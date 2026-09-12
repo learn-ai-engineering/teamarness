@@ -1,4 +1,4 @@
-# 0003 — VRS intent tree as the context authority
+# 0001 — VRS intent tree as the context authority
 
 **Status:** accepted (2026-09-12)
 

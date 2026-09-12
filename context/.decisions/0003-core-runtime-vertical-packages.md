@@ -1,4 +1,4 @@
-# 0002 — Core runtime with vertical packages architecture
+# 0003 — Core runtime with vertical packages architecture
 
 **Status:** accepted (2026-09-12)
 

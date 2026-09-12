@@ -4,7 +4,7 @@
 
 ## Context
 
-Decision 0002 placed canonical membership in the core runtime and described it as a signed, ordered, append-only log. The first requirements made that order a linear hash chain.
+Decision 0003 placed canonical membership in the core runtime and described it as a signed, ordered, append-only log. The first requirements made that order a linear hash chain.
 
 Research for the core runtime found that a linear chain handles concurrent offline managers by rejecting one branch and forcing a retry. That is a poor fit for a local-first workspace. `p2panda-auth` 0.7.1 already models group authority as a dependency DAG and resolves concurrent manager changes with strong removal.
 
@@ -20,7 +20,7 @@ Operations are append-only and content-addressed. The operation ID is a BLAKE3 d
 
 `p2panda-auth` with `StrongRemove` resolves concurrent authority changes. Resonance exposes only `admit` and `revoke` in Phase 1. The p2panda adapter and access levels remain private to the core runtime.
 
-This decision supersedes the linear hash-chain and single-predecessor membership wording in decision 0002. Decision 0002's ownership model and narrow core-to-package seam remain accepted.
+This decision supersedes the linear hash-chain and single-predecessor membership wording in decision 0003. Decision 0003's ownership model and narrow core-to-package seam remain accepted.
 
 ### Identity adapters preserve one installation key
 
@@ -46,7 +46,7 @@ Distributed token spending across managers is deferred with membership synchroni
 
 ### Core persistence uses one database
 
-One core SQLite database owns installation identity, workspace creation state, canonical operations, invitation spends, membership versions, and epoch events. This gives workspace creation and invitation admission one transaction boundary. Package persistence remains separate under decision 0002.
+One core SQLite database owns installation identity, workspace creation state, canonical operations, invitation spends, membership versions, and epoch events. This gives workspace creation and invitation admission one transaction boundary. Package persistence remains separate under decision 0003.
 
 ## Evidence
 

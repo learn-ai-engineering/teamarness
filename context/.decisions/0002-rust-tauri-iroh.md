@@ -1,4 +1,4 @@
-# 0001 — Rust, Tauri, and Iroh for the full stack
+# 0002 — Rust, Tauri, and Iroh for the full stack
 
 **Status:** accepted (2026-09-12)
 
@@ -22,10 +22,11 @@ The runtime is a Rust crate (or small set of crates). Packages have TypeScript U
 - Iroh provides Ed25519-based `EndpointId` as the peer identity primitive. Each device/endpoint has a unique `SecretKey` whose public key is its network identity.
 - Iroh explicitly does NOT provide membership, authorization, or group management. That is a clean seam — we build the membership layer on top of Iroh's transport and identity primitives.
 
-### Iroh for content-addressed data
+### Future data capabilities remain open
 
-- **Iroh blobs** for content-addressed immutable data (documents, file content, message attachments).
-- **Iroh docs** for mutable, multi-writer, eventually-consistent document collaboration where needed.
+Iroh blobs and Iroh docs are candidates for future content-addressed or collaborative data features, but this decision does not adopt either one. A later package design will choose the storage and synchronization mechanism for each feature.
+
+Packages must consume those features through capability contracts exposed by the core runtime rather than depend directly on Iroh. The runtime may use Iroh blobs, Iroh docs, or another implementation behind those contracts once the relevant trade-offs have been evaluated.
 
 ### Why not Electron
 
@@ -40,7 +41,7 @@ Electron was considered but rejected because:
 
 Commonware was considered for the conversations transport layer (as used in the reference Resonance V1). Rejected because:
 
-1. **Iroh provides the full stack.** Transport (QUIC + hole-punching + relay), discovery (DNS/pkarr), content-addressed blobs, and mutable docs — all from one dependency with consistent design.
+1. **Iroh provides the required transport stack.** QUIC transport, hole-punching, relay fallback, and discovery come from one dependency with a consistent design. Its blobs and docs capabilities remain options for later package features rather than part of this decision.
 2. **Documentation and ecosystem.** Iroh has strong documentation, video content, and an active community. A single well-documented dependency reduces the integration burden compared to assembling transport, discovery, and blob storage from separate crates.
 3. **Commonware is also Rust, but younger.** Commonware's p2p crate is newer and less documented than Iroh. The reference Resonance V1 used Commonware because it was already in the stack; this project starts fresh and can choose the more mature option.
 
@@ -49,5 +50,6 @@ Commonware was considered for the conversations transport layer (as used in the 
 - The development environment requires Rust (via rustup) and Node.js (for package UIs and tooling). Students install both.
 - The runtime, transport, and shell are all Rust. Package UIs are TypeScript. The boundary is the Tauri invoke/event bridge.
 - Membership, invitations, revocation, and key rotation are built on top of Iroh's transport and identity — not provided by Iroh itself.
+- Packages do not depend directly on Iroh. Future content-addressed or collaborative data features use core-runtime capability contracts, with their backing implementation decided separately.
 - Iroh's relay servers (number 0 by default) provide NAT traversal fallback. We can configure custom relays or use the default public relays.
 - The reference Resonance V1 codebase (Rust + Tauri + Commonware for chat) remains valuable as a design reference but is not directly copied.
