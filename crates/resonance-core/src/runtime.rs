@@ -1,8 +1,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use iroh_base::PublicKey;
+use iroh_base::{PublicKey, Signature};
 
 use crate::error::{
     CoreError, IdentityError, InvitationError, MembershipError, StorageError, SubscriptionError,
@@ -60,6 +62,23 @@ impl FromStr for PublicIdentity {
             .parse()
             .map(Self)
             .map_err(|_| ValueParseError::new("public identity"))
+    }
+}
+
+impl PublicIdentity {
+    /// Verifies a signature using the same versioned, domain-separated envelope as [`CoreRuntime::sign`].
+    pub fn verify(
+        self,
+        context: &SigningContext,
+        payload: &[u8],
+        signature: &PublicSignature,
+    ) -> Result<(), IdentityError> {
+        crate::identity::verify(
+            self.0,
+            context.as_str(),
+            payload,
+            &signature.as_iroh_signature(),
+        )
     }
 }
 
@@ -262,12 +281,13 @@ impl MembershipSnapshot {
 pub struct SigningContext(String);
 
 impl SigningContext {
-    /// Creates a signing context from a non-empty ASCII domain tag.
+    /// Creates a domain tag of at most 64 bytes.
+    ///
+    /// Tags start with an ASCII lowercase letter and otherwise contain only
+    /// lowercase letters, digits, `.`, `_`, `/`, or `-`.
     pub fn new(domain: impl Into<String>) -> Result<Self, IdentityError> {
         let domain = domain.into();
-        if domain.is_empty() || !domain.is_ascii() {
-            return Err(IdentityError::InvalidSigningContext);
-        }
+        crate::identity::validate_signing_context(&domain)?;
         Ok(Self(domain))
     }
 
@@ -305,6 +325,12 @@ impl FromStr for PublicSignature {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         parse_fixed_hex(value, "public signature").map(Self)
+    }
+}
+
+impl PublicSignature {
+    fn as_iroh_signature(&self) -> Signature {
+        Signature::from_bytes(&self.0)
     }
 }
 
@@ -414,57 +440,144 @@ impl MembershipSubscription {
 
 /// The sole public command and query seam for durable core state.
 ///
-/// Phase 1 establishes this contract. Subsequent implementation phases make
-/// the operations available without exposing keys, SQLite handles, Iroh
-/// transport handles, or mutable p2panda state.
-#[derive(Debug)]
+/// The runtime owns its SQLite connection and installation secret. Neither
+/// those values nor private test dependencies can be obtained by callers.
 pub struct CoreRuntime {
-    state: RuntimeState,
+    public_identity: PublicIdentity,
+    state: Mutex<RuntimeState>,
+    _clock: Box<dyn Clock>,
 }
 
-#[derive(Debug)]
-enum RuntimeState {}
+impl fmt::Debug for CoreRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CoreRuntime")
+            .field("public_identity", &self.public_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+struct RuntimeState {
+    connection: rusqlite::Connection,
+    secret_key: iroh_base::SecretKey,
+    display_name: String,
+    poisoned: bool,
+}
+
+trait Clock: Send + Sync {
+    fn now_unix_ms(&self) -> i64;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix_ms(&self) -> i64 {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+    }
+}
 
 impl CoreRuntime {
     /// Opens or initializes the runtime in its private data directory.
-    pub fn open(_config: CoreRuntimeConfig) -> Result<Self, CoreError> {
-        Err(CoreError::Storage(StorageError::RuntimeUnavailable))
+    pub fn open(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
+        Self::open_inner(config, Box::new(SystemClock))
+    }
+
+    #[cfg(test)]
+    fn open_with_clock(
+        config: CoreRuntimeConfig,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, CoreError> {
+        Self::open_inner(config, clock)
+    }
+
+    fn open_inner(config: CoreRuntimeConfig, clock: Box<dyn Clock>) -> Result<Self, CoreError> {
+        let _opened_at_unix_ms = clock.now_unix_ms();
+        let stored = crate::storage::open(config.private_data_directory())?;
+        let public_identity = PublicIdentity(stored.secret_key.public());
+        Ok(Self {
+            public_identity,
+            state: Mutex::new(RuntimeState {
+                connection: stored.connection,
+                secret_key: stored.secret_key,
+                display_name: stored.display_name,
+                poisoned: false,
+            }),
+            _clock: clock,
+        })
     }
 
     /// Returns this installation's validated public identity.
     #[must_use]
-    pub fn public_identity(&self) -> PublicIdentity {
-        match self.state {}
+    pub const fn public_identity(&self) -> PublicIdentity {
+        self.public_identity
     }
 
-    /// Returns this installation's validated display name.
+    /// Returns a snapshot of this installation's validated display name.
     #[must_use]
-    pub fn display_name(&self) -> &str {
-        match self.state {}
+    pub fn display_name(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .display_name
+            .clone()
     }
 
     /// Updates this installation's display name.
-    pub fn set_display_name(&self, _display_name: &str) -> Result<(), IdentityError> {
-        match self.state {}
+    ///
+    /// Names contain 1–64 Unicode alphanumeric characters, spaces, hyphens,
+    /// underscores, apostrophes, or periods, with no surrounding whitespace.
+    pub fn set_display_name(&self, display_name: &str) -> Result<(), IdentityError> {
+        crate::identity::validate_display_name(display_name)?;
+        let mut state = self.lock_identity_state()?;
+        match crate::storage::update_display_name(&mut state.connection, display_name) {
+            Ok(()) => {
+                state.display_name = display_name.to_owned();
+                Ok(())
+            }
+            Err(error) => {
+                if error == StorageError::UncertainOutcome {
+                    state.poisoned = true;
+                }
+                Err(IdentityError::Storage(error))
+            }
+        }
     }
 
-    /// Signs bytes under a validated, length-delimited domain context.
+    /// Signs bytes under a validated, versioned, length-delimited domain context.
     pub fn sign(
         &self,
-        _context: &SigningContext,
-        _payload: &[u8],
+        context: &SigningContext,
+        payload: &[u8],
     ) -> Result<PublicSignature, IdentityError> {
-        match self.state {}
+        let state = self.lock_identity_state()?;
+        crate::identity::sign(&state.secret_key, context.as_str(), payload)
+            .map(|signature| PublicSignature(signature.to_bytes()))
+    }
+
+    fn lock_identity_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, IdentityError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| IdentityError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(IdentityError::Storage(StorageError::RuntimePoisoned));
+        }
+        Ok(state)
     }
 
     /// Creates a named workspace with this installation as its first manager.
     pub fn create_workspace(&self, _name: &str) -> Result<WorkspaceSummary, WorkspaceError> {
-        match self.state {}
+        Err(WorkspaceError::RuntimeUnavailable)
     }
 
     /// Lists workspaces known to this installation.
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>, WorkspaceError> {
-        match self.state {}
+        Err(WorkspaceError::RuntimeUnavailable)
     }
 
     /// Issues an expiring invitation as the local manager.
@@ -473,7 +586,7 @@ impl CoreRuntime {
         _workspace_id: WorkspaceId,
         _expires_at_unix_ms: i64,
     ) -> Result<InvitationToken, InvitationError> {
-        match self.state {}
+        Err(InvitationError::RuntimeUnavailable)
     }
 
     /// Creates proof that this installation claims the supplied invitation.
@@ -481,7 +594,7 @@ impl CoreRuntime {
         &self,
         _token: &InvitationToken,
     ) -> Result<InvitationClaim, InvitationError> {
-        match self.state {}
+        Err(InvitationError::RuntimeUnavailable)
     }
 
     /// Redeems a claim on the installation that issued its token.
@@ -489,7 +602,7 @@ impl CoreRuntime {
         &self,
         _claim: &InvitationClaim,
     ) -> Result<MembershipTransition, InvitationError> {
-        match self.state {}
+        Err(InvitationError::RuntimeUnavailable)
     }
 
     /// Revokes a workspace member as the local manager.
@@ -498,7 +611,7 @@ impl CoreRuntime {
         _workspace_id: WorkspaceId,
         _member: PublicIdentity,
     ) -> Result<MembershipTransition, MembershipError> {
-        match self.state {}
+        Err(MembershipError::RuntimeUnavailable)
     }
 
     /// Returns the current canonical membership projection.
@@ -506,7 +619,7 @@ impl CoreRuntime {
         &self,
         _workspace_id: WorkspaceId,
     ) -> Result<MembershipSnapshot, MembershipError> {
-        match self.state {}
+        Err(MembershipError::RuntimeUnavailable)
     }
 
     /// Answers declared-time membership history.
@@ -518,7 +631,7 @@ impl CoreRuntime {
         _identity: PublicIdentity,
         _at_unix_ms: i64,
     ) -> Result<bool, MembershipError> {
-        match self.state {}
+        Err(MembershipError::RuntimeUnavailable)
     }
 
     /// Subscribes after a durable local epoch cursor.
@@ -527,6 +640,46 @@ impl CoreRuntime {
         _workspace_id: WorkspaceId,
         _after_epoch: MembershipEpoch,
     ) -> Result<MembershipSubscription, SubscriptionError> {
-        match self.state {}
+        Err(SubscriptionError::RuntimeUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    struct RecordingClock {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Clock for RecordingClock {
+        fn now_unix_ms(&self) -> i64 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            1_234
+        }
+    }
+
+    #[test]
+    fn test_clock_is_injected_without_entering_the_public_configuration() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let directory =
+            std::env::temp_dir().join(format!("resonance-runtime-clock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+
+        let runtime = CoreRuntime::open_with_clock(
+            CoreRuntimeConfig::new(&directory),
+            Box::new(RecordingClock {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        drop(runtime);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

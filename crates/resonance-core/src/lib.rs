@@ -23,10 +23,10 @@ mod runtime;
 
 // These boundaries are intentionally private. Later phases deepen them without
 // changing which implementation details callers can name.
-mod identity {}
+mod identity;
 mod invitation {}
 mod membership {}
-mod storage {}
+mod storage;
 mod subscription {}
 mod workspace {}
 
