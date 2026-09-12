@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. The Rust workspace and core-runtime contract are now the current implementation baseline; runtime behavior is delivered incrementally through the active core-runtime workstream.
+The VRS intent tree and accepted architecture decisions are established. The Phase 1 Rust core runtime is complete and is the current implementation baseline. Phase 2, the shell and package lifecycle, is next and has not started.
 
 ## Phases
 
@@ -16,7 +16,7 @@ Established the VRS intent tree, ontology, initial decisions, and open questions
 
 **Outcome:** A complete, internally consistent intent layer that answers: what is Resonance, what terms does it use, what decisions have been made, what questions remain open, and in what order will we build it.
 
-### Phase 1 — Core Runtime (current)
+### Phase 1 — Core Runtime (complete)
 
 The minimum viable runtime: installation identity (an Ed25519 keypair compatible with an Iroh `EndpointId`), workspace creation, a signed append-only causal membership DAG, single-use invitations, and revocation with durable membership transitions. No UI. No packages. No endpoint binding or network transport.
 
@@ -24,7 +24,7 @@ The minimum viable runtime: installation identity (an Ed25519 keypair compatible
 
 **Depends on:** Phase 0.
 
-### Phase 2 — Shell and Package Lifecycle
+### Phase 2 — Shell and Package Lifecycle (next)
 
 The Tauri desktop shell with package mounting in webviews, workspace controls, and workspace-level theming. The package SDK in TypeScript with manifest parsing, semantic capability declaration, and the standard lifecycle (activate, suspend, dispose). A reference package that exercises the lifecycle end-to-end. The Tauri invoke/event bridge carries typed, secret-free capability contracts.
 

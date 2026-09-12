@@ -1,6 +1,6 @@
 # Resonance
 
-Resonance is a local-first, peer-to-peer team workspace. This repository is at the core-runtime foundation stage: it contains the Phase 1 Rust library and the intent and design records that govern its implementation.
+Resonance is a local-first, peer-to-peer team workspace. This repository contains the completed Phase 1 Rust core runtime and the intent and design records that govern it. The Tauri shell and package lifecycle are next.
 
 ## Prerequisites
 
