@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -170,6 +171,12 @@ fixed_hex_value!(
     "A digest of a resolved membership snapshot."
 );
 
+impl MembershipSnapshotDigest {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 fn parse_fixed_hex<const N: usize>(
     value: &str,
     label: &'static str,
@@ -222,6 +229,10 @@ pub struct MemberSnapshot {
 }
 
 impl MemberSnapshot {
+    pub(crate) const fn new(identity: PublicIdentity, role: MembershipRole) -> Self {
+        Self { identity, role }
+    }
+
     /// Returns the member's installation identity.
     #[must_use]
     pub const fn identity(&self) -> PublicIdentity {
@@ -294,6 +305,20 @@ pub struct MembershipSnapshot {
 }
 
 impl MembershipSnapshot {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        epoch: MembershipEpoch,
+        version: MembershipVersion,
+        members: Vec<MemberSnapshot>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            epoch,
+            version,
+            members,
+        }
+    }
+
     /// Returns the workspace represented by this snapshot.
     #[must_use]
     pub const fn workspace_id(&self) -> WorkspaceId {
@@ -388,6 +413,22 @@ pub struct MembershipTransition {
 }
 
 impl MembershipTransition {
+    pub(crate) const fn new(
+        workspace_id: WorkspaceId,
+        epoch: MembershipEpoch,
+        version: MembershipVersion,
+        cause: MembershipOperationId,
+        snapshot_digest: MembershipSnapshotDigest,
+    ) -> Self {
+        Self {
+            workspace_id,
+            epoch,
+            version,
+            cause,
+            snapshot_digest,
+        }
+    }
+
     /// Returns the workspace whose membership changed.
     #[must_use]
     pub const fn workspace_id(&self) -> WorkspaceId {
@@ -458,6 +499,7 @@ struct RuntimeState {
     connection: rusqlite::Connection,
     secret_key: iroh_base::SecretKey,
     display_name: String,
+    memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
     poisoned: bool,
 }
 
@@ -502,15 +544,23 @@ impl CoreRuntime {
     }
 
     fn open_inner(config: CoreRuntimeConfig, clock: Box<dyn Clock>) -> Result<Self, CoreError> {
-        let _opened_at_unix_ms = clock.now_unix_ms();
+        let opened_at_unix_ms = clock.now_unix_ms();
         let stored = crate::storage::open(config.private_data_directory())?;
-        let public_identity = PublicIdentity(stored.secret_key.public());
+        let crate::storage::StoredRuntime {
+            mut connection,
+            secret_key,
+            display_name,
+        } = stored;
+        let public_identity = PublicIdentity(secret_key.public());
+        let memberships =
+            crate::membership::projection::recover(&mut connection, opened_at_unix_ms)?;
         Ok(Self {
             public_identity,
             state: Mutex::new(RuntimeState {
-                connection: stored.connection,
-                secret_key: stored.secret_key,
-                display_name: stored.display_name,
+                connection,
+                secret_key,
+                display_name,
+                memberships,
                 poisoned: false,
             }),
             clock,
@@ -589,13 +639,29 @@ impl CoreRuntime {
         let secret_key = state.secret_key.clone();
         let result =
             crate::workspace::create(&mut state.connection, &secret_key, name, now_unix_ms);
-        if matches!(
-            result,
-            Err(WorkspaceError::Storage(StorageError::UncertainOutcome))
-        ) {
-            state.poisoned = true;
+        match result {
+            Ok(summary) => {
+                match crate::membership::projection::recover(&mut state.connection, now_unix_ms) {
+                    Ok(memberships) => state.memberships = memberships,
+                    Err(error) => {
+                        if error == StorageError::UncertainOutcome {
+                            state.poisoned = true;
+                        }
+                        return Err(WorkspaceError::Storage(error));
+                    }
+                }
+                Ok(summary)
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    WorkspaceError::Storage(StorageError::UncertainOutcome)
+                ) {
+                    state.poisoned = true;
+                }
+                Err(error)
+            }
         }
-        result
     }
 
     /// Lists workspaces known to this installation.
@@ -645,18 +711,153 @@ impl CoreRuntime {
     /// Revokes a workspace member as the local manager.
     pub fn revoke_member(
         &self,
-        _workspace_id: WorkspaceId,
-        _member: PublicIdentity,
+        workspace_id: WorkspaceId,
+        member: PublicIdentity,
     ) -> Result<MembershipTransition, MembershipError> {
-        Err(MembershipError::RuntimeUnavailable)
+        let mut state = self.lock_membership_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let RuntimeState {
+            connection,
+            secret_key,
+            memberships,
+            poisoned,
+            ..
+        } = &mut *state;
+        if let Err(error) =
+            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
+        {
+            if matches!(
+                error,
+                MembershipError::Storage(StorageError::UncertainOutcome)
+            ) {
+                *poisoned = true;
+            }
+            return Err(error);
+        }
+        let current = memberships
+            .get(&workspace_id)
+            .cloned()
+            .ok_or(MembershipError::WorkspaceNotFound)?;
+        if current.creator() == member {
+            return Err(MembershipError::CannotRevokeManager);
+        }
+        if !current.contains_member(member) {
+            return Err(MembershipError::MemberNotFound);
+        }
+        let envelope = crate::membership::MembershipEnvelope::sign(
+            secret_key,
+            workspace_id,
+            now_unix_ms,
+            crate::membership::MembershipAction::Revoke { target: member },
+            current.heads(),
+        )?;
+        match crate::membership::projection::apply_canonical(
+            connection,
+            memberships,
+            envelope.canonical_bytes(),
+            now_unix_ms,
+        ) {
+            Ok(applied) if applied.accepted => Ok(MembershipTransition::new(
+                workspace_id,
+                applied.snapshot.epoch(),
+                applied.snapshot.version(),
+                applied.operation_id,
+                applied.snapshot_digest,
+            )),
+            Ok(_) => Err(MembershipError::AuthorizationRejected),
+            Err(error) => {
+                if matches!(
+                    error,
+                    MembershipError::Storage(StorageError::UncertainOutcome)
+                ) {
+                    *poisoned = true;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Returns the current canonical membership projection.
     pub fn membership_snapshot(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
     ) -> Result<MembershipSnapshot, MembershipError> {
-        Err(MembershipError::RuntimeUnavailable)
+        let mut state = self.lock_membership_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let RuntimeState {
+            connection,
+            memberships,
+            poisoned,
+            ..
+        } = &mut *state;
+        if let Err(error) =
+            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
+        {
+            if matches!(
+                error,
+                MembershipError::Storage(StorageError::UncertainOutcome)
+            ) {
+                *poisoned = true;
+            }
+            return Err(error);
+        }
+        memberships
+            .get(&workspace_id)
+            .map(crate::membership::WorkspaceProjection::snapshot)
+            .ok_or(MembershipError::WorkspaceNotFound)
+    }
+
+    fn lock_membership_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, MembershipError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MembershipError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(MembershipError::Storage(StorageError::RuntimePoisoned));
+        }
+        Ok(state)
+    }
+
+    // Phase 6 invitation redemption will call this same production path.
+    #[allow(dead_code)]
+    pub(crate) fn apply_membership_envelope(
+        &self,
+        canonical_envelope: &[u8],
+    ) -> Result<crate::membership::projection::AppliedMembership, MembershipError> {
+        let mut state = self.lock_membership_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let RuntimeState {
+            connection,
+            memberships,
+            poisoned,
+            ..
+        } = &mut *state;
+        if let Err(error) =
+            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
+        {
+            if matches!(
+                error,
+                MembershipError::Storage(StorageError::UncertainOutcome)
+            ) {
+                *poisoned = true;
+            }
+            return Err(error);
+        }
+        let result = crate::membership::projection::apply_canonical(
+            connection,
+            memberships,
+            canonical_envelope,
+            now_unix_ms,
+        );
+        if matches!(
+            result,
+            Err(MembershipError::Storage(StorageError::UncertainOutcome))
+        ) {
+            *poisoned = true;
+        }
+        result
     }
 
     /// Answers declared-time membership history.
@@ -685,9 +886,13 @@ impl CoreRuntime {
 mod tests {
     use std::fs;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    use iroh_base::SecretKey;
 
     use super::*;
+    use crate::invitation::{sign_claim, sign_token};
+    use crate::membership::{AdmissionProof, MembershipAction, MembershipEnvelope};
 
     struct RecordingClock {
         calls: Arc<AtomicU64>,
@@ -717,6 +922,382 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         drop(runtime);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn member_secret(byte: u8) -> SecretKey {
+        SecretKey::from_bytes(&[byte; 32])
+    }
+
+    fn runtime_secret(runtime: &CoreRuntime) -> SecretKey {
+        runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .secret_key
+            .clone()
+    }
+
+    fn runtime_heads(
+        runtime: &CoreRuntime,
+        workspace_id: WorkspaceId,
+    ) -> Vec<MembershipOperationId> {
+        runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .memberships
+            .get(&workspace_id)
+            .unwrap()
+            .heads()
+    }
+
+    fn admit(
+        manager: &SecretKey,
+        invitee: &SecretKey,
+        workspace_id: WorkspaceId,
+        timestamp: i64,
+        dependencies: Vec<MembershipOperationId>,
+        nonce: u8,
+    ) -> MembershipEnvelope {
+        let token = sign_token(
+            manager,
+            workspace_id,
+            timestamp - 1,
+            timestamp + 100_000,
+            [nonce; 32],
+        )
+        .unwrap();
+        let claim = sign_claim(invitee, &token).unwrap();
+        let target = claim.invitee;
+        MembershipEnvelope::sign(
+            manager,
+            workspace_id,
+            timestamp,
+            MembershipAction::Admit {
+                target,
+                proof: Box::new(AdmissionProof { claim }),
+            },
+            dependencies,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_advancing_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-membership-validation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+        let workspace = runtime.create_workspace("Membership validation").unwrap();
+        let manager = runtime_secret(&runtime);
+        let member = member_secret(31);
+        let base = workspace.created_at_unix_ms();
+
+        let admission = admit(
+            &manager,
+            &member,
+            workspace.id(),
+            base + 1,
+            runtime_heads(&runtime, workspace.id()),
+            1,
+        );
+        let accepted = runtime
+            .apply_membership_envelope(admission.canonical_bytes())
+            .unwrap();
+        assert!(accepted.accepted);
+        assert!(!accepted.quarantined);
+        assert_eq!(accepted.snapshot.epoch(), MembershipEpoch::new(1));
+
+        let duplicate = runtime
+            .apply_membership_envelope(admission.canonical_bytes())
+            .unwrap();
+        assert!(!duplicate.accepted);
+        assert_eq!(duplicate.snapshot.epoch(), MembershipEpoch::new(1));
+
+        let outsider = member_secret(32);
+        let wrong_token =
+            sign_token(&outsider, workspace.id(), base, base + 100_000, [2; 32]).unwrap();
+        let wrong_claim = sign_claim(&member_secret(33), &wrong_token).unwrap();
+        let invalid_proof = MembershipEnvelope::sign(
+            &manager,
+            workspace.id(),
+            base + 2,
+            MembershipAction::Admit {
+                target: wrong_claim.invitee,
+                proof: Box::new(AdmissionProof { claim: wrong_claim }),
+            },
+            runtime_heads(&runtime, workspace.id()),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .apply_membership_envelope(invalid_proof.canonical_bytes())
+                .unwrap_err(),
+            MembershipError::InvalidAdmissionProof
+        );
+
+        let writer_action = MembershipEnvelope::sign(
+            &member,
+            workspace.id(),
+            base + 2,
+            MembershipAction::Revoke {
+                target: runtime.public_identity(),
+            },
+            runtime_heads(&runtime, workspace.id()),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .apply_membership_envelope(writer_action.canonical_bytes())
+                .unwrap_err(),
+            MembershipError::NotManager
+        );
+        assert_eq!(
+            runtime.membership_snapshot(workspace.id()).unwrap().epoch(),
+            MembershipEpoch::new(1)
+        );
+
+        let revocation = runtime
+            .revoke_member(
+                workspace.id(),
+                PublicIdentity::from_bytes(*member.public().as_bytes()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(revocation.epoch(), MembershipEpoch::new(2));
+        let readmission = admit(
+            &manager,
+            &member,
+            workspace.id(),
+            base + 100_000,
+            vec![revocation.cause()],
+            3,
+        );
+        assert_eq!(
+            runtime
+                .apply_membership_envelope(readmission.canonical_bytes())
+                .unwrap_err(),
+            MembershipError::CausalReadmission
+        );
+        let final_snapshot = runtime.membership_snapshot(workspace.id()).unwrap();
+        assert_eq!(final_snapshot.epoch(), MembershipEpoch::new(2));
+        assert_eq!(final_snapshot.members().len(), 1);
+
+        drop(runtime);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn topological_orders(prerequisites: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        fn visit(
+            prerequisites: &[Vec<usize>],
+            current: &mut Vec<usize>,
+            orders: &mut Vec<Vec<usize>>,
+        ) {
+            if current.len() == prerequisites.len() {
+                orders.push(current.clone());
+                return;
+            }
+            for candidate in 0..prerequisites.len() {
+                if current.contains(&candidate)
+                    || !prerequisites[candidate]
+                        .iter()
+                        .all(|required| current.contains(required))
+                {
+                    continue;
+                }
+                current.push(candidate);
+                visit(prerequisites, current, orders);
+                current.pop();
+            }
+        }
+        let mut orders = Vec::new();
+        visit(prerequisites, &mut Vec::new(), &mut orders);
+        orders
+    }
+
+    #[test]
+    fn every_reachable_topological_order_converges_for_single_manager_branches() {
+        let baseline = std::env::temp_dir().join(format!(
+            "resonance-runtime-convergence-baseline-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&baseline);
+        let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&baseline)).unwrap();
+        let workspace = runtime.create_workspace("Reachable convergence").unwrap();
+        let manager = runtime_secret(&runtime);
+        let genesis = runtime_heads(&runtime, workspace.id())[0];
+        let base = workspace.created_at_unix_ms();
+        let member_a = member_secret(41);
+        let member_b = member_secret(42);
+        let member_c = member_secret(43);
+
+        let admit_a = admit(
+            &manager,
+            &member_a,
+            workspace.id(),
+            base + 1,
+            vec![genesis],
+            11,
+        );
+        let duplicate_a = admit(
+            &manager,
+            &member_a,
+            workspace.id(),
+            base + 2,
+            vec![genesis],
+            12,
+        );
+        let admit_b = admit(
+            &manager,
+            &member_b,
+            workspace.id(),
+            base + 3,
+            vec![genesis],
+            13,
+        );
+        let revoke_a = MembershipEnvelope::sign(
+            &manager,
+            workspace.id(),
+            base + 4,
+            MembershipAction::Revoke {
+                target: PublicIdentity::from_bytes(*member_a.public().as_bytes()).unwrap(),
+            },
+            vec![admit_a.id],
+        )
+        .unwrap();
+        let admit_c = admit(
+            &manager,
+            &member_c,
+            workspace.id(),
+            base + 4,
+            vec![admit_b.id],
+            14,
+        );
+        let operations = [admit_a, duplicate_a, admit_b, revoke_a, admit_c]
+            .map(|operation| operation.canonical_bytes().to_vec());
+        drop(runtime);
+
+        let orders = topological_orders(&[vec![], vec![], vec![], vec![0], vec![2]]);
+        assert!(orders.len() > 1);
+        let mut expected = None;
+        for (index, order) in orders.into_iter().enumerate() {
+            let directory = std::env::temp_dir().join(format!(
+                "resonance-runtime-convergence-{}-{index}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            fs::create_dir_all(&directory).unwrap();
+            fs::copy(
+                baseline.join(crate::storage::DATABASE_FILE_NAME),
+                directory.join(crate::storage::DATABASE_FILE_NAME),
+            )
+            .unwrap();
+            let branch = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+            for operation in order {
+                assert!(
+                    branch
+                        .apply_membership_envelope(&operations[operation])
+                        .unwrap()
+                        .accepted
+                );
+            }
+            let snapshot = branch.membership_snapshot(workspace.id()).unwrap();
+            assert_eq!(snapshot.epoch(), MembershipEpoch::new(5));
+            match &expected {
+                Some(expected) => assert_eq!(&snapshot, expected),
+                None => expected = Some(snapshot),
+            }
+            drop(branch);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        fs::remove_dir_all(baseline).unwrap();
+    }
+
+    struct AdjustableClock(Arc<AtomicI64>);
+
+    impl Clock for AdjustableClock {
+        fn now_unix_ms(&self) -> i64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn quarantine_retries_dependency_first_and_never_advances_twice() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-quarantine-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let now = Arc::new(AtomicI64::new(1_000));
+        let config = CoreRuntimeConfig::new(&directory);
+        let runtime = CoreRuntime::open_with_clock(
+            config.clone(),
+            Box::new(AdjustableClock(Arc::clone(&now))),
+        )
+        .unwrap();
+        let workspace = runtime.create_workspace("Quarantine").unwrap();
+        let manager = runtime_secret(&runtime);
+        let member = member_secret(51);
+        let genesis = runtime_heads(&runtime, workspace.id())[0];
+        let admission = admit(
+            &manager,
+            &member,
+            workspace.id(),
+            301_001,
+            vec![genesis],
+            21,
+        );
+        let revocation = MembershipEnvelope::sign(
+            &manager,
+            workspace.id(),
+            301_002,
+            MembershipAction::Revoke {
+                target: PublicIdentity::from_bytes(*member.public().as_bytes()).unwrap(),
+            },
+            vec![admission.id],
+        )
+        .unwrap();
+
+        let first = runtime
+            .apply_membership_envelope(admission.canonical_bytes())
+            .unwrap();
+        let second = runtime
+            .apply_membership_envelope(revocation.canonical_bytes())
+            .unwrap();
+        assert!(first.quarantined && second.quarantined);
+        assert_eq!(
+            runtime.membership_snapshot(workspace.id()).unwrap().epoch(),
+            MembershipEpoch::new(0)
+        );
+
+        drop(runtime);
+        now.store(1_002, Ordering::Relaxed);
+        let recovered = CoreRuntime::open_with_clock(
+            config.clone(),
+            Box::new(AdjustableClock(Arc::clone(&now))),
+        )
+        .unwrap();
+        let eligible = recovered.membership_snapshot(workspace.id()).unwrap();
+        assert_eq!(eligible.epoch(), MembershipEpoch::new(2));
+        assert_eq!(eligible.members().len(), 1);
+        assert_eq!(
+            recovered.membership_snapshot(workspace.id()).unwrap(),
+            eligible
+        );
+        drop(recovered);
+
+        let reopened =
+            CoreRuntime::open_with_clock(config, Box::new(AdjustableClock(Arc::clone(&now))))
+                .unwrap();
+        assert_eq!(
+            reopened.membership_snapshot(workspace.id()).unwrap(),
+            eligible
+        );
+
+        drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }
 }

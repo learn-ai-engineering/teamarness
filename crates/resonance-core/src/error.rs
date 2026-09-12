@@ -182,6 +182,8 @@ pub enum MembershipError {
     AdmissionTargetMismatch,
     /// A canonical field or complete envelope exceeds its version-1 bound.
     DecodeLimit,
+    /// The requested workspace does not exist.
+    WorkspaceNotFound,
     /// The envelope names a different workspace than its trust anchor.
     WorkspaceMismatch,
     /// A dependency is unavailable.
@@ -196,8 +198,20 @@ pub enum MembershipError {
     FutureTimestamp,
     /// A create operation conflicts with the immutable genesis.
     ConflictingGenesis,
+    /// The operation author is not the workspace's sole version-1 manager.
+    NotManager,
+    /// The admission token and claim do not authorize this operation.
+    InvalidAdmissionProof,
+    /// Version 1 forbids admission after a causal revocation of the same installation.
+    CausalReadmission,
+    /// The requested member is not currently active.
+    MemberNotFound,
+    /// Version 1 keeps the creator as the sole manager.
+    CannotRevokeManager,
     /// p2panda rejected the authenticated operation.
     AuthorizationRejected,
+    /// Durable storage failed while processing canonical membership.
+    Storage(StorageError),
 }
 
 impl fmt::Display for MembershipError {
@@ -212,6 +226,7 @@ impl fmt::Display for MembershipError {
             Self::InvalidSignature => "membership operation signature is invalid",
             Self::AdmissionTargetMismatch => "admission proof target does not match",
             Self::DecodeLimit => "membership operation exceeds a decode bound",
+            Self::WorkspaceNotFound => "workspace was not found",
             Self::WorkspaceMismatch => "membership operation belongs to another workspace",
             Self::MissingDependency => "membership dependency is unavailable",
             Self::CrossWorkspaceDependency => "membership dependency belongs to another workspace",
@@ -219,12 +234,25 @@ impl fmt::Display for MembershipError {
             Self::NonMonotonicTimestamp => "membership timestamp is not causally monotonic",
             Self::FutureTimestamp => "membership operation timestamp is too far in the future",
             Self::ConflictingGenesis => "membership operation conflicts with workspace genesis",
+            Self::NotManager => "membership operation author is not the workspace manager",
+            Self::InvalidAdmissionProof => "admission proof does not authorize this operation",
+            Self::CausalReadmission => "causal re-admission is not supported in version 1",
+            Self::MemberNotFound => "workspace member is not currently active",
+            Self::CannotRevokeManager => "the version-1 creator manager cannot be revoked",
             Self::AuthorizationRejected => "membership operation was rejected by authorization",
+            Self::Storage(error) => return error.fmt(formatter),
         })
     }
 }
 
-impl Error for MembershipError {}
+impl Error for MembershipError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// An invitation token or claim authentication error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

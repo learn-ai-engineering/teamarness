@@ -427,13 +427,6 @@ fn verify_ready(connection: &Connection) -> Result<(), StorageError> {
         ) {
             return Err(StorageError::CorruptWorkspace);
         }
-        let operation_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM membership_operations WHERE workspace_id = ?1",
-                [request.workspace_id.as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .map_err(|_| StorageError::Database)?;
         let dependency_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM membership_dependencies WHERE operation_id = ?1",
@@ -441,53 +434,14 @@ fn verify_ready(connection: &Connection) -> Result<(), StorageError> {
                 |row| row.get(0),
             )
             .map_err(|_| StorageError::Database)?;
-        if operation_count != 1 || dependency_count != 0 {
+        if dependency_count != 0 {
             return Err(StorageError::CorruptWorkspace);
         }
-        verify_state_and_snapshot(connection, request)?;
     }
     let ready_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
         .map_err(|_| StorageError::Database)?;
     if ready_count != i64::try_from(requests.len()).map_err(|_| StorageError::CorruptWorkspace)? {
-        return Err(StorageError::CorruptWorkspace);
-    }
-    Ok(())
-}
-
-fn verify_state_and_snapshot(
-    connection: &Connection,
-    request: &CreationRequest,
-) -> Result<(), StorageError> {
-    let expected_version = membership_version(request.workspace_id, request.genesis_id);
-    let state: Option<(i64, Vec<u8>)> = connection
-        .query_row(
-            "SELECT epoch, membership_version FROM workspace_membership_state
-             WHERE workspace_id = ?1",
-            [request.workspace_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|_| StorageError::Database)?;
-    if !matches!(state, Some((0, version)) if version == expected_version.as_bytes()) {
-        return Err(StorageError::CorruptWorkspace);
-    }
-    let members: Vec<(Vec<u8>, i64)> = {
-        let mut statement = connection
-            .prepare(
-                "SELECT member_identity, role FROM membership_snapshot_members
-                 WHERE workspace_id = ?1 ORDER BY member_identity",
-            )
-            .map_err(|_| StorageError::Database)?;
-        let rows = statement
-            .query_map([request.workspace_id.as_bytes().as_slice()], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .map_err(|_| StorageError::Database)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|_| StorageError::Database)?
-    };
-    if members != vec![(request.creator.as_bytes().to_vec(), 1)] {
         return Err(StorageError::CorruptWorkspace);
     }
     Ok(())
