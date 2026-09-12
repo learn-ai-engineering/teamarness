@@ -61,6 +61,8 @@ pub enum StorageError {
     UnsupportedSchema,
     /// Durable installation identity records failed authentication.
     CorruptIdentity,
+    /// Durable workspace trust anchors or canonical genesis records disagree.
+    CorruptWorkspace,
     /// SQLite may have committed, so the active runtime cannot safely continue.
     UncertainOutcome,
     /// The active runtime is poisoned and must be reopened.
@@ -77,6 +79,7 @@ impl fmt::Display for StorageError {
             Self::Migration => "core database migration failed",
             Self::UnsupportedSchema => "core database schema is newer than this runtime",
             Self::CorruptIdentity => "durable installation identity is corrupt",
+            Self::CorruptWorkspace => "durable workspace trust anchor is corrupt",
             Self::UncertainOutcome => "database commit outcome is uncertain",
             Self::RuntimePoisoned => "the runtime must be reopened before another command",
         };
@@ -123,7 +126,39 @@ impl Error for IdentityError {
     }
 }
 
-error_family!(WorkspaceError, "A workspace command or query error.");
+/// A workspace command or query error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WorkspaceError {
+    /// A workspace name violated the documented length or character rules.
+    InvalidName,
+    /// A workspace identity or genesis conflicts with durable state.
+    Conflict,
+    /// A ready workspace trust anchor or pending request is corrupt.
+    CorruptTrustAnchor,
+    /// Durable storage failed while processing the workspace.
+    Storage(StorageError),
+}
+
+impl fmt::Display for WorkspaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => formatter.write_str("invalid workspace name"),
+            Self::Conflict => formatter.write_str("workspace identity or genesis conflicts"),
+            Self::CorruptTrustAnchor => formatter.write_str("workspace trust anchor is corrupt"),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for WorkspaceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// A canonical membership authentication error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +182,22 @@ pub enum MembershipError {
     AdmissionTargetMismatch,
     /// A canonical field or complete envelope exceeds its version-1 bound.
     DecodeLimit,
+    /// The envelope names a different workspace than its trust anchor.
+    WorkspaceMismatch,
+    /// A dependency is unavailable.
+    MissingDependency,
+    /// A dependency belongs to another workspace.
+    CrossWorkspaceDependency,
+    /// A dependency does not descend from the workspace genesis.
+    NonDescendantDependency,
+    /// Authored time is earlier than a dependency's authored time.
+    NonMonotonicTimestamp,
+    /// Authored time exceeds the accepted five-minute future bound.
+    FutureTimestamp,
+    /// A create operation conflicts with the immutable genesis.
+    ConflictingGenesis,
+    /// p2panda rejected the authenticated operation.
+    AuthorizationRejected,
 }
 
 impl fmt::Display for MembershipError {
@@ -161,6 +212,14 @@ impl fmt::Display for MembershipError {
             Self::InvalidSignature => "membership operation signature is invalid",
             Self::AdmissionTargetMismatch => "admission proof target does not match",
             Self::DecodeLimit => "membership operation exceeds a decode bound",
+            Self::WorkspaceMismatch => "membership operation belongs to another workspace",
+            Self::MissingDependency => "membership dependency is unavailable",
+            Self::CrossWorkspaceDependency => "membership dependency belongs to another workspace",
+            Self::NonDescendantDependency => "membership dependency does not descend from genesis",
+            Self::NonMonotonicTimestamp => "membership timestamp is not causally monotonic",
+            Self::FutureTimestamp => "membership operation timestamp is too far in the future",
+            Self::ConflictingGenesis => "membership operation conflicts with workspace genesis",
+            Self::AuthorizationRejected => "membership operation was rejected by authorization",
         })
     }
 }

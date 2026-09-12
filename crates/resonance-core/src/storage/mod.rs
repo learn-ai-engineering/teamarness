@@ -57,6 +57,7 @@ fn open_inner(
     let (secret_key, display_name) = initialize_identity(&mut connection)?;
     fault(IdentityTransactionBoundary::AfterCommit)?;
     authenticate_local_subject(&connection, &secret_key)?;
+    crate::workspace::recover_pending(&mut connection)?;
 
     Ok(StoredRuntime {
         connection,

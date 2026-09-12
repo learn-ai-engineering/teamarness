@@ -5,9 +5,10 @@ use p2panda_core::Hash;
 
 use super::{AuthId, MembershipAction, MembershipEnvelope};
 
-pub(crate) struct OperationAdapter<'a>(pub(crate) &'a MembershipEnvelope);
+#[derive(Clone)]
+pub(crate) struct OperationAdapter(pub(crate) MembershipEnvelope);
 
-impl Operation<AuthId, Hash, ()> for OperationAdapter<'_> {
+impl Operation<AuthId, Hash, ()> for OperationAdapter {
     fn id(&self) -> Hash {
         self.0.id.as_hash()
     }
@@ -67,7 +68,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let adapter = OperationAdapter(&envelope);
+        let adapter = OperationAdapter(envelope.clone());
 
         assert_eq!(adapter.id(), envelope.id.as_hash());
         assert_eq!(

@@ -65,6 +65,51 @@ fn migration_0001_reserves_nullable_human_identity_subjects() {
 }
 
 #[test]
+fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
+    let directory = private_data_directory("migration-workspaces");
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    runtime.create_workspace("Migration").unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+
+    for table in [
+        "workspace_creation_requests",
+        "workspaces",
+        "membership_operations",
+        "membership_dependencies",
+        "future_membership_operations",
+        "future_membership_dependencies",
+        "workspace_membership_state",
+        "membership_snapshot_members",
+    ] {
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing migration table {table}");
+    }
+    assert!(
+        connection
+            .execute(
+                "UPDATE membership_operations SET authored_at_unix_ms = 0",
+                []
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM membership_operations", [])
+            .is_err()
+    );
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
@@ -81,7 +126,7 @@ fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     assert_eq!(installation_count, 1);
 
     drop(connection);

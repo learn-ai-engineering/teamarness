@@ -32,7 +32,7 @@ mod invitation;
 mod membership;
 mod storage;
 mod subscription {}
-mod workspace {}
+mod workspace;
 
 pub use error::{
     ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError, StorageError,

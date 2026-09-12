@@ -153,6 +153,16 @@ fixed_hex_value!(
     "membership version",
     "A content-derived identifier for an accepted membership operation set."
 );
+
+impl MembershipVersion {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 fixed_hex_value!(
     MembershipSnapshotDigest,
     32,
@@ -235,6 +245,20 @@ pub struct WorkspaceSummary {
 }
 
 impl WorkspaceSummary {
+    pub(crate) fn new(
+        id: WorkspaceId,
+        name: String,
+        created_by: PublicIdentity,
+        created_at_unix_ms: i64,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            created_by,
+            created_at_unix_ms,
+        }
+    }
+
     /// Returns the immutable workspace identifier.
     #[must_use]
     pub const fn id(&self) -> WorkspaceId {
@@ -418,7 +442,7 @@ impl MembershipSubscription {
 pub struct CoreRuntime {
     public_identity: PublicIdentity,
     state: Mutex<RuntimeState>,
-    _clock: Box<dyn Clock>,
+    clock: Box<dyn Clock>,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -489,7 +513,7 @@ impl CoreRuntime {
                 display_name: stored.display_name,
                 poisoned: false,
             }),
-            _clock: clock,
+            clock,
         })
     }
 
@@ -555,13 +579,42 @@ impl CoreRuntime {
     }
 
     /// Creates a named workspace with this installation as its first manager.
-    pub fn create_workspace(&self, _name: &str) -> Result<WorkspaceSummary, WorkspaceError> {
-        Err(WorkspaceError::RuntimeUnavailable)
+    ///
+    /// Names contain 1–64 Unicode alphanumeric characters, spaces, hyphens,
+    /// underscores, apostrophes, or periods, with no surrounding whitespace.
+    pub fn create_workspace(&self, name: &str) -> Result<WorkspaceSummary, WorkspaceError> {
+        crate::workspace::validate_name(name)?;
+        let mut state = self.lock_workspace_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let secret_key = state.secret_key.clone();
+        let result =
+            crate::workspace::create(&mut state.connection, &secret_key, name, now_unix_ms);
+        if matches!(
+            result,
+            Err(WorkspaceError::Storage(StorageError::UncertainOutcome))
+        ) {
+            state.poisoned = true;
+        }
+        result
     }
 
     /// Lists workspaces known to this installation.
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>, WorkspaceError> {
-        Err(WorkspaceError::RuntimeUnavailable)
+        let state = self.lock_workspace_state()?;
+        crate::workspace::list(&state.connection)
+    }
+
+    fn lock_workspace_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, WorkspaceError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| WorkspaceError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(WorkspaceError::Storage(StorageError::RuntimePoisoned));
+        }
+        Ok(state)
     }
 
     /// Issues an expiring invitation as the local manager.

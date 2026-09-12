@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PublicIdentity, WorkspaceId};
 
+pub(crate) use adapter::OperationAdapter;
 pub(crate) use envelope::{MembershipAction, MembershipEnvelope};
 pub use id::MembershipOperationId;
-pub(crate) use validation::authenticate;
+pub(crate) use validation::{authenticate, validate_context};
 
 pub(crate) const INSTALLATION_TAG: u8 = 1;
 pub(crate) const WORKSPACE_TAG: u8 = 2;
