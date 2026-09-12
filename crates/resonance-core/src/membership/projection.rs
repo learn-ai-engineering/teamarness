@@ -32,10 +32,10 @@ type FutureRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>);
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceProjection {
-    workspace_id: WorkspaceId,
-    creator: PublicIdentity,
-    genesis_id: MembershipOperationId,
-    operations: BTreeMap<MembershipOperationId, MembershipEnvelope>,
+    pub(super) workspace_id: WorkspaceId,
+    pub(super) creator: PublicIdentity,
+    pub(super) genesis_id: MembershipOperationId,
+    pub(super) operations: BTreeMap<MembershipOperationId, MembershipEnvelope>,
     snapshot: MembershipSnapshot,
 }
 
@@ -83,8 +83,9 @@ pub(crate) fn recover(
     now_unix_ms: i64,
 ) -> Result<BTreeMap<WorkspaceId, WorkspaceProjection>, StorageError> {
     let mut projections = load_and_replay(connection)?;
+    verify_transition_evidence(connection, &projections)?;
     repair_all_derived(connection, &projections)?;
-    maintain_quarantine(connection, &mut projections, now_unix_ms)
+    let _ = maintain_quarantine(connection, &mut projections, now_unix_ms)
         .map_err(membership_to_storage)?;
     Ok(projections)
 }
@@ -93,11 +94,12 @@ pub(crate) fn maintain_quarantine(
     connection: &mut Connection,
     projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
     now_unix_ms: i64,
-) -> Result<(), MembershipError> {
+) -> Result<Vec<AppliedMembership>, MembershipError> {
+    let mut applied = Vec::new();
     loop {
         let rows = load_pending_future(connection)?;
         if rows.is_empty() {
-            return Ok(());
+            return Ok(applied);
         }
         let pending_ids = rows
             .iter()
@@ -151,7 +153,12 @@ pub(crate) fn maintain_quarantine(
             }
 
             match apply_authenticated(connection, projections, envelope, now_unix_ms, Some(id)) {
-                Ok(_) => progressed = true,
+                Ok(result) => {
+                    if result.accepted {
+                        applied.push(result);
+                    }
+                    progressed = true;
+                }
                 Err(error) if is_terminal(&error) => {
                     reject_future(connection, &stored_id, terminal_reason(&error))?;
                     progressed = true;
@@ -161,7 +168,7 @@ pub(crate) fn maintain_quarantine(
         }
 
         if !progressed {
-            return Ok(());
+            return Ok(applied);
         }
     }
 }
@@ -513,7 +520,7 @@ fn load_dependencies(
     .collect()
 }
 
-fn replay(
+pub(super) fn replay(
     workspace_id: WorkspaceId,
     creator: PublicIdentity,
     genesis_id: MembershipOperationId,
@@ -794,7 +801,103 @@ fn persist_candidate_rows(
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
-    write_derived(transaction, candidate)
+    write_derived(transaction, candidate)?;
+    let epoch = i64::try_from(candidate.snapshot.epoch().value())
+        .map_err(|_| MembershipError::Storage(StorageError::CorruptWorkspace))?;
+    let digest = snapshot_digest(&candidate.snapshot);
+    transaction
+        .execute(
+            "INSERT INTO membership_transitions (
+                workspace_id, epoch, membership_version, cause_operation_id, snapshot_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                candidate.workspace_id.as_bytes().as_slice(),
+                epoch,
+                candidate.snapshot.version().as_bytes().as_slice(),
+                envelope.id.as_bytes().as_slice(),
+                digest.as_bytes().as_slice(),
+            ],
+        )
+        .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    Ok(())
+}
+
+fn verify_transition_evidence(
+    connection: &Connection,
+    projections: &BTreeMap<WorkspaceId, WorkspaceProjection>,
+) -> Result<(), StorageError> {
+    for projection in projections.values() {
+        let mut statement = connection
+            .prepare(
+                "SELECT epoch, membership_version, cause_operation_id, snapshot_digest
+                 FROM membership_transitions WHERE workspace_id = ?1 ORDER BY epoch",
+            )
+            .map_err(|_| StorageError::Database)?;
+        let rows = statement
+            .query_map([projection.workspace_id.as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|_| StorageError::Database)?;
+        let events = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StorageError::Database)?;
+
+        let genesis = projection
+            .operations
+            .get(&projection.genesis_id)
+            .ok_or(StorageError::CorruptWorkspace)?
+            .clone();
+        let mut prefix = BTreeMap::from([(projection.genesis_id, genesis)]);
+        for (index, (stored_epoch, stored_version, stored_cause, stored_digest)) in
+            events.into_iter().enumerate()
+        {
+            let expected_epoch =
+                i64::try_from(index + 1).map_err(|_| StorageError::CorruptWorkspace)?;
+            if stored_epoch != expected_epoch {
+                return Err(StorageError::CorruptWorkspace);
+            }
+            let cause = operation_id(&stored_cause).map_err(membership_to_storage)?;
+            let operation = projection
+                .operations
+                .get(&cause)
+                .ok_or(StorageError::CorruptWorkspace)?;
+            if cause == projection.genesis_id
+                || prefix.contains_key(&cause)
+                || !operation
+                    .dependencies
+                    .iter()
+                    .all(|dependency| prefix.contains_key(dependency))
+            {
+                return Err(StorageError::CorruptWorkspace);
+            }
+            prefix.insert(cause, operation.clone());
+            let at_event = replay(
+                projection.workspace_id,
+                projection.creator,
+                projection.genesis_id,
+                prefix.clone(),
+            )
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+            if at_event.snapshot.epoch().value()
+                != u64::try_from(expected_epoch).map_err(|_| StorageError::CorruptWorkspace)?
+                || at_event.snapshot.version()
+                    != MembershipVersion::from_bytes(fixed(&stored_version)?)
+                || snapshot_digest(&at_event.snapshot)
+                    != MembershipSnapshotDigest::from_bytes(fixed(&stored_digest)?)
+            {
+                return Err(StorageError::CorruptWorkspace);
+            }
+        }
+        if prefix.len() != projection.operations.len() {
+            return Err(StorageError::CorruptWorkspace);
+        }
+    }
+    Ok(())
 }
 
 fn repair_all_derived(

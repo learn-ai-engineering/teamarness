@@ -1,5 +1,6 @@
 mod adapter;
 mod envelope;
+mod history;
 mod id;
 pub(crate) mod projection;
 mod validation;
@@ -10,6 +11,7 @@ use crate::{PublicIdentity, WorkspaceId};
 
 pub(crate) use adapter::OperationAdapter;
 pub(crate) use envelope::{AdmissionProof, MembershipAction, MembershipEnvelope};
+pub(crate) use history::was_member;
 pub use id::MembershipOperationId;
 pub(crate) use projection::WorkspaceProjection;
 pub(crate) use validation::{authenticate, validate_context};

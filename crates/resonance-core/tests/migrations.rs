@@ -138,6 +138,34 @@ fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
 }
 
 #[test]
+fn migration_0004_adds_the_append_only_transition_ledger() {
+    let directory = private_data_directory("migration-transitions");
+    CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+
+    let table_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'membership_transitions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let composite_primary_key: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('membership_transitions') WHERE pk > 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_exists, 1);
+    assert_eq!(composite_primary_key, 2);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
@@ -154,7 +182,7 @@ fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(installation_count, 1);
 
     drop(connection);

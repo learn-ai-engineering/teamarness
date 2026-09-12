@@ -324,10 +324,38 @@ impl Error for InvitationError {
         }
     }
 }
-error_family!(
-    SubscriptionError,
-    "A membership transition subscription error."
-);
+/// An error while registering or receiving membership transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriptionError {
+    /// The requested workspace does not exist.
+    WorkspaceNotFound,
+    /// The supplied cursor is ahead of durable workspace state.
+    CursorAhead,
+    /// Durable transition storage could not be read.
+    Storage(StorageError),
+}
+
+impl fmt::Display for SubscriptionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkspaceNotFound => formatter.write_str("subscription workspace was not found"),
+            Self::CursorAhead => {
+                formatter.write_str("subscription cursor is ahead of durable state")
+            }
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SubscriptionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// An error returned while opening the core runtime.
 #[derive(Debug)]

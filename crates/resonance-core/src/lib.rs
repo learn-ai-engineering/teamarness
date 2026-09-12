@@ -31,7 +31,7 @@ mod invitation;
 #[allow(dead_code)]
 mod membership;
 mod storage;
-mod subscription {}
+mod subscription;
 mod workspace;
 
 pub use error::{

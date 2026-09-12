@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_base::{PublicKey, SecretKey, Signature};
@@ -174,6 +174,10 @@ fixed_hex_value!(
 impl MembershipSnapshotDigest {
     pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -463,16 +467,13 @@ impl MembershipTransition {
 /// A gap-free stream of durable then live membership transitions.
 #[derive(Debug)]
 pub struct MembershipSubscription {
-    state: SubscriptionState,
+    state: crate::subscription::SubscriptionState,
 }
-
-#[derive(Debug)]
-enum SubscriptionState {}
 
 impl MembershipSubscription {
     /// Waits for the next transition, returning `None` after orderly shutdown.
     pub fn next_transition(&mut self) -> Result<Option<MembershipTransition>, SubscriptionError> {
-        match self.state {}
+        Ok(self.state.next())
     }
 }
 
@@ -500,6 +501,7 @@ struct RuntimeState {
     secret_key: iroh_base::SecretKey,
     display_name: String,
     memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
+    subscribers: BTreeMap<WorkspaceId, Vec<crate::subscription::TransitionSender>>,
     poisoned: bool,
 }
 
@@ -561,6 +563,7 @@ impl CoreRuntime {
                 secret_key,
                 display_name,
                 memberships,
+                subscribers: BTreeMap::new(),
                 poisoned: false,
             }),
             clock,
@@ -691,24 +694,13 @@ impl CoreRuntime {
     ) -> Result<InvitationToken, InvitationError> {
         let mut state = self.lock_invitation_state()?;
         let now_unix_ms = self.clock.now_unix_ms();
+        self.maintain_and_publish(&mut state, now_unix_ms)
+            .map_err(InvitationError::Membership)?;
         let RuntimeState {
-            connection,
             secret_key,
             memberships,
-            poisoned,
             ..
         } = &mut *state;
-        if let Err(error) =
-            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
-        {
-            if matches!(
-                error,
-                MembershipError::Storage(StorageError::UncertainOutcome)
-            ) {
-                *poisoned = true;
-            }
-            return Err(InvitationError::Membership(error));
-        }
         let projection = memberships
             .get(&workspace_id)
             .ok_or(InvitationError::WorkspaceNotFound)?;
@@ -759,6 +751,8 @@ impl CoreRuntime {
         let claim = claim.verified()?;
         let mut state = self.lock_invitation_state()?;
         let now_unix_ms = self.clock.now_unix_ms();
+        self.maintain_and_publish(&mut state, now_unix_ms)
+            .map_err(InvitationError::Membership)?;
         let RuntimeState {
             connection,
             secret_key,
@@ -766,32 +760,20 @@ impl CoreRuntime {
             poisoned,
             ..
         } = &mut *state;
-        if let Err(error) =
-            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
-        {
-            if matches!(
-                error,
-                MembershipError::Storage(StorageError::UncertainOutcome)
-            ) {
-                *poisoned = true;
-            }
-            return Err(InvitationError::Membership(error));
-        }
-        match crate::membership::projection::redeem_invitation_with_fault(
+        let result = crate::membership::projection::redeem_invitation_with_fault(
             connection,
             memberships,
             secret_key,
             claim,
             now_unix_ms,
             fault,
-        ) {
-            Ok(applied) => Ok(MembershipTransition::new(
-                applied.snapshot.workspace_id(),
-                applied.snapshot.epoch(),
-                applied.snapshot.version(),
-                applied.operation_id,
-                applied.snapshot_digest,
-            )),
+        );
+        match result {
+            Ok(applied) => {
+                let transition = Self::transition_from_applied(applied);
+                Self::publish_transition(&mut state, transition.clone());
+                Ok(transition)
+            }
             Err(error) => {
                 if matches!(
                     error,
@@ -849,6 +831,7 @@ impl CoreRuntime {
     ) -> Result<MembershipTransition, MembershipError> {
         let mut state = self.lock_membership_state()?;
         let now_unix_ms = self.clock.now_unix_ms();
+        self.maintain_and_publish(&mut state, now_unix_ms)?;
         let RuntimeState {
             connection,
             secret_key,
@@ -856,17 +839,6 @@ impl CoreRuntime {
             poisoned,
             ..
         } = &mut *state;
-        if let Err(error) =
-            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
-        {
-            if matches!(
-                error,
-                MembershipError::Storage(StorageError::UncertainOutcome)
-            ) {
-                *poisoned = true;
-            }
-            return Err(error);
-        }
         let current = memberships
             .get(&workspace_id)
             .cloned()
@@ -890,13 +862,11 @@ impl CoreRuntime {
             envelope.canonical_bytes(),
             now_unix_ms,
         ) {
-            Ok(applied) if applied.accepted => Ok(MembershipTransition::new(
-                workspace_id,
-                applied.snapshot.epoch(),
-                applied.snapshot.version(),
-                applied.operation_id,
-                applied.snapshot_digest,
-            )),
+            Ok(applied) if applied.accepted => {
+                let transition = Self::transition_from_applied(applied);
+                Self::publish_transition(&mut state, transition.clone());
+                Ok(transition)
+            }
             Ok(_) => Err(MembershipError::AuthorizationRejected),
             Err(error) => {
                 if matches!(
@@ -917,27 +887,57 @@ impl CoreRuntime {
     ) -> Result<MembershipSnapshot, MembershipError> {
         let mut state = self.lock_membership_state()?;
         let now_unix_ms = self.clock.now_unix_ms();
-        let RuntimeState {
-            connection,
-            memberships,
-            poisoned,
-            ..
-        } = &mut *state;
-        if let Err(error) =
-            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
-        {
-            if matches!(
-                error,
-                MembershipError::Storage(StorageError::UncertainOutcome)
-            ) {
-                *poisoned = true;
-            }
-            return Err(error);
-        }
-        memberships
+        self.maintain_and_publish(&mut state, now_unix_ms)?;
+        state
+            .memberships
             .get(&workspace_id)
             .map(crate::membership::WorkspaceProjection::snapshot)
             .ok_or(MembershipError::WorkspaceNotFound)
+    }
+
+    fn maintain_and_publish(
+        &self,
+        state: &mut RuntimeState,
+        now_unix_ms: i64,
+    ) -> Result<(), MembershipError> {
+        let applied = match crate::membership::projection::maintain_quarantine(
+            &mut state.connection,
+            &mut state.memberships,
+            now_unix_ms,
+        ) {
+            Ok(applied) => applied,
+            Err(error) => {
+                if matches!(
+                    error,
+                    MembershipError::Storage(StorageError::UncertainOutcome)
+                ) {
+                    state.poisoned = true;
+                }
+                return Err(error);
+            }
+        };
+        for applied in applied {
+            Self::publish_transition(state, Self::transition_from_applied(applied));
+        }
+        Ok(())
+    }
+
+    fn transition_from_applied(
+        applied: crate::membership::projection::AppliedMembership,
+    ) -> MembershipTransition {
+        MembershipTransition::new(
+            applied.snapshot.workspace_id(),
+            applied.snapshot.epoch(),
+            applied.snapshot.version(),
+            applied.operation_id,
+            applied.snapshot_digest,
+        )
+    }
+
+    fn publish_transition(state: &mut RuntimeState, transition: MembershipTransition) {
+        if let Some(listeners) = state.subscribers.get_mut(&transition.workspace_id()) {
+            listeners.retain(|listener| listener.send(transition.clone()).is_ok());
+        }
     }
 
     fn lock_membership_state(
@@ -961,57 +961,121 @@ impl CoreRuntime {
     ) -> Result<crate::membership::projection::AppliedMembership, MembershipError> {
         let mut state = self.lock_membership_state()?;
         let now_unix_ms = self.clock.now_unix_ms();
-        let RuntimeState {
-            connection,
-            memberships,
-            poisoned,
-            ..
-        } = &mut *state;
-        if let Err(error) =
-            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
-        {
-            if matches!(
-                error,
-                MembershipError::Storage(StorageError::UncertainOutcome)
-            ) {
-                *poisoned = true;
+        self.maintain_and_publish(&mut state, now_unix_ms)?;
+        let result = {
+            let RuntimeState {
+                connection,
+                memberships,
+                ..
+            } = &mut *state;
+            crate::membership::projection::apply_canonical(
+                connection,
+                memberships,
+                canonical_envelope,
+                now_unix_ms,
+            )
+        };
+        match result {
+            Ok(applied) => {
+                if applied.accepted {
+                    let transition = MembershipTransition::new(
+                        applied.snapshot.workspace_id(),
+                        applied.snapshot.epoch(),
+                        applied.snapshot.version(),
+                        applied.operation_id,
+                        applied.snapshot_digest,
+                    );
+                    Self::publish_transition(&mut state, transition);
+                }
+                Ok(applied)
             }
-            return Err(error);
+            Err(error) => {
+                if matches!(
+                    error,
+                    MembershipError::Storage(StorageError::UncertainOutcome)
+                ) {
+                    state.poisoned = true;
+                }
+                Err(error)
+            }
         }
-        let result = crate::membership::projection::apply_canonical(
-            connection,
-            memberships,
-            canonical_envelope,
-            now_unix_ms,
-        );
-        if matches!(
-            result,
-            Err(MembershipError::Storage(StorageError::UncertainOutcome))
-        ) {
-            *poisoned = true;
-        }
-        result
     }
 
-    /// Answers declared-time membership history.
+    /// Returns the current content-derived membership version.
+    pub fn membership_version(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<MembershipVersion, MembershipError> {
+        self.membership_snapshot(workspace_id)
+            .map(|snapshot| snapshot.version())
+    }
+
+    /// Answers authenticated author-declared membership history.
     ///
-    /// This query is informational and must never authorize a new write.
+    /// Admission is inclusive at its signed authored millisecond and revocation
+    /// is exclusive at its signed authored millisecond. Late operations can
+    /// revise an earlier answer. This informational query must never authorize
+    /// a new write; authorization must use current membership and its version.
     pub fn was_member(
         &self,
-        _workspace_id: WorkspaceId,
-        _identity: PublicIdentity,
-        _at_unix_ms: i64,
+        workspace_id: WorkspaceId,
+        identity: PublicIdentity,
+        at_unix_ms: i64,
     ) -> Result<bool, MembershipError> {
-        Err(MembershipError::RuntimeUnavailable)
+        let mut state = self.lock_membership_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        self.maintain_and_publish(&mut state, now_unix_ms)?;
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(MembershipError::WorkspaceNotFound)?;
+        crate::membership::was_member(projection, workspace_id, identity, at_unix_ms)
     }
 
     /// Subscribes after a durable local epoch cursor.
+    ///
+    /// Durable catch-up is returned first in epoch order, followed by live
+    /// post-commit delivery. Registering the listener and reading catch-up both
+    /// happen while the runtime state lock is held, preventing a handoff gap.
     pub fn subscribe_membership(
         &self,
-        _workspace_id: WorkspaceId,
-        _after_epoch: MembershipEpoch,
+        workspace_id: WorkspaceId,
+        after_epoch: MembershipEpoch,
     ) -> Result<MembershipSubscription, SubscriptionError> {
-        Err(SubscriptionError::RuntimeUnavailable)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SubscriptionError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(SubscriptionError::Storage(StorageError::RuntimePoisoned));
+        }
+        let now_unix_ms = self.clock.now_unix_ms();
+        self.maintain_and_publish(&mut state, now_unix_ms)
+            .map_err(|error| match error {
+                MembershipError::Storage(error) => SubscriptionError::Storage(error),
+                _ => SubscriptionError::Storage(StorageError::CorruptWorkspace),
+            })?;
+        let (sender, receiver) = mpsc::channel();
+        state
+            .subscribers
+            .entry(workspace_id)
+            .or_default()
+            .push(sender);
+        let durable =
+            match crate::subscription::load_after(&state.connection, workspace_id, after_epoch) {
+                Ok(durable) => durable,
+                Err(error) => {
+                    state
+                        .subscribers
+                        .get_mut(&workspace_id)
+                        .expect("listener was registered")
+                        .pop();
+                    return Err(error);
+                }
+            };
+        Ok(MembershipSubscription {
+            state: crate::subscription::SubscriptionState::new(durable, receiver, after_epoch),
+        })
     }
 }
 
@@ -1208,6 +1272,16 @@ mod tests {
             .unwrap();
         assert!(!duplicate.accepted);
         assert_eq!(duplicate.snapshot.epoch(), MembershipEpoch::new(1));
+        let transition_count: i64 = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection
+            .query_row("SELECT COUNT(*) FROM membership_transitions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(transition_count, 1);
 
         let outsider = member_secret(32);
         let wrong_token =
@@ -1397,6 +1471,23 @@ mod tests {
             }
             let snapshot = branch.membership_snapshot(workspace.id()).unwrap();
             assert_eq!(snapshot.epoch(), MembershipEpoch::new(5));
+            let member_a_identity =
+                PublicIdentity::from_bytes(*member_a.public().as_bytes()).unwrap();
+            assert!(
+                branch
+                    .was_member(workspace.id(), member_a_identity, base + 1)
+                    .unwrap()
+            );
+            assert!(
+                branch
+                    .was_member(workspace.id(), member_a_identity, base + 3)
+                    .unwrap()
+            );
+            assert!(
+                !branch
+                    .was_member(workspace.id(), member_a_identity, base + 4)
+                    .unwrap()
+            );
             match &expected {
                 Some(expected) => assert_eq!(&snapshot, expected),
                 None => expected = Some(snapshot),
@@ -1464,6 +1555,22 @@ mod tests {
             runtime.membership_snapshot(workspace.id()).unwrap().epoch(),
             MembershipEpoch::new(0)
         );
+        let member_identity = PublicIdentity::from_bytes(*member.public().as_bytes()).unwrap();
+        assert!(
+            !runtime
+                .was_member(workspace.id(), member_identity, 301_001)
+                .unwrap()
+        );
+        let transition_count: i64 = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection
+            .query_row("SELECT COUNT(*) FROM membership_transitions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(transition_count, 0);
 
         drop(runtime);
         now.store(1_002, Ordering::Relaxed);
@@ -1475,6 +1582,26 @@ mod tests {
         let eligible = recovered.membership_snapshot(workspace.id()).unwrap();
         assert_eq!(eligible.epoch(), MembershipEpoch::new(2));
         assert_eq!(eligible.members().len(), 1);
+        assert!(
+            recovered
+                .was_member(workspace.id(), member_identity, 301_001)
+                .unwrap()
+        );
+        assert!(
+            !recovered
+                .was_member(workspace.id(), member_identity, 301_002)
+                .unwrap()
+        );
+        let transition_count: i64 = recovered
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection
+            .query_row("SELECT COUNT(*) FROM membership_transitions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(transition_count, 2);
         assert_eq!(
             recovered.membership_snapshot(workspace.id()).unwrap(),
             eligible
