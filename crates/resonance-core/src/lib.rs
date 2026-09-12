@@ -24,8 +24,12 @@ mod runtime;
 // These boundaries are intentionally private. Later phases deepen them without
 // changing which implementation details callers can name.
 mod identity;
-mod invitation {}
-mod membership {}
+// These authenticated private values are constructed by the workspace and
+// redemption workflows in later phases.
+#[allow(dead_code)]
+mod invitation;
+#[allow(dead_code)]
+mod membership;
 mod storage;
 mod subscription {}
 mod workspace {}
@@ -34,9 +38,11 @@ pub use error::{
     ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError, StorageError,
     SubscriptionError, ValueParseError, WorkspaceError,
 };
+pub use invitation::{InvitationClaim, InvitationToken};
+pub use membership::MembershipOperationId;
 pub use runtime::{
-    CoreRuntime, CoreRuntimeConfig, InvitationClaim, InvitationToken, MemberSnapshot,
-    MembershipEpoch, MembershipOperationId, MembershipRole, MembershipSnapshot,
-    MembershipSnapshotDigest, MembershipSubscription, MembershipTransition, MembershipVersion,
-    PublicIdentity, PublicSignature, SigningContext, WorkspaceId, WorkspaceSummary,
+    CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipEpoch, MembershipRole,
+    MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription, MembershipTransition,
+    MembershipVersion, PublicIdentity, PublicSignature, SigningContext, WorkspaceId,
+    WorkspaceSummary,
 };

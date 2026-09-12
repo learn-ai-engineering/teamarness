@@ -10,6 +10,7 @@ use crate::error::{
     CoreError, IdentityError, InvitationError, MembershipError, StorageError, SubscriptionError,
     ValueParseError, WorkspaceError,
 };
+use crate::{InvitationClaim, InvitationToken, MembershipOperationId};
 
 /// Configuration for opening a [`CoreRuntime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +67,20 @@ impl FromStr for PublicIdentity {
 }
 
 impl PublicIdentity {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Result<Self, ValueParseError> {
+        PublicKey::from_bytes(&bytes)
+            .map(Self)
+            .map_err(|_| ValueParseError::new("public identity"))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub(crate) const fn as_public_key(self) -> PublicKey {
+        self.0
+    }
+
     /// Verifies a signature using the same versioned, domain-separated envelope as [`CoreRuntime::sign`].
     pub fn verify(
         self,
@@ -122,12 +137,16 @@ fixed_hex_value!(
     "workspace ID",
     "The immutable identifier of a workspace."
 );
-fixed_hex_value!(
-    MembershipOperationId,
-    32,
-    "membership operation ID",
-    "The content-derived identifier of a canonical membership operation."
-);
+
+impl WorkspaceId {
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
 fixed_hex_value!(
     MembershipVersion,
     32,
@@ -334,52 +353,6 @@ impl PublicSignature {
     }
 }
 
-/// An opaque, transferable signed invitation token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvitationToken(String);
-
-impl InvitationToken {
-    /// Returns the token's transport-safe encoded form.
-    #[must_use]
-    pub fn encoded(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for InvitationToken {
-    type Err = ValueParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() {
-            return Err(ValueParseError::new("invitation token"));
-        }
-        Ok(Self(value.to_owned()))
-    }
-}
-
-/// An opaque invitation token plus proof of possession by the invitee.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvitationClaim(String);
-
-impl InvitationClaim {
-    /// Returns the claim's transport-safe encoded form.
-    #[must_use]
-    pub fn encoded(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for InvitationClaim {
-    type Err = ValueParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() {
-            return Err(ValueParseError::new("invitation claim"));
-        }
-        Ok(Self(value.to_owned()))
-    }
-}
-
 /// One durable, post-genesis membership transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipTransition {
@@ -480,6 +453,17 @@ impl Clock for SystemClock {
 }
 
 impl CoreRuntime {
+    /// Authenticates a canonical membership envelope without consulting workspace state.
+    ///
+    /// This verifies only version-1 structure, content identity, admission proof, and signatures.
+    /// Trust anchoring, dependency resolution, timestamp policy, and authorization remain part of
+    /// durable workspace processing.
+    pub fn authenticate_membership_operation(
+        canonical_envelope: &[u8],
+    ) -> Result<MembershipOperationId, MembershipError> {
+        crate::membership::authenticate(canonical_envelope).map(|envelope| envelope.id)
+    }
+
     /// Opens or initializes the runtime in its private data directory.
     pub fn open(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
         Self::open_inner(config, Box::new(SystemClock))

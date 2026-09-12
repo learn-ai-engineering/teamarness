@@ -855,6 +855,7 @@ dependencies = [
  "p2panda-auth",
  "p2panda-core",
  "rusqlite",
+ "serde",
 ]
 
 [[package]]

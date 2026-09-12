@@ -124,11 +124,90 @@ impl Error for IdentityError {
 }
 
 error_family!(WorkspaceError, "A workspace command or query error.");
-error_family!(MembershipError, "A canonical membership error.");
-error_family!(
-    InvitationError,
-    "An invitation issue, claim, or redemption error."
-);
+
+/// A canonical membership authentication error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MembershipError {
+    /// The command is reserved for a later implementation phase.
+    RuntimeUnavailable,
+    /// The canonical format version is unsupported.
+    UnsupportedVersion,
+    /// Bytes do not describe a well-formed Phase 1 action.
+    MalformedAction,
+    /// An installation or workspace identifier appeared in the wrong role.
+    InvalidRole,
+    /// Dependencies were not encoded in strictly increasing order.
+    DependenciesNotCanonical,
+    /// The encoded operation ID does not match the canonical unsigned bytes.
+    ContentHashMismatch,
+    /// The operation author's signature is invalid.
+    InvalidSignature,
+    /// A claim does not bind the member admitted by the action.
+    AdmissionTargetMismatch,
+    /// A canonical field or complete envelope exceeds its version-1 bound.
+    DecodeLimit,
+}
+
+impl fmt::Display for MembershipError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RuntimeUnavailable => "the membership runtime is not available",
+            Self::UnsupportedVersion => "unsupported membership operation version",
+            Self::MalformedAction => "malformed membership action",
+            Self::InvalidRole => "membership identifier has the wrong role",
+            Self::DependenciesNotCanonical => "membership dependencies are not canonical",
+            Self::ContentHashMismatch => "membership operation content hash does not match",
+            Self::InvalidSignature => "membership operation signature is invalid",
+            Self::AdmissionTargetMismatch => "admission proof target does not match",
+            Self::DecodeLimit => "membership operation exceeds a decode bound",
+        })
+    }
+}
+
+impl Error for MembershipError {}
+
+/// An invitation token or claim authentication error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvitationError {
+    /// The command is reserved for a later implementation phase.
+    RuntimeUnavailable,
+    /// The canonical format version is unsupported.
+    UnsupportedVersion,
+    /// Bytes do not describe a well-formed token or claim.
+    Malformed,
+    /// An installation or workspace identifier appeared in the wrong role.
+    InvalidRole,
+    /// The token ID does not match its canonical unsigned bytes.
+    ContentHashMismatch,
+    /// The invitation token signature is invalid.
+    InvalidTokenSignature,
+    /// The invitee claim signature is invalid.
+    InvalidClaimSignature,
+    /// The claim is not bound to the expected invitee.
+    ClaimTargetMismatch,
+    /// A canonical field or complete value exceeds its version-1 bound.
+    DecodeLimit,
+}
+
+impl fmt::Display for InvitationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RuntimeUnavailable => "the invitation runtime is not available",
+            Self::UnsupportedVersion => "unsupported invitation format version",
+            Self::Malformed => "malformed invitation value",
+            Self::InvalidRole => "invitation identifier has the wrong role",
+            Self::ContentHashMismatch => "invitation token content hash does not match",
+            Self::InvalidTokenSignature => "invitation token signature is invalid",
+            Self::InvalidClaimSignature => "invitation claim signature is invalid",
+            Self::ClaimTargetMismatch => "invitation claim target does not match",
+            Self::DecodeLimit => "invitation value exceeds a decode bound",
+        })
+    }
+}
+
+impl Error for InvitationError {}
 error_family!(
     SubscriptionError,
     "A membership transition subscription error."
