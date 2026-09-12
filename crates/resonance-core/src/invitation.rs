@@ -385,4 +385,55 @@ mod tests {
             "0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4171c46882cafe2efbac629bd4f9aef6d7c17b7474f7bbacc3301ec5ed35faf962d39a32e90fef0f27cefc4dda0f3a29dc62b74b19800031e6d4b7985507fa0fb0c011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93caa432e395758fbacba6b468cba11e64b1da4448abf984d30440fb3bfd2d2d308f29a78c358f13b2fc81a384fdeeaba679f3d783e4ab7df904c6fa28817bc9700a"
         );
     }
+
+    #[test]
+    fn bounded_generated_invitation_values_round_trip_and_reject_malformed_bytes() {
+        for seed in 1_u8..=24 {
+            let issued_at = i64::from(seed) * 1_000;
+            let token = sign_token(
+                &secret(seed),
+                WorkspaceId::from_bytes([seed; 16]),
+                issued_at,
+                issued_at + i64::from(seed) + 1,
+                [seed.wrapping_mul(17); 32],
+            )
+            .unwrap();
+            let claim = sign_claim(&secret(seed + 32), &token).unwrap();
+
+            let token_text = InvitationToken::from_verified(&token);
+            let parsed_token = InvitationToken::from_str(token_text.encoded()).unwrap();
+            assert_eq!(parsed_token, token_text);
+            assert_eq!(parsed_token.verified().unwrap().bytes, token.bytes);
+
+            let claim_text = InvitationClaim::from_verified(&claim);
+            let parsed_claim = InvitationClaim::from_str(claim_text.encoded()).unwrap();
+            assert_eq!(parsed_claim, claim_text);
+            assert_eq!(parsed_claim.verified().unwrap().bytes, claim.bytes);
+
+            let canonical = token.bytes.as_slice();
+            for offset in (0..canonical.len()).step_by((canonical.len() / 13).max(1)) {
+                let mut malformed = canonical.to_vec();
+                malformed[offset] ^= 0x80;
+                assert!(decode_token(&malformed).is_err());
+            }
+            for length in [0, 1, canonical.len() / 2, canonical.len() - 1] {
+                assert!(decode_token(&canonical[..length]).is_err());
+            }
+            let mut oversized = canonical.to_vec();
+            oversized.push(seed);
+            assert!(decode_token(&oversized).is_err());
+
+            for offset in (0..claim.bytes.len()).step_by((claim.bytes.len() / 13).max(1)) {
+                let mut malformed = claim.bytes.clone();
+                malformed[offset] ^= 0x80;
+                assert!(decode_claim(&malformed).is_err());
+            }
+            for length in [0, 1, claim.bytes.len() / 2, claim.bytes.len() - 1] {
+                assert!(decode_claim(&claim.bytes[..length]).is_err());
+            }
+            let mut oversized = claim.bytes.clone();
+            oversized.push(seed);
+            assert!(decode_claim(&oversized).is_err());
+        }
+    }
 }

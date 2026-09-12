@@ -1,6 +1,6 @@
 # Resonance
 
-Resonance is a local-first, peer-to-peer team workspace. This repository is at the core-runtime foundation stage: it contains one Rust library and the intent and design records that govern its implementation.
+Resonance is a local-first, peer-to-peer team workspace. This repository is at the core-runtime foundation stage: it contains the Phase 1 Rust library and the intent and design records that govern its implementation.
 
 ## Prerequisites
 
@@ -27,7 +27,7 @@ cargo fetch --locked
 cargo build --workspace --locked
 ```
 
-No service, database server, Node package install, or network endpoint is needed for the current library scaffold.
+No service, database server, Node package install, or network endpoint is needed for the current library.
 
 ## Checks
 
@@ -47,7 +47,13 @@ cargo tree -p resonance-core -e features
 cargo tree -p resonance-core -i iroh
 ```
 
-The inverse `iroh` query should report that no matching package exists. The core crate's public API is `resonance_core::CoreRuntime`; identity secrets, SQLite handles, Iroh transport handles, and mutable p2panda state remain private.
+The inverse `iroh` query should report that no matching package exists. The core crate's public API is `resonance_core::CoreRuntime`; identity secrets, raw key bytes, SQLite handles, Iroh transport handles, private membership adapters, and mutable p2panda state remain private.
+
+## Core runtime behavior
+
+See [`crates/resonance-core/README.md`](crates/resonance-core/README.md) for the Phase 1 API, the declared-time history warning, database ownership and recovery model, and explicit exclusions. In particular, `was_member` is informational author-declared history and must not authorize writes. The runtime exclusively owns one private `core.sqlite3`; uncertain commit outcomes require dropping and reopening the runtime so authenticated replay can recover durable state.
+
+Phase 1 is single-manager and has no networking or membership synchronization. Multi-manager conflicts, distributed invitation spending, human identity, package behavior, package-key rotation, transport, and UI remain deferred to their accepted later phases.
 
 ## Repository intent
 

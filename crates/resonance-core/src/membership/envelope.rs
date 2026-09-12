@@ -472,4 +472,66 @@ mod tests {
             Err(MembershipError::AdmissionTargetMismatch)
         ));
     }
+
+    #[test]
+    fn bounded_generated_envelopes_round_trip_and_reject_malformed_bytes() {
+        for seed in 1_u8..=24 {
+            let dependencies = (0..usize::from(seed % 5))
+                .map(|index| MembershipOperationId::digest([seed, index as u8]))
+                .collect();
+            let workspace_id = WorkspaceId::from_bytes([seed; 16]);
+            let authored_at_unix_ms = i64::from(seed) * 1_000;
+            let action = match seed % 3 {
+                0 => MembershipAction::Create,
+                1 => {
+                    let token = sign_token(
+                        &secret(seed),
+                        workspace_id,
+                        authored_at_unix_ms - 100,
+                        authored_at_unix_ms + 100,
+                        [seed; 32],
+                    )
+                    .unwrap();
+                    let claim = sign_claim(&secret(seed + 32), &token).unwrap();
+                    MembershipAction::Admit {
+                        target: claim.invitee,
+                        proof: Box::new(AdmissionProof { claim }),
+                    }
+                }
+                _ => {
+                    let target =
+                        PublicIdentity::from_bytes(*secret(seed + 32).public().as_bytes()).unwrap();
+                    MembershipAction::Revoke { target }
+                }
+            };
+            let envelope = MembershipEnvelope::sign(
+                &secret(seed),
+                workspace_id,
+                authored_at_unix_ms,
+                action,
+                dependencies,
+            )
+            .unwrap();
+            let decoded = MembershipEnvelope::decode(envelope.canonical_bytes()).unwrap();
+            assert_eq!(decoded.canonical_bytes(), envelope.canonical_bytes());
+            assert_eq!(
+                decoded.canonical_unsigned_bytes(),
+                envelope.canonical_unsigned_bytes()
+            );
+            assert_eq!(decoded.id, envelope.id);
+
+            let canonical = envelope.canonical_bytes();
+            for offset in (0..canonical.len()).step_by((canonical.len() / 13).max(1)) {
+                let mut malformed = canonical.to_vec();
+                malformed[offset] ^= 0x80;
+                assert!(MembershipEnvelope::decode(&malformed).is_err());
+            }
+            for length in [0, 1, 4, canonical.len() / 2, canonical.len() - 1] {
+                assert!(MembershipEnvelope::decode(&canonical[..length]).is_err());
+            }
+            let mut oversized = canonical.to_vec();
+            oversized.push(seed);
+            assert!(MembershipEnvelope::decode(&oversized).is_err());
+        }
+    }
 }
