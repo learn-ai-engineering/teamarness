@@ -52,8 +52,7 @@ impl InvitationToken {
         decode_token(&decode_hex(&self.0).map_err(|_| InvitationError::Malformed)?)
     }
 
-    #[cfg(test)]
-    fn from_verified(token: &VerifiedInvitationToken) -> Self {
+    pub(crate) fn from_verified(token: &VerifiedInvitationToken) -> Self {
         Self(encode_hex(&token.bytes))
     }
 }
@@ -79,8 +78,7 @@ impl InvitationClaim {
         decode_claim(&decode_hex(&self.0).map_err(|_| InvitationError::Malformed)?)
     }
 
-    #[cfg(test)]
-    fn from_verified(claim: &VerifiedInvitationClaim) -> Self {
+    pub(crate) fn from_verified(claim: &VerifiedInvitationClaim) -> Self {
         Self(encode_hex(&claim.bytes))
     }
 }

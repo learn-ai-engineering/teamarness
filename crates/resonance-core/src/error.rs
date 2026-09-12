@@ -274,6 +274,20 @@ pub enum InvitationError {
     InvalidClaimSignature,
     /// The claim is not bound to the expected invitee.
     ClaimTargetMismatch,
+    /// The requested workspace does not exist on the issuing installation.
+    WorkspaceNotFound,
+    /// The local installation did not issue the token.
+    WrongIssuer,
+    /// The local installation is not a current workspace manager.
+    NotManager,
+    /// The invitation has expired or was issued with no usable lifetime.
+    Expired,
+    /// The invitation nonce has already been consumed.
+    AlreadyUsed,
+    /// Durable storage failed while processing the invitation.
+    Storage(StorageError),
+    /// The authenticated admission could not be accepted.
+    Membership(MembershipError),
     /// A canonical field or complete value exceeds its version-1 bound.
     DecodeLimit,
 }
@@ -289,12 +303,27 @@ impl fmt::Display for InvitationError {
             Self::InvalidTokenSignature => "invitation token signature is invalid",
             Self::InvalidClaimSignature => "invitation claim signature is invalid",
             Self::ClaimTargetMismatch => "invitation claim target does not match",
+            Self::WorkspaceNotFound => "invitation workspace was not found",
+            Self::WrongIssuer => "invitation must be redeemed by its issuing installation",
+            Self::NotManager => "invitation issuer is not a current workspace manager",
+            Self::Expired => "invitation has expired",
+            Self::AlreadyUsed => "invitation has already been used",
+            Self::Storage(error) => return error.fmt(formatter),
+            Self::Membership(error) => return error.fmt(formatter),
             Self::DecodeLimit => "invitation value exceeds a decode bound",
         })
     }
 }
 
-impl Error for InvitationError {}
+impl Error for InvitationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::Membership(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 error_family!(
     SubscriptionError,
     "A membership transition subscription error."

@@ -1,18 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use iroh_base::SecretKey;
 use p2panda_auth::group::GroupCrdt;
 use p2panda_auth::group::resolver::StrongRemove;
 use p2panda_core::Hash;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
-use crate::error::{MembershipError, StorageError};
+use crate::error::{InvitationError, MembershipError, StorageError};
+use crate::invitation::VerifiedInvitationClaim;
 use crate::{
     MemberSnapshot, MembershipEpoch, MembershipOperationId, MembershipRole, MembershipSnapshot,
     MembershipSnapshotDigest, MembershipVersion, PublicIdentity, WorkspaceId,
 };
 
 use super::{
-    AuthId, MembershipAction, MembershipEnvelope, OperationAdapter, authenticate, validate_context,
+    AdmissionProof, AuthId, MembershipAction, MembershipEnvelope, OperationAdapter, authenticate,
+    validate_context,
 };
 
 const VERSION_DOMAIN: &[u8] = b"resonance.membership-version/v1";
@@ -169,6 +174,140 @@ pub(crate) fn apply_canonical(
 ) -> Result<AppliedMembership, MembershipError> {
     let envelope = authenticate(canonical_envelope)?;
     apply_authenticated(connection, projections, envelope, now_unix_ms, None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RedemptionBoundary {
+    BeforeCommit,
+    AfterCommit,
+}
+
+pub(crate) fn redeem_invitation(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    secret_key: &SecretKey,
+    claim: VerifiedInvitationClaim,
+    now_unix_ms: i64,
+) -> Result<AppliedMembership, InvitationError> {
+    redeem_invitation_with_fault(
+        connection,
+        projections,
+        secret_key,
+        claim,
+        now_unix_ms,
+        |_| Ok(()),
+    )
+}
+
+pub(crate) fn redeem_invitation_with_fault(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    secret_key: &SecretKey,
+    claim: VerifiedInvitationClaim,
+    now_unix_ms: i64,
+    mut fault: impl FnMut(RedemptionBoundary) -> Result<(), StorageError>,
+) -> Result<AppliedMembership, InvitationError> {
+    let local_identity = PublicIdentity::from_bytes(*secret_key.public().as_bytes())
+        .map_err(|_| InvitationError::InvalidRole)?;
+    if claim.token.inviter != local_identity {
+        return Err(InvitationError::WrongIssuer);
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| InvitationError::Storage(StorageError::Database))?;
+    let mut durable = load_and_replay(&transaction).map_err(InvitationError::Storage)?;
+    let projection = durable
+        .get(&claim.token.workspace_id)
+        .ok_or(InvitationError::WorkspaceNotFound)?;
+
+    if claim.token.issued_at_unix_ms > now_unix_ms || claim.token.expires_at_unix_ms < now_unix_ms {
+        return Err(InvitationError::Expired);
+    }
+    let local_is_manager = projection.snapshot.members().iter().any(|member| {
+        member.identity() == local_identity && member.role() == MembershipRole::Manager
+    });
+    if !local_is_manager {
+        return Err(InvitationError::NotManager);
+    }
+    let already_used: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM used_invitation_nonces WHERE nonce = ?1)",
+            [claim.token.nonce.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| InvitationError::Storage(StorageError::Database))?;
+    if already_used {
+        return Err(InvitationError::AlreadyUsed);
+    }
+
+    let envelope = MembershipEnvelope::sign(
+        secret_key,
+        claim.token.workspace_id,
+        now_unix_ms,
+        MembershipAction::Admit {
+            target: claim.invitee,
+            proof: Box::new(AdmissionProof {
+                claim: claim.clone(),
+            }),
+        },
+        projection.heads(),
+    )
+    .map_err(InvitationError::Membership)?;
+    let dependency_context = dependency_context(&transaction, projection, &envelope)
+        .map_err(InvitationError::Membership)?;
+    validate_context(
+        &envelope,
+        projection.workspace_id,
+        projection.genesis_id,
+        &dependency_context,
+        now_unix_ms,
+    )
+    .map_err(InvitationError::Membership)?;
+    let mut candidate_operations = projection.operations.clone();
+    candidate_operations.insert(envelope.id, envelope.clone());
+    let candidate = replay(
+        projection.workspace_id,
+        projection.creator,
+        projection.genesis_id,
+        candidate_operations,
+    )
+    .map_err(InvitationError::Membership)?;
+
+    persist_candidate_rows(&transaction, &envelope, &candidate)
+        .map_err(InvitationError::Membership)?;
+    transaction
+        .execute(
+            "INSERT INTO used_invitation_nonces (
+                nonce, workspace_id, invitation_token_id, admission_operation_id
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                claim.token.nonce.as_slice(),
+                claim.token.workspace_id.as_bytes().as_slice(),
+                claim.token.id.as_bytes().as_slice(),
+                envelope.id.as_bytes().as_slice(),
+            ],
+        )
+        .map_err(|error| {
+            if matches!(
+                error,
+                rusqlite::Error::SqliteFailure(ref failure, _)
+                    if failure.code == ErrorCode::ConstraintViolation
+            ) {
+                InvitationError::AlreadyUsed
+            } else {
+                InvitationError::Storage(StorageError::Database)
+            }
+        })?;
+    fault(RedemptionBoundary::BeforeCommit).map_err(InvitationError::Storage)?;
+    transaction
+        .commit()
+        .map_err(|_| InvitationError::Storage(StorageError::UncertainOutcome))?;
+    fault(RedemptionBoundary::AfterCommit).map_err(InvitationError::Storage)?;
+
+    let result = applied_result(&candidate, envelope.id, true, false);
+    durable.insert(envelope.workspace_id, candidate);
+    *projections = durable;
+    Ok(result)
 }
 
 fn apply_authenticated(
@@ -591,6 +730,31 @@ fn persist_candidate(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    persist_candidate_rows(&transaction, envelope, candidate)?;
+    if let Some(id) = future_id {
+        transaction
+            .execute(
+                "DELETE FROM future_membership_dependencies WHERE operation_id = ?1",
+                [id.as_bytes().as_slice()],
+            )
+            .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+        transaction
+            .execute(
+                "DELETE FROM future_membership_operations WHERE operation_id = ?1",
+                [id.as_bytes().as_slice()],
+            )
+            .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))
+}
+
+fn persist_candidate_rows(
+    transaction: &Transaction<'_>,
+    envelope: &MembershipEnvelope,
+    candidate: &WorkspaceProjection,
+) -> Result<(), MembershipError> {
     transaction
         .execute(
             "INSERT INTO membership_operations (
@@ -630,24 +794,7 @@ fn persist_candidate(
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
-    write_derived(&transaction, candidate)?;
-    if let Some(id) = future_id {
-        transaction
-            .execute(
-                "DELETE FROM future_membership_dependencies WHERE operation_id = ?1",
-                [id.as_bytes().as_slice()],
-            )
-            .map_err(|_| MembershipError::Storage(StorageError::Database))?;
-        transaction
-            .execute(
-                "DELETE FROM future_membership_operations WHERE operation_id = ?1",
-                [id.as_bytes().as_slice()],
-            )
-            .map_err(|_| MembershipError::Storage(StorageError::Database))?;
-    }
-    transaction
-        .commit()
-        .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))
+    write_derived(transaction, candidate)
 }
 
 fn repair_all_derived(
@@ -923,5 +1070,178 @@ fn terminal_reason(error: &MembershipError) -> &'static str {
         MembershipError::CannotRevokeManager => "cannot revoke manager",
         MembershipError::AuthorizationRejected => "authorization rejected",
         _ => "invalid membership operation",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::invitation::{sign_claim, sign_token};
+
+    fn count_redemption_rows(connection: &Connection) -> (i64, i64, i64) {
+        connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM used_invitation_nonces),
+                    (SELECT COUNT(*) FROM membership_operations WHERE action = 1),
+                    (SELECT epoch FROM workspace_membership_state LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_non_manager_inviter_cannot_redeem_or_consume_a_nonce() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-invitation-non-manager-redeem-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let stored = crate::storage::open(&directory).unwrap();
+        let mut connection = stored.connection;
+        let manager = stored.secret_key;
+        let workspace =
+            crate::workspace::create(&mut connection, &manager, "Manager check", 1_000).unwrap();
+        let mut projections = recover(&mut connection, 1_100).unwrap();
+        let member = SecretKey::from_bytes(&[61; 32]);
+        let manager_token = sign_token(&manager, workspace.id(), 1_000, 2_000, [1; 32]).unwrap();
+        let manager_claim = sign_claim(&member, &manager_token).unwrap();
+        redeem_invitation(
+            &mut connection,
+            &mut projections,
+            &manager,
+            manager_claim,
+            1_100,
+        )
+        .unwrap();
+        let before = count_redemption_rows(&connection);
+
+        let member_token = sign_token(&member, workspace.id(), 1_101, 2_000, [2; 32]).unwrap();
+        let target = SecretKey::from_bytes(&[62; 32]);
+        let member_claim = sign_claim(&target, &member_token).unwrap();
+        assert_eq!(
+            redeem_invitation(
+                &mut connection,
+                &mut projections,
+                &member,
+                member_claim,
+                1_102,
+            )
+            .unwrap_err(),
+            InvitationError::NotManager
+        );
+        assert_eq!(count_redemption_rows(&connection), before);
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invitation_commit_faults_consume_nothing_or_recover_one_stable_admission() {
+        for (index, boundary) in [
+            RedemptionBoundary::BeforeCommit,
+            RedemptionBoundary::AfterCommit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = std::env::temp_dir().join(format!(
+                "resonance-invitation-fault-{}-{index}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            let stored = crate::storage::open(&directory).unwrap();
+            let mut connection = stored.connection;
+            let manager = stored.secret_key;
+            let workspace =
+                crate::workspace::create(&mut connection, &manager, "Invitation fault", 1_000)
+                    .unwrap();
+            let mut projections = recover(&mut connection, 1_100).unwrap();
+            let token = sign_token(
+                &manager,
+                workspace.id(),
+                1_000,
+                2_000,
+                [u8::try_from(index + 1).unwrap(); 32],
+            )
+            .unwrap();
+            let invitee = SecretKey::from_bytes(&[u8::try_from(index + 41).unwrap(); 32]);
+            let claim = sign_claim(&invitee, &token).unwrap();
+
+            let result = redeem_invitation_with_fault(
+                &mut connection,
+                &mut projections,
+                &manager,
+                claim.clone(),
+                1_100,
+                |current| {
+                    if current == boundary {
+                        Err(if current == RedemptionBoundary::AfterCommit {
+                            StorageError::UncertainOutcome
+                        } else {
+                            StorageError::Database
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                projections[&workspace.id()].snapshot.epoch(),
+                MembershipEpoch::new(0)
+            );
+
+            if boundary == RedemptionBoundary::BeforeCommit {
+                assert_eq!(count_redemption_rows(&connection), (0, 0, 0));
+                let accepted =
+                    redeem_invitation(&mut connection, &mut projections, &manager, claim, 1_100)
+                        .unwrap();
+                assert!(accepted.accepted);
+                assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    InvitationError::Storage(StorageError::UncertainOutcome)
+                );
+                assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
+                let committed_id: Vec<u8> = connection
+                    .query_row(
+                        "SELECT admission_operation_id FROM used_invitation_nonces",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                drop(connection);
+
+                let reopened = crate::storage::open(&directory).unwrap();
+                connection = reopened.connection;
+                projections = recover(&mut connection, 1_100).unwrap();
+                assert_eq!(
+                    projections[&workspace.id()].snapshot.epoch(),
+                    MembershipEpoch::new(1)
+                );
+                assert_eq!(
+                    redeem_invitation(&mut connection, &mut projections, &manager, claim, 1_100,)
+                        .unwrap_err(),
+                    InvitationError::AlreadyUsed
+                );
+                let recovered_id: Vec<u8> = connection
+                    .query_row(
+                        "SELECT admission_operation_id FROM used_invitation_nonces",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(recovered_id, committed_id);
+                assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
+            }
+
+            drop(connection);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

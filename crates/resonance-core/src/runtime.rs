@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iroh_base::{PublicKey, Signature};
+use iroh_base::{PublicKey, SecretKey, Signature};
 
 use crate::error::{
     CoreError, IdentityError, InvitationError, MembershipError, StorageError, SubscriptionError,
@@ -686,26 +686,159 @@ impl CoreRuntime {
     /// Issues an expiring invitation as the local manager.
     pub fn issue_invitation(
         &self,
-        _workspace_id: WorkspaceId,
-        _expires_at_unix_ms: i64,
+        workspace_id: WorkspaceId,
+        expires_at_unix_ms: i64,
     ) -> Result<InvitationToken, InvitationError> {
-        Err(InvitationError::RuntimeUnavailable)
+        let mut state = self.lock_invitation_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let RuntimeState {
+            connection,
+            secret_key,
+            memberships,
+            poisoned,
+            ..
+        } = &mut *state;
+        if let Err(error) =
+            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
+        {
+            if matches!(
+                error,
+                MembershipError::Storage(StorageError::UncertainOutcome)
+            ) {
+                *poisoned = true;
+            }
+            return Err(InvitationError::Membership(error));
+        }
+        let projection = memberships
+            .get(&workspace_id)
+            .ok_or(InvitationError::WorkspaceNotFound)?;
+        let local_is_manager = projection.snapshot().members().iter().any(|member| {
+            member.identity() == self.public_identity && member.role() == MembershipRole::Manager
+        });
+        if !local_is_manager {
+            return Err(InvitationError::NotManager);
+        }
+        if expires_at_unix_ms <= now_unix_ms {
+            return Err(InvitationError::Expired);
+        }
+        let nonce = SecretKey::generate().to_bytes();
+        let token = crate::invitation::sign_token(
+            secret_key,
+            workspace_id,
+            now_unix_ms,
+            expires_at_unix_ms,
+            nonce,
+        )?;
+        Ok(InvitationToken::from_verified(&token))
     }
 
     /// Creates proof that this installation claims the supplied invitation.
     pub fn create_invitation_claim(
         &self,
-        _token: &InvitationToken,
+        token: &InvitationToken,
     ) -> Result<InvitationClaim, InvitationError> {
-        Err(InvitationError::RuntimeUnavailable)
+        let token = token.verified()?;
+        let state = self.lock_invitation_state()?;
+        let claim = crate::invitation::sign_claim(&state.secret_key, &token)?;
+        Ok(InvitationClaim::from_verified(&claim))
     }
 
     /// Redeems a claim on the installation that issued its token.
     pub fn redeem_invitation(
         &self,
-        _claim: &InvitationClaim,
+        claim: &InvitationClaim,
     ) -> Result<MembershipTransition, InvitationError> {
-        Err(InvitationError::RuntimeUnavailable)
+        self.redeem_invitation_inner(claim, |_| Ok(()))
+    }
+
+    fn redeem_invitation_inner(
+        &self,
+        claim: &InvitationClaim,
+        fault: impl FnMut(crate::membership::projection::RedemptionBoundary) -> Result<(), StorageError>,
+    ) -> Result<MembershipTransition, InvitationError> {
+        let claim = claim.verified()?;
+        let mut state = self.lock_invitation_state()?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let RuntimeState {
+            connection,
+            secret_key,
+            memberships,
+            poisoned,
+            ..
+        } = &mut *state;
+        if let Err(error) =
+            crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
+        {
+            if matches!(
+                error,
+                MembershipError::Storage(StorageError::UncertainOutcome)
+            ) {
+                *poisoned = true;
+            }
+            return Err(InvitationError::Membership(error));
+        }
+        match crate::membership::projection::redeem_invitation_with_fault(
+            connection,
+            memberships,
+            secret_key,
+            claim,
+            now_unix_ms,
+            fault,
+        ) {
+            Ok(applied) => Ok(MembershipTransition::new(
+                applied.snapshot.workspace_id(),
+                applied.snapshot.epoch(),
+                applied.snapshot.version(),
+                applied.operation_id,
+                applied.snapshot_digest,
+            )),
+            Err(error) => {
+                if matches!(
+                    error,
+                    InvitationError::Storage(StorageError::UncertainOutcome)
+                        | InvitationError::Membership(MembershipError::Storage(
+                            StorageError::UncertainOutcome
+                        ))
+                ) {
+                    *poisoned = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn redeem_invitation_with_test_fault(
+        &self,
+        claim: &InvitationClaim,
+        boundary: crate::membership::projection::RedemptionBoundary,
+    ) -> Result<MembershipTransition, InvitationError> {
+        self.redeem_invitation_inner(claim, |current| {
+            if current == boundary {
+                Err(
+                    if current == crate::membership::projection::RedemptionBoundary::AfterCommit {
+                        StorageError::UncertainOutcome
+                    } else {
+                        StorageError::Database
+                    },
+                )
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn lock_invitation_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, InvitationError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| InvitationError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(InvitationError::Storage(StorageError::RuntimePoisoned));
+        }
+        Ok(state)
     }
 
     /// Revokes a workspace member as the local manager.
@@ -981,6 +1114,65 @@ mod tests {
             dependencies,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen() {
+        let issuer_directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-invitation-uncertain-{}",
+            std::process::id()
+        ));
+        let invitee_directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-invitation-claimant-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&issuer_directory);
+        let _ = fs::remove_dir_all(&invitee_directory);
+        let config = CoreRuntimeConfig::new(&issuer_directory);
+        let issuer = CoreRuntime::open(config.clone()).unwrap();
+        let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+        let workspace = issuer.create_workspace("Uncertain invitation").unwrap();
+        let token = issuer
+            .issue_invitation(
+                workspace.id(),
+                issuer.clock.now_unix_ms().saturating_add(60_000),
+            )
+            .unwrap();
+        let claim = invitee.create_invitation_claim(&token).unwrap();
+
+        assert_eq!(
+            issuer
+                .redeem_invitation_with_test_fault(
+                    &claim,
+                    crate::membership::projection::RedemptionBoundary::AfterCommit,
+                )
+                .unwrap_err(),
+            InvitationError::Storage(StorageError::UncertainOutcome)
+        );
+        assert_eq!(
+            issuer
+                .issue_invitation(
+                    workspace.id(),
+                    issuer.clock.now_unix_ms().saturating_add(60_000),
+                )
+                .unwrap_err(),
+            InvitationError::Storage(StorageError::RuntimePoisoned)
+        );
+        drop(issuer);
+
+        let reopened = CoreRuntime::open(config).unwrap();
+        let snapshot = reopened.membership_snapshot(workspace.id()).unwrap();
+        assert_eq!(snapshot.epoch(), MembershipEpoch::new(1));
+        assert_eq!(snapshot.members().len(), 2);
+        assert_eq!(
+            reopened.redeem_invitation(&claim).unwrap_err(),
+            InvitationError::AlreadyUsed
+        );
+
+        drop(reopened);
+        drop(invitee);
+        fs::remove_dir_all(issuer_directory).unwrap();
+        fs::remove_dir_all(invitee_directory).unwrap();
     }
 
     #[test]

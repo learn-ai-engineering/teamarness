@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{PublicIdentity, WorkspaceId};
 
 pub(crate) use adapter::OperationAdapter;
-#[cfg(test)]
-pub(crate) use envelope::AdmissionProof;
-pub(crate) use envelope::{MembershipAction, MembershipEnvelope};
+pub(crate) use envelope::{AdmissionProof, MembershipAction, MembershipEnvelope};
 pub use id::MembershipOperationId;
 pub(crate) use projection::WorkspaceProjection;
 pub(crate) use validation::{authenticate, validate_context};

@@ -110,6 +110,34 @@ fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
 }
 
 #[test]
+fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
+    let directory = private_data_directory("migration-invitations");
+    CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+
+    let table_exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'used_invitation_nonces'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let nonce_primary_key: i64 = connection
+        .query_row(
+            "SELECT pk FROM pragma_table_info('used_invitation_nonces') WHERE name = 'nonce'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_exists, 1);
+    assert_eq!(nonce_primary_key, 1);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
@@ -126,7 +154,7 @@ fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert_eq!(installation_count, 1);
 
     drop(connection);
