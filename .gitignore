@@ -1,0 +1,9 @@
+# Rust build output
+/target/
+
+# Local MyFlow planning and implementation artifacts
+/.myflow/
+
+# Local editor and operating-system files
+.DS_Store
+*.swp
