@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use resonance_core::{CoreRuntime, CoreRuntimeConfig, PublicIdentity};
+use serde::{Deserialize, Serialize};
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 fn temporary_directory() -> PathBuf {
@@ -56,6 +59,29 @@ fn compile_fails(fixture: &Path, expected_marker: &str, shared_target: &Path) {
     );
 
     fs::remove_dir_all(crate_directory).unwrap();
+}
+
+#[test]
+fn public_identity_has_a_stable_validated_string_serde_contract() {
+    fn assert_serde_traits<T: Serialize + for<'de> Deserialize<'de>>() {}
+
+    assert_serde_traits::<PublicIdentity>();
+
+    let directory = temporary_directory();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let identity = runtime.public_identity();
+    let display = identity.to_string();
+
+    let serialized = serde_json::to_string(&identity).unwrap();
+    assert_eq!(serialized, format!("\"{display}\""));
+    assert_eq!(
+        serde_json::from_str::<PublicIdentity>(&serialized).unwrap(),
+        identity
+    );
+    assert!(serde_json::from_str::<PublicIdentity>(r#""not-a-public-identity""#).is_err());
+
+    drop(runtime);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

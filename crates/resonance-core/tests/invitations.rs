@@ -41,6 +41,15 @@ fn decode_hex(value: &str) -> Vec<u8> {
         .collect()
 }
 
+fn tamper_hex_byte(value: &mut String, offset: usize) {
+    let replacement = if &value[offset..offset + 2] == "00" {
+        "01"
+    } else {
+        "00"
+    };
+    value.replace_range(offset..offset + 2, replacement);
+}
+
 #[test]
 fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
     let issuer_directory = private_data_directory("invitation-issuer");
@@ -150,10 +159,10 @@ fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_rejected
     );
 
     let mut tampered_token = token.encoded().to_owned();
-    tampered_token.replace_range(140..142, "00");
+    tamper_hex_byte(&mut tampered_token, 140);
     assert!(InvitationToken::from_str(&tampered_token).is_err());
     let mut changed_target = claim.encoded().to_owned();
-    changed_target.replace_range(400..402, "00");
+    tamper_hex_byte(&mut changed_target, 400);
     assert!(InvitationClaim::from_str(&changed_target).is_err());
     assert!(InvitationClaim::from_str(token.encoded()).is_err());
 

@@ -6,6 +6,7 @@ use std::sync::{Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_base::{PublicKey, SecretKey, Signature};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{
     CoreError, IdentityError, InvitationError, MembershipError, StorageError, SubscriptionError,
@@ -64,6 +65,25 @@ impl FromStr for PublicIdentity {
             .parse()
             .map(Self)
             .map_err(|_| ValueParseError::new("public identity"))
+    }
+}
+
+impl Serialize for PublicIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 
