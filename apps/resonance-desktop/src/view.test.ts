@@ -67,6 +67,44 @@ describe("Shell workspace flow", () => {
     expect(controller.snapshot().workspaces).toEqual([workspace]);
   });
 
+  it("refreshes issuer membership after another Installation joins", async () => {
+    const creatorOnly: Membership = { ...membership, epoch: "1", members: [membership.members[1]!] };
+    let currentMembership = creatorOnly;
+    const controller = new ShellController(fakeBridge({
+      currentMembership: async () => currentMembership,
+    }), () => undefined);
+
+    await controller.load();
+    expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(creatorOnly.members);
+
+    currentMembership = membership;
+    await controller.refreshMembership(workspace.id);
+
+    const html = renderShell(controller.snapshot());
+    expect(html).toContain('data-refresh-membership="00112233445566778899aabbccddeeff"');
+    expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);
+    expect(html).toContain(membership.members[0]!.identity);
+    expect(html).toContain(membership.members[1]!.identity);
+  });
+
+  it("keeps membership refresh failures observable", async () => {
+    const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
+    let shouldFail = false;
+    const controller = new ShellController(fakeBridge({
+      currentMembership: async () => {
+        if (shouldFail) throw failure;
+        return membership;
+      },
+    }), () => undefined);
+    await controller.load();
+
+    shouldFail = true;
+    await controller.refreshMembership(workspace.id);
+
+    expect(controller.snapshot()).toMatchObject({ loading: false, error: "timeout" });
+    expect(renderShell(controller.snapshot())).toContain('role="alert"');
+  });
+
   it("shows stable failure and retry states", async () => {
     const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
     const controller = new ShellController(fakeBridge({ listWorkspaces: async () => { throw failure; } }), () => undefined);

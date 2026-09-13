@@ -61,6 +61,16 @@ export class ShellController {
     });
   }
 
+  public async refreshMembership(workspaceId: string): Promise<void> {
+    await this.perform(async () => {
+      const membership = await this.bridge.currentMembership(workspaceId);
+      this.set({
+        memberships: { ...this.model.memberships, [workspaceId]: membership },
+        notice: "Membership refreshed",
+      });
+    });
+  }
+
   public async joinWorkspace(invitation: string): Promise<void> {
     await this.perform(async () => {
       const joined = await this.bridge.joinWorkspace(invitation);
@@ -119,7 +129,10 @@ export function renderShell(model: ShellModel): string {
       <p class="identifier">${escape(workspace.id)}</p>
       <p>Membership version <span class="version">${escape(membership?.version ?? "Unavailable")}</span></p>
       <ol class="members">${members}</ol>
-      <button data-invite="${escape(workspace.id)}" ${model.loading ? "disabled" : ""}>Copy invitation</button>
+      <div class="actions">
+        <button data-refresh-membership="${escape(workspace.id)}" ${model.loading ? "disabled" : ""}>Refresh members</button>
+        <button data-invite="${escape(workspace.id)}" ${model.loading ? "disabled" : ""}>Copy invitation</button>
+      </div>
       <p class="sensitive">Invitations are sensitive bearer admission material.</p></li>`;
   }).join("");
 

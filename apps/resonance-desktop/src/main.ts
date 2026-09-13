@@ -24,6 +24,9 @@ function bindActions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-invite]").forEach((button) => {
     button.addEventListener("click", () => void controller.copyInvitation(button.dataset.invite ?? ""));
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-refresh-membership]").forEach((button) => {
+    button.addEventListener("click", () => void controller.refreshMembership(button.dataset.refreshMembership ?? ""));
+  });
   document.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => void controller.load());
 }
 
