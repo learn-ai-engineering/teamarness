@@ -48,6 +48,12 @@ pub(crate) struct Transport {
     #[cfg(test)]
     release_post_response: Notify,
     #[cfg(test)]
+    hold_after_invitation_readiness: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    invitation_readiness_held: Notify,
+    #[cfg(test)]
+    release_invitation_readiness: Notify,
+    #[cfg(test)]
     post_response_block_ms: std::sync::atomic::AtomicU64,
 }
 
@@ -125,6 +131,12 @@ impl Transport {
             #[cfg(test)]
             release_post_response: Notify::new(),
             #[cfg(test)]
+            hold_after_invitation_readiness: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            invitation_readiness_held: Notify::new(),
+            #[cfg(test)]
+            release_invitation_readiness: Notify::new(),
+            #[cfg(test)]
             post_response_block_ms: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -133,8 +145,8 @@ impl Transport {
         self.endpoint.id()
     }
 
-    pub(crate) async fn invitation_address(&self) -> Result<EndpointAddr, OnboardingError> {
-        let _operation = self.lifecycle.begin()?;
+    pub(crate) async fn begin_invitation(&self) -> Result<InvitationOperation, OnboardingError> {
+        let operation = self.lifecycle.begin()?;
         match self.readiness {
             Readiness::EndpointOnline(duration) => timeout(duration, self.endpoint.online())
                 .await
@@ -149,7 +161,10 @@ impl Transport {
         {
             return Err(OnboardingError::Readiness);
         }
-        Ok(address)
+        Ok(InvitationOperation {
+            address,
+            _operation: operation,
+        })
     }
 
     #[allow(dead_code)]
@@ -351,6 +366,33 @@ impl Transport {
     }
 
     #[cfg(test)]
+    pub(crate) fn hold_next_invitation_after_readiness(&self) {
+        self.hold_after_invitation_readiness
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_invitation_readiness(&self) {
+        if self
+            .hold_after_invitation_readiness
+            .swap(false, Ordering::AcqRel)
+        {
+            self.invitation_readiness_held.notify_one();
+            self.release_invitation_readiness.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_invitation_readiness_hold(&self) {
+        self.invitation_readiness_held.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_invitation_readiness_hold(&self) {
+        self.release_invitation_readiness.notify_one();
+    }
+
+    #[cfg(test)]
     pub(crate) fn force_next_post_response_block(&self, duration: Duration) {
         self.post_response_block_ms.store(
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -489,6 +531,17 @@ impl Drop for ActiveOperation {
     }
 }
 
+pub(crate) struct InvitationOperation {
+    address: EndpointAddr,
+    _operation: ActiveOperation,
+}
+
+impl InvitationOperation {
+    pub(crate) fn address(&self) -> EndpointAddr {
+        self.address.clone()
+    }
+}
+
 pub(crate) struct OutboundPermit {
     _operation: ActiveOperation,
     _permit: OwnedSemaphorePermit,
@@ -553,10 +606,10 @@ mod tests {
         let transport = Transport::bind_loopback(secret(3), Duration::from_millis(5), false)
             .await
             .unwrap();
-        assert_eq!(
-            transport.invitation_address().await.unwrap_err(),
-            OnboardingError::Readiness
-        );
+        assert!(matches!(
+            transport.begin_invitation().await,
+            Err(OnboardingError::Readiness)
+        ));
         transport.shutdown().await.unwrap();
     }
 

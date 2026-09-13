@@ -805,7 +805,9 @@ impl CoreRuntime {
     ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
         const INVITATION_LIFETIME_MS: i64 = 15 * 60 * 1_000;
 
-        let endpoint_addr = self.transport.invitation_address().await?;
+        let operation = self.transport.begin_invitation().await?;
+        #[cfg(test)]
+        self.transport.pause_after_invitation_readiness().await;
         let issued_at_unix_ms = self.clock.now_unix_ms();
         let token = self
             .issue_invitation_at(
@@ -817,8 +819,10 @@ impl CoreRuntime {
         let verified = token
             .verified()
             .map_err(|_| crate::OnboardingError::Authentication)?;
-        crate::WorkspaceInvitation::from_parts(&verified, endpoint_addr)
-            .map_err(|_| crate::OnboardingError::InvalidInput)
+        let invitation = crate::WorkspaceInvitation::from_parts(&verified, operation.address())
+            .map_err(|_| crate::OnboardingError::InvalidInput);
+        drop(operation);
+        invitation
     }
 
     /// Joins the invited Workspace after authenticated transport and atomic local import.
@@ -1930,6 +1934,49 @@ mod tests {
         );
         reopened.shutdown().await.unwrap();
         drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_invitation_creation_after_readiness() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-invitation-shutdown-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let runtime = Arc::new(
+            CoreRuntime::open_with_clock(
+                CoreRuntimeConfig::new(&directory),
+                Box::new(AdjustableClock(Arc::new(AtomicI64::new(42_000)))),
+            )
+            .await
+            .unwrap(),
+        );
+        let workspace = runtime.create_workspace("Invitation shutdown").unwrap();
+
+        runtime.transport.hold_next_invitation_after_readiness();
+        let inviting_runtime = Arc::clone(&runtime);
+        let invitation = tokio::spawn(async move {
+            inviting_runtime
+                .create_workspace_invitation(workspace.id())
+                .await
+        });
+        runtime.transport.wait_for_invitation_readiness_hold().await;
+        assert_eq!(runtime.transport.active_operations(), 1);
+
+        let closing_runtime = Arc::clone(&runtime);
+        let mut shutdown = tokio::spawn(async move { closing_runtime.shutdown().await });
+        tokio::select! {
+            result = &mut shutdown => {
+                panic!("shutdown completed before invitation creation: {result:?}");
+            }
+            () = runtime.transport.wait_for_idle_waiter() => {}
+        }
+
+        runtime.transport.release_invitation_readiness_hold();
+        invitation.await.unwrap().unwrap();
+        shutdown.await.unwrap().unwrap();
+        drop(runtime);
         fs::remove_dir_all(directory).unwrap();
     }
 
