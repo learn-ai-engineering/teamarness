@@ -1021,6 +1021,10 @@ impl CoreRuntime {
                 state
                     .memberships
                     .insert(snapshot.workspace_id(), imported.projection);
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    state.poisoned = true;
+                    return Err(crate::OnboardingError::UncertainStorageOutcome);
+                }
                 Ok((imported.summary, snapshot))
             }
             Err(error) => {

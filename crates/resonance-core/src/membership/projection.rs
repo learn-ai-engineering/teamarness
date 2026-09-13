@@ -564,7 +564,11 @@ pub(crate) fn import_bootstrap_with_fault(
     transaction
         .commit()
         .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
-    fault(ImportBoundary::AfterCommit).map_err(import_fault)?;
+    let post_commit = fault(ImportBoundary::AfterCommit).map_err(import_fault);
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(crate::OnboardingError::UncertainStorageOutcome);
+    }
+    post_commit?;
 
     Ok(ImportedWorkspace {
         summary: crate::WorkspaceSummary::new(

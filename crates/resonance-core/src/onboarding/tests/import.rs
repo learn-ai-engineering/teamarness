@@ -66,6 +66,15 @@ fn workspace_row_count(directory: &std::path::Path) -> i64 {
         .unwrap()
 }
 
+fn membership_operation_row_count(directory: &std::path::Path) -> i64 {
+    Connection::open(directory.join("core.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM membership_operations", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
 #[tokio::test]
 async fn initial_replay_and_transition_verification_overruns_time_out_and_roll_back() {
     let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
@@ -117,6 +126,51 @@ async fn final_success_path_overrun_times_out_and_rolls_back() {
     issuer.shutdown().await.unwrap();
     joiner.shutdown().await.unwrap();
     drop((issuer, joiner));
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
+async fn post_commit_deadline_overrun_is_uncertain_until_authenticated_reopen() {
+    let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
+        response_fixture("post-commit-deadline").await;
+
+    let expected_operation_rows = i64::try_from(response.post_genesis.len() + 1).unwrap();
+    let error = joiner
+        .import_response_with_deadline_delay_for_test(
+            &invitation,
+            response.clone(),
+            ImportBoundary::AfterCommit,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+    assert_eq!(error, OnboardingError::UncertainStorageOutcome);
+    assert_eq!(workspace_row_count(&joiner_directory), 1);
+    assert_eq!(
+        joiner.list_workspaces().unwrap_err(),
+        crate::WorkspaceError::Storage(crate::StorageError::RuntimePoisoned)
+    );
+
+    joiner.shutdown().await.unwrap();
+    drop(joiner);
+    let reopened = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&joiner_directory))
+        .await
+        .unwrap();
+    let reconciled = reopened
+        .import_response_for_test(&invitation, response, None)
+        .unwrap();
+    assert_eq!(reopened.list_workspaces().unwrap(), vec![reconciled.0]);
+    assert_eq!(workspace_row_count(&joiner_directory), 1);
+    assert_eq!(
+        membership_operation_row_count(&joiner_directory),
+        expected_operation_rows
+    );
+
+    issuer.shutdown().await.unwrap();
+    reopened.shutdown().await.unwrap();
+    drop((issuer, reopened));
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(joiner_directory).unwrap();
 }
