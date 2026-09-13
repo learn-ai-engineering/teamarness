@@ -2,11 +2,12 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_core.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_workspaces_membership.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_invitations.sql");
 const MIGRATION_0004: &str = include_str!("../../migrations/0004_transitions.sql");
+const MIGRATION_0005: &str = include_str!("../../migrations/0005_invitation_recovery.sql");
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
     let transaction = connection
@@ -38,6 +39,11 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
     if current_version < 4 {
         transaction
             .execute_batch(MIGRATION_0004)
+            .map_err(|_| StorageError::Migration)?;
+    }
+    if current_version < 5 {
+        transaction
+            .execute_batch(MIGRATION_0005)
             .map_err(|_| StorageError::Migration)?;
     }
     transaction

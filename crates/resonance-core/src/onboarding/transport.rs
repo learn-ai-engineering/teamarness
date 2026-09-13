@@ -10,7 +10,7 @@ use iroh_base::{EndpointAddr, SecretKey};
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
-use super::handler::OnboardingHandler;
+use super::handler::{IssuerService, OnboardingHandler};
 use crate::OnboardingError;
 
 pub(crate) const ONBOARDING_ALPN: &[u8] = b"resonance/workspace-join/1";
@@ -47,6 +47,7 @@ enum Readiness {
 impl Transport {
     pub(crate) async fn bind_production(
         secret_key: SecretKey,
+        issuer: IssuerService,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -57,6 +58,7 @@ impl Transport {
                 require_relay_address: true,
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
+            Some(issuer),
         )
         .await
     }
@@ -64,6 +66,7 @@ impl Transport {
     async fn bind(
         secret_key: SecretKey,
         options: BindOptions,
+        issuer: Option<IssuerService>,
     ) -> Result<Arc<Self>, OnboardingError> {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
@@ -79,7 +82,10 @@ impl Transport {
             .bind()
             .await
             .map_err(|_| OnboardingError::Readiness)?;
-        let handler = Arc::new(OnboardingHandler::new(options.request_timeout));
+        let handler = Arc::new(match issuer {
+            Some(issuer) => OnboardingHandler::with_issuer(options.request_timeout, issuer),
+            None => OnboardingHandler::new(options.request_timeout),
+        });
         let router = Router::builder(endpoint.clone())
             .accept(ONBOARDING_ALPN, Arc::clone(&handler))
             .spawn();
@@ -214,6 +220,32 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
     ) -> Result<Arc<Self>, OnboardingError> {
+        Self::bind_loopback_inner(secret_key, readiness_timeout, ready_immediately, None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn bind_loopback_with_issuer(
+        secret_key: SecretKey,
+        readiness_timeout: Duration,
+        ready_immediately: bool,
+        issuer: IssuerService,
+    ) -> Result<Arc<Self>, OnboardingError> {
+        Self::bind_loopback_inner(
+            secret_key,
+            readiness_timeout,
+            ready_immediately,
+            Some(issuer),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn bind_loopback_inner(
+        secret_key: SecretKey,
+        readiness_timeout: Duration,
+        ready_immediately: bool,
+        issuer: Option<IssuerService>,
+    ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
             BindOptions {
@@ -227,6 +259,7 @@ impl Transport {
                 require_relay_address: false,
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
+            issuer,
         )
         .await
     }

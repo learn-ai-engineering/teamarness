@@ -503,8 +503,8 @@ impl MembershipSubscription {
 /// those values nor private test dependencies can be obtained by callers.
 pub struct CoreRuntime {
     public_identity: PublicIdentity,
-    state: Mutex<RuntimeState>,
-    clock: Box<dyn Clock>,
+    state: Arc<Mutex<RuntimeState>>,
+    clock: Arc<dyn Clock>,
     transport: Arc<crate::onboarding::transport::Transport>,
 }
 
@@ -517,7 +517,7 @@ impl fmt::Debug for CoreRuntime {
     }
 }
 
-struct RuntimeState {
+pub(crate) struct RuntimeState {
     connection: rusqlite::Connection,
     secret_key: iroh_base::SecretKey,
     display_name: String,
@@ -526,7 +526,7 @@ struct RuntimeState {
     poisoned: bool,
 }
 
-trait Clock: Send + Sync {
+pub(crate) trait Clock: Send + Sync {
     fn now_unix_ms(&self) -> i64;
 }
 
@@ -583,6 +583,7 @@ impl CoreRuntime {
         clock: Box<dyn Clock>,
         #[cfg_attr(not(test), allow(unused_variables))] test_readiness: Option<bool>,
     ) -> Result<Self, CoreError> {
+        let clock: Arc<dyn Clock> = Arc::from(clock);
         let opened_at_unix_ms = clock.now_unix_ms();
         let stored = crate::storage::open(config.private_data_directory())?;
         let crate::storage::StoredRuntime {
@@ -593,32 +594,40 @@ impl CoreRuntime {
         let public_identity = PublicIdentity(secret_key.public());
         let memberships =
             crate::membership::projection::recover(&mut connection, opened_at_unix_ms)?;
+        let state = Arc::new(Mutex::new(RuntimeState {
+            connection,
+            secret_key: secret_key.clone(),
+            display_name,
+            memberships,
+            subscribers: BTreeMap::new(),
+            poisoned: false,
+        }));
+        let issuer = crate::onboarding::handler::IssuerService::new(
+            Arc::downgrade(&state),
+            Arc::clone(&clock),
+        );
         #[cfg(test)]
         let transport = if let Some(ready_immediately) = test_readiness {
-            crate::onboarding::transport::Transport::bind_loopback(
+            crate::onboarding::transport::Transport::bind_loopback_with_issuer(
                 secret_key.clone(),
                 std::time::Duration::from_millis(5),
                 ready_immediately,
+                issuer,
             )
             .await
         } else {
-            crate::onboarding::transport::Transport::bind_production(secret_key.clone()).await
+            crate::onboarding::transport::Transport::bind_production(secret_key.clone(), issuer)
+                .await
         };
         #[cfg(not(test))]
         let transport =
-            crate::onboarding::transport::Transport::bind_production(secret_key.clone()).await;
+            crate::onboarding::transport::Transport::bind_production(secret_key.clone(), issuer)
+                .await;
         let transport = transport.map_err(CoreError::Onboarding)?;
         debug_assert_eq!(transport.endpoint_id(), secret_key.public());
         Ok(Self {
             public_identity,
-            state: Mutex::new(RuntimeState {
-                connection,
-                secret_key,
-                display_name,
-                memberships,
-                subscribers: BTreeMap::new(),
-                poisoned: false,
-            }),
+            state,
             clock,
             transport,
         })
@@ -852,18 +861,23 @@ impl CoreRuntime {
             poisoned,
             ..
         } = &mut *state;
+        let authenticated_peer = claim.invitee;
         let result = crate::membership::projection::redeem_invitation_with_fault(
             connection,
             memberships,
             secret_key,
             claim,
+            authenticated_peer,
             now_unix_ms,
             fault,
         );
         match result {
-            Ok(applied) => {
-                let transition = Self::transition_from_applied(applied);
-                Self::publish_transition(&mut state, transition.clone());
+            Ok(export) => {
+                let accepted = export.applied.accepted;
+                let transition = Self::transition_from_applied(export.applied);
+                if accepted {
+                    Self::publish_transition(&mut state, transition.clone());
+                }
                 Ok(transition)
             }
             Err(error) => {
@@ -877,6 +891,90 @@ impl CoreRuntime {
                     *poisoned = true;
                 }
                 Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_for_onboarding_test(
+        config: CoreRuntimeConfig,
+    ) -> Result<Self, CoreError> {
+        Self::open_with_clock(config, Box::new(SystemClock)).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_and_export_for_test(
+        &self,
+        claim: &InvitationClaim,
+        authenticated_peer: PublicIdentity,
+        boundary: Option<crate::membership::projection::RedemptionBoundary>,
+    ) -> Result<Vec<u8>, crate::OnboardingError> {
+        self.admit_and_export_with_limits_for_test(
+            claim,
+            authenticated_peer,
+            crate::membership::projection::BootstrapLimits::CURRENT,
+            boundary,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_and_export_with_limits_for_test(
+        &self,
+        claim: &InvitationClaim,
+        authenticated_peer: PublicIdentity,
+        limits: crate::membership::projection::BootstrapLimits,
+        boundary: Option<crate::membership::projection::RedemptionBoundary>,
+    ) -> Result<Vec<u8>, crate::OnboardingError> {
+        let claim = claim.verified().map_err(map_invitation_onboarding_error)?;
+        let mut state = self
+            .lock_invitation_state()
+            .map_err(map_invitation_onboarding_error)?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        let RuntimeState {
+            connection,
+            secret_key,
+            memberships,
+            poisoned,
+            ..
+        } = &mut *state;
+        let result = crate::membership::projection::redeem_invitation_with_fault_and_limits(
+            connection,
+            memberships,
+            secret_key,
+            claim,
+            crate::membership::projection::AdmissionContext {
+                authenticated_peer,
+                now_unix_ms,
+                limits,
+            },
+            |current| {
+                if boundary == Some(current) {
+                    Err(
+                        if current == crate::membership::projection::RedemptionBoundary::AfterCommit
+                        {
+                            StorageError::UncertainOutcome
+                        } else {
+                            StorageError::Database
+                        },
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        match result {
+            Ok(export) => Ok(export.response),
+            Err(error) => {
+                if matches!(
+                    error,
+                    InvitationError::Storage(StorageError::UncertainOutcome)
+                        | InvitationError::Membership(MembershipError::Storage(
+                            StorageError::UncertainOutcome
+                        ))
+                ) {
+                    *poisoned = true;
+                }
+                Err(map_invitation_onboarding_error(error))
             }
         }
     }
@@ -921,6 +1019,29 @@ impl CoreRuntime {
         workspace_id: WorkspaceId,
         member: PublicIdentity,
     ) -> Result<MembershipTransition, MembershipError> {
+        self.revoke_member_with_limits(
+            workspace_id,
+            member,
+            crate::membership::projection::BootstrapLimits::CURRENT,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_member_with_limits_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        member: PublicIdentity,
+        limits: crate::membership::projection::BootstrapLimits,
+    ) -> Result<MembershipTransition, MembershipError> {
+        self.revoke_member_with_limits(workspace_id, member, limits)
+    }
+
+    fn revoke_member_with_limits(
+        &self,
+        workspace_id: WorkspaceId,
+        member: PublicIdentity,
+        limits: crate::membership::projection::BootstrapLimits,
+    ) -> Result<MembershipTransition, MembershipError> {
         let mut state = self.lock_membership_state()?;
         let now_unix_ms = self.clock.now_unix_ms();
         self.maintain_and_publish(&mut state, now_unix_ms)?;
@@ -948,11 +1069,12 @@ impl CoreRuntime {
             crate::membership::MembershipAction::Revoke { target: member },
             current.heads(),
         )?;
-        match crate::membership::projection::apply_canonical(
+        match crate::membership::projection::apply_canonical_with_limits(
             connection,
             memberships,
             envelope.canonical_bytes(),
             now_unix_ms,
+            limits,
         ) {
             Ok(applied) if applied.accepted => {
                 let transition = Self::transition_from_applied(applied);
@@ -1171,7 +1293,78 @@ impl CoreRuntime {
     }
 }
 
-fn map_invitation_onboarding_error(error: InvitationError) -> crate::OnboardingError {
+pub(crate) fn respond_to_join(
+    state: &Arc<Mutex<RuntimeState>>,
+    clock: &Arc<dyn Clock>,
+    authenticated_peer: PublicIdentity,
+    claim: crate::invitation::VerifiedInvitationClaim,
+) -> Result<Vec<u8>, crate::OnboardingError> {
+    if claim.invitee != authenticated_peer {
+        return Err(crate::OnboardingError::Authentication);
+    }
+    let mut state = state
+        .lock()
+        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+    if state.poisoned {
+        return Err(crate::OnboardingError::UncertainStorageOutcome);
+    }
+    let now_unix_ms = clock.now_unix_ms();
+    let applied = {
+        let RuntimeState {
+            connection,
+            memberships,
+            ..
+        } = &mut *state;
+        crate::membership::projection::maintain_quarantine(connection, memberships, now_unix_ms)
+    }
+    .map_err(|error| match error {
+        MembershipError::Storage(StorageError::UncertainOutcome) => {
+            state.poisoned = true;
+            crate::OnboardingError::UncertainStorageOutcome
+        }
+        _ => crate::OnboardingError::InvalidInput,
+    })?;
+    for applied in applied {
+        CoreRuntime::publish_transition(&mut state, CoreRuntime::transition_from_applied(applied));
+    }
+    let RuntimeState {
+        connection,
+        secret_key,
+        memberships,
+        poisoned,
+        ..
+    } = &mut *state;
+    match crate::membership::projection::redeem_invitation(
+        connection,
+        memberships,
+        secret_key,
+        claim,
+        authenticated_peer,
+        now_unix_ms,
+    ) {
+        Ok(export) => {
+            if export.applied.accepted {
+                let transition = CoreRuntime::transition_from_applied(export.applied);
+                CoreRuntime::publish_transition(&mut state, transition);
+            }
+            Ok(export.response)
+        }
+        Err(error) => {
+            if matches!(
+                error,
+                InvitationError::Storage(StorageError::UncertainOutcome)
+                    | InvitationError::Membership(MembershipError::Storage(
+                        StorageError::UncertainOutcome
+                    ))
+            ) {
+                *poisoned = true;
+            }
+            Err(map_invitation_onboarding_error(error))
+        }
+    }
+}
+
+pub(crate) fn map_invitation_onboarding_error(error: InvitationError) -> crate::OnboardingError {
     match error {
         InvitationError::Expired => crate::OnboardingError::Expired,
         InvitationError::AlreadyUsed => crate::OnboardingError::AlreadyUsed,
@@ -1180,6 +1373,12 @@ fn map_invitation_onboarding_error(error: InvitationError) -> crate::OnboardingE
             crate::OnboardingError::UncertainStorageOutcome
         }
         InvitationError::WorkspaceNotFound => crate::OnboardingError::LocalConflict,
+        InvitationError::Membership(MembershipError::MemberNotFound) => {
+            crate::OnboardingError::AdmissionNoLongerCurrent
+        }
+        InvitationError::Membership(MembershipError::DecodeLimit) => {
+            crate::OnboardingError::Overload
+        }
         InvitationError::NotManager
         | InvitationError::WrongIssuer
         | InvitationError::InvalidTokenSignature
@@ -1475,10 +1674,8 @@ mod tests {
         let snapshot = reopened.membership_snapshot(workspace.id()).unwrap();
         assert_eq!(snapshot.epoch(), MembershipEpoch::new(1));
         assert_eq!(snapshot.members().len(), 2);
-        assert_eq!(
-            reopened.redeem_invitation(&claim).unwrap_err(),
-            InvitationError::AlreadyUsed
-        );
+        let recovered = reopened.redeem_invitation(&claim).unwrap();
+        assert_eq!(recovered.epoch(), MembershipEpoch::new(1));
 
         reopened.shutdown().await.unwrap();
         drop(reopened);

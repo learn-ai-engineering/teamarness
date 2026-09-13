@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
@@ -10,7 +10,10 @@ use iroh_base::PublicKey;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
-use super::wire::{MAX_REQUEST_BODY_BYTES, decode_request};
+use super::transport::RESPONSE_IO_TIMEOUT;
+use super::wire::{MAX_REQUEST_BODY_BYTES, decode_request, encode_error};
+use crate::runtime::{Clock, RuntimeState};
+use crate::{OnboardingError, PublicIdentity};
 
 pub(crate) const MAX_INBOUND_HANDLERS: usize = 8;
 
@@ -19,6 +22,7 @@ pub(crate) struct OnboardingHandler {
     inbound: Arc<Semaphore>,
     peers: Arc<Mutex<HashSet<PublicKey>>>,
     request_timeout: Duration,
+    issuer: Option<IssuerService>,
     #[cfg(test)]
     handled: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -41,11 +45,18 @@ impl OnboardingHandler {
             inbound: Arc::new(Semaphore::new(MAX_INBOUND_HANDLERS)),
             peers: Arc::new(Mutex::new(HashSet::new())),
             request_timeout,
+            issuer: None,
             #[cfg(test)]
             handled: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             handled_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    pub(crate) fn with_issuer(request_timeout: Duration, issuer: IssuerService) -> Self {
+        let mut handler = Self::new(request_timeout);
+        handler.issuer = Some(issuer);
+        handler
     }
 
     pub(crate) fn acquire(&self, peer: PublicKey) -> Option<InboundPermit> {
@@ -91,7 +102,7 @@ impl ProtocolHandler for OnboardingHandler {
             return Ok(());
         };
         let stream = timeout(self.request_timeout, connection.accept_bi()).await;
-        let Ok(Ok((_send, mut receive))) = stream else {
+        let Ok(Ok((mut send, mut receive))) = stream else {
             connection.close(2_u8.into(), b"onboarding request timeout");
             return Ok(());
         };
@@ -101,7 +112,27 @@ impl ProtocolHandler for OnboardingHandler {
         )
         .await;
         if let Ok(Ok(frame)) = frame {
-            let _ = decode_request(&frame);
+            let response = match decode_request(&frame) {
+                Ok(request) if request.claim.invitee.as_public_key() != connection.remote_id() => {
+                    encode_error(OnboardingError::Authentication).ok()
+                }
+                Ok(request) => self.issuer.as_ref().and_then(|issuer| {
+                    match issuer.respond(connection.remote_id(), request.claim) {
+                        Ok(response) => Some(response),
+                        Err(error) => encode_error(error).ok(),
+                    }
+                }),
+                Err(_) => encode_error(OnboardingError::InvalidInput).ok(),
+            };
+            if let Some(response) = response {
+                let write = async {
+                    send.write_all(&response).await.map_err(|_| ())?;
+                    send.finish().map_err(|_| ())?;
+                    send.stopped().await.map_err(|_| ())?;
+                    Ok::<(), ()>(())
+                };
+                let _ = timeout(RESPONSE_IO_TIMEOUT, write).await;
+            }
             #[cfg(test)]
             {
                 self.handled.fetch_add(1, Ordering::AcqRel);
@@ -113,6 +144,29 @@ impl ProtocolHandler for OnboardingHandler {
 
     async fn shutdown(&self) {
         self.stop();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IssuerService {
+    state: Weak<Mutex<RuntimeState>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl IssuerService {
+    pub(crate) fn new(state: Weak<Mutex<RuntimeState>>, clock: Arc<dyn Clock>) -> Self {
+        Self { state, clock }
+    }
+
+    fn respond(
+        &self,
+        peer: PublicKey,
+        claim: crate::invitation::VerifiedInvitationClaim,
+    ) -> Result<Vec<u8>, OnboardingError> {
+        let state = self.state.upgrade().ok_or(OnboardingError::Shutdown)?;
+        let peer = PublicIdentity::from_bytes(*peer.as_bytes())
+            .map_err(|_| OnboardingError::Authentication)?;
+        crate::runtime::respond_to_join(&state, &self.clock, peer, claim)
     }
 }
 

@@ -10,14 +10,14 @@ const SUCCESS_TAG: u8 = 0;
 const ERROR_TAG: u8 = 1;
 pub(super) const MAX_REQUEST_BODY_BYTES: usize = 1024;
 pub(super) const MAX_ERROR_BODY_BYTES: usize = 1024;
-pub(super) const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
-pub(super) const MAX_OPERATIONS: usize = 1024;
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_OPERATIONS: usize = 1024;
 pub(super) const MAX_ENVELOPE_BYTES: usize = 65_636;
 pub(super) const MAX_DEPENDENCIES: usize = 64;
 pub(super) const MAX_WORKSPACE_NAME_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CodecError {
+pub(crate) enum CodecError {
     UnsupportedVersion,
     Malformed,
     Limit,
@@ -30,16 +30,16 @@ pub(super) struct JoinRequest {
 }
 
 #[derive(Clone)]
-pub(super) struct SuccessResponse {
-    pub(super) workspace_id: WorkspaceId,
-    pub(super) creator: PublicIdentity,
-    pub(super) created_at_unix_ms: i64,
-    pub(super) name: String,
-    pub(super) genesis_id: MembershipOperationId,
-    pub(super) genesis: MembershipEnvelope,
-    pub(super) post_genesis: Vec<MembershipEnvelope>,
-    pub(super) admission_id: MembershipOperationId,
-    pub(super) membership_version: MembershipVersion,
+pub(crate) struct SuccessResponse {
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) creator: PublicIdentity,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) name: String,
+    pub(crate) genesis_id: MembershipOperationId,
+    pub(crate) genesis: MembershipEnvelope,
+    pub(crate) post_genesis: Vec<MembershipEnvelope>,
+    pub(crate) admission_id: MembershipOperationId,
+    pub(crate) membership_version: MembershipVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +67,16 @@ pub(super) fn decode_request(frame: &[u8]) -> Result<JoinRequest, CodecError> {
     Ok(JoinRequest { claim })
 }
 
-pub(super) fn encode_success(response: &SuccessResponse) -> Result<Vec<u8>, CodecError> {
-    validate_success(response)?;
+pub(crate) fn encode_success(response: &SuccessResponse) -> Result<Vec<u8>, CodecError> {
+    encode_success_with_limits(response, MAX_RESPONSE_BODY_BYTES, MAX_OPERATIONS)
+}
+
+pub(crate) fn encode_success_with_limits(
+    response: &SuccessResponse,
+    max_body_bytes: usize,
+    max_operations: usize,
+) -> Result<Vec<u8>, CodecError> {
+    validate_success(response, max_operations)?;
     let name_len = u16::try_from(response.name.len()).map_err(|_| CodecError::Limit)?;
     let post_count = u16::try_from(response.post_genesis.len()).map_err(|_| CodecError::Limit)?;
     let mut body = Vec::new();
@@ -86,7 +94,7 @@ pub(super) fn encode_success(response: &SuccessResponse) -> Result<Vec<u8>, Code
     }
     body.extend_from_slice(response.admission_id.as_bytes());
     body.extend_from_slice(response.membership_version.as_bytes());
-    encode_frame(&body, MAX_RESPONSE_BODY_BYTES)
+    encode_frame(&body, max_body_bytes)
 }
 
 pub(super) fn decode_success(frame: &[u8]) -> Result<SuccessResponse, CodecError> {
@@ -133,7 +141,7 @@ pub(super) fn decode_success(frame: &[u8]) -> Result<SuccessResponse, CodecError
         admission_id,
         membership_version,
     };
-    validate_success(&response)?;
+    validate_success(&response, MAX_OPERATIONS)?;
     Ok(response)
 }
 
@@ -174,7 +182,7 @@ pub(super) fn decode_error(frame: &[u8]) -> Result<ErrorResponse, CodecError> {
     Ok(ErrorResponse { error, retryable })
 }
 
-fn validate_success(response: &SuccessResponse) -> Result<(), CodecError> {
+fn validate_success(response: &SuccessResponse, max_operations: usize) -> Result<(), CodecError> {
     validate_workspace_name(&response.name)?;
     if response.name.len() > MAX_WORKSPACE_NAME_BYTES
         || response
@@ -182,7 +190,7 @@ fn validate_success(response: &SuccessResponse) -> Result<(), CodecError> {
             .len()
             .checked_add(1)
             .ok_or(CodecError::Limit)?
-            > MAX_OPERATIONS
+            > max_operations
     {
         return Err(CodecError::Limit);
     }

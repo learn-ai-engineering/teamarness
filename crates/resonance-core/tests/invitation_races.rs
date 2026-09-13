@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resonance_core::{CoreRuntime, CoreRuntimeConfig, InvitationError, MembershipEpoch};
+use resonance_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -28,7 +28,7 @@ fn now_unix_ms() -> i64 {
 }
 
 #[tokio::test]
-async fn concurrent_redemption_has_one_success_and_one_already_used_result() {
+async fn concurrent_exact_redemption_recovers_one_shared_admission() {
     let issuer_directory = private_data_directory("invitation-race-issuer");
     let invitee_directory = private_data_directory("invitation-race-invitee");
     let config = CoreRuntimeConfig::new(&issuer_directory);
@@ -61,14 +61,12 @@ async fn concurrent_redemption_has_one_success_and_one_already_used_result() {
     let (other_issuer, second_result) = second.join().unwrap();
     let results = [first_result, second_result];
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| matches!(result, Err(InvitationError::AlreadyUsed)))
-            .count(),
-        1
-    );
+    assert!(results.iter().all(Result::is_ok));
+    let causes = results
+        .iter()
+        .map(|result| result.as_ref().unwrap().cause())
+        .collect::<Vec<_>>();
+    assert_eq!(causes[0], causes[1]);
 
     let connection = Connection::open(issuer_directory.join("core.sqlite3")).unwrap();
     let counts: (i64, i64, i64) = connection
@@ -82,7 +80,7 @@ async fn concurrent_redemption_has_one_success_and_one_already_used_result() {
         )
         .unwrap();
     assert_eq!(counts, (1, 1, 1));
-    let transition = results.into_iter().find_map(Result::ok).unwrap();
+    let transition = results.into_iter().next().unwrap().unwrap();
     assert_eq!(transition.epoch(), MembershipEpoch::new(1));
 
     drop(connection);

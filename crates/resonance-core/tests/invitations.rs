@@ -102,10 +102,9 @@ async fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
         reopened.membership_snapshot(workspace.id()).unwrap(),
         snapshot
     );
-    assert_eq!(
-        reopened.redeem_invitation(&claim).unwrap_err(),
-        InvitationError::AlreadyUsed
-    );
+    let recovered = reopened.redeem_invitation(&claim).unwrap();
+    assert_eq!(recovered.cause(), transition.cause());
+    assert_eq!(recovered.epoch(), transition.epoch());
 
     reopened.shutdown().await.unwrap();
     drop(reopened);

@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use resonance_core::{
-    CoreError, CoreRuntime, CoreRuntimeConfig, InvitationError, MembershipEpoch, MembershipError,
-    StorageError,
+    CoreError, CoreRuntime, CoreRuntimeConfig, MembershipEpoch, MembershipError, StorageError,
 };
 use rusqlite::Connection;
 
@@ -72,8 +71,8 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
         issuer.membership_version(workspace.id()).unwrap()
     );
     assert_eq!(
-        issuer.redeem_invitation(&first_claim).unwrap_err(),
-        InvitationError::AlreadyUsed
+        issuer.redeem_invitation(&first_claim).unwrap().cause(),
+        first.cause()
     );
     assert_eq!(
         database(&issuer_directory)

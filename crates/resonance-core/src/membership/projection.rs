@@ -10,6 +10,10 @@ use rusqlite::{
 
 use crate::error::{InvitationError, MembershipError, StorageError};
 use crate::invitation::VerifiedInvitationClaim;
+use crate::onboarding::wire::{
+    CodecError, MAX_OPERATIONS, MAX_RESPONSE_BODY_BYTES, SuccessResponse,
+    encode_success_with_limits,
+};
 use crate::{
     MemberSnapshot, MembershipEpoch, MembershipOperationId, MembershipRole, MembershipSnapshot,
     MembershipSnapshotDigest, MembershipVersion, PublicIdentity, WorkspaceId,
@@ -183,10 +187,47 @@ pub(crate) fn apply_canonical(
     apply_authenticated(connection, projections, envelope, now_unix_ms, None)
 }
 
+pub(crate) fn apply_canonical_with_limits(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    canonical_envelope: &[u8],
+    now_unix_ms: i64,
+    limits: BootstrapLimits,
+) -> Result<AppliedMembership, MembershipError> {
+    let envelope = authenticate(canonical_envelope)?;
+    apply_authenticated_with_limits(connection, projections, envelope, now_unix_ms, None, limits)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AdmissionContext {
+    pub(crate) authenticated_peer: PublicIdentity,
+    pub(crate) now_unix_ms: i64,
+    pub(crate) limits: BootstrapLimits,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BootstrapLimits {
+    pub(crate) max_body_bytes: usize,
+    pub(crate) max_operations: usize,
+}
+
+impl BootstrapLimits {
+    pub(crate) const CURRENT: Self = Self {
+        max_body_bytes: MAX_RESPONSE_BODY_BYTES,
+        max_operations: MAX_OPERATIONS,
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RedemptionBoundary {
     BeforeCommit,
     AfterCommit,
+}
+
+#[derive(Debug)]
+pub(crate) struct AdmissionExport {
+    pub(crate) applied: AppliedMembership,
+    pub(crate) response: Vec<u8>,
 }
 
 pub(crate) fn redeem_invitation(
@@ -194,13 +235,15 @@ pub(crate) fn redeem_invitation(
     projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
     secret_key: &SecretKey,
     claim: VerifiedInvitationClaim,
+    authenticated_peer: PublicIdentity,
     now_unix_ms: i64,
-) -> Result<AppliedMembership, InvitationError> {
+) -> Result<AdmissionExport, InvitationError> {
     redeem_invitation_with_fault(
         connection,
         projections,
         secret_key,
         claim,
+        authenticated_peer,
         now_unix_ms,
         |_| Ok(()),
     )
@@ -211,9 +254,40 @@ pub(crate) fn redeem_invitation_with_fault(
     projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
     secret_key: &SecretKey,
     claim: VerifiedInvitationClaim,
+    authenticated_peer: PublicIdentity,
     now_unix_ms: i64,
+    fault: impl FnMut(RedemptionBoundary) -> Result<(), StorageError>,
+) -> Result<AdmissionExport, InvitationError> {
+    redeem_invitation_with_fault_and_limits(
+        connection,
+        projections,
+        secret_key,
+        claim,
+        AdmissionContext {
+            authenticated_peer,
+            now_unix_ms,
+            limits: BootstrapLimits::CURRENT,
+        },
+        fault,
+    )
+}
+
+pub(crate) fn redeem_invitation_with_fault_and_limits(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    secret_key: &SecretKey,
+    claim: VerifiedInvitationClaim,
+    context: AdmissionContext,
     mut fault: impl FnMut(RedemptionBoundary) -> Result<(), StorageError>,
-) -> Result<AppliedMembership, InvitationError> {
+) -> Result<AdmissionExport, InvitationError> {
+    let AdmissionContext {
+        authenticated_peer,
+        now_unix_ms,
+        limits,
+    } = context;
+    if authenticated_peer != claim.invitee {
+        return Err(InvitationError::ClaimTargetMismatch);
+    }
     let local_identity = PublicIdentity::from_bytes(*secret_key.public().as_bytes())
         .map_err(|_| InvitationError::InvalidRole)?;
     if claim.token.inviter != local_identity {
@@ -223,10 +297,69 @@ pub(crate) fn redeem_invitation_with_fault(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| InvitationError::Storage(StorageError::Database))?;
     let mut durable = load_and_replay(&transaction).map_err(InvitationError::Storage)?;
+    verify_transition_evidence(&transaction, &durable).map_err(InvitationError::Storage)?;
+    let spent: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT workspace_id, invitation_token_id, admission_operation_id
+             FROM used_invitation_nonces WHERE nonce = ?1",
+            [claim.token.nonce.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| InvitationError::Storage(StorageError::Database))?;
+    if let Some((stored_workspace, stored_token_id, stored_admission_id)) = spent {
+        let stored_workspace = WorkspaceId::from_bytes(
+            fixed(&stored_workspace).map_err(|_| corrupt_invitation_evidence())?,
+        );
+        let stored_admission_id =
+            operation_id(&stored_admission_id).map_err(|_| corrupt_invitation_evidence())?;
+        let stored_projection = durable
+            .get(&stored_workspace)
+            .ok_or_else(corrupt_invitation_evidence)?;
+        let admission = stored_projection
+            .operations
+            .get(&stored_admission_id)
+            .ok_or_else(corrupt_invitation_evidence)?;
+        let MembershipAction::Admit { target, proof } = &admission.action else {
+            return Err(corrupt_invitation_evidence());
+        };
+        if admission.author != local_identity
+            || admission.workspace_id != stored_workspace
+            || *target != proof.claim.invitee
+            || proof.claim.token.nonce != claim.token.nonce
+            || proof.claim.token.id.as_bytes() != stored_token_id.as_slice()
+            || proof.claim.token.workspace_id != stored_workspace
+        {
+            return Err(corrupt_invitation_evidence());
+        }
+        if stored_workspace != claim.token.workspace_id
+            || stored_token_id != claim.token.id.as_bytes()
+            || proof.claim.bytes != claim.bytes
+            || proof.claim.invitee != authenticated_peer
+        {
+            return Err(InvitationError::AlreadyUsed);
+        }
+        if !stored_projection.contains_member(claim.invitee) {
+            return Err(InvitationError::Membership(MembershipError::MemberNotFound));
+        }
+        let response = encode_current_bootstrap_with_limits(
+            &transaction,
+            stored_projection,
+            stored_admission_id,
+            limits,
+        )
+        .map_err(InvitationError::Membership)?;
+        let applied = applied_result(stored_projection, stored_admission_id, false, false);
+        transaction
+            .commit()
+            .map_err(|_| InvitationError::Storage(StorageError::UncertainOutcome))?;
+        *projections = durable;
+        return Ok(AdmissionExport { applied, response });
+    }
+
     let projection = durable
         .get(&claim.token.workspace_id)
         .ok_or(InvitationError::WorkspaceNotFound)?;
-
     if claim.token.issued_at_unix_ms > now_unix_ms || claim.token.expires_at_unix_ms < now_unix_ms {
         return Err(InvitationError::Expired);
     }
@@ -235,16 +368,6 @@ pub(crate) fn redeem_invitation_with_fault(
     });
     if !local_is_manager {
         return Err(InvitationError::NotManager);
-    }
-    let already_used: bool = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM used_invitation_nonces WHERE nonce = ?1)",
-            [claim.token.nonce.as_slice()],
-            |row| row.get(0),
-        )
-        .map_err(|_| InvitationError::Storage(StorageError::Database))?;
-    if already_used {
-        return Err(InvitationError::AlreadyUsed);
     }
 
     let envelope = MembershipEnvelope::sign(
@@ -282,6 +405,9 @@ pub(crate) fn redeem_invitation_with_fault(
 
     persist_candidate_rows(&transaction, &envelope, &candidate)
         .map_err(InvitationError::Membership)?;
+    // Encode the exact candidate bootstrap before spending the invitation or committing.
+    encode_current_bootstrap_with_limits(&transaction, &candidate, envelope.id, limits)
+        .map_err(InvitationError::Membership)?;
     transaction
         .execute(
             "INSERT INTO used_invitation_nonces (
@@ -311,10 +437,86 @@ pub(crate) fn redeem_invitation_with_fault(
         .map_err(|_| InvitationError::Storage(StorageError::UncertainOutcome))?;
     fault(RedemptionBoundary::AfterCommit).map_err(InvitationError::Storage)?;
 
+    // Reload and encode durable current evidence while the caller still owns the consistency lock.
+    let response =
+        encode_current_bootstrap_with_limits(connection, &candidate, envelope.id, limits)
+            .map_err(InvitationError::Membership)?;
     let result = applied_result(&candidate, envelope.id, true, false);
     durable.insert(envelope.workspace_id, candidate);
     *projections = durable;
-    Ok(result)
+    Ok(AdmissionExport {
+        applied: result,
+        response,
+    })
+}
+
+fn corrupt_invitation_evidence() -> InvitationError {
+    InvitationError::Storage(StorageError::CorruptWorkspace)
+}
+
+fn encode_current_bootstrap_with_limits(
+    connection: &Connection,
+    projection: &WorkspaceProjection,
+    admission_id: MembershipOperationId,
+    limits: BootstrapLimits,
+) -> Result<Vec<u8>, MembershipError> {
+    verify_transition_evidence(
+        connection,
+        &BTreeMap::from([(projection.workspace_id, projection.clone())]),
+    )
+    .map_err(MembershipError::Storage)?;
+    let (name, created_at_unix_ms): (String, i64) = connection
+        .query_row(
+            "SELECT name, authored_at_unix_ms FROM workspaces WHERE workspace_id = ?1",
+            [projection.workspace_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    let genesis = projection
+        .operations
+        .get(&projection.genesis_id)
+        .ok_or(MembershipError::Storage(StorageError::CorruptWorkspace))?
+        .clone();
+    let mut statement = connection
+        .prepare(
+            "SELECT cause_operation_id FROM membership_transitions
+             WHERE workspace_id = ?1 ORDER BY epoch",
+        )
+        .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    let rows = statement
+        .query_map([projection.workspace_id.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    let mut post_genesis = Vec::new();
+    for row in rows {
+        let bytes = row.map_err(|_| MembershipError::Storage(StorageError::Database))?;
+        let id = operation_id(&bytes)?;
+        post_genesis.push(
+            projection
+                .operations
+                .get(&id)
+                .ok_or(MembershipError::Storage(StorageError::CorruptWorkspace))?
+                .clone(),
+        );
+    }
+    let response = SuccessResponse {
+        workspace_id: projection.workspace_id,
+        creator: projection.creator,
+        created_at_unix_ms,
+        name,
+        genesis_id: projection.genesis_id,
+        genesis,
+        post_genesis,
+        admission_id,
+        membership_version: projection.snapshot.version(),
+    };
+    encode_success_with_limits(&response, limits.max_body_bytes, limits.max_operations).map_err(
+        |error| match error {
+            CodecError::Limit => MembershipError::DecodeLimit,
+            _ => MembershipError::Storage(StorageError::CorruptWorkspace),
+        },
+    )
 }
 
 fn apply_authenticated(
@@ -323,6 +525,24 @@ fn apply_authenticated(
     envelope: MembershipEnvelope,
     now_unix_ms: i64,
     future_id: Option<MembershipOperationId>,
+) -> Result<AppliedMembership, MembershipError> {
+    apply_authenticated_with_limits(
+        connection,
+        projections,
+        envelope,
+        now_unix_ms,
+        future_id,
+        BootstrapLimits::CURRENT,
+    )
+}
+
+fn apply_authenticated_with_limits(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    envelope: MembershipEnvelope,
+    now_unix_ms: i64,
+    future_id: Option<MembershipOperationId>,
+    limits: BootstrapLimits,
 ) -> Result<AppliedMembership, MembershipError> {
     let projection = projections
         .get(&envelope.workspace_id)
@@ -363,7 +583,7 @@ fn apply_authenticated(
         candidate_operations,
     )?;
 
-    persist_candidate(connection, &envelope, &candidate, future_id)?;
+    persist_candidate(connection, &envelope, &candidate, future_id, limits)?;
     let result = applied_result(&candidate, envelope.id, true, false);
     projections.insert(envelope.workspace_id, candidate);
     Ok(result)
@@ -733,11 +953,14 @@ fn persist_candidate(
     envelope: &MembershipEnvelope,
     candidate: &WorkspaceProjection,
     future_id: Option<MembershipOperationId>,
+    limits: BootstrapLimits,
 ) -> Result<(), MembershipError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     persist_candidate_rows(&transaction, envelope, candidate)?;
+    // Every accepted mutation must leave a complete onboarding bootstrap encodable.
+    encode_current_bootstrap_with_limits(&transaction, candidate, candidate.genesis_id, limits)?;
     if let Some(id) = future_id {
         transaction
             .execute(
@@ -1216,7 +1439,8 @@ mod tests {
             &mut connection,
             &mut projections,
             &manager,
-            manager_claim,
+            manager_claim.clone(),
+            manager_claim.invitee,
             1_100,
         )
         .unwrap();
@@ -1230,7 +1454,8 @@ mod tests {
                 &mut connection,
                 &mut projections,
                 &member,
-                member_claim,
+                member_claim.clone(),
+                member_claim.invitee,
                 1_102,
             )
             .unwrap_err(),
@@ -1279,6 +1504,7 @@ mod tests {
                 &mut projections,
                 &manager,
                 claim.clone(),
+                claim.invitee,
                 1_100,
                 |current| {
                     if current == boundary {
@@ -1300,10 +1526,16 @@ mod tests {
 
             if boundary == RedemptionBoundary::BeforeCommit {
                 assert_eq!(count_redemption_rows(&connection), (0, 0, 0));
-                let accepted =
-                    redeem_invitation(&mut connection, &mut projections, &manager, claim, 1_100)
-                        .unwrap();
-                assert!(accepted.accepted);
+                let accepted = redeem_invitation(
+                    &mut connection,
+                    &mut projections,
+                    &manager,
+                    claim.clone(),
+                    claim.invitee,
+                    1_100,
+                )
+                .unwrap();
+                assert!(accepted.applied.accepted);
                 assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
             } else {
                 assert_eq!(
@@ -1328,9 +1560,20 @@ mod tests {
                     MembershipEpoch::new(1)
                 );
                 assert_eq!(
-                    redeem_invitation(&mut connection, &mut projections, &manager, claim, 1_100,)
-                        .unwrap_err(),
-                    InvitationError::AlreadyUsed
+                    redeem_invitation(
+                        &mut connection,
+                        &mut projections,
+                        &manager,
+                        claim.clone(),
+                        claim.invitee,
+                        1_100,
+                    )
+                    .unwrap()
+                    .applied
+                    .operation_id,
+                    MembershipOperationId::from_hash(Hash::from_bytes(
+                        fixed(&committed_id).unwrap()
+                    ))
                 );
                 let recovered_id: Vec<u8> = connection
                     .query_row(

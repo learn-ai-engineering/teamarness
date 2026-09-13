@@ -181,6 +181,44 @@ async fn migration_0004_adds_the_append_only_transition_ledger() {
 }
 
 #[tokio::test]
+async fn migration_0005_makes_spent_invitation_evidence_append_only() {
+    let directory = private_data_directory("migration-invitation-recovery");
+    let issuer = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    let workspace = issuer.create_workspace("Recovery guards").unwrap();
+    let invitee_directory = private_data_directory("migration-invitation-recovery-invitee");
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
+    let token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
+    let claim = invitee.create_invitation_claim(&token).unwrap();
+    issuer.redeem_invitation(&claim).unwrap();
+    issuer.shutdown().await.unwrap();
+    invitee.shutdown().await.unwrap();
+    drop(issuer);
+    drop(invitee);
+
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE used_invitation_nonces SET workspace_id = workspace_id",
+                []
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM used_invitation_nonces", [])
+            .is_err()
+    );
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(invitee_directory).unwrap();
+}
+
+#[tokio::test]
 async fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
@@ -201,7 +239,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(installation_count, 1);
 
     drop(connection);
