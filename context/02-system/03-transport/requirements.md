@@ -2,7 +2,7 @@
 
 Prefix: `RES.SYS.TRANS`
 
-*Requirements for this subsystem will be authored during Phase 1-2 scoping. The transport layer is Iroh: QUIC connectivity, hole-punching, relay fallback, and DNS/pkarr-based peer discovery. Each installation binds an Iroh `Endpoint` from its `SecretKey`. Packages may use Iroh streams via capability-scoped interfaces — they do not receive raw `Endpoint` handles.*
+The transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for workspace onboarding. A later package foundation will provide typed, capability-scoped transport interfaces without exposing raw endpoint handles.
 
 ## RES.SYS.TRANS-R01 — Iroh Endpoint Management
 
@@ -10,8 +10,16 @@ The core runtime SHALL create and manage the Iroh `Endpoint`. The endpoint SHALL
 
 ## RES.SYS.TRANS-R02 — Relay Configuration
 
-The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT traversal fallback. Teams SHALL have the option to configure custom relay servers. All relayed traffic SHALL be end-to-end encrypted; relays SHALL NOT have access to plaintext.
+The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT traversal fallback. Phase 2 SHALL use that default configuration. A later phase SHALL let teams configure custom relay servers. All relayed traffic SHALL be end-to-end encrypted; relays SHALL NOT have access to plaintext.
 
 ## RES.SYS.TRANS-R03 — Package Transport Access
 
-Packages SHALL access Iroh transport through typed, capability-scoped interfaces. The runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, or relay configuration to packages. Packages SHALL register ALPN identifiers for their protocol streams.
+When package support is added, packages SHALL access Iroh transport through typed, capability-scoped interfaces. The runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, or relay configuration to packages. Packages SHALL register ALPN identifiers for their protocol streams.
+
+## RES.SYS.TRANS-R04 — Copyable Workspace Invitation
+
+Phase 2 SHALL let a member copy one transfer value that contains a single-use workspace invitation and enough public connection information for another installation to reach the inviter through Iroh. The transfer value SHALL NOT contain private key material or make a central service authoritative for admission.
+
+## RES.SYS.TRANS-R05 — Workspace Bootstrap Transfer
+
+After accepting an invitation, the joining installation SHALL receive the authenticated workspace identity, genesis, canonical membership history needed to validate the workspace, and the operation admitting that installation. It SHALL validate the received state before storing the workspace locally. After a successful join, inviter and joiner SHALL report the same workspace identity and current member set. An interrupted or retried transfer SHALL NOT create a false local join or a duplicate admission. If the admitting installation commits an admission before its response is lost, a retry by the same joining installation SHALL recover that result without making the invitation available to another installation.

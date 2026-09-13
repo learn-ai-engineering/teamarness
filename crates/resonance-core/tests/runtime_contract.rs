@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use resonance_core::{
     CoreRuntimeConfig, IdentityError, MembershipEpoch, MembershipOperationId, MembershipVersion,
-    SigningContext, WorkspaceId,
+    OnboardingError, SigningContext, WorkspaceId,
 };
 
 #[test]
@@ -51,4 +51,27 @@ fn signing_context_rejects_an_empty_or_non_ascii_domain() {
         SigningContext::new("resonance.🔑").unwrap_err(),
         IdentityError::InvalidSigningContext
     );
+}
+
+#[test]
+fn onboarding_errors_have_a_stable_retryability_contract() {
+    let cases = [
+        (OnboardingError::InvalidInput, false),
+        (OnboardingError::Authentication, false),
+        (OnboardingError::Expired, false),
+        (OnboardingError::AlreadyUsed, false),
+        (OnboardingError::Readiness, true),
+        (OnboardingError::Timeout, true),
+        (OnboardingError::Overload, true),
+        (OnboardingError::InvalidBootstrap, false),
+        (OnboardingError::LocalConflict, false),
+        (OnboardingError::AdmissionNoLongerCurrent, false),
+        (OnboardingError::UncertainStorageOutcome, false),
+        (OnboardingError::Shutdown, true),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(error.is_retryable(), expected, "{error:?}");
+        assert!(!error.to_string().is_empty());
+    }
 }

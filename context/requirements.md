@@ -24,7 +24,7 @@ Revoking a member SHALL end their current membership interval. Every committed m
 
 ## RES-R06 — Package Model
 
-All user-visible capability SHALL live in packages. A package SHALL declare its identity, the semantic capabilities it consumes, its scope, and its entrypoints in a manifest. The runtime SHALL activate, suspend, and dispose packages through a standard lifecycle. A package SHALL own its domain logic, storage, transport, UI, and package-scoped membership. Team and individual packages SHALL use the same programming interface. Package UIs SHALL be TypeScript web content; package backends SHALL be Rust modules.
+All product-domain capability SHALL live in packages. Host-level workspace controls SHALL remain in the shell. A package SHALL declare its identity, the semantic capabilities it consumes, its scope, and its entrypoints in a manifest. The runtime SHALL activate, suspend, and dispose packages through a standard lifecycle. A package SHALL own its domain logic, storage, transport, UI, and package-scoped membership. Team and individual packages SHALL use the same programming interface. Package UIs SHALL be TypeScript web content; package backends SHALL be Rust modules.
 
 ## RES-R07 — Semantic Capabilities
 

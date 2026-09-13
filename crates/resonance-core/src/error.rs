@@ -324,6 +324,69 @@ impl Error for InvitationError {
         }
     }
 }
+
+/// A stable error returned by Workspace onboarding operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OnboardingError {
+    /// The transfer value or protocol input is malformed or unsupported.
+    InvalidInput,
+    /// An invitation, claim, or authenticated peer binding is invalid.
+    Authentication,
+    /// The unused invitation has expired.
+    Expired,
+    /// Another Installation has already used the invitation.
+    AlreadyUsed,
+    /// Public endpoint addressing did not become ready in time.
+    Readiness,
+    /// A bounded onboarding operation exceeded its time budget.
+    Timeout,
+    /// The runtime has reached an onboarding concurrency or size limit.
+    Overload,
+    /// A received Workspace bootstrap is invalid or incomplete.
+    InvalidBootstrap,
+    /// Durable local Workspace state conflicts with the received Workspace.
+    LocalConflict,
+    /// The recovered admission no longer grants current membership.
+    AdmissionNoLongerCurrent,
+    /// Storage may have committed and the runtime must be reopened.
+    UncertainStorageOutcome,
+    /// Runtime shutdown has started, so no new onboarding work is accepted.
+    Shutdown,
+}
+
+impl OnboardingError {
+    /// Reports whether retrying the same operation without changing its input may succeed.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Readiness | Self::Timeout | Self::Overload | Self::Shutdown
+        )
+    }
+}
+
+impl fmt::Display for OnboardingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "invalid workspace onboarding input",
+            Self::Authentication => "workspace onboarding authentication failed",
+            Self::Expired => "workspace invitation has expired",
+            Self::AlreadyUsed => "workspace invitation was used by another installation",
+            Self::Readiness => "workspace invitation addressing is not ready",
+            Self::Timeout => "workspace onboarding timed out",
+            Self::Overload => "workspace onboarding is overloaded",
+            Self::InvalidBootstrap => "workspace bootstrap is invalid",
+            Self::LocalConflict => "local workspace state conflicts with the invitation",
+            Self::AdmissionNoLongerCurrent => "the recovered admission is no longer current",
+            Self::UncertainStorageOutcome => "workspace onboarding storage outcome is uncertain",
+            Self::Shutdown => "workspace onboarding is unavailable during shutdown",
+        })
+    }
+}
+
+impl Error for OnboardingError {}
+
 /// An error while registering or receiving membership transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

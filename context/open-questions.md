@@ -16,7 +16,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## RES-DQ2 — Package backend execution model
 
-**Blocks:** `02-system/05-packages/` spec, Phase 2 implementation
+**Blocks:** `02-system/05-packages/` spec, Phase 3 package-foundation implementation
 
 **Question:** How should package backends execute relative to the core runtime? In the same Rust process with module-level isolation, or in separate processes?
 
@@ -26,7 +26,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 - C: Staged: bundled packages run in-process (trusted); member-loaded packages run in separate webviews or processes (untrusted).
 
 **Considerations:**
-- Phase 2 starts with bundled (trusted) packages only. Same-process isolation via crate visibility is sufficient.
+- Phase 3 starts with bundled trusted packages only. Same-process isolation via crate visibility is sufficient.
 - The long-term direction includes member-loaded packages that need stronger isolation.
 - Option C matches the existing Resonance design: a shared main webview is not a sandbox; untrusted packages need separate webviews.
 
@@ -34,7 +34,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## RES-DQ3 — Storage ownership and isolation
 
-**Blocks:** Phase 2-3 implementation
+**Blocks:** Phase 3-4 implementation
 
 **Question:** How should package storage be isolated from core storage and from other packages?
 
@@ -56,7 +56,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Decision:** Phase 1 treats installations as first-class members. The internal p2panda adapter uses tagged installation and workspace identifiers and keeps nested groups private, leaving room for a later human group of installation identities without changing installation keys.
 
-**Rationale:** Iroh identifies installations, and Phase 1 has no device-management or human-key protocol. Pretending that a device key identifies a human would make the first schema misleading. The p2panda group model leaves a later grouping path, but human identity remains separate Phase 4 design work. See `context/.decisions/0004-p2panda-membership-dag.md`.
+**Rationale:** Iroh identifies installations, and Phase 1 has no device-management or human-key protocol. Pretending that a device key identifies a human would make the first schema misleading. The p2panda group model leaves a later grouping path, but human identity remains separate Phase 5 design work. See `context/.decisions/0004-p2panda-membership-dag.md`.
 
 ---
 
@@ -72,15 +72,18 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## RES-DQ6 — Tauri version and tooling
 
-**Blocks:** Phase 2 implementation
+**Status:** Resolved (2026-09-13, research).
 
-**Question:** Which version of Tauri and which build tooling should we use?
+**Decision:** Use Tauri 2.11 with exact package pins, vanilla TypeScript, Vite, Vitest, and npm workspaces. Commit the Rust and npm lockfiles. Re-check patch versions if implementation begins after the research date, while preserving Tauri minor-version compatibility.
 
-**Options:**
-- A: Tauri v2 stable with its built-in tooling. Current production version, well-documented, active ecosystem.
-- B: Tauri v2 with a specific frontend framework (Vite, etc.) for package UI development.
+**Rationale:** The official Tauri release index and package registries confirmed compatible current versions and support the repository's Node.js 24 and Rust 1.96 minimums. The shell and reference package do not need a frontend framework. See `.myflow/workstreams/shell-package-lifecycle/research/20260912T221751Z_tauri-package-execution-storage-and-core-boundary.md`.
 
-**Considerations:**
-- Tauri v2 is the current stable major version with significant improvements over v1.
-- Package UIs are TypeScript web content; they can use any framework or none. The shell should be framework-agnostic.
-- The choice of frontend tooling for the shell itself (Vite, etc.) is separate from what packages use.
+---
+
+## RES-DQ7 - Workspace join protocol
+
+**Status:** Resolved (2026-09-13, design).
+
+**Decision:** Keep onboarding behind high-level Core Runtime operations. Wrap the existing signed invitation in a bounded `WorkspaceInvitation` with an Iroh endpoint ticket. Bind both authenticated peers to the token and claim, commit admission before response delivery, validate and import the complete bootstrap atomically, and report local join only after that import. An exact retry recovers the original admission before expiry checks, then exports the issuer's complete current accepted set at one consistency boundary without creating another admission.
+
+**Rationale:** The issuer and joiner have independent databases, so retry must bridge two commit points rather than pretend they share a transaction. Current-state join completion preserves the matching-membership requirement if another admission or revocation commits before retry. The operation remains bounded and claim-specific; continuous membership synchronization is a separate protocol. See `context/.decisions/0005-iroh-workspace-onboarding.md` and `.myflow/workstreams/shell-package-lifecycle/design/20260913T002055Z_workspace-onboarding-protocol.md`.

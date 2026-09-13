@@ -96,6 +96,7 @@ fn external_consumers_cannot_cross_the_runtime_boundary() {
         ("sqlite_connection.rs", "connection"),
         ("private_adapter.rs", "membership"),
         ("mutable_group_crdt.rs", "group_crdt_mut"),
+        ("endpoint_ticket.rs", "endpoint_ticket"),
     ];
 
     for (fixture, marker) in cases {

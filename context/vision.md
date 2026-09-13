@@ -13,7 +13,7 @@ The standard tools compound the problem: SaaS-based, role-siloed, server-depende
 ## The Values
 
 - **Local-first, no required server.** The app works offline. Peers synchronize directly over Iroh's QUIC transport. No central server mediates content or authentication. Iroh relays handle NAT traversal edge cases but carry no content authority — all traffic is end-to-end encrypted.
-- **Extensible through packages.** All user-visible capability lives in packages. The runtime provides identity, membership, and the shell. Teams build packages in TypeScript without touching Rust or the runtime.
+- **Extensible through packages.** All product-domain capability lives in packages. The runtime provides identity and membership, while the shell provides host-level workspace controls. Teams build packages in TypeScript without touching Rust or the runtime.
 - **AI as a package concern.** AI tooling — agents, skills, prompts, workflows — is owned by packages, not the runtime. Team-agreed AI behavior is checked in and shared. Individuals layer personal configuration on top.
 - **Git remains the source of truth for code.** Resonance reads repositories; it does not replace version control.
 - **A working demonstration of P2P for enterprise.** This is software teams can point to as evidence that local-first and P2P are viable for real team tooling.

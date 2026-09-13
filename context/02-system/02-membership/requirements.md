@@ -33,3 +33,7 @@ The system SHALL project the canonical membership log into a current member snap
 ## RES.SYS.MEM-R08 — Manager-Only Membership
 
 The initial implementation SHALL use manager-only membership: only members with appropriate capability may admit or revoke members. Free delegation (any member may delegate onward) is deferred. The membership log schema SHALL support future capability models without migration.
+
+## RES.SYS.MEM-R09 — Local Workspace Join
+
+A joining installation SHALL NOT report membership until it has validated and durably stored the workspace identity, genesis, canonical membership history required for validation, and its own accepted admission operation. The admitting installation SHALL validate the invitation claim, spend the invitation once, and commit the admission before reporting success. Both installations SHALL derive the same current membership from the accepted operation set. Join retries after interruption SHALL be safe and SHALL NOT create duplicate admission operations. A retry by the installation already admitted through that invitation MAY recover the accepted result, but another installation SHALL NOT reuse the invitation.

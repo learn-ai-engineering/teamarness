@@ -9,7 +9,7 @@ Canonical terminology for the Resonance domain. When a term appears in requireme
 | **Resonance** | The application: a local-first, P2P, package-extensible team workspace |
 | **Installation** | One running instance of Resonance on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
-| **Package** | A vertical module owning its domain: backend behavior, UI, storage, transport, and package-scoped membership. All user-visible capability lives in packages. UIs are TypeScript web content; backends are Rust modules |
+| **Package** | A vertical module owning its domain: backend behavior, UI, storage, transport, and package-scoped membership. All product-domain capability lives in packages; host-level workspace controls live in the shell. UIs are TypeScript web content; backends are Rust modules |
 | **Core Runtime** | The application kernel that owns installation identity, workspace creation/invitations, canonical membership, membership intervals, revocation, and the package lifecycle. Written in Rust |
 | **Shell** | The Tauri desktop host that owns package mounting in webviews, workspace controls, workspace-level theming, and the desktop window lifecycle |
 

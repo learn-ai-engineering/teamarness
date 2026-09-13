@@ -2,11 +2,11 @@
 //!
 //! # Dependency boundary
 //!
-//! `iroh-base` supplies only installation key types in Phase 1; the full Iroh
-//! endpoint crate is intentionally absent. `p2panda-auth` and `p2panda-core`
-//! are isolated behind the private membership adapter, and `rusqlite` is
-//! isolated behind private storage modules. Canonical membership bytes do not
-//! depend on serde-derived p2panda representations.
+//! Iroh endpoint and ticket crates are isolated behind the private onboarding
+//! boundary. `p2panda-auth` and `p2panda-core` are isolated behind the private
+//! membership adapter, and `rusqlite` is isolated behind private storage
+//! modules. Canonical membership bytes do not depend on serde-derived p2panda
+//! representations.
 //!
 //! # Visibility boundary
 //!
@@ -30,16 +30,19 @@ mod identity;
 mod invitation;
 #[allow(dead_code)]
 mod membership;
+#[allow(dead_code)]
+mod onboarding;
 mod storage;
 mod subscription;
 mod workspace;
 
 pub use error::{
-    ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError, StorageError,
-    SubscriptionError, ValueParseError, WorkspaceError,
+    ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError,
+    OnboardingError, StorageError, SubscriptionError, ValueParseError, WorkspaceError,
 };
 pub use invitation::{InvitationClaim, InvitationToken};
 pub use membership::MembershipOperationId;
+pub use onboarding::WorkspaceInvitation;
 pub use runtime::{
     CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipEpoch, MembershipRole,
     MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription, MembershipTransition,
