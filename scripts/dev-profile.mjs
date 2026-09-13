@@ -22,7 +22,7 @@ export function resolveDevelopmentDataDir(value, repositoryRoot = REPOSITORY_ROO
     );
   }
 
-  return join(repositoryRoot, ".resonance-dev", value);
+  return join(repositoryRoot, ".teamarness-dev", value);
 }
 
 export function buildDevelopmentCommand(dataDir, platform = process.platform) {
@@ -30,14 +30,14 @@ export function buildDevelopmentCommand(dataDir, platform = process.platform) {
     command: platform === "win32" ? "npm.cmd" : "npm",
     args: [
       "--workspace",
-      "resonance-desktop",
+      "teamarness-desktop",
       "run",
       "tauri",
       "--",
       "dev",
       "--",
       "--",
-      "--resonance-data-dir",
+      "--data-dir",
       dataDir,
     ],
   };
@@ -52,11 +52,11 @@ export function buildInstanceCommand(
     repositoryRoot,
     "target",
     "debug",
-    platform === "win32" ? "resonance-desktop.exe" : "resonance-desktop",
+    platform === "win32" ? "teamarness-desktop.exe" : "teamarness-desktop",
   );
   return {
     command: executable,
-    args: ["--resonance-data-dir", dataDir],
+    args: ["--data-dir", dataDir],
   };
 }
 

@@ -1,4 +1,4 @@
-# Resonance — Roadmap
+# Teamarness — Roadmap
 
 ## Status
 
@@ -14,7 +14,7 @@ The VRS intent tree and accepted architecture decisions are established. Phase 2
 
 Established the VRS intent tree, ontology, initial decisions, and open questions before product code. This phase produced the `context/` tree that guides all subsequent work.
 
-**Outcome:** A complete, internally consistent intent layer that answers: what is Resonance, what terms does it use, what decisions have been made, what questions remain open, and in what order will we build it.
+**Outcome:** A complete, internally consistent intent layer that answers: what is Teamarness, what terms does it use, what decisions have been made, what questions remain open, and in what order will we build it.
 
 ### Phase 1 — Core Runtime (complete)
 
@@ -58,7 +58,7 @@ Workspace leave, manager assignment and transfer, member removal controls, revoc
 
 ### Phase 6 - Repository Integration
 
-Repository registration, local Git reading, and repository-backed package views. Resonance does not replicate repository content. Iroh is not used for Git transport. Git remains the sole repository transport.
+Repository registration, local Git reading, and repository-backed package views. Teamarness does not replicate repository content. Iroh is not used for Git transport. Git remains the sole repository transport.
 
 **Outcome:** A user registers a local clone and a package renders repository-derived context.
 

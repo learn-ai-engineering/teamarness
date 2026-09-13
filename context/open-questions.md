@@ -1,10 +1,10 @@
-# Resonance — Open Questions
+# Teamarness — Open Questions
 
 Design uncertainties that need resolution before or during implementation. Each entry records the question, the decision point it blocks, and what would constitute an answer.
 
 ---
 
-## RES-DQ1 — Membership log design: signature chain vs CRDT
+## TEAM-DQ1 — Membership log design: signature chain vs CRDT
 
 **Status:** Resolved (2026-09-12, research).
 
@@ -14,7 +14,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## RES-DQ2 — Package backend execution model
+## TEAM-DQ2 — Package backend execution model
 
 **Status:** Resolved (2026-09-12, design).
 
@@ -24,7 +24,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## RES-DQ3 — Storage ownership and isolation
+## TEAM-DQ3 — Storage ownership and isolation
 
 **Blocks:** Phase 3-4 implementation
 
@@ -36,13 +36,13 @@ Design uncertainties that need resolution before or during implementation. Each 
 - C: Package-owned storage abstraction where the runtime provides a namespaced handle. Packages don't know the underlying database layout.
 
 **Considerations:**
-- Option A is what Resonance V1 used and was flagged as a coupling problem.
+- Option A is what Teamarness V1 used and was flagged as a coupling problem.
 - Option B aligns with the declared direction that packages own their persistence.
 - Option C adds an abstraction layer but provides the cleanest seam for future storage backends.
 
 ---
 
-## RES-DQ4 — Device identity vs human identity
+## TEAM-DQ4 — Device identity vs human identity
 
 **Status:** Resolved (2026-09-12, design).
 
@@ -52,7 +52,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## RES-DQ5 — Membership log durability
+## TEAM-DQ5 — Membership log durability
 
 **Status:** Resolved (2026-09-12, design).
 
@@ -62,7 +62,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## RES-DQ6 — Tauri version and tooling
+## TEAM-DQ6 — Tauri version and tooling
 
 **Status:** Resolved (2026-09-13, research).
 
@@ -72,7 +72,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## RES-DQ7 - Workspace join protocol
+## TEAM-DQ7 - Workspace join protocol
 
 **Status:** Resolved (2026-09-13, design).
 
@@ -82,7 +82,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## RES-DQ8 - Recognizable remote-member names
+## TEAM-DQ8 - Recognizable remote-member names
 
 **Blocks:** Phase 5 member presentation, human identity, and multi-device design
 

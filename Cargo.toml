@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/resonance-core", "apps/resonance-desktop/src-tauri"]
+members = ["crates/teamarness-core", "apps/teamarness-desktop/src-tauri"]
 resolver = "3"
 
 [workspace.package]

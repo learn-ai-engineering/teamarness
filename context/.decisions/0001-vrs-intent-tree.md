@@ -4,7 +4,7 @@
 
 ## Context
 
-The project needs an intent layer: a single source of truth for what Resonance is, what it should do, what decisions have been made, what questions remain open, and where the implementation diverges from the spec. Without a canonical intent layer, documentation, code, and other surfaces drift into competing sources of truth.
+The project needs an intent layer: a single source of truth for what Teamarness is, what it should do, what decisions have been made, what questions remain open, and where the implementation diverges from the spec. Without a canonical intent layer, documentation, code, and other surfaces drift into competing sources of truth.
 
 LiveStore (`livestorejs/livestore`) uses a VRS (Versioned Requirements Specification) intent tree rooted at `context/`. This decision adopts that pattern for this project.
 
@@ -12,7 +12,7 @@ LiveStore (`livestorejs/livestore`) uses a VRS (Versioned Requirements Specifica
 
 ### Root at `context/`
 
-The `context/` directory is the product-scoped VRS root. It is the canonical, settled intent for the Resonance product. All other surfaces — documentation, code comments, README — derive from `context/`.
+The `context/` directory is the product-scoped VRS root. It is the canonical, settled intent for the Teamarness product. All other surfaces — documentation, code comments, README — derive from `context/`.
 
 ### Structure
 
@@ -20,10 +20,10 @@ The `context/` directory is the product-scoped VRS root. It is the canonical, se
 context/
   vision.md           — what this is and why
   ontology.md         — canonical domain terminology
-  requirements.md     — root product requirements (RES prefix)
+  requirements.md     — root product requirements (TEAM prefix)
   spec.md             — branch table and cross-cutting rules
   roadmap.md          — phased delivery sequence
-  open-questions.md   — unresolved design questions (RES-DQ prefix)
+  open-questions.md   — unresolved design questions (TEAM-DQ prefix)
   .decisions/         — accepted architectural decisions (numbered, immutable)
   .delta/             — known divergence from spec (DELTA prefix)
   01-product/         — product requirements and success criteria
@@ -48,7 +48,7 @@ context/
 
 - LiveStore's VRS tree (`livestorejs/livestore/context/`) demonstrates this pattern in production use.
 - LiveStore decisions 0001 (root VRS at context) and 0002 (single intent layer) establish the rationale for a product-scoped canonical tree.
-- The existing Resonance project used a simpler `context/` layout without the full VRS discipline. This project adopts the stricter VRS rules from the start.
+- The existing Teamarness project used a simpler `context/` layout without the full VRS discipline. This project adopts the stricter VRS rules from the start.
 
 ## Rejected alternatives
 

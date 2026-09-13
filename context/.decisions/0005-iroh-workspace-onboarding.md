@@ -22,7 +22,7 @@ Low-level invitation issue, claim, and redemption mechanics become crate-private
 
 ### The copied value wraps the existing invitation
 
-`InvitationToken` version 1 remains unchanged. A Resonance-owned, bounded, versioned `WorkspaceInvitation` wraps the signed token and an Iroh `EndpointTicket`.
+`InvitationToken` version 1 remains unchanged. A Teamarness-owned, bounded, versioned `WorkspaceInvitation` wraps the signed token and an Iroh `EndpointTicket`.
 
 The outer parser enforces text and decoded-byte limits, accepts only the Phase 2 IP and relay address forms, limits address count, and requires the ticket Endpoint ID to equal the signed token inviter before dialing. The production path waits up to five seconds for default-relay readiness before it issues a fixed 15-minute invitation.
 
@@ -30,7 +30,7 @@ The copied value contains no private key material. It is still bearer admission 
 
 ### The protocol binds both authenticated peers
 
-Workspace onboarding uses ALPN `resonance/workspace-join/1`, a fully handshaken connection, no 0-RTT, and one bounded request and response over one bidirectional stream.
+Workspace onboarding uses ALPN `teamarness/workspace-join/1`, a fully handshaken connection, no 0-RTT, and one bounded request and response over one bidirectional stream.
 
 The joiner requires the authenticated remote Endpoint ID to equal the token inviter. The issuer requires the authenticated remote Endpoint ID to equal the invitee embedded in the signed claim before it reads or changes invitation state.
 
@@ -62,7 +62,7 @@ This is a bounded one-shot completion step, not continuous synchronization. It h
 
 ### The shell selects storage before opening the runtime
 
-An ordinary Tauri launch uses the bundle-specific application data directory. Development and packaged two-instance checks may pass `--resonance-data-dir <absolute-path>` to the backend. Relative paths are rejected. JavaScript cannot select or inspect arbitrary storage paths.
+An ordinary Tauri launch uses the bundle-specific application data directory. Development and packaged two-instance checks may pass `--data-dir <absolute-path>` to the backend. Relative paths are rejected. JavaScript cannot select or inspect arbitrary storage paths.
 
 The Tauri bridge owns serializable DTOs and stable error codes. It never receives private keys, raw secret bytes, SQLite handles, canonical envelopes, or raw Iroh types.
 
@@ -98,7 +98,7 @@ Rejected for Phase 2. The authenticated inviter connection is sufficient for imp
 
 ## Consequences
 
-- `resonance-core` adds exact `iroh = "=1.2.0"` and `iroh-tickets = "=1.0.0"` dependencies plus an exact compatible Tokio dependency selected during implementation.
+- `teamarness-core` adds exact `iroh = "=1.2.0"` and `iroh-tickets = "=1.0.0"` dependencies plus an exact compatible Tokio dependency selected during implementation.
 - Runtime opening becomes asynchronous. Existing tests, examples, and documentation must change.
 - The issuer and joiner use separate durable transactions with network delivery between them. Recovery, not rollback, closes the gap.
 - No runtime mutex guard may cross a network await. SQLite work runs away from the Tauri UI thread.
@@ -115,10 +115,10 @@ Rejected for Phase 2. The authenticated inviter connection is sufficient for imp
 - `context/02-system/02-membership/requirements.md`
 - `context/02-system/03-transport/requirements.md`
 - `context/02-system/07-shell/requirements.md`
-- `crates/resonance-core/src/invitation.rs`
-- `crates/resonance-core/src/membership/projection.rs`
-- `crates/resonance-core/src/runtime.rs`
-- `crates/resonance-core/src/workspace.rs`
-- `crates/resonance-core/migrations/0002_workspaces_membership.sql`
-- `crates/resonance-core/migrations/0003_invitations.sql`
-- `crates/resonance-core/migrations/0004_transitions.sql`
+- `crates/teamarness-core/src/invitation.rs`
+- `crates/teamarness-core/src/membership/projection.rs`
+- `crates/teamarness-core/src/runtime.rs`
+- `crates/teamarness-core/src/workspace.rs`
+- `crates/teamarness-core/migrations/0002_workspaces_membership.sql`
+- `crates/teamarness-core/migrations/0003_invitations.sql`
+- `crates/teamarness-core/migrations/0004_transitions.sql`

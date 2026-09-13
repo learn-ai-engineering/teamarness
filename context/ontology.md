@@ -1,13 +1,13 @@
-# Resonance — Ontology
+# Teamarness — Ontology
 
-Canonical terminology for the Resonance domain. When a term appears in requirements, specs, code, UI, or conversation, it carries the meaning defined here. Divergence from this file in another surface is a bug.
+Canonical terminology for the Teamarness domain. When a term appears in requirements, specs, code, UI, or conversation, it carries the meaning defined here. Divergence from this file in another surface is a bug.
 
 ## Top-level
 
 | Term | Definition |
 |---|---|
-| **Resonance** | The application: a local-first, P2P, package-extensible team workspace |
-| **Installation** | One running instance of Resonance on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
+| **Teamarness** | The application: a local-first, P2P, package-extensible team workspace |
+| **Installation** | One running instance of Teamarness on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
 | **Package** | A vertical module owning its domain: backend behavior, UI, storage, transport, and package-scoped membership. All product-domain capability lives in packages; host-level workspace controls live in the shell. UIs are TypeScript web content; backends are Rust modules |
 | **Core Runtime** | The application kernel that owns installation identity, workspace creation/invitations, canonical membership, membership intervals, revocation, and the package lifecycle. Written in Rust |
@@ -62,5 +62,5 @@ Canonical terminology for the Resonance domain. When a term appears in requireme
 
 | Term | Definition |
 |---|---|
-| **Repository Registration** | Binding a local Git clone to a workspace so packages can read it. Resonance does not replicate repository files |
+| **Repository Registration** | Binding a local Git clone to a workspace so packages can read it. Teamarness does not replicate repository files |
 | **Workspace Files** | Collaborative documents owned by the workspace-files package. Filesystem-first authority with signed operations, transported as Iroh blobs |

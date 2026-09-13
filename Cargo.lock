@@ -4167,32 +4167,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "resonance-core"
-version = "0.1.0"
-dependencies = [
- "iroh",
- "iroh-base",
- "iroh-tickets",
- "p2panda-auth",
- "p2panda-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "resonance-desktop"
-version = "0.1.0"
-dependencies = [
- "resonance-core",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5327,6 +5301,32 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
+name = "teamarness-core"
+version = "0.1.0"
+dependencies = [
+ "iroh",
+ "iroh-base",
+ "iroh-tickets",
+ "p2panda-auth",
+ "p2panda-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "teamarness-desktop"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "teamarness-core",
 ]
 
 [[package]]

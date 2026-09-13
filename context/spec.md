@@ -1,23 +1,23 @@
-# Resonance — Specification
+# Teamarness — Specification
 
-Branch table for the Resonance product VRS. Every requirement, spec clause, decision, and delta is owned by exactly one branch node. This file is the root; subsystem branches delegate to their own `spec.md` or `requirements.md`.
+Branch table for the Teamarness product VRS. Every requirement, spec clause, decision, and delta is owned by exactly one branch node. This file is the root; subsystem branches delegate to their own `spec.md` or `requirements.md`.
 
 ## Branch table
 
 | Prefix | Node | Owns |
 |---|---|---|
-| `RES` | Root (`context/`) | Product-wide requirements that span subsystems |
-| `RES.PROD` | `01-product/` | Product requirements, vision, roadmap, success criteria |
-| `RES.SYS.ID` | `02-system/01-identity/` | Installation identity, Iroh endpoint binding, key custody, public identity |
-| `RES.SYS.MEM` | `02-system/02-membership/` | Canonical membership log, intervals, invitations, revocation, epochs |
-| `RES.SYS.TRANS` | `02-system/03-transport/` | Iroh endpoint management, relay configuration, package transport access |
-| `RES.SYS.CONV` | `02-system/04-conversations/` | Channels, messages, channel membership, conversation keys, Iroh message delivery |
-| `RES.SYS.PKG` | `02-system/05-packages/` | Package manifest, lifecycle, semantic capabilities, SDK, trust model |
-| `RES.SYS.REPO` | `02-system/06-repos/` | Repository registration, local Git integration |
-| `RES.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package webview mounting, workspace controls, theming |
-| `RES.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
-| `RES.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
-| `RES.CONTRIB` | `04-contributing/` | Development setup, contribution workflow, code standards |
+| `TEAM` | Root (`context/`) | Product-wide requirements that span subsystems |
+| `TEAM.PROD` | `01-product/` | Product requirements, vision, roadmap, success criteria |
+| `TEAM.SYS.ID` | `02-system/01-identity/` | Installation identity, Iroh endpoint binding, key custody, public identity |
+| `TEAM.SYS.MEM` | `02-system/02-membership/` | Canonical membership log, intervals, invitations, revocation, epochs |
+| `TEAM.SYS.TRANS` | `02-system/03-transport/` | Iroh endpoint management, relay configuration, package transport access |
+| `TEAM.SYS.CONV` | `02-system/04-conversations/` | Channels, messages, channel membership, conversation keys, Iroh message delivery |
+| `TEAM.SYS.PKG` | `02-system/05-packages/` | Package manifest, lifecycle, semantic capabilities, SDK, trust model |
+| `TEAM.SYS.REPO` | `02-system/06-repos/` | Repository registration, local Git integration |
+| `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package webview mounting, workspace controls, theming |
+| `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
+| `TEAM.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
+| `TEAM.CONTRIB` | `04-contributing/` | Development setup, contribution workflow, code standards |
 
 ## Cross-cutting rules
 

@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-shell",
+  "description": "Bundled Teamarness Shell window only",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-installation-details",
+    "allow-list-workspaces",
+    "allow-create-workspace",
+    "allow-create-workspace-invitation",
+    "allow-join-workspace",
+    "allow-current-membership"
+  ]
+}

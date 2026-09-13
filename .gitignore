@@ -1,9 +1,9 @@
 # Build and dependency output
 /target/
 node_modules/
-/apps/resonance-desktop/dist/
-/apps/resonance-desktop/src-tauri/gen/
-/.resonance-dev/
+/apps/teamarness-desktop/dist/
+/apps/teamarness-desktop/src-tauri/gen/
+/.teamarness-dev/
 
 # Local MyFlow planning and implementation artifacts
 /.myflow/

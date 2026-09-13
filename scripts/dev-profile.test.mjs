@@ -13,7 +13,7 @@ import {
   resolveDevelopmentDataDir,
 } from "./dev-profile.mjs";
 
-const repositoryRoot = "/repo/resonance";
+const repositoryRoot = "/repo/teamarness";
 
 test("accepts one supported launcher mode and one profile argument", () => {
   assert.deepEqual(parseLauncherArguments(["dev", "alice"]), {
@@ -32,18 +32,18 @@ test("accepts one supported launcher mode and one profile argument", () => {
 test("resolves a safe profile beneath the repository development-data root", () => {
   assert.equal(
     resolveDevelopmentDataDir("alice", repositoryRoot),
-    join(repositoryRoot, ".resonance-dev", "alice"),
+    join(repositoryRoot, ".teamarness-dev", "alice"),
   );
   assert.equal(
     resolveDevelopmentDataDir("team_2-local", repositoryRoot),
-    join(repositoryRoot, ".resonance-dev", "team_2-local"),
+    join(repositoryRoot, ".teamarness-dev", "team_2-local"),
   );
 });
 
 test("accepts an absolute path as an expert override", () => {
   assert.equal(
-    resolveDevelopmentDataDir("/private/tmp/resonance alice", repositoryRoot),
-    "/private/tmp/resonance alice",
+    resolveDevelopmentDataDir("/private/tmp/teamarness alice", repositoryRoot),
+    "/private/tmp/teamarness alice",
   );
 });
 
@@ -69,7 +69,7 @@ test("rejects missing, traversal, separators, and unsafe profile names", () => {
 });
 
 test("creates the selected data directory with private permissions", async () => {
-  const root = await mkdtemp(join(tmpdir(), "resonance-dev-profile-"));
+  const root = await mkdtemp(join(tmpdir(), "teamarness-dev-profile-"));
   const dataDir = join(root, "profiles", "alice");
   try {
     await ensurePrivateDirectory(dataDir);
@@ -88,14 +88,14 @@ test("constructs the Tauri development command with runner and app separators", 
     command: "npm",
     args: [
       "--workspace",
-      "resonance-desktop",
+      "teamarness-desktop",
       "run",
       "tauri",
       "--",
       "dev",
       "--",
       "--",
-      "--resonance-data-dir",
+      "--data-dir",
       "/data/alice",
     ],
   });
@@ -104,20 +104,20 @@ test("constructs the Tauri development command with runner and app separators", 
 
 test("constructs the platform debug executable command without a shell", () => {
   assert.deepEqual(buildInstanceCommand("/data/bob", repositoryRoot, "darwin"), {
-    command: join(repositoryRoot, "target", "debug", "resonance-desktop"),
-    args: ["--resonance-data-dir", "/data/bob"],
+    command: join(repositoryRoot, "target", "debug", "teamarness-desktop"),
+    args: ["--data-dir", "/data/bob"],
   });
   assert.equal(
     buildInstanceCommand("C:\\data\\bob", repositoryRoot, "win32").command,
-    join(repositoryRoot, "target", "debug", "resonance-desktop.exe"),
+    join(repositoryRoot, "target", "debug", "teamarness-desktop.exe"),
   );
 });
 
 test("explains how to build a missing debug executable", async () => {
-  const root = await mkdtemp(join(tmpdir(), "resonance-missing-binary-"));
+  const root = await mkdtemp(join(tmpdir(), "teamarness-missing-binary-"));
   try {
     await assert.rejects(
-      requireDebugExecutable(join(root, "resonance-desktop")),
+      requireDebugExecutable(join(root, "teamarness-desktop")),
       /Run "npm run dev -- <profile>" once to build it/,
     );
   } finally {

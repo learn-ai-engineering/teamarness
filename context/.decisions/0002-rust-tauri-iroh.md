@@ -4,7 +4,7 @@
 
 ## Context
 
-Resonance needs a desktop shell, a core runtime, a P2P transport layer, and an identity foundation. These choices are interdependent and effectively irreversible — changing the shell or transport after packages exist would be a rewrite. The decision must be made before any code is written.
+Teamarness needs a desktop shell, a core runtime, a P2P transport layer, and an identity foundation. These choices are interdependent and effectively irreversible — changing the shell or transport after packages exist would be a rewrite. The decision must be made before any code is written.
 
 ## Decision
 
@@ -12,7 +12,7 @@ Resonance needs a desktop shell, a core runtime, a P2P transport layer, and an i
 
 - **Rust** for the core runtime, all backend logic, and the native desktop layer.
 - **Tauri v2** for the desktop shell — window management, system tray, native menus, auto-updater. Tauri provides the thin native bridge; all application behavior lives in the Rust runtime.
-- **TypeScript** for package UIs only — the web content rendered in Tauri webviews. The package SDK and semantic capability contracts are TypeScript, matching the existing Resonance contract model.
+- **TypeScript** for package UIs only — the web content rendered in Tauri webviews. The package SDK and semantic capability contracts are TypeScript, matching the existing Teamarness contract model.
 
 The runtime is a Rust crate (or small set of crates). Packages have TypeScript UIs that mount into Tauri webviews. The runtime-to-package bridge uses Tauri's invoke/event system with strict typed contracts, matching the runtime-facade-shell-bridge pattern from the reference design.
 
@@ -39,11 +39,11 @@ Electron was considered but rejected because:
 
 ### Why not Commonware
 
-Commonware was considered for the conversations transport layer (as used in the reference Resonance V1). Rejected because:
+Commonware was considered for the conversations transport layer (as used in the reference Teamarness V1). Rejected because:
 
 1. **Iroh provides the required transport stack.** QUIC transport, hole-punching, relay fallback, and discovery come from one dependency with a consistent design. Its blobs and docs capabilities remain options for later package features rather than part of this decision.
 2. **Documentation and ecosystem.** Iroh has strong documentation, video content, and an active community. A single well-documented dependency reduces the integration burden compared to assembling transport, discovery, and blob storage from separate crates.
-3. **Commonware is also Rust, but younger.** Commonware's p2p crate is newer and less documented than Iroh. The reference Resonance V1 used Commonware because it was already in the stack; this project starts fresh and can choose the more mature option.
+3. **Commonware is also Rust, but younger.** Commonware's p2p crate is newer and less documented than Iroh. The reference Teamarness V1 used Commonware because it was already in the stack; this project starts fresh and can choose the more mature option.
 
 ## Consequences
 
@@ -52,4 +52,4 @@ Commonware was considered for the conversations transport layer (as used in the 
 - Membership, invitations, revocation, and key rotation are built on top of Iroh's transport and identity — not provided by Iroh itself.
 - Packages do not depend directly on Iroh. Future content-addressed or collaborative data features use core-runtime capability contracts, with their backing implementation decided separately.
 - Iroh's relay servers (number 0 by default) provide NAT traversal fallback. We can configure custom relays or use the default public relays.
-- The reference Resonance V1 codebase (Rust + Tauri + Commonware for chat) remains valuable as a design reference but is not directly copied.
+- The reference Teamarness V1 codebase (Rust + Tauri + Commonware for chat) remains valuable as a design reference but is not directly copied.

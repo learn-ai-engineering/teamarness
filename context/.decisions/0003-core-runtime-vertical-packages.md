@@ -4,7 +4,7 @@
 
 ## Context
 
-The reference Resonance implementation (V1, RFC 0011) fused the Conversations domain into the core runtime: membership transitions waited for conversation epoch construction, `ConversationRuntime` held concrete core types, and the workspace session imported conversation-specific records. A post-merge seam assessment (2026-09-12) declared a new direction: the core runtime owns only installation identity and canonical workspace membership, while every product domain is a vertical package that owns its backend, UI, storage, and transport.
+The reference Teamarness implementation (V1, RFC 0011) fused the Conversations domain into the core runtime: membership transitions waited for conversation epoch construction, `ConversationRuntime` held concrete core types, and the workspace session imported conversation-specific records. A post-merge seam assessment (2026-09-12) declared a new direction: the core runtime owns only installation identity and canonical workspace membership, while every product domain is a vertical package that owns its backend, UI, storage, and transport.
 
 This decision adopts that declared direction as the architecture for this project.
 
@@ -75,7 +75,7 @@ Iroh provides transport and peer identity, not membership or authorization (per 
 
 ## Rejected alternatives
 
-### Monolithic runtime (Resonance V1 pattern)
+### Monolithic runtime (Teamarness V1 pattern)
 
 Rejected. The seam assessment demonstrated that fusing Conversations into core makes core membership dependent on Conversations availability and prevents Conversations from becoming optional or replaceable.
 

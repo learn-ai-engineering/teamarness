@@ -16,9 +16,9 @@ The first core design adopted p2panda but left the old linear-chain wording in p
 
 Each workspace has one immutable, anchored genesis operation. Every later membership operation links to the causal heads known to its author. The links form a directed acyclic graph rather than one predecessor chain.
 
-Operations are append-only and content-addressed. The operation ID is a BLAKE3 digest of a versioned canonical unsigned encoding. The author signs that encoding with the installation's Iroh-compatible Ed25519 key under a membership-specific domain. Resonance verifies the hash, signature, workspace, genesis descent, dependencies, timestamp rules, and action shape before `p2panda-auth` processes the operation.
+Operations are append-only and content-addressed. The operation ID is a BLAKE3 digest of a versioned canonical unsigned encoding. The author signs that encoding with the installation's Iroh-compatible Ed25519 key under a membership-specific domain. Teamarness verifies the hash, signature, workspace, genesis descent, dependencies, timestamp rules, and action shape before `p2panda-auth` processes the operation.
 
-`p2panda-auth` with `StrongRemove` resolves concurrent authority changes. Resonance exposes only `admit` and `revoke` in Phase 1. The p2panda adapter and access levels remain private to the core runtime.
+`p2panda-auth` with `StrongRemove` resolves concurrent authority changes. Teamarness exposes only `admit` and `revoke` in Phase 1. The p2panda adapter and access levels remain private to the core runtime.
 
 This decision supersedes the linear hash-chain and single-predecessor membership wording in decision 0003. Decision 0003's ownership model and narrow core-to-package seam remain accepted.
 

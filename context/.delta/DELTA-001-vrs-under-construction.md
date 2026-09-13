@@ -9,7 +9,7 @@ The VRS intent tree is being established as Phase 0 of the project. Subsystem re
 ## Impact
 
 - Subsystem-level requirements for conversations, packages, repos, and observability are not yet authored.
-- Cross-references between root requirements (`RES-R01`–`RES-R13`) and subsystem requirements use speculative prefixes that may change during detailed subsystem scoping.
+- Cross-references between root requirements (`TEAM-R01`–`TEAM-R13`) and subsystem requirements use speculative prefixes that may change during detailed subsystem scoping.
 
 ## Resolution plan
 
@@ -22,7 +22,7 @@ The VRS intent tree is being established as Phase 0 of the project. Subsystem re
 ## Tracking
 
 - Subsystem count: 10 declared in branch table, 4 with authored requirements (identity, membership, transport, shell), 4 with placeholder summaries, 2 with minimal requirements
-- Root requirements: 13 authored (`RES-R01`–`RES-R13`)
+- Root requirements: 13 authored (`TEAM-R01`–`TEAM-R13`)
 - Root decisions: 3 authored (0001–0003)
 - Root deltas: 1 (this file)
-- Open questions: 6 (`RES-DQ1`–`RES-DQ6`)
+- Open questions: 6 (`TEAM-DQ1`–`TEAM-DQ6`)
