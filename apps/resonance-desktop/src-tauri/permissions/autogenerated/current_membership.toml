@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-current-membership"
+description = "Enables the current_membership command without any pre-configured scope."
+commands.allow = ["current_membership"]
+
+[[permission]]
+identifier = "deny-current-membership"
+description = "Denies the current_membership command without any pre-configured scope."
+commands.deny = ["current_membership"]

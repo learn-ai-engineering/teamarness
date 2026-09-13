@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-join-workspace"
+description = "Enables the join_workspace command without any pre-configured scope."
+commands.allow = ["join_workspace"]
+
+[[permission]]
+identifier = "deny-join-workspace"
+description = "Denies the join_workspace command without any pre-configured scope."
+commands.deny = ["join_workspace"]

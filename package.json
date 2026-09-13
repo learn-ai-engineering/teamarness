@@ -1,0 +1,12 @@
+{
+  "name": "resonance",
+  "private": true,
+  "workspaces": ["apps/resonance-desktop"],
+  "scripts": {
+    "build": "npm --workspace resonance-desktop run build",
+    "typecheck": "npm --workspace resonance-desktop run typecheck",
+    "lint": "npm --workspace resonance-desktop run lint",
+    "test": "npm --workspace resonance-desktop test",
+    "tauri": "npm --workspace resonance-desktop run tauri --"
+  }
+}

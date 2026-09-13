@@ -1,5 +1,8 @@
-# Rust build output
+# Build and dependency output
 /target/
+node_modules/
+/apps/resonance-desktop/dist/
+/apps/resonance-desktop/src-tauri/gen/
 
 # Local MyFlow planning and implementation artifacts
 /.myflow/

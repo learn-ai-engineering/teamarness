@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/resonance-core"]
+members = ["crates/resonance-core", "apps/resonance-desktop/src-tauri"]
 resolver = "3"
 
 [workspace.package]
@@ -16,4 +16,6 @@ p2panda-core = "=0.7.1"
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.149"
+tauri = "=2.11.5"
+tauri-build = "=2.6.3"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }

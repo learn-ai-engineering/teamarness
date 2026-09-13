@@ -1,0 +1,39 @@
+{
+  "installation": {
+    "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "displayName": "Local installation"
+  },
+  "workspace": {
+    "id": "00112233445566778899aabbccddeeff",
+    "name": "Design team",
+    "createdBy": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "createdAtUnixMs": 1789264800000
+  },
+  "membership": {
+    "workspaceId": "00112233445566778899aabbccddeeff",
+    "epoch": "2",
+    "version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "members": [
+      { "identity": "1111111111111111111111111111111111111111111111111111111111111111", "role": "member" },
+      { "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "role": "manager" }
+    ]
+  },
+  "invitation": {
+    "value": "resonance-workspace-v1.00",
+    "sensitivity": "bearer_admission"
+  },
+  "errors": [
+    { "code": "invalid_input", "retryable": false },
+    { "code": "authentication", "retryable": false },
+    { "code": "expired", "retryable": false },
+    { "code": "already_used", "retryable": false },
+    { "code": "readiness", "retryable": true },
+    { "code": "timeout", "retryable": true },
+    { "code": "overload", "retryable": true },
+    { "code": "invalid_bootstrap", "retryable": false },
+    { "code": "local_conflict", "retryable": false },
+    { "code": "admission_no_longer_current", "retryable": false },
+    { "code": "uncertain_storage_outcome", "retryable": false },
+    { "code": "shutdown", "retryable": true }
+  ]
+}
