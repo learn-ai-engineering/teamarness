@@ -233,6 +233,8 @@ pub(crate) struct AdmissionExport {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImportBoundary {
+    LocalReplay,
+    TransitionVerification,
     CreationRequest,
     WorkspaceAnchor,
     Operations,
@@ -343,16 +345,42 @@ pub(crate) fn validate_bootstrap(
     })
 }
 
+fn ensure_import_deadline(
+    deadline: Option<std::time::Instant>,
+) -> Result<(), crate::OnboardingError> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        Err(crate::OnboardingError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
+fn import_boundary(
+    fault: &mut impl FnMut(ImportBoundary) -> Result<(), StorageError>,
+    boundary: ImportBoundary,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), crate::OnboardingError> {
+    ensure_import_deadline(deadline)?;
+    fault(boundary).map_err(import_fault)?;
+    ensure_import_deadline(deadline)
+}
+
 pub(crate) fn import_bootstrap_with_fault(
     connection: &mut Connection,
     bootstrap: &ValidatedBootstrap,
+    deadline: Option<std::time::Instant>,
     mut fault: impl FnMut(ImportBoundary) -> Result<(), StorageError>,
 ) -> Result<ImportedWorkspace, crate::OnboardingError> {
+    ensure_import_deadline(deadline)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| crate::OnboardingError::LocalConflict)?;
-    let local = load_and_replay(&transaction).map_err(import_storage_error)?;
-    verify_transition_evidence(&transaction, &local).map_err(import_storage_error)?;
+    ensure_import_deadline(deadline)?;
+    let local = load_and_replay_until(&transaction, deadline).map_err(import_storage_error)?;
+    import_boundary(&mut fault, ImportBoundary::LocalReplay, deadline)?;
+    verify_transition_evidence_until(&transaction, &local, deadline)
+        .map_err(import_storage_error)?;
+    import_boundary(&mut fault, ImportBoundary::TransitionVerification, deadline)?;
     let response = &bootstrap.response;
     let remote_order = std::iter::once(response.genesis_id)
         .chain(response.post_genesis.iter().map(|envelope| envelope.id))
@@ -392,11 +420,16 @@ pub(crate) fn import_bootstrap_with_fault(
                 return Err(crate::OnboardingError::LocalConflict);
             }
             verify_creation_request(&transaction, response)?;
-            let local_order =
-                transition_order(&transaction, response.workspace_id, existing.genesis_id)
-                    .map_err(import_storage_error)?;
+            let local_order = transition_order(
+                &transaction,
+                response.workspace_id,
+                existing.genesis_id,
+                deadline,
+            )
+            .map_err(import_storage_error)?;
             let shared = local_order.len().min(remote_order.len());
             for index in 0..shared {
+                ensure_import_deadline(deadline)?;
                 let local_id = local_order[index];
                 let remote_id = remote_order[index];
                 if local_id != remote_id {
@@ -438,9 +471,12 @@ pub(crate) fn import_bootstrap_with_fault(
                     {
                         return Err(crate::OnboardingError::LocalConflict);
                     }
+                    ensure_import_deadline(deadline)?;
                     insert_operation(&transaction, envelope)?;
-                    insert_dependencies(&transaction, envelope)?;
+                    ensure_import_deadline(deadline)?;
+                    insert_dependencies(&transaction, envelope, deadline)?;
                     insert_identity_subject(&transaction, envelope)?;
+                    ensure_import_deadline(deadline)?;
                     insert_transition(&transaction, expected, envelope.id)?;
                     candidate = expected.clone();
                 }
@@ -474,7 +510,7 @@ pub(crate) fn import_bootstrap_with_fault(
                     ],
                 )
                 .map_err(|_| crate::OnboardingError::LocalConflict)?;
-            fault(ImportBoundary::CreationRequest).map_err(import_fault)?;
+            import_boundary(&mut fault, ImportBoundary::CreationRequest, deadline)?;
             transaction
                 .execute(
                     "INSERT INTO workspaces (
@@ -491,33 +527,40 @@ pub(crate) fn import_bootstrap_with_fault(
                     ],
                 )
                 .map_err(|_| crate::OnboardingError::LocalConflict)?;
-            fault(ImportBoundary::WorkspaceAnchor).map_err(import_fault)?;
+            import_boundary(&mut fault, ImportBoundary::WorkspaceAnchor, deadline)?;
             for envelope in std::iter::once(&response.genesis).chain(response.post_genesis.iter()) {
+                ensure_import_deadline(deadline)?;
                 insert_operation(&transaction, envelope)?;
             }
-            fault(ImportBoundary::Operations).map_err(import_fault)?;
+            import_boundary(&mut fault, ImportBoundary::Operations, deadline)?;
             for envelope in &response.post_genesis {
-                insert_dependencies(&transaction, envelope)?;
+                ensure_import_deadline(deadline)?;
+                insert_dependencies(&transaction, envelope, deadline)?;
             }
-            fault(ImportBoundary::Dependencies).map_err(import_fault)?;
+            import_boundary(&mut fault, ImportBoundary::Dependencies, deadline)?;
             for envelope in std::iter::once(&response.genesis).chain(response.post_genesis.iter()) {
+                ensure_import_deadline(deadline)?;
                 insert_identity_subject(&transaction, envelope)?;
             }
-            fault(ImportBoundary::IdentitySubjects).map_err(import_fault)?;
+            import_boundary(&mut fault, ImportBoundary::IdentitySubjects, deadline)?;
             for (envelope, prefix) in response.post_genesis.iter().zip(&bootstrap.prefixes) {
+                ensure_import_deadline(deadline)?;
                 insert_transition(&transaction, prefix, envelope.id)?;
             }
-            fault(ImportBoundary::Transitions).map_err(import_fault)?;
+            import_boundary(&mut fault, ImportBoundary::Transitions, deadline)?;
             (bootstrap.projection.clone(), true)
         };
 
     if writes_derived_state {
+        ensure_import_deadline(deadline)?;
         write_current_state(&transaction, &imported_projection)?;
-        fault(ImportBoundary::CurrentState).map_err(import_fault)?;
-        write_member_snapshot(&transaction, &imported_projection)?;
-        fault(ImportBoundary::MemberSnapshot).map_err(import_fault)?;
+        import_boundary(&mut fault, ImportBoundary::CurrentState, deadline)?;
+        write_member_snapshot(&transaction, &imported_projection, deadline)?;
+        import_boundary(&mut fault, ImportBoundary::MemberSnapshot, deadline)?;
     }
-    fault(ImportBoundary::BeforeCommit).map_err(import_fault)?;
+    import_boundary(&mut fault, ImportBoundary::BeforeCommit, deadline)?;
+    // This is the last rollback-safe check. Never turn a completed commit into a timeout.
+    ensure_import_deadline(deadline)?;
     transaction
         .commit()
         .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
@@ -574,6 +617,7 @@ fn transition_order(
     connection: &Connection,
     workspace_id: WorkspaceId,
     genesis_id: MembershipOperationId,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<MembershipOperationId>, StorageError> {
     let mut statement = connection
         .prepare(
@@ -588,6 +632,7 @@ fn transition_order(
         .map_err(|_| StorageError::Database)?;
     let mut order = vec![genesis_id];
     for row in rows {
+        ensure_storage_deadline(deadline)?;
         order.push(
             operation_id(&row.map_err(|_| StorageError::Database)?)
                 .map_err(membership_to_storage)?,
@@ -622,8 +667,10 @@ fn insert_operation(
 fn insert_dependencies(
     transaction: &Transaction<'_>,
     envelope: &MembershipEnvelope,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(), crate::OnboardingError> {
     for dependency in &envelope.dependencies {
+        ensure_import_deadline(deadline)?;
         transaction
             .execute(
                 "INSERT INTO membership_dependencies (operation_id, dependency_operation_id)
@@ -712,6 +759,7 @@ fn write_current_state(
 fn write_member_snapshot(
     transaction: &Transaction<'_>,
     projection: &WorkspaceProjection,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(), crate::OnboardingError> {
     transaction
         .execute(
@@ -720,6 +768,7 @@ fn write_member_snapshot(
         )
         .map_err(|_| crate::OnboardingError::LocalConflict)?;
     for member in projection.snapshot.members() {
+        ensure_import_deadline(deadline)?;
         transaction
             .execute(
                 "INSERT INTO membership_snapshot_members (workspace_id, member_identity, role)
@@ -1131,18 +1180,38 @@ fn applied_result(
 fn load_and_replay(
     connection: &Connection,
 ) -> Result<BTreeMap<WorkspaceId, WorkspaceProjection>, StorageError> {
-    let anchors = load_anchors(connection)?;
+    load_and_replay_until(connection, None)
+}
+
+fn ensure_storage_deadline(deadline: Option<std::time::Instant>) -> Result<(), StorageError> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        Err(StorageError::Database)
+    } else {
+        Ok(())
+    }
+}
+
+fn load_and_replay_until(
+    connection: &Connection,
+    deadline: Option<std::time::Instant>,
+) -> Result<BTreeMap<WorkspaceId, WorkspaceProjection>, StorageError> {
+    ensure_storage_deadline(deadline)?;
+    let anchors = load_anchors(connection, deadline)?;
     let mut projections = BTreeMap::new();
     for (workspace_id, creator, genesis_id, genesis_bytes) in anchors {
-        let operations = load_operations(connection, workspace_id)?;
+        ensure_storage_deadline(deadline)?;
+        let operations = load_operations(connection, workspace_id, deadline)?;
         let genesis = operations
             .get(&genesis_id)
             .ok_or(StorageError::CorruptWorkspace)?;
         if genesis.canonical_bytes() != genesis_bytes {
             return Err(StorageError::CorruptWorkspace);
         }
-        let projection = replay(workspace_id, creator, genesis_id, operations)
-            .map_err(|_| StorageError::CorruptWorkspace)?;
+        let projection = replay_until(workspace_id, creator, genesis_id, operations, deadline)
+            .map_err(|error| match error {
+                MembershipError::Storage(storage) => storage,
+                _ => StorageError::CorruptWorkspace,
+            })?;
         projections.insert(workspace_id, projection);
     }
 
@@ -1161,7 +1230,10 @@ fn load_and_replay(
     Ok(projections)
 }
 
-fn load_anchors(connection: &Connection) -> Result<Vec<WorkspaceAnchor>, StorageError> {
+fn load_anchors(
+    connection: &Connection,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<WorkspaceAnchor>, StorageError> {
     let mut statement = connection
         .prepare(
             "SELECT workspace_id, creator_public_identity, genesis_operation_id, genesis_envelope
@@ -1180,6 +1252,7 @@ fn load_anchors(connection: &Connection) -> Result<Vec<WorkspaceAnchor>, Storage
         .map_err(|_| StorageError::Database)?;
     let mut anchors = Vec::new();
     for row in rows {
+        ensure_storage_deadline(deadline)?;
         let (workspace, creator, genesis, bytes): WorkspaceRow =
             row.map_err(|_| StorageError::Database)?;
         anchors.push((
@@ -1196,6 +1269,7 @@ fn load_anchors(connection: &Connection) -> Result<Vec<WorkspaceAnchor>, Storage
 fn load_operations(
     connection: &Connection,
     workspace_id: WorkspaceId,
+    deadline: Option<std::time::Instant>,
 ) -> Result<BTreeMap<MembershipOperationId, MembershipEnvelope>, StorageError> {
     let mut statement = connection
         .prepare(
@@ -1217,6 +1291,7 @@ fn load_operations(
         .map_err(|_| StorageError::Database)?;
     let mut operations = BTreeMap::new();
     for row in rows {
+        ensure_storage_deadline(deadline)?;
         let (stored_id, stored_author, stored_timestamp, stored_action, bytes): OperationRow =
             row.map_err(|_| StorageError::Database)?;
         let envelope = authenticate(&bytes).map_err(|_| StorageError::CorruptWorkspace)?;
@@ -1229,7 +1304,7 @@ fn load_operations(
         {
             return Err(StorageError::CorruptWorkspace);
         }
-        let stored_dependencies = load_dependencies(connection, envelope.id)?;
+        let stored_dependencies = load_dependencies(connection, envelope.id, deadline)?;
         if stored_dependencies != envelope.dependencies {
             return Err(StorageError::CorruptWorkspace);
         }
@@ -1243,6 +1318,7 @@ fn load_operations(
 fn load_dependencies(
     connection: &Connection,
     operation_id: MembershipOperationId,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<MembershipOperationId>, StorageError> {
     let mut statement = connection
         .prepare(
@@ -1255,13 +1331,15 @@ fn load_dependencies(
             row.get::<_, Vec<u8>>(0)
         })
         .map_err(|_| StorageError::Database)?;
-    rows.map(|row| {
+    let mut dependencies = Vec::new();
+    for row in rows {
+        ensure_storage_deadline(deadline)?;
         let bytes = row.map_err(|_| StorageError::Database)?;
-        Ok(MembershipOperationId::from_hash(Hash::from_bytes(fixed(
+        dependencies.push(MembershipOperationId::from_hash(Hash::from_bytes(fixed(
             &bytes,
-        )?)))
-    })
-    .collect()
+        )?)));
+    }
+    Ok(dependencies)
 }
 
 pub(super) fn replay(
@@ -1270,6 +1348,21 @@ pub(super) fn replay(
     genesis_id: MembershipOperationId,
     operations: BTreeMap<MembershipOperationId, MembershipEnvelope>,
 ) -> Result<WorkspaceProjection, MembershipError> {
+    replay_until(workspace_id, creator, genesis_id, operations, None)
+}
+
+fn ensure_membership_deadline(deadline: Option<std::time::Instant>) -> Result<(), MembershipError> {
+    ensure_storage_deadline(deadline).map_err(MembershipError::Storage)
+}
+
+fn replay_until(
+    workspace_id: WorkspaceId,
+    creator: PublicIdentity,
+    genesis_id: MembershipOperationId,
+    operations: BTreeMap<MembershipOperationId, MembershipEnvelope>,
+    deadline: Option<std::time::Instant>,
+) -> Result<WorkspaceProjection, MembershipError> {
+    ensure_membership_deadline(deadline)?;
     let genesis = operations
         .get(&genesis_id)
         .ok_or(MembershipError::ConflictingGenesis)?;
@@ -1292,22 +1385,25 @@ pub(super) fn replay(
     let mut processed = BTreeSet::from([genesis_id]);
 
     while processed.len() < operations.len() {
-        let ready = operations
-            .values()
-            .filter(|operation| {
-                !processed.contains(&operation.id)
-                    && operation
-                        .dependencies
-                        .iter()
-                        .all(|dependency| processed.contains(dependency))
-            })
-            .map(|operation| operation.id)
-            .collect::<Vec<_>>();
+        ensure_membership_deadline(deadline)?;
+        let mut ready = Vec::new();
+        for operation in operations.values() {
+            ensure_membership_deadline(deadline)?;
+            if !processed.contains(&operation.id)
+                && operation
+                    .dependencies
+                    .iter()
+                    .all(|dependency| processed.contains(dependency))
+            {
+                ready.push(operation.id);
+            }
+        }
         if ready.is_empty() {
             return Err(MembershipError::MissingDependency);
         }
 
         for id in ready {
+            ensure_membership_deadline(deadline)?;
             let operation = operations.get(&id).expect("ready operation exists");
             let dependencies = operation
                 .dependencies
@@ -1324,32 +1420,31 @@ pub(super) fn replay(
                 })
                 .collect::<Vec<_>>();
             validate_context(operation, workspace_id, genesis_id, &dependencies, i64::MAX)?;
-            validate_phase_one(operation, creator, &operations)?;
+            validate_phase_one(operation, creator, &operations, deadline)?;
             state = MembershipCrdt::process(state, &OperationAdapter(operation.clone()))
                 .map_err(|_| MembershipError::AuthorizationRejected)?;
             processed.insert(id);
         }
     }
 
-    let mut members = state
-        .members(AuthId::workspace(workspace_id))
-        .into_iter()
-        .map(|(id, access)| {
-            let AuthId::Installation(bytes) = id else {
-                return Err(MembershipError::InvalidRole);
-            };
-            let identity =
-                PublicIdentity::from_bytes(bytes).map_err(|_| MembershipError::InvalidRole)?;
-            let role = if access.is_manage() {
-                MembershipRole::Manager
-            } else if access.is_write() {
-                MembershipRole::Member
-            } else {
-                return Err(MembershipError::InvalidRole);
-            };
-            Ok(MemberSnapshot::new(identity, role))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    ensure_membership_deadline(deadline)?;
+    let mut members = Vec::new();
+    for (id, access) in state.members(AuthId::workspace(workspace_id)) {
+        ensure_membership_deadline(deadline)?;
+        let AuthId::Installation(bytes) = id else {
+            return Err(MembershipError::InvalidRole);
+        };
+        let identity =
+            PublicIdentity::from_bytes(bytes).map_err(|_| MembershipError::InvalidRole)?;
+        let role = if access.is_manage() {
+            MembershipRole::Manager
+        } else if access.is_write() {
+            MembershipRole::Member
+        } else {
+            return Err(MembershipError::InvalidRole);
+        };
+        members.push(MemberSnapshot::new(identity, role));
+    }
     members.sort_by_key(MemberSnapshot::identity);
     if members
         .iter()
@@ -1379,6 +1474,7 @@ fn validate_phase_one(
     operation: &MembershipEnvelope,
     creator: PublicIdentity,
     operations: &BTreeMap<MembershipOperationId, MembershipEnvelope>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(), MembershipError> {
     if operation.author != creator {
         return Err(MembershipError::NotManager);
@@ -1394,7 +1490,7 @@ fn validate_phase_one(
             {
                 return Err(MembershipError::InvalidAdmissionProof);
             }
-            if causal_ancestry_contains_revoke(operation, *target, operations) {
+            if causal_ancestry_contains_revoke(operation, *target, operations, deadline)? {
                 return Err(MembershipError::CausalReadmission);
             }
             Ok(())
@@ -1412,10 +1508,12 @@ fn causal_ancestry_contains_revoke(
     operation: &MembershipEnvelope,
     target: PublicIdentity,
     operations: &BTreeMap<MembershipOperationId, MembershipEnvelope>,
-) -> bool {
+    deadline: Option<std::time::Instant>,
+) -> Result<bool, MembershipError> {
     let mut pending = operation.dependencies.clone();
     let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop() {
+        ensure_membership_deadline(deadline)?;
         if !visited.insert(id) {
             continue;
         }
@@ -1424,11 +1522,11 @@ fn causal_ancestry_contains_revoke(
         };
         if matches!(ancestor.action, MembershipAction::Revoke { target: revoked } if revoked == target)
         {
-            return true;
+            return Ok(true);
         }
         pending.extend(ancestor.dependencies.iter().copied());
     }
-    false
+    Ok(false)
 }
 
 fn dependency_context(
@@ -1573,7 +1671,16 @@ fn verify_transition_evidence(
     connection: &Connection,
     projections: &BTreeMap<WorkspaceId, WorkspaceProjection>,
 ) -> Result<(), StorageError> {
+    verify_transition_evidence_until(connection, projections, None)
+}
+
+fn verify_transition_evidence_until(
+    connection: &Connection,
+    projections: &BTreeMap<WorkspaceId, WorkspaceProjection>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), StorageError> {
     for projection in projections.values() {
+        ensure_storage_deadline(deadline)?;
         let mut statement = connection
             .prepare(
                 "SELECT epoch, membership_version, cause_operation_id, snapshot_digest
@@ -1590,9 +1697,11 @@ fn verify_transition_evidence(
                 ))
             })
             .map_err(|_| StorageError::Database)?;
-        let events = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| StorageError::Database)?;
+        let mut events = Vec::new();
+        for row in rows {
+            ensure_storage_deadline(deadline)?;
+            events.push(row.map_err(|_| StorageError::Database)?);
+        }
 
         let genesis = projection
             .operations
@@ -1603,6 +1712,7 @@ fn verify_transition_evidence(
         for (index, (stored_epoch, stored_version, stored_cause, stored_digest)) in
             events.into_iter().enumerate()
         {
+            ensure_storage_deadline(deadline)?;
             let expected_epoch =
                 i64::try_from(index + 1).map_err(|_| StorageError::CorruptWorkspace)?;
             if stored_epoch != expected_epoch {
@@ -1623,13 +1733,17 @@ fn verify_transition_evidence(
                 return Err(StorageError::CorruptWorkspace);
             }
             prefix.insert(cause, operation.clone());
-            let at_event = replay(
+            let at_event = replay_until(
                 projection.workspace_id,
                 projection.creator,
                 projection.genesis_id,
                 prefix.clone(),
+                deadline,
             )
-            .map_err(|_| StorageError::CorruptWorkspace)?;
+            .map_err(|error| match error {
+                MembershipError::Storage(storage) => storage,
+                _ => StorageError::CorruptWorkspace,
+            })?;
             if at_event.snapshot.epoch().value()
                 != u64::try_from(expected_epoch).map_err(|_| StorageError::CorruptWorkspace)?
                 || at_event.snapshot.version()

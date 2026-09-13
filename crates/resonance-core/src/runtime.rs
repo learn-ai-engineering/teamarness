@@ -927,7 +927,7 @@ impl CoreRuntime {
         &self,
         bootstrap: &crate::membership::projection::ValidatedBootstrap,
         deadline: Option<std::time::Instant>,
-        mut fault: impl FnMut(crate::membership::projection::ImportBoundary) -> Result<(), StorageError>,
+        fault: impl FnMut(crate::membership::projection::ImportBoundary) -> Result<(), StorageError>,
     ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
         if let Some(deadline) = deadline {
             Self::ensure_join_deadline(deadline)?;
@@ -954,19 +954,11 @@ impl CoreRuntime {
                 .busy_timeout(remaining)
                 .map_err(|_| crate::OnboardingError::LocalConflict)?;
         }
-        let mut deadline_expired = false;
         let result = crate::membership::projection::import_bootstrap_with_fault(
             &mut state.connection,
             bootstrap,
-            |boundary| {
-                if boundary != crate::membership::projection::ImportBoundary::AfterCommit
-                    && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                {
-                    deadline_expired = true;
-                    return Err(StorageError::Database);
-                }
-                fault(boundary)
-            },
+            deadline,
+            fault,
         );
         if state
             .connection
@@ -980,8 +972,7 @@ impl CoreRuntime {
             &result,
             Err(crate::OnboardingError::UncertainStorageOutcome)
         ) && result.is_err()
-            && (deadline_expired
-                || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline))
+            && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
             return Err(crate::OnboardingError::Timeout);
         }
@@ -1061,6 +1052,43 @@ impl CoreRuntime {
         .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
         crate::onboarding::wire::decode_success(&frame)
             .map_err(|_| crate::OnboardingError::InvalidBootstrap)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn import_response_with_deadline_delay_for_test(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+        response: crate::onboarding::wire::SuccessResponse,
+        boundary: crate::membership::projection::ImportBoundary,
+        delay: std::time::Duration,
+        budget: std::time::Duration,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        let invitation = invitation
+            .verified()
+            .map_err(|_| crate::OnboardingError::InvalidInput)?;
+        let claim = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            crate::invitation::sign_claim(&state.secret_key, &invitation.token)
+                .map_err(map_invitation_onboarding_error)?
+        };
+        let bootstrap = crate::membership::projection::validate_bootstrap(
+            response,
+            &invitation.token,
+            &claim,
+            self.public_identity,
+        )?;
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .ok_or(crate::OnboardingError::Timeout)?;
+        self.import_validated_bootstrap(&bootstrap, Some(deadline), |current| {
+            if current == boundary {
+                std::thread::sleep(delay);
+            }
+            Ok(())
+        })
     }
 
     #[cfg(test)]

@@ -67,6 +67,61 @@ fn workspace_row_count(directory: &std::path::Path) -> i64 {
 }
 
 #[tokio::test]
+async fn initial_replay_and_transition_verification_overruns_time_out_and_roll_back() {
+    let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
+        response_fixture("initial-replay-deadline").await;
+
+    for boundary in [
+        ImportBoundary::LocalReplay,
+        ImportBoundary::TransitionVerification,
+    ] {
+        let error = joiner
+            .import_response_with_deadline_delay_for_test(
+                &invitation,
+                response.clone(),
+                boundary,
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(5),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, OnboardingError::Timeout);
+        assert_eq!(workspace_row_count(&joiner_directory), 0);
+    }
+
+    issuer.shutdown().await.unwrap();
+    joiner.shutdown().await.unwrap();
+    drop((issuer, joiner));
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
+async fn final_success_path_overrun_times_out_and_rolls_back() {
+    let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
+        response_fixture("final-success-deadline").await;
+
+    let error = joiner
+        .import_response_with_deadline_delay_for_test(
+            &invitation,
+            response,
+            ImportBoundary::BeforeCommit,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(5),
+        )
+        .unwrap_err();
+
+    assert_eq!(error, OnboardingError::Timeout);
+    assert_eq!(workspace_row_count(&joiner_directory), 0);
+
+    issuer.shutdown().await.unwrap();
+    joiner.shutdown().await.unwrap();
+    drop((issuer, joiner));
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
 async fn absent_workspace_exact_reimport_and_authenticated_reopen_are_idempotent() {
     let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
         response_fixture("idempotent").await;
@@ -304,6 +359,8 @@ async fn validation_rejects_anchor_name_genesis_admission_version_order_and_memb
 #[tokio::test]
 async fn every_import_write_group_rolls_back_and_uncertain_commit_poisons_until_reopen() {
     let boundaries = [
+        ImportBoundary::LocalReplay,
+        ImportBoundary::TransitionVerification,
         ImportBoundary::CreationRequest,
         ImportBoundary::WorkspaceAnchor,
         ImportBoundary::Operations,
