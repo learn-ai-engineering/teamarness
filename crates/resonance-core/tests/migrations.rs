@@ -15,10 +15,14 @@ fn private_data_directory(test_name: &str) -> PathBuf {
     ))
 }
 
-#[test]
-fn migration_0001_reserves_nullable_human_identity_subjects() {
+#[tokio::test]
+async fn migration_0001_reserves_nullable_human_identity_subjects() {
     let directory = private_data_directory("migration-human-identity");
-    CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
 
     let human_column: Option<(i64, String)> = connection
@@ -64,11 +68,14 @@ fn migration_0001_reserves_nullable_human_identity_subjects() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
+#[tokio::test]
+async fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
     let directory = private_data_directory("migration-workspaces");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
     runtime.create_workspace("Migration").unwrap();
+    runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
 
@@ -109,10 +116,14 @@ fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
+#[tokio::test]
+async fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
     let directory = private_data_directory("migration-invitations");
-    CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
 
     let table_exists: i64 = connection
@@ -137,10 +148,14 @@ fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn migration_0004_adds_the_append_only_transition_ledger() {
+#[tokio::test]
+async fn migration_0004_adds_the_append_only_transition_ledger() {
     let directory = private_data_directory("migration-transitions");
-    CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
 
     let table_exists: i64 = connection
@@ -165,13 +180,17 @@ fn migration_0004_adds_the_append_only_transition_ledger() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn ordered_migration_is_idempotent_on_reopen() {
+#[tokio::test]
+async fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
 
-    CoreRuntime::open(config.clone()).unwrap();
-    CoreRuntime::open(config).unwrap();
+    let first = CoreRuntime::open(config.clone()).await.unwrap();
+    first.shutdown().await.unwrap();
+    drop(first);
+    let second = CoreRuntime::open(config).await.unwrap();
+    second.shutdown().await.unwrap();
+    drop(second);
 
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     let version: i64 = connection

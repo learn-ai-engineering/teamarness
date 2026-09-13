@@ -430,6 +430,8 @@ pub enum CoreError {
     Identity(IdentityError),
     /// Durable storage initialization or recovery failed.
     Storage(StorageError),
+    /// The private onboarding transport could not be started.
+    Onboarding(OnboardingError),
 }
 
 impl fmt::Display for CoreError {
@@ -438,6 +440,7 @@ impl fmt::Display for CoreError {
             Self::Configuration(error) => error.fmt(formatter),
             Self::Identity(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
+            Self::Onboarding(error) => error.fmt(formatter),
         }
     }
 }
@@ -454,6 +457,7 @@ impl Error for CoreError {
             Self::Configuration(error) => Some(error),
             Self::Identity(error) => Some(error),
             Self::Storage(error) => Some(error),
+            Self::Onboarding(error) => Some(error),
         }
     }
 }

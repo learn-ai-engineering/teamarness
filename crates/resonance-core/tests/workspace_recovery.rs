@@ -23,11 +23,11 @@ fn database(directory: &Path) -> Connection {
     connection
 }
 
-#[test]
-fn create_workspace_persists_one_immutable_manager_genesis() {
+#[tokio::test]
+async fn create_workspace_persists_one_immutable_manager_genesis() {
     let directory = private_data_directory("workspace-create");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
     let creator = runtime.public_identity();
 
     let created = runtime.create_workspace("Field Notes").unwrap();
@@ -35,9 +35,10 @@ fn create_workspace_persists_one_immutable_manager_genesis() {
     assert_eq!(created.created_by(), creator);
     assert!(created.created_at_unix_ms() > 0);
     assert_eq!(runtime.list_workspaces().unwrap(), vec![created.clone()]);
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).unwrap();
+    let reopened = CoreRuntime::open(config).await.unwrap();
     assert_eq!(reopened.list_workspaces().unwrap(), vec![created.clone()]);
 
     let connection = database(&directory);
@@ -73,16 +74,18 @@ fn create_workspace_persists_one_immutable_manager_genesis() {
     assert_eq!(role, MembershipRole::Manager as i64);
 
     drop(connection);
+    reopened.shutdown().await.unwrap();
     drop(reopened);
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
+#[tokio::test]
+async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
     let directory = private_data_directory("workspace-pending-recovery");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
     let workspace = runtime.create_workspace("Recovered").unwrap();
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
     let connection = database(&directory);
@@ -131,7 +134,7 @@ fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
         .unwrap();
     drop(connection);
 
-    let recovered = CoreRuntime::open(config).unwrap();
+    let recovered = CoreRuntime::open(config).await.unwrap();
     assert_eq!(
         recovered.list_workspaces().unwrap(),
         vec![workspace.clone()]
@@ -159,14 +162,17 @@ fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
     assert_eq!(counts, (1, 1, 1));
 
     drop(connection);
+    recovered.shutdown().await.unwrap();
     drop(recovered);
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn workspace_names_are_validated_before_any_request_is_written() {
+#[tokio::test]
+async fn workspace_names_are_validated_before_any_request_is_written() {
     let directory = private_data_directory("workspace-name");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
 
     for invalid in [
         "",
@@ -192,6 +198,7 @@ fn workspace_names_are_validated_before_any_request_is_written() {
     assert_eq!(pending, None);
 
     drop(connection);
+    runtime.shutdown().await.unwrap();
     drop(runtime);
     fs::remove_dir_all(directory).unwrap();
 }

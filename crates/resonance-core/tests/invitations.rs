@@ -50,13 +50,15 @@ fn tamper_hex_byte(value: &mut String, offset: usize) {
     value.replace_range(offset..offset + 2, replacement);
 }
 
-#[test]
-fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
+#[tokio::test]
+async fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
     let issuer_directory = private_data_directory("invitation-issuer");
     let invitee_directory = private_data_directory("invitation-invitee");
     let issuer_config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(issuer_config.clone()).unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+    let issuer = CoreRuntime::open(issuer_config.clone()).await.unwrap();
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Invitations").unwrap();
 
     let token = issuer
@@ -92,9 +94,10 @@ fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
         transition.cause()
     );
     drop(connection);
+    issuer.shutdown().await.unwrap();
     drop(issuer);
 
-    let reopened = CoreRuntime::open(issuer_config).unwrap();
+    let reopened = CoreRuntime::open(issuer_config).await.unwrap();
     assert_eq!(
         reopened.membership_snapshot(workspace.id()).unwrap(),
         snapshot
@@ -104,19 +107,21 @@ fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
         InvitationError::AlreadyUsed
     );
 
+    reopened.shutdown().await.unwrap();
     drop(reopened);
+    invitee.shutdown().await.unwrap();
     drop(invitee);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();
 }
 
-#[test]
-fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_rejected() {
+#[tokio::test]
+async fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_rejected() {
     let issuer_directory = private_data_directory("invitation-validation-issuer");
     let issuer_copy_directory = private_data_directory("invitation-validation-copy");
     let invitee_directory = private_data_directory("invitation-validation-invitee");
     let issuer_config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(issuer_config.clone()).unwrap();
+    let issuer = CoreRuntime::open(issuer_config.clone()).await.unwrap();
     fs::create_dir_all(&issuer_copy_directory).unwrap();
     fs::copy(
         issuer_directory.join("core.sqlite3"),
@@ -142,7 +147,9 @@ fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_rejected
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
     let claim = invitee.create_invitation_claim(&token).unwrap();
 
     assert_eq!(
@@ -150,7 +157,9 @@ fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_rejected
         InvitationError::WrongIssuer
     );
     let issuer_without_workspace =
-        CoreRuntime::open(CoreRuntimeConfig::new(&issuer_copy_directory)).unwrap();
+        CoreRuntime::open(CoreRuntimeConfig::new(&issuer_copy_directory))
+            .await
+            .unwrap();
     assert_eq!(
         issuer_without_workspace
             .redeem_invitation(&claim)
@@ -166,20 +175,27 @@ fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_rejected
     assert!(InvitationClaim::from_str(&changed_target).is_err());
     assert!(InvitationClaim::from_str(token.encoded()).is_err());
 
+    issuer_without_workspace.shutdown().await.unwrap();
     drop(issuer_without_workspace);
+    invitee.shutdown().await.unwrap();
     drop(invitee);
+    issuer.shutdown().await.unwrap();
     drop(issuer);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(issuer_copy_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();
 }
 
-#[test]
-fn an_expired_token_is_not_consumed() {
+#[tokio::test]
+async fn an_expired_token_is_not_consumed() {
     let issuer_directory = private_data_directory("invitation-expired-issuer");
     let invitee_directory = private_data_directory("invitation-expired-invitee");
-    let issuer = CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory)).unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+    let issuer = CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory))
+        .await
+        .unwrap();
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Expiry").unwrap();
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 5)
@@ -205,26 +221,32 @@ fn an_expired_token_is_not_consumed() {
     assert_eq!(counts, (0, 0, 0));
 
     drop(connection);
+    invitee.shutdown().await.unwrap();
     drop(invitee);
+    issuer.shutdown().await.unwrap();
     drop(issuer);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();
 }
 
-#[test]
-fn an_admitted_non_manager_cannot_issue_an_invitation() {
+#[tokio::test]
+async fn an_admitted_non_manager_cannot_issue_an_invitation() {
     let issuer_directory = private_data_directory("invitation-non-manager-issuer");
     let invitee_directory = private_data_directory("invitation-non-manager-invitee");
     let issuer_config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(issuer_config.clone()).unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+    let issuer = CoreRuntime::open(issuer_config.clone()).await.unwrap();
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Manager only").unwrap();
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
     let claim = invitee.create_invitation_claim(&token).unwrap();
     issuer.redeem_invitation(&claim).unwrap();
+    issuer.shutdown().await.unwrap();
     drop(issuer);
+    invitee.shutdown().await.unwrap();
     drop(invitee);
 
     let invitee_connection = database(&invitee_directory);
@@ -245,7 +267,7 @@ fn an_admitted_non_manager_cannot_issue_an_invitation() {
         .unwrap();
     drop(connection);
 
-    let member_runtime = CoreRuntime::open(issuer_config).unwrap();
+    let member_runtime = CoreRuntime::open(issuer_config).await.unwrap();
     assert_eq!(
         member_runtime
             .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
@@ -253,6 +275,7 @@ fn an_admitted_non_manager_cannot_issue_an_invitation() {
         InvitationError::NotManager
     );
 
+    member_runtime.shutdown().await.unwrap();
     drop(member_runtime);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();

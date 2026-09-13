@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_base::{PublicKey, SecretKey, Signature};
@@ -505,6 +505,7 @@ pub struct CoreRuntime {
     public_identity: PublicIdentity,
     state: Mutex<RuntimeState>,
     clock: Box<dyn Clock>,
+    transport: Arc<crate::onboarding::transport::Transport>,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -552,20 +553,36 @@ impl CoreRuntime {
         crate::membership::authenticate(canonical_envelope).map(|envelope| envelope.id)
     }
 
-    /// Opens or initializes the runtime in its private data directory.
-    pub fn open(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
-        Self::open_inner(config, Box::new(SystemClock))
+    /// Opens storage and starts the authenticated onboarding transport.
+    ///
+    /// Opening does not wait for public relay readiness, so local commands remain
+    /// available while offline. Call [`Self::shutdown`] and await it before exit.
+    pub async fn open(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
+        Self::open_inner(config, Box::new(SystemClock), None).await
     }
 
     #[cfg(test)]
-    fn open_with_clock(
+    async fn open_with_clock(
         config: CoreRuntimeConfig,
         clock: Box<dyn Clock>,
     ) -> Result<Self, CoreError> {
-        Self::open_inner(config, clock)
+        Self::open_inner(config, clock, Some(true)).await
     }
 
-    fn open_inner(config: CoreRuntimeConfig, clock: Box<dyn Clock>) -> Result<Self, CoreError> {
+    #[cfg(test)]
+    async fn open_with_clock_and_readiness(
+        config: CoreRuntimeConfig,
+        clock: Box<dyn Clock>,
+        ready_immediately: bool,
+    ) -> Result<Self, CoreError> {
+        Self::open_inner(config, clock, Some(ready_immediately)).await
+    }
+
+    async fn open_inner(
+        config: CoreRuntimeConfig,
+        clock: Box<dyn Clock>,
+        #[cfg_attr(not(test), allow(unused_variables))] test_readiness: Option<bool>,
+    ) -> Result<Self, CoreError> {
         let opened_at_unix_ms = clock.now_unix_ms();
         let stored = crate::storage::open(config.private_data_directory())?;
         let crate::storage::StoredRuntime {
@@ -576,6 +593,22 @@ impl CoreRuntime {
         let public_identity = PublicIdentity(secret_key.public());
         let memberships =
             crate::membership::projection::recover(&mut connection, opened_at_unix_ms)?;
+        #[cfg(test)]
+        let transport = if let Some(ready_immediately) = test_readiness {
+            crate::onboarding::transport::Transport::bind_loopback(
+                secret_key.clone(),
+                std::time::Duration::from_millis(5),
+                ready_immediately,
+            )
+            .await
+        } else {
+            crate::onboarding::transport::Transport::bind_production(secret_key.clone()).await
+        };
+        #[cfg(not(test))]
+        let transport =
+            crate::onboarding::transport::Transport::bind_production(secret_key.clone()).await;
+        let transport = transport.map_err(CoreError::Onboarding)?;
+        debug_assert_eq!(transport.endpoint_id(), secret_key.public());
         Ok(Self {
             public_identity,
             state: Mutex::new(RuntimeState {
@@ -587,6 +620,7 @@ impl CoreRuntime {
                 poisoned: false,
             }),
             clock,
+            transport,
         })
     }
 
@@ -712,9 +746,17 @@ impl CoreRuntime {
         workspace_id: WorkspaceId,
         expires_at_unix_ms: i64,
     ) -> Result<InvitationToken, InvitationError> {
+        self.issue_invitation_at(workspace_id, self.clock.now_unix_ms(), expires_at_unix_ms)
+    }
+
+    fn issue_invitation_at(
+        &self,
+        workspace_id: WorkspaceId,
+        issued_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<InvitationToken, InvitationError> {
         let mut state = self.lock_invitation_state()?;
-        let now_unix_ms = self.clock.now_unix_ms();
-        self.maintain_and_publish(&mut state, now_unix_ms)
+        self.maintain_and_publish(&mut state, issued_at_unix_ms)
             .map_err(InvitationError::Membership)?;
         let RuntimeState {
             secret_key,
@@ -730,18 +772,48 @@ impl CoreRuntime {
         if !local_is_manager {
             return Err(InvitationError::NotManager);
         }
-        if expires_at_unix_ms <= now_unix_ms {
+        if expires_at_unix_ms <= issued_at_unix_ms {
             return Err(InvitationError::Expired);
         }
         let nonce = SecretKey::generate().to_bytes();
         let token = crate::invitation::sign_token(
             secret_key,
             workspace_id,
-            now_unix_ms,
+            issued_at_unix_ms,
             expires_at_unix_ms,
             nonce,
         )?;
         Ok(InvitationToken::from_verified(&token))
+    }
+
+    /// Creates a fixed-lifetime opaque invitation after endpoint readiness succeeds.
+    pub async fn create_workspace_invitation(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
+        const INVITATION_LIFETIME_MS: i64 = 15 * 60 * 1_000;
+
+        let endpoint_addr = self.transport.invitation_address().await?;
+        let issued_at_unix_ms = self.clock.now_unix_ms();
+        let token = self
+            .issue_invitation_at(
+                workspace_id,
+                issued_at_unix_ms,
+                issued_at_unix_ms.saturating_add(INVITATION_LIFETIME_MS),
+            )
+            .map_err(map_invitation_onboarding_error)?;
+        let verified = token
+            .verified()
+            .map_err(|_| crate::OnboardingError::Authentication)?;
+        crate::WorkspaceInvitation::from_parts(&verified, endpoint_addr)
+            .map_err(|_| crate::OnboardingError::InvalidInput)
+    }
+
+    /// Stops accepting onboarding work and awaits transport closure.
+    ///
+    /// Local identity, Workspace, and membership commands remain available.
+    pub async fn shutdown(&self) -> Result<(), crate::OnboardingError> {
+        self.transport.shutdown().await
     }
 
     /// Creates proof that this installation claims the supplied invitation.
@@ -1099,6 +1171,30 @@ impl CoreRuntime {
     }
 }
 
+fn map_invitation_onboarding_error(error: InvitationError) -> crate::OnboardingError {
+    match error {
+        InvitationError::Expired => crate::OnboardingError::Expired,
+        InvitationError::AlreadyUsed => crate::OnboardingError::AlreadyUsed,
+        InvitationError::Storage(StorageError::UncertainOutcome)
+        | InvitationError::Membership(MembershipError::Storage(StorageError::UncertainOutcome)) => {
+            crate::OnboardingError::UncertainStorageOutcome
+        }
+        InvitationError::WorkspaceNotFound => crate::OnboardingError::LocalConflict,
+        InvitationError::NotManager
+        | InvitationError::WrongIssuer
+        | InvitationError::InvalidTokenSignature
+        | InvitationError::InvalidClaimSignature
+        | InvitationError::ClaimTargetMismatch => crate::OnboardingError::Authentication,
+        _ => crate::OnboardingError::InvalidInput,
+    }
+}
+
+impl Drop for CoreRuntime {
+    fn drop(&mut self) {
+        self.transport.start_abnormal_shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1122,8 +1218,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_clock_is_injected_without_entering_the_public_configuration() {
+    #[tokio::test]
+    async fn test_clock_is_injected_without_entering_the_public_configuration() {
         let calls = Arc::new(AtomicU64::new(0));
         let directory =
             std::env::temp_dir().join(format!("resonance-runtime-clock-{}", std::process::id()));
@@ -1135,9 +1231,137 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
         )
+        .await
         .unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn endpoint_identity_persists_and_invitation_lifetime_starts_after_readiness() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-transport-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let now = Arc::new(AtomicI64::new(42_000));
+        let config = CoreRuntimeConfig::new(&directory);
+        let runtime = CoreRuntime::open_with_clock(
+            config.clone(),
+            Box::new(AdjustableClock(Arc::clone(&now))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.transport.endpoint_id(),
+            runtime.public_identity.as_public_key()
+        );
+        let workspace = runtime.create_workspace("Transport identity").unwrap();
+        let invitation = runtime
+            .create_workspace_invitation(workspace.id())
+            .await
+            .unwrap();
+        let verified = invitation.verified().unwrap();
+        assert_eq!(verified.token.issued_at_unix_ms, 42_000);
+        assert_eq!(verified.token.expires_at_unix_ms, 42_000 + 15 * 60 * 1_000);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+
+        let reopened =
+            CoreRuntime::open_with_clock(config, Box::new(AdjustableClock(Arc::clone(&now))))
+                .await
+                .unwrap();
+        assert_eq!(
+            reopened.transport.endpoint_id(),
+            reopened.public_identity.as_public_key()
+        );
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_does_not_sign_or_start_an_invitation_lifetime() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-readiness-clock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let calls = Arc::new(AtomicU64::new(0));
+        let runtime = CoreRuntime::open_with_clock_and_readiness(
+            CoreRuntimeConfig::new(&directory),
+            Box::new(RecordingClock {
+                calls: Arc::clone(&calls),
+            }),
+            false,
+        )
+        .await
+        .unwrap();
+        let workspace = runtime.create_workspace("No readiness").unwrap();
+        let before = calls.load(Ordering::Relaxed);
+        assert_eq!(
+            runtime
+                .create_workspace_invitation(workspace.id())
+                .await
+                .unwrap_err(),
+            crate::OnboardingError::Readiness
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), before);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_transport_rejects_onboarding_but_preserves_local_commands() {
+        let directory = std::env::temp_dir().join(format!(
+            "resonance-runtime-local-during-shutdown-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let runtime = Arc::new(
+            CoreRuntime::open_with_clock(
+                CoreRuntimeConfig::new(&directory),
+                Box::new(AdjustableClock(Arc::new(AtomicI64::new(7_000)))),
+            )
+            .await
+            .unwrap(),
+        );
+        let workspace = runtime.create_workspace("Local during shutdown").unwrap();
+        let active = runtime.transport.begin_outbound().await.unwrap();
+        let closing = Arc::clone(&runtime);
+        let shutdown = tokio::spawn(async move { closing.shutdown().await });
+        while runtime.transport.lifecycle_state() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(runtime.display_name(), "This device");
+        assert_eq!(runtime.list_workspaces().unwrap(), vec![workspace.clone()]);
+        assert_eq!(
+            runtime
+                .membership_snapshot(workspace.id())
+                .unwrap()
+                .members()
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .create_workspace_invitation(workspace.id())
+                .await
+                .unwrap_err(),
+            crate::OnboardingError::Shutdown
+        );
+        assert!(matches!(
+            runtime.transport.begin_outbound().await,
+            Err(crate::OnboardingError::Shutdown)
+        ));
+        drop(active);
+        shutdown.await.unwrap().unwrap();
+        runtime.shutdown().await.unwrap();
         drop(runtime);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1200,8 +1424,8 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen() {
+    #[tokio::test]
+    async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen() {
         let issuer_directory = std::env::temp_dir().join(format!(
             "resonance-runtime-invitation-uncertain-{}",
             std::process::id()
@@ -1213,8 +1437,10 @@ mod tests {
         let _ = fs::remove_dir_all(&issuer_directory);
         let _ = fs::remove_dir_all(&invitee_directory);
         let config = CoreRuntimeConfig::new(&issuer_directory);
-        let issuer = CoreRuntime::open(config.clone()).unwrap();
-        let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+        let issuer = CoreRuntime::open(config.clone()).await.unwrap();
+        let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+            .await
+            .unwrap();
         let workspace = issuer.create_workspace("Uncertain invitation").unwrap();
         let token = issuer
             .issue_invitation(
@@ -1242,9 +1468,10 @@ mod tests {
                 .unwrap_err(),
             InvitationError::Storage(StorageError::RuntimePoisoned)
         );
+        issuer.shutdown().await.unwrap();
         drop(issuer);
 
-        let reopened = CoreRuntime::open(config).unwrap();
+        let reopened = CoreRuntime::open(config).await.unwrap();
         let snapshot = reopened.membership_snapshot(workspace.id()).unwrap();
         assert_eq!(snapshot.epoch(), MembershipEpoch::new(1));
         assert_eq!(snapshot.members().len(), 2);
@@ -1253,20 +1480,24 @@ mod tests {
             InvitationError::AlreadyUsed
         );
 
+        reopened.shutdown().await.unwrap();
         drop(reopened);
+        invitee.shutdown().await.unwrap();
         drop(invitee);
         fs::remove_dir_all(issuer_directory).unwrap();
         fs::remove_dir_all(invitee_directory).unwrap();
     }
 
-    #[test]
-    fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_advancing_state() {
+    #[tokio::test]
+    async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_advancing_state() {
         let directory = std::env::temp_dir().join(format!(
             "resonance-runtime-membership-validation-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&directory);
-        let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+        let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+            .await
+            .unwrap();
         let workspace = runtime.create_workspace("Membership validation").unwrap();
         let manager = runtime_secret(&runtime);
         let member = member_secret(31);
@@ -1371,6 +1602,7 @@ mod tests {
         assert_eq!(final_snapshot.epoch(), MembershipEpoch::new(2));
         assert_eq!(final_snapshot.members().len(), 1);
 
+        runtime.shutdown().await.unwrap();
         drop(runtime);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1403,14 +1635,16 @@ mod tests {
         orders
     }
 
-    #[test]
-    fn every_reachable_topological_order_converges_for_single_manager_branches() {
+    #[tokio::test]
+    async fn every_reachable_topological_order_converges_for_single_manager_branches() {
         let baseline = std::env::temp_dir().join(format!(
             "resonance-runtime-convergence-baseline-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&baseline);
-        let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&baseline)).unwrap();
+        let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&baseline))
+            .await
+            .unwrap();
         let workspace = runtime.create_workspace("Reachable convergence").unwrap();
         let manager = runtime_secret(&runtime);
         let genesis = runtime_heads(&runtime, workspace.id())[0];
@@ -1463,6 +1697,7 @@ mod tests {
         );
         let operations = [admit_a, duplicate_a, admit_b, revoke_a, admit_c]
             .map(|operation| operation.canonical_bytes().to_vec());
+        runtime.shutdown().await.unwrap();
         drop(runtime);
 
         let orders = topological_orders(&[vec![], vec![], vec![], vec![0], vec![2]]);
@@ -1480,7 +1715,9 @@ mod tests {
                 directory.join(crate::storage::DATABASE_FILE_NAME),
             )
             .unwrap();
-            let branch = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+            let branch = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+                .await
+                .unwrap();
             for operation in order {
                 assert!(
                     branch
@@ -1512,6 +1749,7 @@ mod tests {
                 Some(expected) => assert_eq!(&snapshot, expected),
                 None => expected = Some(snapshot),
             }
+            branch.shutdown().await.unwrap();
             drop(branch);
             fs::remove_dir_all(directory).unwrap();
         }
@@ -1527,8 +1765,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn quarantine_retries_dependency_first_and_never_advances_twice() {
+    #[tokio::test]
+    async fn quarantine_retries_dependency_first_and_never_advances_twice() {
         let directory = std::env::temp_dir().join(format!(
             "resonance-runtime-quarantine-{}",
             std::process::id()
@@ -1540,6 +1778,7 @@ mod tests {
             config.clone(),
             Box::new(AdjustableClock(Arc::clone(&now))),
         )
+        .await
         .unwrap();
         let workspace = runtime.create_workspace("Quarantine").unwrap();
         let manager = runtime_secret(&runtime);
@@ -1592,12 +1831,14 @@ mod tests {
             .unwrap();
         assert_eq!(transition_count, 0);
 
+        runtime.shutdown().await.unwrap();
         drop(runtime);
         now.store(1_002, Ordering::Relaxed);
         let recovered = CoreRuntime::open_with_clock(
             config.clone(),
             Box::new(AdjustableClock(Arc::clone(&now))),
         )
+        .await
         .unwrap();
         let eligible = recovered.membership_snapshot(workspace.id()).unwrap();
         assert_eq!(eligible.epoch(), MembershipEpoch::new(2));
@@ -1626,16 +1867,19 @@ mod tests {
             recovered.membership_snapshot(workspace.id()).unwrap(),
             eligible
         );
+        recovered.shutdown().await.unwrap();
         drop(recovered);
 
         let reopened =
             CoreRuntime::open_with_clock(config, Box::new(AdjustableClock(Arc::clone(&now))))
+                .await
                 .unwrap();
         assert_eq!(
             reopened.membership_snapshot(workspace.id()).unwrap(),
             eligible
         );
 
+        reopened.shutdown().await.unwrap();
         drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }

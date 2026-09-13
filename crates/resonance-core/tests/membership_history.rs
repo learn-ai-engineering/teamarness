@@ -40,14 +40,20 @@ fn operation_time(directory: &Path, action: i64) -> i64 {
         .unwrap()
 }
 
-#[test]
-fn declared_history_uses_inclusive_admission_and_exclusive_revocation_boundaries() {
+#[tokio::test]
+async fn declared_history_uses_inclusive_admission_and_exclusive_revocation_boundaries() {
     let issuer_directory = private_data_directory("history-issuer");
     let invitee_directory = private_data_directory("history-invitee");
     let never_directory = private_data_directory("history-never");
-    let issuer = CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory)).unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
-    let never_runtime = CoreRuntime::open(CoreRuntimeConfig::new(&never_directory)).unwrap();
+    let issuer = CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory))
+        .await
+        .unwrap();
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
+    let never_runtime = CoreRuntime::open(CoreRuntimeConfig::new(&never_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("History").unwrap();
     let creator = issuer.public_identity();
     let never: PublicIdentity = never_runtime.public_identity();
@@ -118,8 +124,11 @@ fn declared_history_uses_inclusive_admission_and_exclusive_revocation_boundaries
             .version()
     );
 
+    never_runtime.shutdown().await.unwrap();
     drop(never_runtime);
+    invitee.shutdown().await.unwrap();
     drop(invitee);
+    issuer.shutdown().await.unwrap();
     drop(issuer);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();

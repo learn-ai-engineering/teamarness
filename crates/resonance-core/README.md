@@ -9,17 +9,18 @@ Open one runtime for an installation-private data directory:
 ```rust
 use resonance_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch};
 
-let runtime = CoreRuntime::open(CoreRuntimeConfig::new("private-data"))?;
+let runtime = CoreRuntime::open(CoreRuntimeConfig::new("private-data")).await?;
 let identity = runtime.public_identity();
 let workspace = runtime.create_workspace("Team")?;
 let snapshot = runtime.membership_snapshot(workspace.id())?;
 let transitions = runtime.subscribe_membership(workspace.id(), MembershipEpoch::new(0))?;
+runtime.shutdown().await?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The public API supports:
 
-- opening an installation and reading or changing validated display metadata;
+- asynchronously opening an installation, authenticating storage, recovering membership, and starting one Iroh onboarding endpoint from the persisted Installation key;
 - domain-separated signing and public signature verification without secret access;
 - creating and listing workspaces;
 - issuing an expiring invitation as the creator-manager, claiming it on another installation, and redeeming it once on the issuer;
@@ -28,7 +29,9 @@ The public API supports:
 - querying declared-time membership history; and
 - catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor.
 
-Installation secrets, raw key bytes, SQLite connections, canonical-operation adapters, mutable p2panda `GroupCrdt` state, fault hooks, and transition publishers are not public.
+Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. Runtime shutdown rejects new onboarding transport work, leaves local identity, Workspace, and membership commands available, and must be awaited. `Drop` is an abnormal best-effort cleanup fallback only.
+
+Installation secrets, raw key bytes, SQLite connections, Iroh endpoint and router handles, canonical-operation adapters, mutable p2panda `GroupCrdt` state, fault hooks, and transition publishers are not public.
 
 ## Declared-time warning
 
@@ -44,7 +47,7 @@ Workspace creation records generated identity and signed genesis material once, 
 
 Phase 1 does not provide:
 
-- Iroh endpoint binding, relays, peer discovery, networking, or membership synchronization;
+- completed remote admission, Workspace bootstrap import, peer discovery, or membership synchronization;
 - distributed invitation-spend coordination across managers or databases;
 - a second-manager path, promotion, demotion, arbitrary access levels, nested groups, or re-admission after revocation;
 - multi-manager conflict fixtures (mutual manager removal and dependent transitive invalidation are deferred until a supported second-manager path exists);

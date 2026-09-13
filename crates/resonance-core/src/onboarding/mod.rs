@@ -1,4 +1,6 @@
+mod handler;
 mod transfer;
+pub(crate) mod transport;
 mod wire;
 
 pub use transfer::WorkspaceInvitation;

@@ -42,15 +42,19 @@ fn admit(issuer: &CoreRuntime, invitee: &CoreRuntime, workspace_id: resonance_co
     issuer.redeem_invitation(&claim).unwrap();
 }
 
-#[test]
-fn durable_and_live_transitions_resume_in_order_without_startup_duplicates() {
+#[tokio::test]
+async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates() {
     let issuer_directory = private_data_directory("transitions-issuer");
     let invitee_a_directory = private_data_directory("transitions-a");
     let invitee_b_directory = private_data_directory("transitions-b");
     let config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(config.clone()).unwrap();
-    let invitee_a = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_a_directory)).unwrap();
-    let invitee_b = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_b_directory)).unwrap();
+    let issuer = CoreRuntime::open(config.clone()).await.unwrap();
+    let invitee_a = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_a_directory))
+        .await
+        .unwrap();
+    let invitee_b = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_b_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Transitions").unwrap();
     let mut live = issuer
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
@@ -116,9 +120,10 @@ fn durable_and_live_transitions_resume_in_order_without_startup_duplicates() {
     assert_eq!(digest, third.snapshot_digest().to_string());
     drop(connection);
     drop(live);
+    issuer.shutdown().await.unwrap();
     drop(issuer);
 
-    let reopened = CoreRuntime::open(config.clone()).unwrap();
+    let reopened = CoreRuntime::open(config.clone()).await.unwrap();
     let mut from_zero = reopened
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
         .unwrap();
@@ -138,20 +143,29 @@ fn durable_and_live_transitions_resume_in_order_without_startup_duplicates() {
 
     drop(from_two);
     drop(from_zero);
+    reopened.shutdown().await.unwrap();
     drop(reopened);
+    invitee_a.shutdown().await.unwrap();
     drop(invitee_a);
+    invitee_b.shutdown().await.unwrap();
     drop(invitee_b);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_a_directory).unwrap();
     fs::remove_dir_all(invitee_b_directory).unwrap();
 }
 
-#[test]
-fn listener_registration_racing_a_commit_is_gap_free_and_slow_delivery_is_ordered() {
+#[tokio::test]
+async fn listener_registration_racing_a_commit_is_gap_free_and_slow_delivery_is_ordered() {
     let issuer_directory = private_data_directory("transition-race-issuer");
     let invitee_directory = private_data_directory("transition-race-invitee");
-    let issuer = Arc::new(CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory)).unwrap());
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+    let issuer = Arc::new(
+        CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory))
+            .await
+            .unwrap(),
+    );
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Transition race").unwrap();
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
@@ -170,22 +184,27 @@ fn listener_registration_racing_a_commit_is_gap_free_and_slow_delivery_is_ordere
     assert_eq!(subscription.next_transition().unwrap(), Some(committed));
 
     drop(subscription);
+    invitee.shutdown().await.unwrap();
     drop(invitee);
+    issuer.shutdown().await.unwrap();
     drop(issuer);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();
 }
 
-#[test]
-fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_evidence() {
+#[tokio::test]
+async fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_evidence() {
     let issuer_directory = private_data_directory("transition-recovery-issuer");
     let invitee_directory = private_data_directory("transition-recovery-invitee");
     let config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(config.clone()).unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory)).unwrap();
+    let issuer = CoreRuntime::open(config.clone()).await.unwrap();
+    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Transition recovery").unwrap();
     admit(&issuer, &invitee, workspace.id());
     let expected = issuer.membership_snapshot(workspace.id()).unwrap();
+    issuer.shutdown().await.unwrap();
     drop(issuer);
 
     let connection = database(&issuer_directory);
@@ -196,11 +215,12 @@ fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_eviden
         .execute("DELETE FROM workspace_membership_state", [])
         .unwrap();
     drop(connection);
-    let repaired = CoreRuntime::open(config.clone()).unwrap();
+    let repaired = CoreRuntime::open(config.clone()).await.unwrap();
     assert_eq!(
         repaired.membership_snapshot(workspace.id()).unwrap(),
         expected
     );
+    repaired.shutdown().await.unwrap();
     drop(repaired);
 
     let connection = database(&issuer_directory);
@@ -220,7 +240,7 @@ fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_eviden
         .unwrap();
     drop(connection);
     assert!(matches!(
-        CoreRuntime::open(config.clone()),
+        CoreRuntime::open(config.clone()).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 
@@ -247,10 +267,11 @@ fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_eviden
         .unwrap();
     drop(connection);
     assert!(matches!(
-        CoreRuntime::open(config),
+        CoreRuntime::open(config).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 
+    invitee.shutdown().await.unwrap();
     drop(invitee);
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(invitee_directory).unwrap();

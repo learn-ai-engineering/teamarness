@@ -61,14 +61,16 @@ fn compile_fails(fixture: &Path, expected_marker: &str, shared_target: &Path) {
     fs::remove_dir_all(crate_directory).unwrap();
 }
 
-#[test]
-fn public_identity_has_a_stable_validated_string_serde_contract() {
+#[tokio::test]
+async fn public_identity_has_a_stable_validated_string_serde_contract() {
     fn assert_serde_traits<T: Serialize + for<'de> Deserialize<'de>>() {}
 
     assert_serde_traits::<PublicIdentity>();
 
     let directory = temporary_directory();
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
     let identity = runtime.public_identity();
     let display = identity.to_string();
 
@@ -80,12 +82,13 @@ fn public_identity_has_a_stable_validated_string_serde_contract() {
     );
     assert!(serde_json::from_str::<PublicIdentity>(r#""not-a-public-identity""#).is_err());
 
+    runtime.shutdown().await.unwrap();
     drop(runtime);
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn external_consumers_cannot_cross_the_runtime_boundary() {
+#[tokio::test]
+async fn external_consumers_cannot_cross_the_runtime_boundary() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui");
     let target = temporary_directory();
     let cases = [

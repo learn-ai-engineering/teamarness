@@ -23,11 +23,11 @@ fn database(directory: &Path) -> Connection {
     Connection::open(directory.join("core.sqlite3")).unwrap()
 }
 
-#[test]
-fn workspace_snapshot_is_available_through_core_runtime_and_survives_reopen() {
+#[tokio::test]
+async fn workspace_snapshot_is_available_through_core_runtime_and_survives_reopen() {
     let directory = private_data_directory("membership-snapshot");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
     let creator = runtime.public_identity();
     let workspace = runtime.create_workspace("Projected").unwrap();
 
@@ -37,22 +37,26 @@ fn workspace_snapshot_is_available_through_core_runtime_and_survives_reopen() {
     assert_eq!(before.members().len(), 1);
     assert_eq!(before.members()[0].identity(), creator);
     assert_eq!(before.members()[0].role(), MembershipRole::Manager);
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).unwrap();
+    let reopened = CoreRuntime::open(config).await.unwrap();
     assert_eq!(
         reopened.membership_snapshot(workspace.id()).unwrap(),
         before
     );
 
+    reopened.shutdown().await.unwrap();
     drop(reopened);
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn invalid_public_membership_commands_leave_the_projection_unchanged() {
+#[tokio::test]
+async fn invalid_public_membership_commands_leave_the_projection_unchanged() {
     let directory = private_data_directory("membership-invalid");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Guarded membership").unwrap();
     let before = runtime.membership_snapshot(workspace.id()).unwrap();
 
@@ -70,17 +74,19 @@ fn invalid_public_membership_commands_leave_the_projection_unchanged() {
         MembershipError::WorkspaceNotFound
     );
 
+    runtime.shutdown().await.unwrap();
     drop(runtime);
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
+#[tokio::test]
+async fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
     let directory = private_data_directory("membership-rebuild");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
     let workspace = runtime.create_workspace("Repairable").unwrap();
     let expected = runtime.membership_snapshot(workspace.id()).unwrap();
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
     let connection = database(&directory);
@@ -92,11 +98,12 @@ fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
         .unwrap();
     drop(connection);
 
-    let reopened = CoreRuntime::open(config.clone()).unwrap();
+    let reopened = CoreRuntime::open(config.clone()).await.unwrap();
     assert_eq!(
         reopened.membership_snapshot(workspace.id()).unwrap(),
         expected
     );
+    reopened.shutdown().await.unwrap();
     drop(reopened);
 
     let connection = database(&directory);
@@ -112,7 +119,7 @@ fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
     drop(connection);
 
     assert!(matches!(
-        CoreRuntime::open(config),
+        CoreRuntime::open(config).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 

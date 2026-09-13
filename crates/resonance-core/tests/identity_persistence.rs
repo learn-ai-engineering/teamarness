@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 
 use resonance_core::{
     CoreError, CoreRuntime, CoreRuntimeConfig, IdentityError, SigningContext, StorageError,
@@ -18,52 +17,46 @@ fn private_data_directory(test_name: &str) -> PathBuf {
     ))
 }
 
-#[test]
-fn first_open_creates_one_identity_and_reopen_loads_it() {
+#[tokio::test]
+async fn first_open_creates_one_identity_and_reopen_loads_it() {
     let directory = private_data_directory("identity-reopen");
     let config = CoreRuntimeConfig::new(&directory);
 
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
     let identity = runtime.public_identity();
     assert_eq!(runtime.display_name(), "This device");
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).unwrap();
+    let reopened = CoreRuntime::open(config).await.unwrap();
     assert_eq!(reopened.public_identity(), identity);
     assert_eq!(reopened.display_name(), "This device");
+    reopened.shutdown().await.unwrap();
 
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn concurrent_first_open_still_creates_one_identity() {
+#[tokio::test]
+async fn concurrent_first_open_still_creates_one_identity() {
     let directory = private_data_directory("identity-concurrent");
     let config = CoreRuntimeConfig::new(&directory);
-    let barrier = Arc::new(Barrier::new(3));
-    let mut threads = Vec::new();
-
-    for _ in 0..2 {
-        let config = config.clone();
-        let barrier = Arc::clone(&barrier);
-        threads.push(std::thread::spawn(move || {
-            barrier.wait();
-            CoreRuntime::open(config).unwrap().public_identity()
-        }));
-    }
-    barrier.wait();
-
-    let first = threads.remove(0).join().unwrap();
-    let second = threads.remove(0).join().unwrap();
-    assert_eq!(first, second);
+    let (first, second) =
+        tokio::join!(CoreRuntime::open(config.clone()), CoreRuntime::open(config));
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.public_identity(), second.public_identity());
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
 
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn authenticated_reopen_rejects_a_missing_local_identity_subject() {
+#[tokio::test]
+async fn authenticated_reopen_rejects_a_missing_local_identity_subject() {
     let directory = private_data_directory("identity-authenticated-reopen");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
@@ -73,18 +66,18 @@ fn authenticated_reopen_rejects_a_missing_local_identity_subject() {
     drop(connection);
 
     assert!(matches!(
-        CoreRuntime::open(config),
+        CoreRuntime::open(config).await,
         Err(CoreError::Storage(StorageError::CorruptIdentity))
     ));
 
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn display_name_updates_are_validated_and_durable() {
+#[tokio::test]
+async fn display_name_updates_are_validated_and_durable() {
     let directory = private_data_directory("display-name");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).unwrap();
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
 
     for invalid in [
         "",
@@ -102,18 +95,22 @@ fn display_name_updates_are_validated_and_durable() {
 
     runtime.set_display_name("Zoë's laptop").unwrap();
     assert_eq!(runtime.display_name(), "Zoë's laptop");
+    runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).unwrap();
+    let reopened = CoreRuntime::open(config).await.unwrap();
     assert_eq!(reopened.display_name(), "Zoë's laptop");
+    reopened.shutdown().await.unwrap();
 
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-fn signatures_are_publicly_verifiable_and_separated_by_context() {
+#[tokio::test]
+async fn signatures_are_publicly_verifiable_and_separated_by_context() {
     let directory = private_data_directory("signing");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
     let membership = SigningContext::new("resonance.membership-operation/v1").unwrap();
     let invitation = SigningContext::new("resonance.invitation/v1").unwrap();
     let payload = b"same payload";
@@ -140,17 +137,22 @@ fn signatures_are_publicly_verifiable_and_separated_by_context() {
             .unwrap_err(),
         IdentityError::InvalidSignature
     );
+    runtime.shutdown().await.unwrap();
 
     fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(unix)]
-#[test]
-fn identity_database_and_directory_have_restrictive_permissions() {
+#[tokio::test]
+async fn identity_database_and_directory_have_restrictive_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = private_data_directory("permissions");
-    CoreRuntime::open(CoreRuntimeConfig::new(&directory)).unwrap();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
 
     let directory_mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
     let database_mode = fs::metadata(directory.join("core.sqlite3"))

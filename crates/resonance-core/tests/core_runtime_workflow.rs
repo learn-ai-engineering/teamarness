@@ -44,14 +44,17 @@ fn has_member(snapshot: &resonance_core::MembershipSnapshot, identity: PublicIde
         .any(|member| member.identity() == identity && member.role() == MembershipRole::Member)
 }
 
-#[test]
-fn public_runtime_workflow_survives_membership_lifecycle_and_reopen() {
+#[tokio::test]
+async fn public_runtime_workflow_survives_membership_lifecycle_and_reopen() {
     let installation_a_directory = private_data_directory("a");
     let installation_b_directory = private_data_directory("b");
     let installation_a_config = CoreRuntimeConfig::new(&installation_a_directory);
-    let installation_a = CoreRuntime::open(installation_a_config.clone()).unwrap();
-    let installation_b =
-        CoreRuntime::open(CoreRuntimeConfig::new(&installation_b_directory)).unwrap();
+    let installation_a = CoreRuntime::open(installation_a_config.clone())
+        .await
+        .unwrap();
+    let installation_b = CoreRuntime::open(CoreRuntimeConfig::new(&installation_b_directory))
+        .await
+        .unwrap();
     let identity_a = installation_a.public_identity();
     let identity_b = installation_b.public_identity();
 
@@ -129,15 +132,18 @@ fn public_runtime_workflow_survives_membership_lifecycle_and_reopen() {
     );
 
     drop(transitions);
+    installation_a.shutdown().await.unwrap();
     drop(installation_a);
-    let reopened_a = CoreRuntime::open(installation_a_config).unwrap();
+    let reopened_a = CoreRuntime::open(installation_a_config).await.unwrap();
     assert_eq!(reopened_a.public_identity(), identity_a);
     let reopened_snapshot = reopened_a.membership_snapshot(workspace.id()).unwrap();
     assert_eq!(reopened_snapshot, revoked_snapshot);
     assert_eq!(reopened_snapshot.epoch(), revoked_snapshot.epoch());
     assert_eq!(reopened_snapshot.version(), revoked_snapshot.version());
 
+    reopened_a.shutdown().await.unwrap();
     drop(reopened_a);
+    installation_b.shutdown().await.unwrap();
     drop(installation_b);
     fs::remove_dir_all(installation_a_directory).unwrap();
     fs::remove_dir_all(installation_b_directory).unwrap();
