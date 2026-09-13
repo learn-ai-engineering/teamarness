@@ -31,9 +31,13 @@ The public API supports:
 - querying declared-time membership history; and
 - catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor.
 
-Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. Runtime shutdown rejects new onboarding transport work, leaves local identity, Workspace, and membership commands available, and must be awaited. `Drop` is an abnormal best-effort cleanup fallback only.
+Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. The returned `WorkspaceInvitation` is an opaque, sensitive bearer value: applications may parse, display, copy, and submit its text, but must not interpret its private wire representation.
 
-Low-level token issuance, claim creation, and redemption are private onboarding mechanics. Installation secrets, raw key bytes, SQLite connections, Iroh endpoint, router, connection, stream, and ticket handles, bootstrap and canonical-operation values, membership adapters, mutable p2panda `GroupCrdt` state, fault hooks, and transition publishers are not public.
+A successful onboarding response contains the issuer's complete accepted membership state at one consistency boundary. Version 1 limits that bootstrap to 8 MiB and 1,024 canonical operations. The same Installation can recover its one committed admission after interrupted response delivery, including after the invitation expires, provided it is still a current member. Another Installation cannot reuse the invitation. This is bounded one-shot onboarding, not continuous synchronization.
+
+Runtime shutdown rejects new onboarding transport work, leaves local identity, Workspace, and membership commands available, and must be awaited. `Drop` is an abnormal best-effort cleanup fallback only.
+
+Low-level token issuance, claim creation, and redemption were intentionally removed from the public interface; they are private onboarding mechanics. Installation secrets, raw key bytes, SQLite connections, Iroh endpoint, router, connection, stream, and ticket handles, bootstrap and canonical-operation values, membership adapters, mutable p2panda `GroupCrdt` state, fault hooks, and transition publishers are not public.
 
 ## Declared-time warning
 
