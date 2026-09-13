@@ -18,9 +18,9 @@ The system SHALL expose the installation's public identity as a validated `Publi
 
 The system SHALL provide domain-separated signing operations to packages. Each signing context SHALL include a domain tag to prevent cross-domain signature reuse. The signing interface SHALL return signatures without exposing the private key.
 
-## RES.SYS.ID-R05 — Identity Display
+## RES.SYS.ID-R05 — Installation Display Name
 
-The system SHALL support a human-readable display name for the local installation. The display name SHALL be bounded in length and validated against a defined character set. It SHALL be changeable by the user.
+The system SHALL support an Installation Display Name for the local Installation. It SHALL contain 1 through 64 Unicode alphanumeric characters, spaces, hyphens, underscores, apostrophes, or periods, with no surrounding whitespace. The user SHALL be able to change it. It SHALL NOT replace the Public Identity or become canonical membership authority.
 
 ## RES.SYS.ID-R06 — Device vs Human Identity
 

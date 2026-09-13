@@ -30,4 +30,4 @@ Branch table for the Resonance product VRS. Every requirement, spec clause, deci
 
 ## Current state
 
-The VRS is in initial establishment. Subsystem requirements and specs are being authored. See `roadmap.md` for the phased plan and `open-questions.md` for unresolved design questions.
+The Context Foundation, Core Runtime, and Desktop Shell with Workspace onboarding are complete. Phase 3, Package Foundation, is next. See `roadmap.md` for phase status and `open-questions.md` for unresolved design questions.

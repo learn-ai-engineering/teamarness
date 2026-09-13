@@ -12,7 +12,7 @@ A user SHALL be able to create a named workspace. Creation SHALL produce an immu
 
 ## RES-R03 — Invitations
 
-A workspace member SHALL be able to generate a single-use, cryptographically-signed invitation token. The token SHALL carry the inviter's identity, the workspace identity, and an expiry. An installation that presents a valid, unexpired, unused invitation SHALL be admitted to the workspace. Used tokens SHALL NOT be reusable.
+A Workspace member SHALL be able to generate a single-use, cryptographically signed Invitation. The Invitation SHALL carry the inviter's identity, the Workspace identity, and an expiry. An Installation that presents a valid, unexpired, unused Invitation SHALL be admitted to the Workspace. An expired unused Invitation or an Invitation spent by a different Installation SHALL be rejected. An exact retry by the already admitted Installation MAY recover the same committed admission after expiry and SHALL NOT create another admission.
 
 ## RES-R04 — Canonical Membership
 

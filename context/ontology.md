@@ -18,11 +18,13 @@ Canonical terminology for the Resonance domain. When a term appears in requireme
 | Term | Definition |
 |---|---|
 | **Installation Identity** | A permanent Ed25519 keypair generated on first launch. The `SecretKey` is the Iroh endpoint secret; the `PublicKey` is the Iroh `EndpointId`. This is the device's network identity |
+| **Installation Display Name** | User-changeable, validated human-readable metadata for the local Installation. It does not replace the Public Identity and is not currently shared through canonical membership |
 | **Public Identity** | The public half of an installation identity (`EndpointId`), shared with workspaces as a member identifier |
 | **Member** | An installation identity admitted to a workspace. Membership is canonical and interval-based. A human may have multiple device identities; devices are first-class members |
 | **Membership Interval** | A bounded period `[admitted, revoked?)` during which an identity was a workspace member. Intervals are contiguous; a member cannot have gaps |
 | **Canonical Membership** | The signed, causally ordered, append-only membership operation DAG that is the sole authority for who is a workspace member. Built above Iroh's transport identity. Iroh connects peers; the membership DAG authorizes them |
-| **Invitation** | A single-use, cryptographically-signed token that authorizes one installation to join a workspace. Carries the inviter's identity, workspace identity, and an expiry. Once used, it cannot be reused |
+| **Invitation** | A single-use, cryptographically signed token that authorizes one Installation to join a Workspace. It carries the inviter identity, Workspace identity, and expiry. An exact retry by the already admitted Installation may recover the same committed admission; recovery is not a second use |
+| **Workspace Invitation** | The opaque, copied onboarding value that wraps a signed Invitation and the issuer's public Iroh endpoint ticket. It is sensitive bearer admission material |
 | **Revocation** | A signed membership operation that ends a member's current interval. The revoked member retains past data but cannot read or write future content. Triggers key rotation in affected packages |
 | **Epoch** | A workspace-local, monotonically increasing cursor for committed membership transitions. It orders local delivery but does not identify distributed membership state |
 | **Membership Version** | A content-derived identifier for a workspace's accepted membership operation set. Peers with the same operation set have the same membership version |

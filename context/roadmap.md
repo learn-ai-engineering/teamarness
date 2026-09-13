@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. The Phase 1 Rust core runtime is complete and is the current implementation baseline. Phase 2, the desktop shell and workspace onboarding, is in implementation.
+The VRS intent tree and accepted architecture decisions are established. Phase 2, the desktop shell and Workspace onboarding, is complete and is the current implementation baseline. Phase 3, Package Foundation, is next.
 
 ## Phases
 
@@ -24,9 +24,9 @@ The minimum viable runtime: installation identity (an Ed25519 keypair compatible
 
 **Depends on:** Phase 0.
 
-### Phase 2 - Desktop Shell and Workspace Onboarding (in progress)
+### Phase 2 - Desktop Shell and Workspace Onboarding (complete)
 
-Scope began on 2026-09-13. This phase adds the Tauri desktop shell, binds the runtime's Iroh endpoint, and completes workspace onboarding between two installations. One installation creates a workspace and a single-use invitation. A second installation pastes the invitation, connects to the inviter through Iroh, joins, persists the workspace locally, and displays the same member set. Package hosting, workspace leave, member removal controls, and manager administration are deferred.
+Completed on 2026-09-13. This phase added the Tauri desktop shell, bound the runtime's Iroh endpoint, and completed Workspace onboarding between two Installations. One Installation creates a Workspace and a single-use Workspace Invitation. A second Installation pastes the invitation, connects to the inviter through Iroh, joins, persists the Workspace locally, and displays the same member set after explicit refresh. Package hosting, Workspace leave, member removal controls, manager administration, and continuous membership synchronization remain deferred.
 
 **Outcome:** Two independently stored desktop app instances can create and join one workspace through a copied invitation, then show the same workspace identity and membership.
 
@@ -50,7 +50,7 @@ The conversations domain as the first real package: channels, signed Markdown me
 
 ### Phase 5 - Membership Management and Hardening
 
-Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple device identities, with device-aware membership operations.
+Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. This phase also resolves whether recognizable remote-member names are local aliases or signed shared Installation or human profile data.
 
 **Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member sees only post-admission content, and packages rotate keys after membership transitions.
 

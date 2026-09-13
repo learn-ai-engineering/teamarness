@@ -12,7 +12,7 @@ The system SHALL support two post-genesis membership operations: `admit` and `re
 
 ## RES.SYS.MEM-R03 — Single-Use Invitations
 
-The system SHALL generate cryptographically-signed, single-use invitation tokens. A token SHALL carry the inviter's identity, the workspace identity, an expiry timestamp, and a signature from the inviter. The system SHALL reject expired or previously-used tokens. A valid, unused token SHALL authorize exactly one installation to join.
+The system SHALL generate cryptographically signed, single-use Invitation tokens. A token SHALL carry the inviter's identity, the Workspace identity, an expiry timestamp, and a signature from the inviter. The system SHALL reject expired unused tokens and tokens spent by another Installation. A valid, unused token SHALL authorize exactly one Installation to join. An exact retry by that already admitted Installation MAY recover the same committed admission after expiry and SHALL NOT create another admission.
 
 ## RES.SYS.MEM-R04 — Membership Intervals
 

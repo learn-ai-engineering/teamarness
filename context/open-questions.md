@@ -16,19 +16,11 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## RES-DQ2 — Package backend execution model
 
-**Blocks:** `02-system/05-packages/` spec, Phase 3 package-foundation implementation
+**Status:** Resolved (2026-09-12, design).
 
-**Question:** How should package backends execute relative to the core runtime? In the same Rust process with module-level isolation, or in separate processes?
+**Decision:** Trusted bundled package backends run as Rust modules in the main process with crate-level isolation. Package UIs run in Tauri webviews. Raw Core Runtime and Iroh handles remain private behind typed capability contracts. Isolation for future untrusted member-loaded packages remains deferred until that loading model is designed.
 
-**Options:**
-- A: Same-process Rust modules. Packages are crates or modules within the same binary. Crate-level visibility controls isolation. Simplest, no IPC overhead.
-- B: Separate processes with IPC (Tauri sidecars or subprocesses). Strongest isolation, but adds IPC complexity and serialization overhead.
-- C: Staged: bundled packages run in-process (trusted); member-loaded packages run in separate webviews or processes (untrusted).
-
-**Considerations:**
-- Phase 3 starts with bundled trusted packages only. Same-process isolation via crate visibility is sufficient.
-- The long-term direction includes member-loaded packages that need stronger isolation.
-- Option C matches the existing Resonance design: a shared main webview is not a sandbox; untrusted packages need separate webviews.
+**Rationale:** Phase 3 begins with trusted bundled packages, so separate backend processes would add IPC and serialization without protecting against untrusted code in the current Scope. ADR 0003 establishes the in-process package boundary and keeps future stronger isolation possible. See `context/.decisions/0003-core-runtime-vertical-packages.md`.
 
 ---
 
@@ -87,3 +79,17 @@ Design uncertainties that need resolution before or during implementation. Each 
 **Decision:** Keep onboarding behind high-level Core Runtime operations. Wrap the existing signed invitation in a bounded `WorkspaceInvitation` with an Iroh endpoint ticket. Bind both authenticated peers to the token and claim, commit admission before response delivery, validate and import the complete bootstrap atomically, and report local join only after that import. An exact retry recovers the original admission before expiry checks, then exports the issuer's complete current accepted set at one consistency boundary without creating another admission.
 
 **Rationale:** The issuer and joiner have independent databases, so retry must bridge two commit points rather than pretend they share a transaction. Current-state join completion preserves the matching-membership requirement if another admission or revocation commits before retry. The operation remains bounded and claim-specific; continuous membership synchronization is a separate protocol. See `context/.decisions/0005-iroh-workspace-onboarding.md` and `.myflow/workstreams/shell-package-lifecycle/design/20260913T002055Z_workspace-onboarding-protocol.md`.
+
+---
+
+## RES-DQ8 - Recognizable remote-member names
+
+**Blocks:** Phase 5 member presentation, human identity, and multi-device design
+
+**Question:** When a Workspace displays a remote Member, should its recognizable name be a local alias, a signed Installation Display Name shared with peers, a future human profile name, or a combination with explicit precedence?
+
+**Current state:** The Core Runtime stores a validated Installation Display Name as local metadata. Canonical membership identifies Members by Public Identity and does not distribute names. The Shell therefore falls back to long public keys for remote Members.
+
+**What must be resolved:** Define who owns and signs a name, whether it is local or shared, its privacy boundary, rename and conflict behavior, offline convergence, multi-device presentation, and the fallback when no trusted name exists. A display name or alias must never become membership or authorization authority.
+
+**Intended destination:** Phase 5, Membership Management and Hardening. Do not add name propagation to Phase 2 closeout.
