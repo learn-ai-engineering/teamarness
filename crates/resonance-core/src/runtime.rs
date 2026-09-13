@@ -841,8 +841,12 @@ impl CoreRuntime {
         let deadline = std::time::Instant::now()
             .checked_add(budget)
             .ok_or(crate::OnboardingError::Timeout)?;
+        let permit = self.transport.begin_outbound().await?;
         self.transport
-            .whole_join_until(self.join_workspace_inner(invitation, deadline), deadline)
+            .whole_join_until(
+                self.join_workspace_inner(invitation, deadline, &permit),
+                deadline,
+            )
             .await
     }
 
@@ -850,6 +854,7 @@ impl CoreRuntime {
         &self,
         invitation: &crate::WorkspaceInvitation,
         deadline: std::time::Instant,
+        permit: &crate::onboarding::transport::OutboundPermit,
     ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
         let verified = invitation
             .verified()
@@ -881,9 +886,13 @@ impl CoreRuntime {
         };
         Self::ensure_join_deadline(deadline)?;
 
-        let response =
-            crate::onboarding::client::join(&self.transport, verified.clone(), claim.clone())
-                .await?;
+        let response = crate::onboarding::client::join(
+            &self.transport,
+            permit,
+            verified.clone(),
+            claim.clone(),
+        )
+        .await?;
         #[cfg(test)]
         self.transport.pause_after_response().await;
         Self::ensure_join_deadline(deadline)?;
@@ -1205,6 +1214,21 @@ impl CoreRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn hold_next_join_after_response_for_test(&self) {
+        self.transport.hold_next_join_after_response();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_join_held_after_response_for_test(&self) {
+        self.transport.wait_for_post_response_hold().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_join_held_after_response_for_test(&self) {
+        self.transport.release_post_response_hold();
+    }
+
+    #[cfg(test)]
     pub(crate) fn block_next_join_after_response_for_test(&self, duration: std::time::Duration) {
         self.transport.force_next_post_response_block(duration);
     }
@@ -1242,12 +1266,28 @@ impl CoreRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_onboarding_operations_for_test(&self) -> usize {
+        self.transport.active_operations()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_outbound_joins_for_test(&self) -> usize {
+        self.transport.available_outbound_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_shutdown_idle_waiter_for_test(&self) {
+        self.transport.wait_for_idle_waiter().await;
+    }
+
+    #[cfg(test)]
     pub(crate) async fn send_raw_onboarding_frame_for_test(
         &self,
         address: iroh_base::EndpointAddr,
         frame: &[u8],
     ) -> Result<Vec<u8>, crate::OnboardingError> {
-        let (connection, _permit) = self.transport.connect(address).await?;
+        let permit = self.transport.begin_outbound().await?;
+        let connection = self.transport.connect(address, &permit).await?;
         let (mut send, mut receive) = connection
             .open_bi()
             .await

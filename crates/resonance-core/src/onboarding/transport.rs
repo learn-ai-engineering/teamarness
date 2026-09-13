@@ -42,6 +42,12 @@ pub(crate) struct Transport {
     #[cfg(test)]
     pause_after_response: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    hold_after_response: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    post_response_held: Notify,
+    #[cfg(test)]
+    release_post_response: Notify,
+    #[cfg(test)]
     post_response_block_ms: std::sync::atomic::AtomicU64,
 }
 
@@ -113,6 +119,12 @@ impl Transport {
             #[cfg(test)]
             pause_after_response: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            hold_after_response: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            post_response_held: Notify::new(),
+            #[cfg(test)]
+            release_post_response: Notify::new(),
+            #[cfg(test)]
             post_response_block_ms: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -156,16 +168,15 @@ impl Transport {
     pub(crate) async fn connect(
         &self,
         address: EndpointAddr,
-    ) -> Result<(Connection, OutboundPermit), OnboardingError> {
-        let permit = self.begin_outbound().await?;
-        let connection = timeout(
+        _permit: &OutboundPermit,
+    ) -> Result<Connection, OnboardingError> {
+        timeout(
             CONNECT_TIMEOUT,
             self.endpoint.connect(address, ONBOARDING_ALPN),
         )
         .await
         .map_err(|_| OnboardingError::Timeout)?
-        .map_err(|_| OnboardingError::Authentication)?;
-        Ok((connection, permit))
+        .map_err(|_| OnboardingError::Authentication)
     }
 
     #[allow(dead_code)]
@@ -318,6 +329,25 @@ impl Transport {
         if self.pause_after_response.swap(false, Ordering::AcqRel) {
             std::future::pending::<()>().await;
         }
+        if self.hold_after_response.swap(false, Ordering::AcqRel) {
+            self.post_response_held.notify_one();
+            self.release_post_response.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_join_after_response(&self) {
+        self.hold_after_response.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_post_response_hold(&self) {
+        self.post_response_held.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_post_response_hold(&self) {
+        self.release_post_response.notify_one();
     }
 
     #[cfg(test)]
@@ -349,6 +379,21 @@ impl Transport {
     pub(crate) fn lifecycle_state(&self) -> u8 {
         self.lifecycle.state.load(Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) fn active_operations(&self) -> usize {
+        self.lifecycle.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_outbound_permits(&self) -> usize {
+        self.outbound.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_idle_waiter(&self) {
+        self.lifecycle.idle_waiting.notified().await;
+    }
 }
 
 struct BindOptions {
@@ -363,6 +408,8 @@ struct Lifecycle {
     state: AtomicU8,
     active: AtomicUsize,
     idle: Notify,
+    #[cfg(test)]
+    idle_waiting: Notify,
 }
 
 impl Lifecycle {
@@ -371,6 +418,8 @@ impl Lifecycle {
             state: AtomicU8::new(RUNNING),
             active: AtomicUsize::new(0),
             idle: Notify::const_new(),
+            #[cfg(test)]
+            idle_waiting: Notify::const_new(),
         }
     }
 
@@ -410,8 +459,24 @@ impl Lifecycle {
     }
 
     async fn wait_for_idle(&self) {
-        while self.active.load(Ordering::Acquire) != 0 {
-            self.idle.notified().await;
+        self.wait_for_idle_with_hook(std::future::ready(())).await;
+    }
+
+    async fn wait_for_idle_with_hook(&self, hook: impl Future<Output = ()>) {
+        let mut hook = Some(hook);
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(hook) = hook.take() {
+                hook.await;
+            }
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            #[cfg(test)]
+            self.idle_waiting.notify_one();
+            notified.await;
         }
     }
 }
@@ -454,9 +519,10 @@ mod tests {
         let client = Transport::bind_loopback(secret(2), Duration::from_millis(20), true)
             .await
             .unwrap();
-        let (connection, permit) = timeout(
+        let permit = client.begin_outbound().await.unwrap();
+        let connection = timeout(
             Duration::from_secs(3),
-            client.connect(server.endpoint_address()),
+            client.connect(server.endpoint_address(), &permit),
         )
         .await
         .expect("loopback connect timed out")
@@ -543,7 +609,11 @@ mod tests {
         let client = Transport::bind_loopback(secret(6), Duration::from_millis(20), true)
             .await
             .unwrap();
-        let (connection, permit) = client.connect(server.endpoint_address()).await.unwrap();
+        let permit = client.begin_outbound().await.unwrap();
+        let connection = client
+            .connect(server.endpoint_address(), &permit)
+            .await
+            .unwrap();
         let (mut send, receive) = connection.open_bi().await.unwrap();
         send.write_all(&[0]).await.unwrap();
 
@@ -579,5 +649,33 @@ mod tests {
         first_shutdown.await.unwrap().unwrap();
         second_shutdown.await.unwrap().unwrap();
         assert_eq!(transport.lifecycle_state(), STOPPED);
+    }
+
+    #[tokio::test]
+    async fn idle_wait_registers_before_the_final_operation_finishes() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let operation = lifecycle.begin().unwrap();
+        let count_checked = Arc::new(Notify::new());
+        let continue_wait = Arc::new(Notify::new());
+        let waiting_lifecycle = Arc::clone(&lifecycle);
+        let waiting_count_checked = Arc::clone(&count_checked);
+        let waiting_continue = Arc::clone(&continue_wait);
+        let waiter = tokio::spawn(async move {
+            waiting_lifecycle
+                .wait_for_idle_with_hook(async move {
+                    waiting_count_checked.notify_one();
+                    waiting_continue.notified().await;
+                })
+                .await;
+        });
+
+        count_checked.notified().await;
+        drop(operation);
+        continue_wait.notify_one();
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("idle wait lost the final operation notification")
+            .unwrap();
     }
 }

@@ -209,7 +209,11 @@ async fn authenticated_handler_returns_bootstrap_after_releasing_runtime_state()
     let client = Transport::bind_loopback(invitee_secret, Duration::from_millis(20), true)
         .await
         .unwrap();
-    let (connection, permit) = client.connect(verified.endpoint_addr).await.unwrap();
+    let permit = client.begin_outbound().await.unwrap();
+    let connection = client
+        .connect(verified.endpoint_addr, &permit)
+        .await
+        .unwrap();
     let (mut send, mut receive) = connection.open_bi().await.unwrap();
     let request = encode_request(&JoinRequest { claim }).unwrap();
     send.write_all(&request).await.unwrap();
@@ -459,7 +463,11 @@ async fn malformed_handler_request_gets_a_stable_error_without_state_change() {
     )
     .await
     .unwrap();
-    let (connection, permit) = client.connect(verified.endpoint_addr).await.unwrap();
+    let permit = client.begin_outbound().await.unwrap();
+    let connection = client
+        .connect(verified.endpoint_addr, &permit)
+        .await
+        .unwrap();
     let (mut send, mut receive) = connection.open_bi().await.unwrap();
     send.write_all(&[0, 0, 0, 1, 99]).await.unwrap();
     send.finish().unwrap();

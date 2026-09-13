@@ -3,7 +3,7 @@ use std::sync::Arc;
 use iroh_base::PublicKey;
 
 use super::transfer::VerifiedWorkspaceInvitation;
-use super::transport::Transport;
+use super::transport::{OutboundPermit, Transport};
 use super::wire::{
     JoinRequest, MAX_RESPONSE_BODY_BYTES, SuccessResponse, decode_error, decode_success,
     encode_request,
@@ -13,14 +13,16 @@ use crate::invitation::VerifiedInvitationClaim;
 
 pub(crate) async fn join(
     transport: &Arc<Transport>,
+    permit: &OutboundPermit,
     invitation: VerifiedWorkspaceInvitation,
     claim: VerifiedInvitationClaim,
 ) -> Result<SuccessResponse, OnboardingError> {
-    exchange(transport, invitation, claim).await
+    exchange(transport, permit, invitation, claim).await
 }
 
 async fn exchange(
     transport: &Arc<Transport>,
+    permit: &OutboundPermit,
     invitation: VerifiedWorkspaceInvitation,
     claim: VerifiedInvitationClaim,
 ) -> Result<SuccessResponse, OnboardingError> {
@@ -28,7 +30,7 @@ async fn exchange(
     if invitation.endpoint_addr.id != expected_peer {
         return Err(OnboardingError::Authentication);
     }
-    let (connection, _permit) = transport.connect(invitation.endpoint_addr).await?;
+    let connection = transport.connect(invitation.endpoint_addr, permit).await?;
     require_peer(connection.remote_id(), expected_peer)?;
     let (mut send, mut receive) = transport
         .response_io(async {

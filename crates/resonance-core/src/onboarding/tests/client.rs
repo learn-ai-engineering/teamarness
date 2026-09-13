@@ -72,6 +72,74 @@ async fn authenticated_client_uses_one_exchange_and_returns_only_after_durable_i
 }
 
 #[tokio::test]
+async fn outbound_join_accounting_covers_post_response_work_and_shutdown() {
+    let issuer_directory = directory("outbound-accounting-issuer");
+    let joiner_directory = directory("outbound-accounting-joiner");
+    let issuer = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&issuer_directory))
+        .await
+        .unwrap();
+    let joiner = std::sync::Arc::new(
+        CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&joiner_directory))
+            .await
+            .unwrap(),
+    );
+    let held_workspace = issuer.create_workspace("Held network join").unwrap();
+    let other_workspace = issuer.create_workspace("Other network join").unwrap();
+    let held_invitation = issuer
+        .create_workspace_invitation(held_workspace.id())
+        .await
+        .unwrap();
+    let other_invitation = issuer
+        .create_workspace_invitation(other_workspace.id())
+        .await
+        .unwrap();
+
+    joiner.hold_next_join_after_response_for_test();
+    let joining_runtime = std::sync::Arc::clone(&joiner);
+    let joining =
+        tokio::spawn(async move { joining_runtime.join_workspace(&held_invitation).await });
+    joiner.wait_for_join_held_after_response_for_test().await;
+
+    assert_eq!(joiner.active_onboarding_operations_for_test(), 1);
+    assert_eq!(
+        joiner.available_outbound_joins_for_test(),
+        crate::onboarding::transport::MAX_OUTBOUND_JOINS - 1
+    );
+    let mut other_permits = Vec::new();
+    for _ in 1..crate::onboarding::transport::MAX_OUTBOUND_JOINS {
+        other_permits.push(joiner.hold_outbound_join_for_test().await.unwrap());
+    }
+    assert_eq!(
+        joiner.join_workspace(&other_invitation).await.unwrap_err(),
+        OnboardingError::Overload
+    );
+    drop(other_permits);
+
+    let closing_runtime = std::sync::Arc::clone(&joiner);
+    let mut shutdown = tokio::spawn(async move { closing_runtime.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = &mut shutdown => {
+                panic!("shutdown completed before the post-response join: {result:?}");
+            }
+            () = joiner.wait_for_shutdown_idle_waiter_for_test() => {}
+        }
+    })
+    .await
+    .expect("shutdown did not wait for the active public join");
+
+    joiner.release_join_held_after_response_for_test();
+    joining.await.unwrap().unwrap();
+    shutdown.await.unwrap().unwrap();
+    issuer.shutdown().await.unwrap();
+    drop(issuer);
+    let joiner = std::sync::Arc::try_unwrap(joiner).expect("join tasks released runtime");
+    drop(joiner);
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
 async fn post_response_work_obeys_the_whole_join_budget() {
     let issuer_directory = directory("post-response-timeout-issuer");
     let joiner_directory = directory("post-response-timeout-joiner");
