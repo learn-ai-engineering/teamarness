@@ -3,6 +3,7 @@
 node_modules/
 /apps/resonance-desktop/dist/
 /apps/resonance-desktop/src-tauri/gen/
+/.resonance-dev/
 
 # Local MyFlow planning and implementation artifacts
 /.myflow/

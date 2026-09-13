@@ -32,27 +32,34 @@ Use `npm ci` instead of `npm install` in a clean or automated environment when t
 
 ## Development
 
-Start the desktop application from the repository root:
+Start the first named development Installation from the repository root:
 
 ```sh
-npm run tauri dev
+npm run dev -- alice
 ```
 
-An ordinary launch stores private runtime state in Tauri's bundle-specific application-data directory. The JavaScript bridge cannot select or inspect that directory.
+The launcher stores its private runtime state under the ignored `.resonance-dev/alice` directory and creates the profile directory with owner-only permissions on platforms that support them. Profile names may contain 1 to 64 letters, numbers, underscores, or hyphens and must start with a letter or number.
 
-For an independent test Installation, pass an absolute private directory to the Rust backend. Relative paths, repeated options, and missing values are rejected:
+After the first command builds the debug executable, start a second Installation without another Vite server:
 
 ```sh
-npm run tauri dev -- -- --resonance-data-dir /absolute/private/resonance-one
+npm run dev:instance -- bob
 ```
 
-After the development executable has been built by the first command, a second instance can be launched without starting a second Vite server:
+Each profile owns a distinct Installation identity and `core.sqlite3`. Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
+
+An absolute directory is available as an expert override. Arbitrary relative paths are rejected:
+
+```sh
+npm run dev -- /absolute/private/resonance-one
+npm run dev:instance -- /absolute/private/resonance-two
+```
+
+The lower-level `npm run tauri dev` command remains available for an ordinary launch using Tauri's bundle-specific application-data directory. The JavaScript bridge cannot select or inspect that directory. The direct debug binary also remains available for troubleshooting:
 
 ```sh
 target/debug/resonance-desktop --resonance-data-dir /absolute/private/resonance-two
 ```
-
-Each directory owns a distinct Installation identity and `core.sqlite3`. Do not share one directory between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
 
 ## Checks
 

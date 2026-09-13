@@ -3,10 +3,13 @@
   "private": true,
   "workspaces": ["apps/resonance-desktop"],
   "scripts": {
+    "dev": "node scripts/dev-profile.mjs dev",
+    "dev:instance": "node scripts/dev-profile.mjs instance",
     "build": "npm --workspace resonance-desktop run build",
     "typecheck": "npm --workspace resonance-desktop run typecheck",
     "lint": "npm --workspace resonance-desktop run lint",
-    "test": "npm --workspace resonance-desktop test",
+    "test": "node --test scripts/dev-profile.test.mjs && npm --workspace resonance-desktop test",
+    "test:dev-profile": "node --test scripts/dev-profile.test.mjs",
     "tauri": "npm --workspace resonance-desktop run tauri --"
   }
 }
