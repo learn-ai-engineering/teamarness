@@ -826,6 +826,15 @@ impl CoreRuntime {
         &self,
         invitation: &crate::WorkspaceInvitation,
     ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        self.transport
+            .whole_join(self.join_workspace_inner(invitation))
+            .await
+    }
+
+    async fn join_workspace_inner(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
         let verified = invitation
             .verified()
             .map_err(|_| crate::OnboardingError::InvalidInput)?;
@@ -857,6 +866,8 @@ impl CoreRuntime {
         let response =
             crate::onboarding::client::join(&self.transport, verified.clone(), claim.clone())
                 .await?;
+        #[cfg(test)]
+        self.transport.pause_after_response().await;
         let bootstrap = crate::membership::projection::validate_bootstrap(
             response,
             &verified.token,
@@ -1104,6 +1115,22 @@ impl CoreRuntime {
     #[cfg(test)]
     pub(crate) fn invalidate_next_bootstrap_for_test(&self) {
         self.transport.force_next_invalid_bootstrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_join_after_response_for_test(&self) {
+        self.transport.force_next_post_response_pause();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn join_workspace_with_budget_for_test(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+        budget: std::time::Duration,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        self.transport
+            .whole_join_with_budget_for_test(self.join_workspace_inner(invitation), budget)
+            .await
     }
 
     #[cfg(test)]

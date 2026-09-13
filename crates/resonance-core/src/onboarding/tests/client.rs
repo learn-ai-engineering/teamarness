@@ -1,6 +1,6 @@
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
@@ -57,6 +57,39 @@ async fn authenticated_client_uses_one_exchange_and_returns_only_after_durable_i
         joiner.membership_snapshot(workspace.id()).unwrap()
     );
     assert_eq!(snapshot.members().len(), 2);
+
+    issuer.shutdown().await.unwrap();
+    joiner.shutdown().await.unwrap();
+    drop((issuer, joiner));
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
+async fn post_response_work_obeys_the_whole_join_budget() {
+    let issuer_directory = directory("post-response-timeout-issuer");
+    let joiner_directory = directory("post-response-timeout-joiner");
+    let issuer = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&issuer_directory))
+        .await
+        .unwrap();
+    let joiner = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&joiner_directory))
+        .await
+        .unwrap();
+    let workspace = issuer.create_workspace("Timed network join").unwrap();
+    let invitation = issuer
+        .create_workspace_invitation(workspace.id())
+        .await
+        .unwrap();
+    joiner.pause_next_join_after_response_for_test();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        joiner.join_workspace_with_budget_for_test(&invitation, Duration::from_millis(25)),
+    )
+    .await
+    .expect("join operation outlived its whole-operation budget");
+    assert_eq!(result.unwrap_err(), OnboardingError::Timeout);
+    assert_eq!(workspace_rows(&joiner_directory), 0);
 
     issuer.shutdown().await.unwrap();
     joiner.shutdown().await.unwrap();

@@ -39,6 +39,8 @@ pub(crate) struct Transport {
     timeout_next_join: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     invalidate_next_bootstrap: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pause_after_response: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +108,8 @@ impl Transport {
             timeout_next_join: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             invalidate_next_bootstrap: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pause_after_response: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -170,18 +174,35 @@ impl Transport {
             .map_err(|_| OnboardingError::Timeout)?
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn whole_join<T>(
         &self,
         future: impl Future<Output = Result<T, OnboardingError>>,
+    ) -> Result<T, OnboardingError> {
+        self.whole_join_with_budget(future, WHOLE_JOIN_TIMEOUT)
+            .await
+    }
+
+    async fn whole_join_with_budget<T>(
+        &self,
+        future: impl Future<Output = Result<T, OnboardingError>>,
+        budget: Duration,
     ) -> Result<T, OnboardingError> {
         #[cfg(test)]
         if self.timeout_next_join.swap(false, Ordering::AcqRel) {
             return Err(OnboardingError::Timeout);
         }
-        timeout(WHOLE_JOIN_TIMEOUT, future)
+        timeout(budget, future)
             .await
             .map_err(|_| OnboardingError::Timeout)?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn whole_join_with_budget_for_test<T>(
+        &self,
+        future: impl Future<Output = Result<T, OnboardingError>>,
+        budget: Duration,
+    ) -> Result<T, OnboardingError> {
+        self.whole_join_with_budget(future, budget).await
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
@@ -298,6 +319,18 @@ impl Transport {
     pub(crate) fn force_next_invalid_bootstrap(&self) {
         self.invalidate_next_bootstrap
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_post_response_pause(&self) {
+        self.pause_after_response.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_response(&self) {
+        if self.pause_after_response.swap(false, Ordering::AcqRel) {
+            std::future::pending::<()>().await;
+        }
     }
 
     #[cfg(test)]

@@ -16,9 +16,7 @@ pub(crate) async fn join(
     invitation: VerifiedWorkspaceInvitation,
     claim: VerifiedInvitationClaim,
 ) -> Result<SuccessResponse, OnboardingError> {
-    transport
-        .whole_join(exchange(transport, invitation, claim))
-        .await
+    exchange(transport, invitation, claim).await
 }
 
 async fn exchange(
