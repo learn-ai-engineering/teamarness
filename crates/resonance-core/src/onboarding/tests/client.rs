@@ -4,7 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-use crate::{CoreRuntime, CoreRuntimeConfig, OnboardingError};
+use crate::{
+    CoreRuntime, CoreRuntimeConfig, MembershipSnapshot, OnboardingError, WorkspaceInvitation,
+    WorkspaceSummary,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -33,10 +36,44 @@ fn workspace_rows(directory: &std::path::Path) -> i64 {
         .unwrap()
 }
 
+fn spent_invitation_rows(directory: &std::path::Path) -> i64 {
+    Connection::open(directory.join("core.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM used_invitation_nonces", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
 fn block_workspace_import(directory: &std::path::Path) -> Connection {
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection.execute_batch("BEGIN IMMEDIATE").unwrap();
     connection
+}
+
+type JoinResult = Result<(WorkspaceSummary, MembershipSnapshot), OnboardingError>;
+
+fn spawn_join(
+    runtime: std::sync::Arc<CoreRuntime>,
+    invitation: WorkspaceInvitation,
+    budget: Duration,
+) -> (
+    std::thread::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<JoinResult>,
+) {
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let thread = std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result =
+            executor.block_on(runtime.join_workspace_with_budget_for_test(&invitation, budget));
+        result_sender
+            .send(result)
+            .unwrap_or_else(|_| panic!("join result receiver dropped"));
+    });
+    (thread, result_receiver)
 }
 
 #[tokio::test]
@@ -135,6 +172,112 @@ async fn outbound_join_accounting_covers_post_response_work_and_shutdown() {
     drop(issuer);
     let joiner = std::sync::Arc::try_unwrap(joiner).expect("join tasks released runtime");
     drop(joiner);
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
+async fn pre_network_runtime_mutex_contention_obeys_the_whole_join_budget() {
+    let issuer_directory = directory("pre-network-mutex-timeout-issuer");
+    let joiner_directory = directory("pre-network-mutex-timeout-joiner");
+    let issuer = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&issuer_directory))
+        .await
+        .unwrap();
+    let joiner = std::sync::Arc::new(
+        CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&joiner_directory))
+            .await
+            .unwrap(),
+    );
+    let workspace = issuer
+        .create_workspace("Pre-network mutex timeout")
+        .unwrap();
+    let invitation = issuer
+        .create_workspace_invitation(workspace.id())
+        .await
+        .unwrap();
+    let state_hold = joiner.hold_runtime_state_for_test();
+
+    let (joining, result_receiver) = spawn_join(
+        std::sync::Arc::clone(&joiner),
+        invitation,
+        Duration::from_millis(100),
+    );
+    let started = std::time::Instant::now();
+    let timed = tokio::time::timeout(Duration::from_secs(2), result_receiver).await;
+    let elapsed = started.elapsed();
+    state_hold.release();
+    joining.join().unwrap();
+    let result = timed
+        .expect("pre-network mutex wait outlived the join budget")
+        .expect("join thread disconnected");
+
+    assert_eq!(result.unwrap_err(), OnboardingError::Timeout);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "pre-network mutex wait exceeded the join budget: {elapsed:?}"
+    );
+    assert_eq!(spent_invitation_rows(&issuer_directory), 0);
+    assert_eq!(workspace_rows(&joiner_directory), 0);
+
+    issuer.shutdown().await.unwrap();
+    joiner.shutdown().await.unwrap();
+    drop((issuer, joiner));
+    fs::remove_dir_all(issuer_directory).unwrap();
+    fs::remove_dir_all(joiner_directory).unwrap();
+}
+
+#[tokio::test]
+async fn pre_import_runtime_mutex_contention_obeys_the_whole_join_budget() {
+    let issuer_directory = directory("pre-import-mutex-timeout-issuer");
+    let joiner_directory = directory("pre-import-mutex-timeout-joiner");
+    let issuer = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&issuer_directory))
+        .await
+        .unwrap();
+    let joiner = std::sync::Arc::new(
+        CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&joiner_directory))
+            .await
+            .unwrap(),
+    );
+    let workspace = issuer.create_workspace("Pre-import mutex timeout").unwrap();
+    let invitation = issuer
+        .create_workspace_invitation(workspace.id())
+        .await
+        .unwrap();
+    joiner.hold_next_join_after_response_for_test();
+
+    let (joining, result_receiver) = spawn_join(
+        std::sync::Arc::clone(&joiner),
+        invitation,
+        Duration::from_secs(3),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        joiner.wait_for_join_held_after_response_for_test(),
+    )
+    .await
+    .expect("join did not reach the post-response boundary");
+    let state_hold = joiner.hold_runtime_state_for_test();
+    let started = std::time::Instant::now();
+    joiner.release_join_held_after_response_for_test();
+    let timed = tokio::time::timeout(Duration::from_secs(4), result_receiver).await;
+    let elapsed = started.elapsed();
+    state_hold.release();
+    joining.join().unwrap();
+    let result = timed
+        .expect("pre-import mutex wait outlived the join budget")
+        .expect("join thread disconnected");
+
+    assert_eq!(result.unwrap_err(), OnboardingError::Timeout);
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "pre-import mutex wait exceeded the join budget: {elapsed:?}"
+    );
+    assert_eq!(spent_invitation_rows(&issuer_directory), 1);
+    assert_eq!(workspace_rows(&joiner_directory), 0);
+
+    issuer.shutdown().await.unwrap();
+    joiner.shutdown().await.unwrap();
+    drop((issuer, joiner));
     fs::remove_dir_all(issuer_directory).unwrap();
     fs::remove_dir_all(joiner_directory).unwrap();
 }

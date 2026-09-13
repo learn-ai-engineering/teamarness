@@ -865,13 +865,7 @@ impl CoreRuntime {
             .map_err(|_| crate::OnboardingError::InvalidInput)?;
         Self::ensure_join_deadline(deadline)?;
         let claim = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
-            if state.poisoned {
-                return Err(crate::OnboardingError::UncertainStorageOutcome);
-            }
+            let state = self.lock_join_state_until(deadline).await?;
             let local_creator: Option<Vec<u8>> = state
                 .connection
                 .query_row(
@@ -916,7 +910,8 @@ impl CoreRuntime {
         .await
         .map_err(|_| crate::OnboardingError::InvalidBootstrap)??;
         Self::ensure_join_deadline(deadline)?;
-        self.import_validated_bootstrap(&bootstrap, Some(deadline), |_| Ok(()))
+        let state = self.lock_join_state_until(deadline).await?;
+        self.import_validated_bootstrap_after_lock(state, &bootstrap, Some(deadline), |_| Ok(()))
     }
 
     fn ensure_join_deadline(deadline: std::time::Instant) -> Result<(), crate::OnboardingError> {
@@ -927,6 +922,33 @@ impl CoreRuntime {
         }
     }
 
+    async fn lock_join_state_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, crate::OnboardingError> {
+        loop {
+            Self::ensure_join_deadline(deadline)?;
+            if let Some(state) = self.try_lock_join_state()? {
+                return Ok(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn try_lock_join_state(
+        &self,
+    ) -> Result<Option<std::sync::MutexGuard<'_, RuntimeState>>, crate::OnboardingError> {
+        match self.state.try_lock() {
+            Ok(state) if state.poisoned => Err(crate::OnboardingError::UncertainStorageOutcome),
+            Ok(state) => Ok(Some(state)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err(crate::OnboardingError::UncertainStorageOutcome)
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn import_validated_bootstrap(
         &self,
         bootstrap: &crate::membership::projection::ValidatedBootstrap,
@@ -936,12 +958,25 @@ impl CoreRuntime {
         if let Some(deadline) = deadline {
             Self::ensure_join_deadline(deadline)?;
         }
-        let mut state = self
+        let state = self
             .state
             .lock()
             .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        self.import_validated_bootstrap_after_lock(state, bootstrap, deadline, fault)
+    }
+
+    fn import_validated_bootstrap_after_lock(
+        &self,
+        mut state: std::sync::MutexGuard<'_, RuntimeState>,
+        bootstrap: &crate::membership::projection::ValidatedBootstrap,
+        deadline: Option<std::time::Instant>,
+        fault: impl FnMut(crate::membership::projection::ImportBoundary) -> Result<(), StorageError>,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
         if state.poisoned {
             return Err(crate::OnboardingError::UncertainStorageOutcome);
+        }
+        if let Some(deadline) = deadline {
+            Self::ensure_join_deadline(deadline)?;
         }
         let prior_busy_timeout_ms = state
             .connection
@@ -1272,6 +1307,23 @@ impl CoreRuntime {
         budget: std::time::Duration,
     ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
         self.join_workspace_with_budget(invitation, budget).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_runtime_state_for_test(&self) -> RuntimeStateHold {
+        let state = Arc::clone(&self.state);
+        let (acquired_sender, acquired_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _state = state.lock().unwrap();
+            acquired_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        acquired_receiver.recv().unwrap();
+        RuntimeStateHold {
+            release: Some(release_sender),
+            thread: Some(thread),
+        }
     }
 
     #[cfg(test)]
@@ -1745,6 +1797,32 @@ impl CoreRuntime {
         Ok(MembershipSubscription {
             state: crate::subscription::SubscriptionState::new(durable, receiver, after_epoch),
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct RuntimeStateHold {
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl RuntimeStateHold {
+    pub(crate) fn release(mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimeStateHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
