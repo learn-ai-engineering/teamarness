@@ -97,7 +97,7 @@ pub(crate) fn encode_success_with_limits(
     encode_frame(&body, max_body_bytes)
 }
 
-pub(super) fn decode_success(frame: &[u8]) -> Result<SuccessResponse, CodecError> {
+pub(crate) fn decode_success(frame: &[u8]) -> Result<SuccessResponse, CodecError> {
     let body = decode_frame(frame, MAX_RESPONSE_BODY_BYTES)?;
     let mut cursor = Cursor::new(body);
     require_version(&mut cursor)?;

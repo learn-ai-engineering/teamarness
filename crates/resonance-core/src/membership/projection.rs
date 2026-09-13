@@ -9,7 +9,7 @@ use rusqlite::{
 };
 
 use crate::error::{InvitationError, MembershipError, StorageError};
-use crate::invitation::VerifiedInvitationClaim;
+use crate::invitation::{VerifiedInvitationClaim, VerifiedInvitationToken};
 use crate::onboarding::wire::{
     CodecError, MAX_OPERATIONS, MAX_RESPONSE_BODY_BYTES, SuccessResponse,
     encode_success_with_limits,
@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     AdmissionProof, AuthId, MembershipAction, MembershipEnvelope, OperationAdapter, authenticate,
-    validate_context,
+    authenticate_canonical_copy, validate_context,
 };
 
 const VERSION_DOMAIN: &[u8] = b"resonance.membership-version/v1";
@@ -33,6 +33,7 @@ type OperationRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>);
 type WorkspaceRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 type WorkspaceAnchor = (WorkspaceId, PublicIdentity, MembershipOperationId, Vec<u8>);
 type FutureRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>);
+type CreationRequestEvidence = (Vec<u8>, String, i64, Vec<u8>, Vec<u8>, String);
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceProjection {
@@ -228,6 +229,529 @@ pub(crate) enum RedemptionBoundary {
 pub(crate) struct AdmissionExport {
     pub(crate) applied: AppliedMembership,
     pub(crate) response: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportBoundary {
+    CreationRequest,
+    WorkspaceAnchor,
+    Operations,
+    Dependencies,
+    IdentitySubjects,
+    Transitions,
+    CurrentState,
+    MemberSnapshot,
+    BeforeCommit,
+    AfterCommit,
+}
+
+pub(crate) struct ValidatedBootstrap {
+    response: SuccessResponse,
+    projection: WorkspaceProjection,
+    prefixes: Vec<WorkspaceProjection>,
+}
+
+pub(crate) struct ImportedWorkspace {
+    pub(crate) summary: crate::WorkspaceSummary,
+    pub(crate) projection: WorkspaceProjection,
+}
+
+pub(crate) fn validate_bootstrap(
+    response: SuccessResponse,
+    token: &VerifiedInvitationToken,
+    claim: &VerifiedInvitationClaim,
+    local_identity: PublicIdentity,
+) -> Result<ValidatedBootstrap, crate::OnboardingError> {
+    crate::workspace::validate_name(&response.name)
+        .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
+    authenticate_canonical_copy(&response.genesis)
+        .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
+    for envelope in &response.post_genesis {
+        authenticate_canonical_copy(envelope)
+            .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
+    }
+    if response.workspace_id != token.workspace_id
+        || response.creator != token.inviter
+        || response.genesis_id != response.genesis.id
+        || response.genesis.workspace_id != response.workspace_id
+        || response.genesis.author != response.creator
+        || response.genesis.authored_at_unix_ms != response.created_at_unix_ms
+        || !response.genesis.dependencies.is_empty()
+        || !matches!(response.genesis.action, MembershipAction::Create)
+        || claim.token.bytes != token.bytes
+        || claim.invitee != local_identity
+    {
+        return Err(crate::OnboardingError::InvalidBootstrap);
+    }
+
+    let mut operations = BTreeMap::from([(response.genesis_id, response.genesis.clone())]);
+    let mut prefixes = Vec::with_capacity(response.post_genesis.len());
+    for envelope in &response.post_genesis {
+        if envelope.workspace_id != response.workspace_id
+            || matches!(envelope.action, MembershipAction::Create)
+            || operations.contains_key(&envelope.id)
+            || envelope.dependencies.is_empty()
+            || !envelope
+                .dependencies
+                .iter()
+                .all(|dependency| operations.contains_key(dependency))
+        {
+            return Err(crate::OnboardingError::InvalidBootstrap);
+        }
+        operations.insert(envelope.id, envelope.clone());
+        prefixes.push(
+            replay(
+                response.workspace_id,
+                response.creator,
+                response.genesis_id,
+                operations.clone(),
+            )
+            .map_err(|_| crate::OnboardingError::InvalidBootstrap)?,
+        );
+    }
+    let projection = if let Some(last) = prefixes.last() {
+        last.clone()
+    } else {
+        replay(
+            response.workspace_id,
+            response.creator,
+            response.genesis_id,
+            operations,
+        )
+        .map_err(|_| crate::OnboardingError::InvalidBootstrap)?
+    };
+    let admission = projection
+        .operations
+        .get(&response.admission_id)
+        .ok_or(crate::OnboardingError::InvalidBootstrap)?;
+    let MembershipAction::Admit { target, proof } = &admission.action else {
+        return Err(crate::OnboardingError::InvalidBootstrap);
+    };
+    if admission.author != token.inviter
+        || *target != local_identity
+        || proof.claim.bytes != claim.bytes
+        || proof.claim.token.bytes != token.bytes
+        || projection.snapshot.version() != response.membership_version
+        || !projection.contains_member(local_identity)
+    {
+        return Err(crate::OnboardingError::InvalidBootstrap);
+    }
+    Ok(ValidatedBootstrap {
+        response,
+        projection,
+        prefixes,
+    })
+}
+
+pub(crate) fn import_bootstrap_with_fault(
+    connection: &mut Connection,
+    bootstrap: &ValidatedBootstrap,
+    mut fault: impl FnMut(ImportBoundary) -> Result<(), StorageError>,
+) -> Result<ImportedWorkspace, crate::OnboardingError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    let local = load_and_replay(&transaction).map_err(import_storage_error)?;
+    verify_transition_evidence(&transaction, &local).map_err(import_storage_error)?;
+    let response = &bootstrap.response;
+    let remote_order = std::iter::once(response.genesis_id)
+        .chain(response.post_genesis.iter().map(|envelope| envelope.id))
+        .collect::<Vec<_>>();
+
+    let (imported_projection, writes_derived_state) =
+        if let Some(existing) = local.get(&response.workspace_id) {
+            let (name, creator, created_at, genesis_id, genesis_bytes): (
+                String,
+                Vec<u8>,
+                i64,
+                Vec<u8>,
+                Vec<u8>,
+            ) = transaction
+                .query_row(
+                    "SELECT name, creator_public_identity, authored_at_unix_ms,
+                        genesis_operation_id, genesis_envelope
+                 FROM workspaces WHERE workspace_id = ?1",
+                    [response.workspace_id.as_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| crate::OnboardingError::LocalConflict)?;
+            if name != response.name
+                || creator != response.creator.as_bytes()
+                || created_at != response.created_at_unix_ms
+                || genesis_id != response.genesis_id.as_bytes()
+                || genesis_bytes != response.genesis.canonical_bytes()
+            {
+                return Err(crate::OnboardingError::LocalConflict);
+            }
+            verify_creation_request(&transaction, response)?;
+            let local_order =
+                transition_order(&transaction, response.workspace_id, existing.genesis_id)
+                    .map_err(import_storage_error)?;
+            let shared = local_order.len().min(remote_order.len());
+            for index in 0..shared {
+                let local_id = local_order[index];
+                let remote_id = remote_order[index];
+                if local_id != remote_id {
+                    return Err(crate::OnboardingError::LocalConflict);
+                }
+                let local_envelope = existing
+                    .operations
+                    .get(&local_id)
+                    .ok_or(crate::OnboardingError::LocalConflict)?;
+                let remote_envelope = bootstrap
+                    .projection
+                    .operations
+                    .get(&remote_id)
+                    .ok_or(crate::OnboardingError::InvalidBootstrap)?;
+                if local_envelope.canonical_bytes() != remote_envelope.canonical_bytes() {
+                    return Err(crate::OnboardingError::LocalConflict);
+                }
+            }
+            if local_order.len() >= remote_order.len() {
+                (existing.clone(), false)
+            } else {
+                let mut candidate = existing.clone();
+                for (index, remote_id) in remote_order
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .skip(local_order.len())
+                {
+                    let envelope = bootstrap
+                        .projection
+                        .operations
+                        .get(&remote_id)
+                        .ok_or(crate::OnboardingError::InvalidBootstrap)?;
+                    let expected = &bootstrap.prefixes[index - 1];
+                    if !candidate
+                        .operations
+                        .keys()
+                        .all(|id| expected.operations.contains_key(id))
+                    {
+                        return Err(crate::OnboardingError::LocalConflict);
+                    }
+                    insert_operation(&transaction, envelope)?;
+                    insert_dependencies(&transaction, envelope)?;
+                    insert_identity_subject(&transaction, envelope)?;
+                    insert_transition(&transaction, expected, envelope.id)?;
+                    candidate = expected.clone();
+                }
+                (candidate, true)
+            }
+        } else {
+            if transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM workspace_creation_requests WHERE workspace_id = ?1",
+                    [response.workspace_id.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| crate::OnboardingError::LocalConflict)?
+                != 0
+            {
+                return Err(crate::OnboardingError::LocalConflict);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO workspace_creation_requests (
+                    workspace_id, creator_public_identity, name, authored_at_unix_ms,
+                    genesis_operation_id, genesis_envelope, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Complete')",
+                    params![
+                        response.workspace_id.as_bytes().as_slice(),
+                        response.creator.as_bytes().as_slice(),
+                        response.name,
+                        response.created_at_unix_ms,
+                        response.genesis_id.as_bytes().as_slice(),
+                        response.genesis.canonical_bytes(),
+                    ],
+                )
+                .map_err(|_| crate::OnboardingError::LocalConflict)?;
+            fault(ImportBoundary::CreationRequest).map_err(import_fault)?;
+            transaction
+                .execute(
+                    "INSERT INTO workspaces (
+                    workspace_id, creator_public_identity, name, authored_at_unix_ms,
+                    genesis_operation_id, genesis_envelope
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        response.workspace_id.as_bytes().as_slice(),
+                        response.creator.as_bytes().as_slice(),
+                        response.name,
+                        response.created_at_unix_ms,
+                        response.genesis_id.as_bytes().as_slice(),
+                        response.genesis.canonical_bytes(),
+                    ],
+                )
+                .map_err(|_| crate::OnboardingError::LocalConflict)?;
+            fault(ImportBoundary::WorkspaceAnchor).map_err(import_fault)?;
+            for envelope in std::iter::once(&response.genesis).chain(response.post_genesis.iter()) {
+                insert_operation(&transaction, envelope)?;
+            }
+            fault(ImportBoundary::Operations).map_err(import_fault)?;
+            for envelope in &response.post_genesis {
+                insert_dependencies(&transaction, envelope)?;
+            }
+            fault(ImportBoundary::Dependencies).map_err(import_fault)?;
+            for envelope in std::iter::once(&response.genesis).chain(response.post_genesis.iter()) {
+                insert_identity_subject(&transaction, envelope)?;
+            }
+            fault(ImportBoundary::IdentitySubjects).map_err(import_fault)?;
+            for (envelope, prefix) in response.post_genesis.iter().zip(&bootstrap.prefixes) {
+                insert_transition(&transaction, prefix, envelope.id)?;
+            }
+            fault(ImportBoundary::Transitions).map_err(import_fault)?;
+            (bootstrap.projection.clone(), true)
+        };
+
+    if writes_derived_state {
+        write_current_state(&transaction, &imported_projection)?;
+        fault(ImportBoundary::CurrentState).map_err(import_fault)?;
+        write_member_snapshot(&transaction, &imported_projection)?;
+        fault(ImportBoundary::MemberSnapshot).map_err(import_fault)?;
+    }
+    fault(ImportBoundary::BeforeCommit).map_err(import_fault)?;
+    transaction
+        .commit()
+        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+    fault(ImportBoundary::AfterCommit).map_err(import_fault)?;
+
+    Ok(ImportedWorkspace {
+        summary: crate::WorkspaceSummary::new(
+            response.workspace_id,
+            response.name.clone(),
+            response.creator,
+            response.created_at_unix_ms,
+        ),
+        projection: imported_projection,
+    })
+}
+
+fn verify_creation_request(
+    connection: &Connection,
+    response: &SuccessResponse,
+) -> Result<(), crate::OnboardingError> {
+    let row: Option<CreationRequestEvidence> = connection
+        .query_row(
+            "SELECT creator_public_identity, name, authored_at_unix_ms,
+                    genesis_operation_id, genesis_envelope, status
+             FROM workspace_creation_requests WHERE workspace_id = ?1",
+            [response.workspace_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    if !matches!(row, Some((creator, name, created_at, genesis_id, genesis, status))
+        if creator == response.creator.as_bytes()
+            && name == response.name
+            && created_at == response.created_at_unix_ms
+            && genesis_id == response.genesis_id.as_bytes()
+            && genesis == response.genesis.canonical_bytes()
+            && status == "Complete")
+    {
+        return Err(crate::OnboardingError::LocalConflict);
+    }
+    Ok(())
+}
+
+fn transition_order(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    genesis_id: MembershipOperationId,
+) -> Result<Vec<MembershipOperationId>, StorageError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT cause_operation_id FROM membership_transitions
+             WHERE workspace_id = ?1 ORDER BY epoch",
+        )
+        .map_err(|_| StorageError::Database)?;
+    let rows = statement
+        .query_map([workspace_id.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .map_err(|_| StorageError::Database)?;
+    let mut order = vec![genesis_id];
+    for row in rows {
+        order.push(
+            operation_id(&row.map_err(|_| StorageError::Database)?)
+                .map_err(membership_to_storage)?,
+        );
+    }
+    Ok(order)
+}
+
+fn insert_operation(
+    transaction: &Transaction<'_>,
+    envelope: &MembershipEnvelope,
+) -> Result<(), crate::OnboardingError> {
+    transaction
+        .execute(
+            "INSERT INTO membership_operations (
+                operation_id, workspace_id, author_public_identity,
+                authored_at_unix_ms, action, canonical_envelope
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                envelope.id.as_bytes().as_slice(),
+                envelope.workspace_id.as_bytes().as_slice(),
+                envelope.author.as_bytes().as_slice(),
+                envelope.authored_at_unix_ms,
+                action_tag(&envelope.action),
+                envelope.canonical_bytes(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|_| crate::OnboardingError::LocalConflict)
+}
+
+fn insert_dependencies(
+    transaction: &Transaction<'_>,
+    envelope: &MembershipEnvelope,
+) -> Result<(), crate::OnboardingError> {
+    for dependency in &envelope.dependencies {
+        transaction
+            .execute(
+                "INSERT INTO membership_dependencies (operation_id, dependency_operation_id)
+                 VALUES (?1, ?2)",
+                params![
+                    envelope.id.as_bytes().as_slice(),
+                    dependency.as_bytes().as_slice()
+                ],
+            )
+            .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    }
+    Ok(())
+}
+
+fn insert_identity_subject(
+    transaction: &Transaction<'_>,
+    envelope: &MembershipEnvelope,
+) -> Result<(), crate::OnboardingError> {
+    transaction
+        .execute(
+            "INSERT INTO identity_subjects (installation_public_identity, human_identity_id)
+             VALUES (?1, NULL) ON CONFLICT(installation_public_identity) DO NOTHING",
+            [envelope.author.as_bytes().as_slice()],
+        )
+        .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    if let MembershipAction::Admit { target, .. } | MembershipAction::Revoke { target } =
+        &envelope.action
+    {
+        transaction
+            .execute(
+                "INSERT INTO identity_subjects (installation_public_identity, human_identity_id)
+                 VALUES (?1, NULL) ON CONFLICT(installation_public_identity) DO NOTHING",
+                [target.as_bytes().as_slice()],
+            )
+            .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    }
+    Ok(())
+}
+
+fn insert_transition(
+    transaction: &Transaction<'_>,
+    projection: &WorkspaceProjection,
+    cause: MembershipOperationId,
+) -> Result<(), crate::OnboardingError> {
+    let epoch = i64::try_from(projection.snapshot.epoch().value())
+        .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
+    transaction
+        .execute(
+            "INSERT INTO membership_transitions (
+                workspace_id, epoch, membership_version, cause_operation_id, snapshot_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                projection.workspace_id.as_bytes().as_slice(),
+                epoch,
+                projection.snapshot.version().as_bytes().as_slice(),
+                cause.as_bytes().as_slice(),
+                snapshot_digest(&projection.snapshot).as_bytes().as_slice(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|_| crate::OnboardingError::LocalConflict)
+}
+
+fn write_current_state(
+    transaction: &Transaction<'_>,
+    projection: &WorkspaceProjection,
+) -> Result<(), crate::OnboardingError> {
+    let epoch = i64::try_from(projection.snapshot.epoch().value())
+        .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
+    transaction
+        .execute(
+            "INSERT INTO workspace_membership_state (workspace_id, epoch, membership_version)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                 epoch = excluded.epoch, membership_version = excluded.membership_version",
+            params![
+                projection.workspace_id.as_bytes().as_slice(),
+                epoch,
+                projection.snapshot.version().as_bytes().as_slice(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|_| crate::OnboardingError::LocalConflict)
+}
+
+fn write_member_snapshot(
+    transaction: &Transaction<'_>,
+    projection: &WorkspaceProjection,
+) -> Result<(), crate::OnboardingError> {
+    transaction
+        .execute(
+            "DELETE FROM membership_snapshot_members WHERE workspace_id = ?1",
+            [projection.workspace_id.as_bytes().as_slice()],
+        )
+        .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    for member in projection.snapshot.members() {
+        transaction
+            .execute(
+                "INSERT INTO membership_snapshot_members (workspace_id, member_identity, role)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    projection.workspace_id.as_bytes().as_slice(),
+                    member.identity().as_bytes().as_slice(),
+                    match member.role() {
+                        MembershipRole::Member => 0,
+                        MembershipRole::Manager => 1,
+                    },
+                ],
+            )
+            .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    }
+    Ok(())
+}
+
+fn import_storage_error(error: StorageError) -> crate::OnboardingError {
+    match error {
+        StorageError::UncertainOutcome => crate::OnboardingError::UncertainStorageOutcome,
+        StorageError::CorruptWorkspace => crate::OnboardingError::LocalConflict,
+        _ => crate::OnboardingError::LocalConflict,
+    }
+}
+
+fn import_fault(error: StorageError) -> crate::OnboardingError {
+    if error == StorageError::UncertainOutcome {
+        crate::OnboardingError::UncertainStorageOutcome
+    } else {
+        crate::OnboardingError::LocalConflict
+    }
 }
 
 pub(crate) fn redeem_invitation(
@@ -454,7 +978,7 @@ fn corrupt_invitation_evidence() -> InvitationError {
     InvitationError::Storage(StorageError::CorruptWorkspace)
 }
 
-fn encode_current_bootstrap_with_limits(
+pub(crate) fn encode_current_bootstrap_with_limits(
     connection: &Connection,
     projection: &WorkspaceProjection,
     admission_id: MembershipOperationId,

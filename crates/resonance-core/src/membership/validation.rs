@@ -10,6 +10,42 @@ pub(crate) fn authenticate(bytes: &[u8]) -> Result<MembershipEnvelope, Membershi
     MembershipEnvelope::decode(bytes)
 }
 
+/// Re-authenticates an already decoded wire envelope and rejects any mismatch
+/// between its parsed fields and canonical signed bytes.
+pub(crate) fn authenticate_canonical_copy(
+    envelope: &MembershipEnvelope,
+) -> Result<(), MembershipError> {
+    let authenticated = authenticate(envelope.canonical_bytes())?;
+    let action_matches = match (&authenticated.action, &envelope.action) {
+        (MembershipAction::Create, MembershipAction::Create) => true,
+        (
+            MembershipAction::Admit {
+                target: left_target,
+                proof: left_proof,
+            },
+            MembershipAction::Admit {
+                target: right_target,
+                proof: right_proof,
+            },
+        ) => left_target == right_target && left_proof.claim.bytes == right_proof.claim.bytes,
+        (MembershipAction::Revoke { target: left }, MembershipAction::Revoke { target: right }) => {
+            left == right
+        }
+        _ => false,
+    };
+    if authenticated.id != envelope.id
+        || authenticated.workspace_id != envelope.workspace_id
+        || authenticated.author != envelope.author
+        || authenticated.authored_at_unix_ms != envelope.authored_at_unix_ms
+        || authenticated.dependencies != envelope.dependencies
+        || authenticated.signature.to_bytes() != envelope.signature.to_bytes()
+        || !action_matches
+    {
+        return Err(MembershipError::ContentHashMismatch);
+    }
+    Ok(())
+}
+
 /// Validates an authenticated envelope against one immutable workspace anchor
 /// and its available causal dependency records.
 pub(crate) fn validate_context(

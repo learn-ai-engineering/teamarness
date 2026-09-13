@@ -14,7 +14,7 @@ pub(crate) use envelope::{AdmissionProof, MembershipAction, MembershipEnvelope};
 pub(crate) use history::was_member;
 pub use id::MembershipOperationId;
 pub(crate) use projection::WorkspaceProjection;
-pub(crate) use validation::{authenticate, validate_context};
+pub(crate) use validation::{authenticate, authenticate_canonical_copy, validate_context};
 
 pub(crate) const INSTALLATION_TAG: u8 = 1;
 pub(crate) const WORKSPACE_TAG: u8 = 2;

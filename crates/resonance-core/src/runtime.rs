@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_base::{PublicKey, SecretKey, Signature};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{
@@ -816,6 +817,185 @@ impl CoreRuntime {
             .map_err(|_| crate::OnboardingError::Authentication)?;
         crate::WorkspaceInvitation::from_parts(&verified, endpoint_addr)
             .map_err(|_| crate::OnboardingError::InvalidInput)
+    }
+
+    /// Joins the invited Workspace after authenticated transport and atomic local import.
+    pub async fn join_workspace(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        let verified = invitation
+            .verified()
+            .map_err(|_| crate::OnboardingError::InvalidInput)?;
+        let claim = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            if state.poisoned {
+                return Err(crate::OnboardingError::UncertainStorageOutcome);
+            }
+            let local_creator: Option<Vec<u8>> = state
+                .connection
+                .query_row(
+                    "SELECT creator_public_identity FROM workspaces WHERE workspace_id = ?1",
+                    [verified.token.workspace_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| crate::OnboardingError::LocalConflict)?;
+            if matches!(local_creator, Some(creator) if creator != verified.token.inviter.as_bytes())
+            {
+                return Err(crate::OnboardingError::LocalConflict);
+            }
+            crate::invitation::sign_claim(&state.secret_key, &verified.token)
+                .map_err(map_invitation_onboarding_error)?
+        };
+
+        let response =
+            crate::onboarding::client::join(&self.transport, verified.clone(), claim.clone())
+                .await?;
+        let bootstrap = crate::membership::projection::validate_bootstrap(
+            response,
+            &verified.token,
+            &claim,
+            self.public_identity,
+        )?;
+        self.import_validated_bootstrap(&bootstrap, |_| Ok(()))
+    }
+
+    fn import_validated_bootstrap(
+        &self,
+        bootstrap: &crate::membership::projection::ValidatedBootstrap,
+        fault: impl FnMut(crate::membership::projection::ImportBoundary) -> Result<(), StorageError>,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        if state.poisoned {
+            return Err(crate::OnboardingError::UncertainStorageOutcome);
+        }
+        let result = crate::membership::projection::import_bootstrap_with_fault(
+            &mut state.connection,
+            bootstrap,
+            fault,
+        );
+        match result {
+            Ok(imported) => {
+                let snapshot = imported.projection.snapshot();
+                state
+                    .memberships
+                    .insert(snapshot.workspace_id(), imported.projection);
+                Ok((imported.summary, snapshot))
+            }
+            Err(error) => {
+                if error == crate::OnboardingError::UncertainStorageOutcome {
+                    state.poisoned = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_workspace_invitation_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        issued_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
+        let token = self
+            .issue_invitation_at(workspace_id, issued_at_unix_ms, expires_at_unix_ms)
+            .map_err(map_invitation_onboarding_error)?;
+        crate::WorkspaceInvitation::from_parts(
+            &token
+                .verified()
+                .map_err(|_| crate::OnboardingError::Authentication)?,
+            self.transport.endpoint_address(),
+        )
+        .map_err(|_| crate::OnboardingError::InvalidInput)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_claim_for_invitation_test(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+    ) -> Result<InvitationClaim, crate::OnboardingError> {
+        let invitation = invitation
+            .verified()
+            .map_err(|_| crate::OnboardingError::InvalidInput)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        let claim = crate::invitation::sign_claim(&state.secret_key, &invitation.token)
+            .map_err(map_invitation_onboarding_error)?;
+        Ok(InvitationClaim::from_verified(&claim))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn export_current_bootstrap_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        admission_id: MembershipOperationId,
+    ) -> Result<crate::onboarding::wire::SuccessResponse, crate::OnboardingError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(crate::OnboardingError::LocalConflict)?;
+        let frame = crate::membership::projection::encode_current_bootstrap_with_limits(
+            &state.connection,
+            projection,
+            admission_id,
+            crate::membership::projection::BootstrapLimits::CURRENT,
+        )
+        .map_err(|_| crate::OnboardingError::InvalidBootstrap)?;
+        crate::onboarding::wire::decode_success(&frame)
+            .map_err(|_| crate::OnboardingError::InvalidBootstrap)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn import_response_for_test(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+        response: crate::onboarding::wire::SuccessResponse,
+        boundary: Option<crate::membership::projection::ImportBoundary>,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        let invitation = invitation
+            .verified()
+            .map_err(|_| crate::OnboardingError::InvalidInput)?;
+        let claim = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            crate::invitation::sign_claim(&state.secret_key, &invitation.token)
+                .map_err(map_invitation_onboarding_error)?
+        };
+        let bootstrap = crate::membership::projection::validate_bootstrap(
+            response,
+            &invitation.token,
+            &claim,
+            self.public_identity,
+        )?;
+        self.import_validated_bootstrap(&bootstrap, |current| {
+            if boundary == Some(current) {
+                Err(
+                    if current == crate::membership::projection::ImportBoundary::AfterCommit {
+                        StorageError::UncertainOutcome
+                    } else {
+                        StorageError::Database
+                    },
+                )
+            } else {
+                Ok(())
+            }
+        })
     }
 
     /// Stops accepting onboarding work and awaits transport closure.
