@@ -40,7 +40,6 @@ pub use error::{
     ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError,
     OnboardingError, StorageError, SubscriptionError, ValueParseError, WorkspaceError,
 };
-pub use invitation::{InvitationClaim, InvitationToken};
 pub use membership::MembershipOperationId;
 pub use onboarding::WorkspaceInvitation;
 pub use runtime::{

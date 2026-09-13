@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resonance_core::{
+use crate::{
     CoreError, CoreRuntime, CoreRuntimeConfig, MembershipEpoch, MembershipError, StorageError,
 };
 use rusqlite::Connection;
@@ -33,7 +33,7 @@ fn database(directory: &Path) -> Connection {
     Connection::open(directory.join("core.sqlite3")).unwrap()
 }
 
-fn admit(issuer: &CoreRuntime, invitee: &CoreRuntime, workspace_id: resonance_core::WorkspaceId) {
+fn admit(issuer: &CoreRuntime, invitee: &CoreRuntime, workspace_id: crate::WorkspaceId) {
     let token = issuer
         .issue_invitation(workspace_id, now_unix_ms() + 60_000)
         .unwrap();

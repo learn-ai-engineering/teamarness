@@ -9,11 +9,12 @@ use iroh_base::{PublicKey, SecretKey, Signature};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::MembershipOperationId;
 use crate::error::{
     CoreError, IdentityError, InvitationError, MembershipError, StorageError, SubscriptionError,
     ValueParseError, WorkspaceError,
 };
-use crate::{InvitationClaim, InvitationToken, MembershipOperationId};
+use crate::invitation::{InvitationClaim, InvitationToken};
 
 /// Configuration for opening a [`CoreRuntime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -751,7 +752,8 @@ impl CoreRuntime {
     }
 
     /// Issues an expiring invitation as the local manager.
-    pub fn issue_invitation(
+    #[allow(dead_code)]
+    pub(crate) fn issue_invitation(
         &self,
         workspace_id: WorkspaceId,
         expires_at_unix_ms: i64,
@@ -1006,7 +1008,8 @@ impl CoreRuntime {
     }
 
     /// Creates proof that this installation claims the supplied invitation.
-    pub fn create_invitation_claim(
+    #[allow(dead_code)]
+    pub(crate) fn create_invitation_claim(
         &self,
         token: &InvitationToken,
     ) -> Result<InvitationClaim, InvitationError> {
@@ -1017,7 +1020,8 @@ impl CoreRuntime {
     }
 
     /// Redeems a claim on the installation that issued its token.
-    pub fn redeem_invitation(
+    #[allow(dead_code)]
+    pub(crate) fn redeem_invitation(
         &self,
         claim: &InvitationClaim,
     ) -> Result<MembershipTransition, InvitationError> {
@@ -1080,6 +1084,93 @@ impl CoreRuntime {
         config: CoreRuntimeConfig,
     ) -> Result<Self, CoreError> {
         Self::open_with_clock(config, Box::new(SystemClock)).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_next_onboarding_response_for_test(&self) {
+        self.transport.handler().drop_next_response();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn endpoint_address_for_test(&self) -> iroh_base::EndpointAddr {
+        self.transport.endpoint_address()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeout_next_join_for_test(&self) {
+        self.transport.force_next_join_timeout();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_next_bootstrap_for_test(&self) {
+        self.transport.force_next_invalid_bootstrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn exhaust_outbound_joins_for_test(
+        &self,
+    ) -> Vec<crate::onboarding::transport::OutboundPermit> {
+        let mut permits = Vec::new();
+        for _ in 0..crate::onboarding::transport::MAX_OUTBOUND_JOINS {
+            permits.push(self.transport.begin_outbound().await.expect("test permit"));
+        }
+        permits
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_outbound_join_for_test(
+        &self,
+    ) -> Result<crate::onboarding::transport::OutboundPermit, crate::OnboardingError> {
+        self.transport.begin_outbound().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn onboarding_lifecycle_state_for_test(&self) -> u8 {
+        self.transport.lifecycle_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn send_raw_onboarding_frame_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, crate::OnboardingError> {
+        let (connection, _permit) = self.transport.connect(address).await?;
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .map_err(|_| crate::OnboardingError::Authentication)?;
+        send.write_all(frame)
+            .await
+            .map_err(|_| crate::OnboardingError::Authentication)?;
+        send.finish()
+            .map_err(|_| crate::OnboardingError::Authentication)?;
+        receive
+            .read_to_end(1_024 + 4)
+            .await
+            .map_err(|_| crate::OnboardingError::Overload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_workspace_invitation_for_workspace_id_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        let issued_at_unix_ms = self.clock.now_unix_ms();
+        let token = crate::invitation::sign_token(
+            &state.secret_key,
+            workspace_id,
+            issued_at_unix_ms,
+            issued_at_unix_ms.saturating_add(60_000),
+            SecretKey::generate().to_bytes(),
+        )
+        .map_err(map_invitation_onboarding_error)?;
+        crate::WorkspaceInvitation::from_parts(&token, self.transport.endpoint_address())
+            .map_err(|_| crate::OnboardingError::InvalidInput)
     }
 
     #[cfg(test)]

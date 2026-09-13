@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resonance_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch};
+use crate::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);

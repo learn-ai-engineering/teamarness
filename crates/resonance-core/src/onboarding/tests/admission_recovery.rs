@@ -70,6 +70,21 @@ async fn exact_retry_recovers_after_expiry_without_a_duplicate_admission() {
 
     assert_eq!(first_response.admission_id, recovered_response.admission_id);
     assert_eq!(count_admissions(&issuer_directory), (1, 1));
+    let connection = Connection::open(issuer_directory.join("core.sqlite3")).unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE used_invitation_nonces SET workspace_id = workspace_id",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM used_invitation_nonces", [])
+            .is_err()
+    );
+    drop(connection);
 
     issuer.shutdown().await.unwrap();
     invitee.shutdown().await.unwrap();

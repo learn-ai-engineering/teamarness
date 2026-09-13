@@ -100,6 +100,17 @@ async fn external_consumers_cannot_cross_the_runtime_boundary() {
         ("private_adapter.rs", "membership"),
         ("mutable_group_crdt.rs", "group_crdt_mut"),
         ("endpoint_ticket.rs", "endpoint_ticket"),
+        ("endpoint_handle.rs", "endpoint"),
+        ("router_handle.rs", "router"),
+        ("connection_handle.rs", "connection"),
+        ("stream_handle.rs", "stream"),
+        ("workspace_bootstrap.rs", "WorkspaceBootstrap"),
+        ("canonical_membership_bytes.rs", "canonical_bytes"),
+        ("invitation_token.rs", "InvitationToken"),
+        ("invitation_claim.rs", "InvitationClaim"),
+        ("issue_invitation.rs", "issue_invitation"),
+        ("create_invitation_claim.rs", "create_invitation_claim"),
+        ("redeem_invitation.rs", "redeem_invitation"),
     ];
 
     for (fixture, marker) in cases {

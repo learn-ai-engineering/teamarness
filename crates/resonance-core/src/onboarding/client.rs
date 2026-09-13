@@ -42,7 +42,8 @@ async fn exchange(
         .await?;
     let request =
         encode_request(&JoinRequest { claim }).map_err(|_| OnboardingError::InvalidInput)?;
-    let frame = transport
+    #[allow(unused_mut)]
+    let mut frame = transport
         .response_io(async {
             send.write_all(&request)
                 .await
@@ -54,6 +55,8 @@ async fn exchange(
                 .map_err(|_| OnboardingError::Overload)
         })
         .await?;
+    #[cfg(test)]
+    transport.alter_received_bootstrap(&mut frame);
     if let Ok(response) = decode_success(&frame) {
         return Ok(response);
     }

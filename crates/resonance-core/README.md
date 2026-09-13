@@ -1,8 +1,8 @@
 # resonance-core
 
-`resonance-core` is the Phase 1 durable identity and canonical-membership library. Applications use the public `CoreRuntime` seam; the crate owns installation key custody, SQLite persistence, authenticated membership replay, recovery, and transition publication.
+`resonance-core` is the durable identity, canonical-membership, and Workspace onboarding library. Applications use the public `CoreRuntime` seam; the crate owns installation key custody, SQLite persistence, authenticated membership replay, Iroh onboarding, recovery, and transition publication.
 
-## Phase 1 API
+## Core Runtime API
 
 Open one runtime for an installation-private data directory:
 
@@ -22,8 +22,10 @@ The public API supports:
 
 - asynchronously opening an installation, authenticating storage, recovering membership, and starting one Iroh onboarding endpoint from the persisted Installation key;
 - domain-separated signing and public signature verification without secret access;
-- creating and listing workspaces;
-- issuing an expiring invitation as the creator-manager, claiming it on another installation, and redeeming it once on the issuer;
+- creating and listing Workspaces;
+- creating one opaque, fixed-lifetime `WorkspaceInvitation` as the creator-manager;
+- joining an invited Workspace through authenticated Iroh transport and returning owned `WorkspaceSummary` and `MembershipSnapshot` values only after atomic local import;
+- recovering the same committed admission when response delivery is interrupted, including after invitation expiry while that Installation remains current;
 - reading the current membership snapshot and content-derived `MembershipVersion`;
 - revoking an admitted member;
 - querying declared-time membership history; and
@@ -31,7 +33,7 @@ The public API supports:
 
 Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. Runtime shutdown rejects new onboarding transport work, leaves local identity, Workspace, and membership commands available, and must be awaited. `Drop` is an abnormal best-effort cleanup fallback only.
 
-Installation secrets, raw key bytes, SQLite connections, Iroh endpoint and router handles, canonical-operation adapters, mutable p2panda `GroupCrdt` state, fault hooks, and transition publishers are not public.
+Low-level token issuance, claim creation, and redemption are private onboarding mechanics. Installation secrets, raw key bytes, SQLite connections, Iroh endpoint, router, connection, stream, and ticket handles, bootstrap and canonical-operation values, membership adapters, mutable p2panda `GroupCrdt` state, fault hooks, and transition publishers are not public.
 
 ## Declared-time warning
 
@@ -43,11 +45,11 @@ A runtime owns one `core.sqlite3` database beneath its private data directory. T
 
 Workspace creation records generated identity and signed genesis material once, then rolls a committed pending request forward on `CoreRuntime::open`. Invitation redemption atomically spends the nonce and commits the authenticated admission, derived state, epoch, and transition. Startup authenticates canonical operations, reconstructs projections, repairs safe derived-state drift, and rejects missing or contradictory canonical evidence. If a commit outcome is uncertain, the active runtime is poisoned and must be dropped and reopened before another command.
 
-## Explicit Phase 1 exclusions
+## Explicit exclusions
 
-Phase 1 does not provide:
+The Core Runtime does not provide:
 
-- completed remote admission, Workspace bootstrap import, peer discovery, or membership synchronization;
+- peer discovery or continuous/background membership synchronization after the bounded one-shot onboarding export;
 - distributed invitation-spend coordination across managers or databases;
 - a second-manager path, promotion, demotion, arbitrary access levels, nested groups, or re-admission after revocation;
 - multi-manager conflict fixtures (mutual manager removal and dependent transitive invalidation are deferred until a supported second-manager path exists);

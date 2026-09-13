@@ -35,6 +35,10 @@ pub(crate) struct Transport {
     shutdown: OnceCell<Result<(), OnboardingError>>,
     readiness: Readiness,
     require_relay_address: bool,
+    #[cfg(test)]
+    timeout_next_join: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    invalidate_next_bootstrap: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +102,10 @@ impl Transport {
             shutdown: OnceCell::new(),
             readiness: options.readiness,
             require_relay_address: options.require_relay_address,
+            #[cfg(test)]
+            timeout_next_join: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            invalidate_next_bootstrap: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -167,6 +175,10 @@ impl Transport {
         &self,
         future: impl Future<Output = Result<T, OnboardingError>>,
     ) -> Result<T, OnboardingError> {
+        #[cfg(test)]
+        if self.timeout_next_join.swap(false, Ordering::AcqRel) {
+            return Err(OnboardingError::Timeout);
+        }
         timeout(WHOLE_JOIN_TIMEOUT, future)
             .await
             .map_err(|_| OnboardingError::Timeout)?
@@ -275,6 +287,26 @@ impl Transport {
     #[cfg(test)]
     pub(crate) fn handler(&self) -> &Arc<OnboardingHandler> {
         &self.handler
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_join_timeout(&self) {
+        self.timeout_next_join.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_invalid_bootstrap(&self) {
+        self.invalidate_next_bootstrap
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alter_received_bootstrap(&self, frame: &mut [u8]) {
+        if self.invalidate_next_bootstrap.swap(false, Ordering::AcqRel)
+            && let Some(version) = frame.get_mut(4)
+        {
+            *version = version.wrapping_add(1);
+        }
     }
 
     #[cfg(test)]

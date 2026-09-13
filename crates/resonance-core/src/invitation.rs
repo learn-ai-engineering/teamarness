@@ -17,11 +17,11 @@ const CLAIM_LEN: usize = 1 + 2 + TOKEN_LEN + 1 + 32 + 64;
 
 /// An opaque, transferable signed invitation token.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvitationToken(String);
+pub(crate) struct InvitationToken(String);
 
 /// An opaque invitation token plus proof of possession by the invitee.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvitationClaim(String);
+pub(crate) struct InvitationClaim(String);
 
 #[derive(Clone)]
 pub(crate) struct VerifiedInvitationToken {
@@ -44,7 +44,7 @@ pub(crate) struct VerifiedInvitationClaim {
 impl InvitationToken {
     /// Returns the token's transport-safe lowercase hexadecimal form.
     #[must_use]
-    pub fn encoded(&self) -> &str {
+    pub(crate) fn encoded(&self) -> &str {
         &self.0
     }
 
@@ -70,7 +70,7 @@ impl FromStr for InvitationToken {
 impl InvitationClaim {
     /// Returns the claim's transport-safe lowercase hexadecimal form.
     #[must_use]
-    pub fn encoded(&self) -> &str {
+    pub(crate) fn encoded(&self) -> &str {
         &self.0
     }
 

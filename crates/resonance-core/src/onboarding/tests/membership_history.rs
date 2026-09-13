@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resonance_core::{CoreRuntime, CoreRuntimeConfig, PublicIdentity};
+use crate::{CoreRuntime, CoreRuntimeConfig, PublicIdentity};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);

@@ -27,6 +27,8 @@ pub(crate) struct OnboardingHandler {
     handled: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     handled_notify: tokio::sync::Notify,
+    #[cfg(test)]
+    drop_next_response: AtomicBool,
 }
 
 impl fmt::Debug for OnboardingHandler {
@@ -50,6 +52,8 @@ impl OnboardingHandler {
             handled: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             handled_notify: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            drop_next_response: AtomicBool::new(false),
         }
     }
 
@@ -93,6 +97,11 @@ impl OnboardingHandler {
             self.handled_notify.notified().await;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn drop_next_response(&self) {
+        self.drop_next_response.store(true, Ordering::Release);
+    }
 }
 
 impl ProtocolHandler for OnboardingHandler {
@@ -125,6 +134,11 @@ impl ProtocolHandler for OnboardingHandler {
                 Err(_) => encode_error(OnboardingError::InvalidInput).ok(),
             };
             if let Some(response) = response {
+                #[cfg(test)]
+                if self.drop_next_response.swap(false, Ordering::AcqRel) {
+                    connection.close(3_u8.into(), b"simulated response loss");
+                    return Ok(());
+                }
                 let write = async {
                     send.write_all(&response).await.map_err(|_| ())?;
                     send.finish().map_err(|_| ())?;

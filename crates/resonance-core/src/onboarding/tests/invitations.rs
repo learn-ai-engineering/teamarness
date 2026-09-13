@@ -4,9 +4,9 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resonance_core::{
-    CoreRuntime, CoreRuntimeConfig, InvitationClaim, InvitationError, InvitationToken,
-    MembershipEpoch, MembershipRole, WorkspaceId,
+use crate::invitation::{InvitationClaim, InvitationToken};
+use crate::{
+    CoreRuntime, CoreRuntimeConfig, InvitationError, MembershipEpoch, MembershipRole, WorkspaceId,
 };
 use rusqlite::Connection;
 
