@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, PathBuf};
 
 use serde::Deserialize;
 
@@ -205,14 +205,6 @@ fn normalized_relative(value: &str) -> Result<PathBuf, CatalogFailure> {
         return Err(invalid_registration());
     }
     Ok(path)
-}
-
-fn reject_final_symlink(path: &Path) -> Result<(), CatalogFailure> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| invalid_registration())?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid_registration());
-    }
-    Ok(())
 }
 
 const fn invalid_registration() -> CatalogFailure {

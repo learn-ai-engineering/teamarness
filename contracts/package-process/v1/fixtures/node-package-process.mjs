@@ -222,6 +222,7 @@ function rejectDuplicateKeys(text) {
 async function serve() {
   let buffer = Buffer.alloc(0);
   let delayedRequest;
+  let packageIdentity;
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
     buffer = Buffer.concat([buffer, chunk]);
@@ -232,11 +233,13 @@ async function serve() {
       const frame = decodeFrame(buffer.subarray(0, length + 4));
       buffer = buffer.subarray(length + 4);
       if (frame.kind === "initialize") {
+        packageIdentity = frame.package.identity;
         send({ kind: "initialized", nonce: frame.nonce, package: frame.package, uiContractDigest: frame.uiContractDigest, processGeneration: frame.processGeneration, protocol: frame.protocol });
       } else if (frame.kind === "ping") {
         send({ kind: "pong", nonce: frame.nonce });
       } else if (frame.kind === "request" && frame.operation.startsWith("lifecycle.")) {
         const operation = frame.operation.slice("lifecycle.".length);
+        if (["activate", "recover"].includes(operation) && packageIdentity?.endsWith(".crash")) process.abort();
         send({ kind: "response", id: frame.id, payload: { state: operation === "recover" ? "active" : operation } });
         if (operation === "activate") {
           send({ kind: "request", id: "p:fixture-cap", operation: "capability.call", grant: "Z3JhbnQx", deadlineUnixMs: frame.deadlineUnixMs, payload: { method: "get" } });
@@ -244,6 +247,18 @@ async function serve() {
       } else if (frame.kind === "stream_open") {
         send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: 1 } });
         send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.error") {
+        send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: {} });
+      } else if (frame.kind === "request" && frame.operation === "fixture.abort") {
+        await import("node:fs/promises").then((fs) => fs.appendFile("mutation-attempts", "1\n"));
+        process.abort();
+      } else if (frame.kind === "request" && frame.operation === "fixture.malformed") {
+        process.stdout.write(Buffer.from([0, 0, 0, 1, 0x7b]));
+      } else if (frame.kind === "request" && frame.operation === "fixture.unknown_response") {
+        send({ kind: "response", id: "h:unknown", payload: {} });
+      } else if (frame.kind === "request" && frame.operation === "fixture.stderr") {
+        for (let index = 0; index < 100; index += 1) process.stderr.write(`${"x".repeat(20_000)}\n`);
+        send({ kind: "response", id: frame.id, payload: { written: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.delayed") {
         delayedRequest = frame;
       } else if (frame.kind === "request" && frame.operation === "fixture.immediate") {

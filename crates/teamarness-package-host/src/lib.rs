@@ -1,30 +1,28 @@
-//! Package source admission, durable continuity, and the Package Host value contract.
+//! Package admission, durable continuity, and supervised Package Processes.
 //!
-//! Source parsing, schema compilation, storage, and data-directory allocation stay
-//! private. Operational host behavior lands in the next package-foundation phase.
+//! [`PackageHost`] is the actor facade. Source policy, process handles, protocol
+//! tasks, leases, data paths, and dependency types remain private.
 
 #![forbid(unsafe_code)]
 
-// Phase 2 builds these private adapters before Phase 3 wires them into PackageHost::open.
-#[allow(dead_code)]
 mod admission;
-#[allow(dead_code)]
 mod catalog;
-#[allow(dead_code)]
 mod data_directory;
-#[allow(dead_code)]
 mod host_store;
-#[allow(dead_code)]
+mod instance;
 mod manifest;
-#[allow(dead_code)]
+mod protocol;
+mod supervisor;
 mod ui;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, watch};
 
 /// A failure to parse one of the Package Host's public string values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -598,17 +596,503 @@ pub enum PackageHostCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PackageHostOutcome {
-    Reconciled { revision: HostRevision },
-    Suspended { revision: HostRevision },
-    Recovered { revision: HostRevision },
-    Disposed { revision: HostRevision },
-    UiMountOpened { revision: HostRevision },
-    UiMountClosed { revision: HostRevision },
-    UiResponse { payload: PackageValue },
+    Reconciled {
+        revision: HostRevision,
+    },
+    Suspended {
+        revision: HostRevision,
+    },
+    Recovered {
+        revision: HostRevision,
+    },
+    Disposed {
+        revision: HostRevision,
+    },
+    UiMountOpened {
+        mount: UiMountId,
+        revision: HostRevision,
+    },
+    UiMountClosed {
+        revision: HostRevision,
+    },
+    UiResponse {
+        payload: PackageValue,
+    },
     UiRequestCancelled,
     UiSubscriptionOpened,
     UiEventsAcknowledged,
     UiSubscriptionClosed,
-    UiFaultRecorded { revision: HostRevision },
+    UiFaultRecorded {
+        revision: HostRevision,
+    },
     Shutdown,
 }
+
+/// A coalesced host-state notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostStateNotification {
+    pub revision: HostRevision,
+    pub revision_gap: bool,
+}
+
+/// A bounded subscription to the latest Package Host revision.
+pub struct PackageHostSubscription {
+    receiver: watch::Receiver<HostRevision>,
+    after: HostRevision,
+}
+
+#[allow(clippy::result_large_err)]
+impl PackageHostSubscription {
+    /// Waits for the newest revision. `revision_gap` requires a fresh snapshot.
+    pub async fn changed(&mut self) -> Result<HostStateNotification, PackageErrorEnvelope> {
+        let current = *self.receiver.borrow();
+        let revision = if current > self.after {
+            current
+        } else {
+            self.receiver.changed().await.map_err(|_| {
+                host_error(PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown)
+            })?;
+            *self.receiver.borrow()
+        };
+        let notification = HostStateNotification {
+            revision,
+            revision_gap: revision.0 > self.after.0.saturating_add(1),
+        };
+        self.after = revision;
+        Ok(notification)
+    }
+}
+
+/// Actor facade for admitted and supervised Package Instances.
+#[derive(Clone)]
+pub struct PackageHost {
+    inner: Arc<PackageHostInner>,
+}
+
+struct PackageHostInner {
+    data: Mutex<HostData>,
+    revisions: watch::Sender<HostRevision>,
+}
+
+struct HostData {
+    state: PackageHostState,
+    revision: HostRevision,
+    packages: Vec<PackageCatalogEntry>,
+    diagnostics: Vec<PackageErrorEnvelope>,
+    instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
+    mounts: BTreeMap<UiMountId, PackageInstanceKey>,
+}
+
+#[allow(clippy::result_large_err)]
+impl PackageHost {
+    /// Opens host metadata, admits sources, reconciles leases, and eagerly activates
+    /// every admitted Package for every Workspace known to Core.
+    pub async fn open(
+        config: PackageHostConfig,
+        core: Arc<teamarness_core::CoreRuntime>,
+    ) -> Result<Self, PackageErrorEnvelope> {
+        let mut report = admission::admit(&config)
+            .map_err(|failure| host_error(failure.code, PackageErrorStage::Admission))?;
+        let unresolved = supervisor::reconcile_orphans(config.private_data_directory())
+            .map_err(|code| host_error(code, PackageErrorStage::Process))?;
+        for lease in &unresolved {
+            let package = lease.package_identity.parse().ok();
+            let mut error = host_error(
+                PackageErrorCode::OrphanUnresolved,
+                PackageErrorStage::Process,
+            );
+            error.affected_package = package;
+            report.snapshot.diagnostics.push(error);
+        }
+        let blocked: std::collections::BTreeSet<_> = unresolved
+            .iter()
+            .map(|lease| (lease.package_identity.clone(), lease.workspace_id.clone()))
+            .collect();
+        let workspaces = core.list_workspaces().map_err(|_| {
+            host_error(
+                PackageErrorCode::DataDirectoryUnavailable,
+                PackageErrorStage::Storage,
+            )
+        })?;
+        let store = host_store::HostStore::open(config.private_data_directory())
+            .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
+        let mut instances = BTreeMap::new();
+        for admission in report.admissions {
+            let catalog = report
+                .snapshot
+                .packages
+                .iter()
+                .find(|entry| entry.identity == admission.manifest.identity)
+                .expect("every admission has a catalog entry");
+            let source_label = match catalog.source {
+                PackageSourceKind::Bundled => "bundled",
+                PackageSourceKind::Local => "local",
+            };
+            let trust_label = match catalog.trust {
+                PackageTrustKind::ApplicationBundled => "application_bundled",
+                PackageTrustKind::TrustedNativeCodeV1 => "trusted_native_code_v1",
+            };
+            for workspace in &workspaces {
+                let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
+                    host_error(
+                        PackageErrorCode::DataDirectoryUnrepresentable,
+                        PackageErrorStage::Storage,
+                    )
+                })?;
+                if blocked.contains(&(
+                    admission.manifest.identity.to_string(),
+                    workspace_id.to_string(),
+                )) {
+                    continue;
+                }
+                let key = PackageInstanceKey::new(
+                    admission.manifest.identity.clone(),
+                    workspace_id.clone(),
+                );
+                let grant = data_directory::allocate(
+                    &store,
+                    config.private_data_directory(),
+                    config.installation_public_identity(),
+                    &workspace_id,
+                    &admission.manifest.identity,
+                )
+                .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
+                let spec = supervisor::ProcessSpec {
+                    package_identity: admission.manifest.identity.clone(),
+                    package_version: admission.manifest.version.to_string(),
+                    manifest_digest: admission.manifest.manifest_digest.clone(),
+                    backend_digest: admission.manifest.backend.digest.clone(),
+                    ui_contract_digest: admission.manifest.ui.contract.digest.clone(),
+                    backend_path: admission.backend_path.clone(),
+                    workspace_id,
+                    workspace_name: workspace.name().to_owned(),
+                    installation: config.installation_public_identity().clone(),
+                    data_directory: grant.path,
+                    continuity_id: grant.continuity_id,
+                    private_data_directory: config.private_data_directory().to_owned(),
+                    source_label: source_label.to_owned(),
+                    trust_label: trust_label.to_owned(),
+                    protocol: (
+                        admission.manifest.protocol.major,
+                        admission.manifest.protocol.max_minor,
+                    ),
+                    capabilities: admission
+                        .manifest
+                        .capabilities
+                        .iter()
+                        .map(|capability| {
+                            (
+                                capability.identity.clone(),
+                                capability.major,
+                                capability.max_minor,
+                            )
+                        })
+                        .collect(),
+                };
+                let actor = Arc::new(instance::InstanceActor::new(key.clone(), spec));
+                if let Err(failure) = actor.activate().await {
+                    let mut error = host_error(failure.code, PackageErrorStage::Process);
+                    error.affected_instance = Some(key.clone());
+                    report.snapshot.diagnostics.push(error);
+                }
+                instances.insert(key, actor);
+            }
+        }
+        let revision = HostRevision(1);
+        let (revisions, _) = watch::channel(revision);
+        let host = Self {
+            inner: Arc::new(PackageHostInner {
+                data: Mutex::new(HostData {
+                    state: PackageHostState::Running,
+                    revision,
+                    packages: report.snapshot.packages,
+                    diagnostics: report.snapshot.diagnostics,
+                    instances,
+                    mounts: BTreeMap::new(),
+                }),
+                revisions,
+            }),
+        };
+        Ok(host)
+    }
+
+    /// Returns the authoritative Package Host state.
+    pub async fn snapshot(&self) -> PackageHostSnapshot {
+        let (state, revision, packages, diagnostics, instances) = {
+            let data = self.inner.data.lock().await;
+            (
+                data.state,
+                data.revision,
+                data.packages.clone(),
+                data.diagnostics.clone(),
+                data.instances.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let mut snapshots = Vec::with_capacity(instances.len());
+        for actor in instances {
+            snapshots.push(actor.snapshot().await);
+        }
+        PackageHostSnapshot {
+            revision,
+            state,
+            packages,
+            instances: snapshots,
+            diagnostics,
+        }
+    }
+
+    /// Subscribes to coalesced state revisions after the caller's last snapshot.
+    #[must_use]
+    pub fn subscribe(&self, after_revision: HostRevision) -> PackageHostSubscription {
+        PackageHostSubscription {
+            receiver: self.inner.revisions.subscribe(),
+            after: after_revision,
+        }
+    }
+
+    /// Executes one typed host command.
+    pub async fn execute(
+        &self,
+        command: PackageHostCommand,
+    ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
+        if self.inner.data.lock().await.state == PackageHostState::Stopped {
+            return Err(host_error(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            ));
+        }
+        match command {
+            PackageHostCommand::ReconcileWorkspaces(_) => {
+                let revision = self.bump_revision().await;
+                Ok(PackageHostOutcome::Reconciled { revision })
+            }
+            PackageHostCommand::Suspend(input) => {
+                let actor = self.actor(&input.instance).await?;
+                actor
+                    .suspend()
+                    .await
+                    .map_err(|failure| instance_error(failure, &input.instance))?;
+                Ok(PackageHostOutcome::Suspended {
+                    revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::Recover(input) => {
+                let actor = self.actor(&input.instance).await?;
+                actor
+                    .recover()
+                    .await
+                    .map_err(|failure| instance_error(failure, &input.instance))?;
+                Ok(PackageHostOutcome::Recovered {
+                    revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::Dispose(input) => {
+                let actor = self.actor(&input.instance).await?;
+                actor
+                    .dispose()
+                    .await
+                    .map_err(|failure| instance_error(failure, &input.instance))?;
+                Ok(PackageHostOutcome::Disposed {
+                    revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::OpenUiMount(input) => {
+                let actor = self.actor(&input.instance).await?;
+                let mount = actor
+                    .open_mount()
+                    .await
+                    .map_err(|failure| instance_error(failure, &input.instance))?;
+                self.inner
+                    .data
+                    .lock()
+                    .await
+                    .mounts
+                    .insert(mount.clone(), input.instance);
+                Ok(PackageHostOutcome::UiMountOpened {
+                    mount,
+                    revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::CloseUiMount(input) => {
+                if let Some(actor) = self.actor_for_mount(&input.mount).await {
+                    actor.close_mount(&input.mount).await;
+                    self.inner.data.lock().await.mounts.remove(&input.mount);
+                }
+                Ok(PackageHostOutcome::UiMountClosed {
+                    revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::UiRequest(input) => {
+                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
+                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                })?;
+                let payload = actor
+                    .request(&input.mount, input.request, input.operation, input.payload)
+                    .await
+                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Process))?;
+                Ok(PackageHostOutcome::UiResponse { payload })
+            }
+            PackageHostCommand::CancelUiRequest(input) => {
+                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
+                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                })?;
+                actor
+                    .cancel(&input.request)
+                    .await
+                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                Ok(PackageHostOutcome::UiRequestCancelled)
+            }
+            PackageHostCommand::OpenUiSubscription(input) => {
+                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
+                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                })?;
+                actor
+                    .stream_open(
+                        &input.mount,
+                        input.subscription,
+                        input.operation,
+                        input.payload,
+                    )
+                    .await
+                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                Ok(PackageHostOutcome::UiSubscriptionOpened)
+            }
+            PackageHostCommand::AcknowledgeUiEvents(input) => {
+                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
+                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                })?;
+                actor
+                    .acknowledge(&input.mount, &input.subscription, input.through_sequence)
+                    .await
+                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                Ok(PackageHostOutcome::UiEventsAcknowledged)
+            }
+            PackageHostCommand::CloseUiSubscription(input) => {
+                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
+                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                })?;
+                actor
+                    .close_subscription(&input.mount, &input.subscription)
+                    .await
+                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                Ok(PackageHostOutcome::UiSubscriptionClosed)
+            }
+            PackageHostCommand::ReportUiFault(input) => {
+                if let Some(actor) = self.actor_for_mount(&input.mount).await {
+                    actor.close_mount(&input.mount).await;
+                    self.inner.data.lock().await.mounts.remove(&input.mount);
+                }
+                Ok(PackageHostOutcome::UiFaultRecorded {
+                    revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::Shutdown(_) => {
+                {
+                    let mut data = self.inner.data.lock().await;
+                    data.state = PackageHostState::ShuttingDown;
+                }
+                self.bump_revision().await;
+                let actors = self
+                    .inner
+                    .data
+                    .lock()
+                    .await
+                    .instances
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for actor in actors {
+                    actor.shutdown().await;
+                }
+                {
+                    let mut data = self.inner.data.lock().await;
+                    data.state = PackageHostState::Stopped;
+                }
+                self.bump_revision().await;
+                Ok(PackageHostOutcome::Shutdown)
+            }
+        }
+    }
+
+    async fn actor(
+        &self,
+        key: &PackageInstanceKey,
+    ) -> Result<Arc<instance::InstanceActor>, PackageErrorEnvelope> {
+        self.inner
+            .data
+            .lock()
+            .await
+            .instances
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                host_error(
+                    PackageErrorCode::InvalidLifecycleState,
+                    PackageErrorStage::Lifecycle,
+                )
+            })
+    }
+
+    async fn actor_for_mount(&self, mount: &UiMountId) -> Option<Arc<instance::InstanceActor>> {
+        let data = self.inner.data.lock().await;
+        let key = data.mounts.get(mount)?;
+        data.instances.get(key).cloned()
+    }
+
+    async fn bump_revision(&self) -> HostRevision {
+        let mut data = self.inner.data.lock().await;
+        data.revision.0 = data.revision.0.saturating_add(1);
+        let revision = data.revision;
+        self.inner.revisions.send_replace(revision);
+        revision
+    }
+}
+
+fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorEnvelope {
+    let retryable = matches!(
+        code,
+        PackageErrorCode::DeadlineExceeded
+            | PackageErrorCode::ProcessExited
+            | PackageErrorCode::BackendError
+            | PackageErrorCode::Cancelled
+    );
+    let recovery = match code {
+        PackageErrorCode::CrashLoop
+        | PackageErrorCode::ProcessExited
+        | PackageErrorCode::DeadlineExceeded
+        | PackageErrorCode::OutcomeUncertain => RecoveryAction::RecoverBackend,
+        PackageErrorCode::StaleMount | PackageErrorCode::UiException => RecoveryAction::ReloadUi,
+        PackageErrorCode::ShuttingDown => RecoveryAction::None,
+        _ => RecoveryAction::CorrectPackageSource,
+    };
+    let mut random = [0_u8; 12];
+    let _ = getrandom::fill(&mut random);
+    let text = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    PackageErrorEnvelope::new(
+        code,
+        stage,
+        retryable,
+        recovery,
+        DiagnosticId::new(format!("diag-{text}")).expect("hex diagnostic ID"),
+    )
+}
+
+fn instance_error(
+    failure: protocol::WireFailure,
+    instance: &PackageInstanceKey,
+) -> PackageErrorEnvelope {
+    let mut error = host_error(failure.code, PackageErrorStage::Lifecycle);
+    error.affected_instance = Some(instance.clone());
+    error
+}
+
+impl fmt::Display for PackageErrorEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "teamarness.package-host:{:?}", self.code)
+    }
+}
+
+impl std::error::Error for PackageErrorEnvelope {}

@@ -88,6 +88,16 @@ impl Frame {
     }
 }
 
+impl TryFrom<Value> for Frame {
+    type Error = ProtocolError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let payload =
+            serde_json::to_vec(&value).map_err(|_| ProtocolError::new("malformed_frame"))?;
+        decode_payload(&payload)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolError {
     code: &'static str,

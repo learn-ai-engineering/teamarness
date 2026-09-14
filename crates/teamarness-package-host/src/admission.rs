@@ -19,6 +19,8 @@ pub(crate) struct AdmissionReport {
     pub(crate) admissions: Vec<Admission>,
 }
 
+// Phase 5 consumes the admitted UI cache and compiled contract.
+#[allow(dead_code)]
 pub(crate) struct Admission {
     pub(crate) package_root: PathBuf,
     pub(crate) backend_path: PathBuf,

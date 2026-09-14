@@ -121,6 +121,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             revision: HostRevision::INITIAL,
         },
         PackageHostOutcome::UiMountOpened {
+            mount: teamarness_package_host::UiMountId::new("mount-2").unwrap(),
             revision: HostRevision::INITIAL,
         },
         PackageHostOutcome::UiMountClosed {
@@ -320,15 +321,15 @@ fn snapshots_and_errors_expose_only_host_values() {
 }
 
 #[test]
-fn public_source_does_not_export_dependency_types_or_operational_host() {
+fn public_source_does_not_export_dependency_types() {
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
     for forbidden in [
         "rusqlite::",
         "jsonschema::",
         "semver::",
-        "teamarness_core::",
-        "pub struct PackageHost {",
+        "pub tokio::",
+        "pub nix::",
     ] {
         assert!(
             !source.contains(forbidden),
@@ -336,12 +337,6 @@ fn public_source_does_not_export_dependency_types_or_operational_host() {
         );
     }
 
-    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|extension| extension == "rs") {
-            let source = std::fs::read_to_string(path).unwrap();
-            assert!(!source.contains("std::process::Command"));
-            assert!(!source.contains("tokio::process"));
-        }
-    }
+    assert!(!source.contains("pub process:"));
+    assert!(!source.contains("pub child:"));
 }

@@ -2,6 +2,8 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
 use crate::host_store::HostStore;
 use crate::manifest::sha256;
 use crate::{InstallationPublicIdentity, PackageErrorCode, PackageIdentity, WorkspaceId};
@@ -34,18 +36,16 @@ pub(crate) fn allocate(
             workspace.as_str(),
             sha256(package.as_str().as_bytes())
         );
-        let continuity_id = format!(
-            "continuity-v1-{}",
-            sha256(
-                format!(
-                    "{}\0{}\0{}",
-                    installation.as_str(),
-                    workspace.as_str(),
-                    package.as_str()
-                )
-                .as_bytes()
+        let continuity_digest = sha256(
+            format!(
+                "{}\0{}\0{}",
+                installation.as_str(),
+                workspace.as_str(),
+                package.as_str()
             )
+            .as_bytes(),
         );
+        let continuity_id = URL_SAFE_NO_PAD.encode(continuity_digest.as_bytes());
         (relative_path, continuity_id)
     });
     let relative = validate_relative_mapping(&relative_path)?;

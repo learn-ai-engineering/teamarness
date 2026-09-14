@@ -15,6 +15,19 @@ pub(crate) struct HostStore {
     connection: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessLease {
+    pub(crate) package_identity: String,
+    pub(crate) workspace_id: String,
+    pub(crate) process_generation: u64,
+    pub(crate) pid: u32,
+    pub(crate) process_group: i32,
+    pub(crate) start_time: String,
+    pub(crate) canonical_executable: String,
+    pub(crate) executable_digest: String,
+    pub(crate) launch_token: String,
+}
+
 pub(crate) struct StoredAdmission<'a> {
     pub(crate) admission_digest: &'a str,
     pub(crate) package_identity: &'a str,
@@ -111,6 +124,74 @@ impl HostStore {
                     admission.backend_digest,
                     admission.ui_contract_digest
                 ],
+            )
+            .map_err(|_| storage_failure())?;
+        Ok(())
+    }
+
+    pub(crate) fn process_leases(&self) -> Result<Vec<ProcessLease>, HostStoreFailure> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT package_identity, workspace_id, process_generation, pid, process_group,
+                        start_time, canonical_executable, executable_digest, launch_token
+                 FROM process_leases ORDER BY package_identity, workspace_id",
+            )
+            .map_err(|_| storage_failure())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ProcessLease {
+                    package_identity: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    process_generation: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                    pid: row.get(3)?,
+                    process_group: row.get(4)?,
+                    start_time: row.get(5)?,
+                    canonical_executable: row.get(6)?,
+                    executable_digest: row.get(7)?,
+                    launch_token: row.get(8)?,
+                })
+            })
+            .map_err(|_| storage_failure())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| storage_failure())
+    }
+
+    pub(crate) fn record_process_lease(
+        &self,
+        lease: &ProcessLease,
+    ) -> Result<(), HostStoreFailure> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO process_leases(
+                    package_identity, workspace_id, process_generation, pid, process_group,
+                    start_time, canonical_executable, executable_digest, launch_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    lease.package_identity,
+                    lease.workspace_id,
+                    i64::try_from(lease.process_generation).map_err(|_| storage_failure())?,
+                    lease.pid,
+                    lease.process_group,
+                    lease.start_time,
+                    lease.canonical_executable,
+                    lease.executable_digest,
+                    lease.launch_token,
+                ],
+            )
+            .map_err(|_| storage_failure())?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_process_lease(
+        &self,
+        package: &str,
+        workspace: &str,
+    ) -> Result<(), HostStoreFailure> {
+        self.connection
+            .execute(
+                "DELETE FROM process_leases WHERE package_identity = ?1 AND workspace_id = ?2",
+                params![package, workspace],
             )
             .map_err(|_| storage_failure())?;
         Ok(())

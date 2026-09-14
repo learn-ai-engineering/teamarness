@@ -13,6 +13,7 @@ mod version;
 pub use codec::{
     Frame, FrameDecoder, FrameKind, ProtocolError, decode_frame, decode_payload, encode_frame,
 };
+pub use serde_json::Value as JsonValue;
 pub use state::{ContractState, Direction};
 pub use version::{ProtocolRange, ProtocolVersion, negotiate_version};
 

@@ -18,6 +18,7 @@ pub(crate) struct UiContractFailure {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct UiCacheRecord {
     pub(crate) admitted_root: PathBuf,
     pub(crate) entrypoint: String,
@@ -27,6 +28,7 @@ pub(crate) struct UiCacheRecord {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct UiAssetRecord {
     pub(crate) relative_path: String,
     pub(crate) media_type: String,

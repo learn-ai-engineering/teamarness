@@ -19,6 +19,7 @@ fn observes_exact_child_identity_then_terminates_and_reaps_its_process_group() {
     let executable = std::fs::canonicalize("/usr/bin/yes").expect("canonical test executable");
     let mut child = Command::new(&executable)
         .arg(&launch_token)
+        .arg("--teamarness-protocol=1")
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -64,10 +65,11 @@ fn observes_exact_child_identity_then_terminates_and_reaps_its_process_group() {
         "observed canonical executable"
     );
     assert!(
-        evidence
-            .3
-            .iter()
-            .any(|argument| argument == std::ffi::OsStr::new(&launch_token)),
+        evidence.3.iter().any(|argument| argument
+            .to_string_lossy()
+            .lines()
+            .next()
+            .is_some_and(|value| value == launch_token)),
         "observed launch token in process arguments"
     );
     assert_eq!(

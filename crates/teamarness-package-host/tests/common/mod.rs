@@ -1,0 +1,100 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+use teamarness_package_host::{InstallationPublicIdentity, PackageHostConfig};
+use tempfile::TempDir;
+
+pub struct Fixture {
+    pub _root: TempDir,
+    pub _private: PathBuf,
+    pub core: Arc<CoreRuntime>,
+    pub config: PackageHostConfig,
+}
+
+impl Fixture {
+    pub async fn node(packages: &[(&str, &str)]) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let application = root.path().join("application");
+        let private = root.path().join("private");
+        let core_dir = root.path().join("core");
+        fs::create_dir_all(&application).unwrap();
+        fs::create_dir_all(&private).unwrap();
+        let mut entries = Vec::new();
+        for (directory, identity) in packages {
+            write_node_package(&application.join(directory), identity);
+            entries.push(serde_json::json!({"directory": directory}));
+        }
+        let index = application.join("application-packages.v1.json");
+        fs::write(
+            &index,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1, "packages": entries
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let core = Arc::new(
+            CoreRuntime::open(CoreRuntimeConfig::new(core_dir))
+                .await
+                .unwrap(),
+        );
+        core.create_workspace("Fixture Workspace").unwrap();
+        let config = PackageHostConfig::new(
+            &application,
+            index,
+            &private,
+            InstallationPublicIdentity::new("installation1").unwrap(),
+        );
+        Self {
+            _root: root,
+            _private: private,
+            core,
+            config,
+        }
+    }
+}
+
+pub fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn write_node_package(root: &Path, identity: &str) {
+    fs::create_dir_all(root.join("backend")).unwrap();
+    fs::create_dir_all(root.join("ui")).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/package-process/v1/fixtures/node-package-process.mjs");
+    let backend = fs::read(source).unwrap();
+    let backend_path = root.join("backend/package.mjs");
+    fs::write(&backend_path, &backend).unwrap();
+    fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let entrypoint = b"export function mount() { return async () => {}; }";
+    let contract = br#"{"type":"object","additionalProperties":true}"#;
+    fs::write(root.join("ui/index.js"), entrypoint).unwrap();
+    fs::write(root.join("ui/contract.json"), contract).unwrap();
+    fs::write(root.join("teamarness.package.json"), serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "identity": identity,
+        "version": "1.0.0",
+        "presentation": {"displayName": identity},
+        "protocol": {"major": 1, "minMinor": 0, "maxMinor": 0},
+        "backends": [{
+            "target":"aarch64-apple-darwin", "path":"backend/package.mjs",
+            "size":backend.len(), "sha256":digest(&backend)
+        }],
+        "ui": {
+            "entrypoint":{"path":"ui/index.js","size":entrypoint.len(),"sha256":digest(entrypoint)},
+            "assets":[],
+            "contract":{"path":"ui/contract.json","sha256":digest(contract)}
+        },
+        "capabilities": [{
+            "identity":"teamarness.workspace-context", "major":1, "minMinor":0, "maxMinor":0
+        }]
+    })).unwrap()).unwrap();
+}
