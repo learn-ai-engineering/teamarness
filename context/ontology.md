@@ -9,9 +9,9 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Teamarness** | The application: a local-first, P2P, package-extensible team workspace |
 | **Installation** | One running instance of Teamarness on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
-| **Package** | A vertical module owning its domain: backend behavior, UI, storage, transport, and package-scoped membership. All product-domain capability lives in packages; host-level workspace controls live in the shell. UIs are TypeScript web content; backends are Rust modules |
-| **Core Runtime** | The application kernel that owns installation identity, workspace creation/invitations, canonical membership, membership intervals, revocation, and the package lifecycle. Written in Rust |
-| **Shell** | The Tauri desktop host that owns package mounting in webviews, workspace controls, workspace-level theming, and the desktop window lifecycle |
+| **Package** | A vertical module that owns one product domain, including its model, records, schemas, projections, policy, UI, and Package-specific membership. A Package consumes Semantic Capabilities for Teamarness-owned authority and generic services |
+| **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and Teamarness implementations of Semantic Capabilities |
+| **Shell** | The Tauri desktop host that owns Package navigation and UI mounting, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
 
 ## Identity and Membership
 
@@ -34,11 +34,26 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 
 | Term | Definition |
 |---|---|
-| **Semantic Capability** | A versioned interface a package declares and the runtime fulfills. Example: `conversations:v1`. Typed, secret-free, transport-handle-free. Implemented over Tauri's invoke/event bridge |
-| **Package Backend** | The Rust module that owns a package's domain logic, storage, transport, and lifecycle. Runs in the main process with crate-level isolation from core internals |
-| **Package UI** | The TypeScript web content a package renders into a Tauri webview. Communicates with its backend through typed semantic capability contracts |
-| **Package Scope** | The instance boundary: `bundled` (shipped with the app), `team` (checked into the team's workspace), or `individual` (personal configuration) |
-| **Package Manifest** | Declares the package identity, semantic capabilities it consumes, scope, entrypoints, and trust level |
+| **Package Host** | The Teamarness boundary that operates Package Instances and routes Package Process, data-directory, Semantic Capability, and UI contracts without product-specific branches |
+| **Semantic Capability** | A versioned, typed interface through which a Package uses Teamarness-owned authority or generic behavior without receiving host secrets or resources |
+| **Synchronization Capability** | A Package-scoped Semantic Capability that uses Core Runtime-owned replication and transport machinery for Package-defined records. The Package still owns its schemas, projections, and domain policy |
+| **Package Identity** | The stable identifier of one Package across versions, Package Sources, distributions, and Package Instances |
+| **Package Manifest** | The Package-owned declaration that binds a Package Identity to its compatibility requirements, entrypoints, and consumed Semantic Capabilities |
+| **Package Backend** | The part of a Package that executes its domain behavior, policy, projections, and background work |
+| **Package UI** | The part of a Package that presents its domain and communicates through the Package's declared contracts |
+| **Package Instance** | One activation of a Package Identity for one Workspace on one Installation. Its Backend lifecycle does not depend on whether its UI is visible |
+| **Package Process** | One supervised operating-system process running a Package Backend for one Package Instance |
+| **Package Process Protocol** | The versioned, language-neutral executable contract between the Package Host and a Package Process |
+| **Package UI Mount** | The Shell-owned attachment of a Package UI to the visible Package pane for one Package Instance. Mounting and visibility do not define Backend lifetime |
+| **Package Data Directory** | The durable local directory assigned to one Package Identity, Workspace, and Installation. The Package owns its contents and local representation |
+| **Package Artifact** | A built Package file selected for a specific target and entrypoint |
+| **Package Directory** | A directory containing one Package Manifest and the Package Artifacts it identifies. A configured local Package path identifies this directory |
+| **Package Source** | The concrete Package Directory from which an Installation discovers and validates a Package. A Package Source is `bundled` or `local` in Phase 3 |
+| **Package Distribution** | The means by which a Package Directory reaches an Installation. Distribution does not determine Package Identity, Package Trust, or runtime behavior |
+| **Package Registration** | A binding that makes one Package Source available to Teamarness under a stated Package Registration Scope |
+| **Package Registration Scope** | The authority boundary for a Package Registration: `application`, `installation`, or `workspace`. Phase 3 uses application registrations for bundled sources and installation registrations for configured local sources |
+| **Package Admission** | The Teamarness decision to accept a validated Package Source for execution as a Package Identity |
+| **Package Trust** | The authority Teamarness grants during Package Admission. A Package Manifest cannot grant trust to its own Package |
 
 ## Conversations
 
@@ -47,7 +62,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Channel** | A named, append-only message stream within a workspace. Has an owning creator and a lifecycle (active, archived) |
 | **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a channel. Transported over Iroh QUIC streams between package instances |
 | **Channel Membership** | Package-owned membership determining who can read and post in a specific channel. Bounded by canonical workspace membership |
-| **Conversation Transport** | Iroh-based P2P delivery of messages between peers. The conversations package maintains an allow-list of `EndpointId`s derived from canonical workspace membership |
+| **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns the records and domain policy; a generic Synchronization Capability owns the reusable Iroh transport and replication machinery |
 
 ## Transport (Iroh)
 
@@ -56,7 +71,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Endpoint** | An Iroh network node. Created from a `SecretKey`, bound to a local socket, connected to a home relay. The core runtime creates one endpoint per installation |
 | **EndpointId** | The Ed25519 public key identifying an Iroh endpoint. Used as the peer identity for connections. Doubles as the installation's public identity |
 | **Relay** | An Iroh relay server that forwards encrypted traffic between endpoints that cannot establish direct connections. Carries no content authority — traffic is end-to-end encrypted |
-| **ALPN** | Application-Layer Protocol Negotiation — a protocol identifier used when establishing Iroh connections. Each package may register its own ALPN for package-specific streams |
+| **ALPN** | Application-Layer Protocol Negotiation, a protocol identifier used when establishing Iroh connections |
 
 ## Repository and Files
 

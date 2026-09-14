@@ -1,0 +1,15 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "response",
+        "id": "h:missing",
+        "payload": {}
+      }
+    }
+  ],
+  "expectedError": "unknown_response",
+  "description": "unknown response"
+}

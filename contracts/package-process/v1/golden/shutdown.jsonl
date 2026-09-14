@@ -1,0 +1,2 @@
+{"direction":"host","frame":{"kind":"shutdown","reason":"application_shutdown"}}
+{"direction":"package","frame":{"kind":"shutdown_ack"}}

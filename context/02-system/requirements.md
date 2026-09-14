@@ -4,11 +4,11 @@ Prefix: `TEAM.SYS`
 
 ## TEAM.SYS-R01 — Architecture Boundary
 
-The system SHALL separate the core runtime (identity, membership, package lifecycle) from product-domain packages (conversations, documents, repos, AI tooling). No product-domain behavior SHALL live in the core runtime. No package SHALL import core-internal modules directly.
+The system SHALL keep product-domain Package behavior separate from Core Runtime, Package Host, and Shell responsibilities. No product-domain behavior SHALL live in the Core Runtime, Package Host, or Shell. A Package SHALL use declared Semantic Capabilities rather than Core Runtime internals.
 
 ## TEAM.SYS-R02 — Technology Stack
 
-The core runtime, shell, and package backends SHALL be written in Rust. The desktop shell SHALL use Tauri v2. Package UIs SHALL use TypeScript. Iroh SHALL be the P2P transport layer. The stack SHALL require Rust (via rustup) and Node.js for development.
+The Core Runtime and Shell SHALL be written in Rust. The desktop Shell SHALL use Tauri v2. Phase 3 SHALL provide a Rust Package Backend SDK and Rust reference Package, but the Package Process Protocol SHALL be language-neutral. Package UIs SHALL use TypeScript. Iroh SHALL be the Core Runtime's P2P transport layer. The Phase 3 development stack SHALL require Rust through rustup and Node.js.
 
 ## TEAM.SYS-R03 — Local-First
 

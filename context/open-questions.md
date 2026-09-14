@@ -14,31 +14,23 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ---
 
-## TEAM-DQ2 — Package backend execution model
+## TEAM-DQ2 — Package Backend execution model
 
-**Status:** Resolved (2026-09-12, design).
+**Status:** Resolved (2026-09-13, prototype and domain modeling).
 
-**Decision:** Trusted bundled package backends run as Rust modules in the main process with crate-level isolation. Package UIs run in Tauri webviews. Raw Core Runtime and Iroh handles remain private behind typed capability contracts. Isolation for future untrusted member-loaded packages remains deferred until that loading model is designed.
+**Decision:** Each Package Instance runs its Package Backend as an executable in a host-supervised Package Process. The Package Process Protocol is language-neutral. Phase 3 ships a Rust Backend SDK and Rust reference Package, not a Rust-only host contract. Application-bundled and installation-local Package Sources use the same Package Manifest, protocol, lifecycle, capabilities, and Package-owned code.
 
-**Rationale:** Phase 3 begins with trusted bundled packages, so separate backend processes would add IPC and serialization without protecting against untrusted code in the current Scope. ADR 0003 establishes the in-process package boundary and keeps future stronger isolation possible. See `context/.decisions/0003-core-runtime-vertical-packages.md`.
+**Rationale:** The local Package path changed the trade-off behind ADR 0003's in-process choice. A three-candidate prototype found that native libraries conflict with ordinary macOS hardened-runtime library validation, while WebAssembly did not prove the future Conversations background-work model. A sidecar preserved ordinary native dependencies, loaded from both sources, and kept Package aborts and stalled calls outside the host process. ADR 0006 selected sidecars; ADR 0007 supersedes its Rust-only protocol restriction.
 
 ---
 
 ## TEAM-DQ3 — Storage ownership and isolation
 
-**Blocks:** Phase 3-4 implementation
+**Status:** Resolved (2026-09-13, scope and domain modeling).
 
-**Question:** How should package storage be isolated from core storage and from other packages?
+**Decision:** The Package Host assigns each Package Instance a durable Package Data Directory keyed by Installation, Workspace, and Package Identity. The Package owns the directory's contents and may choose SQLite, files, indexes, or another local representation. Source and version changes preserve the directory for the same Package Identity. No supported Teamarness contract exposes Core Runtime storage or another Package's directory.
 
-**Options:**
-- A: Single SQLite database with schema-namespaced tables per package. Simple, one connection, but no storage isolation.
-- B: Separate SQLite database per package per workspace. Strong isolation, multiple connections.
-- C: Package-owned storage abstraction where the runtime provides a namespaced handle. Packages don't know the underlying database layout.
-
-**Considerations:**
-- Option A is what Teamarness V1 used and was flagged as a coupling problem.
-- Option B aligns with the declared direction that packages own their persistence.
-- Option C adds an abstraction layer but provides the cleanest seam for future storage backends.
+**Rationale:** A trusted native Package needs direct control over its local representation. Proxying each storage operation through the host would add a second data API without creating a security boundary because the Package Process retains the current user's ambient filesystem authority. ADR 0007 records this boundary and its limits.
 
 ---
 

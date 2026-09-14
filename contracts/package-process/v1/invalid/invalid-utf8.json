@@ -1,0 +1,6 @@
+{
+  "mode": "frame_hex",
+  "hex": "00000002fffe",
+  "expectedError": "invalid_utf8",
+  "description": "invalid utf8"
+}

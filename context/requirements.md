@@ -24,19 +24,19 @@ Revoking a member SHALL end their current membership interval. Every committed m
 
 ## TEAM-R06 — Package Model
 
-All product-domain capability SHALL live in packages. Host-level workspace controls SHALL remain in the shell. A package SHALL declare its identity, the semantic capabilities it consumes, its scope, and its entrypoints in a manifest. The runtime SHALL activate, suspend, and dispose packages through a standard lifecycle. A package SHALL own its domain logic, storage, transport, UI, and package-scoped membership. Team and individual packages SHALL use the same programming interface. Package UIs SHALL be TypeScript web content; package backends SHALL be Rust modules.
+All product-domain capability SHALL live in Packages. Host-level Workspace controls SHALL remain in the Shell. A Package Manifest SHALL declare its Package Identity, compatibility requirements, consumed Semantic Capabilities, and entrypoints. Teamarness SHALL determine Package Source, Package Registration Scope, Package Admission, and Package Trust outside the Package Manifest. The Package Host SHALL activate, suspend, recover, and dispose Package Instances through a standard lifecycle. A Package SHALL own its domain model, records, schemas, projections, policy, UI, and Package-specific membership. Package Backends SHALL run as supervised executables through one language-neutral Package Process Protocol. Phase 3 SHALL ship a Rust Backend SDK and Rust reference Package without requiring all conforming Package Backends to use Rust.
 
 ## TEAM-R07 — Semantic Capabilities
 
-A package SHALL declare versioned semantic capabilities (e.g., `conversations:v1`) in its manifest. The runtime SHALL fulfill capabilities through typed, secret-free interfaces over Tauri's invoke/event bridge. The shell SHALL NOT hard-code product-specific capability branches.
+A Package SHALL declare consumed, versioned Semantic Capabilities in its Package Manifest. Teamarness SHALL fulfill capabilities for Teamarness-owned authority and generic behavior through typed, secret-free interfaces. Future generic Synchronization Capabilities SHALL keep replication, convergence, retry, and Core-owned Iroh transport out of Package Backends while leaving Package records, schemas, projections, and domain policy Package-owned. Package Backend capability traffic SHALL cross the Package Process Protocol. Package UI traffic SHALL cross Tauri's invoke and event bridge. The Shell SHALL NOT hard-code product-specific capability branches.
 
 ## TEAM-R08 — Shell
 
-The Tauri shell SHALL own package mounting in webviews, workspace controls, workspace-level theming, and the desktop window lifecycle. It SHALL supply generic core capabilities (identity, membership) to packages. It SHALL NOT own product-domain behavior.
+The Tauri Shell SHALL own Package UI Mounts, Package navigation, Workspace controls, Workspace-level theming, and the desktop window lifecycle. It SHALL route generic Package contracts but SHALL NOT own product-domain behavior. Changing the visible Package or Workspace SHALL NOT itself suspend a Package Backend.
 
 ## TEAM-R09 — Conversations Package
 
-The conversations package SHALL own channels, messages, channel membership, conversation keys, transport, storage, unread state, and its UI. It SHALL use Iroh for P2P message delivery between package instances. It SHALL consume canonical workspace membership as an eligibility ceiling. It SHALL NOT mutate canonical membership.
+The Conversations Package SHALL own Channels, Messages, Channel Membership, conversation keys, domain policy, local projections, unread state, and its UI. It SHALL consume Canonical Membership as an eligibility ceiling and SHALL NOT mutate it. Its peer replication SHALL use a generic Package-scoped Synchronization Capability rather than a Conversations-specific Core Runtime branch.
 
 ## TEAM-R10 — Local-First Operation
 
@@ -52,4 +52,4 @@ The system SHALL read registered local Git repositories. It SHALL NOT replicate 
 
 ## TEAM-R13 — Technology Stack
 
-The core runtime, shell, and package backends SHALL be written in Rust. The desktop shell SHALL use Tauri v2. Package UIs SHALL be TypeScript. Iroh SHALL be the P2P transport layer.
+The Core Runtime and Shell SHALL be written in Rust. The desktop Shell SHALL use Tauri v2. Phase 3 SHALL ship a Rust Package Backend SDK and a Rust reference Package, while the Package Process Protocol SHALL remain language-neutral. Package UIs SHALL be TypeScript. Iroh SHALL be the Core Runtime's P2P transport layer.

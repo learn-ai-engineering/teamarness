@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-process/v1/cancel.schema.json",
+  "title": "Package Process Protocol cancel frame v1",
+  "$ref": "frame.schema.json#/$defs/cancel"
+}

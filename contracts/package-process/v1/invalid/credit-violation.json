@@ -1,0 +1,315 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "stream_open",
+        "id": "h:no-credit",
+        "topic": "ui.events",
+        "mountId": "bW91bnQx",
+        "initialCredit": 32,
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "1",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "2",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "3",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "4",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "5",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "6",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "7",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "8",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "9",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "10",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "11",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "12",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "13",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "14",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "15",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "16",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "17",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "18",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "19",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "20",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "21",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "22",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "23",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "24",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "25",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "26",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "27",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "28",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "29",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "30",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "31",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "32",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:no-credit",
+        "sequence": "33",
+        "payload": {}
+      }
+    }
+  ],
+  "expectedError": "credit_violation",
+  "description": "credit violation"
+}

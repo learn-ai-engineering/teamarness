@@ -8,7 +8,7 @@
     "build": "npm --workspace teamarness-desktop run build",
     "typecheck": "npm --workspace teamarness-desktop run typecheck",
     "lint": "npm --workspace teamarness-desktop run lint",
-    "test": "node --test scripts/dev-profile.test.mjs && npm --workspace teamarness-desktop test",
+    "test": "node --test scripts/dev-profile.test.mjs contracts/package-process/v1/fixtures/*.test.mjs && npm --workspace teamarness-desktop test",
     "test:dev-profile": "node --test scripts/dev-profile.test.mjs",
     "tauri": "npm --workspace teamarness-desktop run tauri --"
   }

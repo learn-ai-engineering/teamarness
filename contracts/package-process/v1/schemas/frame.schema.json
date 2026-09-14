@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-process/v1/frame.schema.json",
+  "title": "Teamarness Package Process Protocol frame v1",
+  "oneOf": [
+    { "$ref": "#/$defs/initialize" },
+    { "$ref": "#/$defs/initialized" },
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/cancel" },
+    { "$ref": "#/$defs/stream_open" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/credit" },
+    { "$ref": "#/$defs/stream_close" },
+    { "$ref": "#/$defs/ping" },
+    { "$ref": "#/$defs/pong" },
+    { "$ref": "#/$defs/shutdown" },
+    { "$ref": "#/$defs/shutdown_ack" }
+  ],
+  "$defs": {
+    "decimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "base64url": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "id": { "type": "string", "pattern": "^(h|p):[A-Za-z0-9._~-]{1,126}$", "maxLength": 128 },
+    "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "version": {
+      "type": "object",
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "minor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    },
+    "package": {
+      "type": "object",
+      "required": ["identity", "version", "manifestDigest", "backendDigest"],
+      "properties": {
+        "identity": { "type": "string", "minLength": 3, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "manifestDigest": { "$ref": "#/$defs/digest" },
+        "backendDigest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "initialize": {
+      "type": "object",
+      "required": ["kind", "nonce", "package", "uiContractDigest", "processGeneration", "workspace", "installation", "dataDirectory", "protocol", "capabilities", "limits"],
+      "properties": {
+        "kind": { "const": "initialize" },
+        "nonce": { "$ref": "#/$defs/base64url" },
+        "package": { "$ref": "#/$defs/package" },
+        "uiContractDigest": { "$ref": "#/$defs/digest" },
+        "processGeneration": { "$ref": "#/$defs/decimal" },
+        "workspace": {
+          "type": "object",
+          "required": ["id", "name"],
+          "properties": { "id": { "type": "string", "minLength": 1, "maxLength": 256 }, "name": { "type": "string", "minLength": 1, "maxLength": 256 } },
+          "additionalProperties": false
+        },
+        "installation": {
+          "type": "object",
+          "required": ["identity", "displayName"],
+          "properties": { "identity": { "type": "string", "minLength": 1, "maxLength": 256 }, "displayName": { "type": "string", "minLength": 1, "maxLength": 256 } },
+          "additionalProperties": false
+        },
+        "dataDirectory": {
+          "type": "object",
+          "required": ["path", "continuityId"],
+          "properties": { "path": { "type": "string", "minLength": 1 }, "continuityId": { "$ref": "#/$defs/base64url" } },
+          "additionalProperties": false
+        },
+        "protocol": { "$ref": "#/$defs/version" },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["grant", "identity", "major", "minor"],
+            "properties": {
+              "grant": { "$ref": "#/$defs/base64url" },
+              "identity": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "minor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            },
+            "additionalProperties": false
+          },
+          "maxItems": 128
+        },
+        "limits": {
+          "type": "object",
+          "required": ["maxFrameBytes", "maxInFlightEachDirection", "maxWriterFrames", "maxWriterBytes", "initialStreamCredit"],
+          "properties": {
+            "maxFrameBytes": { "const": 1048576 },
+            "maxInFlightEachDirection": { "const": 32 },
+            "maxWriterFrames": { "const": 64 },
+            "maxWriterBytes": { "const": 8388608 },
+            "initialStreamCredit": { "const": 32 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "initialized": {
+      "type": "object",
+      "required": ["kind", "nonce", "package", "uiContractDigest", "processGeneration", "protocol"],
+      "properties": {
+        "kind": { "const": "initialized" },
+        "nonce": { "$ref": "#/$defs/base64url" },
+        "package": { "$ref": "#/$defs/package" },
+        "uiContractDigest": { "$ref": "#/$defs/digest" },
+        "processGeneration": { "$ref": "#/$defs/decimal" },
+        "protocol": { "$ref": "#/$defs/version" }
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": ["kind", "id", "operation", "deadlineUnixMs", "payload"],
+      "properties": {
+        "kind": { "const": "request" },
+        "id": { "$ref": "#/$defs/id" },
+        "operation": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "grant": { "$ref": "#/$defs/base64url" },
+        "mountId": { "$ref": "#/$defs/base64url" },
+        "deadlineUnixMs": { "$ref": "#/$defs/decimal" },
+        "payload": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "type": "object",
+      "required": ["kind", "id", "payload"],
+      "properties": { "kind": { "const": "response" }, "id": { "$ref": "#/$defs/id" }, "payload": { "type": "object" } },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["kind", "id", "code", "retryable"],
+      "properties": {
+        "kind": { "const": "error" }, "id": { "$ref": "#/$defs/id" },
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "retryable": { "type": "boolean" }, "outcomeUncertain": { "type": "boolean" }, "details": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "cancel": {
+      "type": "object",
+      "required": ["kind", "id", "targetId"],
+      "properties": { "kind": { "const": "cancel" }, "id": { "$ref": "#/$defs/id" }, "targetId": { "$ref": "#/$defs/id" } },
+      "additionalProperties": false
+    },
+    "stream_open": {
+      "type": "object",
+      "required": ["kind", "id", "topic", "initialCredit", "payload"],
+      "properties": {
+        "kind": { "const": "stream_open" }, "id": { "$ref": "#/$defs/id" },
+        "topic": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "mountId": { "$ref": "#/$defs/base64url" }, "initialCredit": { "const": 32 }, "payload": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["kind", "streamId", "sequence", "payload"],
+      "properties": { "kind": { "const": "event" }, "streamId": { "$ref": "#/$defs/id" }, "sequence": { "$ref": "#/$defs/decimal" }, "payload": { "type": "object" } },
+      "additionalProperties": false
+    },
+    "credit": {
+      "type": "object",
+      "required": ["kind", "streamId", "amount"],
+      "properties": { "kind": { "const": "credit" }, "streamId": { "$ref": "#/$defs/id" }, "amount": { "type": "integer", "minimum": 1, "maximum": 32 } },
+      "additionalProperties": false
+    },
+    "stream_close": {
+      "type": "object",
+      "required": ["kind", "streamId"],
+      "properties": { "kind": { "const": "stream_close" }, "streamId": { "$ref": "#/$defs/id" }, "code": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" } },
+      "additionalProperties": false
+    },
+    "ping": {
+      "type": "object", "required": ["kind", "nonce"],
+      "properties": { "kind": { "const": "ping" }, "nonce": { "$ref": "#/$defs/base64url" } }, "additionalProperties": false
+    },
+    "pong": {
+      "type": "object", "required": ["kind", "nonce"],
+      "properties": { "kind": { "const": "pong" }, "nonce": { "$ref": "#/$defs/base64url" } }, "additionalProperties": false
+    },
+    "shutdown": {
+      "type": "object", "required": ["kind", "reason"],
+      "properties": { "kind": { "const": "shutdown" }, "reason": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" } }, "additionalProperties": false
+    },
+    "shutdown_ack": {
+      "type": "object", "required": ["kind"],
+      "properties": { "kind": { "const": "shutdown_ack" } }, "additionalProperties": false
+    }
+  }
+}

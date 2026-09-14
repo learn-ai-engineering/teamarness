@@ -1,0 +1,18 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "request",
+        "id": "p:wrong",
+        "operation": "ui.read",
+        "mountId": "bW91bnQx",
+        "deadlineUnixMs": "1",
+        "payload": {}
+      }
+    }
+  ],
+  "expectedError": "invalid_id_namespace",
+  "description": "wrong id namespace"
+}

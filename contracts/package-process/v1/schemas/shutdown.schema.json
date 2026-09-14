@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-process/v1/shutdown.schema.json",
+  "title": "Package Process Protocol shutdown frame v1",
+  "$ref": "frame.schema.json#/$defs/shutdown"
+}

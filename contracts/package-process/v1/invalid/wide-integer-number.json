@@ -1,0 +1,6 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"request\",\"id\":\"h:number\",\"operation\":\"ui.read\",\"deadlineUnixMs\":9007199254740993,\"payload\":{}}",
+  "expectedError": "invalid_decimal",
+  "description": "wide integers use decimal strings"
+}

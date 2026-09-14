@@ -1,0 +1,6 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"ping\",\"nonce\":\"one\",\"nonce\":\"two\"}",
+  "expectedError": "duplicate_key",
+  "description": "duplicate keys"
+}

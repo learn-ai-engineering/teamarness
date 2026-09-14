@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-process/v1/health.schema.json",
+  "title": "Package health traffic v1",
+  "oneOf": [
+    { "$ref": "frame.schema.json#/$defs/ping" },
+    { "$ref": "frame.schema.json#/$defs/pong" }
+  ]
+}

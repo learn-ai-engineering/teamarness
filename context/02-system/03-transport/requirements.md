@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.TRANS`
 
-The transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for workspace onboarding. A later package foundation will provide typed, capability-scoped transport interfaces without exposing raw endpoint handles.
+The Core Runtime transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each Installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for Workspace onboarding. Later generic Synchronization Capabilities use Core-owned transport without exposing raw endpoint handles to Packages.
 
 ## TEAM.SYS.TRANS-R01 — Iroh Endpoint Management
 
@@ -14,7 +14,7 @@ The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT
 
 ## TEAM.SYS.TRANS-R03 — Package Transport Access
 
-When package support is added, packages SHALL access Iroh transport through typed, capability-scoped interfaces. The runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, or relay configuration to packages. Packages SHALL register ALPN identifiers for their protocol streams.
+Packages SHALL access Teamarness-owned peer transport through versioned, typed Semantic Capabilities. Future Synchronization Capabilities SHALL own reusable Iroh connection, replication, convergence, retry, and backpressure machinery for Package-defined records. The Core Runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, or relay configuration to Packages. A future custom-transport capability MAY provide a Package-scoped escape hatch without exposing those resources.
 
 ## TEAM.SYS.TRANS-R04 — Copyable Workspace Invitation
 

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-process/v1/capability-call.schema.json",
+  "title": "Package-originated capability call v1",
+  "allOf": [
+    { "$ref": "frame.schema.json#/$defs/request" },
+    {
+      "required": ["grant"],
+      "properties": {
+        "id": { "pattern": "^p:" },
+        "operation": { "const": "capability.call" }
+      }
+    }
+  ]
+}

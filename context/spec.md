@@ -12,7 +12,7 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 | `TEAM.SYS.MEM` | `02-system/02-membership/` | Canonical membership log, intervals, invitations, revocation, epochs |
 | `TEAM.SYS.TRANS` | `02-system/03-transport/` | Iroh endpoint management, relay configuration, package transport access |
 | `TEAM.SYS.CONV` | `02-system/04-conversations/` | Channels, messages, channel membership, conversation keys, Iroh message delivery |
-| `TEAM.SYS.PKG` | `02-system/05-packages/` | Package manifest, lifecycle, semantic capabilities, SDK, trust model |
+| `TEAM.SYS.PKG` | `02-system/05-packages/` | Package Manifests, Sources, Registrations, Admission, Package Host, Process Protocol, lifecycle, Semantic Capabilities, SDKs, local data, and trust |
 | `TEAM.SYS.REPO` | `02-system/06-repos/` | Repository registration, local Git integration |
 | `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package webview mounting, workspace controls, theming |
 | `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
@@ -30,4 +30,4 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 
 ## Current state
 
-The Context Foundation, Core Runtime, and Desktop Shell with Workspace onboarding are complete. Phase 3, Package Foundation, is next. See `roadmap.md` for phase status and `open-questions.md` for unresolved design questions.
+The Context Foundation, Core Runtime, and Desktop Shell with Workspace onboarding are complete. Phase 3, Package Foundation, is in progress. See `roadmap.md` for phase status and `open-questions.md` for unresolved design questions.

@@ -1,0 +1,6 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"shutdown_ack\",\"extra\":true}",
+  "expectedError": "malformed_frame",
+  "description": "unknown frame fields are forbidden"
+}

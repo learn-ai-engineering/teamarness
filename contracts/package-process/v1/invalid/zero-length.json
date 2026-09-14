@@ -1,0 +1,6 @@
+{
+  "mode": "frame_hex",
+  "hex": "00000000",
+  "expectedError": "zero_length",
+  "description": "zero length"
+}

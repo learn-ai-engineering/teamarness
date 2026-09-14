@@ -1,0 +1,6 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"mystery\"}",
+  "expectedError": "unknown_kind",
+  "description": "unknown kind"
+}

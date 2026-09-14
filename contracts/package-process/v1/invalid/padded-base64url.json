@@ -1,0 +1,6 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"ping\",\"nonce\":\"padded==\"}",
+  "expectedError": "invalid_base64url",
+  "description": "base64url padding is forbidden"
+}

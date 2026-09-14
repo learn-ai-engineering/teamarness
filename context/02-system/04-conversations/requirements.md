@@ -2,4 +2,4 @@
 
 Prefix: `TEAM.SYS.CONV`
 
-*Requirements for this subsystem will be authored during Phase 4 scoping. The conversations package owns channels, signed Markdown messages, channel membership, conversation keys, Iroh-based P2P transport, local persistence, offline queueing, and unread state. It consumes canonical workspace membership as an eligibility ceiling. The package maintains an allow-list of Iroh `EndpointId`s derived from membership epochs.*
+*Requirements for this subsystem will be authored during Phase 4 scoping. The Conversations Package owns Channels, signed Markdown Messages, Channel Membership, conversation keys, domain policy, local schemas and projections, offline behavior, and unread state. It consumes Canonical Membership as an eligibility ceiling. Peer replication will use a generic Package-scoped Synchronization Capability supplied by the Core Runtime rather than a Conversations-specific Core Runtime branch. Phase 4 design still owns the capability's replication and authorization semantics.*

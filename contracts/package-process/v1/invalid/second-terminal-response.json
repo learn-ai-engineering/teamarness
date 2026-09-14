@@ -1,0 +1,35 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "request",
+        "id": "h:twice",
+        "operation": "ui.read",
+        "mountId": "bW91bnQx",
+        "deadlineUnixMs": "1",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "response",
+        "id": "h:twice",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "error",
+        "id": "h:twice",
+        "code": "fixture.second",
+        "retryable": false
+      }
+    }
+  ],
+  "expectedError": "second_terminal_response",
+  "description": "second terminal response"
+}

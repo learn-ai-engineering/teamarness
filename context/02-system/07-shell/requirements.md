@@ -4,7 +4,7 @@ Prefix: `TEAM.SYS.SHELL`
 
 The Tauri shell owns workspace controls and the desktop window lifecycle. It will also own package mounting and workspace-level theming when the package foundation is added. It communicates with the Rust runtime through typed, secret-free Tauri commands and events.
 
-Phase 2 delivers the desktop window and workspace onboarding between two installations. Phase 3 adds package mounting, package lifecycle coordination, theming, and bounded failure handling for trusted bundled packages. Workspace leave, member removal controls, manager administration, system tray behavior, native menus, and auto-updater behavior are deferred beyond Phase 2.
+Phase 2 delivers the desktop window and Workspace onboarding between two Installations. Phase 3 adds Package mounting, Package Process lifecycle coordination, theming, and bounded failure handling for trusted Packages from application-bundled and installation-local Package Sources. Workspace leave, Member removal controls, manager administration, system tray behavior, native menus, and auto-updater behavior are deferred beyond Phase 2.
 
 ## TEAM.SYS.SHELL-R01 — Tauri Desktop Host
 
@@ -12,7 +12,7 @@ The system SHALL use Tauri v2 as the desktop shell. The shell SHALL manage the m
 
 ## TEAM.SYS.SHELL-R02 — Package Webview Mounting
 
-Beginning in Phase 3, the shell SHALL mount package UIs in Tauri webviews. Each package SHALL render into a host-owned mount point. The shell SHALL coordinate package `activate`, `suspend`, `recover`, and `dispose` operations through the standard lifecycle.
+Beginning in Phase 3, the Shell SHALL mount Package UIs in Tauri webviews. Each Package UI SHALL render into a Shell-owned right-pane Package UI Mount. Package navigation and Workspace context changes SHALL use generic contracts without product-specific branches. Hiding a Package UI or selecting another Workspace SHALL NOT itself suspend that Package Instance's Backend.
 
 ## TEAM.SYS.SHELL-R03 — Theming
 
@@ -24,8 +24,8 @@ The shell SHALL provide workspace creation, join, leave, member-list, invitation
 
 ## TEAM.SYS.SHELL-R05 — Generic Runtime Bridge
 
-The shell SHALL expose only generic, typed runtime contracts over Tauri invoke and event channels. It SHALL NOT expose secrets, database handles, core-internal types, or raw transport handles. When package support is added, the same boundary SHALL expose generic capability contracts without product-specific branches.
+The Shell SHALL expose only generic, typed contracts over Tauri invoke and event channels. It SHALL NOT expose secrets, database handles, Core Runtime types, or raw transport handles. Package UI requests, responses, subscriptions, and events SHALL use Package-owned contracts routed through the generic bridge without product-specific branches.
 
 ## TEAM.SYS.SHELL-R06 — Package Error Containment
 
-Beginning in Phase 3, a returned backend error, lifecycle task failure, unwind-safe panic caught at a host boundary, failed mount, or JavaScript exception in a trusted bundled package SHALL NOT terminate the shell or core runtime. The shell SHALL present the failure and allow the host to recover or dispose the package according to its lifecycle state. This requirement does not promise containment of process aborts, memory exhaustion, undefined behavior, deadlocks, or hostile in-process code.
+Beginning in Phase 3, a returned Package Backend error, lifecycle task failure, Package Process exit, missed execution deadline, failed mount, or JavaScript exception in a trusted Package SHALL NOT terminate the Shell or Core Runtime. The Shell SHALL present the failure and allow Teamarness to recover or dispose the Package Instance according to its lifecycle state. This requirement does not promise safe execution of hostile code, an operating-system sandbox, or recovery from system-wide resource exhaustion.

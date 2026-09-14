@@ -1,0 +1,6 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"ping\",",
+  "expectedError": "malformed_json",
+  "description": "invalid json"
+}

@@ -1,0 +1,2 @@
+{"direction":"package","frame":{"kind":"request","id":"p:cap-1","operation":"capability.call","grant":"Z3JhbnQx","deadlineUnixMs":"9007199254740997","payload":{"method":"get"}}}
+{"direction":"host","frame":{"kind":"response","id":"p:cap-1","payload":{"ok":true}}}

@@ -1,0 +1,6 @@
+{
+  "mode": "length",
+  "length": 1048577,
+  "expectedError": "frame_too_large",
+  "description": "oversized length"
+}

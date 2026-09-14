@@ -1,0 +1,2 @@
+{"direction":"host","frame":{"kind":"request","id":"h:error-1","operation":"ui.read","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740999","payload":{}}}
+{"direction":"package","frame":{"kind":"error","id":"h:error-1","code":"fixture.rejected","retryable":false,"details":{"field":"value"}}}
