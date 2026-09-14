@@ -2,7 +2,15 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 export type PackageValue = null | boolean | number | string | readonly PackageValue[] | { readonly [key: string]: PackageValue };
 
-export type PackagePresentation = Readonly<{ identity: string; displayName: string }>;
+export type PackagePresentation = Readonly<{
+  identity: string;
+  version: string;
+  displayName: string;
+  source: "bundled" | "local";
+  trust: "application_bundled" | "trusted_native_code_v1";
+  lifecycle: "active";
+  processGeneration: number;
+}>;
 export type WorkspacePresentation = Readonly<{ id: string; name: string }>;
 
 export type UiEvent = Readonly<{

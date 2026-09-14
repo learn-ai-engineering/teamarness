@@ -101,6 +101,9 @@ async fn sdk_hides_framing_dispatches_work_and_honors_shutdown() {
     write_json(&mut host_write, r#"{"kind":"request","id":"h:cap","operation":"fixture.capability","deadlineUnixMs":"9999999999999","payload":{}}"#).await;
     let capability = read_frame(&mut host_read).await;
     assert_eq!(capability.kind(), FrameKind::Request);
+    let capability_payload = capability.field("payload").unwrap().as_object().unwrap();
+    assert_eq!(capability_payload.len(), 1);
+    assert_eq!(capability_payload.get("method").unwrap(), "get");
     let capability_id = capability.field("id").unwrap().as_str().unwrap();
     write_json(
         &mut host_write,

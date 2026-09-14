@@ -5,6 +5,7 @@ members = [
     "crates/teamarness-package-host",
     "crates/teamarness-package-protocol",
     "crates/teamarness-package-sdk",
+    "packages/reference-package/backend",
 ]
 resolver = "3"
 

@@ -44,6 +44,26 @@ impl CapabilityClient {
         method: &str,
         payload: JsonValue,
     ) -> Result<JsonValue, BackendError> {
+        let mut input = match payload {
+            JsonValue::Object(input) => input,
+            _ => {
+                return Err(BackendError::new(
+                    "capability_request_invalid",
+                    false,
+                    JsonValue::Object(Default::default()),
+                ));
+            }
+        };
+        if input
+            .insert("method".into(), JsonValue::String(method.into()))
+            .is_some()
+        {
+            return Err(BackendError::new(
+                "capability_request_invalid",
+                false,
+                JsonValue::Object(Default::default()),
+            ));
+        }
         let id = format!("p:{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let deadline = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -59,13 +79,7 @@ impl CapabilityClient {
             ("operation", JsonValue::String("capability.call".into())),
             ("grant", JsonValue::String(grant.into())),
             ("deadlineUnixMs", JsonValue::String(deadline)),
-            (
-                "payload",
-                object([
-                    ("method", JsonValue::String(method.into())),
-                    ("input", payload),
-                ]),
-            ),
+            ("payload", JsonValue::Object(input)),
         ]);
         if self.writer.data(value).await.is_err() {
             self.pending.lock().await.remove(&id);

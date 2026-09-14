@@ -135,7 +135,12 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
                 contract_digest: "digest".into(),
                 package: teamarness_package_host::UiPackageContext {
                     identity: PackageIdentity::from_str("dev.teamarness.reference").unwrap(),
+                    version: "1.0.0".into(),
                     display_name: "Reference".into(),
+                    source: teamarness_package_host::PackageSourceKind::Bundled,
+                    trust: teamarness_package_host::PackageTrustKind::ApplicationBundled,
+                    lifecycle: LifecycleState::Active,
+                    process_generation: 1,
                 },
                 workspace: teamarness_package_host::UiWorkspaceContext {
                     id: teamarness_package_host::WorkspaceId::new("workspace").unwrap(),

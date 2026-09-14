@@ -354,6 +354,31 @@ mod tests {
     }
 
     #[test]
+    fn bundle_configuration_uses_the_generated_reference_package() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let resources = config["bundle"]["resources"].as_object().unwrap();
+        assert_eq!(
+            resources.get("../../../packages/application-packages.v1.json"),
+            Some(&serde_json::Value::String(
+                "packages/application-packages.v1.json".into()
+            ))
+        );
+        assert_eq!(
+            config["bundle"]["externalBin"][0],
+            "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package"
+        );
+        let index: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../packages/application-packages.v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            index["packages"][0]["directory"],
+            "packages/dev.teamarness.reference"
+        );
+    }
+
+    #[test]
     fn exit_handoff_closes_dispatch_then_mounts_host_and_core() {
         let lifecycle = DispatchLifecycle::running();
         let order = std::sync::Mutex::new(Vec::new());

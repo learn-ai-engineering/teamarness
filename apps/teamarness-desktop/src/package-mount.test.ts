@@ -27,7 +27,15 @@ function descriptor(number: number): OpenPackageMount {
       entrypoint: "ui/index.js",
       uiHostVersion: 1,
       contractDigest: "a".repeat(64),
-      package: { identity: instance.packageIdentity, displayName: "Fixture" },
+      package: {
+        identity: instance.packageIdentity,
+        version: "1.0.0",
+        displayName: "Fixture",
+        source: "bundled",
+        trust: "application_bundled",
+        lifecycle: "active",
+        processGeneration: 1,
+      },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
     },
   };
@@ -74,7 +82,15 @@ describe("generic Package UI mount", () => {
     expect(loadedUrl).toBe(`teamarness-package://localhost/${"1".repeat(32)}/ui/index.js`);
     expect(test.tokens).toEqual([[...THEME_TOKENS]]);
     expect(test.contexts[0]).toMatchObject({
-      package: { identity: instance.packageIdentity, displayName: "Fixture" },
+      package: {
+        identity: instance.packageIdentity,
+        version: "1.0.0",
+        displayName: "Fixture",
+        source: "bundled",
+        trust: "application_bundled",
+        lifecycle: "active",
+        processGeneration: 1,
+      },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
       uiHostVersion: 1,
     });

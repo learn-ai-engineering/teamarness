@@ -34,7 +34,15 @@ export type PackageLoader = Readonly<{
   entrypoint: string;
   uiHostVersion: number;
   contractDigest: string;
-  package: Readonly<{ identity: string; displayName: string }>;
+  package: Readonly<{
+    identity: string;
+    version: string;
+    displayName: string;
+    source: "bundled" | "local";
+    trust: "application_bundled" | "trusted_native_code_v1";
+    lifecycle: "active";
+    processGeneration: number;
+  }>;
   workspace: Readonly<{ id: string; name: string }>;
 }>;
 

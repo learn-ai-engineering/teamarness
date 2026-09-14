@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "counter": { "type": "integer", "minimum": 0 },
+        "backgroundMarker": { "type": "integer", "minimum": 0 },
+        "membershipVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "signingVerified": { "type": "boolean" },
+        "processGeneration": { "type": "string", "pattern": "^[0-9]+$" },
+        "packageVersion": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": [
+        "counter",
+        "backgroundMarker",
+        "membershipVersion",
+        "signingVerified",
+        "processGeneration",
+        "packageVersion"
+      ],
+      "additionalProperties": false
+    },
+    "empty": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  "requests": {
+    "reference.read": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/snapshot" }
+    },
+    "reference.increment": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/snapshot" }
+    }
+  },
+  "subscriptions": {
+    "reference.changes": {
+      "request": { "$ref": "#/$defs/empty" },
+      "event": { "$ref": "#/$defs/snapshot" }
+    }
+  }
+}

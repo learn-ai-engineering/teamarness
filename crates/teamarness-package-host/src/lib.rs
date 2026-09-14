@@ -583,7 +583,12 @@ pub struct OpenUiMount {
 #[serde(rename_all = "camelCase")]
 pub struct UiPackageContext {
     pub identity: PackageIdentity,
+    pub version: String,
     pub display_name: String,
+    pub source: PackageSourceKind,
+    pub trust: PackageTrustKind,
+    pub lifecycle: LifecycleState,
+    pub process_generation: u64,
 }
 
 /// Workspace presentation values bound to one UI mount.
@@ -1179,7 +1184,7 @@ impl PackageHost {
                     })?;
                 let token = random_resource_token()
                     .map_err(|code| host_error(code, PackageErrorStage::Ui))?;
-                let display_name = self
+                let package = self
                     .inner
                     .data
                     .lock()
@@ -1187,7 +1192,7 @@ impl PackageHost {
                     .packages
                     .iter()
                     .find(|package| package.identity == input.instance.package_identity)
-                    .map(|package| package.display_name.clone())
+                    .cloned()
                     .ok_or_else(|| {
                         host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
                     })?;
@@ -1198,7 +1203,12 @@ impl PackageHost {
                     contract_digest: ui.cache.contract_digest.clone(),
                     package: UiPackageContext {
                         identity: input.instance.package_identity.clone(),
-                        display_name,
+                        version: package.version,
+                        display_name: package.display_name,
+                        source: package.source,
+                        trust: package.trust,
+                        lifecycle: LifecycleState::Active,
+                        process_generation,
                     },
                     workspace: UiWorkspaceContext {
                         id: input.instance.workspace_id.clone(),

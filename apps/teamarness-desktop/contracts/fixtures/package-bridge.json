@@ -21,6 +21,25 @@
     }],
     "diagnostics": []
   },
+  "loader": {
+    "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "entrypoint": "ui/index.js",
+    "uiHostVersion": 1,
+    "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "package": {
+      "identity": "com.example.fixture",
+      "version": "1.0.0",
+      "displayName": "Fixture",
+      "source": "bundled",
+      "trust": "application_bundled",
+      "lifecycle": "active",
+      "processGeneration": 3
+    },
+    "workspace": {
+      "id": "00112233445566778899aabbccddeeff",
+      "name": "Fixture Workspace"
+    }
+  },
   "event": {
     "mount": "mount-1",
     "subscription": "subscription-1",

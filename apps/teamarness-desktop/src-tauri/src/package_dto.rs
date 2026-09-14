@@ -101,7 +101,12 @@ pub struct UiLoaderDto {
 #[serde(rename_all = "camelCase")]
 pub struct UiPackageContextDto {
     identity: String,
+    version: String,
     display_name: String,
+    source: String,
+    trust: String,
+    lifecycle: String,
+    process_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,7 +125,12 @@ impl From<UiLoaderDescriptor> for UiLoaderDto {
             contract_digest: value.contract_digest,
             package: UiPackageContextDto {
                 identity: value.package.identity.into(),
+                version: value.package.version,
                 display_name: value.package.display_name,
+                source: wire_name(value.package.source),
+                trust: wire_name(value.package.trust),
+                lifecycle: wire_name(value.package.lifecycle),
+                process_generation: value.package.process_generation,
             },
             workspace: UiWorkspaceContextDto {
                 id: value.workspace.id.into(),
@@ -196,6 +206,40 @@ mod tests {
         for forbidden in ["sourcePath", "cachePath", "dataPath", "processHandle"] {
             assert!(!encoded.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn loader_dto_carries_generic_runtime_presentation() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../contracts/fixtures/package-bridge.json"))
+                .unwrap();
+        let descriptor = teamarness_package_host::UiLoaderDescriptor {
+            token: teamarness_package_host::UiResourceToken::new(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .unwrap(),
+            entrypoint: "ui/index.js".into(),
+            ui_host_version: 1,
+            contract_digest: "a".repeat(64),
+            package: teamarness_package_host::UiPackageContext {
+                identity: "com.example.fixture".parse().unwrap(),
+                version: "1.0.0".into(),
+                display_name: "Fixture".into(),
+                source: teamarness_package_host::PackageSourceKind::Bundled,
+                trust: teamarness_package_host::PackageTrustKind::ApplicationBundled,
+                lifecycle: teamarness_package_host::LifecycleState::Active,
+                process_generation: 3,
+            },
+            workspace: teamarness_package_host::UiWorkspaceContext {
+                id: teamarness_package_host::WorkspaceId::new("00112233445566778899aabbccddeeff")
+                    .unwrap(),
+                name: "Fixture Workspace".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(UiLoaderDto::from(descriptor)).unwrap(),
+            fixture["loader"]
+        );
     }
 
     #[test]
