@@ -223,6 +223,11 @@ async function serve() {
   let buffer = Buffer.alloc(0);
   let delayedRequest;
   let packageIdentity;
+  let capabilitySequence = 0;
+  const capabilityGrants = new Map();
+  const pendingCapabilityCalls = new Map();
+  const membershipEvents = [];
+  let membershipStream;
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
     buffer = Buffer.concat([buffer, chunk]);
@@ -234,6 +239,8 @@ async function serve() {
       buffer = buffer.subarray(length + 4);
       if (frame.kind === "initialize") {
         packageIdentity = frame.package.identity;
+        capabilityGrants.clear();
+        for (const capability of frame.capabilities) capabilityGrants.set(capability.identity, capability.grant);
         send({ kind: "initialized", nonce: frame.nonce, package: frame.package, uiContractDigest: frame.uiContractDigest, processGeneration: frame.processGeneration, protocol: frame.protocol });
       } else if (frame.kind === "ping") {
         send({ kind: "pong", nonce: frame.nonce });
@@ -241,12 +248,58 @@ async function serve() {
         const operation = frame.operation.slice("lifecycle.".length);
         if (["activate", "recover"].includes(operation) && packageIdentity?.endsWith(".crash")) process.abort();
         send({ kind: "response", id: frame.id, payload: { state: operation === "recover" ? "active" : operation } });
-        if (operation === "activate") {
-          send({ kind: "request", id: "p:fixture-cap", operation: "capability.call", grant: "Z3JhbnQx", deadlineUnixMs: frame.deadlineUnixMs, payload: { method: "get" } });
+        if (operation === "activate" && capabilityGrants.has("teamarness.workspace-context")) {
+          send({ kind: "request", id: "p:fixture-cap", operation: "capability.call", grant: capabilityGrants.get("teamarness.workspace-context"), deadlineUnixMs: frame.deadlineUnixMs, payload: { method: "get" } });
         }
+      } else if ((frame.kind === "response" || frame.kind === "error") && pendingCapabilityCalls.has(frame.id)) {
+        const requestId = pendingCapabilityCalls.get(frame.id);
+        pendingCapabilityCalls.delete(frame.id);
+        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code } });
+      } else if (frame.kind === "event" && frame.streamId === membershipStream) {
+        membershipEvents.push(frame.payload);
+      } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
+        membershipStream = undefined;
       } else if (frame.kind === "stream_open") {
         send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: 1 } });
         send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.membership_open") {
+        capabilitySequence += 1;
+        membershipStream = `p:membership-${capabilitySequence}`;
+        send({
+          kind: "stream_open",
+          id: membershipStream,
+          topic: "capability.stream",
+          initialCredit: 32,
+          payload: {
+            grant: capabilityGrants.get("teamarness.membership"),
+            method: "subscribe",
+            afterEpoch: frame.payload.afterEpoch,
+          },
+        });
+        send({ kind: "response", id: frame.id, payload: { streamId: membershipStream } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.membership_credit") {
+        send({ kind: "credit", streamId: membershipStream, amount: frame.payload.amount });
+        send({ kind: "response", id: frame.id, payload: { credited: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.membership_close") {
+        if (membershipStream) send({ kind: "stream_close", streamId: membershipStream, code: "closed" });
+        membershipStream = undefined;
+        send({ kind: "response", id: frame.id, payload: { closed: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.membership_events") {
+        send({ kind: "response", id: frame.id, payload: { events: membershipEvents } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.grant") {
+        send({ kind: "response", id: frame.id, payload: { grant: capabilityGrants.get(frame.payload.capability) ?? "missing" } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.capability") {
+        capabilitySequence += 1;
+        const id = `p:fixture-cap-${capabilitySequence}`;
+        pendingCapabilityCalls.set(id, frame.id);
+        send({
+          kind: "request",
+          id,
+          operation: "capability.call",
+          grant: frame.payload.grant ?? capabilityGrants.get(frame.payload.capability) ?? "missing",
+          deadlineUnixMs: frame.deadlineUnixMs,
+          payload: { method: frame.payload.method, ...(frame.payload.arguments ?? {}) },
+        });
       } else if (frame.kind === "request" && frame.operation === "fixture.error") {
         send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: {} });
       } else if (frame.kind === "request" && frame.operation === "fixture.abort") {

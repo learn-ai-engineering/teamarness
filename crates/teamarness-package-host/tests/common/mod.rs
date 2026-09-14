@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,20 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn node(packages: &[(&str, &str)]) -> Self {
+        Self::node_with_capabilities(
+            packages,
+            &[serde_json::json!({
+                "identity":"teamarness.workspace-context", "major":1,
+                "minMinor":0, "maxMinor":0
+            })],
+        )
+        .await
+    }
+
+    pub async fn node_with_capabilities(
+        packages: &[(&str, &str)],
+        capabilities: &[serde_json::Value],
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let application = root.path().join("application");
         let private = root.path().join("private");
@@ -25,7 +41,11 @@ impl Fixture {
         fs::create_dir_all(&private).unwrap();
         let mut entries = Vec::new();
         for (directory, identity) in packages {
-            write_node_package(&application.join(directory), identity);
+            write_node_package_with_capabilities(
+                &application.join(directory),
+                identity,
+                capabilities,
+            );
             entries.push(serde_json::json!({"directory": directory}));
         }
         let index = application.join("application-packages.v1.json");
@@ -47,7 +67,7 @@ impl Fixture {
             &application,
             index,
             &private,
-            InstallationPublicIdentity::new("installation1").unwrap(),
+            InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
         );
         Self {
             _root: root,
@@ -66,6 +86,21 @@ pub fn digest(bytes: &[u8]) -> String {
 }
 
 pub fn write_node_package(root: &Path, identity: &str) {
+    write_node_package_with_capabilities(
+        root,
+        identity,
+        &[serde_json::json!({
+            "identity":"teamarness.workspace-context", "major":1,
+            "minMinor":0, "maxMinor":0
+        })],
+    );
+}
+
+pub fn write_node_package_with_capabilities(
+    root: &Path,
+    identity: &str,
+    capabilities: &[serde_json::Value],
+) {
     fs::create_dir_all(root.join("backend")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -93,8 +128,6 @@ pub fn write_node_package(root: &Path, identity: &str) {
             "assets":[],
             "contract":{"path":"ui/contract.json","sha256":digest(contract)}
         },
-        "capabilities": [{
-            "identity":"teamarness.workspace-context", "major":1, "minMinor":0, "maxMinor":0
-        }]
+        "capabilities": capabilities
     })).unwrap()).unwrap();
 }

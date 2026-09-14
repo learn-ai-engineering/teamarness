@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/workspace-context.schema.json",
+  "title": "Workspace context capability 1.0",
+  "$defs": {
+    "call": {
+      "type": "object",
+      "required": ["method"],
+      "properties": { "method": { "const": "get" } },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "required": ["workspaceId", "workspaceName", "installationIdentity", "installationDisplayName"],
+      "properties": {
+        "workspaceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "workspaceName": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "installationIdentity": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "installationDisplayName": { "type": "string", "minLength": 1, "maxLength": 256 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

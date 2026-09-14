@@ -580,6 +580,7 @@ fn deterministic(code: PackageErrorCode) -> bool {
             | PackageErrorCode::ProtocolViolation
             | PackageErrorCode::MalformedFrame
             | PackageErrorCode::FrameTooLarge
+            | PackageErrorCode::CapabilityUnavailable
             | PackageErrorCode::CapabilityVersionUnsupported
     )
 }

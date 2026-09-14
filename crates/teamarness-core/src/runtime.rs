@@ -497,6 +497,17 @@ impl MembershipSubscription {
     pub fn next_transition(&mut self) -> Result<Option<MembershipTransition>, SubscriptionError> {
         Ok(self.state.next())
     }
+
+    /// Waits up to `timeout` for the next transition.
+    ///
+    /// `None` means no transition arrived before the timeout or the runtime shut down.
+    /// Reopening after the last delivered epoch preserves durable catch-up.
+    pub fn next_transition_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<MembershipTransition>, SubscriptionError> {
+        Ok(self.state.next_timeout(timeout))
+    }
 }
 
 /// The sole public command and query seam for durable core state.
@@ -1767,6 +1778,28 @@ impl CoreRuntime {
         workspace_id: WorkspaceId,
         after_epoch: MembershipEpoch,
     ) -> Result<MembershipSubscription, SubscriptionError> {
+        self.subscribe_membership_inner(workspace_id, after_epoch, None)
+    }
+
+    /// Subscribes with at most 32 durable catch-up transitions held in memory.
+    ///
+    /// Bounded consumers reopen after their last delivered epoch to continue
+    /// catch-up without owning an unbounded live receiver or durable buffer.
+    pub fn subscribe_membership_bounded(
+        &self,
+        workspace_id: WorkspaceId,
+        after_epoch: MembershipEpoch,
+        max_catch_up: usize,
+    ) -> Result<MembershipSubscription, SubscriptionError> {
+        self.subscribe_membership_inner(workspace_id, after_epoch, Some(max_catch_up.clamp(1, 32)))
+    }
+
+    fn subscribe_membership_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        after_epoch: MembershipEpoch,
+        catch_up_limit: Option<usize>,
+    ) -> Result<MembershipSubscription, SubscriptionError> {
         let mut state = self
             .state
             .lock()
@@ -1786,18 +1819,26 @@ impl CoreRuntime {
             .entry(workspace_id)
             .or_default()
             .push(sender);
-        let durable =
-            match crate::subscription::load_after(&state.connection, workspace_id, after_epoch) {
-                Ok(durable) => durable,
-                Err(error) => {
-                    state
-                        .subscribers
-                        .get_mut(&workspace_id)
-                        .expect("listener was registered")
-                        .pop();
-                    return Err(error);
-                }
-            };
+        let durable = match catch_up_limit {
+            Some(limit) => crate::subscription::load_after_bounded(
+                &state.connection,
+                workspace_id,
+                after_epoch,
+                limit,
+            ),
+            None => crate::subscription::load_after(&state.connection, workspace_id, after_epoch),
+        };
+        let durable = match durable {
+            Ok(durable) => durable,
+            Err(error) => {
+                state
+                    .subscribers
+                    .get_mut(&workspace_id)
+                    .expect("listener was registered")
+                    .pop();
+                return Err(error);
+            }
+        };
         Ok(MembershipSubscription {
             state: crate::subscription::SubscriptionState::new(durable, receiver, after_epoch),
         })

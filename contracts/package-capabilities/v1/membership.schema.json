@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/membership.schema.json",
+  "title": "Membership capability 1.0",
+  "$defs": {
+    "decimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "currentCall": {
+      "type": "object",
+      "required": ["method"],
+      "properties": { "method": { "const": "current" } },
+      "additionalProperties": false
+    },
+    "historyCall": {
+      "type": "object",
+      "required": ["method", "identity", "atUnixMs"],
+      "properties": {
+        "method": { "const": "was_member" },
+        "identity": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "atUnixMs": { "type": "string", "pattern": "^-?(0|[1-9][0-9]*)$" }
+      },
+      "additionalProperties": false
+    },
+    "subscribe": {
+      "type": "object",
+      "required": ["grant", "method", "afterEpoch"],
+      "properties": {
+        "grant": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "method": { "const": "subscribe" },
+        "afterEpoch": { "$ref": "#/$defs/decimal" }
+      },
+      "additionalProperties": false
+    },
+    "transition": {
+      "type": "object",
+      "required": ["epoch", "membershipVersion", "cause", "snapshotDigest"],
+      "properties": {
+        "epoch": { "$ref": "#/$defs/decimal" },
+        "membershipVersion": { "$ref": "#/$defs/digest" },
+        "cause": { "$ref": "#/$defs/digest" },
+        "snapshotDigest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

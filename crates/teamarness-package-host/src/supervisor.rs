@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use crate::capability::{CapabilityRequirement, CapabilityScope, GenerationCapabilities};
 use crate::host_store::{HostStore, ProcessLease};
 use crate::manifest::sha256;
 use crate::protocol::{self, ProcessClient, WireFailure};
@@ -23,6 +24,21 @@ pub(crate) const RESTART_DELAYS: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 pub(crate) const CRASH_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+pub(crate) struct ProcessTemplate {
+    pub(crate) package_identity: PackageIdentity,
+    pub(crate) package_version: String,
+    pub(crate) manifest_digest: String,
+    pub(crate) backend_digest: String,
+    pub(crate) ui_contract_digest: String,
+    pub(crate) backend_path: PathBuf,
+    pub(crate) private_data_directory: PathBuf,
+    pub(crate) source_label: String,
+    pub(crate) trust_label: String,
+    pub(crate) protocol: (u16, u16),
+    pub(crate) capabilities: Vec<CapabilityRequirement>,
+}
 
 #[derive(Clone)]
 pub(crate) struct ProcessSpec {
@@ -41,7 +57,8 @@ pub(crate) struct ProcessSpec {
     pub(crate) source_label: String,
     pub(crate) trust_label: String,
     pub(crate) protocol: (u16, u16),
-    pub(crate) capabilities: Vec<(String, u16, u16)>,
+    pub(crate) capabilities: Vec<CapabilityRequirement>,
+    pub(crate) core: Arc<teamarness_core::CoreRuntime>,
 }
 
 pub(crate) struct ProcessGeneration {
@@ -59,6 +76,18 @@ pub(crate) async fn spawn(
     generation: u64,
     recovering: bool,
 ) -> Result<ProcessGeneration, WireFailure> {
+    let capabilities = GenerationCapabilities::bind(
+        spec.core.clone(),
+        CapabilityScope {
+            package_identity: spec.package_identity.clone(),
+            workspace_id: spec.workspace_id.clone(),
+            workspace_name: spec.workspace_name.clone(),
+            installation: spec.installation.clone(),
+        },
+        &spec.capabilities,
+        generation,
+    )
+    .map_err(WireFailure::new)?;
     let current = fs::read(&spec.backend_path)
         .map_err(|_| WireFailure::new(PackageErrorCode::ArtifactChanged))?;
     if sha256(&current) != spec.backend_digest {
@@ -123,8 +152,8 @@ pub(crate) async fn spawn(
         .and_then(|store| store.record_process_lease(&lease))
         .map_err(|_| WireFailure::new(PackageErrorCode::DataDirectoryUnavailable))?;
 
-    let client = protocol::start(stdout, stdin);
-    let initialize = initialize_frame(spec, generation, &launch_token);
+    let client = protocol::start_with_capabilities(stdout, stdin, capabilities.clone());
+    let initialize = initialize_frame(spec, generation, &launch_token, &capabilities);
     let initialized = client.initialize(initialize).await?;
     if !handshake_matches(&initialized, spec, generation, &launch_token) {
         return Err(WireFailure::new(PackageErrorCode::HandshakeMismatch));
@@ -167,14 +196,22 @@ pub(crate) async fn spawn(
     })
 }
 
-fn initialize_frame(spec: &ProcessSpec, generation: u64, nonce: &str) -> Value {
-    let capabilities = spec
-        .capabilities
+fn initialize_frame(
+    spec: &ProcessSpec,
+    generation: u64,
+    nonce: &str,
+    bound_capabilities: &GenerationCapabilities,
+) -> Value {
+    let capabilities = bound_capabilities
+        .advertised()
         .iter()
-        .enumerate()
-        .map(|(index, (identity, major, minor))| {
-            let grant = URL_SAFE_NO_PAD.encode(format!("grant{}", index + 1));
-            json!({"grant":grant,"identity":identity,"major":major,"minor":minor})
+        .map(|capability| {
+            json!({
+                "grant":capability.grant,
+                "identity":capability.identity,
+                "major":capability.major,
+                "minor":capability.minor
+            })
         })
         .collect::<Vec<_>>();
     json!({

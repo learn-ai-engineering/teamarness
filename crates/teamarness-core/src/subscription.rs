@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 use p2panda_core::Hash;
 use rusqlite::Connection;
@@ -46,12 +47,53 @@ impl SubscriptionState {
             return Some(transition);
         }
     }
+
+    pub(crate) fn next_timeout(&mut self, timeout: Duration) -> Option<MembershipTransition> {
+        loop {
+            let transition = if let Some(transition) = self.durable.pop_front() {
+                transition
+            } else {
+                match self.live.recv_timeout(timeout) {
+                    Ok(transition) => transition,
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
+                }
+            };
+            if transition.epoch() <= self.last_epoch {
+                continue;
+            }
+            self.last_epoch = transition.epoch();
+            return Some(transition);
+        }
+    }
 }
 
 pub(crate) fn load_after(
     connection: &Connection,
     workspace_id: WorkspaceId,
     after_epoch: MembershipEpoch,
+) -> Result<Vec<MembershipTransition>, SubscriptionError> {
+    load_after_with_limit(connection, workspace_id, after_epoch, None)
+}
+
+pub(crate) fn load_after_bounded(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    after_epoch: MembershipEpoch,
+    limit: usize,
+) -> Result<Vec<MembershipTransition>, SubscriptionError> {
+    load_after_with_limit(
+        connection,
+        workspace_id,
+        after_epoch,
+        Some(limit.clamp(1, 32)),
+    )
+}
+
+fn load_after_with_limit(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    after_epoch: MembershipEpoch,
+    limit: Option<usize>,
 ) -> Result<Vec<MembershipTransition>, SubscriptionError> {
     let current_epoch: Option<i64> = connection
         .query_row(
@@ -74,12 +116,18 @@ pub(crate) fn load_after(
         .prepare(
             "SELECT epoch, membership_version, cause_operation_id, snapshot_digest
              FROM membership_transitions
-             WHERE workspace_id = ?1 AND epoch > ?2 ORDER BY epoch",
+             WHERE workspace_id = ?1 AND epoch > ?2 ORDER BY epoch LIMIT ?3",
         )
         .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
     let rows = statement
         .query_map(
-            rusqlite::params![workspace_id.as_bytes().as_slice(), after],
+            rusqlite::params![
+                workspace_id.as_bytes().as_slice(),
+                after,
+                limit
+                    .and_then(|value| i64::try_from(value).ok())
+                    .unwrap_or(i64::MAX)
+            ],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,

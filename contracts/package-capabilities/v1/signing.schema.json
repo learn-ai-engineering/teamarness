@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/signing.schema.json",
+  "title": "Signing capability 1.0",
+  "$defs": {
+    "bytes": { "type": "string", "pattern": "^[A-Za-z0-9_-]*$", "maxLength": 349526 },
+    "purpose": { "type": "string", "pattern": "^[!-~]{1,64}$", "maxLength": 64 },
+    "signCall": {
+      "type": "object",
+      "required": ["method", "purpose", "payload"],
+      "properties": {
+        "method": { "const": "sign" },
+        "purpose": { "$ref": "#/$defs/purpose" },
+        "payload": { "$ref": "#/$defs/bytes" }
+      },
+      "additionalProperties": false
+    },
+    "verifyCall": {
+      "type": "object",
+      "required": ["method", "signer", "purpose", "payload", "signature"],
+      "properties": {
+        "method": { "const": "verify" },
+        "signer": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "purpose": { "$ref": "#/$defs/purpose" },
+        "payload": { "$ref": "#/$defs/bytes" },
+        "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

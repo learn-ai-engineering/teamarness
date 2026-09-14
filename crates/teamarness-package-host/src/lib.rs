@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod capability;
 mod catalog;
 mod data_directory;
 mod host_store;
@@ -672,6 +673,10 @@ pub struct PackageHost {
 struct PackageHostInner {
     data: Mutex<HostData>,
     revisions: watch::Sender<HostRevision>,
+    config: PackageHostConfig,
+    core: Arc<teamarness_core::CoreRuntime>,
+    templates: Vec<supervisor::ProcessTemplate>,
+    reconciliation: Mutex<()>,
 }
 
 struct HostData {
@@ -714,9 +719,7 @@ impl PackageHost {
                 PackageErrorStage::Storage,
             )
         })?;
-        let store = host_store::HostStore::open(config.private_data_directory())
-            .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
-        let mut instances = BTreeMap::new();
+        let mut templates = Vec::new();
         for admission in report.admissions {
             let catalog = report
                 .snapshot
@@ -732,6 +735,35 @@ impl PackageHost {
                 PackageTrustKind::ApplicationBundled => "application_bundled",
                 PackageTrustKind::TrustedNativeCodeV1 => "trusted_native_code_v1",
             };
+            templates.push(supervisor::ProcessTemplate {
+                package_identity: admission.manifest.identity.clone(),
+                package_version: admission.manifest.version.to_string(),
+                manifest_digest: admission.manifest.manifest_digest.clone(),
+                backend_digest: admission.manifest.backend.digest.clone(),
+                ui_contract_digest: admission.manifest.ui.contract.digest.clone(),
+                backend_path: admission.backend_path,
+                private_data_directory: config.private_data_directory().to_owned(),
+                source_label: source_label.to_owned(),
+                trust_label: trust_label.to_owned(),
+                protocol: (
+                    admission.manifest.protocol.major,
+                    admission.manifest.protocol.max_minor,
+                ),
+                capabilities: admission
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .map(|requirement| capability::CapabilityRequirement {
+                        identity: requirement.identity.clone(),
+                        major: requirement.major,
+                        min_minor: requirement.min_minor,
+                        max_minor: requirement.max_minor,
+                    })
+                    .collect(),
+            });
+        }
+        let mut instances = BTreeMap::new();
+        for template in &templates {
             for workspace in &workspaces {
                 let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
                     host_error(
@@ -740,58 +772,24 @@ impl PackageHost {
                     )
                 })?;
                 if blocked.contains(&(
-                    admission.manifest.identity.to_string(),
+                    template.package_identity.to_string(),
                     workspace_id.to_string(),
                 )) {
                     continue;
                 }
-                let key = PackageInstanceKey::new(
-                    admission.manifest.identity.clone(),
-                    workspace_id.clone(),
-                );
-                let grant = data_directory::allocate(
-                    &store,
-                    config.private_data_directory(),
-                    config.installation_public_identity(),
-                    &workspace_id,
-                    &admission.manifest.identity,
-                )
-                .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
-                let spec = supervisor::ProcessSpec {
-                    package_identity: admission.manifest.identity.clone(),
-                    package_version: admission.manifest.version.to_string(),
-                    manifest_digest: admission.manifest.manifest_digest.clone(),
-                    backend_digest: admission.manifest.backend.digest.clone(),
-                    ui_contract_digest: admission.manifest.ui.contract.digest.clone(),
-                    backend_path: admission.backend_path.clone(),
-                    workspace_id,
-                    workspace_name: workspace.name().to_owned(),
-                    installation: config.installation_public_identity().clone(),
-                    data_directory: grant.path,
-                    continuity_id: grant.continuity_id,
-                    private_data_directory: config.private_data_directory().to_owned(),
-                    source_label: source_label.to_owned(),
-                    trust_label: trust_label.to_owned(),
-                    protocol: (
-                        admission.manifest.protocol.major,
-                        admission.manifest.protocol.max_minor,
-                    ),
-                    capabilities: admission
-                        .manifest
-                        .capabilities
-                        .iter()
-                        .map(|capability| {
-                            (
-                                capability.identity.clone(),
-                                capability.major,
-                                capability.max_minor,
-                            )
-                        })
-                        .collect(),
-                };
-                let actor = Arc::new(instance::InstanceActor::new(key.clone(), spec));
+                let (key, actor) = prepare_instance(&config, &core, template, workspace).await?;
                 if let Err(failure) = actor.activate().await {
-                    let mut error = host_error(failure.code, PackageErrorStage::Process);
+                    let stage = if matches!(
+                        failure.code,
+                        PackageErrorCode::CapabilityUnavailable
+                            | PackageErrorCode::CapabilityVersionUnsupported
+                            | PackageErrorCode::CapabilityRequestInvalid
+                    ) {
+                        PackageErrorStage::Capability
+                    } else {
+                        PackageErrorStage::Process
+                    };
+                    let mut error = host_error(failure.code, stage);
                     error.affected_instance = Some(key.clone());
                     report.snapshot.diagnostics.push(error);
                 }
@@ -811,6 +809,10 @@ impl PackageHost {
                     mounts: BTreeMap::new(),
                 }),
                 revisions,
+                config,
+                core,
+                templates,
+                reconciliation: Mutex::new(()),
             }),
         };
         Ok(host)
@@ -863,6 +865,54 @@ impl PackageHost {
         }
         match command {
             PackageHostCommand::ReconcileWorkspaces(_) => {
+                let _gate = self.inner.reconciliation.lock().await;
+                let workspaces = self.inner.core.list_workspaces().map_err(|_| {
+                    host_error(
+                        PackageErrorCode::DataDirectoryUnavailable,
+                        PackageErrorStage::Storage,
+                    )
+                })?;
+                for template in &self.inner.templates {
+                    for workspace in &workspaces {
+                        let workspace_id =
+                            WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
+                                host_error(
+                                    PackageErrorCode::DataDirectoryUnrepresentable,
+                                    PackageErrorStage::Storage,
+                                )
+                            })?;
+                        let key = PackageInstanceKey::new(
+                            template.package_identity.clone(),
+                            workspace_id,
+                        );
+                        if self.inner.data.lock().await.instances.contains_key(&key) {
+                            continue;
+                        }
+                        let (key, actor) = prepare_instance(
+                            &self.inner.config,
+                            &self.inner.core,
+                            template,
+                            workspace,
+                        )
+                        .await?;
+                        if let Err(failure) = actor.activate().await {
+                            let stage = if matches!(
+                                failure.code,
+                                PackageErrorCode::CapabilityUnavailable
+                                    | PackageErrorCode::CapabilityVersionUnsupported
+                                    | PackageErrorCode::CapabilityRequestInvalid
+                            ) {
+                                PackageErrorStage::Capability
+                            } else {
+                                PackageErrorStage::Process
+                            };
+                            let mut error = host_error(failure.code, stage);
+                            error.affected_instance = Some(key.clone());
+                            self.inner.data.lock().await.diagnostics.push(error);
+                        }
+                        self.inner.data.lock().await.instances.insert(key, actor);
+                    }
+                }
                 let revision = self.bump_revision().await;
                 Ok(PackageHostOutcome::Reconciled { revision })
             }
@@ -1046,6 +1096,55 @@ impl PackageHost {
         self.inner.revisions.send_replace(revision);
         revision
     }
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_instance(
+    config: &PackageHostConfig,
+    core: &Arc<teamarness_core::CoreRuntime>,
+    template: &supervisor::ProcessTemplate,
+    workspace: &teamarness_core::WorkspaceSummary,
+) -> Result<(PackageInstanceKey, Arc<instance::InstanceActor>), PackageErrorEnvelope> {
+    let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
+        host_error(
+            PackageErrorCode::DataDirectoryUnrepresentable,
+            PackageErrorStage::Storage,
+        )
+    })?;
+    let key = PackageInstanceKey::new(template.package_identity.clone(), workspace_id.clone());
+    let store = host_store::HostStore::open(config.private_data_directory())
+        .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
+    let grant = data_directory::allocate(
+        &store,
+        config.private_data_directory(),
+        config.installation_public_identity(),
+        &workspace_id,
+        &template.package_identity,
+    )
+    .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
+    let spec = supervisor::ProcessSpec {
+        package_identity: template.package_identity.clone(),
+        package_version: template.package_version.clone(),
+        manifest_digest: template.manifest_digest.clone(),
+        backend_digest: template.backend_digest.clone(),
+        ui_contract_digest: template.ui_contract_digest.clone(),
+        backend_path: template.backend_path.clone(),
+        workspace_id,
+        workspace_name: workspace.name().to_owned(),
+        installation: config.installation_public_identity().clone(),
+        data_directory: grant.path,
+        continuity_id: grant.continuity_id,
+        private_data_directory: template.private_data_directory.clone(),
+        source_label: template.source_label.clone(),
+        trust_label: template.trust_label.clone(),
+        protocol: template.protocol,
+        capabilities: template.capabilities.clone(),
+        core: core.clone(),
+    };
+    Ok((
+        key.clone(),
+        Arc::new(instance::InstanceActor::new(key, spec)),
+    ))
 }
 
 fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorEnvelope {

@@ -50,6 +50,31 @@ struct Writer {
     data_bytes: Arc<Semaphore>,
 }
 
+#[derive(Clone)]
+pub(crate) struct HostStreamSender(Writer);
+
+impl HostStreamSender {
+    pub(crate) async fn event(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+        payload: Value,
+    ) -> Result<(), WireFailure> {
+        self.0
+            .data(json!({
+                "kind":"event", "streamId":stream_id,
+                "sequence":sequence.to_string(), "payload":payload
+            }))
+            .await
+    }
+
+    pub(crate) async fn close(&self, stream_id: &str, code: &str) -> Result<(), WireFailure> {
+        self.0
+            .control(json!({"kind":"stream_close","streamId":stream_id,"code":code}))
+            .await
+    }
+}
+
 struct QueuedFrame {
     frame: Frame,
     _bytes: OwnedSemaphorePermit,
@@ -85,14 +110,108 @@ impl Writer {
             _bytes: permit,
         };
         let sender = if control { &self.control } else { &self.data };
-        sender
-            .send(queued)
-            .await
-            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))
+        sender.try_send(queued).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => WireFailure::new(PackageErrorCode::Overloaded),
+            mpsc::error::TrySendError::Closed(_) => {
+                WireFailure::new(PackageErrorCode::ProcessExited)
+            }
+        })
     }
 }
 
+pub(crate) trait CapabilityHandler: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        grant: Option<&'a str>,
+        payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+    >;
+
+    fn open_stream<'a>(
+        &'a self,
+        stream_id: String,
+        topic: &'a str,
+        initial_credit: u64,
+        payload: &'a Value,
+        output: HostStreamSender,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+    >;
+
+    fn add_credit<'a>(
+        &'a self,
+        stream_id: &'a str,
+        amount: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+    >;
+
+    fn close_stream<'a>(
+        &'a self,
+        stream_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+#[allow(dead_code)]
+struct RejectCapabilities;
+
+impl CapabilityHandler for RejectCapabilities {
+    fn call<'a>(
+        &'a self,
+        _grant: Option<&'a str>,
+        _payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+    }
+
+    fn open_stream<'a>(
+        &'a self,
+        _stream_id: String,
+        _topic: &'a str,
+        _initial_credit: u64,
+        _payload: &'a Value,
+        _output: HostStreamSender,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+    }
+
+    fn add_credit<'a>(
+        &'a self,
+        _stream_id: &'a str,
+        _amount: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+    }
+
+    fn close_stream<'a>(
+        &'a self,
+        _stream_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn start<R, W>(reader: R, output: W) -> ProcessClient
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    start_with_capabilities(reader, output, Arc::new(RejectCapabilities))
+}
+
+pub(crate) fn start_with_capabilities<R, W>(
+    reader: R,
+    output: W,
+    capabilities: Arc<dyn CapabilityHandler>,
+) -> ProcessClient
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -131,6 +250,7 @@ where
         shutdown_tx,
         pong_tx,
         failure_tx.clone(),
+        capabilities,
     ));
     ProcessClient {
         writer,
@@ -198,6 +318,7 @@ async fn reader_task<R>(
     shutdown: watch::Sender<bool>,
     pongs: watch::Sender<Option<String>>,
     failure: watch::Sender<Option<PackageErrorCode>>,
+    capabilities: Arc<dyn CapabilityHandler>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -268,15 +389,96 @@ async fn reader_task<R>(
                 let _ = sender.send(result);
             }
             FrameKind::Request => {
-                let Some(id) = frame.field("id").and_then(Value::as_str) else {
+                let Some(id) = frame.field("id").and_then(Value::as_str).map(str::to_owned) else {
                     let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
                     return;
                 };
-                let response = json!({"kind":"response","id":id,"payload":{"ok":true}});
-                if writer.control(response).await.is_err() {
-                    let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                if frame.field("operation").and_then(Value::as_str) != Some("capability.call") {
+                    let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                     return;
                 }
+                let grant = frame
+                    .field("grant")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
+                let writer = writer.clone();
+                let capabilities = capabilities.clone();
+                let failure = failure.clone();
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        capabilities.call(grant.as_deref(), &payload),
+                    )
+                    .await
+                    .unwrap_or(Err(PackageErrorCode::DeadlineExceeded));
+                    let response = match result {
+                        Ok(payload) => json!({"kind":"response","id":id,"payload":payload}),
+                        Err(code) => json!({
+                            "kind":"error", "id":id,
+                            "code":capability_code(code), "retryable":false,
+                            "details":{}
+                        }),
+                    };
+                    if writer.control(response).await.is_err() {
+                        let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                    }
+                });
+            }
+            FrameKind::StreamOpen => {
+                let Some(id) = frame.field("id").and_then(Value::as_str).map(str::to_owned) else {
+                    let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
+                    return;
+                };
+                let topic = frame
+                    .field("topic")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let initial_credit = frame
+                    .field("initialCredit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
+                if let Err(code) = capabilities
+                    .open_stream(
+                        id.clone(),
+                        topic,
+                        initial_credit,
+                        &payload,
+                        HostStreamSender(writer.clone()),
+                    )
+                    .await
+                {
+                    let response = json!({
+                        "kind":"stream_close", "streamId":id,
+                        "code":capability_code(code)
+                    });
+                    if writer.control(response).await.is_err() {
+                        let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                        return;
+                    }
+                }
+            }
+            FrameKind::Credit => {
+                let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
+                    let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
+                    return;
+                };
+                let amount = frame
+                    .field("amount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                if capabilities.add_credit(stream_id, amount).await.is_err() {
+                    let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
+                    return;
+                }
+            }
+            FrameKind::StreamClose => {
+                let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
+                    let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
+                    return;
+                };
+                capabilities.close_stream(stream_id).await;
             }
             FrameKind::ShutdownAck => {
                 let _ = shutdown.send(true);
@@ -288,7 +490,7 @@ async fn reader_task<R>(
                     .map(str::to_owned);
                 let _ = pongs.send(nonce);
             }
-            FrameKind::Event | FrameKind::StreamClose => {}
+            FrameKind::Event => {}
             _ => {
                 let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                 return;
@@ -328,6 +530,16 @@ async fn read_frame<R: AsyncRead + Unpin>(input: &mut R) -> Result<Frame, Packag
     let mut bytes = prefix.to_vec();
     bytes.extend(payload);
     decode_frame(&bytes).map_err(protocol_code)
+}
+
+fn capability_code(code: PackageErrorCode) -> &'static str {
+    match code {
+        PackageErrorCode::CapabilityUnavailable => "capability_unavailable",
+        PackageErrorCode::CapabilityVersionUnsupported => "capability_version_unsupported",
+        PackageErrorCode::DeadlineExceeded => "deadline_exceeded",
+        PackageErrorCode::Overloaded => "overloaded",
+        _ => "capability_request_invalid",
+    }
 }
 
 fn protocol_code(error: teamarness_package_protocol::ProtocolError) -> PackageErrorCode {
