@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.PKG`
 
-The Package system defines Package Manifests, Sources, Registrations, Admission, the Package Host, Package Process Protocol, Semantic Capabilities, lifecycle, SDKs, local data ownership, and trust. All product-domain behavior lives in Packages. Phase 3 delivers the foundation after the desktop Shell and Workspace onboarding path work end to end.
+The Package system defines Package Manifests, Sources, Registrations, Admission, the Package Host, Package Process Protocol, Semantic Capabilities, lifecycle, SDKs, local data ownership, and trust. All product-domain behavior lives in Packages. Phase 3 delivered this foundation after the desktop Shell and Workspace onboarding path worked end to end.
 
 ## TEAM.SYS.PKG-R01 — Package Manifest
 

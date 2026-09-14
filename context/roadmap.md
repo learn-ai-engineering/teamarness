@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phase 2, the desktop shell and Workspace onboarding, is complete and is the current implementation baseline. Phase 3, Package Foundation, is in progress.
+The VRS intent tree and accepted architecture decisions are established. Phase 3, Package Foundation, is complete and is the current implementation baseline. Phase 4, Conversations Package, is in progress.
 
 ## Phases
 
@@ -32,17 +32,17 @@ Completed on 2026-09-13. This phase added the Tauri desktop shell, bound the run
 
 **Depends on:** Phase 1.
 
-### Phase 3 - Package Foundation (in progress)
+### Phase 3 - Package Foundation (complete)
 
-Started on 2026-09-13. The Tauri Shell adds Package mounting, Workspace-level theming, and bounded Package failure handling. Phase 3 defines a language-neutral Package Process Protocol and ships Rust Backend and TypeScript UI SDKs. Each Package Instance receives a durable Package Data Directory and runs independently of UI visibility. One trusted Rust reference Package exercises the foundation from both an application-bundled Package Source and an explicitly registered installation-local Package Source. Phase 3 also establishes versioned Semantic Capability negotiation so later phases can add generic Package-scoped synchronization without changing lifecycle or UI contracts. It does not implement a synchronization engine.
+Completed on 2026-09-14. The Tauri Shell now mounts Package UIs, applies Workspace-level theming, and contains bounded Package failures. Phase 3 defined a language-neutral Package Process Protocol and shipped Rust Backend and TypeScript UI SDKs. Each Package Instance receives a durable Package Data Directory and runs independently of UI visibility. One trusted Rust reference Package exercises the foundation from both an application-bundled Package Source and an explicitly registered installation-local Package Source. Phase 3 also established versioned Semantic Capability negotiation so later phases can add generic Package-scoped synchronization without changing lifecycle or UI contracts. It did not implement a synchronization engine.
 
 **Outcome:** The desktop shell discovers, validates, mounts, activates, recovers, and tears down the same reference package from bundled and configured local sources through one host contract. The documented path from a personal development package to a package shipped with Teamarness does not require package integration code to be rewritten.
 
 **Depends on:** Phase 2.
 
-### Phase 4 - Conversations Package
+### Phase 4 - Conversations Package (in progress)
 
-The Conversations domain as the first real Package. It owns Channels, signed Markdown Messages, Channel Membership, conversation keys, local schemas and projections, offline behavior, unread state, and UI. It consumes Canonical Membership as an eligibility ceiling. Phase 4 adds the first generic Package-scoped Synchronization Capability for the reusable Iroh transport and replication machinery required by Conversations.
+Started on 2026-09-14. The Conversations domain is the first real Package. It owns Channels, signed Markdown Messages, Channel Membership, conversation keys, local schemas and projections, offline behavior, unread state, and UI. It consumes Canonical Membership as an eligibility ceiling. Phase 4 adds the first generic Package-scoped Synchronization Capability for the reusable Iroh transport and replication machinery required by Conversations.
 
 **Outcome:** Two peers on the same network exchange encrypted messages in a `#general` channel through the conversations package UI.
 

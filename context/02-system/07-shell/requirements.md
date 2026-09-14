@@ -2,9 +2,9 @@
 
 Prefix: `TEAM.SYS.SHELL`
 
-The Tauri shell owns workspace controls and the desktop window lifecycle. It will also own package mounting and workspace-level theming when the package foundation is added. It communicates with the Rust runtime through typed, secret-free Tauri commands and events.
+The Tauri Shell owns Workspace controls, the desktop window lifecycle, Package mounting, and Workspace-level theming. It communicates with the Rust runtime through typed, secret-free Tauri commands and events.
 
-Phase 2 delivers the desktop window and Workspace onboarding between two Installations. Phase 3 adds Package mounting, Package Process lifecycle coordination, theming, and bounded failure handling for trusted Packages from application-bundled and installation-local Package Sources. Workspace leave, Member removal controls, manager administration, system tray behavior, native menus, and auto-updater behavior are deferred beyond Phase 2.
+Phase 2 delivered the desktop window and Workspace onboarding between two Installations. Phase 3 added Package mounting, Package Process lifecycle coordination, theming, and bounded failure handling for trusted Packages from application-bundled and installation-local Package Sources. Workspace leave, Member removal controls, manager administration, system tray behavior, native menus, and auto-updater behavior are deferred beyond Phase 2.
 
 ## TEAM.SYS.SHELL-R01 — Tauri Desktop Host
 
