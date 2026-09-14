@@ -4,7 +4,9 @@ import type { PackageMountController } from "./package-mount";
 export type PackageShellActions = Readonly<{
   select(instance: PackageInstanceKey): Promise<void>;
   reloadUi(): Promise<void>;
+  suspendBackend(): Promise<void>;
   recoverBackend(): Promise<void>;
+  disposeBackend(): Promise<void>;
 }>;
 
 export interface PackageShellView {
@@ -20,7 +22,9 @@ export interface PackageSnapshotBridge {
 interface MountController {
   mount(instance: PackageInstanceKey, target: unknown, onFailure: () => void): Promise<unknown>;
   unmount(): Promise<void>;
+  suspendBackend(instance: PackageInstanceKey): Promise<void>;
   recoverBackend(instance: PackageInstanceKey): Promise<void>;
+  disposeBackend(instance: PackageInstanceKey): Promise<void>;
 }
 
 export class PackageShell {
@@ -44,10 +48,32 @@ export class PackageShell {
         await this.loadSelected();
       },
       reloadUi: async () => { await this.loadSelected(); },
+      suspendBackend: async () => {
+        await this.runLifecycle((instance) => this.mounts.suspendBackend(instance));
+      },
       recoverBackend: async () => {
-        if (this.selected) await this.mounts.recoverBackend(this.selected);
+        await this.runLifecycle((instance) => this.mounts.recoverBackend(instance));
+      },
+      disposeBackend: async () => {
+        await this.runLifecycle((instance) => this.mounts.disposeBackend(instance));
       },
     });
+  }
+
+  private async runLifecycle(operation: (instance: PackageInstanceKey) => Promise<void>): Promise<void> {
+    if (!this.selected) return;
+    let failed = false;
+    try {
+      await operation(this.selected);
+    } catch {
+      failed = true;
+    }
+    try {
+      await this.refresh();
+    } catch {
+      failed = true;
+    }
+    if (failed) this.view.showFailure(this.actions());
   }
 
   private async loadSelected(): Promise<void> {
@@ -81,7 +107,8 @@ export class BrowserPackageShellView implements PackageShellView {
       const catalog = snapshot.packages.find(({ identity }) => identity === instance.key.packageIdentity);
       const button = document.createElement("button");
       button.type = "button";
-      button.textContent = `${catalog?.displayName ?? instance.key.packageIdentity} · ${instance.key.workspaceId}`;
+      const generation = instance.processGeneration === null ? "no generation" : `generation ${instance.processGeneration}`;
+      button.textContent = `${catalog?.displayName ?? instance.key.packageIdentity} · ${instance.key.workspaceId} · ${instance.lifecycle} · ${generation}`;
       button.dataset.packageIdentity = instance.key.packageIdentity;
       button.dataset.workspaceId = instance.key.workspaceId;
       button.addEventListener("click", () => { void actions.select(instance.key); });
@@ -98,11 +125,19 @@ export class BrowserPackageShellView implements PackageShellView {
     reload.type = "button";
     reload.textContent = "Reload UI";
     reload.addEventListener("click", () => { void actions.reloadUi(); });
+    const suspend = document.createElement("button");
+    suspend.type = "button";
+    suspend.textContent = "Suspend";
+    suspend.addEventListener("click", () => { void actions.suspendBackend(); });
     const recover = document.createElement("button");
     recover.type = "button";
     recover.textContent = "Recover Backend";
     recover.addEventListener("click", () => { void actions.recoverBackend(); });
-    lifecycleActions.append(reload, recover);
+    const dispose = document.createElement("button");
+    dispose.type = "button";
+    dispose.textContent = "Dispose";
+    dispose.addEventListener("click", () => { void actions.disposeBackend(); });
+    lifecycleActions.append(reload, suspend, recover, dispose);
     this.navigation.replaceChildren(title, list, lifecycleActions);
   }
 

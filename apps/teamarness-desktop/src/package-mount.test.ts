@@ -57,7 +57,9 @@ function harness(): {
     openMount: async () => descriptor(++opened),
     closeMount: async ({ mount }) => { calls.push(`close:${mount}`); },
     reportUiFault: async ({ mount }) => { calls.push(`fault:${mount}`); },
-    recoverBackend: async () => { calls.push("recover"); },
+    suspendBackend: async (selected) => { calls.push(`suspend:${selected.packageIdentity}`); },
+    recoverBackend: async (selected) => { calls.push(`recover:${selected.packageIdentity}`); },
+    disposeBackend: async (selected) => { calls.push(`dispose:${selected.packageIdentity}`); },
   };
   const dom: PackageMountDom = {
     create: () => ({
@@ -95,6 +97,23 @@ describe("generic Package UI mount", () => {
       uiHostVersion: 1,
     });
     expect(JSON.stringify(test.contexts[0])).not.toContain("1".repeat(32));
+  });
+
+  it("routes generic lifecycle actions through the bridge for the supplied instance", async () => {
+    const test = harness();
+    const controller = new PackageMountController(test.bridge, test.dom, async () => ({
+      mount: async () => async () => undefined,
+    }));
+
+    await controller.suspendBackend(instance);
+    await controller.recoverBackend(instance);
+    await controller.disposeBackend(instance);
+
+    expect(test.calls).toEqual([
+      "suspend:com.example.fixture",
+      "recover:com.example.fixture",
+      "dispose:com.example.fixture",
+    ]);
   });
 
   it("unmounts idempotently and replaces a mount without recovering its Backend", async () => {

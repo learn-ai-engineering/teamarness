@@ -22,7 +22,9 @@ export interface PackageMountBridge {
   openMount(instance: PackageInstanceKey): Promise<OpenPackageMount>;
   closeMount(input: Readonly<{ mount: string }>): Promise<void>;
   reportUiFault(input: Readonly<{ mount: string; code: "ui_exception" }>): Promise<void>;
+  suspendBackend(instance: PackageInstanceKey): Promise<void>;
   recoverBackend(instance: PackageInstanceKey): Promise<void>;
+  disposeBackend(instance: PackageInstanceKey): Promise<void>;
 }
 
 export type PackageMountDomLease = Readonly<{
@@ -173,8 +175,16 @@ export class PackageMountController {
     return operation;
   }
 
+  public async suspendBackend(instance: PackageInstanceKey): Promise<void> {
+    await this.bridge.suspendBackend(instance);
+  }
+
   public async recoverBackend(instance: PackageInstanceKey): Promise<void> {
     await this.bridge.recoverBackend(instance);
+  }
+
+  public async disposeBackend(instance: PackageInstanceKey): Promise<void> {
+    await this.bridge.disposeBackend(instance);
   }
 }
 
