@@ -42,22 +42,12 @@ pub(crate) struct ProcessTemplate {
 
 #[derive(Clone)]
 pub(crate) struct ProcessSpec {
-    pub(crate) package_identity: PackageIdentity,
-    pub(crate) package_version: String,
-    pub(crate) manifest_digest: String,
-    pub(crate) backend_digest: String,
-    pub(crate) ui_contract_digest: String,
-    pub(crate) backend_path: PathBuf,
+    pub(crate) template: ProcessTemplate,
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) workspace_name: String,
     pub(crate) installation: InstallationPublicIdentity,
     pub(crate) data_directory: PathBuf,
     pub(crate) continuity_id: String,
-    pub(crate) private_data_directory: PathBuf,
-    pub(crate) source_label: String,
-    pub(crate) trust_label: String,
-    pub(crate) protocol: (u16, u16),
-    pub(crate) capabilities: Vec<CapabilityRequirement>,
     pub(crate) core: Arc<teamarness_core::CoreRuntime>,
 }
 
@@ -79,21 +69,21 @@ pub(crate) async fn spawn(
     let capabilities = GenerationCapabilities::bind(
         spec.core.clone(),
         CapabilityScope {
-            package_identity: spec.package_identity.clone(),
+            package_identity: spec.template.package_identity.clone(),
             workspace_id: spec.workspace_id.clone(),
             workspace_name: spec.workspace_name.clone(),
             installation: spec.installation.clone(),
         },
-        &spec.capabilities,
+        &spec.template.capabilities,
         generation,
     )
     .map_err(WireFailure::new)?;
-    let current = fs::read(&spec.backend_path)
+    let current = fs::read(&spec.template.backend_path)
         .map_err(|_| WireFailure::new(PackageErrorCode::ArtifactChanged))?;
-    if sha256(&current) != spec.backend_digest {
+    if sha256(&current) != spec.template.backend_digest {
         return Err(WireFailure::new(PackageErrorCode::ArtifactChanged));
     }
-    let executable = fs::canonicalize(&spec.backend_path)
+    let executable = fs::canonicalize(&spec.template.backend_path)
         .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?;
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?;
@@ -125,11 +115,11 @@ pub(crate) async fn spawn(
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(capture_stderr(
             stderr,
-            spec.private_data_directory.clone(),
-            spec.package_identity.to_string(),
+            spec.template.private_data_directory.clone(),
+            spec.template.package_identity.to_string(),
             spec.workspace_id.to_string(),
-            spec.source_label.clone(),
-            spec.trust_label.clone(),
+            spec.template.source_label.clone(),
+            spec.template.trust_label.clone(),
             generation,
         ));
     }
@@ -137,7 +127,7 @@ pub(crate) async fn spawn(
         .await
         .unwrap_or_else(|| "unknown".into());
     let lease = ProcessLease {
-        package_identity: spec.package_identity.to_string(),
+        package_identity: spec.template.package_identity.to_string(),
         workspace_id: spec.workspace_id.to_string(),
         process_generation: generation,
         pid,
@@ -145,10 +135,10 @@ pub(crate) async fn spawn(
             .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?,
         start_time,
         canonical_executable: executable.to_string_lossy().into_owned(),
-        executable_digest: spec.backend_digest.clone(),
+        executable_digest: spec.template.backend_digest.clone(),
         launch_token: launch_token.clone(),
     };
-    HostStore::open(&spec.private_data_directory)
+    HostStore::open(&spec.template.private_data_directory)
         .and_then(|store| store.record_process_lease(&lease))
         .map_err(|_| WireFailure::new(PackageErrorCode::DataDirectoryUnavailable))?;
 
@@ -189,9 +179,9 @@ pub(crate) async fn spawn(
         generation,
         client,
         child,
-        package: spec.package_identity.clone(),
+        package: spec.template.package_identity.clone(),
         workspace: spec.workspace_id.clone(),
-        private_data_directory: spec.private_data_directory.clone(),
+        private_data_directory: spec.template.private_data_directory.clone(),
         health,
     })
 }
@@ -218,17 +208,17 @@ fn initialize_frame(
         "kind":"initialize",
         "nonce":nonce,
         "package":{
-            "identity":spec.package_identity.as_str(),
-            "version":spec.package_version,
-            "manifestDigest":spec.manifest_digest,
-            "backendDigest":spec.backend_digest,
+            "identity":spec.template.package_identity.as_str(),
+            "version":spec.template.package_version,
+            "manifestDigest":spec.template.manifest_digest,
+            "backendDigest":spec.template.backend_digest,
         },
-        "uiContractDigest":spec.ui_contract_digest,
+        "uiContractDigest":spec.template.ui_contract_digest,
         "processGeneration":generation.to_string(),
         "workspace":{"id":spec.workspace_id.as_str(),"name":spec.workspace_name},
         "installation":{"identity":spec.installation.as_str(),"displayName":spec.installation.as_str()},
         "dataDirectory":{"path":spec.data_directory.to_string_lossy(),"continuityId":spec.continuity_id},
-        "protocol":{"major":spec.protocol.0,"minor":spec.protocol.1},
+        "protocol":{"major":spec.template.protocol.0,"minor":spec.template.protocol.1},
         "capabilities":capabilities,
         "limits":{
             "maxFrameBytes":1048576,
@@ -251,13 +241,13 @@ fn handshake_matches(
         && frame.field("processGeneration").and_then(Value::as_str)
             == Some(generation.to_string().as_str())
         && frame.field("uiContractDigest").and_then(Value::as_str)
-            == Some(spec.ui_contract_digest.as_str())
+            == Some(spec.template.ui_contract_digest.as_str())
         && frame
             .field("package")
             .and_then(Value::as_object)
             .and_then(|package| package.get("identity"))
             .and_then(Value::as_str)
-            == Some(spec.package_identity.as_str())
+            == Some(spec.template.package_identity.as_str())
 }
 
 impl ProcessGeneration {

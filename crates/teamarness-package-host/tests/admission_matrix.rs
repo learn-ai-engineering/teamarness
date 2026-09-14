@@ -245,6 +245,18 @@ fn registration_metadata_policy_rejects_wrong_owner_permissions_and_symlinks() {
 }
 
 #[test]
+fn local_registration_can_add_a_package_without_an_application_counterpart() {
+    let mut fixture = Fixture::new();
+    let local = fixture.add_local("dev.teamarness.tutorial", "1.0.0");
+    fixture.registrations(vec![local_entry(&local, "dev.teamarness.tutorial", false)]);
+
+    let report = admission::admit(&fixture.config()).unwrap();
+
+    assert!(package_ids(&report).contains(&"dev.teamarness.tutorial".to_owned()));
+    assert!(report.snapshot.diagnostics.is_empty());
+}
+
+#[test]
 fn local_registration_requires_absolute_owner_only_non_symlink_file_and_complete_trust() {
     let mut fixture = Fixture::new();
     fixture.add_application("good", "com.example.good", "1.0.0");

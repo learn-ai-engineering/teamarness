@@ -120,13 +120,6 @@ pub(crate) fn admit(config: &PackageHostConfig) -> Result<AdmissionReport, Admis
         match (application, local) {
             (Some(application), None) => selected.push(application),
             (None, Some(local)) => match local.result {
-                Ok(_candidate) if identity.as_str().starts_with("dev.teamarness.") => {
-                    diagnostics.push(diagnostic(
-                        PackageErrorCode::InvalidRegistration,
-                        PackageErrorStage::Admission,
-                        Some(identity),
-                    ));
-                }
                 Ok(candidate) => selected.push(candidate),
                 Err(code) => diagnostics.push(diagnostic(
                     code,

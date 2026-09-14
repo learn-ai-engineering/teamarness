@@ -1146,11 +1146,11 @@ impl PackageHost {
                 })
             }
             PackageHostCommand::Dispose(input) => {
+                let _gate = self.inner.mount_management.lock().await;
                 let actor = self.actor(&input.instance).await?;
-                actor
-                    .dispose()
-                    .await
-                    .map_err(|failure| instance_error(failure, &input.instance))?;
+                let result = actor.dispose().await;
+                self.revoke_mounts_for_instance(&input.instance).await;
+                result.map_err(|failure| instance_error(failure, &input.instance))?;
                 Ok(PackageHostOutcome::Disposed {
                     revision: self.bump_revision().await,
                 })
@@ -1449,6 +1449,20 @@ impl PackageHost {
             .retain(|(route_mount, _), _| route_mount != mount);
     }
 
+    async fn revoke_mounts_for_instance(&self, instance: &PackageInstanceKey) {
+        let mounts = {
+            let data = self.inner.data.lock().await;
+            data.mounts
+                .iter()
+                .filter(|(_, lease)| lease.instance == *instance)
+                .map(|(mount, _)| mount.clone())
+                .collect::<Vec<_>>()
+        };
+        for mount in mounts {
+            self.revoke_mount(&mount).await;
+        }
+    }
+
     async fn fail_mount(&self, mount: &UiMountId) {
         if let Some(actor) = self.actor_for_mount(mount).await
             && actor.fail_mount(mount).await
@@ -1518,22 +1532,12 @@ async fn prepare_instance(
     )
     .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
     let spec = supervisor::ProcessSpec {
-        package_identity: template.package_identity.clone(),
-        package_version: template.package_version.clone(),
-        manifest_digest: template.manifest_digest.clone(),
-        backend_digest: template.backend_digest.clone(),
-        ui_contract_digest: template.ui_contract_digest.clone(),
-        backend_path: template.backend_path.clone(),
+        template: template.clone(),
         workspace_id,
         workspace_name: workspace.name().to_owned(),
         installation: config.installation_public_identity().clone(),
         data_directory: grant.path,
         continuity_id: grant.continuity_id,
-        private_data_directory: template.private_data_directory.clone(),
-        source_label: template.source_label.clone(),
-        trust_label: template.trust_label.clone(),
-        protocol: template.protocol,
-        capabilities: template.capabilities.clone(),
         core: core.clone(),
     };
     Ok((

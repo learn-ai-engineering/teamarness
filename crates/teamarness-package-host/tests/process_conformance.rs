@@ -3,10 +3,11 @@ mod common;
 use std::collections::BTreeMap;
 
 use teamarness_package_host::{
-    AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    HostRevision, LifecycleState, OpenUiMount, OpenUiSubscription, PackageHost, PackageHostCommand,
-    PackageHostNotification, PackageHostOutcome, PackageHostSubscriptionSelector, PackageValue,
-    RecoverPackage, ShutdownHost, SuspendPackage, UiRequest, UiRequestId, UiSubscriptionId,
+    AcknowledgeUiEvents, CancelUiRequest, CloseUiSubscription, DisposePackage, HostRevision,
+    LifecycleState, OpenUiMount, OpenUiSubscription, PackageErrorCode, PackageHost,
+    PackageHostCommand, PackageHostNotification, PackageHostOutcome,
+    PackageHostSubscriptionSelector, PackageValue, RecoverPackage, ShutdownHost, SuspendPackage,
+    UiRequest, UiRequestId, UiSubscriptionId,
 };
 
 fn empty() -> PackageValue {
@@ -131,17 +132,6 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         .unwrap(),
         PackageHostOutcome::UiEventsAcknowledged
     ));
-    assert!(matches!(
-        host.execute(PackageHostCommand::CloseUiSubscription(
-            CloseUiSubscription {
-                mount: mount.clone(),
-                subscription: UiSubscriptionId::new("events").unwrap(),
-            }
-        ))
-        .await
-        .unwrap(),
-        PackageHostOutcome::UiSubscriptionClosed
-    ));
     assert_eq!(
         host.snapshot().await.instances[0].lifecycle,
         LifecycleState::Active
@@ -206,9 +196,6 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         })
         .await
         .unwrap();
-    host.execute(PackageHostCommand::CloseUiMount(CloseUiMount { mount }))
-        .await
-        .unwrap();
     host.execute(PackageHostCommand::Dispose(DisposePackage { instance }))
         .await
         .unwrap();
@@ -226,6 +213,26 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         0,
         "disposed process was reaped before lease deletion"
     );
+    let stale_request = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new("after-dispose").unwrap(),
+            operation: "fixture.immediate".into(),
+            payload: empty(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_request.code, PackageErrorCode::StaleMount);
+    let stale_subscription = host
+        .execute(PackageHostCommand::CloseUiSubscription(
+            CloseUiSubscription {
+                mount,
+                subscription: UiSubscriptionId::new("events").unwrap(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_subscription.code, PackageErrorCode::StaleMount);
 
     assert!(matches!(
         host.execute(PackageHostCommand::Shutdown(ShutdownHost))

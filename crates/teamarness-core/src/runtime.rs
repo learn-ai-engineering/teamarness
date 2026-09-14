@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh_base::{PublicKey, SecretKey, Signature};
@@ -487,9 +487,36 @@ impl MembershipTransition {
 }
 
 /// A gap-free stream of durable then live membership transitions.
-#[derive(Debug)]
 pub struct MembershipSubscription {
     state: crate::subscription::SubscriptionState,
+    runtime_state: Weak<Mutex<RuntimeState>>,
+    workspace_id: WorkspaceId,
+    subscriber_id: u64,
+}
+
+impl fmt::Debug for MembershipSubscription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MembershipSubscription")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for MembershipSubscription {
+    fn drop(&mut self) {
+        let Some(runtime_state) = self.runtime_state.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = runtime_state.lock() else {
+            return;
+        };
+        if let Some(listeners) = state.subscribers.get_mut(&self.workspace_id) {
+            listeners.retain(|listener| listener.id != self.subscriber_id);
+            if listeners.is_empty() {
+                state.subscribers.remove(&self.workspace_id);
+            }
+        }
+    }
 }
 
 impl MembershipSubscription {
@@ -530,12 +557,18 @@ impl fmt::Debug for CoreRuntime {
     }
 }
 
+struct MembershipSubscriber {
+    id: u64,
+    sender: crate::subscription::TransitionSender,
+}
+
 pub(crate) struct RuntimeState {
     connection: rusqlite::Connection,
     secret_key: iroh_base::SecretKey,
     display_name: String,
     memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
-    subscribers: BTreeMap<WorkspaceId, Vec<crate::subscription::TransitionSender>>,
+    subscribers: BTreeMap<WorkspaceId, Vec<MembershipSubscriber>>,
+    next_subscriber_id: u64,
     poisoned: bool,
 }
 
@@ -613,6 +646,7 @@ impl CoreRuntime {
             display_name,
             memberships,
             subscribers: BTreeMap::new(),
+            next_subscriber_id: 0,
             poisoned: false,
         }));
         let issuer = crate::onboarding::handler::IssuerService::new(
@@ -1672,7 +1706,7 @@ impl CoreRuntime {
 
     fn publish_transition(state: &mut RuntimeState, transition: MembershipTransition) {
         if let Some(listeners) = state.subscribers.get_mut(&transition.workspace_id()) {
-            listeners.retain(|listener| listener.send(transition.clone()).is_ok());
+            listeners.retain(|listener| listener.sender.send(transition.clone()).is_ok());
         }
     }
 
@@ -1814,11 +1848,16 @@ impl CoreRuntime {
                 _ => SubscriptionError::Storage(StorageError::CorruptWorkspace),
             })?;
         let (sender, receiver) = mpsc::channel();
+        state.next_subscriber_id = state.next_subscriber_id.saturating_add(1);
+        let subscriber_id = state.next_subscriber_id;
         state
             .subscribers
             .entry(workspace_id)
             .or_default()
-            .push(sender);
+            .push(MembershipSubscriber {
+                id: subscriber_id,
+                sender,
+            });
         let durable = match catch_up_limit {
             Some(limit) => crate::subscription::load_after_bounded(
                 &state.connection,
@@ -1831,16 +1870,20 @@ impl CoreRuntime {
         let durable = match durable {
             Ok(durable) => durable,
             Err(error) => {
-                state
-                    .subscribers
-                    .get_mut(&workspace_id)
-                    .expect("listener was registered")
-                    .pop();
+                if let Some(listeners) = state.subscribers.get_mut(&workspace_id) {
+                    listeners.retain(|listener| listener.id != subscriber_id);
+                    if listeners.is_empty() {
+                        state.subscribers.remove(&workspace_id);
+                    }
+                }
                 return Err(error);
             }
         };
         Ok(MembershipSubscription {
             state: crate::subscription::SubscriptionState::new(durable, receiver, after_epoch),
+            runtime_state: Arc::downgrade(&self.state),
+            workspace_id,
+            subscriber_id,
         })
     }
 }
@@ -2012,6 +2055,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_membership_subscription_deregisters_its_listener() {
+        let directory = std::env::temp_dir().join(format!(
+            "teamarness-runtime-subscription-drop-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let runtime = CoreRuntime::open_with_clock(
+            CoreRuntimeConfig::new(&directory),
+            Box::new(RecordingClock {
+                calls: Arc::new(AtomicU64::new(0)),
+            }),
+        )
+        .await
+        .unwrap();
+        let workspace = runtime.create_workspace("Subscription drop").unwrap();
+
+        let subscription = runtime
+            .subscribe_membership_bounded(workspace.id(), MembershipEpoch::new(0), 1)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .state
+                .lock()
+                .unwrap()
+                .subscribers
+                .get(&workspace.id())
+                .map_or(0, Vec::len),
+            1
+        );
+        drop(subscription);
+        assert_eq!(
+            runtime
+                .state
+                .lock()
+                .unwrap()
+                .subscribers
+                .get(&workspace.id())
+                .map_or(0, Vec::len),
+            0
+        );
+
         runtime.shutdown().await.unwrap();
         drop(runtime);
         fs::remove_dir_all(directory).unwrap();

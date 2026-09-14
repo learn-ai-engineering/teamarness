@@ -223,11 +223,7 @@ impl InstanceActor {
                 }
                 {
                     let mut state = self.state.lock().await;
-                    state.process = None;
-                    state.mounts.clear();
-                    state.requests.clear();
-                    state.request_tombstones.clear();
-                    state.subscriptions.clear();
+                    clear_process_state(&mut state);
                     state.failures.clear();
                 }
                 self.start_generation(true, false).await
@@ -264,11 +260,7 @@ impl InstanceActor {
             process.shutdown().await;
         }
         let mut state = self.state.lock().await;
-        state.process = None;
-        state.mounts.clear();
-        state.requests.clear();
-        state.request_tombstones.clear();
-        state.subscriptions.clear();
+        clear_process_state(&mut state);
         state.lifecycle = LifecycleState::Disposed;
         result
     }
@@ -460,11 +452,7 @@ impl InstanceActor {
                         if state.process.as_ref().map(|live| live.generation)
                             == Some(process.generation)
                         {
-                            state.process = None;
-                            state.mounts.clear();
-                            state.requests.clear();
-                            state.request_tombstones.clear();
-                            state.subscriptions.clear();
+                            clear_process_state(&mut state);
                             state.failures.push_back(Instant::now());
                             while state
                                 .failures
@@ -638,11 +626,7 @@ impl InstanceActor {
                 {
                     None
                 } else {
-                    state.process = None;
-                    state.mounts.clear();
-                    state.requests.clear();
-                    state.request_tombstones.clear();
-                    state.subscriptions.clear();
+                    clear_process_state(&mut state);
                     state.failures.push_back(Instant::now());
                     while state
                         .failures
@@ -674,12 +658,16 @@ impl InstanceActor {
             process.shutdown().await;
         }
         let mut state = self.state.lock().await;
-        state.process = None;
-        state.mounts.clear();
-        state.requests.clear();
-        state.request_tombstones.clear();
-        state.subscriptions.clear();
+        clear_process_state(&mut state);
     }
+}
+
+fn clear_process_state(state: &mut InstanceState) {
+    state.process = None;
+    state.mounts.clear();
+    state.requests.clear();
+    state.request_tombstones.clear();
+    state.subscriptions.clear();
 }
 
 fn deterministic(code: PackageErrorCode) -> bool {
