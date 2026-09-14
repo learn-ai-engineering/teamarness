@@ -10,7 +10,8 @@ use tempfile::TempDir;
 pub use teamarness_package_host::{
     DiagnosticId, HostRevision, InstallationPublicIdentity, PackageCatalogEntry, PackageErrorCode,
     PackageErrorEnvelope, PackageErrorStage, PackageHostConfig, PackageHostSnapshot,
-    PackageHostState, PackageIdentity, PackageSourceKind, PackageTrustKind, RecoveryAction,
+    PackageHostState, PackageIdentity, PackageSourceKind, PackageTrustKind, PackageValue,
+    RecoveryAction,
 };
 
 #[path = "../src/admission.rs"]
@@ -106,7 +107,7 @@ fn write_package(root: &Path, identity: &str, version: &str) {
     fs::create_dir_all(root.join("ui")).unwrap();
     let backend = format!("backend-{identity}-{version}").into_bytes();
     let entrypoint = format!("export const identity = '{identity}';").into_bytes();
-    let contract = br#"{"type":"object","additionalProperties":true}"#.to_vec();
+    let contract = br#"{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}"#.to_vec();
     fs::write(root.join("backend/package"), &backend).unwrap();
     fs::write(root.join("ui/index.js"), &entrypoint).unwrap();
     fs::write(root.join("ui/contract.json"), &contract).unwrap();
@@ -449,27 +450,32 @@ fn ui_cache_is_digest_addressed_read_only_and_public_snapshot_is_url_neutral() {
     fixture.add_application("one", "com.example.one", "1.0.0");
     let report = admission::admit(&fixture.config()).unwrap();
     let admitted = &report.admissions[0];
-    assert!(
+    assert_eq!(
         admitted
-            .ui_cache
+            .ui
+            .cache
             .admitted_root
-            .ends_with(&report.snapshot.packages[0].admission_digest)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .len(),
+        64
     );
     assert_eq!(
-        fs::metadata(&admitted.ui_cache.admitted_root)
+        fs::metadata(&admitted.ui.cache.admitted_root)
             .unwrap()
             .permissions()
             .mode()
             & 0o777,
-        0o555
+        0o500
     );
     assert_eq!(
-        fs::metadata(admitted.ui_cache.admitted_root.join("ui/index.js"))
+        fs::metadata(admitted.ui.cache.admitted_root.join("ui/index.js"))
             .unwrap()
             .permissions()
             .mode()
             & 0o777,
-        0o444
+        0o400
     );
     let public = serde_json::to_string(&report.snapshot).unwrap();
     assert!(!public.contains(fixture.application.to_str().unwrap()));
@@ -478,11 +484,7 @@ fn ui_cache_is_digest_addressed_read_only_and_public_snapshot_is_url_neutral() {
 
     let second = admission::admit(&fixture.config()).unwrap();
     assert_eq!(
-        second.snapshot.packages[0].admission_digest,
-        report.snapshot.packages[0].admission_digest
-    );
-    assert_eq!(
-        second.admissions[0].ui_cache.admitted_root,
-        admitted.ui_cache.admitted_root
+        second.admissions[0].ui.cache.admitted_root,
+        admitted.ui.cache.admitted_root
     );
 }

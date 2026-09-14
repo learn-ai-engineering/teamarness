@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
-
-use jsonschema::Validator;
+use std::sync::Arc;
 
 use crate::catalog::{self, ApplicationRegistration, InstallationRegistration};
 use crate::host_store::{HostStore, StoredAdmission};
 use crate::manifest::{self, LoadedManifest, sha256};
-use crate::ui::{self, UiCacheRecord};
+use crate::ui::{self, AdmittedUi};
 use crate::{
     DiagnosticId, HostRevision, PackageCatalogEntry, PackageErrorCode, PackageErrorEnvelope,
     PackageErrorStage, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
@@ -19,14 +18,10 @@ pub(crate) struct AdmissionReport {
     pub(crate) admissions: Vec<Admission>,
 }
 
-// Phase 5 consumes the admitted UI cache and compiled contract.
-#[allow(dead_code)]
 pub(crate) struct Admission {
-    pub(crate) package_root: PathBuf,
     pub(crate) backend_path: PathBuf,
-    pub(crate) ui_cache: UiCacheRecord,
+    pub(crate) ui: Arc<AdmittedUi>,
     pub(crate) manifest: LoadedManifest,
-    pub(crate) ui_contract: Validator,
 }
 
 #[derive(Debug)]
@@ -268,7 +263,6 @@ fn finalize(
         display_name: candidate.manifest.display_name.clone(),
         source: candidate.source,
         trust: candidate.trust,
-        admission_digest,
         ui_contract_digest: candidate.manifest.ui.contract.digest.clone(),
     };
     let backend_path = candidate
@@ -277,11 +271,12 @@ fn finalize(
     Ok((
         catalog,
         Admission {
-            package_root: candidate.root,
             backend_path,
-            ui_cache,
+            ui: Arc::new(AdmittedUi {
+                cache: ui_cache,
+                contract: ui_contract,
+            }),
             manifest: candidate.manifest,
-            ui_contract,
         },
     ))
 }

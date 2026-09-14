@@ -228,6 +228,7 @@ async function serve() {
   const pendingCapabilityCalls = new Map();
   const membershipEvents = [];
   let membershipStream;
+  const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
     buffer = Buffer.concat([buffer, chunk]);
@@ -260,8 +261,37 @@ async function serve() {
       } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
         membershipStream = undefined;
       } else if (frame.kind === "stream_open") {
-        send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: 1 } });
-        send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
+        uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
+        if (frame.topic === "fixture.close") {
+          send({ kind: "stream_close", streamId: frame.id, code: "closed" });
+          uiStreams.delete(frame.id);
+        } else if (frame.topic === "fixture.invalid_event") {
+          send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: "invalid" } });
+        } else if (frame.topic === "fixture.duplicate") {
+          send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: 1 } });
+          send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: 1 } });
+        } else if (frame.topic === "fixture.gap") {
+          send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
+        } else {
+          const count = ["fixture.saturation", "fixture.overflow"].includes(frame.topic) ? 32 : 2;
+          for (let sequence = 1; sequence <= count; sequence += 1) {
+            send({ kind: "event", streamId: frame.id, sequence: String(sequence), payload: { order: sequence } });
+          }
+          uiStreams.get(frame.id).sequence = count;
+          if (frame.topic === "fixture.overflow") {
+            send({ kind: "event", streamId: frame.id, sequence: "33", payload: { order: 33 } });
+          }
+        }
+      } else if (frame.kind === "credit" && uiStreams.has(frame.streamId)) {
+        const stream = uiStreams.get(frame.streamId);
+        if (stream.topic === "fixture.saturation") {
+          for (let index = 0; index < frame.amount; index += 1) {
+            stream.sequence += 1;
+            send({ kind: "event", streamId: frame.streamId, sequence: String(stream.sequence), payload: { order: stream.sequence } });
+          }
+        }
+      } else if (frame.kind === "stream_close" && uiStreams.has(frame.streamId)) {
+        uiStreams.delete(frame.streamId);
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_open") {
         capabilitySequence += 1;
         membershipStream = `p:membership-${capabilitySequence}`;
@@ -300,6 +330,10 @@ async function serve() {
           deadlineUnixMs: frame.deadlineUnixMs,
           payload: { method: frame.payload.method, ...(frame.payload.arguments ?? {}) },
         });
+      } else if (frame.kind === "request" && frame.operation === "fixture.typed") {
+        send({ kind: "response", id: frame.id, payload: { accepted: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.invalid_response") {
+        send({ kind: "response", id: frame.id, payload: { value: false } });
       } else if (frame.kind === "request" && frame.operation === "fixture.error") {
         send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: {} });
       } else if (frame.kind === "request" && frame.operation === "fixture.abort") {
@@ -316,8 +350,12 @@ async function serve() {
         delayedRequest = frame;
       } else if (frame.kind === "request" && frame.operation === "fixture.immediate") {
         send({ kind: "response", id: frame.id, payload: { order: 2 } });
-        send({ kind: "response", id: delayedRequest.id, payload: { order: 1 } });
+        if (delayedRequest) {
+          send({ kind: "response", id: delayedRequest.id, payload: { order: 1 } });
+          delayedRequest = undefined;
+        }
       } else if (frame.kind === "cancel") {
+        if (delayedRequest?.id === frame.targetId) delayedRequest = undefined;
         send({ kind: "error", id: frame.targetId, code: "cancelled", retryable: true });
       } else if (frame.kind === "shutdown") {
         send({ kind: "shutdown_ack" });

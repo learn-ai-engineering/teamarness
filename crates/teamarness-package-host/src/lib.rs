@@ -163,6 +163,52 @@ bounded_id!(UiRequestId, "UI request identity");
 bounded_id!(UiSubscriptionId, "UI subscription identity");
 bounded_id!(DiagnosticId, "diagnostic identity");
 
+/// A mount-scoped opaque UI resource token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct UiResourceToken(String);
+
+impl UiResourceToken {
+    /// Validates an exact 192-bit unpadded base64url token.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueParseError> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ValueParseError::new("UI resource token"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the opaque token text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for UiResourceToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UiResourceToken([redacted])")
+    }
+}
+
+impl TryFrom<String> for UiResourceToken {
+    type Error = ValueParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<UiResourceToken> for String {
+    fn from(value: UiResourceToken) -> Self {
+        value.0
+    }
+}
+
 /// One Package Identity and Workspace pair inside the opened Installation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -360,7 +406,6 @@ pub struct PackageCatalogEntry {
     pub display_name: String,
     pub source: PackageSourceKind,
     pub trust: PackageTrustKind,
-    pub admission_digest: String,
     pub ui_contract_digest: String,
 }
 
@@ -532,6 +577,35 @@ pub struct DisposePackage {
 pub struct OpenUiMount {
     pub instance: PackageInstanceKey,
 }
+
+/// Package presentation values bound to one UI mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiPackageContext {
+    pub identity: PackageIdentity,
+    pub display_name: String,
+}
+
+/// Workspace presentation values bound to one UI mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiWorkspaceContext {
+    pub id: WorkspaceId,
+    pub name: String,
+}
+
+/// Opaque information needed to load one admitted Package UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiLoaderDescriptor {
+    pub token: UiResourceToken,
+    pub entrypoint: String,
+    pub ui_host_version: u16,
+    pub contract_digest: String,
+    pub package: UiPackageContext,
+    pub workspace: UiWorkspaceContext,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseUiMount {
     pub mount: UiMountId,
@@ -571,6 +645,12 @@ pub struct ReportUiFault {
     pub mount: UiMountId,
     pub code: String,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadUiResource {
+    pub mount: UiMountId,
+    pub token: UiResourceToken,
+    pub relative_path: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownHost;
 
@@ -590,6 +670,7 @@ pub enum PackageHostCommand {
     AcknowledgeUiEvents(AcknowledgeUiEvents),
     CloseUiSubscription(CloseUiSubscription),
     ReportUiFault(ReportUiFault),
+    ReadUiResource(ReadUiResource),
     Shutdown(ShutdownHost),
 }
 
@@ -611,6 +692,7 @@ pub enum PackageHostOutcome {
     },
     UiMountOpened {
         mount: UiMountId,
+        loader: UiLoaderDescriptor,
         revision: HostRevision,
     },
     UiMountClosed {
@@ -626,41 +708,118 @@ pub enum PackageHostOutcome {
     UiFaultRecorded {
         revision: HostRevision,
     },
+    UiResource {
+        bytes: Vec<u8>,
+        media_type: String,
+    },
     Shutdown,
 }
 
+/// A closed selector for host state or one already-opened UI event route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PackageHostSubscriptionSelector {
+    HostState {
+        after_revision: HostRevision,
+    },
+    UiEvents {
+        mount: UiMountId,
+        subscription: UiSubscriptionId,
+    },
+}
+
 /// A coalesced host-state notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HostStateNotification {
     pub revision: HostRevision,
     pub revision_gap: bool,
 }
 
-/// A bounded subscription to the latest Package Host revision.
+/// One ordered Package UI event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiEventNotification {
+    pub mount: UiMountId,
+    pub subscription: UiSubscriptionId,
+    /// Decimal-string sequence for JavaScript-safe desktop transport.
+    pub sequence: String,
+    pub payload: PackageValue,
+}
+
+/// Typed result yielded by a Package Host subscription.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PackageHostNotification {
+    HostState(HostStateNotification),
+    UiEvent(UiEventNotification),
+}
+
+/// A bounded subscription to host revisions or one Package UI stream.
 pub struct PackageHostSubscription {
-    receiver: watch::Receiver<HostRevision>,
-    after: HostRevision,
+    kind: PackageHostSubscriptionKind,
+}
+
+enum PackageHostSubscriptionKind {
+    HostState {
+        receiver: watch::Receiver<HostRevision>,
+        after: HostRevision,
+    },
+    UiEvents {
+        receiver: protocol::UiEventReceiver,
+        host: PackageHost,
+        mount: UiMountId,
+        subscription: UiSubscriptionId,
+    },
 }
 
 #[allow(clippy::result_large_err)]
 impl PackageHostSubscription {
-    /// Waits for the newest revision. `revision_gap` requires a fresh snapshot.
-    pub async fn changed(&mut self) -> Result<HostStateNotification, PackageErrorEnvelope> {
-        let current = *self.receiver.borrow();
-        let revision = if current > self.after {
-            current
-        } else {
-            self.receiver.changed().await.map_err(|_| {
-                host_error(PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown)
-            })?;
-            *self.receiver.borrow()
-        };
-        let notification = HostStateNotification {
-            revision,
-            revision_gap: revision.0 > self.after.0.saturating_add(1),
-        };
-        self.after = revision;
-        Ok(notification)
+    /// Waits for the next typed notification or a terminal stream result.
+    pub async fn changed(&mut self) -> Result<PackageHostNotification, PackageErrorEnvelope> {
+        match &mut self.kind {
+            PackageHostSubscriptionKind::HostState { receiver, after } => {
+                let current = *receiver.borrow();
+                let revision = if current > *after {
+                    current
+                } else {
+                    receiver.changed().await.map_err(|_| {
+                        host_error(PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown)
+                    })?;
+                    *receiver.borrow()
+                };
+                let notification = HostStateNotification {
+                    revision,
+                    revision_gap: revision.0 > after.0.saturating_add(1),
+                };
+                *after = revision;
+                Ok(PackageHostNotification::HostState(notification))
+            }
+            PackageHostSubscriptionKind::UiEvents {
+                receiver,
+                host,
+                mount,
+                subscription,
+            } => match receiver.changed().await {
+                Ok(event) => Ok(PackageHostNotification::UiEvent(UiEventNotification {
+                    mount: mount.clone(),
+                    subscription: subscription.clone(),
+                    sequence: event.sequence.to_string(),
+                    payload: event.payload,
+                })),
+                Err(code) => {
+                    if matches!(
+                        code,
+                        PackageErrorCode::UiContractViolation
+                            | PackageErrorCode::EventLagged
+                            | PackageErrorCode::ProtocolViolation
+                    ) {
+                        host.fail_mount(mount).await;
+                    }
+                    Err(host_error(code, PackageErrorStage::Ui))
+                }
+            },
+        }
     }
 }
 
@@ -676,7 +835,9 @@ struct PackageHostInner {
     config: PackageHostConfig,
     core: Arc<teamarness_core::CoreRuntime>,
     templates: Vec<supervisor::ProcessTemplate>,
+    admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
     reconciliation: Mutex<()>,
+    mount_management: Mutex<()>,
 }
 
 struct HostData {
@@ -685,7 +846,16 @@ struct HostData {
     packages: Vec<PackageCatalogEntry>,
     diagnostics: Vec<PackageErrorEnvelope>,
     instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
-    mounts: BTreeMap<UiMountId, PackageInstanceKey>,
+    mounts: BTreeMap<UiMountId, MountLease>,
+    ui_routes: BTreeMap<(UiMountId, UiSubscriptionId), Option<protocol::UiEventReceiver>>,
+}
+
+#[derive(Clone)]
+struct MountLease {
+    instance: PackageInstanceKey,
+    process_generation: u64,
+    token: UiResourceToken,
+    ui: Arc<ui::AdmittedUi>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -720,6 +890,7 @@ impl PackageHost {
             )
         })?;
         let mut templates = Vec::new();
+        let mut admitted_ui = BTreeMap::new();
         for admission in report.admissions {
             let catalog = report
                 .snapshot
@@ -735,6 +906,7 @@ impl PackageHost {
                 PackageTrustKind::ApplicationBundled => "application_bundled",
                 PackageTrustKind::TrustedNativeCodeV1 => "trusted_native_code_v1",
             };
+            admitted_ui.insert(admission.manifest.identity.clone(), admission.ui.clone());
             templates.push(supervisor::ProcessTemplate {
                 package_identity: admission.manifest.identity.clone(),
                 package_version: admission.manifest.version.to_string(),
@@ -807,12 +979,15 @@ impl PackageHost {
                     diagnostics: report.snapshot.diagnostics,
                     instances,
                     mounts: BTreeMap::new(),
+                    ui_routes: BTreeMap::new(),
                 }),
                 revisions,
                 config,
                 core,
                 templates,
+                admitted_ui,
                 reconciliation: Mutex::new(()),
+                mount_management: Mutex::new(()),
             }),
         };
         Ok(host)
@@ -843,13 +1018,42 @@ impl PackageHost {
         }
     }
 
-    /// Subscribes to coalesced state revisions after the caller's last snapshot.
-    #[must_use]
-    pub fn subscribe(&self, after_revision: HostRevision) -> PackageHostSubscription {
-        PackageHostSubscription {
-            receiver: self.inner.revisions.subscribe(),
-            after: after_revision,
-        }
+    /// Claims a coalesced host-state subscription or one open UI event route.
+    pub async fn subscribe(
+        &self,
+        selector: PackageHostSubscriptionSelector,
+    ) -> Result<PackageHostSubscription, PackageErrorEnvelope> {
+        let kind = match selector {
+            PackageHostSubscriptionSelector::HostState { after_revision } => {
+                PackageHostSubscriptionKind::HostState {
+                    receiver: self.inner.revisions.subscribe(),
+                    after: after_revision,
+                }
+            }
+            PackageHostSubscriptionSelector::UiEvents {
+                mount,
+                subscription,
+            } => {
+                let receiver = self
+                    .inner
+                    .data
+                    .lock()
+                    .await
+                    .ui_routes
+                    .get_mut(&(mount.clone(), subscription.clone()))
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                    })?;
+                PackageHostSubscriptionKind::UiEvents {
+                    receiver,
+                    host: self.clone(),
+                    mount,
+                    subscription,
+                }
+            }
+        };
+        Ok(PackageHostSubscription { kind })
     }
 
     /// Executes one typed host command.
@@ -947,70 +1151,157 @@ impl PackageHost {
                 })
             }
             PackageHostCommand::OpenUiMount(input) => {
+                let _gate = self.inner.mount_management.lock().await;
                 let actor = self.actor(&input.instance).await?;
-                let mount = actor
+                let replaced = {
+                    let data = self.inner.data.lock().await;
+                    data.mounts
+                        .iter()
+                        .filter(|(_, lease)| lease.instance == input.instance)
+                        .map(|(mount, _)| mount.clone())
+                        .collect::<Vec<_>>()
+                };
+                for mount in replaced {
+                    actor.close_mount(&mount).await;
+                    self.revoke_mount(&mount).await;
+                }
+                let (mount, process_generation) = actor
                     .open_mount()
                     .await
                     .map_err(|failure| instance_error(failure, &input.instance))?;
-                self.inner
+                let ui = self
+                    .inner
+                    .admitted_ui
+                    .get(&input.instance.package_identity)
+                    .cloned()
+                    .ok_or_else(|| {
+                        host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
+                    })?;
+                let token = random_resource_token()
+                    .map_err(|code| host_error(code, PackageErrorStage::Ui))?;
+                let display_name = self
+                    .inner
                     .data
                     .lock()
                     .await
-                    .mounts
-                    .insert(mount.clone(), input.instance);
+                    .packages
+                    .iter()
+                    .find(|package| package.identity == input.instance.package_identity)
+                    .map(|package| package.display_name.clone())
+                    .ok_or_else(|| {
+                        host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
+                    })?;
+                let loader = UiLoaderDescriptor {
+                    token: token.clone(),
+                    entrypoint: ui.cache.entrypoint.clone(),
+                    ui_host_version: 1,
+                    contract_digest: ui.cache.contract_digest.clone(),
+                    package: UiPackageContext {
+                        identity: input.instance.package_identity.clone(),
+                        display_name,
+                    },
+                    workspace: UiWorkspaceContext {
+                        id: input.instance.workspace_id.clone(),
+                        name: actor.workspace_name().to_owned(),
+                    },
+                };
+                self.inner.data.lock().await.mounts.insert(
+                    mount.clone(),
+                    MountLease {
+                        instance: input.instance,
+                        process_generation,
+                        token,
+                        ui,
+                    },
+                );
                 Ok(PackageHostOutcome::UiMountOpened {
                     mount,
+                    loader,
                     revision: self.bump_revision().await,
                 })
             }
             PackageHostCommand::CloseUiMount(input) => {
+                let _gate = self.inner.mount_management.lock().await;
                 if let Some(actor) = self.actor_for_mount(&input.mount).await {
                     actor.close_mount(&input.mount).await;
-                    self.inner.data.lock().await.mounts.remove(&input.mount);
                 }
+                self.revoke_mount(&input.mount).await;
                 Ok(PackageHostOutcome::UiMountClosed {
                     revision: self.bump_revision().await,
                 })
             }
             PackageHostCommand::UiRequest(input) => {
-                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
-                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
-                })?;
+                let (lease, actor) = self.live_mount(&input.mount).await?;
+                lease
+                    .ui
+                    .contract
+                    .validate_request(&input.operation, &input.payload)
+                    .map_err(|_| {
+                        host_error(PackageErrorCode::UiContractViolation, PackageErrorStage::Ui)
+                    })?;
+                let operation = input.operation;
                 let payload = actor
-                    .request(&input.mount, input.request, input.operation, input.payload)
+                    .request(
+                        &input.mount,
+                        input.request,
+                        operation.clone(),
+                        input.payload,
+                    )
                     .await
                     .map_err(|failure| host_error(failure.code, PackageErrorStage::Process))?;
+                if lease
+                    .ui
+                    .contract
+                    .validate_response(&operation, &payload)
+                    .is_err()
+                {
+                    self.fail_mount(&input.mount).await;
+                    return Err(host_error(
+                        PackageErrorCode::UiContractViolation,
+                        PackageErrorStage::Ui,
+                    ));
+                }
                 Ok(PackageHostOutcome::UiResponse { payload })
             }
             PackageHostCommand::CancelUiRequest(input) => {
-                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
-                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
-                })?;
+                let (_, actor) = self.live_mount(&input.mount).await?;
                 actor
-                    .cancel(&input.request)
+                    .cancel(&input.mount, &input.request)
                     .await
                     .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
                 Ok(PackageHostOutcome::UiRequestCancelled)
             }
             PackageHostCommand::OpenUiSubscription(input) => {
-                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
-                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
-                })?;
-                actor
+                let (lease, actor) = self.live_mount(&input.mount).await?;
+                lease
+                    .ui
+                    .contract
+                    .validate_subscription(&input.operation, &input.payload)
+                    .map_err(|_| {
+                        host_error(PackageErrorCode::UiContractViolation, PackageErrorStage::Ui)
+                    })?;
+                let receiver = actor
                     .stream_open(
                         &input.mount,
-                        input.subscription,
+                        input.subscription.clone(),
                         input.operation,
                         input.payload,
+                        lease.ui.clone(),
                     )
                     .await
                     .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                let terminal = receiver.terminal();
+                self.inner
+                    .data
+                    .lock()
+                    .await
+                    .ui_routes
+                    .insert((input.mount.clone(), input.subscription), Some(receiver));
+                self.monitor_ui_route(input.mount, terminal);
                 Ok(PackageHostOutcome::UiSubscriptionOpened)
             }
             PackageHostCommand::AcknowledgeUiEvents(input) => {
-                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
-                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
-                })?;
+                let (_, actor) = self.live_mount(&input.mount).await?;
                 actor
                     .acknowledge(&input.mount, &input.subscription, input.through_sequence)
                     .await
@@ -1018,22 +1309,39 @@ impl PackageHost {
                 Ok(PackageHostOutcome::UiEventsAcknowledged)
             }
             PackageHostCommand::CloseUiSubscription(input) => {
-                let actor = self.actor_for_mount(&input.mount).await.ok_or_else(|| {
-                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
-                })?;
+                let (_, actor) = self.live_mount(&input.mount).await?;
                 actor
                     .close_subscription(&input.mount, &input.subscription)
                     .await
                     .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                self.inner
+                    .data
+                    .lock()
+                    .await
+                    .ui_routes
+                    .remove(&(input.mount, input.subscription));
                 Ok(PackageHostOutcome::UiSubscriptionClosed)
             }
             PackageHostCommand::ReportUiFault(input) => {
-                if let Some(actor) = self.actor_for_mount(&input.mount).await {
-                    actor.close_mount(&input.mount).await;
-                    self.inner.data.lock().await.mounts.remove(&input.mount);
-                }
+                self.fail_mount(&input.mount).await;
                 Ok(PackageHostOutcome::UiFaultRecorded {
                     revision: self.bump_revision().await,
+                })
+            }
+            PackageHostCommand::ReadUiResource(input) => {
+                let (lease, _) = self.live_mount(&input.mount).await?;
+                if lease.token != input.token {
+                    return Err(host_error(
+                        PackageErrorCode::StaleMount,
+                        PackageErrorStage::Ui,
+                    ));
+                }
+                let resource = lease.ui.cache.resolve(&input.relative_path).map_err(|_| {
+                    host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
+                })?;
+                Ok(PackageHostOutcome::UiResource {
+                    bytes: resource.bytes,
+                    media_type: resource.media_type,
                 })
             }
             PackageHostCommand::Shutdown(_) => {
@@ -1042,6 +1350,11 @@ impl PackageHost {
                     data.state = PackageHostState::ShuttingDown;
                 }
                 self.bump_revision().await;
+                {
+                    let mut data = self.inner.data.lock().await;
+                    data.mounts.clear();
+                    data.ui_routes.clear();
+                }
                 let actors = self
                     .inner
                     .data
@@ -1085,8 +1398,80 @@ impl PackageHost {
 
     async fn actor_for_mount(&self, mount: &UiMountId) -> Option<Arc<instance::InstanceActor>> {
         let data = self.inner.data.lock().await;
-        let key = data.mounts.get(mount)?;
-        data.instances.get(key).cloned()
+        let lease = data.mounts.get(mount)?;
+        data.instances.get(&lease.instance).cloned()
+    }
+
+    async fn live_mount(
+        &self,
+        mount: &UiMountId,
+    ) -> Result<(MountLease, Arc<instance::InstanceActor>), PackageErrorEnvelope> {
+        let (lease, actor) = {
+            let data = self.inner.data.lock().await;
+            let lease =
+                data.mounts.get(mount).cloned().ok_or_else(|| {
+                    host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui)
+                })?;
+            let actor = data
+                .instances
+                .get(&lease.instance)
+                .cloned()
+                .ok_or_else(|| host_error(PackageErrorCode::StaleMount, PackageErrorStage::Ui))?;
+            (lease, actor)
+        };
+        if !actor
+            .is_mount_current(mount, lease.process_generation)
+            .await
+        {
+            self.revoke_mount(mount).await;
+            return Err(host_error(
+                PackageErrorCode::StaleMount,
+                PackageErrorStage::Ui,
+            ));
+        }
+        Ok((lease, actor))
+    }
+
+    async fn revoke_mount(&self, mount: &UiMountId) {
+        let mut data = self.inner.data.lock().await;
+        data.mounts.remove(mount);
+        data.ui_routes
+            .retain(|(route_mount, _), _| route_mount != mount);
+    }
+
+    async fn fail_mount(&self, mount: &UiMountId) {
+        if let Some(actor) = self.actor_for_mount(mount).await
+            && actor.fail_mount(mount).await
+        {
+            self.bump_revision().await;
+        }
+    }
+
+    fn monitor_ui_route(
+        &self,
+        mount: UiMountId,
+        mut terminal: watch::Receiver<Option<PackageErrorCode>>,
+    ) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let current = *terminal.borrow();
+                if let Some(code) = current {
+                    if matches!(
+                        code,
+                        PackageErrorCode::UiContractViolation
+                            | PackageErrorCode::EventLagged
+                            | PackageErrorCode::ProtocolViolation
+                    ) {
+                        host.fail_mount(&mount).await;
+                    }
+                    return;
+                }
+                if terminal.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
     }
 
     async fn bump_revision(&self) -> HostRevision {
@@ -1147,6 +1532,14 @@ async fn prepare_instance(
     ))
 }
 
+fn random_resource_token() -> Result<UiResourceToken, PackageErrorCode> {
+    let mut random = [0_u8; 24];
+    getrandom::fill(&mut random).map_err(|_| PackageErrorCode::UiLoadFailed)?;
+    use base64::Engine as _;
+    UiResourceToken::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random))
+        .map_err(|_| PackageErrorCode::UiLoadFailed)
+}
+
 fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorEnvelope {
     let retryable = matches!(
         code,
@@ -1160,7 +1553,11 @@ fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorE
         | PackageErrorCode::ProcessExited
         | PackageErrorCode::DeadlineExceeded
         | PackageErrorCode::OutcomeUncertain => RecoveryAction::RecoverBackend,
-        PackageErrorCode::StaleMount | PackageErrorCode::UiException => RecoveryAction::ReloadUi,
+        PackageErrorCode::StaleMount
+        | PackageErrorCode::UiException
+        | PackageErrorCode::UiContractViolation
+        | PackageErrorCode::EventLagged
+        | PackageErrorCode::UiLoadFailed => RecoveryAction::ReloadUi,
         PackageErrorCode::ShuttingDown => RecoveryAction::None,
         _ => RecoveryAction::CorrectPackageSource,
     };

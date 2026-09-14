@@ -2,13 +2,20 @@ mod common;
 #[allow(dead_code)]
 #[path = "../src/protocol.rs"]
 mod host_protocol;
+#[allow(dead_code)]
+#[path = "../src/manifest.rs"]
+mod manifest;
+#[allow(dead_code)]
+#[path = "../src/ui.rs"]
+mod ui;
 
 use std::collections::BTreeMap;
 
 use teamarness_package_host::{
-    LifecycleState, OpenUiMount, PackageErrorCode, PackageHost, PackageHostCommand,
-    PackageHostOutcome, PackageValue, RecoverPackage, UiRequest, UiRequestId,
+    LifecycleState, OpenUiMount, PackageHost, PackageHostCommand, PackageHostOutcome,
+    RecoverPackage, UiRequest, UiRequestId,
 };
+pub use teamarness_package_host::{PackageErrorCode, PackageIdentity, PackageValue};
 
 #[tokio::test]
 async fn package_error_preserves_generation_and_unrelated_instance() {

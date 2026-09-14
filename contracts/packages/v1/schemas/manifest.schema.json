@@ -25,7 +25,7 @@
       "required": ["path", "size", "sha256"],
       "properties": {
         "path": { "$ref": "#/$defs/relativePath" },
-        "size": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0, "maximum": 8388608 },
         "sha256": { "$ref": "#/$defs/digest" }
       },
       "additionalProperties": false
@@ -66,13 +66,14 @@
         "entrypoint": { "$ref": "#/$defs/sizedFile" },
         "assets": {
           "type": "array",
+          "maxItems": 64,
           "items": {
             "type": "object",
             "required": ["path", "mediaType", "size", "sha256"],
             "properties": {
               "path": { "$ref": "#/$defs/relativePath" },
               "mediaType": { "type": "string", "minLength": 3 },
-              "size": { "type": "integer", "minimum": 0 },
+              "size": { "type": "integer", "minimum": 0, "maximum": 8388608 },
               "sha256": { "$ref": "#/$defs/digest" }
             },
             "additionalProperties": false

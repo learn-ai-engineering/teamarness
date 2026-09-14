@@ -261,7 +261,6 @@ async fn rejects_forged_cross_scope_and_invalid_signing_calls() {
         ("empty-purpose", "", "aA".to_owned()),
         ("invalid-purpose", "bad purpose", "aA".to_owned()),
         ("long-purpose", &"x".repeat(65), "aA".to_owned()),
-        ("large-payload", "fixture.read", "YQ".repeat(174_764)),
     ] {
         let response = call(
             &host,
@@ -282,6 +281,24 @@ async fn rejects_forged_cross_scope_and_invalid_signing_calls() {
             Some(&PackageValue::String("capability_request_invalid".into()))
         );
     }
+
+    let error = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: second,
+            request: UiRequestId::new("large-payload").unwrap(),
+            operation: "fixture.capability".into(),
+            payload: capability(
+                "teamarness.signing",
+                "sign",
+                object([
+                    ("purpose", PackageValue::String("fixture.read".into())),
+                    ("payload", PackageValue::String("YQ".repeat(174_764))),
+                ]),
+            ),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, PackageErrorCode::UiContractViolation);
 }
 
 #[tokio::test]

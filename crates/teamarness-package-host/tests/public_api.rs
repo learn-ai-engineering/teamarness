@@ -5,9 +5,9 @@ use teamarness_package_host::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     HostRevision, LifecycleState, MountState, OpenUiMount, OpenUiSubscription, PackageErrorCode,
     PackageErrorEnvelope, PackageErrorStage, PackageHostCommand, PackageHostConfig,
-    PackageHostOutcome, PackageHostSnapshot, PackageHostState, PackageIdentity,
+    PackageHostOutcome, PackageHostSnapshot, PackageHostState, PackageIdentity, ReadUiResource,
     ReconcileWorkspaces, RecoverPackage, RecoveryAction, ReportUiFault, ShutdownHost,
-    SuspendPackage, UiRequest,
+    SuspendPackage, UiRequest, UiResourceToken,
 };
 
 #[test]
@@ -83,12 +83,17 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             subscription,
         }),
         PackageHostCommand::ReportUiFault(ReportUiFault {
-            mount,
+            mount: mount.clone(),
             code: "ui_exception".into(),
+        }),
+        PackageHostCommand::ReadUiResource(ReadUiResource {
+            mount,
+            token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
+            relative_path: "ui/index.js".into(),
         }),
         PackageHostCommand::Shutdown(ShutdownHost),
     ];
-    assert_eq!(commands.len(), 13);
+    assert_eq!(commands.len(), 14);
     for command in &commands {
         match command {
             PackageHostCommand::ReconcileWorkspaces(_)
@@ -103,6 +108,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostCommand::AcknowledgeUiEvents(_)
             | PackageHostCommand::CloseUiSubscription(_)
             | PackageHostCommand::ReportUiFault(_)
+            | PackageHostCommand::ReadUiResource(_)
             | PackageHostCommand::Shutdown(_) => {}
         }
     }
@@ -122,6 +128,20 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
         },
         PackageHostOutcome::UiMountOpened {
             mount: teamarness_package_host::UiMountId::new("mount-2").unwrap(),
+            loader: teamarness_package_host::UiLoaderDescriptor {
+                token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                entrypoint: "ui/index.js".into(),
+                ui_host_version: 1,
+                contract_digest: "digest".into(),
+                package: teamarness_package_host::UiPackageContext {
+                    identity: PackageIdentity::from_str("dev.teamarness.reference").unwrap(),
+                    display_name: "Reference".into(),
+                },
+                workspace: teamarness_package_host::UiWorkspaceContext {
+                    id: teamarness_package_host::WorkspaceId::new("workspace").unwrap(),
+                    name: "Workspace".into(),
+                },
+            },
             revision: HostRevision::INITIAL,
         },
         PackageHostOutcome::UiMountClosed {
@@ -137,9 +157,13 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
         PackageHostOutcome::UiFaultRecorded {
             revision: HostRevision::INITIAL,
         },
+        PackageHostOutcome::UiResource {
+            bytes: vec![],
+            media_type: "text/javascript".into(),
+        },
         PackageHostOutcome::Shutdown,
     ];
-    assert_eq!(outcomes.len(), 13);
+    assert_eq!(outcomes.len(), 14);
     for outcome in &outcomes {
         match outcome {
             PackageHostOutcome::Reconciled { .. }
@@ -154,6 +178,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostOutcome::UiEventsAcknowledged
             | PackageHostOutcome::UiSubscriptionClosed
             | PackageHostOutcome::UiFaultRecorded { .. }
+            | PackageHostOutcome::UiResource { .. }
             | PackageHostOutcome::Shutdown => {}
         }
     }
@@ -339,4 +364,8 @@ fn public_source_does_not_export_dependency_types() {
 
     assert!(!source.contains("pub process:"));
     assert!(!source.contains("pub child:"));
+    assert!(!source.contains("pub admission_digest"));
+
+    let token = UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+    assert_eq!(format!("{token:?}"), "UiResourceToken([redacted])");
 }

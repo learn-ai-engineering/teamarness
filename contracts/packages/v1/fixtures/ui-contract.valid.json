@@ -1,1 +1,23 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"kind":{"type":"string"}},"required":["kind"],"additionalProperties":false}
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "item": {
+      "type": "object",
+      "properties": { "value": { "type": "string" } },
+      "required": ["value"],
+      "additionalProperties": false
+    }
+  },
+  "requests": {
+    "reference.read": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": { "$ref": "#/$defs/item" }
+    }
+  },
+  "subscriptions": {
+    "reference.changes": {
+      "request": { "type": "object", "additionalProperties": false },
+      "event": { "$ref": "#/$defs/item" }
+    }
+  }
+}

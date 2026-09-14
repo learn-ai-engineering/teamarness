@@ -10,9 +10,175 @@ use teamarness_package_protocol::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
+use crate::ui::{AdmittedUi, MAX_UI_PAYLOAD_BYTES};
 use crate::{PackageErrorCode, PackageValue};
 
 type PendingRequests = Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<Value, WireFailure>>>>>;
+type UiEventRoutes = Arc<Mutex<BTreeMap<String, Arc<UiEventRoute>>>>;
+
+const UI_EVENT_CAPACITY: usize = 32;
+const UI_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) struct UiEvent {
+    pub(crate) sequence: u64,
+    pub(crate) payload: PackageValue,
+    _bytes: OwnedSemaphorePermit,
+}
+
+pub(crate) struct UiEventReceiver {
+    events: mpsc::Receiver<UiEvent>,
+    terminal: watch::Receiver<Option<PackageErrorCode>>,
+    route: Arc<UiEventRoute>,
+}
+
+pub(crate) struct UiEventRoute {
+    events: mpsc::Sender<UiEvent>,
+    terminal: watch::Sender<Option<PackageErrorCode>>,
+    bytes: Arc<Semaphore>,
+    state: Mutex<UiEventRouteState>,
+    contract: Arc<AdmittedUi>,
+    operation: String,
+}
+
+struct UiEventRouteState {
+    next_expected: u64,
+    highest_received: u64,
+    highest_delivered: u64,
+    highest_acknowledged: u64,
+}
+
+impl UiEventReceiver {
+    pub(crate) fn terminal(&self) -> watch::Receiver<Option<PackageErrorCode>> {
+        self.terminal.clone()
+    }
+
+    pub(crate) async fn changed(&mut self) -> Result<UiEvent, PackageErrorCode> {
+        loop {
+            if let Some(code) = *self.terminal.borrow() {
+                if code == PackageErrorCode::BackendError {
+                    match self.events.try_recv() {
+                        Ok(event) => {
+                            self.route.mark_delivered(event.sequence).await?;
+                            return Ok(event);
+                        }
+                        Err(
+                            mpsc::error::TryRecvError::Empty
+                            | mpsc::error::TryRecvError::Disconnected,
+                        ) => {}
+                    }
+                }
+                return Err(code);
+            }
+            tokio::select! {
+                biased;
+                result = self.terminal.changed() => {
+                    if result.is_err() {
+                        return Err(PackageErrorCode::ProcessExited);
+                    }
+                }
+                event = self.events.recv() => {
+                    let event = event.ok_or(PackageErrorCode::ProcessExited)?;
+                    self.route.mark_delivered(event.sequence).await?;
+                    return Ok(event);
+                }
+            }
+        }
+    }
+}
+
+impl UiEventRoute {
+    fn new(contract: Arc<AdmittedUi>, operation: String) -> (Arc<Self>, UiEventReceiver) {
+        let (events, receiver) = mpsc::channel(UI_EVENT_CAPACITY);
+        let (terminal, terminal_receiver) = watch::channel(None);
+        let route = Arc::new(Self {
+            events,
+            terminal,
+            bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES)),
+            state: Mutex::new(UiEventRouteState {
+                next_expected: 1,
+                highest_received: 0,
+                highest_delivered: 0,
+                highest_acknowledged: 0,
+            }),
+            contract,
+            operation,
+        });
+        let event_receiver = UiEventReceiver {
+            events: receiver,
+            terminal: terminal_receiver,
+            route: route.clone(),
+        };
+        (route, event_receiver)
+    }
+
+    async fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
+        let payload: PackageValue =
+            serde_json::from_value(value).map_err(|_| PackageErrorCode::UiContractViolation)?;
+        self.contract
+            .contract
+            .validate_event(&self.operation, &payload)
+            .map_err(|_| PackageErrorCode::UiContractViolation)?;
+        let encoded =
+            serde_json::to_vec(&payload).map_err(|_| PackageErrorCode::UiContractViolation)?;
+        if encoded.len() > MAX_UI_PAYLOAD_BYTES {
+            return Err(PackageErrorCode::UiContractViolation);
+        }
+        let mut state = self.state.lock().await;
+        if sequence != state.next_expected {
+            return Err(PackageErrorCode::ProtocolViolation);
+        }
+        if state
+            .highest_received
+            .saturating_sub(state.highest_acknowledged)
+            >= UI_EVENT_CAPACITY as u64
+        {
+            return Err(PackageErrorCode::EventLagged);
+        }
+        let permits =
+            u32::try_from(encoded.len()).map_err(|_| PackageErrorCode::UiContractViolation)?;
+        let bytes = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map_err(|_| PackageErrorCode::EventLagged)?;
+        self.events
+            .try_send(UiEvent {
+                sequence,
+                payload,
+                _bytes: bytes,
+            })
+            .map_err(|_| PackageErrorCode::EventLagged)?;
+        state.next_expected = state.next_expected.saturating_add(1);
+        state.highest_received = sequence;
+        Ok(())
+    }
+
+    async fn mark_delivered(&self, sequence: u64) -> Result<(), PackageErrorCode> {
+        let mut state = self.state.lock().await;
+        if sequence != state.highest_delivered.saturating_add(1) {
+            return Err(PackageErrorCode::ProtocolViolation);
+        }
+        state.highest_delivered = sequence;
+        Ok(())
+    }
+
+    pub(crate) async fn acknowledge(&self, through: u64) -> Result<u64, WireFailure> {
+        let mut state = self.state.lock().await;
+        if through <= state.highest_acknowledged
+            || through > state.highest_delivered
+            || through.saturating_sub(state.highest_acknowledged) > UI_EVENT_CAPACITY as u64
+        {
+            return Err(WireFailure::new(PackageErrorCode::ProtocolViolation));
+        }
+        let amount = through - state.highest_acknowledged;
+        state.highest_acknowledged = through;
+        Ok(amount)
+    }
+
+    fn terminate(&self, code: PackageErrorCode) {
+        self.terminal.send_replace(Some(code));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct WireFailure {
@@ -35,6 +201,7 @@ pub(crate) struct ProcessClient {
     pending: PendingRequests,
     tombstones: Arc<Mutex<BTreeSet<String>>>,
     closed_streams: Arc<Mutex<BTreeSet<String>>>,
+    ui_event_routes: UiEventRoutes,
     initialized: Arc<Mutex<Option<oneshot::Receiver<Frame>>>>,
     shutdown_ack: watch::Receiver<bool>,
     pongs: watch::Receiver<Option<String>>,
@@ -227,6 +394,7 @@ where
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let tombstones = Arc::new(Mutex::new(BTreeSet::new()));
     let closed_streams = Arc::new(Mutex::new(BTreeSet::new()));
+    let ui_event_routes = Arc::new(Mutex::new(BTreeMap::new()));
     let state = Arc::new(Mutex::new(ContractState::default()));
     let (initialized_tx, initialized_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -245,6 +413,7 @@ where
         pending.clone(),
         tombstones.clone(),
         closed_streams.clone(),
+        ui_event_routes.clone(),
         state,
         initialized_tx,
         shutdown_tx,
@@ -257,6 +426,7 @@ where
         pending,
         tombstones,
         closed_streams,
+        ui_event_routes,
         initialized: Arc::new(Mutex::new(Some(initialized_rx))),
         shutdown_ack: shutdown_rx,
         pongs: pong_rx,
@@ -313,6 +483,7 @@ async fn reader_task<R>(
     pending: PendingRequests,
     tombstones: Arc<Mutex<BTreeSet<String>>>,
     closed_streams: Arc<Mutex<BTreeSet<String>>>,
+    ui_event_routes: UiEventRoutes,
     state: Arc<Mutex<ContractState>>,
     initialized: oneshot::Sender<Frame>,
     shutdown: watch::Sender<bool>,
@@ -329,9 +500,41 @@ async fn reader_task<R>(
             Err(code) => {
                 let _ = failure.send(Some(code));
                 fail_pending(&pending, code).await;
+                fail_ui_routes(&ui_event_routes, code).await;
                 return;
             }
         };
+        if frame.kind() == FrameKind::Event {
+            let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
+                let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
+                fail_ui_routes(&ui_event_routes, PackageErrorCode::MalformedFrame).await;
+                return;
+            };
+            let ui_route = {
+                let routes = ui_event_routes.lock().await;
+                routes.get(stream_id).cloned()
+            };
+            if let Some(route) = ui_route {
+                let sequence = frame
+                    .field("sequence")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<u64>().ok());
+                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
+                let result = match sequence {
+                    Some(sequence) => route.event(sequence, payload).await,
+                    None => Err(PackageErrorCode::ProtocolViolation),
+                };
+                if let Err(code) = result {
+                    route.terminate(code);
+                    ui_event_routes.lock().await.remove(stream_id);
+                    closed_streams.lock().await.insert(stream_id.to_owned());
+                    let _ = writer
+                        .control(json!({"kind":"stream_close","streamId":stream_id,"code":ui_stream_code(code)}))
+                        .await;
+                }
+                continue;
+            }
+        }
         let is_late_stream_frame =
             if matches!(frame.kind(), FrameKind::Event | FrameKind::StreamClose) {
                 match frame.field("streamId").and_then(Value::as_str) {
@@ -348,6 +551,7 @@ async fn reader_task<R>(
             let code = protocol_code(error);
             let _ = failure.send(Some(code));
             fail_pending(&pending, code).await;
+            fail_ui_routes(&ui_event_routes, code).await;
             return;
         }
         match frame.kind() {
@@ -478,7 +682,12 @@ async fn reader_task<R>(
                     let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
                     return;
                 };
-                capabilities.close_stream(stream_id).await;
+                if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
+                    route.terminate(PackageErrorCode::BackendError);
+                    closed_streams.lock().await.insert(stream_id.to_owned());
+                } else {
+                    capabilities.close_stream(stream_id).await;
+                }
             }
             FrameKind::ShutdownAck => {
                 let _ = shutdown.send(true);
@@ -496,6 +705,13 @@ async fn reader_task<R>(
                 return;
             }
         }
+    }
+}
+
+async fn fail_ui_routes(routes: &UiEventRoutes, code: PackageErrorCode) {
+    let mut routes = routes.lock().await;
+    for (_, route) in std::mem::take(&mut *routes) {
+        route.terminate(code);
     }
 }
 
@@ -530,6 +746,14 @@ async fn read_frame<R: AsyncRead + Unpin>(input: &mut R) -> Result<Frame, Packag
     let mut bytes = prefix.to_vec();
     bytes.extend(payload);
     decode_frame(&bytes).map_err(protocol_code)
+}
+
+fn ui_stream_code(code: PackageErrorCode) -> &'static str {
+    match code {
+        PackageErrorCode::UiContractViolation => "ui_contract_violation",
+        PackageErrorCode::EventLagged => "event_lagged",
+        _ => "protocol_violation",
+    }
 }
 
 fn capability_code(code: PackageErrorCode) -> &'static str {
@@ -640,20 +864,33 @@ impl ProcessClient {
             .await
     }
 
-    pub(crate) async fn stream_open(
+    pub(crate) async fn open_ui_stream(
         &self,
         id: String,
         topic: &str,
         mount: &str,
         payload: PackageValue,
-    ) -> Result<(), WireFailure> {
+        contract: Arc<AdmittedUi>,
+    ) -> Result<(UiEventReceiver, Arc<UiEventRoute>), WireFailure> {
         self.closed_streams.lock().await.remove(&id);
-        self.writer
+        let (route, receiver) = UiEventRoute::new(contract, topic.to_owned());
+        self.ui_event_routes
+            .lock()
+            .await
+            .insert(id.clone(), route.clone());
+        if let Err(error) = self
+            .writer
             .control(json!({
                 "kind":"stream_open", "id":id, "topic":topic, "mountId":mount,
                 "initialCredit":32, "payload":package_value_to_json(payload)
             }))
             .await
+        {
+            self.ui_event_routes.lock().await.remove(&id);
+            route.terminate(error.code);
+            return Err(error);
+        }
+        Ok((receiver, route))
     }
 
     pub(crate) async fn credit(&self, stream_id: &str, amount: u64) -> Result<(), WireFailure> {
@@ -664,11 +901,16 @@ impl ProcessClient {
 
     pub(crate) async fn stream_close(&self, stream_id: &str) -> Result<(), WireFailure> {
         let mut closed = self.closed_streams.lock().await;
-        closed.insert(stream_id.to_owned());
+        if !closed.insert(stream_id.to_owned()) {
+            return Ok(());
+        }
         while closed.len() > 64 {
             closed.pop_first();
         }
         drop(closed);
+        if let Some(route) = self.ui_event_routes.lock().await.remove(stream_id) {
+            route.terminate(PackageErrorCode::Cancelled);
+        }
         self.writer
             .control(json!({"kind":"stream_close","streamId":stream_id,"code":"closed"}))
             .await

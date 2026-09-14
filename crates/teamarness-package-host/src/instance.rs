@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::Mutex;
 
-use crate::protocol::WireFailure;
+use crate::protocol::{UiEventReceiver, UiEventRoute, WireFailure};
 use crate::supervisor::{self, CRASH_WINDOW, ProcessGeneration, ProcessSpec, RESTART_DELAYS};
+use crate::ui::AdmittedUi;
 use crate::{
     LifecycleState, MountState, PackageErrorCode, PackageInstanceKey, PackageInstanceSnapshot,
     PackageValue, UiMountId, UiRequestId, UiSubscriptionId,
@@ -25,16 +26,21 @@ struct InstanceState {
     process: Option<Arc<ProcessGeneration>>,
     failures: VecDeque<Instant>,
     active_since: Option<Instant>,
-    mounts: BTreeMap<UiMountId, u64>,
-    requests: BTreeMap<UiRequestId, String>,
-    request_tombstones: BTreeSet<UiRequestId>,
-    subscriptions: BTreeMap<UiSubscriptionId, SubscriptionState>,
+    mounts: BTreeMap<UiMountId, MountRecord>,
+    requests: BTreeMap<(UiMountId, UiRequestId), String>,
+    request_tombstones: BTreeSet<(UiMountId, UiRequestId)>,
+    subscriptions: BTreeMap<(UiMountId, UiSubscriptionId), SubscriptionState>,
+    next_wire_id: u64,
+}
+
+struct MountRecord {
+    generation: u64,
+    state: MountState,
 }
 
 struct SubscriptionState {
-    mount: UiMountId,
     wire_id: String,
-    acknowledged: u64,
+    route: Arc<UiEventRoute>,
 }
 
 impl InstanceActor {
@@ -52,6 +58,7 @@ impl InstanceActor {
                 requests: BTreeMap::new(),
                 request_tombstones: BTreeSet::new(),
                 subscriptions: BTreeMap::new(),
+                next_wire_id: 0,
             }),
             lifecycle_gate: Mutex::new(()),
         }
@@ -132,7 +139,15 @@ impl InstanceActor {
             key: self.key.clone(),
             lifecycle: state.lifecycle,
             process_generation: (state.generation > 0).then_some(state.generation),
-            mount_state: (!state.mounts.is_empty()).then_some(MountState::Mounted),
+            mount_state: state
+                .mounts
+                .values()
+                .map(|mount| mount.state)
+                .max_by_key(|mount| match mount {
+                    MountState::Failed => 2,
+                    MountState::Mounted => 1,
+                    _ => 0,
+                }),
         }
     }
 
@@ -258,42 +273,123 @@ impl InstanceActor {
         result
     }
 
-    pub(crate) async fn open_mount(&self) -> Result<UiMountId, WireFailure> {
+    pub(crate) async fn open_mount(&self) -> Result<(UiMountId, u64), WireFailure> {
         let mut state = self.state.lock().await;
         if state.lifecycle != LifecycleState::Active {
             return Err(WireFailure::new(PackageErrorCode::InvalidLifecycleState));
         }
+        state.mounts.clear();
         let mut random = [0_u8; 24];
         getrandom::fill(&mut random)
             .map_err(|_| WireFailure::new(PackageErrorCode::UiLoadFailed))?;
         let mount = UiMountId::new(URL_SAFE_NO_PAD.encode(random))
             .map_err(|_| WireFailure::new(PackageErrorCode::UiLoadFailed))?;
         let generation = state.generation;
-        state.mounts.insert(mount.clone(), generation);
-        Ok(mount)
+        state.mounts.insert(
+            mount.clone(),
+            MountRecord {
+                generation,
+                state: MountState::Mounted,
+            },
+        );
+        Ok((mount, generation))
     }
 
     pub(crate) async fn close_mount(&self, mount: &UiMountId) -> bool {
-        let (removed, process, streams) = {
+        let (removed, process, streams, requests) = {
             let mut state = self.state.lock().await;
             let removed = state.mounts.remove(mount).is_some();
-            let streams = state
+            let keys = state
                 .subscriptions
-                .iter()
-                .filter(|(_, stream)| &stream.mount == mount)
-                .map(|(id, stream)| (id.clone(), stream.wire_id.clone()))
+                .keys()
+                .filter(|(stream_mount, _)| stream_mount == mount)
+                .cloned()
                 .collect::<Vec<_>>();
-            for (id, _) in &streams {
-                state.subscriptions.remove(id);
-            }
-            (removed, state.process.clone(), streams)
+            let streams = keys
+                .iter()
+                .filter_map(|key| state.subscriptions.remove(key))
+                .map(|stream| stream.wire_id)
+                .collect::<Vec<_>>();
+            let requests = state
+                .requests
+                .iter()
+                .filter(|((request_mount, _), _)| request_mount == mount)
+                .map(|(_, wire_id)| wire_id.clone())
+                .collect::<Vec<_>>();
+            state
+                .requests
+                .retain(|(request_mount, _), _| request_mount != mount);
+            state
+                .request_tombstones
+                .retain(|(request_mount, _)| request_mount != mount);
+            (removed, state.process.clone(), streams, requests)
         };
         if let Some(process) = process {
-            for (_, stream) in streams {
+            for request in requests {
+                let _ = process.client.cancel(&request).await;
+            }
+            for stream in streams {
                 let _ = process.client.stream_close(&stream).await;
             }
         }
         removed
+    }
+
+    pub(crate) async fn fail_mount(&self, mount: &UiMountId) -> bool {
+        let (changed, process, streams, requests) = {
+            let mut state = self.state.lock().await;
+            let changed = state.mounts.get_mut(mount).is_some_and(|record| {
+                if record.state == MountState::Failed {
+                    false
+                } else {
+                    record.state = MountState::Failed;
+                    true
+                }
+            });
+            let keys = state
+                .subscriptions
+                .keys()
+                .filter(|(stream_mount, _)| stream_mount == mount)
+                .cloned()
+                .collect::<Vec<_>>();
+            let streams = keys
+                .iter()
+                .filter_map(|key| state.subscriptions.remove(key))
+                .map(|stream| stream.wire_id)
+                .collect::<Vec<_>>();
+            let requests = state
+                .requests
+                .iter()
+                .filter(|((request_mount, _), _)| request_mount == mount)
+                .map(|(_, wire_id)| wire_id.clone())
+                .collect::<Vec<_>>();
+            state
+                .requests
+                .retain(|(request_mount, _), _| request_mount != mount);
+            (changed, state.process.clone(), streams, requests)
+        };
+        if let Some(process) = process {
+            for request in requests {
+                let _ = process.client.cancel(&request).await;
+            }
+            for stream in streams {
+                let _ = process.client.stream_close(&stream).await;
+            }
+        }
+        changed
+    }
+
+    pub(crate) async fn is_mount_current(&self, mount: &UiMountId, generation: u64) -> bool {
+        let state = self.state.lock().await;
+        state.lifecycle == LifecycleState::Active
+            && state.generation == generation
+            && state.mounts.get(mount).is_some_and(|record| {
+                record.generation == generation && record.state == MountState::Mounted
+            })
+    }
+
+    pub(crate) fn workspace_name(&self) -> &str {
+        &self.spec.workspace_name
     }
 
     pub(crate) async fn request(
@@ -303,10 +399,13 @@ impl InstanceActor {
         operation: String,
         payload: PackageValue,
     ) -> Result<PackageValue, WireFailure> {
+        let request_key = (mount.clone(), request.clone());
         let (process, wire_id) = {
             let mut state = self.state.lock().await;
             if state.lifecycle != LifecycleState::Active
-                || state.mounts.get(mount) != Some(&state.generation)
+                || !state.mounts.get(mount).is_some_and(|record| {
+                    record.generation == state.generation && record.state == MountState::Mounted
+                })
             {
                 return Err(WireFailure::new(PackageErrorCode::StaleMount));
             }
@@ -314,14 +413,15 @@ impl InstanceActor {
                 .process
                 .clone()
                 .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
-            if state.request_tombstones.remove(&request) {
+            if state.request_tombstones.remove(&request_key) {
                 return Err(WireFailure::new(PackageErrorCode::Cancelled));
             }
-            if state.requests.contains_key(&request) {
+            if state.requests.contains_key(&request_key) {
                 return Err(WireFailure::new(PackageErrorCode::Overloaded));
             }
-            let wire_id = format!("h:ui-{}", request.as_str());
-            state.requests.insert(request.clone(), wire_id.clone());
+            state.next_wire_id = state.next_wire_id.saturating_add(1);
+            let wire_id = format!("h:ui-{}-{}", state.generation, state.next_wire_id);
+            state.requests.insert(request_key.clone(), wire_id.clone());
             (process, wire_id)
         };
         let result = if let Some(code) = process.client.failure() {
@@ -341,8 +441,8 @@ impl InstanceActor {
         };
         {
             let mut state = self.state.lock().await;
-            state.requests.remove(&request);
-            state.request_tombstones.insert(request.clone());
+            state.requests.remove(&request_key);
+            state.request_tombstones.insert(request_key);
             while state.request_tombstones.len() > 64 {
                 state.request_tombstones.pop_first();
             }
@@ -398,11 +498,16 @@ impl InstanceActor {
         }
     }
 
-    pub(crate) async fn cancel(&self, request: &UiRequestId) -> Result<(), WireFailure> {
+    pub(crate) async fn cancel(
+        &self,
+        mount: &UiMountId,
+        request: &UiRequestId,
+    ) -> Result<(), WireFailure> {
+        let request_key = (mount.clone(), request.clone());
         let (process, wire_id) = {
             let mut state = self.state.lock().await;
-            let Some(wire_id) = state.requests.get(request).cloned() else {
-                state.request_tombstones.insert(request.clone());
+            let Some(wire_id) = state.requests.get(&request_key).cloned() else {
+                state.request_tombstones.insert(request_key);
                 while state.request_tombstones.len() > 64 {
                     state.request_tombstones.pop_first();
                 }
@@ -423,41 +528,52 @@ impl InstanceActor {
         subscription: UiSubscriptionId,
         operation: String,
         payload: PackageValue,
-    ) -> Result<(), WireFailure> {
-        let wire_id = format!("h:stream-{}", subscription.as_str());
-        let process = {
+        contract: Arc<AdmittedUi>,
+    ) -> Result<UiEventReceiver, WireFailure> {
+        let key = (mount.clone(), subscription);
+        let (process, wire_id) = {
             let mut state = self.state.lock().await;
             if state.lifecycle != LifecycleState::Active
-                || state.mounts.get(mount) != Some(&state.generation)
+                || !state.mounts.get(mount).is_some_and(|record| {
+                    record.generation == state.generation && record.state == MountState::Mounted
+                })
             {
                 return Err(WireFailure::new(PackageErrorCode::StaleMount));
             }
-            if state.subscriptions.contains_key(&subscription) {
+            if state.subscriptions.contains_key(&key)
+                || state
+                    .subscriptions
+                    .keys()
+                    .filter(|(stream_mount, _)| stream_mount == mount)
+                    .count()
+                    >= 8
+            {
                 return Err(WireFailure::new(PackageErrorCode::Overloaded));
             }
             let process = state
                 .process
                 .clone()
                 .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
-            state.subscriptions.insert(
-                subscription.clone(),
-                SubscriptionState {
-                    mount: mount.clone(),
-                    wire_id: wire_id.clone(),
-                    acknowledged: 0,
-                },
-            );
-            process
+            state.next_wire_id = state.next_wire_id.saturating_add(1);
+            let wire_id = format!("h:stream-{}-{}", state.generation, state.next_wire_id);
+            (process, wire_id)
         };
-        if let Err(error) = process
+        let (receiver, route) = process
             .client
-            .stream_open(wire_id, &operation, mount.as_str(), payload)
+            .open_ui_stream(
+                wire_id.clone(),
+                &operation,
+                mount.as_str(),
+                payload,
+                contract,
+            )
+            .await?;
+        self.state
+            .lock()
             .await
-        {
-            self.state.lock().await.subscriptions.remove(&subscription);
-            return Err(error);
-        }
-        Ok(())
+            .subscriptions
+            .insert(key, SubscriptionState { wire_id, route });
+        Ok(receiver)
     }
 
     pub(crate) async fn acknowledge(
@@ -466,8 +582,8 @@ impl InstanceActor {
         subscription: &UiSubscriptionId,
         through: u64,
     ) -> Result<(), WireFailure> {
-        let (process, stream, amount) = {
-            let mut state = self.state.lock().await;
+        let (process, stream, route) = {
+            let state = self.state.lock().await;
             let generation = state.generation;
             let process = state
                 .process
@@ -475,19 +591,14 @@ impl InstanceActor {
                 .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
             let stream = state
                 .subscriptions
-                .get_mut(subscription)
-                .filter(|stream| &stream.mount == mount)
+                .get(&(mount.clone(), subscription.clone()))
                 .ok_or_else(|| WireFailure::new(PackageErrorCode::StaleMount))?;
-            if through <= stream.acknowledged || through - stream.acknowledged > 32 {
-                return Err(WireFailure::new(PackageErrorCode::ProtocolViolation));
-            }
             if process.generation != generation {
                 return Err(WireFailure::new(PackageErrorCode::StaleMount));
             }
-            let amount = through - stream.acknowledged;
-            stream.acknowledged = through;
-            (process, stream.wire_id.clone(), amount)
+            (process, stream.wire_id.clone(), stream.route.clone())
         };
+        let amount = route.acknowledge(through).await?;
         process.client.credit(&stream, amount).await
     }
 
@@ -500,8 +611,7 @@ impl InstanceActor {
             let mut state = self.state.lock().await;
             let stream = state
                 .subscriptions
-                .remove(subscription)
-                .filter(|stream| &stream.mount == mount)
+                .remove(&(mount.clone(), subscription.clone()))
                 .ok_or_else(|| WireFailure::new(PackageErrorCode::StaleMount))?;
             let process = state
                 .process

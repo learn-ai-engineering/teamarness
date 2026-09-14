@@ -1,1 +1,8 @@
-{"$ref":"https://example.com/package-contract.json"}
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "remote": { "$ref": "https://example.com/package-contract.json" }
+  },
+  "requests": {},
+  "subscriptions": {}
+}

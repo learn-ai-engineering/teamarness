@@ -1,7 +1,54 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teamarness.dev/contracts/packages/v1/ui-contract-profile.schema.json",
-  "title": "Package UI contract restricted profile",
-  "description": "A draft 2020-12 schema accepted only after the host walker rejects remote references, dynamic or recursive references, cycles, and configured depth or node limits.",
-  "type": ["object", "boolean"]
+  "title": "Package UI contract v1",
+  "$defs": {
+    "schema": { "type": ["object", "boolean"] },
+    "requestOperation": {
+      "type": "object",
+      "required": ["request", "response"],
+      "properties": {
+        "request": { "$ref": "#/$defs/schema" },
+        "response": { "$ref": "#/$defs/schema" }
+      },
+      "additionalProperties": false
+    },
+    "subscriptionOperation": {
+      "type": "object",
+      "required": ["request", "event"],
+      "properties": {
+        "request": { "$ref": "#/$defs/schema" },
+        "event": { "$ref": "#/$defs/schema" }
+      },
+      "additionalProperties": false
+    },
+    "operationName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
+    }
+  },
+  "type": "object",
+  "required": ["schemaVersion", "$defs", "requests", "subscriptions"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "$defs": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/schema" }
+    },
+    "requests": {
+      "type": "object",
+      "maxProperties": 128,
+      "propertyNames": { "$ref": "#/$defs/operationName" },
+      "additionalProperties": { "$ref": "#/$defs/requestOperation" }
+    },
+    "subscriptions": {
+      "type": "object",
+      "maxProperties": 128,
+      "propertyNames": { "$ref": "#/$defs/operationName" },
+      "additionalProperties": { "$ref": "#/$defs/subscriptionOperation" }
+    }
+  },
+  "additionalProperties": false
 }

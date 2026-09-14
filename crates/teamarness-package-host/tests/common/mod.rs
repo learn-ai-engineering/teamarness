@@ -110,9 +110,39 @@ pub fn write_node_package_with_capabilities(
     fs::write(&backend_path, &backend).unwrap();
     fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
     let entrypoint = b"export function mount() { return async () => {}; }";
-    let contract = br#"{"type":"object","additionalProperties":true}"#;
+    let contract = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "$defs": {},
+        "requests": {
+            "fixture.abort": {"request": {}, "response": {}},
+            "fixture.capability": {"request": {}, "response": {}},
+            "fixture.delayed": {"request": {}, "response": {}},
+            "fixture.error": {"request": {}, "response": {}},
+            "fixture.grant": {"request": {}, "response": {}},
+            "fixture.immediate": {"request": {}, "response": {}},
+            "fixture.invalid_response": {"request": {}, "response": {"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}},
+            "fixture.malformed": {"request": {}, "response": {}},
+            "fixture.membership_close": {"request": {}, "response": {}},
+            "fixture.membership_credit": {"request": {}, "response": {}},
+            "fixture.membership_events": {"request": {}, "response": {}},
+            "fixture.membership_open": {"request": {}, "response": {}},
+            "fixture.stderr": {"request": {}, "response": {}},
+            "fixture.typed": {"request": {"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}, "response": {}}
+        },
+        "subscriptions": {
+            "fixture.close": {"request": {}, "event": {}},
+            "fixture.duplicate": {"request": {}, "event": {}},
+            "fixture.events": {"request": {}, "event": {}},
+            "fixture.gap": {"request": {}, "event": {}},
+            "fixture.invalid_event": {"request": {}, "event": {"type":"object","properties":{"order":{"type":"integer"}},"required":["order"],"additionalProperties":false}},
+            "fixture.overflow": {"request": {}, "event": {}},
+            "fixture.saturation": {"request": {}, "event": {}}
+        }
+    }))
+    .unwrap();
     fs::write(root.join("ui/index.js"), entrypoint).unwrap();
-    fs::write(root.join("ui/contract.json"), contract).unwrap();
+    fs::write(root.join("ui/icon.svg"), b"<svg/>").unwrap();
+    fs::write(root.join("ui/contract.json"), &contract).unwrap();
     fs::write(root.join("teamarness.package.json"), serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 1,
         "identity": identity,
@@ -125,8 +155,8 @@ pub fn write_node_package_with_capabilities(
         }],
         "ui": {
             "entrypoint":{"path":"ui/index.js","size":entrypoint.len(),"sha256":digest(entrypoint)},
-            "assets":[],
-            "contract":{"path":"ui/contract.json","sha256":digest(contract)}
+            "assets":[{"path":"ui/icon.svg","mediaType":"image/svg+xml","size":6,"sha256":digest(b"<svg/>")}],
+            "contract":{"path":"ui/contract.json","sha256":digest(&contract)}
         },
         "capabilities": capabilities
     })).unwrap()).unwrap();

@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 
 const MANIFEST_NAME: &str = "teamarness.package.json";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+const MAX_UI_ENTRYPOINT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_UI_ASSET_BYTES: usize = 8 * 1024 * 1024;
+const MAX_UI_ASSETS: usize = 64;
+const MAX_UI_CONTRACT_BYTES: usize = 1024 * 1024;
+const MAX_UI_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const PROTOCOL_MAJOR: u16 = 1;
 const PROTOCOL_MINOR: u16 = 0;
 
@@ -172,6 +177,16 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
     }
     validate_extensions(&document.extensions)?;
     validate_capabilities(&document.capabilities)?;
+    if document.ui.entrypoint.size > MAX_UI_ENTRYPOINT_BYTES as u64
+        || document.ui.assets.len() > MAX_UI_ASSETS
+        || document
+            .ui
+            .assets
+            .iter()
+            .any(|asset| asset.size > MAX_UI_ASSET_BYTES as u64)
+    {
+        return Err(ManifestFailure::new(PackageErrorCode::ManifestMalformed));
+    }
 
     let matching: Vec<_> = document
         .backends
@@ -189,7 +204,12 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
         normalized_relative_path(&artifact.path)?;
         validate_digest(&artifact.sha256)?;
     }
-    let backend = verify_sized_file(package_root, matching[0], PackageErrorCode::ArtifactMissing)?;
+    let backend = verify_sized_file(
+        package_root,
+        matching[0],
+        PackageErrorCode::ArtifactMissing,
+        usize::MAX,
+    )?;
     let entrypoint = verify_sized_file(
         package_root,
         &FileArtifact {
@@ -199,12 +219,17 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
             sha256: document.ui.entrypoint.sha256.clone(),
         },
         PackageErrorCode::UiEntrypointMissing,
+        MAX_UI_ENTRYPOINT_BYTES,
     )?;
-    if !seen_paths.insert(document.ui.entrypoint.path.clone())
+    if entrypoint.bytes.len() > MAX_UI_ENTRYPOINT_BYTES
+        || std::str::from_utf8(&entrypoint.bytes).is_err()
+        || document.ui.assets.len() > MAX_UI_ASSETS
+        || !seen_paths.insert(document.ui.entrypoint.path.clone())
         || !seen_paths.insert(document.ui.contract.path.clone())
     {
         return Err(ManifestFailure::new(PackageErrorCode::ManifestMalformed));
     }
+    let mut ui_total = entrypoint.bytes.len();
     let mut assets = Vec::with_capacity(document.ui.assets.len());
     for asset in document.ui.assets {
         if !seen_paths.insert(asset.path.clone())
@@ -221,7 +246,14 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
                 sha256: asset.sha256,
             },
             PackageErrorCode::UiEntrypointMissing,
+            MAX_UI_ASSET_BYTES,
         )?;
+        if file.bytes.len() > MAX_UI_ASSET_BYTES {
+            return Err(ManifestFailure::new(PackageErrorCode::ManifestMalformed));
+        }
+        ui_total = ui_total
+            .checked_add(file.bytes.len())
+            .ok_or_else(|| ManifestFailure::new(PackageErrorCode::ManifestMalformed))?;
         assets.push(LoadedAsset {
             file,
             media_type: asset.media_type,
@@ -232,6 +264,15 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
         &document.ui.contract,
         PackageErrorCode::UiContractViolation,
     )?;
+    ui_total = ui_total
+        .checked_add(contract.bytes.len())
+        .ok_or_else(|| ManifestFailure::new(PackageErrorCode::ManifestMalformed))?;
+    if contract.bytes.len() > MAX_UI_CONTRACT_BYTES {
+        return Err(ManifestFailure::new(PackageErrorCode::UiContractViolation));
+    }
+    if ui_total > MAX_UI_TOTAL_BYTES {
+        return Err(ManifestFailure::new(PackageErrorCode::ManifestMalformed));
+    }
 
     Ok(LoadedManifest {
         identity,
@@ -298,9 +339,10 @@ fn verify_sized_file(
     root: &Path,
     artifact: &FileArtifact,
     missing_code: PackageErrorCode,
+    maximum_bytes: usize,
 ) -> Result<VerifiedFile, ManifestFailure> {
     validate_digest(&artifact.sha256)?;
-    let bytes = read_regular_file(root, &artifact.path, missing_code)?;
+    let bytes = read_regular_file_bounded(root, &artifact.path, missing_code, maximum_bytes)?;
     if u64::try_from(bytes.len()).ok() != Some(artifact.size) || sha256(&bytes) != artifact.sha256 {
         return Err(ManifestFailure::new(PackageErrorCode::ArtifactChanged));
     }
@@ -317,7 +359,8 @@ fn verify_digest_file(
     missing_code: PackageErrorCode,
 ) -> Result<VerifiedFile, ManifestFailure> {
     validate_digest(&artifact.sha256)?;
-    let bytes = read_regular_file(root, &artifact.path, missing_code)?;
+    let bytes =
+        read_regular_file_bounded(root, &artifact.path, missing_code, MAX_UI_CONTRACT_BYTES)?;
     if sha256(&bytes) != artifact.sha256 {
         return Err(ManifestFailure::new(PackageErrorCode::ArtifactChanged));
     }
@@ -344,6 +387,15 @@ fn read_regular_file(
     relative: &str,
     missing_code: PackageErrorCode,
 ) -> Result<Vec<u8>, ManifestFailure> {
+    read_regular_file_bounded(root, relative, missing_code, usize::MAX)
+}
+
+fn read_regular_file_bounded(
+    root: &Path,
+    relative: &str,
+    missing_code: PackageErrorCode,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, ManifestFailure> {
     let relative_path = normalized_relative_path(relative)?;
     let mut path = PathBuf::from(root);
     for component in relative_path.components() {
@@ -359,6 +411,9 @@ fn read_regular_file(
     }
     let metadata = fs::metadata(&path).map_err(|_| ManifestFailure::new(missing_code))?;
     if !metadata.is_file() {
+        return Err(ManifestFailure::new(missing_code));
+    }
+    if metadata.len() > maximum_bytes as u64 {
         return Err(ManifestFailure::new(missing_code));
     }
     fs::read(path).map_err(|_| ManifestFailure::new(missing_code))

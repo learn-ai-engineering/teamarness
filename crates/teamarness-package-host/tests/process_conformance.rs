@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use teamarness_package_host::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     HostRevision, LifecycleState, OpenUiMount, OpenUiSubscription, PackageHost, PackageHostCommand,
-    PackageHostOutcome, PackageValue, RecoverPackage, ShutdownHost, SuspendPackage, UiRequest,
-    UiRequestId, UiSubscriptionId,
+    PackageHostNotification, PackageHostOutcome, PackageHostSubscriptionSelector, PackageValue,
+    RecoverPackage, ShutdownHost, SuspendPackage, UiRequest, UiRequestId, UiSubscriptionId,
 };
 
 fn empty() -> PackageValue {
@@ -48,7 +48,9 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         .await
         .unwrap();
     let (mount, opened_revision) = match opened {
-        PackageHostOutcome::UiMountOpened { mount, revision } => (mount, revision),
+        PackageHostOutcome::UiMountOpened {
+            mount, revision, ..
+        } => (mount, revision),
         other => panic!("unexpected outcome: {other:?}"),
     };
 
@@ -104,6 +106,19 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         .unwrap(),
         PackageHostOutcome::UiSubscriptionOpened
     ));
+    let mut events = host
+        .subscribe(PackageHostSubscriptionSelector::UiEvents {
+            mount: mount.clone(),
+            subscription: UiSubscriptionId::new("events").unwrap(),
+        })
+        .await
+        .unwrap();
+    for sequence in ["1", "2"] {
+        assert!(matches!(
+            events.changed().await.unwrap(),
+            PackageHostNotification::UiEvent(event) if event.sequence == sequence
+        ));
+    }
     assert!(matches!(
         host.execute(PackageHostCommand::AcknowledgeUiEvents(
             AcknowledgeUiEvents {
@@ -185,14 +200,21 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         Some(1)
     );
 
-    let mut subscription = host.subscribe(HostRevision(opened_revision.0));
+    let mut subscription = host
+        .subscribe(PackageHostSubscriptionSelector::HostState {
+            after_revision: HostRevision(opened_revision.0),
+        })
+        .await
+        .unwrap();
     host.execute(PackageHostCommand::CloseUiMount(CloseUiMount { mount }))
         .await
         .unwrap();
     host.execute(PackageHostCommand::Dispose(DisposePackage { instance }))
         .await
         .unwrap();
-    let notice = subscription.changed().await.unwrap();
+    let PackageHostNotification::HostState(notice) = subscription.changed().await.unwrap() else {
+        panic!("expected host state notification")
+    };
     assert!(notice.revision > opened_revision);
     assert!(notice.revision_gap);
     assert_eq!(
