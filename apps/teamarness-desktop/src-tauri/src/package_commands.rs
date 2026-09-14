@@ -15,7 +15,7 @@ use teamarness_package_host::{
 use crate::DesktopState;
 use crate::package_dto::{
     HostStateNotificationDto, OpenUiMountDto, PackageHostSnapshotDto, PackageInstanceKeyDto,
-    UiEventDto,
+    UiStreamMessageDto,
 };
 use crate::package_error::{PackageBridgeError, invalid_input};
 
@@ -153,7 +153,7 @@ pub async fn package_open_stream(
     subscription: String,
     operation: String,
     payload: PackageValue,
-    on_event: Channel<UiEventDto>,
+    on_event: Channel<UiStreamMessageDto>,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
     let mount = parse_mount(mount)?;
@@ -297,10 +297,18 @@ async fn forward_ui_events(
     mut receiver: teamarness_package_host::PackageHostSubscription,
     mount: UiMountId,
     subscription: UiSubscriptionId,
-    on_event: Channel<UiEventDto>,
+    on_event: Channel<UiStreamMessageDto>,
 ) {
-    while let Ok(PackageHostNotification::UiEvent(value)) = receiver.changed().await {
-        if on_event.send(value.into()).is_err() {
+    loop {
+        let message = match receiver.changed().await {
+            Ok(PackageHostNotification::UiEvent(value)) => UiStreamMessageDto::Event(value.into()),
+            Err(error) => {
+                let _ = on_event.send(UiStreamMessageDto::Failure(error.into()));
+                return;
+            }
+            Ok(PackageHostNotification::HostState(_)) => unreachable!("typed UI subscription"),
+        };
+        if on_event.send(message).is_err() {
             let _ = host
                 .execute(PackageHostCommand::CloseUiSubscription(
                     CloseUiSubscription {
@@ -309,7 +317,7 @@ async fn forward_ui_events(
                     },
                 ))
                 .await;
-            break;
+            return;
         }
     }
 }
@@ -339,9 +347,10 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use sha2::{Digest, Sha256};
+    use tauri::ipc::InvokeResponseBody;
     use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
     use teamarness_package_host::{
         InstallationPublicIdentity, PackageHost, PackageHostConfig, ShutdownHost,
@@ -435,6 +444,93 @@ mod tests {
     }
 
     #[test]
+    fn backend_event_contract_failure_reaches_desktop_without_stopping_the_backend() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let before = host.snapshot().await.instances[0].clone();
+            let opened = host
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
+                    instance: before.key.clone(),
+                }))
+                .await
+                .unwrap();
+            let PackageHostOutcome::UiMountOpened { mount, .. } = opened else {
+                unreachable!()
+            };
+            let subscription = UiSubscriptionId::new("invalid-event").unwrap();
+            host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+                mount: mount.clone(),
+                subscription: subscription.clone(),
+                operation: "fixture.invalid_event".into(),
+                payload: PackageValue::Object(Default::default()),
+            }))
+            .await
+            .unwrap();
+            let receiver = host
+                .subscribe(PackageHostSubscriptionSelector::UiEvents {
+                    mount: mount.clone(),
+                    subscription: subscription.clone(),
+                })
+                .await
+                .unwrap();
+            let messages = Arc::new(StdMutex::new(Vec::new()));
+            let received = Arc::clone(&messages);
+            let channel = Channel::new(move |body| {
+                let InvokeResponseBody::Json(json) = body else {
+                    panic!("stream messages use JSON");
+                };
+                received
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+                Ok(())
+            });
+
+            forward_ui_events(
+                Arc::clone(&host),
+                receiver,
+                mount.clone(),
+                subscription.clone(),
+                channel,
+            )
+            .await;
+
+            {
+                let messages = messages.lock().unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0]["kind"], "failure");
+                assert_eq!(messages[0]["value"]["code"], "ui_contract_violation");
+                assert_eq!(messages[0]["value"]["stage"], "ui");
+                assert_eq!(messages[0]["value"]["recovery"], "reload_ui");
+            }
+            assert!(
+                host.execute(PackageHostCommand::AcknowledgeUiEvents(
+                    AcknowledgeUiEvents {
+                        mount: mount.clone(),
+                        subscription,
+                        through_sequence: 1,
+                    },
+                ))
+                .await
+                .is_err()
+            );
+            let after = host.snapshot().await.instances[0].clone();
+            assert_eq!(after.lifecycle, before.lifecycle);
+            assert_eq!(after.lifecycle.as_str(), "active");
+            assert_eq!(after.process_generation, before.process_generation);
+            assert_eq!(
+                after.mount_state.map(|state| state.as_str()),
+                Some("failed")
+            );
+            host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+                .await
+                .unwrap();
+            core.shutdown().await.unwrap();
+            drop(root);
+        });
+    }
+
+    #[test]
     fn reconciliation_adds_new_workspaces_without_restarting_existing_instances() {
         tauri::async_runtime::block_on(async {
             let (root, core, host) = fixture().await;
@@ -483,7 +579,18 @@ mod tests {
             "schemaVersion": 1,
             "$defs": {},
             "requests": {},
-            "subscriptions": {"fixture.saturation": {"request": {}, "event": {}}}
+            "subscriptions": {
+                "fixture.saturation": {"request": {}, "event": {}},
+                "fixture.invalid_event": {
+                    "request": {},
+                    "event": {
+                        "type": "object",
+                        "properties": {"order": {"type": "integer"}},
+                        "required": ["order"],
+                        "additionalProperties": false
+                    }
+                }
+            }
         }))
         .unwrap();
         fs::write(package.join("ui/index.js"), entrypoint).unwrap();

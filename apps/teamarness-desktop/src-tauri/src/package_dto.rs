@@ -166,6 +166,13 @@ impl From<UiEventNotification> for UiEventDto {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum UiStreamMessageDto {
+    Event(UiEventDto),
+    Failure(crate::package_error::PackageBridgeError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStateNotificationDto {

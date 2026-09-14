@@ -37,7 +37,11 @@ export type SubscriptionInput = Readonly<{
 export interface PackageTransport {
   request(input: RequestInput): Promise<PackageValue>;
   cancelRequest(input: Readonly<{ mount: string; request: string }>): Promise<void>;
-  openSubscription(input: SubscriptionInput, deliver: (event: UiEvent) => void): Promise<void>;
+  openSubscription(
+    input: SubscriptionInput,
+    deliver: (event: UiEvent) => void,
+    terminate: () => void,
+  ): Promise<void>;
   acknowledgeEvents(input: Readonly<{ mount: string; subscription: string; throughSequence: string }>): Promise<void>;
   closeSubscription(input: Readonly<{ mount: string; subscription: string }>): Promise<void>;
   reportUiFault(input: Readonly<{ mount: string; code: "ui_exception" }>): Promise<void>;
@@ -123,6 +127,7 @@ export function createPackageClient(
       if (disposed) throw new Error("Package UI mount is closed");
       const subscription = `subscription-${nextSubscription++}`;
       let closed = false;
+      let failed = false;
       let delivery = Promise.resolve();
 
       const close = async (): Promise<void> => {
@@ -134,11 +139,14 @@ export function createPackageClient(
       subscriptions.add(close);
 
       const fail = async (): Promise<void> => {
+        if (failed) return;
+        failed = true;
         try {
           await close();
-        } finally {
-          await transport.reportUiFault({ mount, code: "ui_exception" });
+        } catch {
+          // The host may already have closed a terminal stream.
         }
+        await transport.reportUiFault({ mount, code: "ui_exception" });
       };
 
       await transport.openSubscription(
@@ -159,6 +167,10 @@ export function createPackageClient(
               });
             }
           }).catch(fail);
+        },
+        () => {
+          if (closed) return;
+          delivery = delivery.then(fail, fail);
         },
       );
       return Object.freeze({ close });
@@ -181,8 +193,14 @@ export function createTauriPackageTransport(
   const transport: PackageTransport = {
     request: async (input) => call<PackageValue>("package_request", input),
     cancelRequest: async (input) => { await call("package_cancel_request", input); },
-    openSubscription: async (input, deliver) => {
-      const onEvent = makeChannel(deliver);
+    openSubscription: async (input, deliver, terminate) => {
+      type StreamMessage =
+        | Readonly<{ kind: "event"; value: UiEvent }>
+        | Readonly<{ kind: "failure"; value: unknown }>;
+      const onEvent = makeChannel<StreamMessage>((message) => {
+        if (message.kind === "event") deliver(message.value);
+        else terminate();
+      });
       await call("package_open_stream", { ...input, onEvent });
     },
     acknowledgeEvents: async (input) => { await call("package_acknowledge_events", input); },

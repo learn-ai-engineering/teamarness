@@ -114,6 +114,29 @@ describe("generic Package UI mount", () => {
     expect(test.calls).not.toContain("recover");
   });
 
+  it("surfaces a terminal Backend stream failure to the mount owner", async () => {
+    const test = harness();
+    let terminate: (() => void) | undefined;
+    test.bridge.transport.openSubscription = async (_input, _deliver, onFailure) => {
+      terminate = onFailure;
+    };
+    const controller = new PackageMountController(test.bridge, test.dom, async () => ({
+      mount: async ({ client }) => {
+        await client.subscribe("fixture.changes", {}, async () => undefined);
+        return async () => undefined;
+      },
+    }));
+    let failures = 0;
+    await controller.mount(instance, {}, () => { failures += 1; });
+
+    terminate?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(failures).toBe(1);
+    expect(test.calls).toContain("fault:mount-1");
+    expect(test.calls).not.toContain("recover");
+  });
+
   it("reports import and attributed UI failures without recovering the Backend", async () => {
     const test = harness();
     let attributedFault: (() => void) | undefined;

@@ -18,7 +18,7 @@ export interface PackageSnapshotBridge {
 }
 
 interface MountController {
-  mount(instance: PackageInstanceKey, target: unknown): Promise<unknown>;
+  mount(instance: PackageInstanceKey, target: unknown, onFailure: () => void): Promise<unknown>;
   unmount(): Promise<void>;
   recoverBackend(instance: PackageInstanceKey): Promise<void>;
 }
@@ -52,10 +52,16 @@ export class PackageShell {
 
   private async loadSelected(): Promise<void> {
     if (!this.selected) return;
-    try {
-      await this.mounts.mount(this.selected, this.view.mountTarget);
-    } catch {
+    let failureShown = false;
+    const showFailure = (): void => {
+      if (failureShown) return;
+      failureShown = true;
       this.view.showFailure(this.actions());
+    };
+    try {
+      await this.mounts.mount(this.selected, this.view.mountTarget, showFailure);
+    } catch {
+      showFailure();
     }
   }
 }

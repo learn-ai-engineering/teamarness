@@ -84,28 +84,44 @@ export class PackageMountController {
     private readonly load: PackageModuleLoader = loadModule,
   ) {}
 
-  public mount(instance: PackageInstanceKey, target: unknown): Promise<MountedPackageUi> {
-    const operation = this.transition.then(() => this.mountNow(instance, target));
+  public mount(
+    instance: PackageInstanceKey,
+    target: unknown,
+    onFailure: () => void = () => undefined,
+  ): Promise<MountedPackageUi> {
+    const operation = this.transition.then(() => this.mountNow(instance, target, onFailure));
     this.transition = operation.then(() => undefined, () => undefined);
     return operation;
   }
 
-  private async mountNow(instance: PackageInstanceKey, target: unknown): Promise<MountedPackageUi> {
+  private async mountNow(
+    instance: PackageInstanceKey,
+    target: unknown,
+    onFailure: () => void,
+  ): Promise<MountedPackageUi> {
     await this.current?.unmount();
     const opened = await this.bridge.openMount(instance);
     const domLease = this.dom.create(target);
     domLease.setThemeTokens(THEME_TOKENS);
     const moduleUrl = resourceUrl(opened);
-    const scopedClient = createPackageClient(opened.mount, this.bridge.transport);
     let packageUnmount: PackageUnmount = () => undefined;
     let closed = false;
     let faultReported = false;
 
-    const reportFault = (): void => {
+    const recordFault = async (): Promise<void> => {
       if (faultReported || closed) return;
       faultReported = true;
-      void this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
+      try {
+        await this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
+      } finally {
+        onFailure();
+      }
     };
+    const reportFault = (): void => { void recordFault().catch(() => undefined); };
+    const scopedClient = createPackageClient(opened.mount, Object.freeze({
+      ...this.bridge.transport,
+      reportUiFault: async () => { await recordFault(); },
+    }));
     const stopWatching = this.dom.watchErrors(moduleUrl, reportFault);
 
     const mounted: MountedPackageUi = Object.freeze({
@@ -145,10 +161,7 @@ export class PackageMountController {
       if (typeof packageUnmount !== "function") throw new Error("Package UI mount did not return an unmount function");
       return mounted;
     } catch (error) {
-      if (!faultReported) {
-        faultReported = true;
-        await this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
-      }
+      await recordFault();
       await mounted.unmount();
       throw error;
     }

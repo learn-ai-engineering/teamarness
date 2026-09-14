@@ -1,5 +1,11 @@
+import type { Channel } from "@tauri-apps/api/core";
 import { describe, expect, it } from "vitest";
-import { createPackageClient, type PackageTransport, type UiEvent } from "./index";
+import {
+  createPackageClient,
+  createTauriPackageTransport,
+  type PackageTransport,
+  type UiEvent,
+} from "./index";
 
 function deferred(): { promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } {
   let resolve: () => void = () => {};
@@ -8,11 +14,20 @@ function deferred(): { promise: Promise<void>; resolve: () => void; reject: (rea
   return { promise, resolve, reject };
 }
 
-function fakeTransport(log: string[]): PackageTransport & { deliver?: (event: UiEvent) => void } {
-  const transport: PackageTransport & { deliver?: (event: UiEvent) => void } = {
+function fakeTransport(log: string[]): PackageTransport & {
+  deliver?: (event: UiEvent) => void;
+  terminate?: () => void;
+} {
+  const transport: PackageTransport & {
+    deliver?: (event: UiEvent) => void;
+    terminate?: () => void;
+  } = {
     request: async () => ({ ok: true }),
     cancelRequest: async () => { log.push("cancel"); },
-    openSubscription: async (_input, deliver) => { transport.deliver = deliver; },
+    openSubscription: async (_input, deliver, terminate) => {
+      transport.deliver = deliver;
+      transport.terminate = terminate;
+    },
     acknowledgeEvents: async ({ throughSequence }) => { log.push(`ack:${throughSequence}`); },
     closeSubscription: async () => { log.push("close"); },
     reportUiFault: async () => { log.push("fault"); },
@@ -62,6 +77,37 @@ describe("mount-scoped Package client", () => {
     transport.deliver?.({ mount: "mount-1", subscription: "subscription-1", sequence: "1", payload: {} });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(log).toEqual(["close", "fault"]);
+  });
+
+  it("turns a terminal Backend stream failure into mount failure without acknowledgement", async () => {
+    const log: string[] = [];
+    const transport = fakeTransport(log);
+    const { client } = createPackageClient("mount-1", transport);
+    await client.subscribe("fixture.changes", {}, async () => { log.push("listen"); });
+    transport.terminate?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(log).toEqual(["close", "fault"]);
+  });
+
+  it("maps a terminal Tauri stream message to termination rather than delivery", async () => {
+    let receive: ((message: unknown) => void) | undefined;
+    const transport = createTauriPackageTransport(
+      async () => undefined as never,
+      <T>(handler: (message: T) => void): Channel<T> => {
+        receive = (message) => { handler(message as T); };
+        return {} as Channel<T>;
+      },
+    );
+    const log: string[] = [];
+
+    await transport.openSubscription(
+      { mount: "mount-1", subscription: "subscription-1", operation: "fixture.changes", payload: {} },
+      () => { log.push("deliver"); },
+      () => { log.push("terminate"); },
+    );
+    receive?.({ kind: "failure", value: { code: "event_lagged" } });
+
+    expect(log).toEqual(["terminate"]);
   });
 
   it("makes subscription and mount cleanup idempotent", async () => {
