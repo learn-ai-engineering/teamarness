@@ -1,6 +1,6 @@
 # Teamarness
 
-Teamarness is a local-first, peer-to-peer team workspace. The current Phase 2 application combines a Rust Core Runtime with a small Tauri shell for creating a Workspace and admitting another Installation through an opaque copied invitation.
+Teamarness is a local-first, peer-to-peer team workspace. The desktop combines a Rust Core Runtime, a Tauri Shell, and supervised Package Backends. It can create a Workspace, admit another Installation through an opaque copied invitation, and run the same Package Directory from the application bundle or an explicit installation-local registration.
 
 ## Prerequisites
 
@@ -23,12 +23,12 @@ npm --version
 From a fresh clone, install the locked JavaScript dependency graph and fetch the locked Rust dependencies:
 
 ```sh
-npm install
+npm ci
 cargo fetch --locked
 cargo build --workspace --locked
 ```
 
-Use `npm ci` instead of `npm install` in a clean or automated environment when the committed `package-lock.json` must be reproduced exactly. Both Cargo and npm lockfiles are committed.
+Both Cargo and npm lockfiles are committed. Direct third-party dependencies use exact versions.
 
 ## Development
 
@@ -94,6 +94,14 @@ The default outputs are:
 
 These artifacts are for local verification. Signing, notarization, distribution, auto-update, tray, and native-menu infrastructure are intentionally out of scope.
 
+After the bundle command succeeds, run the automated packaged-app smoke on Apple silicon macOS:
+
+```sh
+npm run verify:packaged-app
+```
+
+The smoke mounts the DMG for inspection, launches the `.app` twice with private temporary data, creates a Workspace, selects the bundled reference Package through macOS accessibility, checks its admitted UI and protocol response, and verifies process-group reaping after each graceful exit. It requires Accessibility permission for the launching terminal. The developer-owned app and DMG walkthroughs remain separate Verify checks.
+
 To run two packaged Installations with separate absolute directories, launch the application bundle twice:
 
 ```sh
@@ -102,6 +110,19 @@ open -n target/release/bundle/macos/Teamarness.app --args --data-dir /absolute/p
 ```
 
 Invitation values are sensitive bearer admission material. Do not store them, private keys, raw secret bytes, or private database contents in logs or verification notes.
+
+## Package development
+
+Read the [Package author guide](docs/package-author-guide.md) to construct a Package Directory, build its Backend executable and ESM UI, declare a manifest and UI contract, and promote tested bytes into application distribution. Read [Local Package registration](docs/local-package-registration.md) for the owner-only registration file, explicit bundled override, restart rules, digest invalidation, and Package Data Directory continuity.
+
+The protocol and supported Rust tooling have separate contracts:
+
+- [`contracts/package-process/v1/README.md`](contracts/package-process/v1/README.md) is the normative language-neutral process protocol.
+- [`crates/teamarness-package-protocol/README.md`](crates/teamarness-package-protocol/README.md) describes its Rust adapter.
+- [`crates/teamarness-package-host/README.md`](crates/teamarness-package-host/README.md) describes the host facade and lifecycle.
+- [`crates/teamarness-package-sdk/README.md`](crates/teamarness-package-sdk/README.md) describes the Rust Backend SDK.
+
+Package trust is broad. Package Processes have the current user's ambient filesystem, network, and process authority. Process separation is a recovery boundary, not a sandbox. A same-webview Package UI shares DOM and known Tauri-command authority with the Shell. Its Shadow Root provides style locality, not a security boundary. Only install or bundle Package code you trust.
 
 ## Core Runtime behavior
 
@@ -113,5 +134,7 @@ The runtime exclusively owns one private `core.sqlite3`. Uncertain commit outcom
 
 - `context/` is the canonical requirements, ontology, roadmap, and decision tree.
 - `crates/teamarness-core/` contains the Core Runtime library, API documentation, and tests.
-- `apps/teamarness-desktop/` contains the typed Tauri adapter and minimal TypeScript shell.
+- `crates/teamarness-package-host/`, `crates/teamarness-package-protocol/`, and `crates/teamarness-package-sdk/` contain the Package runtime and supported Rust tooling.
+- `packages/reference-package/` is the bundled reference Package and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
+- `apps/teamarness-desktop/` contains the typed Tauri adapter and Shell.
 - `p2p-local-first-user-management.md` is the supporting P2P membership research baseline.
