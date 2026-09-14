@@ -423,6 +423,7 @@ fn normalized_relative_path(value: &str) -> Result<PathBuf, ManifestFailure> {
     if value.is_empty()
         || value.starts_with('/')
         || value.ends_with('/')
+        || value.contains('\\')
         || value.contains("//")
         || value
             .split('/')

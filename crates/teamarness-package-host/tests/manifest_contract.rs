@@ -239,6 +239,7 @@ fn paths_symlinks_sizes_digests_and_media_types_are_rejected() {
         "/absolute",
         "../escape",
         "ui/./index.js",
+        "ui\\index.js",
         "ui//index.js",
         "ui/",
     ] {

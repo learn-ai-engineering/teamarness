@@ -121,22 +121,10 @@ export class BrowserPackageShellView implements PackageShellView {
     }
     const lifecycleActions = document.createElement("div");
     lifecycleActions.className = "actions";
-    const reload = document.createElement("button");
-    reload.type = "button";
-    reload.textContent = "Reload UI";
-    reload.addEventListener("click", () => { void actions.reloadUi(); });
-    const suspend = document.createElement("button");
-    suspend.type = "button";
-    suspend.textContent = "Suspend";
-    suspend.addEventListener("click", () => { void actions.suspendBackend(); });
-    const recover = document.createElement("button");
-    recover.type = "button";
-    recover.textContent = "Recover Backend";
-    recover.addEventListener("click", () => { void actions.recoverBackend(); });
-    const dispose = document.createElement("button");
-    dispose.type = "button";
-    dispose.textContent = "Dispose";
-    dispose.addEventListener("click", () => { void actions.disposeBackend(); });
+    const reload = actionButton("Reload UI", () => { void actions.reloadUi(); });
+    const suspend = actionButton("Suspend", () => { void actions.suspendBackend(); });
+    const recover = actionButton("Recover Backend", () => { void actions.recoverBackend(); });
+    const dispose = actionButton("Dispose", () => { void actions.disposeBackend(); });
     lifecycleActions.append(reload, suspend, recover, dispose);
     this.navigation.replaceChildren(title, list, lifecycleActions);
   }
@@ -146,16 +134,18 @@ export class BrowserPackageShellView implements PackageShellView {
     alert.className = "error";
     alert.role = "alert";
     alert.textContent = "This Package interface failed.";
-    const reload = document.createElement("button");
-    reload.type = "button";
-    reload.textContent = "Reload UI";
-    reload.addEventListener("click", () => { void actions.reloadUi(); });
-    const recover = document.createElement("button");
-    recover.type = "button";
-    recover.textContent = "Recover Backend";
-    recover.addEventListener("click", () => { void actions.recoverBackend(); });
+    const reload = actionButton("Reload UI", () => { void actions.reloadUi(); });
+    const recover = actionButton("Recover Backend", () => { void actions.recoverBackend(); });
     this.mountTarget.replaceChildren(alert, reload, recover);
   }
+}
+
+function actionButton(label: string, action: () => void): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.addEventListener("click", action);
+  return button;
 }
 
 export function createPackageShell(

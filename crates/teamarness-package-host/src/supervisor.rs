@@ -98,21 +98,38 @@ pub(crate) async fn spawn(
         .stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
     command.as_std_mut().process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| WireFailure::new(PackageErrorCode::SpawnFailed))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| WireFailure::new(PackageErrorCode::SpawnFailed))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| WireFailure::new(PackageErrorCode::SpawnFailed))?;
-    if let Some(stderr) = child.stderr.take() {
+    let child = match command.spawn() {
+        Ok(child) => Arc::new(Mutex::new(child)),
+        Err(_) => return Err(WireFailure::new(PackageErrorCode::SpawnFailed)),
+    };
+    let pid = match child.lock().await.id() {
+        Some(pid) => pid,
+        None => {
+            cleanup_failed_spawn(&child, spec, None).await;
+            return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
+        }
+    };
+    let stdin = {
+        let mut child = child.lock().await;
+        child.stdin.take()
+    };
+    let Some(stdin) = stdin else {
+        cleanup_failed_spawn(&child, spec, None).await;
+        return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
+    };
+    let stdout = {
+        let mut child = child.lock().await;
+        child.stdout.take()
+    };
+    let Some(stdout) = stdout else {
+        cleanup_failed_spawn(&child, spec, None).await;
+        return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
+    };
+    let stderr = {
+        let mut child = child.lock().await;
+        child.stderr.take()
+    };
+    if let Some(stderr) = stderr {
         tokio::spawn(capture_stderr(
             stderr,
             spec.template.private_data_directory.clone(),
@@ -126,26 +143,43 @@ pub(crate) async fn spawn(
     let start_time = observed_start_time(pid)
         .await
         .unwrap_or_else(|| "unknown".into());
+    let process_group = match i32::try_from(pid) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            cleanup_failed_spawn(&child, spec, None).await;
+            return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
+        }
+    };
     let lease = ProcessLease {
         package_identity: spec.template.package_identity.to_string(),
         workspace_id: spec.workspace_id.to_string(),
         process_generation: generation,
         pid,
-        process_group: i32::try_from(pid)
-            .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?,
+        process_group,
         start_time,
         canonical_executable: executable.to_string_lossy().into_owned(),
         executable_digest: spec.template.backend_digest.clone(),
         launch_token: launch_token.clone(),
     };
-    HostStore::open(&spec.template.private_data_directory)
+    if HostStore::open(&spec.template.private_data_directory)
         .and_then(|store| store.record_process_lease(&lease))
-        .map_err(|_| WireFailure::new(PackageErrorCode::DataDirectoryUnavailable))?;
+        .is_err()
+    {
+        cleanup_failed_spawn(&child, spec, None).await;
+        return Err(WireFailure::new(PackageErrorCode::DataDirectoryUnavailable));
+    }
 
     let client = protocol::start_with_capabilities(stdout, stdin, capabilities.clone());
     let initialize = initialize_frame(spec, generation, &launch_token, &capabilities);
-    let initialized = client.initialize(initialize).await?;
+    let initialized = match client.initialize(initialize).await {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            cleanup_failed_spawn(&child, spec, Some(&lease)).await;
+            return Err(error);
+        }
+    };
     if !handshake_matches(&initialized, spec, generation, &launch_token) {
+        cleanup_failed_spawn(&child, spec, Some(&lease)).await;
         return Err(WireFailure::new(PackageErrorCode::HandshakeMismatch));
     }
     let operation = if recovering {
@@ -153,7 +187,7 @@ pub(crate) async fn spawn(
     } else {
         "lifecycle.activate"
     };
-    client
+    if let Err(error) = client
         .request(
             format!("h:{operation}-{generation}"),
             operation,
@@ -162,8 +196,11 @@ pub(crate) async fn spawn(
             Duration::from_secs(30),
             true,
         )
-        .await?;
-    let child = Arc::new(Mutex::new(child));
+        .await
+    {
+        cleanup_failed_spawn(&child, spec, Some(&lease)).await;
+        return Err(error);
+    }
     let health_client = client.clone();
     let health_child = child.clone();
     let health = tokio::spawn(async move {
@@ -296,6 +333,23 @@ async fn wait_for_exit(child: &Mutex<Child>, duration: Duration) -> bool {
     }
 }
 
+async fn cleanup_failed_spawn(
+    child: &Arc<Mutex<Child>>,
+    spec: &ProcessSpec,
+    lease: Option<&ProcessLease>,
+) {
+    terminate_group(child.lock().await.id(), false);
+    if !wait_for_exit(child, Duration::from_secs(2)).await {
+        terminate_group(child.lock().await.id(), true);
+        let _ = child.lock().await.wait().await;
+    }
+    if let Some(lease) = lease {
+        if let Ok(store) = HostStore::open(&spec.template.private_data_directory) {
+            let _ = store.delete_process_lease(&lease.package_identity, &lease.workspace_id);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn terminate_group(pid: Option<u32>, force: bool) {
     use nix::sys::signal::{Signal, killpg};
@@ -309,6 +363,69 @@ fn terminate_group(pid: Option<u32>, force: bool) {
                 Signal::SIGTERM
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_handshake_reaps_the_process_group_and_removes_the_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let data = root.path().join("data");
+        let backend_path = root.path().join("backend/orphan.sh");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(backend_path.parent().unwrap()).unwrap();
+        let backend = b"#!/bin/sh\nsleep 60 &\nprintf '\\000\\000\\000\\001{'\n".to_vec();
+        std::fs::write(&backend_path, &backend).unwrap();
+        std::fs::set_permissions(&backend_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let core = std::sync::Arc::new(
+            teamarness_core::CoreRuntime::open(teamarness_core::CoreRuntimeConfig::new(
+                root.path().join("core"),
+            ))
+            .await
+            .unwrap(),
+        );
+        let spec = ProcessSpec {
+            template: ProcessTemplate {
+                package_identity: "dev.teamarness.orphan".parse().unwrap(),
+                package_version: "1.0.0".into(),
+                manifest_digest: "a".repeat(64),
+                backend_digest: sha256(&backend),
+                ui_contract_digest: "c".repeat(64),
+                backend_path,
+                private_data_directory: private.clone(),
+                source_label: "bundled".into(),
+                trust_label: "application_bundled".into(),
+                protocol: (1, 0),
+                capabilities: vec![],
+            },
+            workspace_id: WorkspaceId::new("00112233445566778899aabbccddeeff").unwrap(),
+            workspace_name: "Orphan test".into(),
+            installation: InstallationPublicIdentity::new(core.public_identity().to_string())
+                .unwrap(),
+            data_directory: data.clone(),
+            continuity_id: "continuity".into(),
+            core,
+        };
+
+        let error = match spawn(&spec, 1, false).await {
+            Ok(_) => panic!("malformed handshake unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, PackageErrorCode::ProtocolViolation);
+        let lease_count: i64 =
+            rusqlite::Connection::open(private.join("packages/package-host.sqlite3"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM process_leases", [], |row| row.get(0))
+                .unwrap();
+        assert_eq!(lease_count, 0);
     }
 }
 

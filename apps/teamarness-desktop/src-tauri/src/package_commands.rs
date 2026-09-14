@@ -225,19 +225,36 @@ pub async fn package_close_stream(
     Ok(())
 }
 
+async fn run_package_lifecycle(
+    instance: PackageInstanceKeyDto,
+    state: State<'_, DesktopState>,
+    command: fn(PackageInstanceKey) -> PackageHostCommand,
+    remove_tokens: bool,
+) -> Result<(), PackageBridgeError> {
+    let instance = parse_instance(instance)?;
+    state
+        .package_host()?
+        .execute(command(instance.clone()))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    if remove_tokens {
+        state.remove_instance_tokens(&instance).await;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn package_suspend(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let instance = parse_instance(instance)?;
-    state.remove_instance_tokens(&instance).await;
-    state
-        .package_host()?
-        .execute(PackageHostCommand::Suspend(SuspendPackage { instance }))
-        .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+    run_package_lifecycle(
+        instance,
+        state,
+        |instance| PackageHostCommand::Suspend(SuspendPackage { instance }),
+        false,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -245,14 +262,13 @@ pub async fn package_recover(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let instance = parse_instance(instance)?;
-    state.remove_instance_tokens(&instance).await;
-    state
-        .package_host()?
-        .execute(PackageHostCommand::Recover(RecoverPackage { instance }))
-        .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+    run_package_lifecycle(
+        instance,
+        state,
+        |instance| PackageHostCommand::Recover(RecoverPackage { instance }),
+        false,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -260,14 +276,13 @@ pub async fn package_dispose(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let instance = parse_instance(instance)?;
-    state.remove_instance_tokens(&instance).await;
-    state
-        .package_host()?
-        .execute(PackageHostCommand::Dispose(DisposePackage { instance }))
-        .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+    run_package_lifecycle(
+        instance,
+        state,
+        |instance| PackageHostCommand::Dispose(DisposePackage { instance }),
+        true,
+    )
+    .await
 }
 
 #[tauri::command]

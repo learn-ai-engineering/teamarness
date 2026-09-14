@@ -956,19 +956,10 @@ impl PackageHost {
                 }
                 let (key, actor) = prepare_instance(&config, &core, template, workspace).await?;
                 if let Err(failure) = actor.activate().await {
-                    let stage = if matches!(
-                        failure.code,
-                        PackageErrorCode::CapabilityUnavailable
-                            | PackageErrorCode::CapabilityVersionUnsupported
-                            | PackageErrorCode::CapabilityRequestInvalid
-                    ) {
-                        PackageErrorStage::Capability
-                    } else {
-                        PackageErrorStage::Process
-                    };
-                    let mut error = host_error(failure.code, stage);
-                    error.affected_instance = Some(key.clone());
-                    report.snapshot.diagnostics.push(error);
+                    report
+                        .snapshot
+                        .diagnostics
+                        .push(activation_error(&failure, &key));
                 }
                 instances.insert(key, actor);
             }
@@ -1105,19 +1096,12 @@ impl PackageHost {
                         )
                         .await?;
                         if let Err(failure) = actor.activate().await {
-                            let stage = if matches!(
-                                failure.code,
-                                PackageErrorCode::CapabilityUnavailable
-                                    | PackageErrorCode::CapabilityVersionUnsupported
-                                    | PackageErrorCode::CapabilityRequestInvalid
-                            ) {
-                                PackageErrorStage::Capability
-                            } else {
-                                PackageErrorStage::Process
-                            };
-                            let mut error = host_error(failure.code, stage);
-                            error.affected_instance = Some(key.clone());
-                            self.inner.data.lock().await.diagnostics.push(error);
+                            self.inner
+                                .data
+                                .lock()
+                                .await
+                                .diagnostics
+                                .push(activation_error(&failure, &key));
                         }
                         self.inner.data.lock().await.instances.insert(key, actor);
                     }
@@ -1588,6 +1572,25 @@ fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorE
         recovery,
         DiagnosticId::new(format!("diag-{text}")).expect("hex diagnostic ID"),
     )
+}
+
+fn activation_error(
+    failure: &protocol::WireFailure,
+    instance: &PackageInstanceKey,
+) -> PackageErrorEnvelope {
+    let stage = if matches!(
+        failure.code,
+        PackageErrorCode::CapabilityUnavailable
+            | PackageErrorCode::CapabilityVersionUnsupported
+            | PackageErrorCode::CapabilityRequestInvalid
+    ) {
+        PackageErrorStage::Capability
+    } else {
+        PackageErrorStage::Process
+    };
+    let mut error = host_error(failure.code, stage);
+    error.affected_instance = Some(instance.clone());
+    error
 }
 
 fn instance_error(
