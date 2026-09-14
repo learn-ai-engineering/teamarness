@@ -8,6 +8,7 @@ node_modules/
 
 # Local MyFlow planning and implementation artifacts
 /.myflow/
+.ignore
 
 # Local editor and operating-system files
 .DS_Store
