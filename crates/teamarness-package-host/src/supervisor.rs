@@ -55,6 +55,7 @@ pub(crate) struct ProcessGeneration {
     pub(crate) generation: u64,
     pub(crate) client: ProcessClient,
     child: Arc<Mutex<Child>>,
+    process_group: i32,
     package: PackageIdentity,
     workspace: WorkspaceId,
     private_data_directory: PathBuf,
@@ -104,17 +105,18 @@ pub(crate) async fn spawn(
     };
     let pid = match child.lock().await.id() {
         Some(pid) => pid,
-        None => {
-            cleanup_failed_spawn(&child, spec, None).await;
-            return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
-        }
+        None => return Err(WireFailure::new(PackageErrorCode::SpawnFailed)),
+    };
+    let process_group = match i32::try_from(pid) {
+        Ok(process_group) => process_group,
+        Err(_) => return Err(WireFailure::new(PackageErrorCode::SpawnFailed)),
     };
     let stdin = {
         let mut child = child.lock().await;
         child.stdin.take()
     };
     let Some(stdin) = stdin else {
-        cleanup_failed_spawn(&child, spec, None).await;
+        cleanup_failed_spawn(&child, spec, process_group, None).await;
         return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
     };
     let stdout = {
@@ -122,7 +124,7 @@ pub(crate) async fn spawn(
         child.stdout.take()
     };
     let Some(stdout) = stdout else {
-        cleanup_failed_spawn(&child, spec, None).await;
+        cleanup_failed_spawn(&child, spec, process_group, None).await;
         return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
     };
     let stderr = {
@@ -143,13 +145,6 @@ pub(crate) async fn spawn(
     let start_time = observed_start_time(pid)
         .await
         .unwrap_or_else(|| "unknown".into());
-    let process_group = match i32::try_from(pid) {
-        Ok(process_group) => process_group,
-        Err(_) => {
-            cleanup_failed_spawn(&child, spec, None).await;
-            return Err(WireFailure::new(PackageErrorCode::SpawnFailed));
-        }
-    };
     let lease = ProcessLease {
         package_identity: spec.template.package_identity.to_string(),
         workspace_id: spec.workspace_id.to_string(),
@@ -165,7 +160,7 @@ pub(crate) async fn spawn(
         .and_then(|store| store.record_process_lease(&lease))
         .is_err()
     {
-        cleanup_failed_spawn(&child, spec, None).await;
+        cleanup_failed_spawn(&child, spec, process_group, None).await;
         return Err(WireFailure::new(PackageErrorCode::DataDirectoryUnavailable));
     }
 
@@ -174,12 +169,12 @@ pub(crate) async fn spawn(
     let initialized = match client.initialize(initialize).await {
         Ok(initialized) => initialized,
         Err(error) => {
-            cleanup_failed_spawn(&child, spec, Some(&lease)).await;
+            cleanup_failed_spawn(&child, spec, process_group, Some(&lease)).await;
             return Err(error);
         }
     };
     if !handshake_matches(&initialized, spec, generation, &launch_token) {
-        cleanup_failed_spawn(&child, spec, Some(&lease)).await;
+        cleanup_failed_spawn(&child, spec, process_group, Some(&lease)).await;
         return Err(WireFailure::new(PackageErrorCode::HandshakeMismatch));
     }
     let operation = if recovering {
@@ -198,16 +193,16 @@ pub(crate) async fn spawn(
         )
         .await
     {
-        cleanup_failed_spawn(&child, spec, Some(&lease)).await;
+        cleanup_failed_spawn(&child, spec, process_group, Some(&lease)).await;
         return Err(error);
     }
     let health_client = client.clone();
-    let health_child = child.clone();
+    let health_process_group = process_group;
     let health = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             if health_client.health_probe().await.is_err() {
-                terminate_group(health_child.lock().await.id(), false);
+                terminate_group(health_process_group, false);
                 return;
             }
         }
@@ -216,6 +211,7 @@ pub(crate) async fn spawn(
         generation,
         client,
         child,
+        process_group,
         package: spec.template.package_identity.clone(),
         workspace: spec.workspace_id.clone(),
         private_data_directory: spec.template.private_data_directory.clone(),
@@ -291,25 +287,13 @@ impl ProcessGeneration {
     pub(crate) async fn shutdown(&self) {
         self.health.abort();
         self.client.shutdown().await;
-        if wait_for_exit(&self.child, Duration::from_secs(2)).await {
-            self.remove_lease();
-            return;
-        }
-        terminate_group(self.child.lock().await.id(), false);
-        if !wait_for_exit(&self.child, Duration::from_secs(2)).await {
-            terminate_group(self.child.lock().await.id(), true);
-            let _ = self.child.lock().await.wait().await;
-        }
+        stop_process_group(&self.child, self.process_group).await;
         self.remove_lease();
     }
 
     pub(crate) async fn terminate(&self) {
         self.health.abort();
-        terminate_group(self.child.lock().await.id(), false);
-        if !wait_for_exit(&self.child, Duration::from_secs(2)).await {
-            terminate_group(self.child.lock().await.id(), true);
-            let _ = self.child.lock().await.wait().await;
-        }
+        stop_process_group(&self.child, self.process_group).await;
         self.remove_lease();
     }
 
@@ -333,37 +317,46 @@ async fn wait_for_exit(child: &Mutex<Child>, duration: Duration) -> bool {
     }
 }
 
+async fn stop_process_group(child: &Mutex<Child>, process_group: i32) {
+    terminate_group(process_group, false);
+    let leader_exited = wait_for_exit(child, Duration::from_secs(2)).await;
+    // The leader may have exited while descendants remained in its process group.
+    terminate_group(process_group, false);
+    terminate_group(process_group, true);
+    if !leader_exited {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = child.lock().await.wait().await;
+        })
+        .await;
+    }
+}
+
 async fn cleanup_failed_spawn(
     child: &Arc<Mutex<Child>>,
     spec: &ProcessSpec,
+    process_group: i32,
     lease: Option<&ProcessLease>,
 ) {
-    terminate_group(child.lock().await.id(), false);
-    if !wait_for_exit(child, Duration::from_secs(2)).await {
-        terminate_group(child.lock().await.id(), true);
-        let _ = child.lock().await.wait().await;
-    }
-    if let Some(lease) = lease {
-        if let Ok(store) = HostStore::open(&spec.template.private_data_directory) {
-            let _ = store.delete_process_lease(&lease.package_identity, &lease.workspace_id);
-        }
+    stop_process_group(child, process_group).await;
+    if let Some(lease) = lease
+        && let Ok(store) = HostStore::open(&spec.template.private_data_directory)
+    {
+        let _ = store.delete_process_lease(&lease.package_identity, &lease.workspace_id);
     }
 }
 
 #[cfg(unix)]
-fn terminate_group(pid: Option<u32>, force: bool) {
+fn terminate_group(process_group: i32, force: bool) {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
-    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-        let _ = killpg(
-            Pid::from_raw(pid),
-            if force {
-                Signal::SIGKILL
-            } else {
-                Signal::SIGTERM
-            },
-        );
-    }
+    let _ = killpg(
+        Pid::from_raw(process_group),
+        if force {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGTERM
+        },
+    );
 }
 
 #[cfg(test)]
@@ -548,9 +541,9 @@ pub(crate) fn reconcile_orphans(private: &Path) -> Result<Vec<ProcessLease>, Pac
         match evidence {
             LeaseEvidence::Gone | LeaseEvidence::Exact => {
                 if matches!(evidence, LeaseEvidence::Exact) {
-                    terminate_group(Some(lease.pid), false);
+                    terminate_group(lease.process_group, false);
                     std::thread::sleep(Duration::from_millis(100));
-                    terminate_group(Some(lease.pid), true);
+                    terminate_group(lease.process_group, true);
                 }
                 store
                     .delete_process_lease(&lease.package_identity, &lease.workspace_id)

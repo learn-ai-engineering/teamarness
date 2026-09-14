@@ -217,6 +217,30 @@ fn each_invalid_source_isolated_from_an_unrelated_valid_identity() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_registration_symlink_is_reported_instead_of_silent_bundled_fallback() {
+    let fixture = Fixture::new();
+    fixture.add_application("reference", "dev.teamarness.reference", "1.0.0");
+    let registration = fixture.private.join("packages/registrations.v1.json");
+    symlink(
+        fixture.root.path().join("missing-registrations"),
+        registration,
+    )
+    .unwrap();
+
+    let report = admission::admit(&fixture.config()).unwrap();
+
+    assert!(package_ids(&report).contains(&"dev.teamarness.reference".to_owned()));
+    assert!(
+        report
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|error| error.code == PackageErrorCode::InvalidRegistration)
+    );
+}
+
 #[test]
 fn registration_metadata_policy_rejects_wrong_owner_permissions_and_symlinks() {
     use catalog::RegistrationFileKind;

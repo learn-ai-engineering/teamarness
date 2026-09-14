@@ -102,10 +102,11 @@ pub(crate) fn installation_registrations(
     let path = config
         .private_data_directory()
         .join("packages/registrations.v1.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let metadata = fs::symlink_metadata(&path).map_err(|_| invalid_registration())?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(invalid_registration()),
+    };
     let expected_owner = fs::metadata(config.private_data_directory())
         .map_err(|_| invalid_registration())?
         .uid();
