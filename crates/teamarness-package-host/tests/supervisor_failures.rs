@@ -72,6 +72,56 @@ async fn package_error_preserves_generation_and_unrelated_instance() {
 }
 
 #[tokio::test]
+async fn lifecycle_error_fails_without_automatic_restarts_or_cross_instance_effects() {
+    let fixture = common::Fixture::node(&[
+        ("failing", "dev.teamarness.lifecycle-error"),
+        ("healthy", "dev.teamarness.healthy"),
+    ])
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let initial = host.snapshot().await;
+    let failing = initial
+        .instances
+        .iter()
+        .find(|item| item.key.package_identity.as_str() == "dev.teamarness.lifecycle-error")
+        .unwrap();
+    let healthy = initial
+        .instances
+        .iter()
+        .find(|item| item.key.package_identity.as_str() == "dev.teamarness.healthy")
+        .unwrap();
+    assert_eq!(failing.lifecycle, LifecycleState::Failed);
+    assert_eq!(failing.process_generation, Some(1));
+    assert_eq!(healthy.lifecycle, LifecycleState::Active);
+    assert_eq!(healthy.process_generation, Some(1));
+
+    let error = host
+        .execute(PackageHostCommand::Recover(RecoverPackage {
+            instance: failing.key.clone(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, PackageErrorCode::BackendError);
+    let after_recovery = host.snapshot().await;
+    let failing_after_recovery = after_recovery
+        .instances
+        .iter()
+        .find(|item| item.key == failing.key)
+        .unwrap();
+    let healthy_after_recovery = after_recovery
+        .instances
+        .iter()
+        .find(|item| item.key == healthy.key)
+        .unwrap();
+    assert_eq!(failing_after_recovery.lifecycle, LifecycleState::Failed);
+    assert_eq!(failing_after_recovery.process_generation, Some(2));
+    assert_eq!(healthy_after_recovery.lifecycle, LifecycleState::Active);
+    assert_eq!(healthy_after_recovery.process_generation, Some(1));
+}
+
+#[tokio::test]
 async fn exit_invalidates_generation_without_replaying_the_request_and_explicit_recovery_works() {
     let fixture = common::Fixture::node(&[("one", "dev.teamarness.one")]).await;
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())

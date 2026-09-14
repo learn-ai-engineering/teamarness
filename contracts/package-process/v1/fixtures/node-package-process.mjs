@@ -248,9 +248,13 @@ async function serve() {
       } else if (frame.kind === "request" && frame.operation.startsWith("lifecycle.")) {
         const operation = frame.operation.slice("lifecycle.".length);
         if (["activate", "recover"].includes(operation) && packageIdentity?.endsWith(".crash")) process.abort();
-        send({ kind: "response", id: frame.id, payload: { state: operation === "recover" ? "active" : operation } });
-        if (operation === "activate" && capabilityGrants.has("teamarness.workspace-context")) {
-          send({ kind: "request", id: "p:fixture-cap", operation: "capability.call", grant: capabilityGrants.get("teamarness.workspace-context"), deadlineUnixMs: frame.deadlineUnixMs, payload: { method: "get" } });
+        if (packageIdentity?.endsWith(".lifecycle-error")) {
+          send({ kind: "error", id: frame.id, code: "fixture.lifecycle", retryable: true, details: {} });
+        } else {
+          send({ kind: "response", id: frame.id, payload: { state: operation === "recover" ? "active" : operation } });
+          if (operation === "activate" && capabilityGrants.has("teamarness.workspace-context")) {
+            send({ kind: "request", id: "p:fixture-cap", operation: "capability.call", grant: capabilityGrants.get("teamarness.workspace-context"), deadlineUnixMs: frame.deadlineUnixMs, payload: { method: "get" } });
+          }
         }
       } else if ((frame.kind === "response" || frame.kind === "error") && pendingCapabilityCalls.has(frame.id)) {
         const requestId = pendingCapabilityCalls.get(frame.id);

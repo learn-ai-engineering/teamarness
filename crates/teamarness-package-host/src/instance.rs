@@ -686,6 +686,7 @@ fn deterministic(code: PackageErrorCode) -> bool {
     matches!(
         code,
         PackageErrorCode::ArtifactChanged
+            | PackageErrorCode::BackendError
             | PackageErrorCode::HandshakeMismatch
             | PackageErrorCode::ProtocolViolation
             | PackageErrorCode::MalformedFrame
