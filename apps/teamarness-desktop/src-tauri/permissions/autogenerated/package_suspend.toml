@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-suspend"
+description = "Enables the package_suspend command without any pre-configured scope."
+commands.allow = ["package_suspend"]
+
+[[permission]]
+identifier = "deny-package-suspend"
+description = "Denies the package_suspend command without any pre-configured scope."
+commands.deny = ["package_suspend"]

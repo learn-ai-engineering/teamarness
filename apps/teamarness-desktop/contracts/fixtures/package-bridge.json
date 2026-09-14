@@ -1,0 +1,34 @@
+{
+  "snapshot": {
+    "revision": 7,
+    "state": "running",
+    "packages": [{
+      "identity": "com.example.fixture",
+      "version": "1.0.0",
+      "displayName": "Fixture",
+      "source": "bundled",
+      "trust": "application_bundled",
+      "uiContractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }],
+    "instances": [{
+      "key": {
+        "packageIdentity": "com.example.fixture",
+        "workspaceId": "00112233445566778899aabbccddeeff"
+      },
+      "lifecycle": "active",
+      "processGeneration": 3,
+      "mountState": null
+    }],
+    "diagnostics": []
+  },
+  "event": {
+    "mount": "mount-1",
+    "subscription": "subscription-1",
+    "sequence": "9007199254740993",
+    "payload": { "value": true }
+  },
+  "hostState": {
+    "revision": 8,
+    "revisionGap": false
+  }
+}

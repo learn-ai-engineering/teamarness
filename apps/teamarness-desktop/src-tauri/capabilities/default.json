@@ -10,6 +10,19 @@
     "allow-create-workspace",
     "allow-create-workspace-invitation",
     "allow-join-workspace",
-    "allow-current-membership"
+    "allow-current-membership",
+    "allow-package-catalog-snapshot",
+    "allow-package-subscribe-host-state",
+    "allow-package-open-mount",
+    "allow-package-close-mount",
+    "allow-package-request",
+    "allow-package-cancel-request",
+    "allow-package-open-stream",
+    "allow-package-acknowledge-events",
+    "allow-package-close-stream",
+    "allow-package-suspend",
+    "allow-package-recover",
+    "allow-package-dispose",
+    "allow-package-report-ui-fault"
   ]
 }

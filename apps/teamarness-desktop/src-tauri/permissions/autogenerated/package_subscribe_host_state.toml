@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-subscribe-host-state"
+description = "Enables the package_subscribe_host_state command without any pre-configured scope."
+commands.allow = ["package_subscribe_host_state"]
+
+[[permission]]
+identifier = "deny-package-subscribe-host-state"
+description = "Denies the package_subscribe_host_state command without any pre-configured scope."
+commands.deny = ["package_subscribe_host_state"]

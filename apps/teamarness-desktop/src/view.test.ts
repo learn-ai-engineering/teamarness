@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { TeamarnessBridge } from "./bridge";
 import type { BridgeError, Installation, Invitation, Membership, Workspace, WorkspaceState } from "./contracts";
-import { ShellController, renderShell } from "./view";
+import { ShellController, ShellRenderer, renderShell } from "./view";
 
 const installation = fixture.installation as Installation;
 const workspace = fixture.workspace as Workspace;
@@ -23,6 +23,32 @@ function fakeBridge(overrides: Partial<TeamarnessBridge> = {}): TeamarnessBridge
 }
 
 describe("Shell workspace flow", () => {
+  it("updates Workspace controls without replacing the persistent Package pane", () => {
+    const controls = { innerHTML: "" } as HTMLElement;
+    const pane = { mountedUi: "mount-1" };
+    const renderer = new ShellRenderer(controls, pane);
+    renderer.render({
+      installation,
+      workspaces: [workspace],
+      memberships: { [workspace.id]: membership },
+      loading: false,
+      error: null,
+      notice: null,
+    });
+    renderer.render({
+      installation,
+      workspaces: [],
+      memberships: {},
+      loading: false,
+      error: null,
+      notice: "Updated",
+    });
+    expect(renderer.packagePane()).toBe(pane);
+    expect(pane.mountedUi).toBe("mount-1");
+    expect(controls.innerHTML).toContain("Updated");
+    expect(controls.innerHTML).not.toContain("package-pane");
+  });
+
   it("loads the Installation, Workspace list, ordered members, and version", async () => {
     const controller = new ShellController(fakeBridge(), () => undefined);
     await controller.load();

@@ -54,7 +54,8 @@ impl UiEventReceiver {
 
     pub(crate) async fn changed(&mut self) -> Result<UiEvent, PackageErrorCode> {
         loop {
-            if let Some(code) = *self.terminal.borrow() {
+            let terminal_code = *self.terminal.borrow();
+            if let Some(code) = terminal_code {
                 if code == PackageErrorCode::BackendError {
                     match self.events.try_recv() {
                         Ok(event) => {

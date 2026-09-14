@@ -14,6 +14,12 @@ tauri-build.workspace = true
 
 [dependencies]
 teamarness-core = { path = "../../../crates/teamarness-core" }
+teamarness-package-host = { path = "../../../crates/teamarness-package-host" }
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true

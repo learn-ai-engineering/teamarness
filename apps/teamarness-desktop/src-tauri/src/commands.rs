@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tauri::State;
 use teamarness_core::{WorkspaceId, WorkspaceInvitation};
+use teamarness_package_host::{PackageHostCommand, ReconcileWorkspaces};
 
 use crate::DesktopState;
 use crate::dto::{
@@ -62,7 +63,7 @@ pub async fn create_workspace(
     name: String,
     state: State<'_, DesktopState>,
 ) -> Result<WorkspaceStateDto, BridgeError> {
-    blocking(&state, move |runtime| {
+    let created = blocking(&state, move |runtime| {
         let workspace = runtime.create_workspace(&name).map_err(BridgeError::from)?;
         let membership = runtime
             .membership_snapshot(workspace.id())
@@ -72,7 +73,9 @@ pub async fn create_workspace(
             membership: membership.into(),
         })
     })
-    .await
+    .await?;
+    reconcile_packages(&state).await?;
+    Ok(created)
 }
 
 #[tauri::command]
@@ -105,6 +108,7 @@ pub async fn join_workspace(
         .join_workspace(&invitation)
         .await
         .map_err(BridgeError::from)?;
+    reconcile_packages(&state).await?;
     Ok(WorkspaceStateDto {
         workspace: workspace.into(),
         membership: membership.into(),
@@ -125,6 +129,20 @@ pub async fn current_membership(
             .map_err(BridgeError::from)
     })
     .await
+}
+
+async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
+    state
+        .package_host()
+        .map_err(|_| BridgeError::shutdown())?
+        .execute(PackageHostCommand::ReconcileWorkspaces(
+            ReconcileWorkspaces {
+                workspaces: Vec::new(),
+            },
+        ))
+        .await
+        .map_err(|_| BridgeError::shutdown())?;
+    Ok(())
 }
 
 #[cfg(test)]

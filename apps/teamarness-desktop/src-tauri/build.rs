@@ -5,6 +5,19 @@ const COMMANDS: &[&str] = &[
     "create_workspace_invitation",
     "join_workspace",
     "current_membership",
+    "package_catalog_snapshot",
+    "package_subscribe_host_state",
+    "package_open_mount",
+    "package_close_mount",
+    "package_request",
+    "package_cancel_request",
+    "package_open_stream",
+    "package_acknowledge_events",
+    "package_close_stream",
+    "package_suspend",
+    "package_recover",
+    "package_dispose",
+    "package_report_ui_fault",
 ];
 
 fn main() {

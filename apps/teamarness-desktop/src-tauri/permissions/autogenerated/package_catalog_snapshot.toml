@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-catalog-snapshot"
+description = "Enables the package_catalog_snapshot command without any pre-configured scope."
+commands.allow = ["package_catalog_snapshot"]
+
+[[permission]]
+identifier = "deny-package-catalog-snapshot"
+description = "Denies the package_catalog_snapshot command without any pre-configured scope."
+commands.deny = ["package_catalog_snapshot"]

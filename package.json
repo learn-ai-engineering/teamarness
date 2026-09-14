@@ -1,15 +1,20 @@
 {
   "name": "teamarness",
   "private": true,
-  "workspaces": ["apps/teamarness-desktop"],
+  "workspaces": [
+    "apps/teamarness-desktop",
+    "packages/teamarness-package-ui-sdk",
+    "packages/reference-package/ui"
+  ],
   "scripts": {
     "dev": "node scripts/dev-profile.mjs dev",
     "dev:instance": "node scripts/dev-profile.mjs instance",
-    "build": "npm --workspace teamarness-desktop run build",
-    "typecheck": "npm --workspace teamarness-desktop run typecheck",
-    "lint": "npm --workspace teamarness-desktop run lint",
-    "test": "node --test scripts/dev-profile.test.mjs contracts/package-process/v1/fixtures/*.test.mjs && npm --workspace teamarness-desktop test",
+    "build": "npm --workspace @teamarness/package-ui-sdk run build && npm --workspace @teamarness/reference-package-ui run build && npm --workspace teamarness-desktop run build",
+    "typecheck": "npm --workspace @teamarness/package-ui-sdk run typecheck && npm --workspace @teamarness/reference-package-ui run typecheck && npm --workspace teamarness-desktop run typecheck",
+    "lint": "npm --workspace @teamarness/package-ui-sdk run lint && npm --workspace @teamarness/reference-package-ui run lint && npm --workspace teamarness-desktop run lint",
+    "test": "node --test scripts/dev-profile.test.mjs contracts/package-process/v1/fixtures/*.test.mjs && npm --workspace @teamarness/package-ui-sdk test && npm --workspace @teamarness/reference-package-ui test && npm --workspace teamarness-desktop test",
     "test:dev-profile": "node --test scripts/dev-profile.test.mjs",
+    "verify:phase5-webkit:prepare": "npm run build && node packages/reference-package/ui/prepare-webkit-probe.mjs",
     "tauri": "npm --workspace teamarness-desktop run tauri --"
   }
 }

@@ -20,6 +20,21 @@ const initialModel: ShellModel = {
   notice: null,
 };
 
+export class ShellRenderer {
+  public constructor(
+    private readonly controls: Pick<HTMLElement, "innerHTML">,
+    private readonly persistentPackagePane?: object,
+  ) {}
+
+  public packagePane(): object | undefined {
+    return this.persistentPackagePane;
+  }
+
+  public render(model: ShellModel): void {
+    this.controls.innerHTML = renderShell(model);
+  }
+}
+
 export class ShellController {
   private model: ShellModel = initialModel;
 

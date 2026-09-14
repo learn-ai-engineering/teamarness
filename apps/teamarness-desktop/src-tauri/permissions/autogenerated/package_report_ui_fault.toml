@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-report-ui-fault"
+description = "Enables the package_report_ui_fault command without any pre-configured scope."
+commands.allow = ["package_report_ui_fault"]
+
+[[permission]]
+identifier = "deny-package-report-ui-fault"
+description = "Denies the package_report_ui_fault command without any pre-configured scope."
+commands.deny = ["package_report_ui_fault"]

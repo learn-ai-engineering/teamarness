@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-close-stream"
+description = "Enables the package_close_stream command without any pre-configured scope."
+commands.allow = ["package_close_stream"]
+
+[[permission]]
+identifier = "deny-package-close-stream"
+description = "Denies the package_close_stream command without any pre-configured scope."
+commands.deny = ["package_close_stream"]
