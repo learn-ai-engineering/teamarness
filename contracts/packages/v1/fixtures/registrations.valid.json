@@ -1,0 +1,1 @@
+{"schemaVersion":1,"registrations":[{"directory":"/opt/teamarness-packages/reference","expectedIdentity":"dev.teamarness.reference","trust":{"kind":"trusted_native_code_v1","acceptedRisks":["filesystem","network","process"]},"overrideApplication":true}]}

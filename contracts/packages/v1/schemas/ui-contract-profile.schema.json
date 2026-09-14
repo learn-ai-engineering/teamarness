@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/packages/v1/ui-contract-profile.schema.json",
+  "title": "Package UI contract restricted profile",
+  "description": "A draft 2020-12 schema accepted only after the host walker rejects remote references, dynamic or recursive references, cycles, and configured depth or node limits.",
+  "type": ["object", "boolean"]
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/packages/v1/registrations.schema.json",
+  "type": "object",
+  "required": ["schemaVersion", "registrations"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "registrations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["directory", "expectedIdentity", "trust"],
+        "properties": {
+          "directory": { "type": "string", "pattern": "^/" },
+          "expectedIdentity": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]{0,62}(?:\\.[a-z][a-z0-9-]{0,62})+$"
+          },
+          "trust": {
+            "type": "object",
+            "required": ["kind", "acceptedRisks"],
+            "properties": {
+              "kind": { "const": "trusted_native_code_v1" },
+              "acceptedRisks": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "uniqueItems": true,
+                "items": { "enum": ["filesystem", "network", "process"] }
+              }
+            },
+            "additionalProperties": false
+          },
+          "overrideApplication": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

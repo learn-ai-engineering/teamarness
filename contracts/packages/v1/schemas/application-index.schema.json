@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/packages/v1/application-index.schema.json",
+  "type": "object",
+  "required": ["schemaVersion", "packages"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "packages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["directory"],
+        "properties": {
+          "directory": { "type": "string", "pattern": "^[A-Za-z0-9_-]+(?:/[A-Za-z0-9._-]+)*$" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
