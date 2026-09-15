@@ -21,3 +21,7 @@ npm run build
 This project was generated from foundation template version `1`. It records Package Process Protocol `1.0` and UI host version `1` in `teamarness-authoring.json`. The Rust and TypeScript SDK sources under `vendor/teamarness/` are copied from the creating Teamarness checkout, with their license metadata and source notices preserved. Their dependencies are explicit and locked in `Cargo.lock` and `package-lock.json`.
 
 There is no supported in-place SDK upgrade yet. Fixes to Teamarness SDK source do not reach this generated copy automatically; regenerate from a compatible checkout when the authoring policy instructs you to do so.
+
+## Source and policy boundaries
+
+The generated Package is intended to be registered as an installation-local `Local` Package. Source kind is separate from Package Trust and does not grant Workspace enablement, synchronization, sharing, networking, or collaboration. The application builder, not this project, owns bundled Package metadata.

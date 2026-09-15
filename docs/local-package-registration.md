@@ -73,7 +73,7 @@ A local Package with the same Package Identity as an application Package needs a
 
 No source wins by file order or Package version. Teamarness accepts a replacement only when the directory is canonical and readable, the manifest identity equals `expectedIdentity`, trust evidence is complete, and `overrideApplication` is true. If a declared override is invalid, that Package Identity stays unavailable. Teamarness does not silently fall back to bundled code. Unrelated valid Packages and the Core Runtime continue.
 
-Restart Teamarness after creating, changing, or removing the registration. The Shell labels the admitted source `local` and its trust `trusted_native_code_v1`. Confirm both labels before testing the local build.
+Restart Teamarness after creating, changing, or removing the registration. The Shell labels the admitted source `Local` and its trust `trusted_native_code_v1`. Bundled Tutorial is admitted from application resources without this file and is labeled `Bundled`. Confirm both labels before testing the local build. Source kind is not a security verdict and does not grant Workspace enablement, synchronization, sharing, networking, or collaboration.
 
 ## Data continuity
 
