@@ -69,6 +69,51 @@ test("Package author and operator guidance covers the shipped contract", async (
   }
 });
 
+test("Emojart tutorial explains the local Package path without promoting it to the application", async () => {
+  const tutorial = await read("docs/build-your-first-package.md");
+  const readme = await read("README.md");
+
+  for (const phrase of [
+    "Core Runtime",
+    "Shell",
+    "Package Host",
+    "Package Backend",
+    "Package UI",
+    "Package Data Directory",
+    "Package Source",
+    "Package Instance",
+    "dev.teamarness.emojart",
+    "npm run build:emojart",
+    "registrations.v1.json",
+    ".teamarness-dev/emojart-tutorial/packages/registrations.v1.json",
+    "trusted_native_code_v1",
+    "There is no hot reload",
+    "not a sandbox",
+    "future tutorial",
+    "synchronization",
+    "Workspace-specific",
+    "installation-local Package Source",
+    "synchronized team behavior",
+    "owner-only",
+    "artifact_changed",
+    "Digest mismatch",
+    "Unsupported target",
+    "Invalid UI contract",
+  ]) {
+    assert.ok(tutorial.includes(phrase), `tutorial must include ${phrase}`);
+  }
+  assert.match(tutorial, /```mermaid/g);
+  assert.equal((tutorial.match(/```mermaid/g) ?? []).length, 2, "tutorial has its two planned diagrams");
+  assert.equal((tutorial.match(/### Agent brief/g) ?? []).length, 5, "tutorial has its five copyable agent briefs");
+  assert.equal((tutorial.match(/### Human checkpoint/g) ?? []).length, 5, "tutorial has its five human checkpoints");
+  assert.ok(readme.includes("Build your first Package"), "README links the tutorial from Package development");
+
+  const applicationPackages = await read("packages/application-packages.v1.json");
+  const tauriConfig = await read("apps/teamarness-desktop/src-tauri/tauri.conf.json");
+  assert.ok(!applicationPackages.includes("dev.teamarness.emojart"), "Emojart stays out of application Package metadata");
+  assert.ok(!tauriConfig.includes("emojart"), "Emojart stays out of Tauri bundled resources");
+});
+
 test("direct dependencies are exact, lockfiles are committed, and schema retrieval is disabled", async () => {
   const cargo = await read("Cargo.toml");
   const dependencyBlock = cargo.split("[workspace.dependencies]")[1];

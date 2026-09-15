@@ -113,7 +113,7 @@ Invitation values are sensitive bearer admission material. Do not store them, pr
 
 ## Package development
 
-Read the [Package author guide](docs/package-author-guide.md) to construct a Package Directory, build its Backend executable and ESM UI, declare a manifest and UI contract, and promote tested bytes into application distribution. Read [Local Package registration](docs/local-package-registration.md) for the owner-only registration file, explicit bundled override, restart rules, digest invalidation, and Package Data Directory continuity.
+Start with [Build your first Package with an agent](docs/build-your-first-package.md) to create and register the installation-local Emojart Package from an empty directory. Read the [Package author guide](docs/package-author-guide.md) to construct a Package Directory, build its Backend executable and ESM UI, declare a manifest and UI contract, and promote tested bytes into application distribution. Read [Local Package registration](docs/local-package-registration.md) for the owner-only registration file, explicit bundled override, restart rules, digest invalidation, and Package Data Directory continuity.
 
 The protocol and supported Rust tooling have separate contracts:
 
