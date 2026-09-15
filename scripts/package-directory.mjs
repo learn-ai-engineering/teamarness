@@ -1,0 +1,91 @@
+import { createHash } from "node:crypto";
+import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
+export async function stagePackageDirectory({
+  manifestPath,
+  contractPath,
+  backendPath,
+  uiEntrypointPath,
+  uiAssets = [],
+  outputDirectory,
+  version,
+}) {
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const backend = await readFile(backendPath);
+  const entrypoint = await readFile(uiEntrypointPath);
+  const contract = await readFile(contractPath);
+  if (version !== undefined) manifest.version = version;
+  manifest.backends[0].size = backend.length;
+  manifest.backends[0].sha256 = digest(backend);
+  manifest.ui.entrypoint.size = entrypoint.length;
+  manifest.ui.entrypoint.sha256 = digest(entrypoint);
+  manifest.ui.contract.sha256 = digest(contract);
+  if (manifest.ui.assets.length !== uiAssets.length) {
+    throw new Error("Every UI asset must have one build input");
+  }
+  const assets = [];
+  for (const input of uiAssets) {
+    const declaration = manifest.ui.assets.find(({ path }) => path === input.path);
+    if (!declaration) throw new Error(`Undeclared UI asset build input: ${input.path}`);
+    const bytes = await readFile(input.sourcePath);
+    declaration.size = bytes.length;
+    declaration.sha256 = digest(bytes);
+    assets.push({ path: input.path, bytes });
+  }
+
+  await rm(outputDirectory, { recursive: true, force: true });
+  await mkdir(join(outputDirectory, "backend"), { recursive: true, mode: 0o700 });
+  await mkdir(join(outputDirectory, "ui"), { recursive: true, mode: 0o700 });
+  await writeFile(join(outputDirectory, manifest.backends[0].path), backend, { mode: 0o700 });
+  await chmod(join(outputDirectory, manifest.backends[0].path), 0o700);
+  await writeFile(join(outputDirectory, manifest.ui.entrypoint.path), entrypoint, { mode: 0o600 });
+  for (const asset of assets) {
+    await mkdir(dirname(join(outputDirectory, asset.path)), { recursive: true, mode: 0o700 });
+    await writeFile(join(outputDirectory, asset.path), asset.bytes, { mode: 0o600 });
+  }
+  await writeFile(join(outputDirectory, manifest.ui.contract.path), contract, { mode: 0o600 });
+  await writeFile(
+    join(outputDirectory, "teamarness.package.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  return manifest;
+}
+
+export async function copyPackageDirectory(source, destination) {
+  await rm(destination, { recursive: true, force: true });
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  await cp(source, destination, { recursive: true, preserveTimestamps: true });
+}
+
+export async function compareDeclaredPackageBytes(leftDirectory, rightDirectory) {
+  const leftManifestBytes = await readFile(join(leftDirectory, "teamarness.package.json"));
+  const rightManifestBytes = await readFile(join(rightDirectory, "teamarness.package.json"));
+  if (!leftManifestBytes.equals(rightManifestBytes)) throw new Error("manifest byte mismatch");
+  const manifest = JSON.parse(leftManifestBytes.toString("utf8"));
+  const declarations = [
+    ...manifest.backends.map(({ path, size, sha256 }) => ({ path, size, sha256 })),
+    { ...manifest.ui.entrypoint },
+    ...manifest.ui.assets.map(({ path, size, sha256 }) => ({ path, size, sha256 })),
+    { ...manifest.ui.contract, size: undefined },
+  ];
+  let totalBytes = 0;
+  for (const declaration of declarations) {
+    const left = await readFile(join(leftDirectory, declaration.path));
+    const right = await readFile(join(rightDirectory, declaration.path));
+    if (!left.equals(right)) throw new Error(`declared byte mismatch: ${declaration.path}`);
+    if (declaration.size !== undefined && declaration.size !== left.length) {
+      throw new Error(`declared size mismatch: ${declaration.path}`);
+    }
+    if (declaration.sha256 !== digest(left) || declaration.sha256 !== digest(right)) {
+      throw new Error(`declared digest mismatch: ${declaration.path}`);
+    }
+    totalBytes += left.length;
+  }
+  return { files: declarations.map(({ path }) => path), totalBytes };
+}
+
+function digest(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}

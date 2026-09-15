@@ -1,18 +1,17 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { mkdtemp } from "node:fs/promises";
 
 import {
   compareDeclaredPackageBytes,
   copyPackageDirectory,
   stagePackageDirectory,
-} from "./build-reference-package.mjs";
+} from "./package-directory.mjs";
 
 test("staging records every declared byte and copies a byte-identical local Package", async () => {
-  const root = await mkdtemp(join(tmpdir(), "teamarness-reference-stage-"));
+  const root = await mkdtemp(join(tmpdir(), "teamarness-package-stage-"));
   const source = join(root, "source");
   const output = join(root, "bundled");
   const local = join(root, "local");
@@ -26,11 +25,11 @@ test("staging records every declared byte and copies a byte-identical local Pack
   await writeFile(join(source, "contract.json"), contract);
   await writeFile(join(source, "manifest.json"), JSON.stringify({
     schemaVersion: 1,
-    identity: "dev.teamarness.reference",
+    identity: "dev.teamarness.example",
     version: "1.0.0",
-    presentation: { displayName: "Reference Package" },
+    presentation: { displayName: "Example Package" },
     protocol: { major: 1, minMinor: 0, maxMinor: 0 },
-    backends: [{ target: "aarch64-apple-darwin", path: "backend/teamarness-reference-package-aarch64-apple-darwin", size: 0, sha256: "0".repeat(64) }],
+    backends: [{ target: "aarch64-apple-darwin", path: "backend/example-aarch64-apple-darwin", size: 0, sha256: "0".repeat(64) }],
     ui: { entrypoint: { path: "ui/index.js", size: 0, sha256: "0".repeat(64) }, assets: [], contract: { path: "ui/contract.json", sha256: "0".repeat(64) } },
     capabilities: [],
   }));
@@ -50,6 +49,9 @@ test("staging records every declared byte and copies a byte-identical local Pack
   const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
   assert.equal(manifest.backends[0].size, backend.length);
   assert.equal(manifest.ui.entrypoint.size, entrypoint.length);
+  assert.equal((await stat(join(output, manifest.backends[0].path))).mode & 0o777, 0o700);
+  assert.equal((await stat(join(output, manifest.ui.entrypoint.path))).mode & 0o777, 0o600);
+  assert.equal((await stat(join(output, manifest.ui.contract.path))).mode & 0o777, 0o600);
   await writeFile(join(local, "ui/index.js"), "changed");
   await assert.rejects(compareDeclaredPackageBytes(output, local), /byte mismatch/);
 });
