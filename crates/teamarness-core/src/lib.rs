@@ -50,4 +50,7 @@ pub use runtime::{
     MembershipVersion, PublicIdentity, PublicSignature, SigningContext, WorkspaceId,
     WorkspaceSummary,
 };
-pub use synchronization::{Cursor, OrderKey, RecordId};
+pub use synchronization::{
+    Cursor, ImmutableRecord, OpenedRecord, OrderKey, RecordEvent, RecordId, RecordSubscription,
+    SynchronizationError,
+};

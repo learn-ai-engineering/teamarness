@@ -181,6 +181,48 @@ async fn migration_0004_adds_the_append_only_transition_ledger() {
 }
 
 #[tokio::test]
+async fn migration_0006_adds_strict_immutable_journal_and_append_only_guards() {
+    let directory = private_data_directory("migration-immutable-record-log");
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    runtime.create_workspace("Journal").unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    for table in [
+        "sync_scopes",
+        "immutable_operations",
+        "immutable_operation_dependencies",
+        "immutable_author_heads",
+        "immutable_records",
+        "immutable_idempotency",
+        "sealed_envelopes",
+        "protection_state",
+        "protection_pre_keys",
+        "protection_grant_slots",
+        "pending_records",
+        "record_delivery",
+        "durable_wakes",
+    ] {
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing migration table {table}");
+    }
+    let trigger_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'immutable_%_no_%'", [], |row| row.get(0)
+    ).unwrap();
+    assert!(trigger_count >= 6);
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
@@ -201,7 +243,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert_eq!(installation_count, 1);
 
     drop(connection);

@@ -423,6 +423,10 @@ impl FromStr for PublicSignature {
 }
 
 impl PublicSignature {
+    pub(crate) const fn from_bytes(bytes: [u8; 64]) -> Self {
+        Self(bytes)
+    }
+
     fn as_iroh_signature(&self) -> Signature {
         Signature::from_bytes(&self.0)
     }
@@ -562,12 +566,15 @@ struct MembershipSubscriber {
     sender: crate::subscription::TransitionSender,
 }
 
+type RecordSubscriber = std::sync::mpsc::Sender<crate::RecordEvent>;
+
 pub(crate) struct RuntimeState {
     connection: rusqlite::Connection,
     secret_key: iroh_base::SecretKey,
     display_name: String,
     memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
     subscribers: BTreeMap<WorkspaceId, Vec<MembershipSubscriber>>,
+    record_subscribers: BTreeMap<(WorkspaceId, String), Vec<RecordSubscriber>>,
     next_subscriber_id: u64,
     poisoned: bool,
 }
@@ -646,6 +653,7 @@ impl CoreRuntime {
             display_name,
             memberships,
             subscribers: BTreeMap::new(),
+            record_subscribers: BTreeMap::new(),
             next_subscriber_id: 0,
             poisoned: false,
         }));
@@ -1216,6 +1224,143 @@ impl CoreRuntime {
                 Ok(())
             }
         })
+    }
+
+    /// Appends one authenticated, protected immutable record to the workspace journal.
+    pub fn append_record(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        purpose: &str,
+        canonical: &[u8],
+    ) -> Result<crate::ImmutableRecord, crate::SynchronizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(crate::SynchronizationError::RuntimeUnavailable);
+        }
+        let is_member = state
+            .memberships
+            .get(&workspace_id)
+            .is_some_and(|projection| {
+                projection
+                    .snapshot()
+                    .members()
+                    .iter()
+                    .any(|member| member.identity() == self.public_identity)
+            });
+        let secret_key = state.secret_key.clone();
+        let record = crate::synchronization::append(
+            &mut state.connection,
+            &secret_key,
+            workspace_id,
+            package_identity,
+            purpose,
+            canonical,
+            is_member,
+        )?;
+        if let Some(event) = crate::synchronization::event_for_record(
+            &state.connection,
+            workspace_id,
+            package_identity,
+            record.clone(),
+        ) && let Some(listeners) = state
+            .record_subscribers
+            .get_mut(&(workspace_id, package_identity.to_owned()))
+        {
+            listeners.retain(|sender| sender.send(event.clone()).is_ok());
+        }
+        Ok(record)
+    }
+
+    /// Inserts an authenticated sealed record received from another current peer.
+    ///
+    /// The record is committed exactly once and is safe to retry after an uncertain response.
+    pub fn insert_remote_record(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        sealed_record: &[u8],
+    ) -> Result<crate::ImmutableRecord, crate::SynchronizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(crate::SynchronizationError::RuntimeUnavailable);
+        }
+        let record = crate::synchronization::insert_remote(
+            &mut state.connection,
+            workspace_id,
+            package_identity,
+            sealed_record,
+        )?;
+        if let Some(event) = crate::synchronization::event_for_record(
+            &state.connection,
+            workspace_id,
+            package_identity,
+            record.clone(),
+        ) && let Some(listeners) = state
+            .record_subscribers
+            .get_mut(&(workspace_id, package_identity.to_owned()))
+        {
+            listeners.retain(|sender| sender.send(event.clone()).is_ok());
+        }
+        Ok(record)
+    }
+
+    /// Opens sealed records in request order after authenticating their scope and contents.
+    pub fn open_records(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        sealed_records: &[Vec<u8>],
+    ) -> Result<Vec<crate::OpenedRecord>, crate::SynchronizationError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(crate::SynchronizationError::RuntimeUnavailable);
+        }
+        crate::synchronization::open_records(
+            &state.connection,
+            workspace_id,
+            package_identity,
+            sealed_records,
+        )
+    }
+
+    /// Replays the installation-local immutable-record journal from an optional cursor.
+    pub fn subscribe_records(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        after: Option<crate::Cursor>,
+    ) -> Result<crate::RecordSubscription, crate::SynchronizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(crate::SynchronizationError::RuntimeUnavailable);
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let subscription = crate::synchronization::subscribe(
+            &state.connection,
+            workspace_id,
+            package_identity,
+            after,
+            receiver,
+        )?;
+        state
+            .record_subscribers
+            .entry((workspace_id, package_identity.to_owned()))
+            .or_default()
+            .push(sender);
+        Ok(subscription)
     }
 
     /// Stops accepting onboarding work and awaits transport closure.
