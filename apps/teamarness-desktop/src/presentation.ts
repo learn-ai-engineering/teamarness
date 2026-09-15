@@ -18,9 +18,19 @@ export type ShellPresentation = Readonly<{
   error: Readonly<{ message: string; canRetry: boolean }> | null;
 }>;
 
+export type PackageInstancePresentation = Readonly<{
+  name: string;
+  availability: string;
+  actionIndex: number;
+  installationLocal: boolean;
+  canSuspend: boolean;
+  canRecover: boolean;
+  canDispose: boolean;
+}>;
+
 export type PackageNavigationPresentation = Readonly<{
-  teamPackages: readonly Readonly<{ name: string; actionIndex: number }>[];
-  privatePackages: readonly Readonly<{ name: string; actionIndex: number }>[];
+  teamPackages: readonly PackageInstancePresentation[];
+  privatePackages: readonly PackageInstancePresentation[];
 }>;
 
 export async function buildShellPresentation(
@@ -59,21 +69,54 @@ export function buildPackageNavigationPresentation(
   if (!snapshot) return { teamPackages: [], privatePackages: [] };
   const rows = snapshot.instances
     .filter(({ key }) => key.workspaceId === activeWorkspaceId)
-    .map((instance, actionIndex) => {
+    .flatMap((instance, actionIndex) => {
       const catalog = snapshot.packages.find(({ identity }) => identity === instance.key.packageIdentity);
-      return {
-        name: catalog?.displayName ?? "Unavailable Package",
-        source: catalog?.source ?? "bundled",
+      if (!catalog) return [];
+      const capabilities = lifecycleCapabilities(instance.lifecycle);
+      return [{
+        name: catalog.displayName,
+        availability: lifecycleAvailability(instance.lifecycle),
         actionIndex,
-      };
+        installationLocal: catalog.source === "local",
+        ...capabilities,
+      }];
     });
   return {
-    teamPackages: rows
-      .filter(({ source }) => source === "bundled")
-      .map(({ name, actionIndex }) => ({ name, actionIndex })),
-    privatePackages: rows
-      .filter(({ source }) => source === "local")
-      .map(({ name, actionIndex }) => ({ name, actionIndex })),
+    teamPackages: rows.filter(({ installationLocal }) => !installationLocal),
+    privatePackages: rows.filter(({ installationLocal }) => installationLocal),
+  };
+}
+
+function lifecycleAvailability(lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"]): string {
+  switch (lifecycle) {
+    case "admitted":
+    case "activating":
+    case "recovering":
+      return "Getting ready";
+    case "active":
+      return "Available";
+    case "suspending":
+      return "Pausing";
+    case "suspended":
+      return "Paused";
+    case "failed":
+    case "crash_loop":
+      return "Needs recovery";
+    case "disposing":
+      return "Removing";
+    case "disposed":
+      return "Unavailable";
+  }
+}
+
+function lifecycleCapabilities(
+  lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"],
+): Pick<PackageInstancePresentation, "canSuspend" | "canRecover" | "canDispose"> {
+  return {
+    canSuspend: lifecycle === "active",
+    canRecover: lifecycle === "suspended" || lifecycle === "failed" || lifecycle === "crash_loop",
+    canDispose: lifecycle === "admitted" || lifecycle === "active" || lifecycle === "suspended"
+      || lifecycle === "failed" || lifecycle === "crash_loop",
   };
 }
 

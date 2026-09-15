@@ -49,39 +49,45 @@ export class PackageShell {
     await this.loadSelected();
   }
 
-  public async suspendBackend(): Promise<void> {
-    await this.runLifecycle((instance) => this.mounts.suspendBackend(instance));
+  public async suspendBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null> {
+    return this.runLifecycle(instance, (target) => this.mounts.suspendBackend(target));
   }
 
-  public async recoverBackend(): Promise<void> {
-    await this.runLifecycle((instance) => this.mounts.recoverBackend(instance));
+  public async recoverBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null> {
+    return this.runLifecycle(instance, (target) => this.mounts.recoverBackend(target));
   }
 
-  public async disposeBackend(): Promise<void> {
-    await this.runLifecycle((instance) => this.mounts.disposeBackend(instance));
+  public async disposeBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null> {
+    return this.runLifecycle(instance, (target) => this.mounts.disposeBackend(target));
   }
 
   private recoveryActions(): PackageShellActions {
     return Object.freeze({
       reloadUi: async () => { await this.reloadUi(); },
-      recoverBackend: async () => { await this.recoverBackend(); },
+      recoverBackend: async () => {
+        if (this.selected) await this.recoverBackend(this.selected);
+      },
     });
   }
 
-  private async runLifecycle(operation: (instance: PackageInstanceKey) => Promise<void>): Promise<void> {
-    if (!this.selected) return;
+  private async runLifecycle(
+    instance: PackageInstanceKey,
+    operation: (target: PackageInstanceKey) => Promise<void>,
+  ): Promise<PackageHostSnapshot | null> {
     let failed = false;
     try {
-      await operation(this.selected);
+      await operation(instance);
     } catch {
       failed = true;
     }
+    let snapshot: PackageHostSnapshot | null = null;
     try {
-      await this.refresh();
+      snapshot = await this.refresh();
     } catch {
       failed = true;
     }
     if (failed) this.view.showFailure(this.recoveryActions());
+    return snapshot;
   }
 
   private async loadSelected(): Promise<void> {

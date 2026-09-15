@@ -10,6 +10,7 @@ const workspace = fixture.workspace as Workspace;
 const membership = fixture.membership as Membership;
 const otherWorkspace: Workspace = { ...workspace, id: "ffeeddccbbaa99887766554433221100", name: "Other" };
 const packageKey: PackageInstanceKey = { packageIdentity: "com.example.one", workspaceId: workspace.id };
+const privatePackageKey: PackageInstanceKey = { packageIdentity: "com.example.private", workspaceId: workspace.id };
 const packages: PackageHostSnapshot = {
   revision: 739217,
   state: "running",
@@ -22,8 +23,20 @@ const packages: PackageHostSnapshot = {
       trust: "application_bundled",
       uiContractDigest: "secret-contract-digest",
     },
+    {
+      identity: privatePackageKey.packageIdentity,
+      version: "2.0.0-secret-version",
+      displayName: "Private One",
+      source: "local",
+      trust: "trusted_native_code_v1",
+      uiContractDigest: "private-secret-contract-digest",
+    },
   ],
-  instances: [{ key: packageKey, lifecycle: "active", processGeneration: 414, mountState: "mounted" }],
+  instances: [
+    { key: packageKey, lifecycle: "active", processGeneration: 414, mountState: "mounted" },
+    { key: privatePackageKey, lifecycle: "failed", processGeneration: 415, mountState: "failed" },
+    { key: { ...packageKey, workspaceId: otherWorkspace.id }, lifecycle: "suspended", processGeneration: 3, mountState: null },
+  ],
   diagnostics: [{
     version: 1,
     namespace: "teamarness.package-host",
@@ -43,6 +56,7 @@ class Region {
 }
 
 class TestControl {
+  public readonly dataset: Record<string, string> = {};
   private listener: EventListener | null = null;
 
   public addEventListener(_type: string, listener: EventListener): void {
@@ -51,6 +65,31 @@ class TestControl {
 
   public click(): void {
     this.listener?.({} as Event);
+  }
+}
+
+class SettingsRegion extends Region {
+  public readonly suspend = new TestControl();
+  public readonly recover = new TestControl();
+  public readonly dispose = new TestControl();
+  public readonly invalidRecover = new TestControl();
+  public readonly invalidSuspend = new TestControl();
+
+  public querySelector(): null { return null; }
+
+  public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector !== "[data-package-action]") return [];
+    this.suspend.dataset.packageAction = "suspend";
+    this.suspend.dataset.packageActionIndex = "0";
+    this.recover.dataset.packageAction = "recover";
+    this.recover.dataset.packageActionIndex = "1";
+    this.dispose.dataset.packageAction = "dispose";
+    this.dispose.dataset.packageActionIndex = "1";
+    this.invalidRecover.dataset.packageAction = "recover";
+    this.invalidRecover.dataset.packageActionIndex = "0";
+    this.invalidSuspend.dataset.packageAction = "suspend";
+    this.invalidSuspend.dataset.packageActionIndex = "1";
+    return [this.suspend, this.recover, this.dispose, this.invalidRecover, this.invalidSuspend];
   }
 }
 
@@ -96,6 +135,9 @@ function harness(shellScreen: HTMLElement = new Region() as unknown as HTMLEleme
     packageShell: {
       select: async (instance) => { calls.push(`mount:${instance.packageIdentity}`); },
       hide: async () => { calls.push("unmount"); },
+      suspendBackend: async (instance) => { calls.push(`suspend:${instance.packageIdentity}`); return packages; },
+      recoverBackend: async (instance) => { calls.push(`recover:${instance.packageIdentity}`); return packages; },
+      disposeBackend: async (instance) => { calls.push(`dispose:${instance.packageIdentity}`); return packages; },
     },
     theme: {
       getPreference: () => "system",
@@ -172,7 +214,7 @@ describe("persistent Shell frame", () => {
     expect(test.frame.shellScreen.hidden).toBe(false);
   });
 
-  it("renders fixed landmarks, grouped Package navigation, aria-current, and the sole theme selector", async () => {
+  it("renders fixed landmarks, active-Workspace Package groups, safe availability, and the labelled local marker", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
@@ -182,7 +224,65 @@ describe("persistent Shell frame", () => {
     expect(test.frame.workspaceRail.innerHTML).toContain('id="theme-preference"');
     expect(test.frame.contextualNavigation.innerHTML).toContain("Team Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Private Packages");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("One");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Available");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Private One");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Needs recovery");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Runs only on this Installation");
+    expect(test.frame.contextualNavigation.innerHTML).not.toContain("Other");
     expect(test.frame.contextualNavigation.innerHTML).toContain('aria-current="page"');
+  });
+
+  it("renders empty Package groups and an intentional empty settings state", async () => {
+    const test = harness();
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages({ ...packages, packages: [], instances: [] });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    expect(test.frame.contextualNavigation.innerHTML.match(/None available/g)).toHaveLength(2);
+    expect(test.frame.shellScreen.innerHTML).toContain("No Packages are available for this Workspace.");
+  });
+
+  it("routes full Package keys through private settings mappings and gates lifecycle actions", async () => {
+    const screen = new SettingsRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    expect(screen.innerHTML).toContain("Package Instances");
+    expect(screen.innerHTML).toContain("One");
+    expect(screen.innerHTML).toContain("Private One");
+    expect(screen.innerHTML).toContain("Suspend");
+    expect(screen.innerHTML).toContain("Recover Backend");
+    expect(screen.innerHTML).toContain("Dispose");
+    expect(screen.innerHTML).not.toContain(packageKey.packageIdentity);
+    expect(screen.innerHTML).not.toContain(privatePackageKey.packageIdentity);
+
+    screen.invalidRecover.click();
+    screen.invalidSuspend.click();
+    screen.suspend.click();
+    screen.recover.click();
+    screen.dispose.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(test.calls).toEqual([
+      "unmount",
+      `suspend:${packageKey.packageIdentity}`,
+      `recover:${privatePackageKey.packageIdentity}`,
+      `dispose:${privatePackageKey.packageIdentity}`,
+    ]);
+  });
+
+  it.each([
+    ["bundled", packageKey, "One"],
+    ["local", privatePackageKey, "Private One"],
+  ] as const)("uses the same generic navigation path for %s Packages", async (_source, key, name) => {
+    const test = harness();
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "package-instance", instance: key });
+    expect(test.frame.contextualNavigation.innerHTML).toContain(name);
+    expect(test.calls).toEqual([`mount:${key.packageIdentity}`]);
   });
 
   it("binds bridge-error retry feedback to the supported reload action", async () => {
@@ -218,12 +318,17 @@ describe("persistent Shell frame", () => {
         ...membership.members.map(({ identity }) => identity),
         packageKey.packageIdentity,
         "1.0.0-secret-version",
+        "2.0.0-secret-version",
         "bundled",
+        "local",
         "application_bundled",
+        "trusted_native_code_v1",
         "running",
         "active",
+        "failed",
         "mounted",
         "414",
+        "415",
         "739217",
         "secret-contract-digest",
         "teamarness.package-host",

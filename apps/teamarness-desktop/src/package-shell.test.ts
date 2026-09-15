@@ -25,7 +25,7 @@ function view(failures: { value: number } = { value: 0 }): PackageShellView {
   };
 }
 
-it("targets lifecycle actions at the selected Package Instance and refreshes their results", async () => {
+it("targets lifecycle actions at the supplied Package Instance and returns refreshed results", async () => {
   const calls: string[] = [];
   let snapshotCalls = 0;
   const mounts = {
@@ -38,15 +38,15 @@ it("targets lifecycle actions at the selected Package Instance and refreshes the
   const shell = new PackageShell({ snapshot: async () => { snapshotCalls += 1; return snapshot; } }, mounts, view());
   await shell.refresh();
   await shell.select(first);
-  await shell.suspendBackend();
-  await shell.recoverBackend();
-  await shell.disposeBackend();
+  await expect(shell.suspendBackend(second)).resolves.toBe(snapshot);
+  await expect(shell.recoverBackend(second)).resolves.toBe(snapshot);
+  await expect(shell.disposeBackend(second)).resolves.toBe(snapshot);
 
   expect(calls).toEqual([
     "mount:com.example.one",
-    "suspend:com.example.one",
-    "recover:com.example.one",
-    "dispose:com.example.one",
+    "suspend:com.example.two",
+    "recover:com.example.two",
+    "dispose:com.example.two",
   ]);
   expect(snapshotCalls).toBe(4);
 });
@@ -96,8 +96,8 @@ it("contains invalid post-disposal actions in Shell-owned recovery", async () =>
   };
   const shell = new PackageShell({ snapshot: async () => { snapshotCalls += 1; return snapshot; } }, mounts, view(failures));
   await shell.select(first);
-  await shell.disposeBackend();
-  await shell.suspendBackend();
+  await shell.disposeBackend(first);
+  await shell.suspendBackend(first);
 
   expect(failures.value).toBe(2);
   expect(snapshotCalls).toBe(2);
@@ -138,7 +138,7 @@ class TestElement {
 
 afterEach(() => { vi.unstubAllGlobals(); });
 
-it("narrows the browser view to mount recovery actions", () => {
+it("contains mount failure in the selected target and keeps Reload UI separate from Recover Backend", () => {
   vi.stubGlobal("document", { createElement: () => new TestElement() });
   const target = new TestElement();
   const view = new BrowserPackageShellView(target as unknown as HTMLElement);

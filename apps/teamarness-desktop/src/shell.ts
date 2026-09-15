@@ -2,6 +2,8 @@ import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contract
 import {
   buildPackageNavigationPresentation,
   buildShellPresentation,
+  type PackageInstancePresentation,
+  type PackageNavigationPresentation,
   type ShellPresentation,
 } from "./presentation";
 import type { InstallationThemeController, ThemePreference } from "./theme";
@@ -24,6 +26,9 @@ export type ShellFrame = Readonly<{
 type PackageRouter = Readonly<{
   select(instance: PackageInstanceKey): Promise<void>;
   hide(): Promise<void>;
+  suspendBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null>;
+  recoverBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null>;
+  disposeBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null>;
 }>;
 
 type WorkspaceActions = Readonly<{
@@ -49,6 +54,7 @@ export class Shell {
   private packageSnapshot: PackageHostSnapshot | null = null;
   private observedActiveWorkspaceId: string | null = null;
   private packageRoutes: readonly PackageInstanceKey[] = [];
+  private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
 
   public constructor(
@@ -81,6 +87,7 @@ export class Shell {
   public updatePackages(snapshot: PackageHostSnapshot): void {
     this.packageSnapshot = snapshot;
     this.renderContextualNavigation();
+    if (this.selectedRoute.kind === "workspace-settings") this.renderSelectedScreen();
   }
 
   public async navigate(route: ShellRoute): Promise<void> {
@@ -174,9 +181,11 @@ export class Shell {
     this.packageRoutes = this.packageSnapshot?.instances
       .filter(({ key }) => key.workspaceId === active.id)
       .map(({ key }) => key) ?? [];
-    const packages = buildPackageNavigationPresentation(this.packageSnapshot, active.id);
-    const team = packages.teamPackages.map((row) => packageButton(row.name, row.actionIndex, this.selectedRoute, this.packageRoutes)).join("");
-    const privatePackages = packages.privatePackages.map((row) => packageButton(row.name, row.actionIndex, this.selectedRoute, this.packageRoutes)).join("");
+    this.packagePresentation = buildPackageNavigationPresentation(this.packageSnapshot, active.id);
+    const team = this.packagePresentation.teamPackages
+      .map((row) => packageButton(row, this.selectedRoute, this.packageRoutes)).join("");
+    const privatePackages = this.packagePresentation.privatePackages
+      .map((row) => packageButton(row, this.selectedRoute, this.packageRoutes)).join("");
 
     this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></header>
       <nav class="contextual-navigation__body" aria-label="Active Workspace"><ul class="screen-navigation">
@@ -214,7 +223,14 @@ export class Shell {
 
   private renderSelectedScreen(): void {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
-    this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute);
+    let content = renderShell(this.workspacePresentation, this.selectedRoute);
+    if (this.selectedRoute.kind === "workspace-settings") {
+      content = content.replace(
+        "<p>No Package management actions are available on this screen yet.</p>",
+        renderPackageInstanceSettings(this.packagePresentation),
+      );
+    }
+    this.shellFrame.shellScreen.innerHTML = content;
     this.bindSelectedScreen();
   }
 
@@ -249,6 +265,28 @@ export class Shell {
     this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => {
       void this.options.workspaceActions.retry();
     });
+    this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const index = Number(button.dataset.packageActionIndex);
+        const instance = this.packageRoutes[index];
+        const row = packageRows(this.packagePresentation).find(({ actionIndex }) => actionIndex === index);
+        const action = button.dataset.packageAction;
+        if (!instance || !row || !lifecycleActionAllowed(row, action)) return;
+        void this.runPackageLifecycle(action, instance);
+      });
+    });
+  }
+
+  private async runPackageLifecycle(
+    action: "suspend" | "recover" | "dispose",
+    instance: PackageInstanceKey,
+  ): Promise<void> {
+    const snapshot = action === "suspend"
+      ? await this.options.packageShell.suspendBackend(instance)
+      : action === "recover"
+        ? await this.options.packageShell.recoverBackend(instance)
+        : await this.options.packageShell.disposeBackend(instance);
+    if (snapshot) this.updatePackages(snapshot);
   }
 }
 
@@ -291,18 +329,50 @@ function screenButton(label: string, kind: Exclude<ShellRoute["kind"], "workspac
 }
 
 function packageButton(
-  name: string,
-  index: number,
+  row: PackageInstancePresentation,
   route: ShellRoute,
   packageRoutes: readonly PackageInstanceKey[],
 ): string {
-  const instance = packageRoutes[index];
+  const instance = packageRoutes[row.actionIndex];
   const current = route.kind === "package-instance" && instance
     && route.instance.packageIdentity === instance.packageIdentity
     && route.instance.workspaceId === instance.workspaceId
     ? ' aria-current="page"'
     : "";
-  return `<li><button type="button" data-package-index="${index}"${current}>${escape(name)}</button></li>`;
+  const localMarker = row.installationLocal
+    ? '<span class="package-installation-marker">Runs only on this Installation</span>'
+    : "";
+  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${localMarker}</button></li>`;
+}
+
+function renderPackageInstanceSettings(presentation: PackageNavigationPresentation): string {
+  const rows = packageRows(presentation);
+  if (rows.length === 0) return '<p class="empty-state">No Packages are available for this Workspace.</p>';
+  return `<div class="package-instance-list">${rows.map((row) => {
+    const localMarker = row.installationLocal
+      ? '<span class="package-installation-marker">Runs only on this Installation</span>'
+      : "";
+    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${localMarker}</div>
+      <div class="package-instance-actions">
+        ${lifecycleButton("Suspend", "suspend", row.actionIndex, row.name, row.canSuspend)}
+        ${lifecycleButton("Recover Backend", "recover", row.actionIndex, row.name, row.canRecover)}
+        ${lifecycleButton("Dispose", "dispose", row.actionIndex, row.name, row.canDispose)}
+      </div></article>`;
+  }).join("")}</div>`;
+}
+
+function lifecycleButton(label: string, action: string, index: number, name: string, enabled: boolean): string {
+  return `<button type="button" data-package-action="${action}" data-package-action-index="${index}" aria-label="${label} ${escape(name)}"${enabled ? "" : " disabled"}>${label}</button>`;
+}
+
+function packageRows(presentation: PackageNavigationPresentation): readonly PackageInstancePresentation[] {
+  return [...presentation.teamPackages, ...presentation.privatePackages];
+}
+
+function lifecycleActionAllowed(row: PackageInstancePresentation, action: string | undefined): action is "suspend" | "recover" | "dispose" {
+  return (action === "suspend" && row.canSuspend)
+    || (action === "recover" && row.canRecover)
+    || (action === "dispose" && row.canDispose);
 }
 
 function escape(value: string): string {
