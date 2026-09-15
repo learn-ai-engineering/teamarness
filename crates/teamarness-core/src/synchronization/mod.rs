@@ -3,6 +3,7 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
+mod operation_store;
 use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
@@ -922,6 +923,22 @@ pub(crate) fn append(
     let operation_id = RecordId::digest(&sealed_bytes);
     let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),order.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,sealed_bytes.as_slice(),Vec::<u8>::new(),height]).map_err(|_| storage_error())?;
+    operation_store::insert(
+        &tx,
+        secret,
+        scope,
+        operation_id,
+        record_id,
+        order,
+        signed.author,
+        u32::try_from(sequence).map_err(|_| SynchronizationError::CorruptRecord)?,
+        &sealed_bytes,
+        &[],
+        height,
+        purpose,
+        key_id(&key),
+    )
+    .map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),sealed_bytes.as_slice()]).map_err(|_| storage_error())?;
     tx.execute(
         "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
@@ -1147,6 +1164,7 @@ pub(crate) fn insert_remote(
     let operation_id = RecordId::digest(bytes);
     let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice()], |row| row.get(0)).map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),sealed.order_key.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,bytes,Vec::<u8>::new(),sealed.order_key.height()]).map_err(|_| storage_error())?;
+    operation_store::queue_recovery(&tx, operation_id).map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),signed.purpose,Hash::digest(&signed.canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),bytes]).map_err(|_| storage_error())?;
     tx.execute(
         "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
@@ -1189,7 +1207,10 @@ pub(crate) fn event_for_record(
     })
 }
 
-pub(crate) fn recover(conn: &rusqlite::Connection) -> Result<(), StorageError> {
+pub(crate) fn recover(
+    conn: &mut rusqlite::Connection,
+    secret: &SecretKey,
+) -> Result<(), StorageError> {
     let scopes: Vec<ScopeRecoveryRow> = {
         let mut stmt = conn.prepare("SELECT scope_id,package_identity,workspace_id,content_key,content_key_id FROM sync_scopes").map_err(|_| StorageError::Database)?;
         let rows = stmt
@@ -1222,6 +1243,8 @@ pub(crate) fn recover(conn: &rusqlite::Connection) -> Result<(), StorageError> {
         })
         .collect::<Result<_, StorageError>>()?
     };
+    operation_store::repair(conn, secret)?;
+    operation_store::validate(conn)?;
     for (scope, package, workspace, key, id) in scopes {
         if scope_digest(&package, workspace) != scope || key_id(&key) != id {
             return Err(StorageError::CorruptWorkspace);

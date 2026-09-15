@@ -58,7 +58,7 @@ fn open_inner(
     fault(IdentityTransactionBoundary::AfterCommit)?;
     authenticate_local_subject(&connection, &secret_key)?;
     crate::workspace::recover_pending(&mut connection)?;
-    crate::synchronization::recover(&connection)?;
+    crate::synchronization::recover(&mut connection, &secret_key)?;
 
     Ok(StoredRuntime {
         connection,

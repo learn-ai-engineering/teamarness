@@ -223,6 +223,82 @@ async fn migration_0006_adds_strict_immutable_journal_and_append_only_guards() {
 }
 
 #[tokio::test]
+async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
+    let directory = private_data_directory("migration-p2panda-projection");
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Projection").unwrap();
+    runtime
+        .append_record(workspace.id(), "teamarness.test", "message.post", b"sealed")
+        .unwrap();
+    runtime
+        .append_record(
+            workspace.id(),
+            "teamarness.test",
+            "message.post",
+            b"sealed-2",
+        )
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    for column in [
+        "scope_id",
+        "log_id",
+        "operation_id",
+        "author_public_identity",
+        "author_sequence",
+        "backlink",
+        "payload_hash",
+        "payload",
+        "header",
+        "true_height",
+    ] {
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('p2panda_operations') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing p2panda projection column {column}");
+    }
+    let projection: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT length(header), length(payload), true_height FROM p2panda_operations
+             WHERE author_sequence = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(projection.0 > 0);
+    assert!(projection.1 > 0);
+    assert_eq!(projection.2, 0);
+    let first_operation: Vec<u8> = connection
+        .query_row(
+            "SELECT operation_id FROM p2panda_operations WHERE author_sequence = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let second_backlink: Vec<u8> = connection
+        .query_row(
+            "SELECT backlink FROM p2panda_operations WHERE author_sequence = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(second_backlink, first_operation);
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
@@ -243,7 +319,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(installation_count, 1);
 
     drop(connection);
