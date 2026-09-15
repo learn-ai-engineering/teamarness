@@ -25,7 +25,7 @@ pub struct AlgorithmOption {
     pub label: &'static str,
 }
 
-pub const ALGORITHMS: [AlgorithmOption; 3] = [
+pub const ALGORITHMS: [AlgorithmOption; 4] = [
     AlgorithmOption {
         id: "waves",
         label: "Waves",
@@ -35,8 +35,12 @@ pub const ALGORITHMS: [AlgorithmOption; 3] = [
         label: "Ripples",
     },
     AlgorithmOption {
-        id: "sierpinski",
-        label: "Sierpiński",
+        id: "spiral",
+        label: "Spiral",
+    },
+    AlgorithmOption {
+        id: "patchwork",
+        label: "Patchwork",
     },
 ];
 
@@ -45,13 +49,13 @@ pub const ALGORITHMS: [AlgorithmOption; 3] = [
 pub struct PaletteOption {
     pub id: &'static str,
     pub label: &'static str,
-    pub values: &'static [&'static str; 5],
+    pub values: &'static [&'static str; 8],
 }
 
-const GARDEN: [&str; 5] = ["🌱", "🌿", "🍀", "🌸", "🌻"];
-const OCEAN: [&str; 5] = ["💧", "🐚", "🐠", "🐬", "🌊"];
-const SPACE: [&str; 5] = ["🌑", "🌒", "🌓", "🌔", "🌕"];
-const FRUIT: [&str; 5] = ["🍓", "🍊", "🍋", "🍏", "🫐"];
+const GARDEN: [&str; 8] = ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝"];
+const OCEAN: [&str; 8] = ["💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳"];
+const SPACE: [&str; 8] = ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"];
+const FRUIT: [&str; 8] = ["🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"];
 
 pub const PALETTES: [PaletteOption; 4] = [
     PaletteOption {
@@ -143,7 +147,8 @@ pub fn render(recipe: &Recipe) -> Result<Vec<String>, TutorialError> {
             let index = match recipe.algorithm.as_str() {
                 "waves" => waves_index(x, y, recipe.seed),
                 "ripples" => ripples_index(x, y, recipe.seed),
-                "sierpinski" => sierpinski_index(x, y, recipe.seed),
+                "spiral" => spiral_index(x, y, recipe.seed),
+                "patchwork" => patchwork_index(x, y, recipe.seed),
                 _ => return Err(error("tutorial.unknown_algorithm")),
             };
             cells.push(palette[index].to_owned());
@@ -170,7 +175,7 @@ fn validate_recipe(recipe: &Recipe) -> Result<(), TutorialError> {
     Ok(())
 }
 
-fn palette_values(id: &str) -> Result<&'static [&'static str; 5], TutorialError> {
+fn palette_values(id: &str) -> Result<&'static [&'static str; 8], TutorialError> {
     PALETTES
         .iter()
         .find(|palette| palette.id == id)
@@ -198,22 +203,42 @@ fn ripples_index(x: u32, y: u32, seed: u32) -> usize {
     palette_index((distance * frequency + phase).sin())
 }
 
-fn sierpinski_index(x: u32, y: u32, seed: u32) -> usize {
-    let x = if seed & 1 == 0 { x } else { GRID_WIDTH - 1 - x };
-    let y = if seed & 2 == 0 {
-        y
-    } else {
-        GRID_HEIGHT - 1 - y
-    };
-    if x & y != 0 {
-        return 0;
+fn spiral_index(x: u32, y: u32, seed: u32) -> usize {
+    let center_x = f64::from(GRID_WIDTH - 1) / 2.0;
+    let center_y = f64::from(GRID_HEIGHT - 1) / 2.0;
+    let dx = f64::from(x) - center_x;
+    let dy = f64::from(y) - center_y;
+    let distance = dx.hypot(dy) / center_x.hypot(center_y);
+    let phase = f64::from(seed as u8) / 255.0 * TAU;
+    let angle = dy.atan2(dx) + phase;
+    palette_index((angle * 1.5 + distance * TAU * 2.0 + phase.sin()).sin())
+}
+
+fn patchwork_index(x: u32, y: u32, seed: u32) -> usize {
+    let mut state = seed;
+    let mut nearest = 0_usize;
+    let mut nearest_distance = f64::INFINITY;
+    for region in 0..8_usize {
+        let point_x = f64::from((region as u32 % 4) * 4 + next_random(&mut state) % 4);
+        let point_y = f64::from((region as u32 / 4) * 6 + next_random(&mut state) % 6);
+        let distance = (f64::from(x) - point_x).powi(2) + (f64::from(y) - point_y).powi(2);
+        if distance < nearest_distance {
+            nearest = region;
+            nearest_distance = distance;
+        }
     }
-    let rotation = ((seed >> 2) % 4) as usize;
-    1 + ((x as usize + y as usize + rotation) % 4)
+    nearest
+}
+
+fn next_random(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
 }
 
 fn palette_index(value: f64) -> usize {
-    ((((value + 1.0) / 2.0) * 5.0).floor() as usize).min(4)
+    ((((value + 1.0) / 2.0) * 8.0).floor() as usize).min(7)
 }
 
 const fn error(code: &'static str) -> TutorialError {

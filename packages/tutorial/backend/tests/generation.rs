@@ -17,8 +17,8 @@ fn renders_independent_examples_for_each_algorithm() {
     assert_eq!(
         &waves[..16],
         [
-            "🍀", "🌿", "🌿", "🌸", "🌸", "🍀", "🌿", "🌿", "🌸", "🌸", "🍀", "🌿", "🌿", "🌸",
-            "🌸", "🍀"
+            "🌻", "🍀", "🍀", "🪻", "🌷", "🌻", "🍀", "🍀", "🪻", "🌷", "🌻", "🍀", "🍀", "🪻",
+            "🌷", "🌻"
         ]
     );
 
@@ -26,24 +26,32 @@ fn renders_independent_examples_for_each_algorithm() {
     assert_eq!(
         &ripples[..16],
         [
-            "🌊", "💧", "🐬", "🐠", "💧", "🌊", "🐬", "🐠", "🐠", "🐬", "🌊", "💧", "🐠", "🐬",
-            "💧", "🌊"
+            "🐙", "🐚", "🪼", "🐬", "🐚", "🐳", "🐙", "🐬", "🐬", "🐙", "🐳", "🐚", "🐬", "🪼",
+            "🐚", "🐙"
         ]
     );
 
-    let sierpinski = render(&recipe("sierpinski", "fruit", 0x1234_5678)).unwrap();
+    let spiral = render(&recipe("spiral", "fruit", 0x1234_5678)).unwrap();
     assert_eq!(
-        &sierpinski[..16],
+        &spiral[..16],
         [
-            "🍏", "🫐", "🍊", "🍋", "🍏", "🫐", "🍊", "🍋", "🍏", "🫐", "🍊", "🍋", "🍏", "🫐",
-            "🍊", "🍋"
+            "🍒", "🍏", "🍓", "🍓", "🍊", "🍋", "🍏", "🍏", "🍋", "🍓", "🍓", "🍊", "🍇", "🍒",
+            "🍉", "🍊"
+        ]
+    );
+    let patchwork = render(&recipe("patchwork", "fruit", 0x1234_5678)).unwrap();
+    assert_eq!(
+        &patchwork[..16],
+        [
+            "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍏", "🍏", "🍏", "🍏", "🍏",
+            "🍏", "🍏"
         ]
     );
 }
 
 #[test]
 fn recipes_are_reproducible_bounded_and_seed_sensitive() {
-    for algorithm in ["waves", "ripples", "sierpinski"] {
+    for algorithm in ["waves", "ripples", "spiral", "patchwork"] {
         let first = render(&recipe(algorithm, "space", 7)).unwrap();
         assert_eq!(first, render(&recipe(algorithm, "space", 7)).unwrap());
         assert_ne!(first, render(&recipe(algorithm, "space", 91)).unwrap());
@@ -51,14 +59,15 @@ fn recipes_are_reproducible_bounded_and_seed_sensitive() {
         assert!(
             first
                 .iter()
-                .all(|cell| ["🌑", "🌒", "🌓", "🌔", "🌕"].contains(&cell.as_str()))
+                .all(|cell| ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"]
+                    .contains(&cell.as_str()))
         );
     }
 }
 
 #[test]
 fn recipes_reject_unknown_choices_and_noncanonical_versions_or_dimensions() {
-    let unknown_algorithm = render(&recipe("spiral", "garden", 1)).unwrap_err();
+    let unknown_algorithm = render(&recipe("unknown", "garden", 1)).unwrap_err();
     assert_eq!(unknown_algorithm.code(), "tutorial.unknown_algorithm");
 
     let unknown_palette = render(&recipe("waves", "desert", 1)).unwrap_err();

@@ -29,12 +29,12 @@ class FakeClient implements PackageClient {
     }
     if (operation === "tutorial.read") {
       return {
-        algorithms: [{ id: "waves", label: "Waves" }, { id: "ripples", label: "Ripples" }, { id: "sierpinski", label: "Sierpiński" }],
+        algorithms: [{ id: "waves", label: "Waves" }, { id: "ripples", label: "Ripples" }, { id: "spiral", label: "Spiral" }, { id: "patchwork", label: "Patchwork" }],
         palettes: [
-          { id: "garden", label: "Garden", values: ["🌱", "🌿", "🍀", "🌸", "🌻"] },
-          { id: "ocean", label: "Ocean", values: ["💧", "🐚", "🐠", "🐬", "🌊"] },
-          { id: "space", label: "Space", values: ["🌑", "🌒", "🌓", "🌔", "🌕"] },
-          { id: "fruit", label: "Fruit", values: ["🍓", "🍊", "🍋", "🍏", "🫐"] },
+          { id: "garden", label: "Garden", values: ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝"] },
+          { id: "ocean", label: "Ocean", values: ["💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳"] },
+          { id: "space", label: "Space", values: ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"] },
+          { id: "fruit", label: "Fruit", values: ["🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"] },
         ],
         artworks: [],
       } as unknown as TResponse;
@@ -82,6 +82,24 @@ describe("Tutorial UI client flow", () => {
     expect(client.requests.slice(-2)).toEqual([
       { operation: "tutorial.generate", payload: { algorithm: "ripples", palette: "ocean" } },
       { operation: "tutorial.generate", payload: { algorithm: "ripples", palette: "ocean" } },
+    ]);
+  });
+
+  it("supports every Backend-owned pattern and palette choice", async () => {
+    const client = new FakeClient();
+    const controller = createTutorialController(client, () => {});
+    await controller.start();
+    const choices: Array<readonly [string, string]> = [["waves", "garden"], ["ripples", "ocean"], ["spiral", "space"], ["patchwork", "fruit"]];
+    for (const [algorithm, palette] of choices) {
+      controller.setAlgorithm(algorithm);
+      controller.setPalette(palette);
+      await controller.generate();
+    }
+    expect(client.requests.slice(-4).map(({ payload }) => payload)).toEqual([
+      { algorithm: "waves", palette: "garden" },
+      { algorithm: "ripples", palette: "ocean" },
+      { algorithm: "spiral", palette: "space" },
+      { algorithm: "patchwork", palette: "fruit" },
     ]);
   });
 

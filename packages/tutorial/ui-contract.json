@@ -8,7 +8,7 @@
     },
     "algorithmId": {
       "type": "string",
-      "enum": ["waves", "ripples", "sierpinski"]
+      "enum": ["waves", "ripples", "spiral", "patchwork"]
     },
     "paletteId": {
       "type": "string",
@@ -33,7 +33,7 @@
       "maxItems": 192,
       "items": {
         "type": "string",
-        "enum": ["🌱", "🌿", "🍀", "🌸", "🌻", "💧", "🐚", "🐠", "🐬", "🌊", "🌑", "🌒", "🌓", "🌔", "🌕", "🍓", "🍊", "🍋", "🍏", "🫐"]
+        "enum": ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝", "💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳", "🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀", "🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"]
       }
     },
     "draft": {
@@ -59,15 +59,16 @@
       "oneOf": [
         { "const": { "id": "waves", "label": "Waves" } },
         { "const": { "id": "ripples", "label": "Ripples" } },
-        { "const": { "id": "sierpinski", "label": "Sierpiński" } }
+        { "const": { "id": "spiral", "label": "Spiral" } },
+        { "const": { "id": "patchwork", "label": "Patchwork" } }
       ]
     },
     "paletteChoice": {
       "oneOf": [
-        { "const": { "id": "garden", "label": "Garden", "values": ["🌱", "🌿", "🍀", "🌸", "🌻"] } },
-        { "const": { "id": "ocean", "label": "Ocean", "values": ["💧", "🐚", "🐠", "🐬", "🌊"] } },
-        { "const": { "id": "space", "label": "Space", "values": ["🌑", "🌒", "🌓", "🌔", "🌕"] } },
-        { "const": { "id": "fruit", "label": "Fruit", "values": ["🍓", "🍊", "🍋", "🍏", "🫐"] } }
+        { "const": { "id": "garden", "label": "Garden", "values": ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝"] } },
+        { "const": { "id": "ocean", "label": "Ocean", "values": ["💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳"] } },
+        { "const": { "id": "space", "label": "Space", "values": ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"] } },
+        { "const": { "id": "fruit", "label": "Fruit", "values": ["🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"] } }
       ]
     },
     "readResponse": {
@@ -75,8 +76,8 @@
       "properties": {
         "algorithms": {
           "type": "array",
-          "minItems": 3,
-          "maxItems": 3,
+          "minItems": 4,
+          "maxItems": 4,
           "items": { "$ref": "#/$defs/algorithmChoice" }
         },
         "palettes": {

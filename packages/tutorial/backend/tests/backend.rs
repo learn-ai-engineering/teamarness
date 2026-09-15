@@ -133,8 +133,26 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
     .await;
     assert_response(&read);
     let read_payload = read.field("payload").unwrap();
-    assert_eq!(read_payload["algorithms"].as_array().unwrap().len(), 3);
+    assert_eq!(read_payload["algorithms"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        read_payload["algorithms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["waves", "ripples", "spiral", "patchwork"]
+    );
     assert_eq!(read_payload["palettes"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        read_payload["palettes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value["values"].as_array().unwrap().len())
+            .collect::<Vec<_>>(),
+        [8, 8, 8, 8]
+    );
     assert_eq!(read_payload["artworks"], serde_json::json!([]));
 
     let first = request(
