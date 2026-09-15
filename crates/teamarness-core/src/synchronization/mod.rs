@@ -4,6 +4,7 @@
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
 mod operation_store;
+mod protection_control;
 use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
@@ -833,6 +834,7 @@ fn ensure_scope(
     conn: &rusqlite::Transaction<'_>,
     package: &str,
     workspace: WorkspaceId,
+    creator: PublicIdentity,
 ) -> Result<ScopeState, SynchronizationError> {
     let digest = scope_digest(package, workspace);
     let found: Option<(Vec<u8>, Vec<u8>)> = conn
@@ -851,9 +853,11 @@ fn ensure_scope(
     getrandom::fill(&mut journal).map_err(|_| storage_error())?;
     getrandom::fill(&mut key).map_err(|_| storage_error())?;
     conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key_id(&key).as_slice(), key.as_slice()]).map_err(|_| storage_error())?;
+    let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
+    bundle.extend_from_slice(&key);
     conn.execute(
-        "INSERT INTO protection_state(scope_id,state_bytes,content_key_id) VALUES(?1,?2,?3)",
-        rusqlite::params![digest.as_slice(), key.as_slice(), key_id(&key).as_slice()],
+        "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
+        rusqlite::params![digest.as_slice(), bundle, key_id(&key).as_slice(), creator.as_bytes().as_slice()],
     )
     .map_err(|_| storage_error())?;
     conn.execute(
@@ -862,6 +866,139 @@ fn ensure_scope(
     )
     .map_err(|_| storage_error())?;
     Ok((journal, key, digest))
+}
+
+pub(crate) fn export_protection_grant(
+    conn: &mut rusqlite::Connection,
+    secret: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+    recipient: PublicIdentity,
+    admission: [u8; 32],
+) -> Result<Vec<u8>, SynchronizationError> {
+    let scope = scope_digest(package, workspace);
+    let key = conn
+        .query_row(
+            "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|_| storage_error())?
+        .ok_or(SynchronizationError::WorkspaceNotFound)
+        .and_then(fixed)?;
+    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, key);
+    let control =
+        protection_control::decode(&bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| storage_error())?;
+    protection_control::insert(
+        &tx,
+        scope,
+        RecordId::digest(&bytes).as_bytes(),
+        "grant",
+        &control,
+        &bytes,
+    )
+    .map_err(|_| storage_error())?;
+    tx.commit()
+        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
+    Ok(bytes)
+}
+
+pub(crate) fn protection_control_author(
+    bytes: &[u8],
+) -> Result<PublicIdentity, SynchronizationError> {
+    protection_control::decode(bytes)
+        .map(|control| control.author)
+        .map_err(|_| SynchronizationError::CorruptRecord)
+}
+
+pub(crate) fn import_protection_grant(
+    conn: &mut rusqlite::Connection,
+    local_identity: PublicIdentity,
+    workspace: WorkspaceId,
+    package: &str,
+    bytes: &[u8],
+) -> Result<usize, SynchronizationError> {
+    let control =
+        protection_control::decode(bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
+    let scope = scope_digest(package, workspace);
+    if control.scope != scope
+        || control.workspace != workspace
+        || control.recipient != local_identity
+        || !matches!(control.kind, 1 | 3)
+    {
+        return Err(SynchronizationError::WrongScope);
+    }
+    let key = protection_control::decrypt_key(&control)
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| storage_error())?;
+    let existing: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT content_key_id FROM sync_scopes WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| storage_error())?;
+    if let Some(existing) = existing {
+        if existing != control.content_key_id {
+            return Err(SynchronizationError::CorruptRecord);
+        }
+    } else {
+        let mut journal = [0; 16];
+        getrandom::fill(&mut journal).map_err(|_| storage_error())?;
+        tx.execute(
+            "INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.as_slice()],
+        ).map_err(|_| storage_error())?;
+        let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
+        bundle.extend_from_slice(&key);
+        tx.execute(
+            "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![scope.as_slice(), bundle, control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
+        ).map_err(|_| storage_error())?;
+        tx.execute(
+            "INSERT INTO durable_wakes(scope_id,wake_generation) VALUES(?1,0)",
+            [scope.as_slice()],
+        )
+        .map_err(|_| storage_error())?;
+    }
+    protection_control::insert(
+        &tx,
+        scope,
+        RecordId::digest(bytes).as_bytes(),
+        if control.kind == 1 { "create" } else { "grant" },
+        &control,
+        bytes,
+    )
+    .map_err(|_| storage_error())?;
+    let pending: Vec<Vec<u8>> = {
+        let mut statement = tx.prepare("SELECT sealed_record FROM pending_protection_records WHERE scope_id=?1 ORDER BY pending_id").map_err(|_| storage_error())?;
+        statement
+            .query_map([scope.as_slice()], |row| row.get(0))
+            .map_err(|_| storage_error())?
+            .collect::<Result<_, _>>()
+            .map_err(|_| storage_error())?
+    };
+    tx.commit()
+        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
+    let mut promoted = 0;
+    for sealed in pending {
+        if insert_remote(conn, workspace, package, &sealed).is_ok() {
+            conn.execute(
+                "DELETE FROM pending_protection_records WHERE scope_id=?1 AND sealed_record=?2",
+                rusqlite::params![scope.as_slice(), sealed],
+            )
+            .map_err(|_| storage_error())?;
+            promoted += 1;
+        }
+    }
+    Ok(promoted)
 }
 
 fn record_from_row(row: RecordFields<'_>) -> Result<ImmutableRecord, SynchronizationError> {
@@ -885,18 +1022,31 @@ pub(crate) fn append(
     purpose: &str,
     canonical: &[u8],
     is_member: bool,
+    is_creator: bool,
 ) -> Result<ImmutableRecord, SynchronizationError> {
     if !is_member {
         return Err(SynchronizationError::NotCurrentMember);
     }
     let signed = SignedRecordV1::sign(secret, package, workspace, purpose, canonical)
         .map_err(|_| SynchronizationError::InvalidInput)?;
+    let scope_exists = conn
+        .query_row(
+            "SELECT 1 FROM sync_scopes WHERE scope_id=?1",
+            [scope_digest(package, workspace).as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| storage_error())?
+        .is_some();
+    if !scope_exists && !is_creator {
+        return Err(SynchronizationError::NotCurrentMember);
+    }
     let canonical_signed = signed.canonical_bytes();
     let record_id = RecordId::digest(&canonical_signed);
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| storage_error())?;
-    let (journal, key, scope) = ensure_scope(&tx, package, workspace)?;
+    let (journal, key, scope) = ensure_scope(&tx, package, workspace, signed.author)?;
     let protection = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
@@ -923,7 +1073,7 @@ pub(crate) fn append(
     let operation_id = RecordId::digest(&sealed_bytes);
     let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),order.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,sealed_bytes.as_slice(),Vec::<u8>::new(),height]).map_err(|_| storage_error())?;
-    operation_store::insert(
+    let projection_operation_id = operation_store::insert(
         &tx,
         secret,
         scope,
@@ -939,6 +1089,28 @@ pub(crate) fn append(
         key_id(&key),
     )
     .map_err(|_| storage_error())?;
+    if tx
+        .query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM protection_control_operations WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| storage_error())?
+        == 0
+    {
+        let control =
+            protection_control::create(secret, scope, workspace, signed.author, [0; 32], key);
+        let parsed = protection_control::decode(&control).map_err(|_| storage_error())?;
+        protection_control::insert(
+            &tx,
+            scope,
+            RecordId::digest(&control).as_bytes(),
+            "create",
+            &parsed,
+            &control,
+        )?;
+        let _ = projection_operation_id;
+    }
     tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),sealed_bytes.as_slice()]).map_err(|_| storage_error())?;
     tx.execute(
         "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
@@ -1110,9 +1282,13 @@ pub(crate) fn insert_remote(
     bytes: &[u8],
 ) -> Result<ImmutableRecord, SynchronizationError> {
     let scope = scope_digest(package, workspace);
-    let (journal, key): ([u8; 16], [u8; 32]) = conn
+    let sealed = SealedRecordV1::decode(bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
+    if sealed.scope_digest != scope {
+        return Err(SynchronizationError::WrongScope);
+    }
+    let scope_keys: Option<([u8; 16], [u8; 32], [u8; 32])> = conn
         .query_row(
-            "SELECT journal_id,content_key FROM sync_scopes WHERE scope_id=?1",
+            "SELECT journal_id,content_key,content_key_id FROM sync_scopes WHERE scope_id=?1",
             [scope.as_slice()],
             |row| {
                 Ok((
@@ -1122,15 +1298,27 @@ pub(crate) fn insert_remote(
                     row.get::<_, Vec<u8>>(1)?
                         .try_into()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    row.get::<_, Vec<u8>>(2)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                 ))
             },
         )
         .optional()
-        .map_err(|_| storage_error())?
-        .ok_or(SynchronizationError::RuntimeUnavailable)?;
-    let sealed = SealedRecordV1::decode(bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
-    if sealed.scope_digest != scope {
-        return Err(SynchronizationError::WrongScope);
+        .map_err(|_| storage_error())?;
+    let Some((journal, key, content_key_id)) = scope_keys else {
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_protection_records(scope_id,package_identity,workspace_id,content_key_id,sealed_record) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), sealed.content_key_id.as_slice(), bytes],
+        ).map_err(|_| storage_error())?;
+        return Err(SynchronizationError::RuntimeUnavailable);
+    };
+    if content_key_id != sealed.content_key_id {
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_protection_records(scope_id,package_identity,workspace_id,content_key_id,sealed_record) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), sealed.content_key_id.as_slice(), bytes],
+        ).map_err(|_| storage_error())?;
+        return Err(SynchronizationError::RuntimeUnavailable);
     }
     let protector = P2pandaRecordProtection {
         package_identity: package.to_owned(),

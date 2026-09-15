@@ -75,6 +75,36 @@ async fn restart_rejects_tampered_p2panda_projection() {
 }
 
 #[tokio::test]
+async fn creator_bootstrap_is_recorded_as_authenticated_control() {
+    let path = directory();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&path))
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Protection bootstrap").unwrap();
+    runtime
+        .append_record(
+            workspace.id(),
+            "teamarness.test",
+            "message.post",
+            b"bootstrap",
+        )
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    let kind: String = connection
+        .query_row(
+            "SELECT operation_kind FROM protection_control_operations LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "create");
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
 async fn core_database_contains_sealed_payload_not_canonical_record_bytes() {
     let path = directory();
     let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&path))

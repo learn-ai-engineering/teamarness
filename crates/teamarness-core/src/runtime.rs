@@ -1251,6 +1251,10 @@ impl CoreRuntime {
                     .iter()
                     .any(|member| member.identity() == self.public_identity)
             });
+        let is_creator = state
+            .memberships
+            .get(&workspace_id)
+            .is_some_and(|projection| projection.creator() == self.public_identity);
         let secret_key = state.secret_key.clone();
         let record = crate::synchronization::append(
             &mut state.connection,
@@ -1260,6 +1264,7 @@ impl CoreRuntime {
             purpose,
             canonical,
             is_member,
+            is_creator,
         )?;
         if let Some(event) = crate::synchronization::event_for_record(
             &state.connection,
@@ -1309,6 +1314,74 @@ impl CoreRuntime {
             listeners.retain(|sender| sender.send(event.clone()).is_ok());
         }
         Ok(record)
+    }
+
+    /// Creates an authenticated Core-held welcome grant for a current recipient.
+    ///
+    /// The returned bytes are an opaque control operation; they contain no plaintext content key.
+    pub fn export_protection_grant(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        recipient: PublicIdentity,
+    ) -> Result<Vec<u8>, crate::SynchronizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(crate::SynchronizationError::RuntimeUnavailable);
+        }
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(crate::SynchronizationError::WorkspaceNotFound)?;
+        if !projection.contains_member(self.public_identity)
+            || !projection.contains_member(recipient)
+        {
+            return Err(crate::SynchronizationError::NotCurrentMember);
+        }
+        let admission = *projection.snapshot().version().as_bytes();
+        let secret_key = state.secret_key.clone();
+        crate::synchronization::export_protection_grant(
+            &mut state.connection,
+            &secret_key,
+            workspace_id,
+            package_identity,
+            recipient,
+            admission,
+        )
+    }
+
+    /// Imports an authenticated Core welcome and atomically promotes pending records.
+    pub fn import_protection_grant(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        grant: &[u8],
+    ) -> Result<usize, crate::SynchronizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(crate::SynchronizationError::RuntimeUnavailable);
+        }
+        let author = crate::synchronization::protection_control_author(grant)?;
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(crate::SynchronizationError::WorkspaceNotFound)?;
+        if !projection.contains_member(author) {
+            return Err(crate::SynchronizationError::NotCurrentMember);
+        }
+        crate::synchronization::import_protection_grant(
+            &mut state.connection,
+            self.public_identity,
+            workspace_id,
+            package_identity,
+            grant,
+        )
     }
 
     /// Opens sealed records in request order after authenticating their scope and contents.

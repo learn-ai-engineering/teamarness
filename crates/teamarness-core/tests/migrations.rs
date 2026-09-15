@@ -246,7 +246,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     for column in [
         "scope_id",
         "log_id",
@@ -319,7 +319,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(installation_count, 1);
 
     drop(connection);
