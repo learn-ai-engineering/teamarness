@@ -1,4 +1,9 @@
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
+import {
+  buildPackageNavigationPresentation,
+  buildShellPresentation,
+  type ShellPresentation,
+} from "./presentation";
 import type { InstallationThemeController, ThemePreference } from "./theme";
 import { renderShell, type ShellModel } from "./view";
 
@@ -40,9 +45,11 @@ type ShellOptions = Readonly<{
 export class Shell {
   private selectedRoute: ShellRoute = { kind: "workspace-chooser" };
   private workspaceModel: ShellModel | null = null;
+  private workspacePresentation: ShellPresentation | null = null;
   private packageSnapshot: PackageHostSnapshot | null = null;
   private observedActiveWorkspaceId: string | null = null;
   private packageRoutes: readonly PackageInstanceKey[] = [];
+  private presentationRevision = 0;
 
   public constructor(
     private readonly shellFrame: ShellFrame,
@@ -55,7 +62,7 @@ export class Shell {
 
   public route(): ShellRoute { return this.selectedRoute; }
 
-  public updateWorkspace(model: ShellModel): void {
+  public async updateWorkspace(model: ShellModel): Promise<void> {
     this.workspaceModel = model;
     if (model.workspaces.length === 0) {
       if (this.selectedRoute.kind !== "workspace-chooser") {
@@ -68,7 +75,7 @@ export class Shell {
       this.deactivatePackage();
       this.setRoute({ kind: "workspace-overview", workspaceId: model.activeWorkspaceId });
     }
-    this.renderAll();
+    if (await this.preparePresentation()) this.renderAll();
   }
 
   public updatePackages(snapshot: PackageHostSnapshot): void {
@@ -89,12 +96,22 @@ export class Shell {
     await this.options.packageShell.hide();
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
-    this.renderAll();
+    if (await this.preparePresentation()) this.renderAll();
   }
 
   private setRoute(route: ShellRoute): void {
     this.selectedRoute = route;
     this.options.onRouteChange?.(route);
+  }
+
+  private async preparePresentation(): Promise<boolean> {
+    const model = this.workspaceModel;
+    if (!model) return false;
+    const revision = ++this.presentationRevision;
+    const presentation = await buildShellPresentation(model, routeWorkspaceId(this.selectedRoute));
+    if (revision !== this.presentationRevision) return false;
+    this.workspacePresentation = presentation;
+    return true;
   }
 
   private renderAll(): void {
@@ -105,9 +122,10 @@ export class Shell {
 
   private renderWorkspaceRail(): void {
     const model = this.workspaceModel;
-    if (!model) return;
-    const workspaces = model.workspaces.map((workspace, index) => {
-      const current = workspace.id === model.activeWorkspaceId ? ' aria-current="page"' : "";
+    const presentation = this.workspacePresentation;
+    if (!model || !presentation) return;
+    const workspaces = presentation.workspaceChoices.map((workspace, index) => {
+      const current = index === presentation.activeWorkspaceIndex ? ' aria-current="page"' : "";
       return `<li><button type="button" data-workspace-index="${index}"${current} aria-label="Switch to ${escape(workspace.name)}">${escape(workspaceMark(workspace.name))}</button></li>`;
     }).join("");
     const preference = this.options.theme.getPreference();
@@ -115,7 +133,7 @@ export class Shell {
       <ul class="workspace-switcher">${workspaces}</ul>
       <button class="workspace-add" id="choose-workspace" type="button" aria-label="Add or join a Workspace">+</button>
       <details class="installation-menu"><summary>Installation</summary>
-        ${model.installation ? `<p>${escape(model.installation.displayName)}</p>` : ""}
+        ${presentation.installationName ? `<p>${escape(presentation.installationName)}</p>` : '<p>Loading…</p>'}
         <label for="theme-preference">Theme</label>
         <select id="theme-preference">
           ${themeOption("system", "System", preference)}
@@ -126,8 +144,7 @@ export class Shell {
     if (!hasQueries(this.shellFrame.workspaceRail)) return;
     this.shellFrame.workspaceRail.querySelectorAll<HTMLButtonElement>("[data-workspace-index]").forEach((button) => {
       button.addEventListener("click", () => {
-        const index = Number(button.dataset.workspaceIndex);
-        const workspace = model.workspaces[index];
+        const workspace = model.workspaces[Number(button.dataset.workspaceIndex)];
         if (workspace) this.options.workspaceActions.selectWorkspace(workspace.id);
       });
     });
@@ -143,24 +160,25 @@ export class Shell {
 
   private renderContextualNavigation(): void {
     const model = this.workspaceModel;
-    if (!model) return;
-    const active = model.workspaces.find(({ id }) => id === model.activeWorkspaceId);
-    if (!active) {
+    const presentation = this.workspacePresentation;
+    if (!model || !presentation) return;
+    const activeIndex = presentation.activeWorkspaceIndex;
+    const active = activeIndex === null ? undefined : model.workspaces[activeIndex];
+    const activePresentation = activeIndex === null ? undefined : presentation.workspaceChoices[activeIndex];
+    if (!active || !activePresentation) {
       this.packageRoutes = [];
-      this.shellFrame.contextualNavigation.innerHTML = `<div class="contextual-navigation__empty"><p>Choose a Workspace</p></div>`;
+      this.shellFrame.contextualNavigation.innerHTML = '<div class="contextual-navigation__empty"><p>Choose a Workspace</p></div>';
       return;
     }
 
-    const instances = this.packageSnapshot?.instances.filter(({ key }) => key.workspaceId === active.id) ?? [];
-    const packageRows = instances.map((instance) => {
-      const catalog = this.packageSnapshot?.packages.find(({ identity }) => identity === instance.key.packageIdentity);
-      return { instance: instance.key, name: catalog?.displayName ?? "Package", source: catalog?.source ?? "bundled" };
-    });
-    this.packageRoutes = packageRows.map(({ instance }) => instance);
-    const team = packageRows.map((row, index) => row.source === "bundled" ? packageButton(row.name, index, this.selectedRoute, row.instance) : "").join("");
-    const privatePackages = packageRows.map((row, index) => row.source === "local" ? packageButton(row.name, index, this.selectedRoute, row.instance) : "").join("");
+    this.packageRoutes = this.packageSnapshot?.instances
+      .filter(({ key }) => key.workspaceId === active.id)
+      .map(({ key }) => key) ?? [];
+    const packages = buildPackageNavigationPresentation(this.packageSnapshot, active.id);
+    const team = packages.teamPackages.map((row) => packageButton(row.name, row.actionIndex, this.selectedRoute, this.packageRoutes)).join("");
+    const privatePackages = packages.privatePackages.map((row) => packageButton(row.name, row.actionIndex, this.selectedRoute, this.packageRoutes)).join("");
 
-    this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><p>Workspace</p><h1>${escape(active.name)}</h1></header>
+    this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></header>
       <nav class="contextual-navigation__body" aria-label="Active Workspace"><ul class="screen-navigation">
         ${screenButton("Overview", "workspace-overview", active.id, this.selectedRoute)}
         ${screenButton("Invitations", "workspace-invitations", active.id, this.selectedRoute)}
@@ -195,8 +213,8 @@ export class Shell {
   }
 
   private renderSelectedScreen(): void {
-    if (!this.workspaceModel || this.selectedRoute.kind === "package-instance") return;
-    this.shellFrame.shellScreen.innerHTML = renderShell(this.workspaceModel, this.selectedRoute);
+    if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
+    this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute);
     this.bindSelectedScreen();
   }
 
@@ -272,8 +290,14 @@ function screenButton(label: string, kind: Exclude<ShellRoute["kind"], "workspac
   return `<li><button type="button" data-screen="${kind}"${current}>${label}</button></li>`;
 }
 
-function packageButton(name: string, index: number, route: ShellRoute, instance: PackageInstanceKey): string {
-  const current = route.kind === "package-instance"
+function packageButton(
+  name: string,
+  index: number,
+  route: ShellRoute,
+  packageRoutes: readonly PackageInstanceKey[],
+): string {
+  const instance = packageRoutes[index];
+  const current = route.kind === "package-instance" && instance
     && route.instance.packageIdentity === instance.packageIdentity
     && route.instance.workspaceId === instance.workspaceId
     ? ' aria-current="page"'

@@ -1,6 +1,7 @@
 import type { TeamarnessBridge } from "./bridge";
 import { isBridgeError } from "./contracts";
 import type { BridgeErrorCode, Installation, Membership, Workspace } from "./contracts";
+import { buildShellPresentation, type ShellPresentation } from "./presentation";
 import type { ShellRoute } from "./shell";
 
 export type ShellModel = Readonly<{
@@ -33,8 +34,9 @@ export class ShellRenderer {
     return this.persistentPackagePane;
   }
 
-  public render(model: ShellModel, route: ShellRoute = { kind: "workspace-chooser" }): void {
-    this.controls.innerHTML = renderShell(model, route);
+  public async render(model: ShellModel, route: ShellRoute = { kind: "workspace-chooser" }): Promise<void> {
+    const presentation = await buildShellPresentation(model, routeWorkspaceId(route));
+    this.controls.innerHTML = renderShell(presentation, route);
   }
 }
 
@@ -140,63 +142,52 @@ const escape = (value: string): string => value
   .replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;");
 
-export function renderShell(
-  model: ShellModel,
-  route: ShellRoute = { kind: "workspace-chooser" },
-): string {
-  const status = `<p class="shell-status" role="status" aria-live="polite">${model.loading ? "Working…" : escape(model.notice ?? "")}</p>`;
-  const error = `<div class="shell-alert" role="alert">${model.error
-    ? `<p class="error">${escape(errorMessage(model.error))}</p><button id="retry" type="button">Retry</button>`
+export function renderShell(presentation: ShellPresentation, route: ShellRoute): string {
+  const statusMessage = presentation.loading ? "Working…" : presentation.notice ?? "";
+  const status = `<p class="shell-status" role="status" aria-live="polite">${escape(statusMessage)}</p>`;
+  const error = `<div class="shell-alert" role="alert">${presentation.error
+    ? `<p class="error">${escape(presentation.error.message)}</p>${presentation.error.canRetry ? '<button id="retry" type="button">Retry</button>' : ""}`
     : ""}</div>`;
   const feedback = `${status}${error}`;
 
   if (route.kind === "workspace-chooser") {
-    const workspaces = model.workspaces.map((workspace, index) =>
-      `<li><button type="button" data-choose-workspace="${index}">${escape(workspace.name)}</button></li>`).join("");
-    return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><h1 id="chooser-heading">Choose a Workspace</h1>
-      <ul class="workspace-list">${workspaces || "<li>No Workspaces yet.</li>"}</ul>
-      <section><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
-      <input id="workspace-name" required maxlength="64"><button ${model.loading ? "disabled" : ""}>Create</button></form></section>
-      <section><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Invitation</label>
-      <textarea id="invitation-value" required maxlength="8192"></textarea><button ${model.loading ? "disabled" : ""}>Join</button></form></section></section>`;
+    const choices = presentation.workspaceChoices.map(({ name }, index) =>
+      `<li><button type="button" data-choose-workspace="${index}">${escape(name)}</button></li>`).join("");
+    const workspaceList = choices || (presentation.loading
+      ? '<li class="empty-state">Loading Workspaces…</li>'
+      : '<li class="empty-state">No Workspaces yet. Create one or join with an invitation.</li>');
+    return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Choose a Workspace</h1><p>Select an existing Workspace or add another.</p></header>
+      <section class="screen-section" aria-labelledby="workspace-list-heading"><h2 id="workspace-list-heading">Your Workspaces</h2><ul class="workspace-list">${workspaceList}</ul></section>
+      <section class="screen-section"><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
+      <input id="workspace-name" required maxlength="64"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
+      <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Invitation</label>
+      <textarea id="invitation-value" required maxlength="8192"></textarea><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
   }
 
-  const workspaceId = route.kind === "package-instance" ? route.instance.workspaceId : route.workspaceId;
-  const workspace = model.workspaces.find(({ id }) => id === workspaceId);
-  if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1></section>`;
+  const workspace = presentation.workspace;
+  if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1><p>Choose another Workspace or retry.</p></section>`;
 
   if (route.kind === "workspace-invitations") {
-    return `${feedback}<section class="shell-screen"><h1>Invitations</h1><p>Create an invitation for ${escape(workspace.name)}.</p>
-      <button type="button" id="copy-invitation" ${model.loading ? "disabled" : ""}>Copy invitation</button>
-      <p class="sensitive">Invitations are sensitive bearer admission material.</p></section>`;
+    return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Invitations</h1><p>Create a one-use invitation for this Workspace.</p></header>
+      <section class="screen-section notice-panel"><h2>Invite another Installation</h2><button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy invitation</button>
+      <p class="sensitive">Invitations are sensitive bearer admission material. Share them privately.</p></section></section>`;
   }
   if (route.kind === "workspace-settings") {
-    return `${feedback}<section class="shell-screen"><h1>Workspace settings</h1><p>${escape(workspace.name)}</p>
-      <p>Package Instance management will appear here.</p></section>`;
+    return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Workspace settings</h1><p>Workspace details are read-only in this version.</p></header>
+      <section class="screen-section settings-panel" aria-labelledby="workspace-details-heading"><h2 id="workspace-details-heading">Workspace details</h2><dl><div><dt>Name</dt><dd>${escape(workspace.name)}</dd></div><div><dt>Members</dt><dd>${workspace.memberCount}</dd></div></dl></section>
+      <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2><p>No Package management actions are available on this screen yet.</p></section></section>`;
   }
 
-  const membership = model.memberships[workspace.id];
-  const members = membership?.members.map((member) =>
-    `<li><span class="identifier">${escape(member.identity)}</span> — ${member.role}</li>`).join("") ?? "";
-  return `${feedback}<section class="shell-screen"><h1>${escape(workspace.name)}</h1><h2>Members</h2>
-    <ol class="members">${members || "<li>Membership is loading.</li>"}</ol>
-    <button type="button" id="refresh-membership" ${model.loading ? "disabled" : ""}>Refresh members</button></section>`;
+  const memberRows = workspace.members.map((member) => `<li class="member-row"><span><strong>${escape(member.name)}</strong><small>${escape(member.detail)}</small></span><span class="member-role">${member.role}</span></li>`).join("");
+  const members = memberRows || (workspace.membershipLoaded
+    ? '<li class="empty-state">No Members are listed.</li>'
+    : '<li class="empty-state">Membership is loading.</li>');
+  return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">Workspace overview</p><h1>${escape(workspace.name)}</h1><p>${workspace.memberCount === 1 ? "1 Member" : `${workspace.memberCount} Members`}</p></header><section class="screen-section" aria-labelledby="members-heading"><div class="section-heading"><h2 id="members-heading">Members</h2>
+    <button type="button" id="refresh-membership" ${presentation.loading ? "disabled" : ""}>Refresh members</button></div><ol class="members">${members}</ol></section></section>`;
 }
 
-function errorMessage(code: BridgeErrorCode): string {
-  const messages: Record<BridgeErrorCode, string> = {
-    invalid_input: "The supplied value is invalid.",
-    authentication: "Workspace invitation authentication failed.",
-    expired: "The Workspace invitation has expired.",
-    already_used: "Another Installation already used this invitation.",
-    readiness: "Invitation addressing is not ready. Try again.",
-    timeout: "Workspace onboarding timed out. Try again.",
-    overload: "Workspace onboarding is busy. Try again.",
-    invalid_bootstrap: "The received Workspace history is invalid.",
-    local_conflict: "Local Workspace state conflicts with this invitation.",
-    admission_no_longer_current: "This admission is no longer current.",
-    uncertain_storage_outcome: "Storage outcome is uncertain. Restart Teamarness.",
-    shutdown: "Teamarness is shutting down. Try again after reopening.",
-  };
-  return messages[code];
+function routeWorkspaceId(route: ShellRoute): string | null {
+  return route.kind === "workspace-chooser"
+    ? null
+    : route.kind === "package-instance" ? route.instance.workspaceId : route.workspaceId;
 }

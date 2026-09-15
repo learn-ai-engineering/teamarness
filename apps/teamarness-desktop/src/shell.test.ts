@@ -11,18 +11,59 @@ const membership = fixture.membership as Membership;
 const otherWorkspace: Workspace = { ...workspace, id: "ffeeddccbbaa99887766554433221100", name: "Other" };
 const packageKey: PackageInstanceKey = { packageIdentity: "com.example.one", workspaceId: workspace.id };
 const packages: PackageHostSnapshot = {
-  revision: 1,
+  revision: 739217,
   state: "running",
   packages: [
-    { identity: packageKey.packageIdentity, version: "1.0.0", displayName: "One", source: "bundled", trust: "application_bundled", uiContractDigest: "a" },
+    {
+      identity: packageKey.packageIdentity,
+      version: "1.0.0-secret-version",
+      displayName: "One",
+      source: "bundled",
+      trust: "application_bundled",
+      uiContractDigest: "secret-contract-digest",
+    },
   ],
-  instances: [{ key: packageKey, lifecycle: "active", processGeneration: 1, mountState: null }],
-  diagnostics: [],
+  instances: [{ key: packageKey, lifecycle: "active", processGeneration: 414, mountState: "mounted" }],
+  diagnostics: [{
+    version: 1,
+    namespace: "teamarness.package-host",
+    code: "secret-diagnostic-code",
+    stage: "secret-diagnostic-stage",
+    affectedPackage: packageKey.packageIdentity,
+    affectedInstance: packageKey,
+    retryable: true,
+    recovery: "secret-diagnostic-recovery",
+    diagnosticId: "secret-diagnostic-id",
+  }],
 };
 
 class Region {
   public innerHTML = "";
   public hidden = false;
+}
+
+class TestControl {
+  private listener: EventListener | null = null;
+
+  public addEventListener(_type: string, listener: EventListener): void {
+    this.listener = listener;
+  }
+
+  public click(): void {
+    this.listener?.({} as Event);
+  }
+}
+
+class RetryRegion extends Region {
+  public readonly retry = new TestControl();
+
+  public querySelector(selector: string): TestControl | null {
+    return selector === "#retry" && this.innerHTML.includes('id="retry"') ? this.retry : null;
+  }
+
+  public querySelectorAll(): readonly TestControl[] {
+    return [];
+  }
 }
 
 function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
@@ -37,7 +78,7 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
   };
 }
 
-function harness(): {
+function harness(shellScreen: HTMLElement = new Region() as unknown as HTMLElement): {
   shell: Shell;
   frame: ShellFrame;
   calls: string[];
@@ -48,7 +89,7 @@ function harness(): {
   const frame: ShellFrame = {
     workspaceRail: new Region() as unknown as HTMLElement,
     contextualNavigation: new Region() as unknown as HTMLElement,
-    shellScreen: new Region() as unknown as HTMLElement,
+    shellScreen,
     packageMount: new Region() as unknown as HTMLElement,
   };
   const shell = new Shell(frame, {
@@ -66,7 +107,7 @@ function harness(): {
       joinWorkspace: async () => undefined,
       copyInvitation: async () => undefined,
       refreshMembership: async () => undefined,
-      retry: async () => undefined,
+      retry: async () => { calls.push("retry"); },
     },
     onRouteChange: (route) => { routes.push(route); },
   });
@@ -79,8 +120,8 @@ describe("persistent Shell frame", () => {
     const frame = test.shell.frame();
     const mount = frame.packageMount;
 
-    test.shell.updateWorkspace(model());
-    test.shell.updateWorkspace({ ...model(), notice: "Updated" });
+    await test.shell.updateWorkspace(model());
+    await test.shell.updateWorkspace({ ...model(), notice: "Updated" });
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-invitations", workspaceId: workspace.id });
     test.shell.updatePackages({ ...packages, revision: 2 });
@@ -90,12 +131,12 @@ describe("persistent Shell frame", () => {
     expect(test.frame.shellScreen.innerHTML).toContain("Invitations");
   });
 
-  it("selects overview at startup and whenever the active Workspace switches", () => {
+  it("selects overview at startup and whenever the active Workspace switches", async () => {
     const test = harness();
-    test.shell.updateWorkspace(model());
+    await test.shell.updateWorkspace(model());
     expect(test.shell.route()).toEqual({ kind: "workspace-overview", workspaceId: workspace.id });
 
-    test.shell.updateWorkspace(model(otherWorkspace.id));
+    await test.shell.updateWorkspace(model(otherWorkspace.id));
     expect(test.shell.route()).toEqual({ kind: "workspace-overview", workspaceId: otherWorkspace.id });
     expect(test.routes).toEqual([
       { kind: "workspace-overview", workspaceId: workspace.id },
@@ -105,7 +146,7 @@ describe("persistent Shell frame", () => {
 
   it("uses the chooser on first run and exposes discriminated Shell routes", async () => {
     const test = harness();
-    test.shell.updateWorkspace({ ...model(null), workspaces: [], memberships: {} });
+    await test.shell.updateWorkspace({ ...model(null), workspaces: [], memberships: {} });
     expect(test.shell.route()).toEqual({ kind: "workspace-chooser" });
 
     const routes: ShellRoute[] = [
@@ -121,7 +162,7 @@ describe("persistent Shell frame", () => {
 
   it("unmounts Package UI for Shell routes without Backend lifecycle calls", async () => {
     const test = harness();
-    test.shell.updateWorkspace(model());
+    await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "package-instance", instance: packageKey });
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
@@ -133,7 +174,7 @@ describe("persistent Shell frame", () => {
 
   it("renders fixed landmarks, grouped Package navigation, aria-current, and the sole theme selector", async () => {
     const test = harness();
-    test.shell.updateWorkspace(model());
+    await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-overview", workspaceId: workspace.id });
 
@@ -142,5 +183,55 @@ describe("persistent Shell frame", () => {
     expect(test.frame.contextualNavigation.innerHTML).toContain("Team Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Private Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain('aria-current="page"');
+  });
+
+  it("binds bridge-error retry feedback to the supported reload action", async () => {
+    const screen = new RetryRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    await test.shell.updateWorkspace({ ...model(), error: "timeout" });
+    expect(screen.innerHTML).toContain('id="retry"');
+    screen.retry.click();
+    await Promise.resolve();
+    expect(test.calls).toContain("retry");
+  });
+
+  it("keeps protocol data out of normal text, attributes, and accessible labels on every Workspace screen", async () => {
+    const test = harness();
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    const routes: ShellRoute[] = [
+      { kind: "workspace-chooser" },
+      { kind: "workspace-overview", workspaceId: workspace.id },
+      { kind: "workspace-invitations", workspaceId: workspace.id },
+      { kind: "workspace-settings", workspaceId: workspace.id },
+    ];
+    for (const route of routes) {
+      await test.shell.navigate(route);
+      const html = `${test.frame.workspaceRail.innerHTML}${test.frame.contextualNavigation.innerHTML}${test.frame.shellScreen.innerHTML}`;
+      for (const forbidden of [
+        installation.identity,
+        workspace.id,
+        workspace.createdBy,
+        membership.workspaceId,
+        membership.version,
+        String(workspace.createdAtUnixMs),
+        ...membership.members.map(({ identity }) => identity),
+        packageKey.packageIdentity,
+        "1.0.0-secret-version",
+        "bundled",
+        "application_bundled",
+        "running",
+        "active",
+        "mounted",
+        "414",
+        "739217",
+        "secret-contract-digest",
+        "teamarness.package-host",
+        "secret-diagnostic-code",
+        "secret-diagnostic-stage",
+        "secret-diagnostic-recovery",
+        "secret-diagnostic-id",
+      ]) expect(html).not.toContain(forbidden);
+    }
   });
 });

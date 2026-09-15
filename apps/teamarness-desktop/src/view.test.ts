@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { TeamarnessBridge } from "./bridge";
 import type { BridgeError, Installation, Invitation, Membership, Workspace, WorkspaceState } from "./contracts";
+import { buildShellPresentation } from "./presentation";
 import type { ShellRoute } from "./shell";
-import { ShellController, ShellRenderer, renderShell } from "./view";
+import { ShellController, ShellRenderer, renderShell, type ShellModel } from "./view";
 
 const installation = fixture.installation as Installation;
 const workspace = fixture.workspace as Workspace;
@@ -23,53 +24,81 @@ function fakeBridge(overrides: Partial<TeamarnessBridge> = {}): TeamarnessBridge
   };
 }
 
-describe("Shell workspace flow", () => {
-  it("updates Workspace controls without replacing the persistent Package pane", () => {
+function model(change: Partial<ShellModel> = {}): ShellModel {
+  return {
+    installation,
+    workspaces: [workspace],
+    memberships: { [workspace.id]: membership },
+    activeWorkspaceId: workspace.id,
+    loading: false,
+    error: null,
+    notice: null,
+    ...change,
+  };
+}
+
+async function rendered(source: ShellModel, route: ShellRoute): Promise<string> {
+  return renderShell(await buildShellPresentation(source, route.kind === "workspace-chooser" ? null : workspace.id), route);
+}
+
+describe("Shell Workspace screens", () => {
+  it("updates Workspace controls without replacing the persistent Package pane", async () => {
     const controls = { innerHTML: "" } as HTMLElement;
     const pane = { mountedUi: "mount-1" };
     const renderer = new ShellRenderer(controls, pane);
-    renderer.render({
-      installation,
-      workspaces: [workspace],
-      memberships: { [workspace.id]: membership },
-      activeWorkspaceId: workspace.id,
-      loading: false,
-      error: null,
-      notice: null,
-    });
-    renderer.render({
-      installation,
-      workspaces: [],
-      memberships: {},
-      activeWorkspaceId: null,
-      loading: false,
-      error: null,
-      notice: "Updated",
-    });
+    await renderer.render(model(), { kind: "workspace-overview", workspaceId: workspace.id });
+    await renderer.render(model({ workspaces: [], memberships: {}, activeWorkspaceId: null, notice: "Updated" }));
     expect(renderer.packagePane()).toBe(pane);
     expect(pane.mountedUi).toBe("mount-1");
     expect(controls.innerHTML).toContain("Updated");
     expect(controls.innerHTML).not.toContain("package-pane");
   });
 
-  it("loads the Installation and selects the first Workspace", async () => {
+  it("loads the Installation and renders ordered display-safe Member names", async () => {
     const controller = new ShellController(fakeBridge(), () => undefined);
     await controller.load();
     const route: ShellRoute = { kind: "workspace-overview", workspaceId: workspace.id };
-    const html = renderShell(controller.snapshot(), route);
+    const html = await rendered(controller.snapshot(), route);
     expect(controller.snapshot().installation).toEqual(installation);
     expect(controller.snapshot().activeWorkspaceId).toBe(workspace.id);
     expect(html).toContain(workspace.name);
     const memberList = html.slice(html.indexOf('<ol class="members">'));
-    expect(memberList.indexOf(membership.members[0]!.identity)).toBeLessThan(memberList.indexOf(membership.members[1]!.identity));
+    expect(memberList.indexOf("Vivid Whale")).toBeLessThan(memberList.indexOf(installation.displayName));
   });
 
-  it("creates a Workspace and exposes loading and success states", async () => {
+  it("renders chooser listing, create, join, loading, and no-Workspace states", async () => {
+    const chooser: ShellRoute = { kind: "workspace-chooser" };
+    const normal = await rendered(model(), chooser);
+    expect(normal).toContain(workspace.name);
+    expect(normal).toContain('id="create-workspace"');
+    expect(normal).toContain('id="join-workspace"');
+
+    const loading = await rendered(model({ workspaces: [], memberships: {}, activeWorkspaceId: null, loading: true }), chooser);
+    expect(loading).toContain("Loading Workspaces…");
+    expect(loading).toContain("disabled");
+
+    const empty = await rendered(model({ workspaces: [], memberships: {}, activeWorkspaceId: null }), chooser);
+    expect(empty).toContain("No Workspaces yet");
+  });
+
+  it("renders supported invitation and read-only settings screens only", async () => {
+    const invitations = await rendered(model(), { kind: "workspace-invitations", workspaceId: workspace.id });
+    expect(invitations).toContain('id="copy-invitation"');
+    expect(invitations).toContain("sensitive bearer admission material");
+
+    const settings = await rendered(model(), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(settings).toContain("Workspace details");
+    expect(settings).toContain("Package Instances");
+    expect(settings).toContain("read-only");
+    expect(settings).not.toMatch(/rename|leave Workspace|revoke|manager administration/i);
+  });
+
+  it("creates a Workspace and exposes loading and success feedback", async () => {
     let release: ((value: WorkspaceState) => void) | undefined;
     const pending = new Promise<WorkspaceState>((resolve) => { release = resolve; });
     const updates: boolean[] = [];
     const controller = new ShellController(fakeBridge({ createWorkspace: async () => pending }),
-      (model) => updates.push(model.loading));
+      (nextModel) => updates.push(nextModel.loading));
     const operation = controller.createWorkspace(workspace.name);
     expect(controller.snapshot().loading).toBe(true);
     release?.({ workspace, membership });
@@ -78,12 +107,14 @@ describe("Shell workspace flow", () => {
     expect(controller.snapshot().notice).toBe(`Created ${workspace.name}`);
   });
 
-  it("copies an invitation only through the public bridge result", async () => {
+  it("copies an invitation without rendering its bearer value", async () => {
     const copied: string[] = [];
     const controller = new ShellController(fakeBridge(), () => undefined, async (value) => { copied.push(value); });
     await controller.copyInvitation(workspace.id);
     expect(copied).toEqual([invitation.value]);
     expect(controller.snapshot().notice).toContain("Sensitive bearer");
+    expect(await rendered(controller.snapshot(), { kind: "workspace-invitations", workspaceId: workspace.id }))
+      .not.toContain(invitation.value);
   });
 
   it("pastes and joins a Workspace", async () => {
@@ -95,26 +126,34 @@ describe("Shell workspace flow", () => {
     await controller.joinWorkspace(invitation.value);
     expect(pasted).toBe(invitation.value);
     expect(controller.snapshot().workspaces).toEqual([workspace]);
+    expect(controller.snapshot().notice).toBe(`Joined ${workspace.name}`);
   });
 
-  it("refreshes issuer membership after another Installation joins", async () => {
+  it("refreshes membership and renders success without identities or versions", async () => {
     const creatorOnly: Membership = { ...membership, epoch: "1", members: [membership.members[1]!] };
     let currentMembership = creatorOnly;
-    const controller = new ShellController(fakeBridge({
-      currentMembership: async () => currentMembership,
-    }), () => undefined);
-
+    const controller = new ShellController(fakeBridge({ currentMembership: async () => currentMembership }), () => undefined);
     await controller.load();
-    expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(creatorOnly.members);
-
     currentMembership = membership;
     await controller.refreshMembership(workspace.id);
 
-    const html = renderShell(controller.snapshot(), { kind: "workspace-overview", workspaceId: workspace.id });
+    const html = await rendered(controller.snapshot(), { kind: "workspace-overview", workspaceId: workspace.id });
     expect(html).toContain('id="refresh-membership"');
+    expect(html).toContain("Membership refreshed");
     expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);
-    expect(html).toContain(membership.members[0]!.identity);
-    expect(html).toContain(membership.members[1]!.identity);
+    expect(html).not.toContain(membership.version);
+    for (const member of membership.members) expect(html).not.toContain(member.identity);
+  });
+
+  it("shows bridge failure and retry states", async () => {
+    const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
+    const controller = new ShellController(fakeBridge({ listWorkspaces: async () => { throw failure; } }), () => undefined);
+    await controller.load();
+    expect(controller.snapshot()).toMatchObject({ loading: false, error: "timeout" });
+    const html = await rendered(controller.snapshot(), { kind: "workspace-chooser" });
+    expect(html).toContain('role="alert"');
+    expect(html).toContain('id="retry"');
+    expect(html).not.toContain("timeout");
   });
 
   it("keeps membership refresh failures observable", async () => {
@@ -127,20 +166,9 @@ describe("Shell workspace flow", () => {
       },
     }), () => undefined);
     await controller.load();
-
     shouldFail = true;
     await controller.refreshMembership(workspace.id);
-
     expect(controller.snapshot()).toMatchObject({ loading: false, error: "timeout" });
-    expect(renderShell(controller.snapshot())).toContain('role="alert"');
-  });
-
-  it("shows stable failure and retry states", async () => {
-    const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
-    const controller = new ShellController(fakeBridge({ listWorkspaces: async () => { throw failure; } }), () => undefined);
-    await controller.load();
-    expect(controller.snapshot()).toMatchObject({ loading: false, error: "timeout" });
-    expect(renderShell(controller.snapshot())).toContain('id="retry"');
   });
 });
 
