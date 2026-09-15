@@ -3,11 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Teamarness workspace onboarding" />
+    <meta name="description" content="Teamarness workspace" />
     <title>Teamarness</title>
   </head>
   <body>
-    <main id="app" aria-live="polite"></main>
+    <a class="skip-link" href="#selected-content">Skip to selected content</a>
+    <div id="app" class="shell-layout">
+      <nav id="workspace-rail" class="workspace-rail" aria-label="Workspace switcher"></nav>
+      <aside id="contextual-navigation" class="contextual-navigation" aria-label="Active Workspace navigation"></aside>
+      <main id="selected-content" class="selected-content" tabindex="-1">
+        <div id="shell-screen"></div>
+        <div id="package-mount" aria-label="Package interface" hidden></div>
+      </main>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

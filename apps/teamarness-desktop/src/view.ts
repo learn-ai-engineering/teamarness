@@ -1,11 +1,13 @@
 import type { TeamarnessBridge } from "./bridge";
 import { isBridgeError } from "./contracts";
 import type { BridgeErrorCode, Installation, Membership, Workspace } from "./contracts";
+import type { ShellRoute } from "./shell";
 
 export type ShellModel = Readonly<{
   installation: Installation | null;
   workspaces: readonly Workspace[];
   memberships: Readonly<Record<string, Membership>>;
+  activeWorkspaceId: string | null;
   loading: boolean;
   error: BridgeErrorCode | null;
   notice: string | null;
@@ -15,6 +17,7 @@ const initialModel: ShellModel = {
   installation: null,
   workspaces: [],
   memberships: {},
+  activeWorkspaceId: null,
   loading: false,
   error: null,
   notice: null,
@@ -30,8 +33,8 @@ export class ShellRenderer {
     return this.persistentPackagePane;
   }
 
-  public render(model: ShellModel): void {
-    this.controls.innerHTML = renderShell(model);
+  public render(model: ShellModel, route: ShellRoute = { kind: "workspace-chooser" }): void {
+    this.controls.innerHTML = renderShell(model, route);
   }
 }
 
@@ -46,6 +49,11 @@ export class ShellController {
 
   public snapshot(): ShellModel { return this.model; }
 
+  public selectWorkspace(workspaceId: string): void {
+    if (!this.model.workspaces.some(({ id }) => id === workspaceId)) return;
+    this.set({ activeWorkspaceId: workspaceId });
+  }
+
   public async load(): Promise<void> {
     await this.perform(async () => {
       const [installation, workspaces] = await Promise.all([
@@ -53,7 +61,10 @@ export class ShellController {
         this.bridge.listWorkspaces(),
       ]);
       const memberships = await this.loadMemberships(workspaces);
-      this.set({ installation, workspaces, memberships });
+      const activeWorkspaceId = workspaces.some(({ id }) => id === this.model.activeWorkspaceId)
+        ? this.model.activeWorkspaceId
+        : workspaces[0]?.id ?? null;
+      this.set({ installation, workspaces, memberships, activeWorkspaceId });
     });
   }
 
@@ -63,6 +74,7 @@ export class ShellController {
       this.set({
         workspaces: [...this.model.workspaces, created.workspace],
         memberships: { ...this.model.memberships, [created.workspace.id]: created.membership },
+        activeWorkspaceId: created.workspace.id,
         notice: `Created ${created.workspace.name}`,
       });
     });
@@ -93,6 +105,7 @@ export class ShellController {
       this.set({
         workspaces: [...existing, joined.workspace],
         memberships: { ...this.model.memberships, [joined.workspace.id]: joined.membership },
+        activeWorkspaceId: joined.workspace.id,
         notice: `Joined ${joined.workspace.name}`,
       });
     });
@@ -127,36 +140,47 @@ const escape = (value: string): string => value
   .replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;");
 
-export function renderShell(model: ShellModel): string {
-  const status = model.loading ? '<p role="status">Working…</p>' : "";
-  const error = model.error
-    ? `<p class="error" role="alert">${escape(errorMessage(model.error))}</p><button id="retry">Retry</button>`
-    : "";
-  const notice = model.notice ? `<p class="notice">${escape(model.notice)}</p>` : "";
-  const installation = model.installation
-    ? `<p>${escape(model.installation.displayName)}</p><p class="identity">${escape(model.installation.identity)}</p>`
-    : "<p>Installation details are loading.</p>";
-  const workspaces = model.workspaces.map((workspace) => {
-    const membership = model.memberships[workspace.id];
-    const members = membership?.members.map((member) =>
-      `<li><span class="identifier">${escape(member.identity)}</span> — ${member.role}</li>`).join("") ?? "";
-    return `<li class="workspace"><h3>${escape(workspace.name)}</h3>
-      <p class="identifier">${escape(workspace.id)}</p>
-      <p>Membership version <span class="version">${escape(membership?.version ?? "Unavailable")}</span></p>
-      <ol class="members">${members}</ol>
-      <div class="actions">
-        <button data-refresh-membership="${escape(workspace.id)}" ${model.loading ? "disabled" : ""}>Refresh members</button>
-        <button data-invite="${escape(workspace.id)}" ${model.loading ? "disabled" : ""}>Copy invitation</button>
-      </div>
-      <p class="sensitive">Invitations are sensitive bearer admission material.</p></li>`;
-  }).join("");
+export function renderShell(
+  model: ShellModel,
+  route: ShellRoute = { kind: "workspace-chooser" },
+): string {
+  const status = `<p class="shell-status" role="status" aria-live="polite">${model.loading ? "Working…" : escape(model.notice ?? "")}</p>`;
+  const error = `<div class="shell-alert" role="alert">${model.error
+    ? `<p class="error">${escape(errorMessage(model.error))}</p><button id="retry" type="button">Retry</button>`
+    : ""}</div>`;
+  const feedback = `${status}${error}`;
 
-  return `<div class="shell"><header><h1>Teamarness</h1>${installation}</header>${status}${error}${notice}
-    <section><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
+  if (route.kind === "workspace-chooser") {
+    const workspaces = model.workspaces.map((workspace, index) =>
+      `<li><button type="button" data-choose-workspace="${index}">${escape(workspace.name)}</button></li>`).join("");
+    return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><h1 id="chooser-heading">Choose a Workspace</h1>
+      <ul class="workspace-list">${workspaces || "<li>No Workspaces yet.</li>"}</ul>
+      <section><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
       <input id="workspace-name" required maxlength="64"><button ${model.loading ? "disabled" : ""}>Create</button></form></section>
-    <section><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Invitation</label>
-      <textarea id="invitation-value" required maxlength="8192"></textarea><button ${model.loading ? "disabled" : ""}>Join</button></form></section>
-    <section><h2>Workspaces</h2><ul class="workspace-list">${workspaces || "<li>No Workspaces yet.</li>"}</ul></section></div>`;
+      <section><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Invitation</label>
+      <textarea id="invitation-value" required maxlength="8192"></textarea><button ${model.loading ? "disabled" : ""}>Join</button></form></section></section>`;
+  }
+
+  const workspaceId = route.kind === "package-instance" ? route.instance.workspaceId : route.workspaceId;
+  const workspace = model.workspaces.find(({ id }) => id === workspaceId);
+  if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1></section>`;
+
+  if (route.kind === "workspace-invitations") {
+    return `${feedback}<section class="shell-screen"><h1>Invitations</h1><p>Create an invitation for ${escape(workspace.name)}.</p>
+      <button type="button" id="copy-invitation" ${model.loading ? "disabled" : ""}>Copy invitation</button>
+      <p class="sensitive">Invitations are sensitive bearer admission material.</p></section>`;
+  }
+  if (route.kind === "workspace-settings") {
+    return `${feedback}<section class="shell-screen"><h1>Workspace settings</h1><p>${escape(workspace.name)}</p>
+      <p>Package Instance management will appear here.</p></section>`;
+  }
+
+  const membership = model.memberships[workspace.id];
+  const members = membership?.members.map((member) =>
+    `<li><span class="identifier">${escape(member.identity)}</span> — ${member.role}</li>`).join("") ?? "";
+  return `${feedback}<section class="shell-screen"><h1>${escape(workspace.name)}</h1><h2>Members</h2>
+    <ol class="members">${members || "<li>Membership is loading.</li>"}</ol>
+    <button type="button" id="refresh-membership" ${model.loading ? "disabled" : ""}>Refresh members</button></section>`;
 }
 
 function errorMessage(code: BridgeErrorCode): string {

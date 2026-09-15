@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { TeamarnessBridge } from "./bridge";
 import type { BridgeError, Installation, Invitation, Membership, Workspace, WorkspaceState } from "./contracts";
+import type { ShellRoute } from "./shell";
 import { ShellController, ShellRenderer, renderShell } from "./view";
 
 const installation = fixture.installation as Installation;
@@ -31,6 +32,7 @@ describe("Shell workspace flow", () => {
       installation,
       workspaces: [workspace],
       memberships: { [workspace.id]: membership },
+      activeWorkspaceId: workspace.id,
       loading: false,
       error: null,
       notice: null,
@@ -39,6 +41,7 @@ describe("Shell workspace flow", () => {
       installation,
       workspaces: [],
       memberships: {},
+      activeWorkspaceId: null,
       loading: false,
       error: null,
       notice: "Updated",
@@ -49,15 +52,16 @@ describe("Shell workspace flow", () => {
     expect(controls.innerHTML).not.toContain("package-pane");
   });
 
-  it("loads the Installation, Workspace list, ordered members, and version", async () => {
+  it("loads the Installation and selects the first Workspace", async () => {
     const controller = new ShellController(fakeBridge(), () => undefined);
     await controller.load();
-    const html = renderShell(controller.snapshot());
-    expect(html).toContain(installation.identity);
+    const route: ShellRoute = { kind: "workspace-overview", workspaceId: workspace.id };
+    const html = renderShell(controller.snapshot(), route);
+    expect(controller.snapshot().installation).toEqual(installation);
+    expect(controller.snapshot().activeWorkspaceId).toBe(workspace.id);
     expect(html).toContain(workspace.name);
     const memberList = html.slice(html.indexOf('<ol class="members">'));
     expect(memberList.indexOf(membership.members[0]!.identity)).toBeLessThan(memberList.indexOf(membership.members[1]!.identity));
-    expect(html).toContain(membership.version);
   });
 
   it("creates a Workspace and exposes loading and success states", async () => {
@@ -106,8 +110,8 @@ describe("Shell workspace flow", () => {
     currentMembership = membership;
     await controller.refreshMembership(workspace.id);
 
-    const html = renderShell(controller.snapshot());
-    expect(html).toContain('data-refresh-membership="00112233445566778899aabbccddeeff"');
+    const html = renderShell(controller.snapshot(), { kind: "workspace-overview", workspaceId: workspace.id });
+    expect(html).toContain('id="refresh-membership"');
     expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);
     expect(html).toContain(membership.members[0]!.identity);
     expect(html).toContain(membership.members[1]!.identity);

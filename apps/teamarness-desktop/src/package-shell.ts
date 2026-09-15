@@ -2,16 +2,12 @@ import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contract
 import type { PackageMountController } from "./package-mount";
 
 export type PackageShellActions = Readonly<{
-  select(instance: PackageInstanceKey): Promise<void>;
   reloadUi(): Promise<void>;
-  suspendBackend(): Promise<void>;
   recoverBackend(): Promise<void>;
-  disposeBackend(): Promise<void>;
 }>;
 
 export interface PackageShellView {
   readonly mountTarget: unknown;
-  render(snapshot: PackageHostSnapshot, actions: PackageShellActions): void;
   showFailure(actions: PackageShellActions): void;
 }
 
@@ -36,27 +32,39 @@ export class PackageShell {
     private readonly view: PackageShellView,
   ) {}
 
-  public async refresh(): Promise<void> {
-    const snapshot = await this.bridge.snapshot();
-    this.view.render(snapshot, this.actions());
+  public async refresh(): Promise<PackageHostSnapshot> {
+    return this.bridge.snapshot();
   }
 
-  private actions(): PackageShellActions {
+  public async select(instance: PackageInstanceKey): Promise<void> {
+    this.selected = instance;
+    await this.loadSelected();
+  }
+
+  public async hide(): Promise<void> {
+    await this.mounts.unmount();
+  }
+
+  public async reloadUi(): Promise<void> {
+    await this.loadSelected();
+  }
+
+  public async suspendBackend(): Promise<void> {
+    await this.runLifecycle((instance) => this.mounts.suspendBackend(instance));
+  }
+
+  public async recoverBackend(): Promise<void> {
+    await this.runLifecycle((instance) => this.mounts.recoverBackend(instance));
+  }
+
+  public async disposeBackend(): Promise<void> {
+    await this.runLifecycle((instance) => this.mounts.disposeBackend(instance));
+  }
+
+  private recoveryActions(): PackageShellActions {
     return Object.freeze({
-      select: async (instance) => {
-        this.selected = instance;
-        await this.loadSelected();
-      },
-      reloadUi: async () => { await this.loadSelected(); },
-      suspendBackend: async () => {
-        await this.runLifecycle((instance) => this.mounts.suspendBackend(instance));
-      },
-      recoverBackend: async () => {
-        await this.runLifecycle((instance) => this.mounts.recoverBackend(instance));
-      },
-      disposeBackend: async () => {
-        await this.runLifecycle((instance) => this.mounts.disposeBackend(instance));
-      },
+      reloadUi: async () => { await this.reloadUi(); },
+      recoverBackend: async () => { await this.recoverBackend(); },
     });
   }
 
@@ -73,7 +81,7 @@ export class PackageShell {
     } catch {
       failed = true;
     }
-    if (failed) this.view.showFailure(this.actions());
+    if (failed) this.view.showFailure(this.recoveryActions());
   }
 
   private async loadSelected(): Promise<void> {
@@ -82,7 +90,7 @@ export class PackageShell {
     const showFailure = (): void => {
       if (failureShown) return;
       failureShown = true;
-      this.view.showFailure(this.actions());
+      this.view.showFailure(this.recoveryActions());
     };
     try {
       await this.mounts.mount(this.selected, this.view.mountTarget, showFailure);
@@ -93,46 +101,7 @@ export class PackageShell {
 }
 
 export class BrowserPackageShellView implements PackageShellView {
-  public constructor(
-    private readonly navigation: HTMLElement,
-    public readonly mountTarget: HTMLElement,
-  ) {}
-
-  public render(snapshot: PackageHostSnapshot, actions: PackageShellActions): void {
-    const title = document.createElement("h2");
-    title.textContent = "Package interfaces";
-    const list = document.createElement("div");
-    list.className = "package-navigation";
-    for (const instance of snapshot.instances) {
-      const catalog = snapshot.packages.find(({ identity }) => identity === instance.key.packageIdentity);
-      const button = document.createElement("button");
-      button.type = "button";
-      const generation = instance.processGeneration === null ? "no generation" : `generation ${instance.processGeneration}`;
-      button.textContent = `${catalog?.displayName ?? instance.key.packageIdentity} · ${instance.key.workspaceId} · ${instance.lifecycle} · ${generation}`;
-      const source = document.createElement("span");
-      source.className = "package-source";
-      source.textContent = catalog?.source === "local" ? "Personal" : "Team";
-      source.setAttribute("aria-label", `Package source: ${source.textContent}`);
-      button.append(source);
-      button.dataset.packageIdentity = instance.key.packageIdentity;
-      button.dataset.workspaceId = instance.key.workspaceId;
-      button.addEventListener("click", () => { void actions.select(instance.key); });
-      list.append(button);
-    }
-    if (snapshot.instances.length === 0) {
-      const empty = document.createElement("p");
-      empty.textContent = "No Package interfaces are available.";
-      list.append(empty);
-    }
-    const lifecycleActions = document.createElement("div");
-    lifecycleActions.className = "actions";
-    const reload = actionButton("Reload UI", () => { void actions.reloadUi(); });
-    const suspend = actionButton("Suspend", () => { void actions.suspendBackend(); });
-    const recover = actionButton("Recover Backend", () => { void actions.recoverBackend(); });
-    const dispose = actionButton("Dispose", () => { void actions.disposeBackend(); });
-    lifecycleActions.append(reload, suspend, recover, dispose);
-    this.navigation.replaceChildren(title, list, lifecycleActions);
-  }
+  public constructor(public readonly mountTarget: HTMLElement) {}
 
   public showFailure(actions: PackageShellActions): void {
     const alert = document.createElement("p");
@@ -156,8 +125,7 @@ function actionButton(label: string, action: () => void): HTMLButtonElement {
 export function createPackageShell(
   bridge: PackageSnapshotBridge,
   mounts: PackageMountController,
-  navigation: HTMLElement,
   target: HTMLElement,
 ): PackageShell {
-  return new PackageShell(bridge, mounts, new BrowserPackageShellView(navigation, target));
+  return new PackageShell(bridge, mounts, new BrowserPackageShellView(target));
 }
