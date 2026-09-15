@@ -20,7 +20,7 @@ The system SHALL maintain a signed, causally ordered, append-only membership ope
 
 ## TEAM-R05 — Revocation and Epochs
 
-Revoking a member SHALL end their current membership interval. Every committed membership operation SHALL advance a workspace-local monotonic epoch and publish the resulting content-derived `MembershipVersion`. Package-specific keys and authorization SHALL rotate in response to versioned membership transitions. The revoked member SHALL retain past data but SHALL NOT read or write future content.
+Revoking a member SHALL end their current membership interval. Every committed membership operation SHALL advance a workspace-local monotonic epoch and publish the resulting content-derived `MembershipVersion`. Package-specific keys and authorization SHALL rotate in response to versioned membership transitions, except where an accepted package capability explicitly freezes a version-1 one-key/no-rotation policy; that capability SHALL state its retained-key confidentiality limit. The revoked member SHALL retain past data but SHALL NOT read or write future content.
 
 ## TEAM-R06 — Package Model
 

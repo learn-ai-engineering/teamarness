@@ -42,7 +42,7 @@ Phase 3 SHALL discover Package Sources through application and installation Pack
 
 ## TEAM.SYS.PKG-R10 — Synchronization Capability Boundary
 
-A future Synchronization Capability SHALL provide generic, versioned, Package-scoped replication through Core Runtime-owned transport. The capability MAY support replicated append-only operations, mutable structured state, collaborative documents, or custom transport. A Package SHALL retain ownership of its domain records, schemas, projections, and policy. Phase 3 SHALL establish capability negotiation and routing that can add such a family without changing Package lifecycle, Package Process, or Package UI mounting contracts, but SHALL NOT implement a synchronization engine.
+A Synchronization Capability SHALL provide generic, versioned, Package-scoped replication through Core Runtime-owned transport. The first capability is `teamarness.synchronization.immutable-record-log` 1.0 with `append`, `subscribe`, and `open`. It uses implicit grant scope, bounded canonical and sealed values, committed content-idempotent append, and an at-least-once local cursor stream. A Package SHALL retain ownership of its domain records, schemas, projections, and policy. Packages SHALL NOT receive Iroh, P2Panda, SQLite, private-key, or raw-key types. Future family members may support mutable structured state, collaborative documents, or custom transport without changing Package lifecycle, Package Process, or Package UI mounting contracts.
 
 ## TEAM.SYS.PKG-R11 — Native Trust Limits
 

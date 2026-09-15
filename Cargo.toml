@@ -26,7 +26,9 @@ mime = "=0.3.17"
 nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
 p2panda-auth = "=0.7.1"
 p2panda-core = "=0.7.1"
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+p2panda-encryption = "=0.7.1"
+p2panda-sync = "=0.7.1"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
 semver = "=1.0.28"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

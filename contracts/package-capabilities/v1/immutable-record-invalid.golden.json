@@ -1,0 +1,8 @@
+{
+  "invalidRequests": [
+    { "reason": "missing implicit scope selector", "request": { "packageIdentity": "teamarness.conversations" } },
+    { "reason": "empty purpose", "request": { "purpose": "", "canonical": "YQ" } },
+    { "reason": "open item count exceeds 32", "request": { "sealedRecords": "more-than-32-items" } },
+    { "reason": "non-canonical base64url", "request": { "purpose": "message.post", "canonical": "YQ==" } }
+  ]
+}

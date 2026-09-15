@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.TRANS`
 
-The Core Runtime transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each Installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for Workspace onboarding. Later generic Synchronization Capabilities use Core-owned transport without exposing raw endpoint handles to Packages.
+The Core Runtime transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each Installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for Workspace onboarding. Later generic Synchronization Capabilities use Core-owned transport without exposing raw endpoint handles to Packages. The first capability is the generic immutable-record log; it owns replication, retry, bounded sessions, and backpressure while Packages provide canonical domain bytes.
 
 ## TEAM.SYS.TRANS-R01 — Iroh Endpoint Management
 

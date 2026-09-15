@@ -59,10 +59,10 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 
 | Term | Definition |
 |---|---|
-| **Channel** | A named, append-only message stream within a workspace. Has an owning creator and a lifecycle (active, archived) |
-| **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a channel. Transported over Iroh QUIC streams between package instances |
+| **Channel** | A named, append-only message stream within a workspace. Has an owning creator and a lifecycle (active, permanently hidden); synthetic `#general` is always present and cannot be hidden |
+| **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a Channel through the generic immutable-record capability. Transport details remain Core-owned |
 | **Channel Membership** | Package-owned membership determining who can read and post in a specific channel. Bounded by canonical workspace membership |
-| **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns the records and domain policy; a generic Synchronization Capability owns the reusable Iroh transport and replication machinery |
+| **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns records and domain policy; `teamarness.synchronization.immutable-record-log` owns reusable transport, replication, retry, and backpressure |
 
 ## Transport (Iroh)
 

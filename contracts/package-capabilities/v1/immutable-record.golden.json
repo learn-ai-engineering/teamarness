@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "description": "Canonical field order for immutable-record-log v1",
+  "append": {
+    "purpose": "message.post",
+    "canonicalHex": "63616e6f6e6963616c",
+    "packageIdentity": "teamarness.conversations",
+    "workspaceIdHex": "03030303030303030303030303030303",
+    "authorSeedHex": "0707070707070707070707070707070707070707070707070707070707070707"
+  },
+  "orderKey": {
+    "encoding": "version:u8 || causalHeight:u64 big-endian || recordId:32 bytes",
+    "version": 1,
+    "causalHeight": 2
+  },
+  "cursor": {
+    "encoding": "version:u8 || journalId:16 bytes || deliverySequence:u64 big-endian",
+    "version": 1,
+    "journalIdHex": "04040404040404040404040404040404",
+    "deliverySequence": 11
+  },
+  "sealedEnvelope": {
+    "encoding": "version:u8 || cipherSuite:u8 || scopeDigest:32 || recordId:32 || orderKey:41 || contentKeyId:32 || nonce:24 || ciphertextLength:u32 || ciphertext",
+    "cipherSuite": 1
+  }
+}

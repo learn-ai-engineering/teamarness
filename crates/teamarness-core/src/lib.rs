@@ -34,6 +34,8 @@ mod membership;
 mod onboarding;
 mod storage;
 mod subscription;
+#[allow(dead_code)]
+mod synchronization;
 mod workspace;
 
 pub use error::{
@@ -48,3 +50,4 @@ pub use runtime::{
     MembershipVersion, PublicIdentity, PublicSignature, SigningContext, WorkspaceId,
     WorkspaceSummary,
 };
+pub use synchronization::{Cursor, OrderKey, RecordId};
