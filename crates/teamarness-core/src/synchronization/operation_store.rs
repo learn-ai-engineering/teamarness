@@ -44,7 +44,9 @@ fn encode_operation(header: &Header<()>, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn decode_operation(bytes: &[u8]) -> Result<(p2panda_core::AnyHeader, Vec<u8>), StorageError> {
+pub(crate) fn decode_operation(
+    bytes: &[u8],
+) -> Result<(p2panda_core::AnyHeader, Vec<u8>), StorageError> {
     if bytes.len() < 5 || bytes[0] != OPERATION_VERSION {
         return Err(StorageError::CorruptWorkspace);
     }
@@ -151,6 +153,64 @@ pub(crate) fn insert(
 
 /// Re-materialize local Phase 2 rows and retain an explicit queue for rows whose author key is not
 /// held by this installation. No unverified synthetic operation is inserted during recovery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_remote(
+    tx: &Transaction<'_>,
+    scope_id: [u8; 32],
+    teamarness_operation_id: RecordId,
+    record_id: RecordId,
+    order_key: OrderKey,
+    operation: &Operation<()>,
+    operation_kind: &str,
+    content_key_id: [u8; 32],
+) -> Result<[u8; 32], StorageError> {
+    validate_operation(operation).map_err(|_| StorageError::CorruptWorkspace)?;
+    let payload = operation
+        .body
+        .as_ref()
+        .ok_or(StorageError::CorruptWorkspace)?
+        .to_bytes();
+    let author = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
+        .map_err(|_| StorageError::CorruptWorkspace)?;
+    let operation_id = operation.hash.as_bytes();
+    let backlink = operation
+        .header
+        .backlink
+        .map(|value| value.as_bytes().to_owned());
+    let sequence = operation.header.seq_num;
+    let log = log_id(scope_id);
+    tx.execute(
+        "INSERT INTO p2panda_operations(
+            operation_id, teamarness_operation_id, scope_id, log_id,
+            author_public_identity, author_sequence, backlink, payload_hash, payload,
+            header, operation_bytes, record_id, order_key, content_key_id,
+            causal_parents, causal_height, true_height, operation_kind, status
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,'accepted')",
+        params![
+            operation_id.as_slice(),
+            teamarness_operation_id.as_bytes().as_slice(),
+            scope_id.as_slice(),
+            log.as_slice(),
+            author.as_bytes().as_slice(),
+            i64::from(sequence),
+            backlink.as_ref().map(|value| value.as_slice()),
+            Hash::digest(&payload).as_bytes().as_slice(),
+            payload.as_slice(),
+            operation.header.encode(),
+            encode_operation(&operation.header, &payload),
+            record_id.as_bytes().as_slice(),
+            order_key.as_bytes().as_slice(),
+            content_key_id.as_slice(),
+            Vec::<u8>::new(),
+            i64::try_from(order_key.height()).map_err(|_| StorageError::CorruptWorkspace)?,
+            i64::try_from(order_key.height()).map_err(|_| StorageError::CorruptWorkspace)?,
+            operation_kind,
+        ],
+    )
+    .map_err(|_| StorageError::CorruptWorkspace)?;
+    Ok(*operation_id)
+}
+
 pub(crate) fn queue_recovery(
     tx: &Transaction<'_>,
     teamarness_operation_id: RecordId,

@@ -3,8 +3,18 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
+mod log_sync;
+pub(crate) mod network_handler;
 mod operation_store;
+pub(crate) mod p2panda_adapter;
 mod protection_control;
+mod scheduler;
+mod wakes;
+
+pub(crate) use network_handler::{
+    LogSyncHandler, PackageSyncHandler, SyncBatch, SyncReceiver, encode_batch,
+};
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
@@ -12,7 +22,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use iroh_base::{SecretKey, Signature};
-use p2panda_core::Hash;
+use p2panda_core::{Hash, Operation};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
@@ -808,7 +818,7 @@ impl RecordSubscription {
     }
 }
 
-fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) -> [u8; 32] {
+pub(crate) fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) -> [u8; 32] {
     let mut input = Vec::with_capacity(SCOPE_DOMAIN.len() + package_identity.len() + 16);
     input.extend_from_slice(SCOPE_DOMAIN);
     input.extend_from_slice(package_identity.as_bytes());
@@ -1014,6 +1024,7 @@ fn record_from_row(row: RecordFields<'_>) -> Result<ImmutableRecord, Synchroniza
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append(
     conn: &mut rusqlite::Connection,
     secret: &SecretKey,
@@ -1373,6 +1384,107 @@ pub(crate) fn insert_remote(
         &signed.canonical,
         bytes,
     ))
+}
+
+pub(crate) fn insert_remote_operation(
+    conn: &mut rusqlite::Connection,
+    workspace: WorkspaceId,
+    package: &str,
+    operation: &Operation<()>,
+) -> Result<ImmutableRecord, SynchronizationError> {
+    p2panda_core::operation::validate_operation(operation)
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let payload = operation
+        .body
+        .as_ref()
+        .ok_or(SynchronizationError::CorruptRecord)?
+        .to_bytes();
+    let record = insert_remote(conn, workspace, package, &payload)?;
+    if operation.header.verifying_key.as_bytes() != record.author.as_bytes() {
+        return Err(SynchronizationError::CorruptRecord);
+    }
+    let scope = scope_digest(package, workspace);
+    let operation_id = RecordId::digest(&payload);
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| storage_error())?;
+    let existing: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT operation_id FROM p2panda_operations WHERE operation_id=?1",
+            [operation.hash.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| storage_error())?;
+    if existing.is_none() {
+        let expected = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(author_sequence),-1)+1 FROM p2panda_operations
+                 WHERE scope_id=?1 AND author_public_identity=?2",
+                rusqlite::params![scope.as_slice(), operation.header.verifying_key.as_bytes()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| storage_error())?;
+        if i64::from(operation.header.seq_num) != expected {
+            return Err(SynchronizationError::CorruptRecord);
+        }
+        let expected_backlink: Option<Vec<u8>> = if operation.header.seq_num == 0 {
+            None
+        } else {
+            transaction
+                .query_row(
+                    "SELECT operation_id FROM p2panda_operations
+                     WHERE scope_id=?1 AND author_public_identity=?2 AND author_sequence=?3",
+                    rusqlite::params![
+                        scope.as_slice(),
+                        operation.header.verifying_key.as_bytes(),
+                        i64::from(operation.header.seq_num - 1),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| storage_error())?
+        };
+        let actual_backlink = operation
+            .header
+            .backlink
+            .map(|value| value.as_bytes().to_vec());
+        if expected_backlink != actual_backlink {
+            return Err(SynchronizationError::CorruptRecord);
+        }
+        let sealed =
+            SealedRecordV1::decode(&payload).map_err(|_| SynchronizationError::CorruptRecord)?;
+        operation_store::insert_remote(
+            &transaction,
+            scope,
+            operation_id,
+            record.record_id,
+            record.order_key,
+            operation,
+            &record.purpose,
+            sealed.content_key_id,
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
+    Ok(record)
+}
+
+pub(crate) fn records_for_replication(
+    conn: &rusqlite::Connection,
+    workspace: WorkspaceId,
+    package: &str,
+) -> Result<Vec<Vec<u8>>, SynchronizationError> {
+    let scope = scope_digest(package, workspace);
+    let mut statement = conn
+        .prepare("SELECT sealed_record FROM immutable_records WHERE scope_id=?1 ORDER BY record_id")
+        .map_err(|_| storage_error())?;
+    let rows = statement
+        .query_map([scope.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|_| storage_error())?;
+    rows.map(|row| row.map_err(|_| storage_error())).collect()
 }
 
 pub(crate) fn event_for_record(

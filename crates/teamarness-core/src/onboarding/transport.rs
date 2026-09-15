@@ -3,15 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, presets};
-use iroh::protocol::Router;
-use iroh::{Endpoint, RelayMode};
+use iroh::RelayMode;
+use iroh::endpoint::Connection;
 use iroh_base::{EndpointAddr, SecretKey};
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::handler::{IssuerService, OnboardingHandler};
 use crate::OnboardingError;
+use crate::network::Network;
 
 pub(crate) const ONBOARDING_ALPN: &[u8] = b"teamarness/workspace-join/1";
 pub(crate) const INVITATION_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,8 +27,7 @@ const STOPPING: u8 = 1;
 const STOPPED: u8 = 2;
 
 pub(crate) struct Transport {
-    endpoint: Endpoint,
-    router: Router,
+    network: Arc<Network>,
     handler: Arc<OnboardingHandler>,
     lifecycle: Arc<Lifecycle>,
     outbound: Arc<Semaphore>,
@@ -68,6 +67,7 @@ impl Transport {
     pub(crate) async fn bind_production(
         secret_key: SecretKey,
         issuer: IssuerService,
+        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -79,6 +79,7 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             Some(issuer),
+            receiver,
         )
         .await
     }
@@ -87,31 +88,22 @@ impl Transport {
         secret_key: SecretKey,
         options: BindOptions,
         issuer: Option<IssuerService>,
+        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
     ) -> Result<Arc<Self>, OnboardingError> {
-        let mut builder = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .alpns(vec![ONBOARDING_ALPN.to_vec()])
-            .relay_mode(options.relay_mode);
-        if options.loopback_only {
-            builder = builder
-                .clear_ip_transports()
-                .bind_addr("127.0.0.1:0")
-                .map_err(|_| OnboardingError::Readiness)?;
-        }
-        let endpoint = builder
-            .bind()
-            .await
-            .map_err(|_| OnboardingError::Readiness)?;
         let handler = Arc::new(match issuer {
             Some(issuer) => OnboardingHandler::with_issuer(options.request_timeout, issuer),
             None => OnboardingHandler::new(options.request_timeout),
         });
-        let router = Router::builder(endpoint.clone())
-            .accept(ONBOARDING_ALPN, Arc::clone(&handler))
-            .spawn();
+        let network = Network::bind(
+            secret_key,
+            options.relay_mode,
+            options.loopback_only,
+            Arc::clone(&handler),
+            receiver,
+        )
+        .await?;
         Ok(Arc::new(Self {
-            endpoint,
-            router,
+            network,
             handler,
             lifecycle: Arc::new(Lifecycle::new()),
             outbound: Arc::new(Semaphore::new(MAX_OUTBOUND_JOINS)),
@@ -142,20 +134,22 @@ impl Transport {
     }
 
     pub(crate) fn endpoint_id(&self) -> iroh_base::PublicKey {
-        self.endpoint.id()
+        self.network.endpoint_id()
     }
 
     pub(crate) async fn begin_invitation(&self) -> Result<InvitationOperation, OnboardingError> {
         let operation = self.lifecycle.begin()?;
         match self.readiness {
-            Readiness::EndpointOnline(duration) => timeout(duration, self.endpoint.online())
-                .await
-                .map_err(|_| OnboardingError::Readiness)?,
+            Readiness::EndpointOnline(duration) => {
+                timeout(duration, self.network.endpoint().online())
+                    .await
+                    .map_err(|_| OnboardingError::Readiness)?
+            }
             #[cfg(test)]
             Readiness::Immediate => {}
         }
         self.lifecycle.ensure_running()?;
-        let address = self.endpoint.addr();
+        let address = self.network.endpoint().addr();
         if self.require_relay_address
             && !address.addrs.iter().any(iroh_base::TransportAddr::is_relay)
         {
@@ -187,7 +181,7 @@ impl Transport {
     ) -> Result<Connection, OnboardingError> {
         timeout(
             CONNECT_TIMEOUT,
-            self.endpoint.connect(address, ONBOARDING_ALPN),
+            self.network.endpoint().connect(address, ONBOARDING_ALPN),
         )
         .await
         .map_err(|_| OnboardingError::Timeout)?
@@ -218,6 +212,27 @@ impl Transport {
             .map_err(|_| OnboardingError::Timeout)?
     }
 
+    pub(crate) async fn send_sync_batch(
+        &self,
+        address: EndpointAddr,
+        batch: &crate::synchronization::SyncBatch,
+    ) -> Result<usize, OnboardingError> {
+        self.network.send_batch(address, batch).await
+    }
+
+    pub(crate) async fn send_log_sync(
+        &self,
+        address: EndpointAddr,
+        receiver: Arc<dyn crate::synchronization::SyncReceiver>,
+        workspace: crate::WorkspaceId,
+        package: String,
+        peer: crate::PublicIdentity,
+    ) -> Result<usize, OnboardingError> {
+        self.network
+            .send_log_sync(address, receiver, workspace, package, peer)
+            .await
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
         self.lifecycle.stop();
         self.handler.stop();
@@ -225,11 +240,7 @@ impl Transport {
             .shutdown
             .get_or_init(|| async {
                 self.lifecycle.wait_for_idle().await;
-                let result = self
-                    .router
-                    .shutdown()
-                    .await
-                    .map_err(|_| OnboardingError::Shutdown);
+                let result = self.network.shutdown().await;
                 self.lifecycle.stopped();
                 result
             })
@@ -266,7 +277,8 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
     ) -> Result<Arc<Self>, OnboardingError> {
-        Self::bind_loopback_inner(secret_key, readiness_timeout, ready_immediately, None).await
+        Self::bind_loopback_inner(secret_key, readiness_timeout, ready_immediately, None, None)
+            .await
     }
 
     #[cfg(test)]
@@ -281,6 +293,25 @@ impl Transport {
             readiness_timeout,
             ready_immediately,
             Some(issuer),
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn bind_loopback_with_issuer_and_receiver(
+        secret_key: SecretKey,
+        readiness_timeout: Duration,
+        ready_immediately: bool,
+        issuer: IssuerService,
+        receiver: Arc<dyn crate::synchronization::SyncReceiver>,
+    ) -> Result<Arc<Self>, OnboardingError> {
+        Self::bind_loopback_inner(
+            secret_key,
+            readiness_timeout,
+            ready_immediately,
+            Some(issuer),
+            Some(receiver),
         )
         .await
     }
@@ -291,6 +322,7 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: Option<IssuerService>,
+        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -306,14 +338,15 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             issuer,
+            receiver,
         )
         .await
     }
 
     #[cfg(test)]
     pub(crate) fn endpoint_address(&self) -> EndpointAddr {
-        self.endpoint.bound_sockets().into_iter().fold(
-            EndpointAddr::new(self.endpoint.id()),
+        self.network.endpoint().bound_sockets().into_iter().fold(
+            EndpointAddr::new(self.network.endpoint().id()),
             EndpointAddr::with_ip_addr,
         )
     }

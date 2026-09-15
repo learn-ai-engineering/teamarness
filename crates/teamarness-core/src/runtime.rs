@@ -568,6 +568,138 @@ struct MembershipSubscriber {
 
 type RecordSubscriber = std::sync::mpsc::Sender<crate::RecordEvent>;
 
+struct RuntimeSyncReceiver {
+    state: Weak<Mutex<RuntimeState>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
+    fn receive(
+        &self,
+        peer: PublicIdentity,
+        batch: crate::synchronization::SyncBatch,
+    ) -> Result<usize, ()> {
+        let state = self.state.upgrade().ok_or(())?;
+        let mut state = state.lock().map_err(|_| ())?;
+        let workspace = WorkspaceId::from_bytes(batch.workspace);
+        if !batch.membership.is_empty() {
+            let proof = crate::membership::sync::MembershipProof {
+                workspace_id: workspace,
+                operations: batch.membership,
+            };
+            if !state.memberships.contains_key(&workspace)
+                && !crate::membership::sync::admits_peer(&proof, peer).map_err(|_| ())?
+            {
+                return Err(());
+            }
+            let RuntimeState {
+                connection,
+                memberships,
+                ..
+            } = &mut *state;
+            crate::membership::sync::apply(
+                connection,
+                memberships,
+                &proof,
+                self.clock.now_unix_ms(),
+            )
+            .map_err(|_| ())?;
+        }
+        let current = state
+            .memberships
+            .get(&workspace)
+            .is_some_and(|projection| projection.contains_member(peer));
+        if !current {
+            return Err(());
+        }
+        let mut accepted = 0;
+        for sealed in batch.records {
+            let record = crate::synchronization::insert_remote(
+                &mut state.connection,
+                workspace,
+                &batch.package,
+                &sealed,
+            )
+            .map_err(|_| ())?;
+            if let Some(event) = crate::synchronization::event_for_record(
+                &state.connection,
+                workspace,
+                &batch.package,
+                record,
+            ) && let Some(listeners) = state
+                .record_subscribers
+                .get_mut(&(workspace, batch.package.clone()))
+            {
+                listeners.retain(|sender| sender.send(event.clone()).is_ok());
+            }
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
+    fn operations(
+        &self,
+        workspace: WorkspaceId,
+        package: &str,
+    ) -> Result<Vec<([u8; 32], p2panda_core::Operation<()>)>, ()> {
+        let state = self.state.upgrade().ok_or(())?;
+        let state = state.lock().map_err(|_| ())?;
+        if !state.memberships.get(&workspace).is_some_and(|projection| {
+            projection.contains_member(PublicIdentity(state.secret_key.public()))
+        }) {
+            return Err(());
+        }
+        let scope = crate::synchronization::scope_digest(package, workspace);
+        let store = crate::synchronization::p2panda_adapter::TeamarnessLogStore::from_connection(
+            &state.connection,
+            scope,
+        )
+        .map_err(|_| ())?;
+        Ok(store
+            .operations()
+            .into_iter()
+            .map(|operation| (scope, operation))
+            .collect())
+    }
+
+    fn receive_operation(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+        operation: p2panda_core::Operation<()>,
+    ) -> Result<(), ()> {
+        if operation.header.verifying_key.as_bytes() != peer.as_bytes() {
+            return Err(());
+        }
+        let state = self.state.upgrade().ok_or(())?;
+        let mut state = state.lock().map_err(|_| ())?;
+        if !state
+            .memberships
+            .get(&workspace)
+            .is_some_and(|projection| projection.contains_member(peer))
+        {
+            return Err(());
+        }
+        let record = crate::synchronization::insert_remote_operation(
+            &mut state.connection,
+            workspace,
+            package,
+            &operation,
+        )
+        .map_err(|_| ())?;
+        if let Some(event) =
+            crate::synchronization::event_for_record(&state.connection, workspace, package, record)
+            && let Some(listeners) = state
+                .record_subscribers
+                .get_mut(&(workspace, package.to_owned()))
+        {
+            listeners.retain(|sender| sender.send(event.clone()).is_ok());
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct RuntimeState {
     connection: rusqlite::Connection,
     secret_key: iroh_base::SecretKey,
@@ -661,23 +793,36 @@ impl CoreRuntime {
             Arc::downgrade(&state),
             Arc::clone(&clock),
         );
+        let sync_receiver: Arc<dyn crate::synchronization::SyncReceiver> =
+            Arc::new(RuntimeSyncReceiver {
+                state: Arc::downgrade(&state),
+                clock: Arc::clone(&clock),
+            });
         #[cfg(test)]
         let transport = if let Some(ready_immediately) = test_readiness {
-            crate::onboarding::transport::Transport::bind_loopback_with_issuer(
+            crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_receiver(
                 secret_key.clone(),
                 std::time::Duration::from_millis(5),
                 ready_immediately,
                 issuer,
+                Arc::clone(&sync_receiver),
             )
             .await
         } else {
-            crate::onboarding::transport::Transport::bind_production(secret_key.clone(), issuer)
-                .await
+            crate::onboarding::transport::Transport::bind_production(
+                secret_key.clone(),
+                issuer,
+                Some(Arc::clone(&sync_receiver)),
+            )
+            .await
         };
         #[cfg(not(test))]
-        let transport =
-            crate::onboarding::transport::Transport::bind_production(secret_key.clone(), issuer)
-                .await;
+        let transport = crate::onboarding::transport::Transport::bind_production(
+            secret_key.clone(),
+            issuer,
+            Some(sync_receiver),
+        )
+        .await;
         let transport = transport.map_err(CoreError::Onboarding)?;
         debug_assert_eq!(transport.endpoint_id(), secret_key.public());
         Ok(Self {
@@ -1436,7 +1581,93 @@ impl CoreRuntime {
         Ok(subscription)
     }
 
-    /// Stops accepting onboarding work and awaits transport closure.
+    /// Reconciles the locally accepted immutable records with a current peer.
+    ///
+    /// The network operation is finite and bounded. The runtime releases its
+    /// local state lock before dialing, so replication never blocks local
+    /// commands on network I/O.
+    pub async fn replicate_records_to(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        peer: PublicIdentity,
+    ) -> Result<usize, crate::SynchronizationError> {
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+            if state.poisoned {
+                return Err(crate::SynchronizationError::RuntimeUnavailable);
+            }
+            let current = state
+                .memberships
+                .get(&workspace_id)
+                .is_some_and(|projection| projection.contains_member(self.public_identity));
+            if !current {
+                return Err(crate::SynchronizationError::NotCurrentMember);
+            }
+        }
+        let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
+            Arc::new(RuntimeSyncReceiver {
+                state: Arc::downgrade(&self.state),
+                clock: Arc::clone(&self.clock),
+            });
+        let address = iroh_base::EndpointAddr::new(peer.as_public_key());
+        let accepted = self
+            .transport
+            .send_log_sync(
+                address,
+                receiver,
+                workspace_id,
+                package_identity.to_owned(),
+                peer,
+            )
+            .await
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+        Ok(accepted)
+    }
+
+    #[cfg(test)]
+    async fn replicate_records_to_address_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        address: iroh_base::EndpointAddr,
+        peer: PublicIdentity,
+    ) -> Result<usize, crate::SynchronizationError> {
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+            if state.poisoned
+                || !state
+                    .memberships
+                    .get(&workspace_id)
+                    .is_some_and(|projection| projection.contains_member(self.public_identity))
+            {
+                return Err(crate::SynchronizationError::NotCurrentMember);
+            }
+        }
+        let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
+            Arc::new(RuntimeSyncReceiver {
+                state: Arc::downgrade(&self.state),
+                clock: Arc::clone(&self.clock),
+            });
+        self.transport
+            .send_log_sync(
+                address,
+                receiver,
+                workspace_id,
+                package_identity.to_owned(),
+                peer,
+            )
+            .await
+            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)
+    }
+
+    /// Stops accepting onboarding and synchronization work and awaits closure.
     ///
     /// Local identity, Workspace, and membership commands remain available.
     pub async fn shutdown(&self) -> Result<(), crate::OnboardingError> {
@@ -2254,6 +2485,117 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             1_234
         }
+    }
+
+    #[tokio::test]
+    async fn production_log_sync_converges_across_partition_and_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "teamarness-production-log-sync-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let a_dir = root.join("a");
+        let b_dir = root.join("b");
+        let clock = || {
+            Box::new(RecordingClock {
+                calls: Arc::new(AtomicU64::new(0)),
+            }) as Box<dyn Clock>
+        };
+        let a_config = CoreRuntimeConfig::new(&a_dir);
+        let b_config = CoreRuntimeConfig::new(&b_dir);
+        let a = CoreRuntime::open_with_clock_and_readiness(a_config.clone(), clock(), true)
+            .await
+            .unwrap();
+        let workspace = a.create_workspace("Production sync").unwrap();
+        let package = "teamarness.test";
+        let first = a
+            .append_record(workspace.id(), package, "message.post", b"first")
+            .unwrap();
+        let invitation = a
+            .create_workspace_invitation_for_test(workspace.id(), 1, 60_000)
+            .unwrap();
+        let b = CoreRuntime::open_with_clock_and_readiness(b_config.clone(), clock(), true)
+            .await
+            .unwrap();
+        b.join_workspace(&invitation).await.unwrap();
+        let grant = a
+            .export_protection_grant(workspace.id(), package, b.public_identity())
+            .unwrap();
+        b.import_protection_grant(workspace.id(), package, &grant)
+            .unwrap();
+
+        let a_local = a
+            .append_record(workspace.id(), package, "message.post", b"a-local")
+            .unwrap();
+        let b_local = b
+            .append_record(workspace.id(), package, "message.post", b"b-local")
+            .unwrap();
+        let (a_to_b, b_to_a) = tokio::join!(
+            a.replicate_records_to(workspace.id(), package, b.public_identity()),
+            b.replicate_records_to(workspace.id(), package, a.public_identity()),
+        );
+        assert!(a_to_b.unwrap() > 0);
+        assert!(b_to_a.unwrap() > 0);
+
+        let mut b_records = b.subscribe_records(workspace.id(), package, None).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let event = b_records
+                .next_event_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            seen.insert((event.record_id(), event.order_key()));
+        }
+        assert!(seen.contains(&(first.record_id(), first.order_key())));
+        assert!(seen.contains(&(a_local.record_id(), a_local.order_key())));
+        assert!(seen.contains(&(b_local.record_id(), b_local.order_key())));
+
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        drop(a);
+        drop(b);
+        let a = CoreRuntime::open_with_clock_and_readiness(a_config, clock(), true)
+            .await
+            .unwrap();
+        let b = CoreRuntime::open_with_clock_and_readiness(b_config, clock(), true)
+            .await
+            .unwrap();
+        let after_restart = a
+            .append_record(workspace.id(), package, "message.post", b"after-restart")
+            .unwrap();
+        let delivered = a
+            .replicate_records_to_address_for_test(
+                workspace.id(),
+                package,
+                b.transport.endpoint_address(),
+                b.public_identity(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delivered, 0);
+        let opened = b
+            .open_records(
+                workspace.id(),
+                package,
+                &[after_restart.sealed_record().to_vec()],
+            )
+            .unwrap();
+        assert_eq!(opened[0].record_id(), after_restart.record_id());
+        let duplicate = a
+            .replicate_records_to_address_for_test(
+                workspace.id(),
+                package,
+                b.transport.endpoint_address(),
+                b.public_identity(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate, 0);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        drop(a);
+        drop(b);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

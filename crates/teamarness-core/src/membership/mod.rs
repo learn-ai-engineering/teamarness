@@ -3,6 +3,7 @@ mod envelope;
 mod history;
 mod id;
 pub(crate) mod projection;
+pub(crate) mod sync;
 mod validation;
 
 use serde::{Deserialize, Serialize};

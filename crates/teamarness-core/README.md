@@ -1,6 +1,6 @@
 # teamarness-core
 
-`teamarness-core` is the durable identity, canonical-membership, and Workspace onboarding library. Applications use the public `CoreRuntime` seam; the crate owns installation key custody, SQLite persistence, authenticated membership replay, Iroh onboarding, recovery, and transition publication.
+`teamarness-core` is the durable identity, canonical-membership, Workspace onboarding, and bounded immutable-record replication library. Applications use the public `CoreRuntime` seam; the crate owns installation key custody, SQLite persistence, authenticated membership replay, one shared Iroh Endpoint/Router, recovery, and transition publication.
 
 ## Core Runtime API
 
@@ -20,13 +20,14 @@ runtime.shutdown().await?;
 
 The public API supports:
 
-- asynchronously opening an installation, authenticating storage, recovering membership, and starting one Iroh onboarding endpoint from the persisted Installation key;
+- asynchronously opening an installation, authenticating storage, recovering membership and synchronization state, and starting one shared Iroh Endpoint/Router from the persisted Installation key;
 - domain-separated signing and public signature verification without secret access;
 - creating and listing Workspaces;
 - creating one opaque, fixed-lifetime `WorkspaceInvitation` as the creator-manager;
 - joining an invited Workspace through authenticated Iroh transport and returning owned `WorkspaceSummary` and `MembershipSnapshot` values only after atomic local import;
 - recovering the same committed admission when response delivery is interrupted, including after invitation expiry while that Installation remains current;
 - reading the current membership snapshot and content-derived `MembershipVersion`;
+- requesting a finite bounded immutable-record reconciliation with a current peer through the shared Core network;
 - revoking an admitted member;
 - querying declared-time membership history; and
 - catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor.
@@ -53,7 +54,7 @@ Workspace creation records generated identity and signed genesis material once, 
 
 The Core Runtime does not provide:
 
-- peer discovery or continuous/background membership synchronization after the bounded one-shot onboarding export;
+- unbounded synchronization sessions: package-sync batches are finite, authenticated, and bounded to 4,096 operations and 64 MiB;
 - distributed invitation-spend coordination across managers or databases;
 - a second-manager path, promotion, demotion, arbitrary access levels, nested groups, or re-admission after revocation;
 - multi-manager conflict fixtures (mutual manager removal and dependent transitive invalidation are deferred until a supported second-manager path exists);

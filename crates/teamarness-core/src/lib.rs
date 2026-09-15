@@ -31,6 +31,8 @@ mod invitation;
 #[allow(dead_code)]
 mod membership;
 #[allow(dead_code)]
+mod network;
+#[allow(dead_code)]
 mod onboarding;
 mod storage;
 mod subscription;
