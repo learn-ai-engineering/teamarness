@@ -15,8 +15,8 @@ pub const GENERATOR_VERSION: u32 = 1;
 pub const GRID_WIDTH: u32 = 16;
 pub const GRID_HEIGHT: u32 = 12;
 const STATE_SCHEMA_VERSION: u32 = 1;
-const STATE_FILE_NAME: &str = "emojart.v1.json";
-const TEMP_FILE_NAME: &str = "emojart.v1.json.tmp";
+const STATE_FILE_NAME: &str = "tutorial.v1.json";
+const TEMP_FILE_NAME: &str = "tutorial.v1.json.tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,11 +121,11 @@ impl Default for StateDocument {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmojartError {
+pub struct TutorialError {
     code: &'static str,
 }
 
-impl EmojartError {
+impl TutorialError {
     #[must_use]
     pub const fn code(self) -> &'static str {
         self.code
@@ -133,7 +133,7 @@ impl EmojartError {
 }
 
 /// Renders one canonical recipe in row-major order.
-pub fn render(recipe: &Recipe) -> Result<Vec<String>, EmojartError> {
+pub fn render(recipe: &Recipe) -> Result<Vec<String>, TutorialError> {
     validate_recipe(recipe)?;
     let palette = palette_values(&recipe.palette)?;
     let mut cells = Vec::with_capacity((GRID_WIDTH * GRID_HEIGHT) as usize);
@@ -144,7 +144,7 @@ pub fn render(recipe: &Recipe) -> Result<Vec<String>, EmojartError> {
                 "waves" => waves_index(x, y, recipe.seed),
                 "ripples" => ripples_index(x, y, recipe.seed),
                 "sierpinski" => sierpinski_index(x, y, recipe.seed),
-                _ => return Err(error("emojart.unknown_algorithm")),
+                _ => return Err(error("tutorial.unknown_algorithm")),
             };
             cells.push(palette[index].to_owned());
         }
@@ -153,29 +153,29 @@ pub fn render(recipe: &Recipe) -> Result<Vec<String>, EmojartError> {
     Ok(cells)
 }
 
-fn validate_recipe(recipe: &Recipe) -> Result<(), EmojartError> {
+fn validate_recipe(recipe: &Recipe) -> Result<(), TutorialError> {
     if recipe.generator_version != GENERATOR_VERSION
         || recipe.width != GRID_WIDTH
         || recipe.height != GRID_HEIGHT
     {
-        return Err(error("emojart.invalid_recipe"));
+        return Err(error("tutorial.invalid_recipe"));
     }
     if !ALGORITHMS
         .iter()
         .any(|option| option.id == recipe.algorithm)
     {
-        return Err(error("emojart.unknown_algorithm"));
+        return Err(error("tutorial.unknown_algorithm"));
     }
     palette_values(&recipe.palette)?;
     Ok(())
 }
 
-fn palette_values(id: &str) -> Result<&'static [&'static str; 5], EmojartError> {
+fn palette_values(id: &str) -> Result<&'static [&'static str; 5], TutorialError> {
     PALETTES
         .iter()
         .find(|palette| palette.id == id)
         .map(|palette| palette.values)
-        .ok_or_else(|| error("emojart.unknown_palette"))
+        .ok_or_else(|| error("tutorial.unknown_palette"))
 }
 
 fn waves_index(x: u32, y: u32, seed: u32) -> usize {
@@ -216,8 +216,8 @@ fn palette_index(value: f64) -> usize {
     ((((value + 1.0) / 2.0) * 5.0).floor() as usize).min(4)
 }
 
-const fn error(code: &'static str) -> EmojartError {
-    EmojartError { code }
+const fn error(code: &'static str) -> TutorialError {
+    TutorialError { code }
 }
 
 #[derive(Debug)]
@@ -267,13 +267,13 @@ impl StateStore {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
-    Recipe(EmojartError),
+    Recipe(TutorialError),
     Storage,
 }
 
 fn validate_state(state: &StateDocument) -> Result<(), std::io::Error> {
     if state.schema_version != STATE_SCHEMA_VERSION || state.next_id == 0 {
-        return Err(invalid_data("invalid Emojart state version or next ID"));
+        return Err(invalid_data("invalid Tutorial state version or next ID"));
     }
     for artwork in &state.artworks {
         let expected = render(&artwork.recipe).map_err(|_| invalid_data("invalid saved recipe"))?;
@@ -318,18 +318,18 @@ impl SeedSource for SystemSeed {
     }
 }
 
-pub struct EmojartBackend<S = SystemSeed> {
+pub struct TutorialBackend<S = SystemSeed> {
     active: Arc<Mutex<Option<StateStore>>>,
     seeds: S,
 }
 
-impl Default for EmojartBackend<SystemSeed> {
+impl Default for TutorialBackend<SystemSeed> {
     fn default() -> Self {
         Self::with_seed_source(SystemSeed)
     }
 }
 
-impl<S: SeedSource> EmojartBackend<S> {
+impl<S: SeedSource> TutorialBackend<S> {
     #[must_use]
     pub fn with_seed_source(seeds: S) -> Self {
         Self {
@@ -348,9 +348,9 @@ impl<S: SeedSource> EmojartBackend<S> {
             .data_directory()
             .get("path")
             .and_then(JsonValue::as_str)
-            .ok_or_else(|| backend_error("emojart.initialization_invalid", false))?;
+            .ok_or_else(|| backend_error("tutorial.initialization_invalid", false))?;
         let store =
-            StateStore::open(path).map_err(|_| backend_error("emojart.storage_failed", true))?;
+            StateStore::open(path).map_err(|_| backend_error("tutorial.storage_failed", true))?;
         *self.active.lock().await = Some(store);
         Ok(empty_object())
     }
@@ -359,21 +359,21 @@ impl<S: SeedSource> EmojartBackend<S> {
         let active = self.active.lock().await;
         let store = active
             .as_ref()
-            .ok_or_else(|| backend_error("emojart.not_active", true))?;
+            .ok_or_else(|| backend_error("tutorial.not_active", true))?;
         serde_json::to_value(ReadResponse {
             algorithms: &ALGORITHMS,
             palettes: &PALETTES,
             artworks: store.artworks(),
         })
-        .map_err(|_| backend_error("emojart.storage_failed", true))
+        .map_err(|_| backend_error("tutorial.storage_failed", true))
     }
 
     async fn generate(&self, payload: JsonValue) -> Result<JsonValue, BackendError> {
         if self.active.lock().await.is_none() {
-            return Err(backend_error("emojart.not_active", true));
+            return Err(backend_error("tutorial.not_active", true));
         }
         let request: GenerateRequest = serde_json::from_value(payload)
-            .map_err(|_| backend_error("emojart.invalid_request", false))?;
+            .map_err(|_| backend_error("tutorial.invalid_request", false))?;
         let mut recipe = Recipe {
             generator_version: GENERATOR_VERSION,
             algorithm: request.algorithm,
@@ -386,25 +386,25 @@ impl<S: SeedSource> EmojartBackend<S> {
         recipe.seed = self
             .seeds
             .next_seed()
-            .map_err(|SeedError| backend_error("emojart.random_failed", true))?;
+            .map_err(|SeedError| backend_error("tutorial.random_failed", true))?;
         let cells = render(&recipe).map_err(domain_backend_error)?;
         serde_json::to_value(Draft { recipe, cells })
-            .map_err(|_| backend_error("emojart.storage_failed", true))
+            .map_err(|_| backend_error("tutorial.storage_failed", true))
     }
 
     async fn save(&self, payload: JsonValue) -> Result<JsonValue, BackendError> {
         let request: SaveRequest = serde_json::from_value(payload)
-            .map_err(|_| backend_error("emojart.invalid_request", false))?;
+            .map_err(|_| backend_error("tutorial.invalid_request", false))?;
         let mut active = self.active.lock().await;
         let store = active
             .as_mut()
-            .ok_or_else(|| backend_error("emojart.not_active", true))?;
+            .ok_or_else(|| backend_error("tutorial.not_active", true))?;
         let artwork = store.save(request.recipe).map_err(store_backend_error)?;
-        serde_json::to_value(artwork).map_err(|_| backend_error("emojart.storage_failed", true))
+        serde_json::to_value(artwork).map_err(|_| backend_error("tutorial.storage_failed", true))
     }
 }
 
-impl<S: SeedSource> Backend for EmojartBackend<S> {
+impl<S: SeedSource> Backend for TutorialBackend<S> {
     fn handle(
         &self,
         request: BackendRequest,
@@ -417,13 +417,13 @@ impl<S: SeedSource> Backend for EmojartBackend<S> {
                     *self.active.lock().await = None;
                     Ok(empty_object())
                 }
-                "emojart.read" => {
+                "tutorial.read" => {
                     parse_empty(request.payload)?;
                     self.read().await
                 }
-                "emojart.generate" => self.generate(request.payload).await,
-                "emojart.save" => self.save(request.payload).await,
-                _ => Err(backend_error("emojart.unknown_operation", false)),
+                "tutorial.generate" => self.generate(request.payload).await,
+                "tutorial.save" => self.save(request.payload).await,
+                _ => Err(backend_error("tutorial.unknown_operation", false)),
             }
         })
     }
@@ -432,7 +432,7 @@ impl<S: SeedSource> Backend for EmojartBackend<S> {
         &self,
         _request: BackendRequest,
     ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>> {
-        Box::pin(async { Err(backend_error("emojart.unknown_subscription", false)) })
+        Box::pin(async { Err(backend_error("tutorial.unknown_subscription", false)) })
     }
 }
 
@@ -460,22 +460,22 @@ struct SaveRequest {
 fn parse_empty(payload: JsonValue) -> Result<(), BackendError> {
     let fields = payload
         .as_object()
-        .ok_or_else(|| backend_error("emojart.invalid_request", false))?;
+        .ok_or_else(|| backend_error("tutorial.invalid_request", false))?;
     if fields.is_empty() {
         Ok(())
     } else {
-        Err(backend_error("emojart.invalid_request", false))
+        Err(backend_error("tutorial.invalid_request", false))
     }
 }
 
 fn store_backend_error(error: StoreError) -> BackendError {
     match error {
         StoreError::Recipe(error) => domain_backend_error(error),
-        StoreError::Storage => backend_error("emojart.storage_failed", true),
+        StoreError::Storage => backend_error("tutorial.storage_failed", true),
     }
 }
 
-fn domain_backend_error(error: EmojartError) -> BackendError {
+fn domain_backend_error(error: TutorialError) -> BackendError {
     backend_error(error.code(), false)
 }
 

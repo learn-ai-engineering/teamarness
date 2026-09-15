@@ -35,7 +35,7 @@ fn manifest_template_and_request_only_contract_match_package_schemas() {
     }
 
     let manifest = read_json(package_root.join("teamarness.package.json"));
-    assert_eq!(manifest["identity"], "dev.teamarness.emojart");
+    assert_eq!(manifest["identity"], "dev.teamarness.tutorial");
     assert_eq!(manifest["capabilities"], serde_json::json!([]));
     assert_eq!(manifest["ui"]["assets"], serde_json::json!([]));
 
@@ -46,7 +46,7 @@ fn manifest_template_and_request_only_contract_match_package_schemas() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        ["emojart.generate", "emojart.read", "emojart.save"]
+        ["tutorial.generate", "tutorial.read", "tutorial.save"]
     );
     assert_eq!(contract["subscriptions"], serde_json::json!({}));
 }

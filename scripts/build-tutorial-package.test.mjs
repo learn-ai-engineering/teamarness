@@ -4,39 +4,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { buildEmojartPackage } from "./build-emojart-package.mjs";
+import { buildTutorialPackage } from "./build-tutorial-package.mjs";
 
 const digestPlaceholder = "0".repeat(64);
 
-test("build stages only the installation-local Emojart Package Directory", async () => {
-  const root = await mkdtemp(join(tmpdir(), "teamarness-emojart-build-"));
-  await mkdir(join(root, "packages/emojart/ui/dist"), { recursive: true });
-  await mkdir(join(root, "packages/emojart/backend"), { recursive: true });
+test("build stages only the installation-local Tutorial Package Directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "teamarness-tutorial-build-"));
+  await mkdir(join(root, "packages/tutorial/ui/dist"), { recursive: true });
+  await mkdir(join(root, "packages/tutorial/backend"), { recursive: true });
   await writeFile(join(root, "packages/application-packages.v1.json"), '{"untouched":true}\n');
-  await writeFile(join(root, "packages/emojart/ui-contract.json"), '{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}');
-  await writeFile(join(root, "packages/emojart/ui/dist/index.js"), "export const mount = () => () => {};\n");
-  await writeFile(join(root, "packages/emojart/backend/fake"), "backend bytes");
-  await writeFile(join(root, "packages/emojart/teamarness.package.json"), JSON.stringify({
+  await writeFile(join(root, "packages/tutorial/ui-contract.json"), '{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}');
+  await writeFile(join(root, "packages/tutorial/ui/dist/index.js"), "export const mount = () => () => {};\n");
+  await writeFile(join(root, "packages/tutorial/backend/fake"), "backend bytes");
+  await writeFile(join(root, "packages/tutorial/teamarness.package.json"), JSON.stringify({
     schemaVersion: 1,
-    identity: "dev.teamarness.emojart",
+    identity: "dev.teamarness.tutorial",
     version: "1.0.0",
-    presentation: { displayName: "Emojart" },
+    presentation: { displayName: "Tutorial" },
     protocol: { major: 1, minMinor: 0, maxMinor: 0 },
-    backends: [{ target: "aarch64-apple-darwin", path: "backend/teamarness-emojart-package-aarch64-apple-darwin", size: 0, sha256: digestPlaceholder }],
+    backends: [{ target: "aarch64-apple-darwin", path: "backend/teamarness-tutorial-package-aarch64-apple-darwin", size: 0, sha256: digestPlaceholder }],
     ui: { entrypoint: { path: "ui/index.js", size: 0, sha256: digestPlaceholder }, assets: [], contract: { path: "ui/contract.json", sha256: digestPlaceholder } },
     capabilities: [],
   }));
 
-  const output = await buildEmojartPackage({
+  const output = await buildTutorialPackage({
     repositoryRoot: root,
-    backendPath: join(root, "packages/emojart/backend/fake"),
+    backendPath: join(root, "packages/tutorial/backend/fake"),
     skipBuilds: true,
   });
 
-  assert.equal(output, join(root, "target/teamarness-packages-local/dev.teamarness.emojart"));
+  assert.equal(output, join(root, "target/teamarness-packages-local/dev.teamarness.tutorial"));
   assert.equal(await readFile(join(root, "packages/application-packages.v1.json"), "utf8"), '{"untouched":true}\n');
   const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
-  assert.equal(manifest.identity, "dev.teamarness.emojart");
+  assert.equal(manifest.identity, "dev.teamarness.tutorial");
   assert.ok(manifest.backends[0].size > 0);
   assert.match(manifest.backends[0].sha256, /^[0-9a-f]{64}$/);
   assert.ok(manifest.ui.entrypoint.size > 0);

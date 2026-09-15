@@ -22,7 +22,7 @@ type ReadResponse = Readonly<{
   artworks: readonly SavedArtwork[];
 }>;
 
-export type EmojartState = Readonly<{
+export type TutorialState = Readonly<{
   algorithms: readonly Choice[];
   palettes: readonly PaletteChoice[];
   artworks: readonly SavedArtwork[];
@@ -33,7 +33,7 @@ export type EmojartState = Readonly<{
   error?: string;
 }>;
 
-export type EmojartController = Readonly<{
+export type TutorialController = Readonly<{
   start(): Promise<void>;
   setAlgorithm(value: string): void;
   setPalette(value: string): void;
@@ -43,12 +43,12 @@ export type EmojartController = Readonly<{
   dispose(): void;
 }>;
 
-export function createEmojartController(
+export function createTutorialController(
   client: PackageClient,
-  present: (state: EmojartState) => void,
-): EmojartController {
+  present: (state: TutorialState) => void,
+): TutorialController {
   let disposed = false;
-  let state: EmojartState = {
+  let state: TutorialState = {
     algorithms: [],
     palettes: [],
     artworks: [],
@@ -56,18 +56,18 @@ export function createEmojartController(
     palette: "",
   };
 
-  const update = (changes: Partial<EmojartState>): void => {
+  const update = (changes: Partial<TutorialState>): void => {
     if (disposed) return;
     state = { ...state, ...changes };
     present(state);
   };
   const fail = (error: unknown): void => {
-    update({ error: error instanceof Error ? error.message : "Emojart request failed" });
+    update({ error: error instanceof Error ? error.message : "Tutorial request failed" });
   };
   const generate = async (): Promise<void> => {
     if (disposed || !state.algorithm || !state.palette) return;
     try {
-      const result = await client.request("emojart.generate", {
+      const result = await client.request("tutorial.generate", {
         algorithm: state.algorithm,
         palette: state.palette,
       }) as Draft;
@@ -81,10 +81,10 @@ export function createEmojartController(
     async start(): Promise<void> {
       if (disposed) return;
       try {
-        const result = await client.request("emojart.read", {}) as ReadResponse;
+        const result = await client.request("tutorial.read", {}) as ReadResponse;
         const algorithm = result.algorithms[0]?.id;
         const palette = result.palettes[0]?.id;
-        if (!algorithm || !palette) throw new Error("Emojart returned no generation choices");
+        if (!algorithm || !palette) throw new Error("Tutorial returned no generation choices");
         update({
           algorithms: result.algorithms,
           palettes: result.palettes,
@@ -112,7 +112,7 @@ export function createEmojartController(
     async save(): Promise<void> {
       if (disposed || !state.draft) return;
       try {
-        const saved = await client.request("emojart.save", { recipe: state.draft.recipe }) as SavedArtwork;
+        const saved = await client.request("tutorial.save", { recipe: state.draft.recipe }) as SavedArtwork;
         update({
           artworks: [...state.artworks, saved],
           draft: { recipe: saved.recipe, cells: saved.cells },
@@ -179,7 +179,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   article.append(heading, controls, error, grid, savedHeading, savedList);
   context.root.append(style, article);
 
-  const render = (state: EmojartState): void => {
+  const render = (state: TutorialState): void => {
     replaceOptions(algorithm.select, state.algorithms, state.algorithm);
     replaceOptions(palette.select, state.palettes, state.palette);
     error.textContent = state.error ?? "";
@@ -207,7 +207,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
       savedList.append(savedButton);
     }
   };
-  const controller = createEmojartController(context.client, render);
+  const controller = createTutorialController(context.client, render);
 
   const onAlgorithm = (): void => { controller.setAlgorithm(algorithm.select.value); };
   const onPalette = (): void => { controller.setPalette(palette.select.value); };

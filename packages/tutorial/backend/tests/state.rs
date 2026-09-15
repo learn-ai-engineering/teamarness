@@ -1,6 +1,6 @@
 use std::fs;
 
-use teamarness_emojart_package::{GRID_HEIGHT, GRID_WIDTH, Recipe, StateStore, StoreError};
+use teamarness_tutorial_package::{GRID_HEIGHT, GRID_WIDTH, Recipe, StateStore, StoreError};
 
 fn recipe(seed: u32) -> Recipe {
     Recipe {
@@ -18,7 +18,7 @@ fn open_initializes_state_and_save_allocates_stable_ids_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let mut store = StateStore::open(root.path()).unwrap();
     assert!(store.artworks().is_empty());
-    assert!(root.path().join("emojart.v1.json").is_file());
+    assert!(root.path().join("tutorial.v1.json").is_file());
 
     let first = store.save(recipe(7)).unwrap();
     let second = store.save(recipe(91)).unwrap();
@@ -37,7 +37,7 @@ fn failed_atomic_replacement_preserves_the_last_complete_state() {
     let mut store = StateStore::open(root.path()).unwrap();
     let first = store.save(recipe(7)).unwrap();
 
-    let temporary_path = root.path().join("emojart.v1.json.tmp");
+    let temporary_path = root.path().join("tutorial.v1.json.tmp");
     fs::create_dir(&temporary_path).unwrap();
     assert_eq!(store.save(recipe(91)), Err(StoreError::Storage));
 
@@ -59,6 +59,6 @@ fn save_validates_the_recipe_before_changing_state() {
     let StoreError::Recipe(error) = error else {
         panic!("expected recipe error");
     };
-    assert_eq!(error.code(), "emojart.unknown_palette");
+    assert_eq!(error.code(), "tutorial.unknown_palette");
     assert!(store.artworks().is_empty());
 }

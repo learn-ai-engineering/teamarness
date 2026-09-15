@@ -1,4 +1,4 @@
-use teamarness_emojart_package::{GRID_HEIGHT, GRID_WIDTH, Recipe, render};
+use teamarness_tutorial_package::{GRID_HEIGHT, GRID_WIDTH, Recipe, render};
 
 fn recipe(algorithm: &str, palette: &str, seed: u32) -> Recipe {
     Recipe {
@@ -59,22 +59,22 @@ fn recipes_are_reproducible_bounded_and_seed_sensitive() {
 #[test]
 fn recipes_reject_unknown_choices_and_noncanonical_versions_or_dimensions() {
     let unknown_algorithm = render(&recipe("spiral", "garden", 1)).unwrap_err();
-    assert_eq!(unknown_algorithm.code(), "emojart.unknown_algorithm");
+    assert_eq!(unknown_algorithm.code(), "tutorial.unknown_algorithm");
 
     let unknown_palette = render(&recipe("waves", "desert", 1)).unwrap_err();
-    assert_eq!(unknown_palette.code(), "emojart.unknown_palette");
+    assert_eq!(unknown_palette.code(), "tutorial.unknown_palette");
 
     let mut wrong_version = recipe("waves", "garden", 1);
     wrong_version.generator_version = 2;
     assert_eq!(
         render(&wrong_version).unwrap_err().code(),
-        "emojart.invalid_recipe"
+        "tutorial.invalid_recipe"
     );
 
     let mut wrong_dimensions = recipe("waves", "garden", 1);
     wrong_dimensions.width = 20;
     assert_eq!(
         render(&wrong_dimensions).unwrap_err().code(),
-        "emojart.invalid_recipe"
+        "tutorial.invalid_recipe"
     );
 }

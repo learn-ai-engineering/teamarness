@@ -1,7 +1,7 @@
 import type { PackageClient, PackageValue } from "@teamarness/package-ui-sdk";
 import { describe, expect, it } from "vitest";
 
-import { createEmojartController, type Draft, type EmojartState, type Recipe, type SavedArtwork } from "./index";
+import { createTutorialController, type Draft, type TutorialState, type Recipe, type SavedArtwork } from "./index";
 
 const recipe = (seed: number, algorithm = "waves", palette = "garden"): Recipe => ({
   generatorVersion: 1,
@@ -27,7 +27,7 @@ class FakeClient implements PackageClient {
       this.failNext = false;
       throw new Error("Backend unavailable");
     }
-    if (operation === "emojart.read") {
+    if (operation === "tutorial.read") {
       return {
         algorithms: [{ id: "waves", label: "Waves" }, { id: "ripples", label: "Ripples" }, { id: "sierpinski", label: "Sierpiński" }],
         palettes: [
@@ -39,39 +39,39 @@ class FakeClient implements PackageClient {
         artworks: [],
       } as unknown as TResponse;
     }
-    if (operation === "emojart.generate") {
+    if (operation === "tutorial.generate") {
       const selection = payload as { algorithm: string; palette: string };
       return draft(this.generatedSeeds.shift()!, selection.algorithm, selection.palette) as unknown as TResponse;
     }
-    if (operation === "emojart.save") {
+    if (operation === "tutorial.save") {
       return { id: "artwork-1", ...draft(11) } as unknown as TResponse;
     }
     throw new Error(`Unexpected operation ${operation}`);
   }
 
   async subscribe(): Promise<never> {
-    throw new Error("Emojart has no subscriptions");
+    throw new Error("Tutorial has no subscriptions");
   }
 }
 
-describe("Emojart UI client flow", () => {
+describe("Tutorial UI client flow", () => {
   it("reads choices, selects their first values, and generates the initial draft", async () => {
     const client = new FakeClient();
-    let state: EmojartState | undefined;
-    const controller = createEmojartController(client, (next) => { state = next; });
+    let state: TutorialState | undefined;
+    const controller = createTutorialController(client, (next) => { state = next; });
 
     await controller.start();
 
     expect(client.requests).toEqual([
-      { operation: "emojart.read", payload: {} },
-      { operation: "emojart.generate", payload: { algorithm: "waves", palette: "garden" } },
+      { operation: "tutorial.read", payload: {} },
+      { operation: "tutorial.generate", payload: { algorithm: "waves", palette: "garden" } },
     ]);
     expect(state?.draft?.recipe.seed).toBe(11);
   });
 
   it("generates again without changing the selected algorithm or palette", async () => {
     const client = new FakeClient();
-    const controller = createEmojartController(client, () => {});
+    const controller = createTutorialController(client, () => {});
     await controller.start();
     controller.setAlgorithm("ripples");
     controller.setPalette("ocean");
@@ -80,15 +80,15 @@ describe("Emojart UI client flow", () => {
     await controller.generate();
 
     expect(client.requests.slice(-2)).toEqual([
-      { operation: "emojart.generate", payload: { algorithm: "ripples", palette: "ocean" } },
-      { operation: "emojart.generate", payload: { algorithm: "ripples", palette: "ocean" } },
+      { operation: "tutorial.generate", payload: { algorithm: "ripples", palette: "ocean" } },
+      { operation: "tutorial.generate", payload: { algorithm: "ripples", palette: "ocean" } },
     ]);
   });
 
   it("saves the visible recipe and restores a saved piece without generating", async () => {
     const client = new FakeClient();
-    let state: EmojartState | undefined;
-    const controller = createEmojartController(client, (next) => { state = next; });
+    let state: TutorialState | undefined;
+    const controller = createTutorialController(client, (next) => { state = next; });
     await controller.start();
 
     await controller.save();
@@ -96,7 +96,7 @@ describe("Emojart UI client flow", () => {
     const requestCount = client.requests.length;
     controller.selectArtwork(saved.id);
 
-    expect(client.requests.at(-1)).toEqual({ operation: "emojart.save", payload: { recipe: recipe(11) } });
+    expect(client.requests.at(-1)).toEqual({ operation: "tutorial.save", payload: { recipe: recipe(11) } });
     expect(client.requests).toHaveLength(requestCount);
     expect(state?.draft).toEqual({ recipe: saved.recipe, cells: saved.cells });
     expect(state?.selectedArtworkId).toBe("artwork-1");
@@ -104,8 +104,8 @@ describe("Emojart UI client flow", () => {
 
   it("presents request errors and cleanup is idempotent", async () => {
     const client = new FakeClient();
-    const states: EmojartState[] = [];
-    const controller = createEmojartController(client, (state) => { states.push(state); });
+    const states: TutorialState[] = [];
+    const controller = createTutorialController(client, (state) => { states.push(state); });
     await controller.start();
     client.failNext = true;
 

@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "identity": "dev.teamarness.emojart",
+  "identity": "dev.teamarness.tutorial",
   "version": "1.0.0",
   "presentation": {
-    "displayName": "Emojart"
+    "displayName": "Tutorial"
   },
   "protocol": {
     "major": 1,
@@ -13,7 +13,7 @@
   "backends": [
     {
       "target": "aarch64-apple-darwin",
-      "path": "backend/teamarness-emojart-package-aarch64-apple-darwin",
+      "path": "backend/teamarness-tutorial-package-aarch64-apple-darwin",
       "size": 0,
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }

@@ -69,7 +69,7 @@ test("Package author and operator guidance covers the shipped contract", async (
   }
 });
 
-test("Emojart tutorial explains the local Package path without promoting it to the application", async () => {
+test("Tutorial preview and learner Emojart guide keep both local Packages distinct", async () => {
   const tutorial = await read("docs/build-your-first-package.md");
   const readme = await read("README.md");
 
@@ -82,10 +82,17 @@ test("Emojart tutorial explains the local Package path without promoting it to t
     "Package Data Directory",
     "Package Source",
     "Package Instance",
+    "dev.teamarness.tutorial",
     "dev.teamarness.emojart",
+    "npm run setup:tutorial -- tutorial-preview",
+    "npm run build:tutorial",
     "npm run build:emojart",
     "registrations.v1.json",
-    ".teamarness-dev/emojart-tutorial/packages/registrations.v1.json",
+    ".teamarness-dev/tutorial-preview/packages/registrations.v1.json",
+    "packages/tutorial/",
+    "packages/emojart/",
+    "Do not delete, rename, or modify Tutorial",
+    "Do not delete the Tutorial entry",
     "trusted_native_code_v1",
     "There is no hot reload",
     "not a sandbox",
@@ -107,11 +114,33 @@ test("Emojart tutorial explains the local Package path without promoting it to t
   assert.equal((tutorial.match(/### Agent brief/g) ?? []).length, 5, "tutorial has its five copyable agent briefs");
   assert.equal((tutorial.match(/### Human checkpoint/g) ?? []).length, 5, "tutorial has its five human checkpoints");
   assert.ok(readme.includes("Build your first Package"), "README links the tutorial from Package development");
+  assert.ok(readme.includes("npm run setup:tutorial -- tutorial-preview"), "README documents the Tutorial setup command");
+
+  const packageJson = JSON.parse(await read("package.json"));
+  assert.equal(packageJson.scripts["build:tutorial"], "node scripts/build-tutorial-package.mjs");
+  assert.equal(packageJson.scripts["setup:tutorial"], "node scripts/setup-tutorial-package.mjs");
+  assert.ok(packageJson.workspaces.includes("packages/tutorial/ui"));
+  assert.ok(!packageJson.workspaces.includes("packages/emojart/ui"));
+
+  const packageDirectories = await readdir(new URL("packages/", root));
+  assert.ok(packageDirectories.includes("tutorial"));
+  assert.ok(!packageDirectories.includes("emojart"), "checked-in Tutorial source does not occupy the learner Emojart directory");
+
+  const tutorialManifest = JSON.parse(await read("packages/tutorial/teamarness.package.json"));
+  assert.equal(tutorialManifest.identity, "dev.teamarness.tutorial");
+  assert.equal(tutorialManifest.presentation.displayName, "Tutorial");
+  const tutorialContract = JSON.parse(await read("packages/tutorial/ui-contract.json"));
+  assert.deepEqual(Object.keys(tutorialContract.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
 
   const applicationPackages = await read("packages/application-packages.v1.json");
   const tauriConfig = await read("apps/teamarness-desktop/src-tauri/tauri.conf.json");
-  assert.ok(!applicationPackages.includes("dev.teamarness.emojart"), "Emojart stays out of application Package metadata");
-  assert.ok(!tauriConfig.includes("emojart"), "Emojart stays out of Tauri bundled resources");
+  for (const identity of ["dev.teamarness.tutorial", "dev.teamarness.emojart"]) {
+    assert.ok(!applicationPackages.includes(identity), `${identity} stays out of application Package metadata`);
+    assert.ok(!tauriConfig.includes(identity), `${identity} stays out of Tauri bundled resources`);
+  }
+  for (const identifier of ["tutorial", "emojart"]) {
+    assert.ok(!tauriConfig.includes(identifier), `${identifier} stays out of Tauri bundled resources`);
+  }
 });
 
 test("direct dependencies are exact, lockfiles are committed, and schema retrieval is disabled", async () => {

@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use teamarness_emojart_package::{EmojartBackend, SeedError, SeedSource};
 use teamarness_package_protocol::{Frame, FrameKind, decode_frame};
 use teamarness_package_sdk::Package;
+use teamarness_tutorial_package::{SeedError, SeedSource, TutorialBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 struct FixedSeeds(Mutex<VecDeque<u32>>);
@@ -64,7 +64,7 @@ async fn request(
 #[tokio::test]
 async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
     let root = tempfile::tempdir().unwrap();
-    let backend = EmojartBackend::with_seed_source(FixedSeeds::new([7, 91]));
+    let backend = TutorialBackend::with_seed_source(FixedSeeds::new([7, 91]));
     let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
     let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
     let service = tokio::spawn(Package::builder(Arc::new(backend)).serve_io(sdk_read, sdk_write));
@@ -75,7 +75,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
             "kind": "initialize",
             "nonce": "bm9uY2U",
             "package": {
-                "identity": "dev.teamarness.emojart",
+                "identity": "dev.teamarness.tutorial",
                 "version": "1.0.0",
                 "manifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "backendDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -106,11 +106,11 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:inactive",
-        "emojart.read",
+        "tutorial.read",
         serde_json::json!({}),
     )
     .await;
-    assert_error(&inactive, "emojart.not_active", true);
+    assert_error(&inactive, "tutorial.not_active", true);
 
     assert_response(
         &request(
@@ -127,7 +127,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:read",
-        "emojart.read",
+        "tutorial.read",
         serde_json::json!({}),
     )
     .await;
@@ -141,7 +141,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:generate-1",
-        "emojart.generate",
+        "tutorial.generate",
         serde_json::json!({"algorithm": "waves", "palette": "garden"}),
     )
     .await;
@@ -149,7 +149,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:generate-2",
-        "emojart.generate",
+        "tutorial.generate",
         serde_json::json!({"algorithm": "waves", "palette": "garden"}),
     )
     .await;
@@ -164,7 +164,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:save",
-        "emojart.save",
+        "tutorial.save",
         serde_json::json!({"recipe": first.field("payload").unwrap()["recipe"]}),
     )
     .await;
@@ -179,21 +179,21 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:invalid",
-        "emojart.generate",
+        "tutorial.generate",
         serde_json::json!({"algorithm": "unknown", "palette": "garden"}),
     )
     .await;
-    assert_error(&invalid, "emojart.unknown_algorithm", false);
+    assert_error(&invalid, "tutorial.unknown_algorithm", false);
 
     let unknown = request(
         &mut host_write,
         &mut host_read,
         "h:unknown",
-        "emojart.delete",
+        "tutorial.delete",
         serde_json::json!({}),
     )
     .await;
-    assert_error(&unknown, "emojart.unknown_operation", false);
+    assert_error(&unknown, "tutorial.unknown_operation", false);
 
     assert_response(
         &request(
@@ -219,11 +219,11 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:disposed",
-        "emojart.read",
+        "tutorial.read",
         serde_json::json!({}),
     )
     .await;
-    assert_error(&disposed, "emojart.not_active", true);
+    assert_error(&disposed, "tutorial.not_active", true);
 
     assert_response(
         &request(
@@ -239,7 +239,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
         &mut host_write,
         &mut host_read,
         "h:recovered",
-        "emojart.read",
+        "tutorial.read",
         serde_json::json!({}),
     )
     .await;

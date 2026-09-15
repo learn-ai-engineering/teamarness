@@ -1,305 +1,158 @@
 # Build your first Package with an agent
 
-This guide builds Emojart, a small local art Package, from an empty `packages/emojart/` directory. It is for a developer who can review TypeScript and direct a coding agent, but does not need to write Rust or learn the Package Process Protocol frame format.
+Start by running Tutorial, the finished local Package shipped in this clone. Tutorial is an emoji-art Package with the result you will build yourself later. It remains installed while you create a separate Emojart Package at `packages/emojart/`.
 
-The agent writes the code. You set boundaries, review the changed files, run the commands, and inspect the desktop result. The finished Package has waves, ripples, and Sierpiński patterns; garden, ocean, space, and fruit palettes; a fresh result on every Generate press; and saved art that returns after an application restart.
+This guide is for Apple silicon macOS with Rust 1.96 or newer and Node.js 24 or newer. Run `npm ci` and `cargo fetch --locked` first. The SDK is private to this monorepo. This is not a recipe for publishing an external Package SDK.
 
-## Before you start
+## Preview the finished Tutorial Package
 
-Work in this repository on Apple silicon macOS. Install Rust 1.96 or newer and Node.js 24 or newer, then run `npm ci` and `cargo fetch --locked`. Emojart uses the repository-private `@teamarness/package-ui-sdk`, so this guide applies to a Package checked into this monorepo. It is not an external Package SDK recipe.
+Use a fresh named development profile. The setup command builds Tutorial, stages `target/teamarness-packages-local/dev.teamarness.tutorial/`, creates the private profile directories, and writes its owner-only registration. It does not bundle Tutorial or change application metadata.
 
-Start on a branch where `packages/emojart/` does not exist. The checked-in Emojart Package is the completed reference result. Read it after each agent step, not before. The normative Package documents are [the Package author guide](package-author-guide.md), [local registration guide](local-package-registration.md), and the schemas under [`contracts/packages/v1/`](../contracts/packages/v1/).
+```sh
+npm run setup:tutorial -- tutorial-preview
+npm run dev -- tutorial-preview
+```
 
-## Learn the ownership before asking for code
+Create or select a Workspace and open Tutorial. Confirm the Shell reports source `local`, trust `trusted_native_code_v1`, an active lifecycle, and the emoji-art UI. Stop Teamarness cleanly before changing registrations.
 
-A Package is a vertical product module. The Core Runtime owns Installation identity, Workspaces, canonical membership, and Package lifecycle. The Shell owns Workspace controls, navigation, and Package UI mounting. The Package Host operates generic Package Instances and their contracts. Emojart owns its art rules, saved records, Backend, and UI.
+Tutorial is an installation-local Package Source. It is not a bundled application Package, Workspace enablement, synchronization, networking, or collaboration feature. The native Package Backend has the current user's filesystem, network, and process authority. It is not a sandbox. The same-webview Package UI can reach Shell DOM and known Tauri commands. Review both before registering code.
+
+The setup command writes `.teamarness-dev/tutorial-preview/packages/registrations.v1.json` with a canonical absolute directory and the complete `trusted_native_code_v1` acknowledgement. Its profile and `packages` directories have mode `700`; its registration file has mode `600`. Restart after changing the file.
+
+## Keep the two Packages straight
+
+Tutorial is checked in at `packages/tutorial/`, has identity `dev.teamarness.tutorial`, uses `tutorial.read`, `tutorial.generate`, and `tutorial.save`, and keeps its local records in `tutorial.v1.json`. Emojart is your separate Package. Create it from an empty `packages/emojart/` directory with identity `dev.teamarness.emojart`, its own `emojart.*` request namespace, and `emojart.v1.json` state file. Do not delete, rename, or modify Tutorial while working through this guide.
 
 ```mermaid
 flowchart LR
-  Core[Core Runtime\nidentity, Workspaces, lifecycle] --> Host[Package Host\nPackage Instance and contracts]
-  Shell[Shell\nnavigation and UI mount] --> Host
-  Host --> Backend[Package Backend\nrecipes, generation, saved art]
-  Shell --> UI[Package UI\ncontrols and presentation]
-  UI <-->|declared requests| Backend
-  Backend --> Data[Package Data Directory\nlocal emojart.v1.json]
+  Tutorial[packages/tutorial\nTutorial Source] --> TutorialDirectory[target/teamarness-packages-local/dev.teamarness.tutorial]
+  TutorialDirectory --> Registration[owner-only registrations.v1.json]
+  Emojart[packages/emojart\nlearner Source] --> EmojartDirectory[target/teamarness-packages-local/dev.teamarness.emojart]
+  Registration --> Shell[Teamarness Shell]
+  EmojartDirectory --> Registration
 ```
 
-A Package Source is the concrete Package Directory that an Installation discovers. A Package Identity stays stable across sources and versions. After admission, the host creates one Package Instance for each Workspace on that Installation. Each instance gets a separate Package Data Directory keyed by Installation, Workspace, and Package Identity. Emojart's saves are therefore Workspace-specific local data, not one global list for a profile.
+A Package Source is the concrete Package Directory that an Installation discovers. A Package Identity stays stable across sources and versions. The Package Host creates a Package Instance for each Workspace. Each instance gets a Package Data Directory keyed by Installation, Workspace, and Package Identity. Tutorial and Emojart therefore have separate local state, and each Package's saves are Workspace-specific.
 
-Package trust is broad. The native Package Backend has the current user's filesystem, network, and process authority. It is not a sandbox. A same-webview Package UI can reach the Shell DOM and known Tauri commands. A Shadow Root separates styles, not authority. Review both parts before registering a Package.
-
-## Step 1: declare the Package boundary
-
-The first agent task creates the source tree and declares the contract before either side implements it. Keep the declarations small. Emojart needs requests only, no Semantic Capabilities, assets, subscriptions, networking, or synchronization.
+## Step 1: create Emojart from empty source
 
 ### Agent brief 1
 
 ```text
-Create the initial Emojart Package source under packages/emojart/ from an empty directory.
+Create a new Emojart Package under an empty packages/emojart/ directory. Do not copy, rename, delete, or modify packages/tutorial/.
 
-Authority:
-- context/ontology.md defines Package, Package Source, Package Instance, and Package Data Directory.
-- docs/package-author-guide.md and contracts/packages/v1/ define an admitted Package Directory.
-- contracts/package-process/v1/ is normative protocol reference. Do not teach or hand-roll its frames.
+Use docs/package-author-guide.md, docs/local-package-registration.md, contracts/packages/v1/, crates/teamarness-package-sdk/README.md, packages/teamarness-package-ui-sdk/, and packages/reference-package/ for supported shapes.
 
-Sources to inspect:
-- packages/reference-package/ for repository shape only.
-- crates/teamarness-package-sdk/README.md and packages/teamarness-package-ui-sdk/.
-- root Cargo.toml and package.json for workspace conventions.
+Give Emojart identity dev.teamarness.emojart. Add a Rust Backend and TypeScript UI workspace to the root Cargo.toml and package.json. Add teamarness.package.json and ui-contract.json. Declare only emojart.read, emojart.generate, and emojart.save, with no subscriptions, capabilities, assets, network behavior, or synchronization.
 
-Constraints:
-- Use Package Identity dev.teamarness.emojart.
-- Add packages/emojart/teamarness.package.json and packages/emojart/ui-contract.json.
-- Declare only emojart.read, emojart.generate, and emojart.save. Declare no subscriptions, capabilities, assets, network behavior, or synchronization.
-- Do not add Emojart to packages/application-packages.v1.json or Tauri bundled resources.
-
-Output:
-- Rust Backend and TypeScript UI workspace directories wired into the root workspaces.
-- A closed UI contract and manifest template with generated byte fields left for assembly.
-
-Checks:
-- Add contract and document tests at the existing Package seams.
-- Run the narrow new tests, then cargo test -p teamarness-emojart-package --locked.
+Do not add either Tutorial or Emojart to packages/application-packages.v1.json or apps/teamarness-desktop/src-tauri/tauri.conf.json. Add focused contract tests and run them.
 ```
-
-What changed: the manifest identifies the Package and its final files. The UI contract gives the UI and Backend a shared request vocabulary. It is not a runtime discovery mechanism.
 
 ### Human checkpoint 1
 
-Review the contract without reading implementation details. Confirm it has `emojart.read`, `emojart.generate`, and `emojart.save`, an empty `subscriptions` object, and the identity `dev.teamarness.emojart`. Confirm the manifest has no capability declaration and no final byte values yet.
+Review `packages/emojart/`, not `packages/tutorial/`. Confirm the manifest identity is `dev.teamarness.emojart`, the contract has the three `emojart.*` requests and empty `subscriptions`, and neither application metadata nor Tauri resources changed.
 
-## Step 2: give the Backend the domain and local state
+## Step 2: implement Emojart's Backend
 
-The Backend validates choices, creates a new unsigned 32-bit seed for each generation, renders the fixed 16 by 12 grid, and owns durable saves. The UI submits a recipe when saving. It never submits cells. The Backend regenerates and stores the cells, so it remains the source of truth.
+The Core Runtime owns Installation identity, Workspaces, canonical membership, and Package lifecycle. The Shell owns navigation and Package UI mounting. The Package Host routes declared contracts. Emojart owns art rules, saved records, its Package Backend, and its Package UI.
+
+```mermaid
+flowchart LR
+  Core[Core Runtime\nidentity, Workspaces, lifecycle] --> Host[Package Host\nPackage Instance and contracts]
+  Shell[Shell\nnavigation and mount] --> Host
+  Host --> Backend[Emojart Package Backend\ngeneration and saved art]
+  Shell --> UI[Emojart Package UI\ncontrols and presentation]
+  UI <-->|declared requests| Backend
+  Backend --> Data[Package Data Directory\nemojart.v1.json]
+```
 
 ### Agent brief 2
 
 ```text
-Implement the Emojart Backend in packages/emojart/backend/.
+Implement packages/emojart/backend/ against its declared UI contract. Do not read or reuse Tutorial source.
 
-Authority:
-- crates/teamarness-package-sdk/README.md defines the supported Backend adapter and lifecycle boundary.
-- packages/emojart/ui-contract.json is the complete request contract.
-- context/.decisions/0003-core-runtime-vertical-packages.md assigns product records and UI to the Package.
+Support waves, ripples, and sierpinski; garden, ocean, space, and fruit; generatorVersion 1; and a 16 by 12 grid. emojart.generate creates a fresh Backend-owned unsigned 32-bit seed. Equal recipes render equal cells. emojart.save accepts a recipe, regenerates cells in the Backend, assigns stable IDs, and writes a closed schemaVersion 1 emojart.v1.json document in the granted Package Data Directory with temporary-file replacement.
 
-Sources to inspect:
-- packages/reference-package/backend/ for SDK lifecycle shape.
-- packages/emojart/backend/tests/ for required public behavior examples.
-
-Constraints:
-- Support waves, ripples, and sierpinski; garden, ocean, space, and fruit; generatorVersion 1; and a 16 by 12 grid.
-- Generate a fresh Backend-owned seed for every emojart.generate request. Equal recipes must render equal cells.
-- Persist a closed schemaVersion 1 document named emojart.v1.json in the granted Package Data Directory. Use temporary-file replacement for saves.
-- Keep lifecycle work bounded. Do not add capabilities, subscriptions, browser storage, network calls, or synchronization.
-
-Output:
-- Lifecycle-aware read, generate, and save behavior with stable artwork IDs.
-- Real temporary-directory tests for save and reopen continuity.
-
-Checks:
-- Run cargo test -p teamarness-emojart-package --locked.
-- Run cargo fmt --all --check and cargo clippy -p teamarness-emojart-package --all-targets --all-features --locked -- -D warnings.
+Do not add browser persistence, capabilities, subscriptions, network calls, or synchronization. Add real temporary-directory tests, then run cargo test -p teamarness-emojart-package --locked, cargo fmt --all --check, and cargo clippy -p teamarness-emojart-package --all-targets --all-features --locked -- -D warnings.
 ```
-
-What changed: the Package Backend owns formulas, validation, random seed creation, and the Package-owned JSON file. The Core Runtime assigns the directory but does not read, migrate, or synchronize that file.
 
 ### Human checkpoint 2
 
-Ask the agent to show the tests that prove equal recipes reproduce a grid, selected unequal seeds differ, unknown choices fail, and a saved record reopens from a real temporary directory. Check that the state path is supplied by the host, not hard-coded or stored in browser storage.
+Read the tests. They should show reproducible recipes, different selected seeds, rejected choices, and save-and-reopen continuity. The state path must come from the host rather than a hard-coded path or browser storage.
 
-## Step 3: add the UI without giving it host authority
-
-The Package UI mounts into a Shell-provided Shadow Root with a mount-scoped client. It selects a pattern and palette, requests a draft, saves the visible recipe, and restores a selected saved piece. It does not call Tauri directly or own persistence.
+## Step 3: implement the Emojart UI
 
 ### Agent brief 3
 
 ```text
-Implement the Emojart UI in packages/emojart/ui/.
+Implement packages/emojart/ui/ using only the mount-scoped PackageClient and the Emojart UI contract. Do not copy Tutorial files or use direct Tauri commands.
 
-Authority:
-- packages/teamarness-package-ui-sdk/src/index.ts defines the mount-scoped PackageClient.
-- packages/emojart/ui-contract.json defines every allowed request and payload.
-- docs/package-author-guide.md defines the ESM mount and idempotent-unmount requirements.
+Export mount(context) and an idempotent unmount function. Use only emojart.read, emojart.generate, and emojart.save. Show algorithm and palette selects, Generate, Save, a fixed CSS grid, saved-art selection, concise labels, and visible request errors. Generate keeps selected controls and asks the Backend for a fresh seed. Decorative cells stay out of the accessibility tree.
 
-Sources to inspect:
-- packages/reference-package/ui/src/index.ts for mount structure.
-- packages/emojart/ui/src/index.test.ts for the fake client flow seam.
-
-Constraints:
-- Export mount(context) and return an idempotent unmount function.
-- Use only context.client for emojart.read, emojart.generate, and emojart.save.
-- Provide algorithm and palette selects, Generate, Save, a fixed CSS grid, saved-art selection, concise labels, and visible request errors.
-- Generate must preserve selectors and ask the Backend for a new seed. Decorative cells stay out of the accessibility tree.
-- Do not use direct Tauri commands, browser persistence, subscriptions, remote imports, or network calls.
-
-Output:
-- One ESM UI entrypoint and focused client-flow tests.
-
-Checks:
-- Run npm --workspace @teamarness/emojart-package-ui run build.
-- Run npm --workspace @teamarness/emojart-package-ui run typecheck, lint, and test.
+Add focused client-flow tests. Run the Emojart UI build, typecheck, lint, and tests.
 ```
-
-What changed: the UI presents state and sends declared requests. The Backend remains active with its Package Instance even when the UI is not visible.
 
 ### Human checkpoint 3
 
-Read the UI test names and the rendered controls. Confirm the initial read causes a draft, Generate keeps the selected controls while requesting another draft, Save adds a saved-art control, and selecting saved art does not generate a replacement.
+Confirm the UI test names show initial read, selector-preserving Generate, Save, and saved-art selection without a replacement generation. The UI does not own persistence.
 
-## Step 4: assemble final bytes, then admit them
+## Step 4: assemble Emojart bytes
 
-Source files are not a Package Directory. Build output must contain the final executable, one ESM entrypoint, and the UI contract. Assembly copies those bytes, sets final permissions, and writes their final sizes and lowercase SHA-256 digests into the manifest.
-
-```mermaid
-flowchart LR
-  Source[packages/emojart source] --> Build[npm run build:emojart]
-  Build --> Directory[target/teamarness-packages-local/dev.teamarness.emojart]
-  Directory --> Registration[owner-only registrations.v1.json]
-  Registration --> Restart[restart Teamarness]
-  Restart --> Admission[validate identity, permissions, bytes, digests]
-  Admission --> Instance[local Package Source and Workspace Package Instance]
-  Instance --> Mount[Shell mounts the UI]
-```
+Source files are not a Package Directory. Your agent should add an Emojart assembly command after the Backend and UI work. It must stage final bytes, then calculate sizes and lowercase SHA-256 digests in the staged manifest.
 
 ### Agent brief 4
 
 ```text
-Add the Emojart Package assembly command and its integration tests.
+Add npm run build:emojart for the learner-created Package. It must build the release Backend and ESM UI and stage target/teamarness-packages-local/dev.teamarness.emojart/ with the Backend executable, ui/index.js, ui/contract.json, final sizes, lowercase SHA-256 digests, and owner-only final permissions.
 
-Authority:
-- scripts/package-directory.mjs owns neutral final-byte staging.
-- docs/package-author-guide.md defines final-byte admission requirements.
-- docs/local-package-registration.md defines local source rules.
-
-Sources to inspect:
-- scripts/build-reference-package.mjs for existing reference-only behavior to avoid.
-- scripts/build-emojart-package.test.mjs and scripts/package-directory.test.mjs for the integration seam.
-
-Constraints:
-- Add npm run build:emojart.
-- Build the release Backend and ESM UI, then stage target/teamarness-packages-local/dev.teamarness.emojart/.
-- Generate the manifest's final sizes and lowercase SHA-256 digests after copying final bytes.
-- Do not change packages/application-packages.v1.json or apps/teamarness-desktop/src-tauri/tauri.conf.json.
-
-Output:
-- A valid installation-local Package Directory with Backend, UI entrypoint, UI contract, and manifest.
-
-Checks:
-- Run node --test scripts/package-directory.test.mjs scripts/build-emojart-package.test.mjs.
-- Run npm run build:emojart and inspect the staged manifest.
+Reuse scripts/package-directory.mjs if useful. Add a focused staging test. Do not alter npm run build:tutorial, target/teamarness-packages-local/dev.teamarness.tutorial/, packages/application-packages.v1.json, or apps/teamarness-desktop/src-tauri/tauri.conf.json.
 ```
 
 ### Human checkpoint 4
 
-Run this command from the repository root:
+Run `npm run build:emojart`. Inspect `target/teamarness-packages-local/dev.teamarness.emojart/`. The staged manifest should have nonzero byte sizes and lowercase SHA-256 digests. The checked-in Emojart source manifest may use placeholders before assembly.
 
-```sh
-npm run build:emojart
-```
+## Step 5: add Emojart without removing Tutorial
 
-Check that `target/teamarness-packages-local/dev.teamarness.emojart/` has `teamarness.package.json`, the Backend executable, `ui/index.js`, and `ui/contract.json`. Check that the staged manifest has nonzero byte sizes and lowercase SHA-256 digests. The checked-in source manifest intentionally has placeholders.
-
-## Step 5: register the local Package Source
-
-Registration is an owner-only operator action. It does not bundle Emojart or enable it for a team. Start the named development profile once, quit Teamarness cleanly, then build and register the directory.
+Tutorial's registration stays in the named profile. Add a second registration entry for Emojart. Do not delete the Tutorial entry, and do not use `overrideApplication` because neither identity is bundled.
 
 ### Agent brief 5
 
 ```text
-Review the proposed Emojart local-registration procedure without changing application code.
+Review the proposed registration change for the learner-created Emojart Package without changing application code. Preserve the existing dev.teamarness.tutorial registration in the named tutorial-preview profile. Add one registration for target/teamarness-packages-local/dev.teamarness.emojart with expectedIdentity dev.teamarness.emojart and the complete trusted_native_code_v1 acceptedRisks acknowledgement.
 
-Authority:
-- docs/local-package-registration.md is the registration and permission contract.
-- packages/emojart/teamarness.package.json is the Package Identity authority.
-
-Constraints:
-- The source must be the assembled target/teamarness-packages-local/dev.teamarness.emojart directory.
-- Use the named development profile emojart-tutorial.
-- Keep expectedIdentity as dev.teamarness.emojart and use the complete trusted_native_code_v1 acknowledgement.
-- Do not add Emojart to application metadata, bundled resources, Workspace enablement, or synchronization.
-
-Output:
-- Report the exact registration path, required owner-only modes, and restart requirement.
-
-Checks:
-- Compare the proposed JSON against contracts/packages/v1/schemas/registrations.schema.json.
-- Confirm the application metadata and Tauri resources still omit Emojart.
+Use canonical absolute paths. Keep the profile and packages directories mode 700 and registrations.v1.json mode 600. Confirm packages/application-packages.v1.json and apps/teamarness-desktop/src-tauri/tauri.conf.json omit both identities. Restart Teamarness after the file changes.
 ```
 
 ### Human checkpoint 5
 
-First create the profile, then quit the application:
+After `npm run build:emojart`, edit the existing registration file from the repository root. Preserve the Tutorial object and append Emojart:
 
 ```sh
-npm run dev -- emojart-tutorial
-```
-
-Build the Package if you have not already, then write the registration. Run this from the repository root so `pwd -P` gives the canonical absolute repository path:
-
-```sh
-npm run build:emojart
 repository="$(pwd -P)"
-profile="$repository/.teamarness-dev/emojart-tutorial"
+profile="$repository/.teamarness-dev/tutorial-preview"
 package_directory="$repository/target/teamarness-packages-local/dev.teamarness.emojart"
-mkdir -p "$profile/packages"
+# Keep the existing Tutorial registration, then add this second object to registrations:
+# {
+#   "directory": "$package_directory",
+#   "expectedIdentity": "dev.teamarness.emojart",
+#   "trust": {
+#     "kind": "trusted_native_code_v1",
+#     "acceptedRisks": ["filesystem", "network", "process"]
+#   }
+# }
 chmod 700 "$profile" "$profile/packages"
-cat > "$profile/packages/registrations.v1.json" <<EOF
-{
-  "schemaVersion": 1,
-  "registrations": [
-    {
-      "directory": "$package_directory",
-      "expectedIdentity": "dev.teamarness.emojart",
-      "trust": {
-        "kind": "trusted_native_code_v1",
-        "acceptedRisks": ["filesystem", "network", "process"]
-      }
-    }
-  ]
-}
-EOF
 chmod 600 "$profile/packages/registrations.v1.json"
+npm run dev -- tutorial-preview
 ```
 
-The registration path is `.teamarness-dev/emojart-tutorial/packages/registrations.v1.json` under this clone. Do not add `overrideApplication`: Emojart has no bundled Package with the same identity. Do not paste invitations, keys, or database contents into this file.
-
-Restart the profile after creating, changing, or removing the registration:
-
-```sh
-npm run dev -- emojart-tutorial
-```
-
-Confirm the Shell reports source `local`, trust `trusted_native_code_v1`, an active lifecycle, and the Emojart UI. If it does not, stop and fix the registration before testing art behavior.
-
-## Verify the result and the restart loop
-
-Use the same named profile and Workspace. Try all three patterns with more than one palette. Press Generate several times without changing either select and confirm a visibly different grid. Save at least two pieces, stop Teamarness cleanly, restart the same profile, and confirm both pieces return unchanged.
-
-Then create or select a second Workspace. It should start with an empty saved-art list. That difference is expected. The installation-local Package Source is admitted once for the Installation, while each Workspace has its own Package Instance and Package Data Directory.
-
-When source changes, rebuild first and restart second:
-
-```sh
-npm run build:emojart
-npm run dev -- emojart-tutorial
-```
-
-There is no hot reload for admitted Backend bytes. Teamarness reads registration and admits bytes at startup. If a Backend file changes while Teamarness is running, the host can reject a spawn with `artifact_changed`. A restart admits the deliberate rebuild. Rebuilding does not erase saves because the data directory follows Installation, Workspace, and Package Identity rather than the source path or Package version.
+Confirm both Tutorial and Emojart report source `local`, trust `trusted_native_code_v1`, and active lifecycles. Run every pattern with several palettes, press Generate repeatedly, save two pieces, restart, and confirm the saves return. A second Workspace starts with an empty saved-art list. There is no hot reload. Rebuild first and restart second. A changed Backend while Teamarness is running can fail with `artifact_changed`.
 
 ## Troubleshooting
 
-- **Registration permissions:** Make the profile and `packages` directory owner-only with mode `700`, and `registrations.v1.json` owner-only with mode `600`. The file must be regular and not a symlink.
-- **Identity mismatch:** Keep `expectedIdentity` equal to `dev.teamarness.emojart`. Do not change it to hide a manifest error.
-- **Missing artifacts:** Run `npm run build:emojart`, then inspect the staged directory rather than registering `packages/emojart/` source files.
-- **Digest mismatch:** Rebuild and register the newly staged directory. Do not edit files inside the admitted directory after assembly.
-- **Unsupported target:** This tutorial builds the `aarch64-apple-darwin` Backend. Another target needs a declared, self-contained executable and its own support work.
-- **Invalid UI contract:** Keep request names and payloads aligned with `packages/emojart/ui-contract.json`. The host rejects undeclared operations, invalid schemas, and changed contract bytes.
-- **Stale bytes:** Stop Teamarness, rebuild, and start the named profile again. A running process does not discover changed Backend bytes.
+- **Digest mismatch:** Rebuild, then register the staged Package Directory. Do not edit admitted bytes.
+- **Unsupported target:** This guide builds `aarch64-apple-darwin`. Supporting another target needs a declared executable and separate work.
+- **Invalid UI contract:** Keep the `emojart.*` request names aligned with `packages/emojart/ui-contract.json`.
+- **Registration permissions:** Keep profile and `packages` at mode `700` and `registrations.v1.json` at mode `600`. It must be regular, not a symlink.
 
-## Keep the boundary honest
-
-Emojart is local-only. It has an installation-local Package Source and Workspace-specific local state. It does not add bundling, Workspace registration or enablement, networking, peer-to-peer replication, synchronization, or team collaboration.
-
-A future tutorial will cover promotion to application distribution, Workspace enablement, and synchronized team behavior through a Synchronization Capability. Those need separate trust and product decisions. A local registration file does not stand in for any of them.
-
-The architecture recap is short: the Core Runtime owns shared application authority, the Shell owns mounting, the Package Host owns generic admission and routing, and Emojart owns art behavior and local records. That split lets you direct an agent with clear authority while keeping the Package small enough to inspect.
+Emojart stays installation-local. It does not add bundling, Workspace enablement, synchronization, networking, or collaboration. A future tutorial can cover promotion to application distribution and synchronized team behavior, but a local registration file does neither.

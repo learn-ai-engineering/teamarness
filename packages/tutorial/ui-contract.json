@@ -112,15 +112,15 @@
     }
   },
   "requests": {
-    "emojart.read": {
+    "tutorial.read": {
       "request": { "$ref": "#/$defs/empty" },
       "response": { "$ref": "#/$defs/readResponse" }
     },
-    "emojart.generate": {
+    "tutorial.generate": {
       "request": { "$ref": "#/$defs/generateRequest" },
       "response": { "$ref": "#/$defs/draft" }
     },
-    "emojart.save": {
+    "tutorial.save": {
       "request": { "$ref": "#/$defs/saveRequest" },
       "response": { "$ref": "#/$defs/savedArtwork" }
     }
