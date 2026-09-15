@@ -2,6 +2,7 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { buildConversationsPackage } from "./build-conversations-package.mjs";
 import { buildReferencePackage } from "./build-reference-package.mjs";
 import { buildTutorialPackage } from "./build-tutorial-package.mjs";
 
@@ -10,6 +11,7 @@ export const repositoryRoot = resolve(dirname(scriptPath), "..");
 export const APPLICATION_PACKAGE_DECLARATIONS = Object.freeze([
   { identity: "dev.teamarness.reference", directory: "packages/dev.teamarness.reference" },
   { identity: "dev.teamarness.tutorial", directory: "packages/dev.teamarness.tutorial" },
+  { identity: "dev.teamarness.conversations", directory: "packages/dev.teamarness.conversations" },
 ]);
 
 export async function buildApplicationPackages({
@@ -18,12 +20,14 @@ export async function buildApplicationPackages({
   skipUiBuild = false,
   referenceBackendPath,
   tutorialBackendPath,
+  conversationsBackendPath,
 } = {}) {
   const outputRoot = join(root, "target/teamarness-packages");
   await rm(outputRoot, { recursive: true, force: true });
   await mkdir(outputRoot, { recursive: true, mode: 0o700 });
   const referenceDirectory = join(outputRoot, "dev.teamarness.reference");
   const tutorialDirectory = join(outputRoot, "dev.teamarness.tutorial");
+  const conversationsDirectory = join(outputRoot, "dev.teamarness.conversations");
   await buildReferencePackage({
     repositoryRoot: root,
     backendPath: referenceBackendPath,
@@ -38,6 +42,13 @@ export async function buildApplicationPackages({
     skipBuilds,
     skipUiBuild,
   });
+  await buildConversationsPackage({
+    repositoryRoot: root,
+    backendPath: conversationsBackendPath,
+    outputDirectory: conversationsDirectory,
+    skipBuilds,
+    skipUiBuild,
+  });
   const indexPath = join(root, "packages/application-packages.v1.json");
   const temporaryPath = `${indexPath}.tmp-${process.pid}`;
   const document = {
@@ -46,7 +57,7 @@ export async function buildApplicationPackages({
   };
   await writeFile(temporaryPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
   await rename(temporaryPath, indexPath);
-  return { indexPath, directories: [referenceDirectory, tutorialDirectory] };
+  return { indexPath, directories: [referenceDirectory, tutorialDirectory, conversationsDirectory] };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {

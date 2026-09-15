@@ -6,6 +6,9 @@
     },
     {
       "directory": "packages/dev.teamarness.tutorial"
+    },
+    {
+      "directory": "packages/dev.teamarness.conversations"
     }
   ]
 }

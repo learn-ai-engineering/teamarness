@@ -905,6 +905,12 @@ impl ConversationsBackend {
             .get("results")
             .and_then(JsonValue::as_array)
             .ok_or_else(|| error("conversations.invalid_record", false))?;
+        let local_identity = r
+            .initialization
+            .installation()
+            .get("identity")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
         let mut messages = Vec::new();
         for ((id, order, author, _rid, _sealed, ordinal), value) in rows.into_iter().zip(results) {
             let canon = value
@@ -916,7 +922,8 @@ impl ConversationsBackend {
                 messages.push(object([
                     ("id", JsonValue::String(id)),
                     ("orderKey", JsonValue::String(order)),
-                    ("author", JsonValue::String(author)),
+                    ("author", JsonValue::String(author.clone())),
+                    ("isLocal", JsonValue::Bool(author == local_identity)),
                     ("markdown", JsonValue::String(markdown)),
                     ("ingestionOrdinal", JsonValue::String(ordinal.to_string())),
                 ]));

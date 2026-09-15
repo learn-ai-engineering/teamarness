@@ -115,6 +115,8 @@ Invitation values are sensitive bearer admission material. Do not store them, pr
 
 Start with [Build your first Package with an agent](docs/build-your-first-package.md). It begins with the finished Tutorial, explains the boundary between the Teamarness Core Runtime and a Package, then walks through generating, building, registering, and using an external Emojart project. Generate Emojart outside the Teamarness repository with `npm run create:package -- --output <directory> --identity dev.teamarness.emojart --display-name Emojart`. Read the [Package author guide](docs/package-author-guide.md) for the full Package Directory, Backend, UI, contract, and application-distribution rules. Read the UI SDK's [Package UI theme and CSS kit](packages/teamarness-package-ui-sdk/README.md) guidance for the exact semantic tokens, opt-in classes, cleanup contract, and Package-owned header and navigation model. Read [Local Package registration](docs/local-package-registration.md) for other registration layouts, restart rules, digest invalidation, and Package Data Directory continuity. A local registration does not grant Workspace enablement or synchronize, share, network, or collaborate Package code or data.
 
+The application build composes the Reference and Conversations Packages into one verified index. Run `npm run build` to build both Backends, UI entrypoints, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
+
 The protocol and supported Rust tooling have separate contracts:
 
 - [`contracts/package-process/v1/README.md`](contracts/package-process/v1/README.md) is the normative language-neutral process protocol.
@@ -135,6 +137,6 @@ The runtime exclusively owns one private `core.sqlite3`. Uncertain commit outcom
 - `context/` is the canonical requirements, ontology, roadmap, and decision tree.
 - `crates/teamarness-core/` contains the Core Runtime library, API documentation, and tests.
 - `crates/teamarness-package-host/`, `crates/teamarness-package-protocol/`, and `crates/teamarness-package-sdk/` contain the Package runtime and supported Rust tooling.
-- `packages/reference-package/` is the bundled reference Package and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
+- `packages/reference-package/` and `packages/conversations-package/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
 - `apps/teamarness-desktop/` contains the typed Tauri adapter and Shell.
 - `p2p-local-first-user-management.md` is the supporting P2P membership research baseline.

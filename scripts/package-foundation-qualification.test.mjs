@@ -165,7 +165,7 @@ test("packaged smoke waits for Package navigation and captures safe timeout diag
   assert.match(source, /stdio:\s*\["ignore",\s*"pipe",\s*"pipe"\]/);
 });
 
-test("generated foundation and Tutorial policy remain independent", async () => {
+test("generated foundation and bundled Package policies remain independent", async () => {
   const packageJson = JSON.parse(await read("package.json"));
   const agents = await read("templates/package-foundation/v1/AGENTS.md");
   assert.match(agents, /Teamarness Core Runtime/);
@@ -188,6 +188,7 @@ test("generated foundation and Tutorial policy remain independent", async () => 
   assert.deepEqual(index.packages, [
     { directory: "packages/dev.teamarness.reference" },
     { directory: "packages/dev.teamarness.tutorial" },
+    { directory: "packages/dev.teamarness.conversations" },
   ]);
   const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
   assert.deepEqual(Object.keys(tutorial.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
@@ -206,9 +207,11 @@ test("delivery configuration includes both bundled Package Directories and sourc
   const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
   assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.reference/"]);
   assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.tutorial/"]);
+  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.conversations/"]);
   assert.deepEqual(config.bundle.externalBin, [
     "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
     "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
+    "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package",
   ]);
   const shell = await read("apps/teamarness-desktop/src/shell.ts");
   const presentation = await read("apps/teamarness-desktop/src/presentation.ts");
@@ -243,4 +246,53 @@ test("repository authoring records the temporary vendoring policy", async () => 
   }
   assert.match(roadmap, /published.*Rust.*TypeScript.*SDK/i);
   assert.match(roadmap, /upgrade policy/i);
+  assert.equal(JSON.parse(await read("package-lock.json")).lockfileVersion, 3);
+  assert.ok((await read("Cargo.lock")).includes("version = 4"));
+});
+
+test("delivery configuration has one local admitted loader and no deferred Package subsystem", async () => {
+  const packageJson = JSON.parse(await read("package.json"));
+  assert.equal(packageJson.scripts["verify:packaged-app"], "node scripts/smoke-packaged-app.mjs");
+
+  const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
+  assert.deepEqual(config.bundle.targets, ["app", "dmg"]);
+  assert.ok(config.bundle.resources["../../../packages/application-packages.v1.json"]);
+  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.reference/"]);
+  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.tutorial/"]);
+  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.conversations/"]);
+  assert.ok(config.app.security.csp.includes("teamarness-package:"));
+  assert.ok(!config.app.security.csp.includes("file:"));
+  assert.ok(!config.app.security.csp.includes("https:"));
+
+  const capabilityEntries = await readdir(new URL("contracts/package-capabilities/v1/", root));
+  assert.deepEqual(
+    capabilityEntries.sort(),
+    ["README.md", "immutable-record-invalid.golden.json", "immutable-record-log.schema.json", "immutable-record-log.test.mjs", "immutable-record.golden.json", "membership.schema.json", "signing-envelope.golden.json", "signing.schema.json", "workspace-context.schema.json"],
+  );
+
+  const productionPaths = [
+    "apps/teamarness-desktop/src/package-bridge.ts",
+    "apps/teamarness-desktop/src/package-contracts.ts",
+    "apps/teamarness-desktop/src/package-mount.ts",
+    "apps/teamarness-desktop/src-tauri/src/package_commands.rs",
+    "apps/teamarness-desktop/src-tauri/src/package_dto.rs",
+    "apps/teamarness-desktop/src-tauri/src/package_protocol.rs",
+    "crates/teamarness-package-host/src/lib.rs",
+  ];
+  const production = (await Promise.all(productionPaths.map(async (path) =>
+    (await read(path)).split("#[cfg(test)]")[0]))).join("\n").toLowerCase();
+  for (const forbidden of [
+    "reference.read",
+    "reference.increment",
+    "reference.changes",
+    "conversation",
+    "webviewwindow",
+    "convertfilesrc",
+    "source_path",
+    "cache_path",
+    "data_path",
+    "iroh::",
+  ]) {
+    assert.ok(!production.includes(forbidden), `production Package seam contains ${forbidden}`);
+  }
 });

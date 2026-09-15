@@ -7,7 +7,7 @@
   "backends": [{"target":"aarch64-apple-darwin","path":"backend/teamarness-conversations-package-aarch64-apple-darwin","size":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],
   "ui": {
     "entrypoint":{"path":"ui/index.js","size":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},
-    "assets":[],
+    "assets":[{"path":"ui/style.css","mediaType":"text/css","size":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],
     "contract":{"path":"ui-contract.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}
   },
   "capabilities": [
