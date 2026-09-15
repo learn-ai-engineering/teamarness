@@ -3,7 +3,10 @@ import { bridge } from "./bridge";
 import { packageBridge } from "./package-bridge";
 import { PackageMountController } from "./package-mount";
 import { createPackageShell } from "./package-shell";
+import { createInstallationThemeController } from "./theme";
 import { ShellController, ShellRenderer } from "./view";
+
+createInstallationThemeController();
 
 const root = document.querySelector<HTMLElement>("#app");
 if (!root) throw new Error("Shell mount is unavailable");
