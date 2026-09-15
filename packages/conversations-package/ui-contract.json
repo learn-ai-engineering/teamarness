@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "$defs": {},
+  "requests": {
+    "conversations.snapshot": {"request": {"type":"object","additionalProperties":false}, "response": {"type":"object"}},
+    "conversations.channel.create": {"request": {"type":"object","required":["slug"],"properties":{"slug":{"type":"string","minLength":1,"maxLength":48}},"additionalProperties":false}, "response": {"type":"object"}},
+    "conversations.channel.hide": {"request": {"type":"object","required":["channelId","confirm"],"properties":{"channelId":{"type":"string"},"confirm":{"const":true}},"additionalProperties":false}, "response": {"type":"object"}},
+    "conversations.message.post": {"request": {"type":"object","required":["channelId","markdown"],"properties":{"channelId":{"type":"string"},"markdown":{"type":"string","minLength":1,"maxLength":32768}},"additionalProperties":false}, "response": {"type":"object"}},
+    "conversations.channel.open": {"request": {"type":"object","required":["channelId"],"properties":{"channelId":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}, "response": {"type":"object"}},
+    "conversations.channel.page": {"request": {"type":"object","required":["channelId"],"properties":{"channelId":{"type":"string"},"beforeOrderKey":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}, "response": {"type":"object"}},
+    "conversations.channel.mark-read": {"request": {"type":"object","required":["channelId"],"properties":{"channelId":{"type":"string"}},"additionalProperties":false}, "response": {"type":"object"}}
+  },
+  "subscriptions": {
+    "conversations.changes": {"request": {"type":"object","additionalProperties":false}, "event": {"type":"object"}}
+  }
+}

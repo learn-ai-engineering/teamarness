@@ -6541,6 +6541,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamarness-conversations-package"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "rusqlite",
+ "serde_json",
+ "teamarness-package-protocol",
+ "teamarness-package-sdk",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "teamarness-core"
 version = "0.1.0"
 dependencies = [
