@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "requests": {
+    "__REQUEST_NAMESPACE__.read": {
+      "request": { "type": "object", "properties": {}, "additionalProperties": false },
+      "response": {
+        "type": "object",
+        "required": ["message", "displayName"],
+        "properties": {
+          "message": { "type": "string" },
+          "displayName": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "subscriptions": {}
+}

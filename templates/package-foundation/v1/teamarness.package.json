@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "identity": "__PACKAGE_IDENTITY__",
+  "version": "1.0.0",
+  "presentation": { "displayName": "__PACKAGE_DISPLAY_NAME__" },
+  "protocol": { "major": 1, "minMinor": 0, "maxMinor": 0 },
+  "backends": [{
+    "target": "aarch64-apple-darwin",
+    "path": "backend/teamarness-generated-package-backend-aarch64-apple-darwin",
+    "size": 0,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }],
+  "ui": {
+    "entrypoint": { "path": "ui/index.js", "size": 0, "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+    "assets": [],
+    "contract": { "path": "ui/contract.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+  },
+  "capabilities": []
+}

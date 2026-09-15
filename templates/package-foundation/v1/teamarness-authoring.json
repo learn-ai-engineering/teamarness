@@ -1,0 +1,8 @@
+{
+  "templateVersion": 1,
+  "packageProcessProtocol": "1.0",
+  "uiHostVersion": 1,
+  "sdkSource": "vendored-from-teamarness-checkout",
+  "sdkUpgrade": "unsupported-in-place",
+  "requestNamespace": "__REQUEST_NAMESPACE__"
+}

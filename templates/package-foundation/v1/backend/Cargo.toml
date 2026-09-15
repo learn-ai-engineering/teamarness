@@ -1,0 +1,12 @@
+[package]
+name = "teamarness-generated-package-backend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+teamarness-package-protocol = { path = "../vendor/teamarness/package-protocol" }
+teamarness-package-sdk = { path = "../vendor/teamarness/package-sdk" }
+tokio.workspace = true

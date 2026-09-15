@@ -1,0 +1,10 @@
+[package]
+name = "teamarness-package-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+teamarness-package-protocol = { path = "../package-protocol" }
+tokio.workspace = true

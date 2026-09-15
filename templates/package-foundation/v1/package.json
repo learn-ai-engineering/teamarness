@@ -1,0 +1,13 @@
+{
+  "name": "teamarness-generated-package-project",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "workspaces": ["ui", "vendor/teamarness/package-ui-sdk"],
+  "scripts": {
+    "build": "cargo build --release --locked && npm --workspace generated-package-ui run build && node scripts/assemble-package.mjs",
+    "typecheck": "cargo check --workspace --locked && npm --workspace generated-package-ui run typecheck",
+    "lint": "npm --workspace generated-package-ui run lint",
+    "test": "cargo test --workspace --locked && npm --workspace generated-package-ui test"
+  }
+}
