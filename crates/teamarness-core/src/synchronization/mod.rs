@@ -10,6 +10,9 @@ pub(crate) mod p2panda_adapter;
 mod protection_control;
 mod scheduler;
 mod wakes;
+mod worker;
+
+pub(crate) use worker::SyncWorker;
 
 pub(crate) use network_handler::{
     LogSyncHandler, PackageSyncHandler, SyncBatch, SyncReceiver, encode_batch,

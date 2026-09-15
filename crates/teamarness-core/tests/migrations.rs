@@ -218,6 +218,15 @@ async fn migration_0006_adds_strict_immutable_journal_and_append_only_guards() {
         "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'immutable_%_no_%'", [], |row| row.get(0)
     ).unwrap();
     assert!(trigger_count >= 6);
+    let consumed_generation: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('durable_wakes')
+             WHERE name = 'consumed_generation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(consumed_generation, 1);
     drop(connection);
     fs::remove_dir_all(directory).unwrap();
 }
@@ -246,7 +255,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     for column in [
         "scope_id",
         "log_id",
@@ -319,7 +328,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(installation_count, 1);
 
     drop(connection);

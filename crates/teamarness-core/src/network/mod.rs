@@ -160,6 +160,11 @@ impl Network {
         package: String,
         peer: crate::PublicIdentity,
     ) -> Result<usize, OnboardingError> {
+        let _permit = self
+            .outbound
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OnboardingError::Overload)?;
         timeout(
             crate::synchronization::network_handler::SYNC_SESSION_TIMEOUT,
             crate::synchronization::network_handler::outbound_log_session(

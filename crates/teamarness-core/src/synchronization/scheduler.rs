@@ -50,6 +50,16 @@ impl RetryState {
         Duration::from_millis(250_u64.saturating_mul(1_u64 << shift)).min(Duration::from_secs(15))
     }
 
+    pub(crate) fn next_delay_jittered(&mut self) -> Duration {
+        let delay = self.next_delay();
+        let mut sample = [0_u8; 2];
+        let _ = getrandom::fill(&mut sample);
+        let jitter = u64::from(u16::from_be_bytes(sample)) % 251;
+        delay
+            .saturating_add(Duration::from_millis(jitter))
+            .min(Duration::from_secs(15))
+    }
+
     pub(crate) fn succeeded(&mut self) {
         self.failures = 0;
     }
@@ -129,6 +139,24 @@ mod tests {
         assert!(scheduler.next().is_none());
         scheduler.complete(first[0], false);
         assert_eq!(scheduler.next(), Some(identities[4]));
+    }
+
+    #[test]
+    fn twenty_five_members_rotate_without_exceeding_four_active_sessions() {
+        let identities = (1..=25).map(identity).collect::<Vec<_>>();
+        let mut scheduler = ReplicaScheduler::new(identities.clone());
+        let mut seen = Vec::new();
+        for _ in 0..identities.len() {
+            let peer = scheduler.next().expect("a queued peer");
+            seen.push(peer);
+            scheduler.complete(peer, false);
+        }
+        assert_eq!(seen.len(), identities.len());
+        assert_eq!(scheduler.active(), 0);
+        assert!(
+            seen.iter()
+                .all(|peer| seen.iter().filter(|other| *other == peer).count() == 1)
+        );
     }
 
     #[test]

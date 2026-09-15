@@ -550,6 +550,7 @@ pub struct CoreRuntime {
     state: Arc<Mutex<RuntimeState>>,
     clock: Arc<dyn Clock>,
     transport: Arc<crate::onboarding::transport::Transport>,
+    sync_worker: Arc<crate::synchronization::SyncWorker>,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -568,9 +569,9 @@ struct MembershipSubscriber {
 
 type RecordSubscriber = std::sync::mpsc::Sender<crate::RecordEvent>;
 
-struct RuntimeSyncReceiver {
-    state: Weak<Mutex<RuntimeState>>,
-    clock: Arc<dyn Clock>,
+pub(crate) struct RuntimeSyncReceiver {
+    pub(crate) state: Weak<Mutex<RuntimeState>>,
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
@@ -701,21 +702,21 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
 }
 
 pub(crate) struct RuntimeState {
-    connection: rusqlite::Connection,
+    pub(crate) connection: rusqlite::Connection,
     secret_key: iroh_base::SecretKey,
     display_name: String,
-    memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
+    pub(crate) memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
     subscribers: BTreeMap<WorkspaceId, Vec<MembershipSubscriber>>,
     record_subscribers: BTreeMap<(WorkspaceId, String), Vec<RecordSubscriber>>,
     next_subscriber_id: u64,
-    poisoned: bool,
+    pub(crate) poisoned: bool,
 }
 
 pub(crate) trait Clock: Send + Sync {
     fn now_unix_ms(&self) -> i64;
 }
 
-struct SystemClock;
+pub(crate) struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_unix_ms(&self) -> i64 {
@@ -825,11 +826,20 @@ impl CoreRuntime {
         .await;
         let transport = transport.map_err(CoreError::Onboarding)?;
         debug_assert_eq!(transport.endpoint_id(), secret_key.public());
+        // Recovery has completed before the worker is started. The worker owns
+        // wake consumption and scheduling, while all network awaits happen
+        // outside the runtime state mutex.
+        let sync_worker = crate::synchronization::SyncWorker::start(
+            Arc::downgrade(&state),
+            Arc::clone(&transport),
+            public_identity,
+        );
         Ok(Self {
             public_identity,
             state,
             clock,
             transport,
+            sync_worker,
         })
     }
 
@@ -1422,6 +1432,7 @@ impl CoreRuntime {
         {
             listeners.retain(|sender| sender.send(event.clone()).is_ok());
         }
+        self.sync_worker.wake();
         Ok(record)
     }
 
@@ -1458,6 +1469,7 @@ impl CoreRuntime {
         {
             listeners.retain(|sender| sender.send(event.clone()).is_ok());
         }
+        self.sync_worker.wake();
         Ok(record)
     }
 
@@ -1671,6 +1683,10 @@ impl CoreRuntime {
     ///
     /// Local identity, Workspace, and membership commands remain available.
     pub async fn shutdown(&self) -> Result<(), crate::OnboardingError> {
+        // Stop the scheduler and await every session before Router/Endpoint
+        // shutdown. This ordering prevents SQLite callbacks from racing the
+        // shared network teardown.
+        self.sync_worker.shutdown().await;
         self.transport.shutdown().await
     }
 
@@ -2084,6 +2100,7 @@ impl CoreRuntime {
             Ok(applied) if applied.accepted => {
                 let transition = Self::transition_from_applied(applied);
                 Self::publish_transition(&mut state, transition.clone());
+                self.sync_worker.cancel_peer(member);
                 Ok(transition)
             }
             Ok(_) => Err(MembershipError::AuthorizationRejected),
