@@ -3,6 +3,9 @@
   "packages": [
     {
       "directory": "packages/dev.teamarness.reference"
+    },
+    {
+      "directory": "packages/dev.teamarness.tutorial"
     }
   ]
 }

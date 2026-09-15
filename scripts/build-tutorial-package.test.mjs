@@ -31,9 +31,11 @@ test("build stages only the installation-local Tutorial Package Directory", asyn
     repositoryRoot: root,
     backendPath: join(root, "packages/tutorial/backend/fake"),
     skipBuilds: true,
+    skipUiBuild: true,
+    outputDirectory: join(root, "target/teamarness-packages/dev.teamarness.tutorial"),
   });
 
-  assert.equal(output, join(root, "target/teamarness-packages-local/dev.teamarness.tutorial"));
+  assert.equal(output, join(root, "target/teamarness-packages/dev.teamarness.tutorial"));
   assert.equal(await readFile(join(root, "packages/application-packages.v1.json"), "utf8"), '{"untouched":true}\n');
   const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
   assert.equal(manifest.identity, "dev.teamarness.tutorial");

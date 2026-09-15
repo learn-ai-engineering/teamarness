@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "dev.teamarness.desktop",
   "build": {
-    "beforeDevCommand": "npm run build:reference && npm run dev",
+    "beforeDevCommand": "npm run build:application-packages && npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build:reference && npm run build",
+    "beforeBuildCommand": "npm run build:application-packages && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -39,10 +39,12 @@
     ],
     "resources": {
       "../../../packages/application-packages.v1.json": "packages/application-packages.v1.json",
-      "../../../target/teamarness-packages/dev.teamarness.reference/": "packages/dev.teamarness.reference/"
+      "../../../target/teamarness-packages/dev.teamarness.reference/": "packages/dev.teamarness.reference/",
+      "../../../target/teamarness-packages/dev.teamarness.tutorial/": "packages/dev.teamarness.tutorial/"
     },
     "externalBin": [
-      "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package"
+      "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
+      "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package"
     ]
   }
 }

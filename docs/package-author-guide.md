@@ -1,6 +1,6 @@
 # Package author guide
 
-A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as an installation-local Package, then give the same declared bytes to the Teamarness application build.
+A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as an installation-local Package, then give the same declared bytes to the Teamarness application build. For a supported starter project, run `npm run create:package -- --output <directory> --identity <reverse-dns-id> --display-name <name>` from a Teamarness checkout. The generator creates a foundation outside the Teamarness workspaces and vendors the current Rust and TypeScript SDK source with exact lockfiles. Generated SDK copies have no supported in-place upgrade yet.
 
 Phase 3 supports `aarch64-apple-darwin`. It ships a Rust Backend SDK and a TypeScript UI SDK. The Package Process Protocol is language-neutral, but no other production Backend SDK is supported yet.
 
@@ -85,6 +85,10 @@ The initialization frame grants an absolute Package Data Directory. Your Backend
 A Package Backend is trusted native code. It has the current user's ambient filesystem, network, and process authority. Process supervision handles ordinary exits, deadlines, graceful shutdown, and conservative orphan cleanup. It is not a sandbox and does not contain hostile code or deliberately evasive descendants.
 
 A same-webview Package UI can access the Shell DOM and any Tauri command it knows. A Shadow Root limits style collisions only. It does not reduce DOM, JavaScript, network, or Tauri-command authority. Review both Backend and UI code before trusting a Package.
+
+## Bundled and local source kinds
+
+`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local and is admitted through the owner-only registration file. The Shell labels these sources `Bundled` and `Local` from catalog source data. These labels are not trust verdicts and do not imply Workspace enablement, synchronization, sharing, networking, or collaboration.
 
 ## Local development loop
 

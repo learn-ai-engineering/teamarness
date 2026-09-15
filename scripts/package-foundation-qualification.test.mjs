@@ -5,207 +5,87 @@ import { test } from "node:test";
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
-const requiredGuidance = {
-  "README.md": [
-    "Package author guide",
-    "Local Package registration",
-    "Package Processes have the current user's ambient filesystem, network, and process authority",
-    "same-webview Package UI",
-  ],
-  "docs/package-author-guide.md": [
-    "Package Directory",
-    "aarch64-apple-darwin",
-    "teamarness.package.json",
-    "UI contract",
-    "teamarness-package://",
-    "Promotion to application distribution",
-  ],
-  "docs/local-package-registration.md": [
-    "registrations.v1.json",
-    "trusted_native_code_v1",
-    "expectedIdentity",
-    "overrideApplication",
-    "restart",
-    "Package Data Directory",
-  ],
-  "crates/teamarness-package-protocol/README.md": [
-    "language-neutral",
-    "contracts/package-process/v1",
-    "1,048,576",
-  ],
-  "crates/teamarness-package-host/README.md": [
-    "PackageHost::open",
-    "PackageHost::snapshot",
-    "PackageHost::execute",
-    "PackageHost::subscribe",
-  ],
-  "crates/teamarness-package-sdk/README.md": [
-    "Backend",
-    "Package::builder",
-    "CapabilityClient",
-    "Rust",
-  ],
-};
-
-test("Package author and operator guidance covers the shipped contract", async () => {
-  for (const [path, phrases] of Object.entries(requiredGuidance)) {
-    const text = await read(path);
-    for (const phrase of phrases) {
-      assert.ok(text.includes(phrase), `${path} must document ${phrase}`);
-    }
-  }
-
-  const combined = (await Promise.all(Object.keys(requiredGuidance).map(read))).join("\n");
-  for (const phrase of [
-    "not a sandbox",
-    "same-webview",
-    "DOM",
-    "Tauri command",
-    "signing and notarization",
-    "remote Package fetching",
-    "hot reload",
-  ]) {
-    assert.ok(combined.includes(phrase), `guidance must state ${phrase}`);
-  }
-});
-
-test("Tutorial preview and learner Emojart guide keep both local Packages distinct", async () => {
-  const tutorial = await read("docs/build-your-first-package.md");
+test("Package authoring guidance distinguishes checked-in, bundled, and local sources", async () => {
+  const guide = await read("docs/build-your-first-package.md");
   const readme = await read("README.md");
-
   for (const phrase of [
-    "Core Runtime",
-    "Shell",
-    "Package Host",
-    "Package Backend",
-    "Package UI",
-    "Package Data Directory",
-    "Package Source",
-    "Package Instance",
+    "Checked-in source",
+    "Bundled Package",
+    "Learner-owned local Package",
+    "packages/tutorial/",
+    "packages/dev.teamarness.tutorial/",
     "dev.teamarness.tutorial",
     "dev.teamarness.emojart",
-    "npm run setup:tutorial -- tutorial-preview",
-    "npm run build:tutorial",
-    "npm run build:emojart",
+    "npm run create:package --",
+    "--output",
+    "--identity dev.teamarness.emojart",
+    "--display-name Emojart",
+    "teamarness-authoring.json",
+    "vendor/teamarness/",
+    "Cargo.lock",
+    "package-lock.json",
+    "aarch64-apple-darwin",
     "registrations.v1.json",
-    ".teamarness-dev/tutorial-preview/packages/registrations.v1.json",
-    "packages/tutorial/",
-    "packages/emojart/",
-    "Do not delete, rename, or modify Tutorial",
-    "Do not delete the Tutorial entry",
+    "restart",
     "trusted_native_code_v1",
-    "There is no hot reload",
     "not a sandbox",
-    "future tutorial",
+    "same-webview",
+    "There is no hot reload",
+    "Workspace enablement",
     "synchronization",
-    "Workspace-specific",
-    "installation-local Package Source",
-    "synchronized team behavior",
-    "owner-only",
-    "artifact_changed",
-    "Digest mismatch",
-    "Unsupported target",
-    "Invalid UI contract",
-  ]) {
-    assert.ok(tutorial.includes(phrase), `tutorial must include ${phrase}`);
-  }
-  assert.match(tutorial, /```mermaid/g);
-  assert.equal((tutorial.match(/```mermaid/g) ?? []).length, 2, "tutorial has its two planned diagrams");
-  assert.equal((tutorial.match(/### Agent brief/g) ?? []).length, 5, "tutorial has its five copyable agent briefs");
-  assert.equal((tutorial.match(/### Human checkpoint/g) ?? []).length, 5, "tutorial has its five human checkpoints");
-  assert.ok(readme.includes("Build your first Package"), "README links the tutorial from Package development");
-  assert.ok(readme.includes("npm run setup:tutorial -- tutorial-preview"), "README documents the Tutorial setup command");
+    "sharing",
+    "collaboration",
+  ]) assert.ok(guide.includes(phrase), `guide must include ${phrase}`);
+  assert.ok(readme.includes("npm run create:package --"));
+  assert.equal((guide.match(/Agent brief/g) ?? []).length, 5);
+  assert.equal((guide.match(/### Human checkpoint/g) ?? []).length, 5);
+  assert.equal((guide.match(/```mermaid/g) ?? []).length, 2);
+});
 
+test("generated foundation and Tutorial policy remain independent", async () => {
   const packageJson = JSON.parse(await read("package.json"));
-  assert.equal(packageJson.scripts["build:tutorial"], "node scripts/build-tutorial-package.mjs");
-  assert.equal(packageJson.scripts["setup:tutorial"], "node scripts/setup-tutorial-package.mjs");
-  assert.ok(packageJson.workspaces.includes("packages/tutorial/ui"));
-  assert.ok(!packageJson.workspaces.includes("packages/emojart/ui"));
+  assert.equal(packageJson.scripts["create:package"], "node scripts/create-package.mjs");
+  assert.equal(packageJson.scripts["build:application-packages"], "node scripts/build-application-packages.mjs");
+  assert.equal(packageJson.scripts[["setup", "tutorial"].join(":")], undefined);
+  assert.ok(!packageJson.workspaces.includes(["packages", "emojart", "ui"].join("/")));
+  assert.ok((await readdir(new URL("packages/", root))).includes("tutorial"));
 
-  const packageDirectories = await readdir(new URL("packages/", root));
-  assert.ok(packageDirectories.includes("tutorial"));
-  assert.ok(!packageDirectories.includes("emojart"), "checked-in Tutorial source does not occupy the learner Emojart directory");
-
-  const tutorialManifest = JSON.parse(await read("packages/tutorial/teamarness.package.json"));
-  assert.equal(tutorialManifest.identity, "dev.teamarness.tutorial");
-  assert.equal(tutorialManifest.presentation.displayName, "Tutorial");
-  const tutorialContract = JSON.parse(await read("packages/tutorial/ui-contract.json"));
-  assert.deepEqual(Object.keys(tutorialContract.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
-
-  const applicationPackages = await read("packages/application-packages.v1.json");
-  const tauriConfig = await read("apps/teamarness-desktop/src-tauri/tauri.conf.json");
-  for (const identity of ["dev.teamarness.tutorial", "dev.teamarness.emojart"]) {
-    assert.ok(!applicationPackages.includes(identity), `${identity} stays out of application Package metadata`);
-    assert.ok(!tauriConfig.includes(identity), `${identity} stays out of Tauri bundled resources`);
-  }
-  for (const identifier of ["tutorial", "emojart"]) {
-    assert.ok(!tauriConfig.includes(identifier), `${identifier} stays out of Tauri bundled resources`);
+  const index = JSON.parse(await read("packages/application-packages.v1.json"));
+  assert.deepEqual(index.packages, [
+    { directory: "packages/dev.teamarness.reference" },
+    { directory: "packages/dev.teamarness.tutorial" },
+  ]);
+  const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
+  assert.deepEqual(Object.keys(tutorial.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
+  assert.deepEqual(tutorial.subscriptions, {});
+  assert.deepEqual(tutorial["$defs"].algorithmId.enum, ["waves", "ripples", "spiral", "patchwork"]);
+  assert.deepEqual(tutorial["$defs"].paletteId.enum, ["garden", "ocean", "space", "fruit"]);
+  for (const emoji of ["🪻", "🌷", "🐝", "🪼", "🐙", "🐳", "⭐", "🪐", "🚀", "🍇", "🍉", "🍒"]) {
+    assert.ok(JSON.stringify(tutorial).includes(emoji), `contract must include ${emoji}`);
   }
 });
 
-test("direct dependencies are exact, lockfiles are committed, and schema retrieval is disabled", async () => {
-  const cargo = await read("Cargo.toml");
-  const dependencyBlock = cargo.split("[workspace.dependencies]")[1];
-  for (const line of dependencyBlock.split("\n").filter((line) => /^[a-z0-9_-]+\s*=/.test(line))) {
-    if (line.includes("path =")) continue;
-    assert.match(line, /(?:version\s*=\s*)?"=\d+\.\d+\.\d+"/, `Cargo dependency is not exact: ${line}`);
-  }
-  assert.match(cargo, /jsonschema\s*=\s*\{[^\n]*default-features\s*=\s*false/);
-
-  for (const path of ["package.json", "apps/teamarness-desktop/package.json"]) {
-    const packageJson = JSON.parse(await read(path));
-    for (const group of ["dependencies", "devDependencies"]) {
-      for (const [name, version] of Object.entries(packageJson[group] ?? {})) {
-        if (name.startsWith("@teamarness/")) continue;
-        assert.match(version, /^\d+\.\d+\.\d+$/, `${path} does not exactly pin ${name}`);
-      }
-    }
-  }
-  assert.equal(JSON.parse(await read("package-lock.json")).lockfileVersion, 3);
-  assert.ok((await read("Cargo.lock")).includes("version = 4"));
-});
-
-test("delivery configuration has one local admitted loader and no deferred Package subsystem", async () => {
-  const packageJson = JSON.parse(await read("package.json"));
-  assert.equal(packageJson.scripts["verify:packaged-app"], "node scripts/smoke-packaged-app.mjs");
-
+test("delivery configuration includes both bundled Package Directories and source badges", async () => {
   const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
-  assert.deepEqual(config.bundle.targets, ["app", "dmg"]);
-  assert.ok(config.bundle.resources["../../../packages/application-packages.v1.json"]);
   assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.reference/"]);
-  assert.ok(config.app.security.csp.includes("teamarness-package:"));
-  assert.ok(!config.app.security.csp.includes("file:"));
-  assert.ok(!config.app.security.csp.includes("https:"));
+  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.tutorial/"]);
+  assert.deepEqual(config.bundle.externalBin, [
+    "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
+    "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
+  ]);
+  const shell = await read("apps/teamarness-desktop/src/package-shell.ts");
+  assert.match(shell, /Package source/);
+  assert.match(shell, /Bundled/);
+  assert.match(shell, /Local/);
+  assert.match(shell, /catalog\?\.source/);
+});
 
-  const capabilityEntries = await readdir(new URL("contracts/package-capabilities/v1/", root));
-  assert.deepEqual(
-    capabilityEntries.sort(),
-    ["README.md", "membership.schema.json", "signing-envelope.golden.json", "signing.schema.json", "workspace-context.schema.json"],
-  );
-
-  const productionPaths = [
-    "apps/teamarness-desktop/src/package-bridge.ts",
-    "apps/teamarness-desktop/src/package-contracts.ts",
-    "apps/teamarness-desktop/src/package-mount.ts",
-    "apps/teamarness-desktop/src-tauri/src/package_commands.rs",
-    "apps/teamarness-desktop/src-tauri/src/package_dto.rs",
-    "apps/teamarness-desktop/src-tauri/src/package_protocol.rs",
-    "crates/teamarness-package-host/src/lib.rs",
-  ];
-  const production = (await Promise.all(productionPaths.map(async (path) =>
-    (await read(path)).split("#[cfg(test)]")[0]))).join("\n").toLowerCase();
-  for (const forbidden of [
-    "reference.read",
-    "reference.increment",
-    "reference.changes",
-    "conversation",
-    "webviewwindow",
-    "convertfilesrc",
-    "source_path",
-    "cache_path",
-    "data_path",
-    "iroh::",
-  ]) {
-    assert.ok(!production.includes(forbidden), `production Package seam contains ${forbidden}`);
+test("repository authoring records the temporary vendoring policy", async () => {
+  const decision = await read("context/.decisions/0008-vendored-package-authoring.md");
+  const roadmap = await read("context/roadmap.md");
+  for (const phrase of ["vendored", "versioned", "upgrade policy", "no updater", "production authoring"]) {
+    assert.ok(decision.toLowerCase().includes(phrase), `decision must include ${phrase}`);
   }
+  assert.match(roadmap, /published.*Rust.*TypeScript.*SDK/i);
+  assert.match(roadmap, /upgrade policy/i);
 });

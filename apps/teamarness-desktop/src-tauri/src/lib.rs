@@ -365,16 +365,34 @@ mod tests {
             ))
         );
         assert_eq!(
-            config["bundle"]["externalBin"][0],
-            "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package"
+            resources.get("../../../target/teamarness-packages/dev.teamarness.reference/"),
+            Some(&serde_json::Value::String(
+                "packages/dev.teamarness.reference/".into()
+            ))
+        );
+        assert_eq!(
+            resources.get("../../../target/teamarness-packages/dev.teamarness.tutorial/"),
+            Some(&serde_json::Value::String(
+                "packages/dev.teamarness.tutorial/".into()
+            ))
+        );
+        assert_eq!(
+            config["bundle"]["externalBin"].as_array().unwrap(),
+            &[
+                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package".into()),
+                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package".into()),
+            ]
         );
         let index: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../packages/application-packages.v1.json"
         ))
         .unwrap();
         assert_eq!(
-            index["packages"][0]["directory"],
-            "packages/dev.teamarness.reference"
+            index["packages"],
+            serde_json::json!([
+                { "directory": "packages/dev.teamarness.reference" },
+                { "directory": "packages/dev.teamarness.tutorial" },
+            ])
         );
     }
 

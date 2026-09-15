@@ -1,87 +1,49 @@
 import { spawnSync } from "node:child_process";
-import { stat, writeFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  compareDeclaredPackageBytes,
-  copyPackageDirectory,
-  stagePackageDirectory,
-} from "./package-directory.mjs";
-
-export {
-  compareDeclaredPackageBytes,
-  copyPackageDirectory,
-  stagePackageDirectory,
-};
+import { stagePackageDirectory, verifyPackageDirectory } from "./package-directory.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 export const repositoryRoot = resolve(dirname(scriptPath), "..");
-const canonicalDirectory = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.reference");
-const canonicalLocalCopy = join(repositoryRoot, "target/teamarness-packages-local/dev.teamarness.reference");
 
-async function buildReferencePackage(arguments_) {
-  const options = parseArguments(arguments_);
-  let backendPath = options.backend;
-  if (!backendPath) {
-    run("cargo", ["build", "-p", "teamarness-reference-package", "--release", "--locked"]);
-    backendPath = join(repositoryRoot, "target/release/teamarness-reference-package");
+export async function buildReferencePackage({
+  repositoryRoot: root = repositoryRoot,
+  backendPath,
+  outputDirectory,
+  skipBuilds = false,
+  skipUiBuild = false,
+  version,
+} = {}) {
+  if (!outputDirectory) throw new Error("Reference Package outputDirectory is required");
+  let builtBackend = backendPath;
+  if (!skipBuilds) {
+    run(root, "cargo", ["build", "-p", "teamarness-reference-package", "--release", "--locked"]);
+    builtBackend = join(root, "target/release/teamarness-reference-package");
   }
-  if (!options.skipUiBuild) {
-    run("npm", ["--workspace", "@teamarness/reference-package-ui", "run", "build"]);
-  }
-  const backendDetails = await stat(backendPath);
-  if (!backendDetails.isFile()) throw new Error("Reference Package Backend was not built");
-  await stagePackageDirectory({
-    manifestPath: join(repositoryRoot, "packages/reference-package/teamarness.package.json"),
-    contractPath: join(repositoryRoot, "packages/reference-package/ui-contract.json"),
-    backendPath,
-    uiEntrypointPath: join(repositoryRoot, "packages/reference-package/ui/dist/index.js"),
-    uiAssets: [{
-      path: "ui/probe.svg",
-      sourcePath: join(repositoryRoot, "packages/reference-package/ui/dist/probe.svg"),
-    }],
-    outputDirectory: canonicalDirectory,
-    version: options.version,
+  if (!skipUiBuild) run(root, "npm", ["--workspace", "@teamarness/reference-package-ui", "run", "build"]);
+  if (!builtBackend || !(await stat(builtBackend)).isFile()) throw new Error("Reference Package Backend was not built");
+  const manifest = await stagePackageDirectory({
+    manifestPath: join(root, "packages/reference-package/teamarness.package.json"),
+    contractPath: join(root, "packages/reference-package/ui-contract.json"),
+    backendPath: builtBackend,
+    uiEntrypointPath: join(root, "packages/reference-package/ui/dist/index.js"),
+    uiAssets: [{ path: "ui/probe.svg", sourcePath: join(root, "packages/reference-package/ui/dist/probe.svg") }],
+    outputDirectory,
+    version,
   });
-  await writeFile(
-    join(repositoryRoot, "packages/application-packages.v1.json"),
-    `${JSON.stringify({ schemaVersion: 1, packages: [{ directory: "packages/dev.teamarness.reference" }] }, null, 2)}\n`,
-  );
-  const localCopy = options.copyTo ?? canonicalLocalCopy;
-  await copyPackageDirectory(canonicalDirectory, localCopy);
-  await compareDeclaredPackageBytes(canonicalDirectory, localCopy);
-  console.log("Reference Package staged with verified manifest-declared bytes.");
+  await verifyPackageDirectory(outputDirectory);
+  if (manifest.identity !== "dev.teamarness.reference") throw new Error(`Unexpected Reference Package Identity: ${manifest.identity}`);
+  return outputDirectory;
 }
 
-function parseArguments(arguments_) {
-  const options = { backend: undefined, copyTo: undefined, version: undefined, skipUiBuild: false };
-  for (let index = 0; index < arguments_.length; index += 1) {
-    const argument = arguments_[index];
-    if (argument === "--skip-ui-build") {
-      options.skipUiBuild = true;
-      continue;
-    }
-    if (!["--backend", "--copy-to", "--version"].includes(argument)) {
-      throw new Error(`Unknown reference Package build option: ${argument}`);
-    }
-    const value = arguments_[index += 1];
-    if (!value) throw new Error(`Missing value for ${argument}`);
-    if (argument === "--backend") options.backend = resolve(value);
-    if (argument === "--copy-to") options.copyTo = resolve(value);
-    if (argument === "--version") options.version = value;
-  }
-  return options;
-}
-
-function run(command, args) {
-  const result = spawnSync(command, args, { cwd: repositoryRoot, stdio: "inherit", shell: false });
+function run(root, command, args) {
+  const result = spawnSync(command, args, { cwd: root, stdio: "inherit", shell: false });
   if (result.status !== 0) throw new Error(`${command} failed with status ${result.status ?? "unknown"}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
-  buildReferencePackage(process.argv.slice(2)).catch((error) => {
-    console.error(error.message);
-    process.exitCode = 1;
-  });
+  buildReferencePackage({ outputDirectory: join(repositoryRoot, "target/teamarness-packages/dev.teamarness.reference") })
+    .catch((error) => { console.error(error.message); process.exitCode = 1; });
 }

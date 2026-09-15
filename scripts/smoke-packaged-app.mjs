@@ -4,12 +4,15 @@ import { chmod, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { compareDeclaredPackageBytes, repositoryRoot } from "./build-reference-package.mjs";
+import { repositoryRoot } from "./build-application-packages.mjs";
+import { compareDeclaredPackageBytes } from "./package-directory.mjs";
 
 const app = join(repositoryRoot, "target/release/bundle/macos/Teamarness.app");
 const executable = join(app, "Contents/MacOS/teamarness-desktop");
 const resources = join(app, "Contents/Resources/packages/dev.teamarness.reference");
+const tutorialResources = join(app, "Contents/Resources/packages/dev.teamarness.tutorial");
 const staged = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.reference");
+const stagedTutorial = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.tutorial");
 const dmg = join(repositoryRoot, "target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg");
 
 if (process.platform !== "darwin" || process.arch !== "arm64") {
@@ -19,6 +22,7 @@ if (process.platform !== "darwin" || process.arch !== "arm64") {
 await assertFile(executable);
 await assertFile(dmg);
 await compareDeclaredPackageBytes(staged, resources);
+await compareDeclaredPackageBytes(stagedTutorial, tutorialResources);
 await inspectDmg();
 
 const dataDirectory = await mkdtemp(join(tmpdir(), "teamarness-packaged-smoke-"));
@@ -60,6 +64,7 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
           end tell
         end tell
       `);
+      assert.equal(await registrationExists(dataDirectory), false, "fresh bundled Tutorial created a registration file");
     }
 
     backendPid = await waitFor(() => bundledBackend(childPid), "bundled Package Backend");
@@ -81,6 +86,15 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
         return name of first button of navigationGroup whose name starts with "Reference Package"
       end tell
     `, "reference Package navigation");
+    await waitForAppleScript(childPid, `
+      set appProcess to first process whose unix id is ${childPid}
+      tell appProcess
+        set appUi to UI element 1 of scroll area 1 of group 1 of group 1 of window 1
+        set packageGroup to group "Package interface" of group 1 of appUi
+        set navigationGroup to group 1 of packageGroup
+        return name of first button of navigationGroup whose name starts with "Tutorial"
+      end tell
+    `, "bundled Tutorial navigation");
     await runAppleScript(`
       tell application "System Events"
         set appProcess to first process whose unix id is ${childPid}
@@ -194,6 +208,15 @@ async function waitForExit(child, label) {
     new Promise((resolve) => child.once("exit", resolve)),
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 15_000)),
   ]);
+}
+
+async function registrationExists(dataDirectory) {
+  try {
+    await stat(join(dataDirectory, "packages/registrations.v1.json"));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function processExists(pid) {

@@ -8,6 +8,7 @@ import {
   compareDeclaredPackageBytes,
   copyPackageDirectory,
   stagePackageDirectory,
+  verifyPackageDirectory,
 } from "./package-directory.mjs";
 
 test("staging records every declared byte and copies a byte-identical local Package", async () => {
@@ -41,6 +42,7 @@ test("staging records every declared byte and copies a byte-identical local Pack
     uiEntrypointPath: join(source, "ui/index.js"),
     outputDirectory: output,
   });
+  await verifyPackageDirectory(output);
   await copyPackageDirectory(output, local);
   const comparison = await compareDeclaredPackageBytes(output, local);
   assert.equal(comparison.files.length, 3);

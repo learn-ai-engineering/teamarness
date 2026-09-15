@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export async function stagePackageDirectory({
@@ -51,6 +51,29 @@ export async function stagePackageDirectory({
     { mode: 0o600 },
   );
   return manifest;
+}
+
+export async function verifyPackageDirectory(directory) {
+  const manifestPath = join(directory, "teamarness.package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const declarations = [
+    ...manifest.backends.map(({ path, size, sha256 }) => ({ path, size, sha256, mode: 0o700 })),
+    { ...manifest.ui.entrypoint, mode: 0o600 },
+    ...manifest.ui.assets.map(({ path, size, sha256 }) => ({ path, size, sha256, mode: 0o600 })),
+    { ...manifest.ui.contract, size: undefined, mode: 0o600 },
+  ];
+  for (const declaration of declarations) {
+    const path = join(directory, declaration.path);
+    const details = await lstat(path);
+    if (!details.isFile() || details.isSymbolicLink()) throw new Error(`declared path is not a regular file: ${declaration.path}`);
+    const bytes = await readFile(path);
+    if (declaration.size !== undefined && declaration.size !== bytes.length) throw new Error(`declared size mismatch: ${declaration.path}`);
+    if (declaration.sha256 !== digest(bytes) || declaration.sha256 !== declaration.sha256.toLowerCase()) throw new Error(`declared digest mismatch: ${declaration.path}`);
+    if (process.platform !== "win32" && (details.mode & 0o777) !== declaration.mode) throw new Error(`declared mode mismatch: ${declaration.path}`);
+  }
+  const manifestDetails = await stat(manifestPath);
+  if (process.platform !== "win32" && (manifestDetails.mode & 0o777) !== 0o600) throw new Error("manifest mode mismatch");
+  return { identity: manifest.identity, files: declarations.map(({ path }) => path) };
 }
 
 export async function copyPackageDirectory(source, destination) {

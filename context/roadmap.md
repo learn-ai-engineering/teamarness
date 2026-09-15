@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phase 3, Package Foundation, is complete and is the current implementation baseline. Phase 4, Conversations Package, is in progress.
+The VRS intent tree and accepted architecture decisions are established. Package Foundation implementation is the current baseline; external Package authoring remains foundation-only while SDK publication policy is deferred. Phase 4, Conversations Package, is in progress.
 
 ## Phases
 
@@ -39,6 +39,8 @@ Completed on 2026-09-14. The Tauri Shell now mounts Package UIs, applies Workspa
 **Outcome:** The desktop shell discovers, validates, mounts, activates, recovers, and tears down the same reference package from bundled and configured local sources through one host contract. The documented path from a personal development package to a package shipped with Teamarness does not require package integration code to be rewritten.
 
 **Depends on:** Phase 2.
+
+**External authoring condition:** production Package authoring requires published, versioned Rust and TypeScript SDK artifacts plus a supported generated-project upgrade policy. Vendored foundation projects are not upgraded in place, and no updater is provided.
 
 ### Phase 4 - Conversations Package (in progress)
 

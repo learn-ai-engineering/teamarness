@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "$defs": {},
   "requests": {
     "__REQUEST_NAMESPACE__.read": {
       "request": { "type": "object", "properties": {}, "additionalProperties": false },

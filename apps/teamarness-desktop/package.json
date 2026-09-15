@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:reference": "node ../../scripts/build-reference-package.mjs",
+    "build:application-packages": "node ../../scripts/build-application-packages.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
