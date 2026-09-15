@@ -2616,6 +2616,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_remote_sequence_isolated_before_journal_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "teamarness-invalid-remote-operation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let a = CoreRuntime::open_with_clock_and_readiness(
+            CoreRuntimeConfig::new(root.join("a")),
+            Box::new(SystemClock),
+            true,
+        )
+        .await
+        .unwrap();
+        let workspace = a.create_workspace("Invalid remote").unwrap();
+        let invitation = a
+            .create_workspace_invitation_for_test(
+                workspace.id(),
+                1,
+                SystemClock.now_unix_ms().saturating_add(60_000),
+            )
+            .unwrap();
+        let b = CoreRuntime::open_with_clock_and_readiness(
+            CoreRuntimeConfig::new(root.join("b")),
+            Box::new(SystemClock),
+            true,
+        )
+        .await
+        .unwrap();
+        b.join_workspace(&invitation).await.unwrap();
+        let package = "teamarness.test";
+        a.append_record(workspace.id(), package, "message.post", b"seed")
+            .unwrap();
+        let grant = a
+            .export_protection_grant(workspace.id(), package, b.public_identity())
+            .unwrap();
+        b.import_protection_grant(workspace.id(), package, &grant)
+            .unwrap();
+        let record = b
+            .append_record(workspace.id(), package, "message.post", b"remote")
+            .unwrap();
+        let secret = b.state.lock().unwrap().secret_key.to_bytes();
+        let key = p2panda_core::SigningKey::from_bytes(&secret);
+        let operation = p2panda_core::Operation::from_parts(
+            p2panda_core::Header::<()>::builder()
+                .body(record.sealed_record())
+                .seq_num(1)
+                .backlink(Some(p2panda_core::Hash::from_bytes([7; 32])))
+                .build(&key, ()),
+            Some(p2panda_core::Body::from_bytes(record.sealed_record())),
+        );
+        let before = {
+            let state = a.state.lock().unwrap();
+            (
+                state
+                    .connection
+                    .query_row::<i64, _, _>(
+                        "SELECT COUNT(*) FROM immutable_operations",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                state
+                    .connection
+                    .query_row::<i64, _, _>("SELECT COUNT(*) FROM p2panda_operations", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap(),
+            )
+        };
+        let receiver = RuntimeSyncReceiver {
+            state: Arc::downgrade(&a.state),
+            clock: Arc::new(SystemClock),
+        };
+        assert!(
+            crate::synchronization::SyncReceiver::receive_operation(
+                &receiver,
+                b.public_identity(),
+                workspace.id(),
+                package,
+                operation,
+            )
+            .is_err()
+        );
+        let after = {
+            let state = a.state.lock().unwrap();
+            (
+                state
+                    .connection
+                    .query_row::<i64, _, _>(
+                        "SELECT COUNT(*) FROM immutable_operations",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                state
+                    .connection
+                    .query_row::<i64, _, _>("SELECT COUNT(*) FROM p2panda_operations", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap(),
+            )
+        };
+        assert_eq!(before, after);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        drop(a);
+        drop(b);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_clock_is_injected_without_entering_the_public_configuration() {
         let calls = Arc::new(AtomicU64::new(0));
         let directory =

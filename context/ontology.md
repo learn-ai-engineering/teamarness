@@ -37,6 +37,8 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Host** | The Teamarness boundary that operates Package Instances and routes Package Process, data-directory, Semantic Capability, and UI contracts without product-specific branches |
 | **Semantic Capability** | A versioned, typed interface through which a Package uses Teamarness-owned authority or generic behavior without receiving host secrets or resources |
 | **Synchronization Capability** | A Package-scoped Semantic Capability that uses Core Runtime-owned replication and transport machinery for Package-defined records. The Package still owns its schemas, projections, and domain policy |
+| **Synchronization Projection** | Core's private authenticated P2Panda operation view of a Teamarness semantic record. It supplies bounded LogSync ranges without replacing `RecordId`, `OrderKey`, or the Installation-local `Cursor` |
+| **Durable Wake** | A coalesced Core persistence marker that records synchronization work needing a later bounded session, including after restart |
 | **Package Identity** | The stable identifier of one Package across versions, Package Sources, distributions, and Package Instances |
 | **Package Manifest** | The Package-owned declaration that binds a Package Identity to its compatibility requirements, entrypoints, and consumed Semantic Capabilities |
 | **Package Backend** | The part of a Package that executes its domain behavior, policy, projections, and background work |

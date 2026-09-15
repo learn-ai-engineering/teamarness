@@ -1395,6 +1395,9 @@ pub(crate) fn insert_remote_operation(
     package: &str,
     operation: &Operation<()>,
 ) -> Result<ImmutableRecord, SynchronizationError> {
+    // Validate the complete P2Panda operation before touching the Teamarness
+    // journal. In particular, an occupied sequence or backlink conflict must
+    // not leave behind a sealed record that recovery cannot project.
     p2panda_core::operation::validate_operation(operation)
         .map_err(|_| SynchronizationError::CorruptRecord)?;
     let payload = operation
@@ -1402,77 +1405,219 @@ pub(crate) fn insert_remote_operation(
         .as_ref()
         .ok_or(SynchronizationError::CorruptRecord)?
         .to_bytes();
-    let record = insert_remote(conn, workspace, package, &payload)?;
-    if operation.header.verifying_key.as_bytes() != record.author.as_bytes() {
+    let scope = scope_digest(package, workspace);
+    let sealed =
+        SealedRecordV1::decode(&payload).map_err(|_| SynchronizationError::CorruptRecord)?;
+    if sealed.scope_digest != scope {
+        return Err(SynchronizationError::WrongScope);
+    }
+    let (journal, key, content_key_id): ([u8; 16], [u8; 32], [u8; 32]) = conn
+        .query_row(
+            "SELECT journal_id,content_key,content_key_id FROM sync_scopes WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    row.get::<_, Vec<u8>>(1)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    row.get::<_, Vec<u8>>(2)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| storage_error())?
+        .ok_or(SynchronizationError::RuntimeUnavailable)?;
+    if sealed.content_key_id != content_key_id {
+        return Err(SynchronizationError::RuntimeUnavailable);
+    }
+    let protector = P2pandaRecordProtection {
+        package_identity: package.to_owned(),
+        workspace_id: workspace,
+        content_key: key,
+    };
+    let signed = protector
+        .open(&sealed)
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    if operation.header.verifying_key.as_bytes() != signed.author.as_bytes() {
         return Err(SynchronizationError::CorruptRecord);
     }
-    let scope = scope_digest(package, workspace);
-    let operation_id = RecordId::digest(&payload);
+    let record_id = RecordId::digest(&signed.canonical_bytes());
+    if record_id != sealed.record_id {
+        return Err(SynchronizationError::CorruptRecord);
+    }
+    let teamarness_operation_id = RecordId::digest(&payload);
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| storage_error())?;
     let existing: Option<Vec<u8>> = transaction
         .query_row(
-            "SELECT operation_id FROM p2panda_operations WHERE operation_id=?1",
+            "SELECT teamarness_operation_id FROM p2panda_operations WHERE operation_id=?1",
             [operation.hash.as_bytes().as_slice()],
             |row| row.get(0),
         )
         .optional()
         .map_err(|_| storage_error())?;
-    if existing.is_none() {
-        let expected = transaction
+    if let Some(existing) = existing {
+        if existing != teamarness_operation_id.as_bytes() {
+            return Err(SynchronizationError::CorruptRecord);
+        }
+        transaction
+            .commit()
+            .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
+        return record_from_row((
+            record_id.as_bytes().as_slice(),
+            sealed.order_key.as_bytes().as_slice(),
+            signed.author.as_bytes(),
+            &signed.purpose,
+            signed.signature.to_bytes().as_slice(),
+            &signed.canonical,
+            &payload,
+        ));
+    }
+    let expected = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(author_sequence),-1)+1 FROM p2panda_operations
+             WHERE scope_id=?1 AND author_public_identity=?2",
+            rusqlite::params![scope.as_slice(), operation.header.verifying_key.as_bytes()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| storage_error())?;
+    if i64::from(operation.header.seq_num) != expected {
+        return Err(SynchronizationError::CorruptRecord);
+    }
+    let expected_backlink: Option<Vec<u8>> = if operation.header.seq_num == 0 {
+        None
+    } else {
+        transaction
             .query_row(
-                "SELECT COALESCE(MAX(author_sequence),-1)+1 FROM p2panda_operations
-                 WHERE scope_id=?1 AND author_public_identity=?2",
-                rusqlite::params![scope.as_slice(), operation.header.verifying_key.as_bytes()],
-                |row| row.get::<_, i64>(0),
+                "SELECT operation_id FROM p2panda_operations
+                 WHERE scope_id=?1 AND author_public_identity=?2 AND author_sequence=?3",
+                rusqlite::params![
+                    scope.as_slice(),
+                    operation.header.verifying_key.as_bytes(),
+                    i64::from(operation.header.seq_num - 1),
+                ],
+                |row| row.get(0),
             )
-            .map_err(|_| storage_error())?;
-        if i64::from(operation.header.seq_num) != expected {
-            return Err(SynchronizationError::CorruptRecord);
-        }
-        let expected_backlink: Option<Vec<u8>> = if operation.header.seq_num == 0 {
-            None
-        } else {
-            transaction
-                .query_row(
-                    "SELECT operation_id FROM p2panda_operations
-                     WHERE scope_id=?1 AND author_public_identity=?2 AND author_sequence=?3",
-                    rusqlite::params![
-                        scope.as_slice(),
-                        operation.header.verifying_key.as_bytes(),
-                        i64::from(operation.header.seq_num - 1),
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|_| storage_error())?
-        };
-        let actual_backlink = operation
-            .header
-            .backlink
-            .map(|value| value.as_bytes().to_vec());
-        if expected_backlink != actual_backlink {
-            return Err(SynchronizationError::CorruptRecord);
-        }
-        let sealed =
-            SealedRecordV1::decode(&payload).map_err(|_| SynchronizationError::CorruptRecord)?;
-        operation_store::insert_remote(
-            &transaction,
-            scope,
-            operation_id,
-            record.record_id,
-            record.order_key,
-            operation,
-            &record.purpose,
-            sealed.content_key_id,
+            .optional()
+            .map_err(|_| storage_error())?
+    };
+    let actual_backlink = operation
+        .header
+        .backlink
+        .map(|value| value.as_bytes().to_vec());
+    if expected_backlink != actual_backlink {
+        return Err(SynchronizationError::CorruptRecord);
+    }
+    // All Teamarness rows and the P2Panda projection share this transaction.
+    // An invalid projection therefore rolls back the accepted record too.
+    transaction
+        .execute(
+            "INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')",
+            rusqlite::params![
+                teamarness_operation_id.as_bytes().as_slice(),
+                scope.as_slice(),
+                record_id.as_bytes().as_slice(),
+                sealed.order_key.as_bytes().as_slice(),
+                signed.author.as_bytes(),
+                i64::from(operation.header.seq_num),
+                payload.as_slice(),
+                Vec::<u8>::new(),
+                sealed.order_key.height(),
+            ],
         )
         .map_err(|_| SynchronizationError::CorruptRecord)?;
-    }
+    operation_store::insert_remote(
+        &transaction,
+        scope,
+        teamarness_operation_id,
+        record_id,
+        sealed.order_key,
+        operation,
+        &signed.purpose,
+        sealed.content_key_id,
+    )
+    .map_err(|_| SynchronizationError::CorruptRecord)?;
+    transaction
+        .execute(
+            "INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                record_id.as_bytes().as_slice(),
+                scope.as_slice(),
+                signed.purpose,
+                Hash::digest(&signed.canonical).as_bytes().as_slice(),
+                signed.signature.to_bytes().as_slice(),
+                payload.as_slice(),
+            ],
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    transaction
+        .execute(
+            "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
+            rusqlite::params![
+                record_id.as_bytes().as_slice(),
+                scope.as_slice(),
+                payload.as_slice()
+            ],
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    transaction
+        .execute(
+            "INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id)
+             VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                scope.as_slice(),
+                signed.author.as_bytes(),
+                signed.purpose,
+                Hash::digest(&signed.canonical).as_bytes().as_slice(),
+                record_id.as_bytes().as_slice(),
+            ],
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    transaction
+        .execute(
+            "INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id)
+             VALUES(?1,?2,?3)
+             ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id",
+            rusqlite::params![scope.as_slice(), signed.author.as_bytes(), teamarness_operation_id.as_bytes().as_slice()],
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    transaction
+        .execute(
+            "INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms)
+             VALUES(?1,?2,?3,0)",
+            rusqlite::params![
+                scope.as_slice(),
+                journal.as_slice(),
+                record_id.as_bytes().as_slice()
+            ],
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    transaction
+        .execute(
+            "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
+            [scope.as_slice()],
+        )
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
     transaction
         .commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-    Ok(record)
+    record_from_row((
+        record_id.as_bytes().as_slice(),
+        sealed.order_key.as_bytes().as_slice(),
+        signed.author.as_bytes(),
+        &signed.purpose,
+        signed.signature.to_bytes().as_slice(),
+        &signed.canonical,
+        &payload,
+    ))
 }
 
 pub(crate) fn records_for_replication(

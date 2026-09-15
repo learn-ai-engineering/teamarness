@@ -27,7 +27,7 @@ The public API supports:
 - joining an invited Workspace through authenticated Iroh transport and returning owned `WorkspaceSummary` and `MembershipSnapshot` values only after atomic local import;
 - recovering the same committed admission when response delivery is interrupted, including after invitation expiry while that Installation remains current;
 - reading the current membership snapshot and content-derived `MembershipVersion`;
-- requesting a finite bounded immutable-record reconciliation with a current peer through the shared Core network;
+- requesting a finite bounded immutable-record reconciliation with a current peer through the shared Core network; the production path uses a private P2Panda operation projection and LogSync, while the public capability remains semantic and package-neutral;
 - revoking an admitted member;
 - querying declared-time membership history; and
 - catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor.
@@ -44,6 +44,12 @@ Low-level token issuance, claim creation, and redemption were intentionally remo
 
 `CoreRuntime::was_member` reports authenticated **author-declared event time**. Admission is inclusive and revocation is exclusive at their signed authored milliseconds. Late or backdated operations can revise an earlier answer after synchronization. Never use this historical query to authorize a write; security-sensitive work must use current membership and its `MembershipVersion`.
 
+## Generic synchronization foundation
+
+The immutable-record capability is generic: Packages provide bounded canonical bytes and purposes, while Core owns signing, sealed persistence, membership gates, duplicate handling, ordering, cursors, peer reconciliation, and secret custody. Each accepted sealed record has a private authenticated P2Panda projection for production LogSync. Teamarness semantic rows and the projection commit together; an invalid or out-of-order remote operation is rejected before it can leave a partial journal row. Duplicate delivery is idempotent.
+
+Synchronization wakes are durable and coalesced. A private Core worker schedules at most four finite sessions, resumes work after restart, and is awaited before the shared Router and Endpoint shut down. No P2Panda, Iroh, SQLite, endpoint, or raw key type crosses the Package boundary.
+
 ## Database ownership and recovery
 
 A runtime owns one `core.sqlite3` database beneath its private data directory. That database contains the installation identity, workspace creation state, immutable canonical membership envelopes, invitation spends, derived snapshots, membership versions, epochs, and transition evidence. Consumers must not open or mutate it while a runtime is active.
@@ -54,7 +60,7 @@ Workspace creation records generated identity and signed genesis material once, 
 
 The Core Runtime does not provide:
 
-- unbounded synchronization sessions: package-sync batches are finite, authenticated, and bounded to 4,096 operations and 64 MiB;
+- unbounded synchronization sessions: production LogSync sessions are finite and bounded to 4,096 operations, 64 MiB, and 30 seconds;
 - distributed invitation-spend coordination across managers or databases;
 - a second-manager path, promotion, demotion, arbitrary access levels, nested groups, or re-admission after revocation;
 - multi-manager conflict fixtures (mutual manager removal and dependent transitive invalidation are deferred until a supported second-manager path exists);

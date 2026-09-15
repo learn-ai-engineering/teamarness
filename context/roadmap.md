@@ -42,11 +42,11 @@ Completed on 2026-09-14. The Tauri Shell now mounts Package UIs, applies Workspa
 
 **External authoring condition:** production Package authoring requires published, versioned Rust and TypeScript SDK artifacts plus a supported generated-project upgrade policy. Vendored foundation projects are not upgraded in place, and no updater is provided.
 
-### Phase 4 - Conversations Package (in progress)
+### Phase 4 - Conversations Package foundation (Core complete; Package work pending)
 
-Started on 2026-09-14. The Conversations domain is the first real Package. It owns Channels, signed Markdown Messages, Channel Membership, conversation keys, local schemas and projections, offline behavior, unread state, and UI. It consumes Canonical Membership as an eligibility ceiling. Phase 4 adds the first generic Package-scoped Synchronization Capability for the reusable Iroh transport and replication machinery required by Conversations.
+Started on 2026-09-14. The Conversations domain is the first real Package, but its implementation waits until the generic Core capability is qualified. Core now owns the first generic Package-scoped Synchronization Capability: a durable, bounded immutable-record journal with production LogSync, authenticated sealed persistence, membership gates, durable wakes, and awaited lifecycle. Conversations will own Channels, signed Markdown Messages, Channel Membership, conversation keys, local schemas and projections, offline behavior, unread state, and UI in the downstream Package phases.
 
-**Outcome:** Two peers on the same network exchange encrypted messages in a `#general` channel through the conversations package UI.
+**Outcome:** The generic Core foundation is qualified before downstream Package work; later phases will enable two peers to exchange encrypted messages in a `#general` channel through the Conversations Package UI.
 
 **Depends on:** Phase 3.
 
