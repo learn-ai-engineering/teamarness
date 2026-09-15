@@ -1,5 +1,108 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
+export const TEAMARNESS_THEME_TOKENS = Object.freeze([
+  "--teamarness-color-background",
+  "--teamarness-color-panel",
+  "--teamarness-color-text",
+  "--teamarness-color-text-muted",
+  "--teamarness-color-border",
+  "--teamarness-color-accent",
+  "--teamarness-color-danger",
+  "--teamarness-color-focus",
+  "--teamarness-font-body",
+  "--teamarness-font-mono",
+  "--teamarness-radius-control",
+  "--teamarness-radius-panel",
+] as const);
+
+export type TeamarnessThemeToken = (typeof TEAMARNESS_THEME_TOKENS)[number];
+
+const PACKAGE_UI_KIT_CSS = `
+  :host, :host * { box-sizing: border-box; }
+
+  .teamarness-control {
+    border: 1px solid var(--teamarness-color-border);
+    border-radius: var(--teamarness-radius-control);
+    background: var(--teamarness-color-panel);
+    color: var(--teamarness-color-text);
+    font-family: var(--teamarness-font-body);
+    padding: 0.55rem 0.8rem;
+  }
+  .teamarness-control--primary {
+    border-color: var(--teamarness-color-accent);
+    background: var(--teamarness-color-accent);
+    color: var(--teamarness-color-background);
+  }
+  .teamarness-control--secondary {
+    border-color: var(--teamarness-color-border);
+    background: var(--teamarness-color-panel);
+    color: var(--teamarness-color-text);
+  }
+  .teamarness-field { display: grid; gap: 0.35rem; color: var(--teamarness-color-text); }
+  .teamarness-input {
+    width: 100%;
+    border: 1px solid var(--teamarness-color-border);
+    border-radius: var(--teamarness-radius-control);
+    background: var(--teamarness-color-background);
+    color: var(--teamarness-color-text);
+    font: inherit;
+    padding: 0.55rem 0.65rem;
+  }
+  .teamarness-help { color: var(--teamarness-color-text-muted); }
+  .teamarness-validation { color: var(--teamarness-color-danger); font-family: var(--teamarness-font-mono); }
+  .teamarness-notice {
+    border: 1px solid var(--teamarness-color-border);
+    border-radius: var(--teamarness-radius-control);
+    background: var(--teamarness-color-panel);
+    color: var(--teamarness-color-text);
+    padding: 0.75rem;
+  }
+  .teamarness-notice--danger { border-color: var(--teamarness-color-danger); color: var(--teamarness-color-danger); }
+  .teamarness-panel {
+    border: 1px solid var(--teamarness-color-border);
+    border-radius: var(--teamarness-radius-panel);
+    background: var(--teamarness-color-panel);
+    color: var(--teamarness-color-text);
+    padding: 1rem;
+  }
+  .teamarness-stack { display: flex; flex-direction: column; gap: 0.75rem; }
+  .teamarness-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+  .teamarness-focus:focus-visible,
+  .teamarness-control:focus-visible,
+  .teamarness-input:focus-visible {
+    outline: 3px solid var(--teamarness-color-focus);
+    outline-offset: 2px;
+  }
+`;
+
+const installedKits = new WeakMap<ShadowRoot, { readonly style: HTMLStyleElement; users: number }>();
+
+export function installPackageUiKit(root: ShadowRoot): () => void {
+  let installation = installedKits.get(root);
+  if (installation === undefined) {
+    const style = root.ownerDocument.createElement("style");
+    style.setAttribute("data-teamarness-ui-kit", "");
+    style.textContent = PACKAGE_UI_KIT_CSS;
+    installation = { style, users: 0 };
+    installedKits.set(root, installation);
+    root.append(style);
+  }
+  installation.users += 1;
+
+  let cleaned = false;
+  return () => {
+    if (cleaned) return;
+    cleaned = true;
+    const current = installedKits.get(root);
+    if (current !== installation) return;
+    current.users -= 1;
+    if (current.users === 0) {
+      current.style.remove();
+      installedKits.delete(root);
+    }
+  };
+}
+
 export type PackageValue = null | boolean | number | string | readonly PackageValue[] | { readonly [key: string]: PackageValue };
 
 export type PackagePresentation = Readonly<{
@@ -69,7 +172,7 @@ export type PackageMountContext = Readonly<{
   package: PackagePresentation;
   workspace: WorkspacePresentation;
   uiHostVersion: number;
-  themeTokens: readonly string[];
+  themeTokens: readonly TeamarnessThemeToken[];
   client: PackageClient;
 }>;
 

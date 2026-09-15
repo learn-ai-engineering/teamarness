@@ -72,6 +72,12 @@ Build one UTF-8 ESM entrypoint of at most 8 MiB. Declare at most 64 static asset
 
 Export `mount(context)`. The context provides a fresh Shadow Root, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. Use `@teamarness/package-ui-sdk` for requests, cancellation, ordered subscriptions, and post-listener acknowledgement.
 
+### Theme and Package-owned composition
+
+The UI SDK's [Package UI theme and CSS kit guide](../packages/teamarness-package-ui-sdk/README.md) is authoritative for the exact 12 semantic token names and the optional class-based kit. The Shell defines token values on the mount ancestor. Use the tokens inside your Shadow Root so System, Light, and Dark changes inherit without a Package event.
+
+A Package owns its complete internal composition, including its Package-owned header, secondary navigation, forms, state feedback, and domain content. The Shell owns Workspace and Package selection, the mount, inherited token values, and generic recovery; do not copy Shell navigation into a Package. The optional `installPackageUiKit(root)` helper supplies only common controls, fields, validation, notices, panels, flow, and visible focus. Retain its cleanup callback and invoke it from your idempotent unmount function.
+
 The Shell loads admitted resources through `teamarness-package://`. The loader accepts only `GET` and `HEAD` for exact admitted paths. It rejects traversal, encoded separators, query selectors, stale tokens, undeclared files, changed cache bytes, and MIME changes. Responses disable sniffing and storage. Package code never receives the mount token or a source, cache, or data path.
 
 ## Capabilities and local data
@@ -96,7 +102,7 @@ A same-webview Package UI can access the Shell DOM and any Tauri command it know
 2. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`.
 3. Copy the directory outside the Teamarness repository if you want to test the real separate-source path.
 4. Follow [Local Package registration](local-package-registration.md). Use the manifest identity as `expectedIdentity`, accept the native-code risks, and restart Teamarness.
-5. Check the Shell's source, lifecycle, and generation values. Exercise requests, subscriptions, suspend, recover, dispose, restart, and data continuity.
+5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, suspend, recover, dispose, restart, and data continuity. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
 6. Rebuild in place when needed, then restart. There is no source watch or hot reload for Backend bytes.
 
 ## Promotion to application distribution

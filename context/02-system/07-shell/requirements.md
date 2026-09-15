@@ -16,7 +16,7 @@ Beginning in Phase 3, the Shell SHALL mount Package UIs in Tauri webviews. Each 
 
 ## TEAM.SYS.SHELL-R03 — Theming
 
-Beginning in Phase 3, the shell SHALL define workspace-level theme tokens as CSS custom properties on the package mount ancestor. Packages SHALL inherit theme tokens without receiving theme events. The shell SHALL NOT hard-code package-specific styles.
+Beginning in Phase 3, the Shell SHALL define Workspace-level theme tokens as CSS custom properties on the Package UI Mount ancestor. `@teamarness/package-ui-sdk` SHALL be the sole authority for the exact frozen token-name list and its derived TypeScript token-name type, and the Shell SHALL provide that shared list in every Package mount context. Packages SHALL inherit theme values without receiving theme events. The SDK MAY install its optional, class-scoped CSS kit inside a Package Shadow Root; the kit SHALL use only the public theme tokens, SHALL leave Package composition opt-in, and SHALL provide overlapping-safe idempotent cleanup. The Shell SHALL NOT hard-code Package-specific styles.
 
 ## TEAM.SYS.SHELL-R04 — Workspace Controls
 

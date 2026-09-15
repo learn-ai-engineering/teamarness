@@ -12,10 +12,30 @@ describe("reference Package UI", () => {
     expect(source).not.toContain("document.head");
   });
 
-  it("renders the generic Package and Workspace presentation fields", () => {
+  it("adopts the shared theme contract and optional UI kit", () => {
     const source = mount.toString();
-    for (const field of ["source", "trust", "lifecycle", "processGeneration", "workspace.name"]) {
-      expect(source).toContain(field);
+    expect(source).toContain("TEAMARNESS_THEME_TOKENS");
+    expect(source).toContain("installPackageUiKit");
+    expect(source).toContain("teamarness-control");
+    expect(source).toContain("teamarness-panel");
+  });
+
+  it("keeps qualification state while rendering only display-safe readiness labels", () => {
+    const source = mount.toString();
+    for (const label of ["Package UI", "Workspace", "Theme contract", "Membership access", "Signing round trip"]) {
+      expect(source).toContain(label);
+    }
+    for (const diagnostic of [
+      "package.identity",
+      "workspace.id",
+      "package.source",
+      "package.trust",
+      "package.lifecycle",
+      "package.processGeneration",
+      "membershipVersion",
+      "processGeneration",
+    ]) {
+      expect(source).not.toContain(diagnostic);
     }
   });
 });

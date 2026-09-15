@@ -3,9 +3,51 @@ import { describe, expect, it } from "vitest";
 import {
   createPackageClient,
   createTauriPackageTransport,
+  installPackageUiKit,
+  TEAMARNESS_THEME_TOKENS,
   type PackageTransport,
+  type TeamarnessThemeToken,
   type UiEvent,
 } from "./index";
+
+const EXPECTED_THEME_TOKENS = [
+  "--teamarness-color-background",
+  "--teamarness-color-panel",
+  "--teamarness-color-text",
+  "--teamarness-color-text-muted",
+  "--teamarness-color-border",
+  "--teamarness-color-accent",
+  "--teamarness-color-danger",
+  "--teamarness-color-focus",
+  "--teamarness-font-body",
+  "--teamarness-font-mono",
+  "--teamarness-radius-control",
+  "--teamarness-radius-panel",
+] as const satisfies readonly TeamarnessThemeToken[];
+
+function fakeShadowRoot(): ShadowRoot & { readonly children: HTMLElement[] } {
+  const children: HTMLElement[] = [];
+  const ownerDocument = {
+    createElement: () => {
+      const attributes = new Map<string, string>();
+      const element = {
+        textContent: "",
+        setAttribute: (name: string, value: string) => { attributes.set(name, value); },
+        hasAttribute: (name: string) => attributes.has(name),
+        remove: () => {
+          const index = children.indexOf(element as unknown as HTMLElement);
+          if (index >= 0) children.splice(index, 1);
+        },
+      };
+      return element as unknown as HTMLStyleElement;
+    },
+  };
+  return {
+    ownerDocument,
+    children,
+    append: (element: HTMLElement) => { children.push(element); },
+  } as unknown as ShadowRoot & { readonly children: HTMLElement[] };
+}
 
 function deferred(): { promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } {
   let resolve: () => void = () => {};
@@ -34,6 +76,48 @@ function fakeTransport(log: string[]): PackageTransport & {
   };
   return transport;
 }
+
+describe("Package presentation contract", () => {
+  it("publishes the exact frozen theme-token authority", () => {
+    expect(TEAMARNESS_THEME_TOKENS).toEqual(EXPECTED_THEME_TOKENS);
+    expect(Object.isFrozen(TEAMARNESS_THEME_TOKENS)).toBe(true);
+  });
+
+  it("installs one marked, class-scoped style and cleans up overlapping installers safely", () => {
+    const root = fakeShadowRoot();
+    const cleanupFirst = installPackageUiKit(root);
+    const cleanupSecond = installPackageUiKit(root);
+
+    expect(root.children).toHaveLength(1);
+    const style = root.children[0]!;
+    expect(style.hasAttribute("data-teamarness-ui-kit")).toBe(true);
+    for (const className of [
+      "teamarness-control",
+      "teamarness-control--primary",
+      "teamarness-control--secondary",
+      "teamarness-field",
+      "teamarness-input",
+      "teamarness-help",
+      "teamarness-validation",
+      "teamarness-notice",
+      "teamarness-notice--danger",
+      "teamarness-panel",
+      "teamarness-stack",
+      "teamarness-inline",
+      "teamarness-focus",
+    ]) {
+      expect(style.textContent).toContain(`.${className}`);
+    }
+    for (const token of TEAMARNESS_THEME_TOKENS) expect(style.textContent).toContain(`var(${token})`);
+
+    cleanupFirst();
+    cleanupFirst();
+    expect(root.children).toHaveLength(1);
+    cleanupSecond();
+    cleanupSecond();
+    expect(root.children).toHaveLength(0);
+  });
+});
 
 describe("mount-scoped Package client", () => {
   it("cancels a request through its mount without exposing another selector", async () => {

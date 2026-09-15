@@ -18,7 +18,7 @@ A Package SHALL access Teamarness-owned authority and generic behavior only thro
 
 ## TEAM.SYS.PKG-R04 — Backend and UI Boundary
 
-A Package Backend SHALL run as a self-contained executable in one host-supervised Package Process for each Package Instance. The versioned, typed Package Process Protocol SHALL be language-neutral and SHALL define handshake, lifecycle, requests, responses, events, cancellation, and shutdown without a Rust ABI or Rust type contract. Phase 3 SHALL ship a Rust Backend SDK and Rust reference Package. A Package UI SHALL be TypeScript web content mounted by the Shell in a Tauri webview. Package UI and Backend traffic SHALL use Package-owned typed contracts routed through the generic Tauri invoke and event bridge.
+A Package Backend SHALL run as a self-contained executable in one host-supervised Package Process for each Package Instance. The versioned, typed Package Process Protocol SHALL be language-neutral and SHALL define handshake, lifecycle, requests, responses, events, cancellation, and shutdown without a Rust ABI or Rust type contract. Phase 3 SHALL ship a Rust Backend SDK and Rust reference Package. A Package UI SHALL be TypeScript web content mounted by the Shell in a Tauri webview. Each Package UI SHALL own its header, secondary navigation, layout, and domain presentation inside its Shadow Root; shared Shell presentation support SHALL NOT take ownership of those structures. Package UI and Backend traffic SHALL use Package-owned typed contracts routed through the generic Tauri invoke and event bridge.
 
 ## TEAM.SYS.PKG-R05 — Storage Ownership and Isolation
 
@@ -26,7 +26,7 @@ The Package Host SHALL assign each Package Instance a durable Package Data Direc
 
 ## TEAM.SYS.PKG-R06 — Common SDK
 
-Packages from application, installation, and future Workspace registrations SHALL use the same Package Manifest, Package Process Protocol, lifecycle, Semantic Capabilities, UI contracts, data-directory contract, bridge, and theme contract. Phase 3 SHALL ship a Rust Backend SDK and TypeScript UI SDK but SHALL NOT require the Package Process Protocol to be implemented in Rust. Package Registration Scope and Package Trust policy MAY restrict discovery or execution but SHALL NOT create separate programming models.
+Packages from application, installation, and future Workspace registrations SHALL use the same Package Manifest, Package Process Protocol, lifecycle, Semantic Capabilities, UI contracts, data-directory contract, bridge, and theme contract. Phase 3 SHALL ship a Rust Backend SDK and TypeScript UI SDK but SHALL NOT require the Package Process Protocol to be implemented in Rust. The TypeScript UI SDK SHALL publish the exact frozen semantic token-name authority and MAY provide an optional framework-neutral, class-scoped CSS kit with overlapping-safe idempotent installation cleanup. Using the kit SHALL remain optional and SHALL NOT change Package ownership of its UI composition. Package Registration Scope and Package Trust policy MAY restrict discovery or execution but SHALL NOT create separate programming models.
 
 ## TEAM.SYS.PKG-R07 — Trust Boundary
 

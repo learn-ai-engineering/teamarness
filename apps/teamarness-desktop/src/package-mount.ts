@@ -1,21 +1,13 @@
 import {
   createPackageClient,
+  TEAMARNESS_THEME_TOKENS,
   type PackageMountContext,
   type PackageTransport,
   type PackageUiModule,
   type PackageUnmount,
+  type TeamarnessThemeToken,
 } from "@teamarness/package-ui-sdk";
 import type { OpenPackageMount, PackageInstanceKey } from "./package-contracts";
-
-export const THEME_TOKENS = Object.freeze([
-  "--teamarness-color-background",
-  "--teamarness-color-panel",
-  "--teamarness-color-text",
-  "--teamarness-color-accent",
-  "--teamarness-color-danger",
-  "--teamarness-font-body",
-  "--teamarness-radius-control",
-] as const);
 
 export interface PackageMountBridge {
   readonly transport: PackageTransport;
@@ -29,7 +21,7 @@ export interface PackageMountBridge {
 
 export type PackageMountDomLease = Readonly<{
   root: ShadowRoot;
-  setThemeTokens(names: readonly string[]): void;
+  setThemeTokens(names: readonly TeamarnessThemeToken[]): void;
   remove(): void;
 }>;
 
@@ -104,7 +96,7 @@ export class PackageMountController {
     await this.current?.unmount();
     const opened = await this.bridge.openMount(instance);
     const domLease = this.dom.create(target);
-    domLease.setThemeTokens(THEME_TOKENS);
+    domLease.setThemeTokens(TEAMARNESS_THEME_TOKENS);
     const moduleUrl = resourceUrl(opened);
     let packageUnmount: PackageUnmount = () => undefined;
     let closed = false;
@@ -156,7 +148,7 @@ export class PackageMountController {
         package: Object.freeze({ ...opened.loader.package }),
         workspace: Object.freeze({ ...opened.loader.workspace }),
         uiHostVersion: opened.loader.uiHostVersion,
-        themeTokens: THEME_TOKENS,
+        themeTokens: TEAMARNESS_THEME_TOKENS,
         client: scopedClient.client,
       });
       packageUnmount = await module.mount(context);

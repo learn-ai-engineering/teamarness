@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { PackageMountContext, PackageTransport } from "@teamarness/package-ui-sdk";
+import {
+  TEAMARNESS_THEME_TOKENS,
+  type PackageMountContext,
+  type PackageTransport,
+} from "@teamarness/package-ui-sdk";
 import type { OpenPackageMount, PackageInstanceKey } from "./package-contracts";
-import { PackageMountController, THEME_TOKENS, type PackageMountBridge, type PackageMountDom } from "./package-mount";
+import { PackageMountController, type PackageMountBridge, type PackageMountDom } from "./package-mount";
 
 const instance: PackageInstanceKey = {
   packageIdentity: "com.example.fixture",
@@ -82,7 +86,8 @@ describe("generic Package UI mount", () => {
     });
     await controller.mount(instance, {});
     expect(loadedUrl).toBe(`teamarness-package://localhost/${"1".repeat(32)}/ui/index.js`);
-    expect(test.tokens).toEqual([[...THEME_TOKENS]]);
+    expect(test.tokens).toEqual([[...TEAMARNESS_THEME_TOKENS]]);
+    expect(test.contexts[0]?.themeTokens).toBe(TEAMARNESS_THEME_TOKENS);
     expect(test.contexts[0]).toMatchObject({
       package: {
         identity: instance.packageIdentity,

@@ -64,6 +64,43 @@ test("Package authoring guidance follows the local Package development path", as
   assert.equal((guide.match(/```mermaid/g) ?? []).length, 2);
 });
 
+test("Package UI guidance publishes every theme token and opt-in kit class", async () => {
+  const sdk = await read("packages/teamarness-package-ui-sdk/README.md");
+  for (const token of [
+    "--teamarness-color-background",
+    "--teamarness-color-panel",
+    "--teamarness-color-text",
+    "--teamarness-color-text-muted",
+    "--teamarness-color-border",
+    "--teamarness-color-accent",
+    "--teamarness-color-danger",
+    "--teamarness-color-focus",
+    "--teamarness-font-body",
+    "--teamarness-font-mono",
+    "--teamarness-radius-control",
+    "--teamarness-radius-panel",
+  ]) {
+    assert.ok(sdk.includes(token), `UI SDK guidance must document ${token}`);
+  }
+  for (const className of [
+    ".teamarness-control",
+    ".teamarness-control--primary",
+    ".teamarness-control--secondary",
+    ".teamarness-field",
+    ".teamarness-input",
+    ".teamarness-help",
+    ".teamarness-validation",
+    ".teamarness-notice",
+    ".teamarness-notice--danger",
+    ".teamarness-panel",
+    ".teamarness-stack",
+    ".teamarness-inline",
+    ".teamarness-focus",
+  ]) {
+    assert.ok(sdk.includes(className), `UI SDK guidance must document ${className}`);
+  }
+});
+
 test("generated foundation and Tutorial policy remain independent", async () => {
   const packageJson = JSON.parse(await read("package.json"));
   const agents = await read("templates/package-foundation/v1/AGENTS.md");
