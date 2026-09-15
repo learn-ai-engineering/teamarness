@@ -7,7 +7,7 @@ use serde::{
 };
 use serde_json::{Map, Number, Value};
 
-use crate::{MAX_FRAME_BYTES, MAX_WRITER_BYTES};
+use crate::{MAX_DECODED_FRAME_BYTES, MAX_FRAME_BYTES, MAX_WRITER_BYTES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum FrameKind {
@@ -207,6 +207,12 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame, ProtocolError> {
     let Value::Object(fields) = value.0 else {
         return Err(ProtocolError::new("malformed_frame"));
     };
+    let decoded_size = serde_json::to_vec(&Value::Object(fields.clone()))
+        .map_err(|_| ProtocolError::new("malformed_frame"))?
+        .len();
+    if decoded_size > MAX_DECODED_FRAME_BYTES {
+        return Err(ProtocolError::new("frame_too_large"));
+    }
     let kind = fields
         .get("kind")
         .and_then(Value::as_str)

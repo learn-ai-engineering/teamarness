@@ -215,6 +215,59 @@ async fn routes_scoped_workspace_membership_and_signing_calls() {
 }
 
 #[tokio::test]
+async fn immutable_record_capability_appends_and_opens_through_core() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let appended = call(
+        &host,
+        mount.clone(),
+        "record-append",
+        capability(
+            "teamarness.synchronization.immutable-record-log",
+            "append",
+            object([
+                ("purpose", PackageValue::String("message.post".into())),
+                ("canonical", PackageValue::String("aGVsbG8".into())),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        appended.get("durability"),
+        Some(&PackageValue::String("committed".into()))
+    );
+    let sealed = appended.get("sealedRecord").cloned().unwrap();
+    let opened = call(
+        &host,
+        mount,
+        "record-open",
+        capability(
+            "teamarness.synchronization.immutable-record-log",
+            "open",
+            object([("sealedRecords", PackageValue::Array(vec![sealed]))]),
+        ),
+    )
+    .await;
+    let PackageValue::Array(results) = opened.get("results").unwrap() else {
+        panic!("open result was not an array")
+    };
+    assert!(
+        matches!(results.first(), Some(PackageValue::Object(result)) if result.get("status") == Some(&PackageValue::String("ready".into())))
+    );
+}
+
+#[tokio::test]
 async fn rejects_forged_cross_scope_and_invalid_signing_calls() {
     let requirements = [serde_json::json!({
         "identity":"teamarness.signing","major":1,"minMinor":0,"maxMinor":0
@@ -436,6 +489,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
         "workspace-context.schema.json",
         "membership.schema.json",
         "signing.schema.json",
+        "immutable-record-log.schema.json",
         "signing-envelope.golden.json",
     ] {
         let bytes = std::fs::read(root.join(name)).unwrap();
@@ -449,7 +503,16 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
     }
     let mut contract = String::new();
     for entry in std::fs::read_dir(&root).unwrap() {
-        contract.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+        let path = entry.unwrap().path();
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(
+                "immutable-record-log.schema.json" | "immutable-record-log.test.mjs" | "README.md"
+            )
+        ) {
+            continue;
+        }
+        contract.push_str(&std::fs::read_to_string(path).unwrap());
     }
     let lowercase = contract.to_ascii_lowercase();
     for forbidden in [

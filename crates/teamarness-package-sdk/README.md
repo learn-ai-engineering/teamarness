@@ -15,7 +15,7 @@ Package::builder(backend).serve().await.unwrap();
 
 `Backend::handle` receives lifecycle and Package UI requests without framing details. `Backend::subscribe` can return a bounded `EventSubscription`. `Initialization` exposes Package, Workspace, Installation, process generation, Package Data Directory, and negotiated opaque capability descriptors for the current generation.
 
-`CapabilityClient` calls a negotiated grant and method. The caller supplies only method fields, not Package, Workspace, Installation, Core signing context, or transport selectors. Grants stop with the process generation.
+`CapabilityClient` calls a negotiated grant and method. The caller supplies only method fields, not Package, Workspace, Installation, Core signing context, or transport selectors. `CapabilityClient::subscribe` opens a credit-controlled capability stream; `CapabilitySubscription::recv` validates contiguous decimal sequences, returns one credit after consumption, and sends close on explicit close or drop. Grants and stream registries stop with the process generation.
 
 The SDK owns framed stdin and stdout, strict initialization, concurrent request dispatch, lifecycle barriers, capability correlation, control-frame priority, cancellation, event credit, graceful shutdown, and the parent-stdin lifeline. Package diagnostics go to stderr. Package code must not write protocol data there or write non-protocol data to stdout.
 

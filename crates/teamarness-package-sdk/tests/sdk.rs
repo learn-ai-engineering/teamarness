@@ -22,6 +22,30 @@ impl Backend for Echo {
                     .call("Z3JhbnQx", "get", JsonValue::Object(Default::default()))
                     .await;
             }
+            if request.operation == "fixture.capability_stream" {
+                let mut arguments = JsonValue::Object(Default::default());
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("method".into(), JsonValue::String("subscribe".into()));
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("afterCursor".into(), JsonValue::Null);
+                let mut stream = request
+                    .capabilities
+                    .subscribe("Z3JhbnQx", arguments)
+                    .await?;
+                let event = stream.recv().await.ok_or_else(|| {
+                    BackendError::new(
+                        "stream_closed",
+                        false,
+                        JsonValue::Object(Default::default()),
+                    )
+                })??;
+                stream.close().await;
+                return Ok(event);
+            }
             if request.operation == "fixture.slow" {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -80,6 +104,44 @@ async fn read_frame(stream: &mut tokio::io::DuplexStream) -> Frame {
     let mut bytes = prefix.to_vec();
     bytes.extend(payload);
     decode_frame(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn sdk_routes_capability_stream_events_and_returns_credit() {
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service = tokio::spawn(Package::builder(Arc::new(Echo)).serve_io(sdk_read, sdk_write));
+    write_json(&mut host_write, r#"{"kind":"initialize","nonce":"bm9uY2U","package":{"identity":"dev.teamarness.fixture","version":"1.0.0","manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","processGeneration":"1","workspace":{"id":"workspace1","name":"Workspace"},"installation":{"identity":"installation1","displayName":"Installation"},"dataDirectory":{"path":"/tmp/package","continuityId":"Y29udGludWl0eQ"},"protocol":{"major":1,"minor":0},"capabilities":[],"limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,"maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}}"#).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"request","id":"h:stream","operation":"fixture.capability_stream","deadlineUnixMs":"9999999999999","payload":{}}"#).await;
+    let opened = read_frame(&mut host_read).await;
+    assert_eq!(opened.kind(), FrameKind::StreamOpen);
+    let stream_id = opened.field("id").unwrap().as_str().unwrap().to_owned();
+    write_json(&mut host_write, &format!(r#"{{"kind":"event","streamId":"{stream_id}","sequence":"1","payload":{{"cursor":"next"}}}}"#)).await;
+    let credit = read_frame(&mut host_read).await;
+    assert_eq!(credit.kind(), FrameKind::Credit);
+    assert_eq!(credit.field("amount").unwrap(), 1);
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::StreamClose
+    );
+    let response = read_frame(&mut host_read).await;
+    assert_eq!(response.kind(), FrameKind::Response);
+    assert_eq!(response.field("id").unwrap(), "h:stream");
+    write_json(
+        &mut host_write,
+        r#"{"kind":"shutdown","reason":"application_shutdown"}"#,
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    drop(host_write);
+    service.await.unwrap().unwrap();
 }
 
 #[tokio::test]

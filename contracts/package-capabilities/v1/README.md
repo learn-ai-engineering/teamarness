@@ -67,8 +67,10 @@ Package Process Protocol's 1 MiB frame limit.
 
 `recordId`, `orderKey`, and `cursor` are distinct opaque values. `recordId` is
 stable authenticated equality; `orderKey` is a bytewise-sortable causal order;
-`cursor` is local delivery progress and is never an order offset. Core retains
-raw signing and content-key custody. Packages receive no Iroh, P2Panda, SQLite,
+`cursor` is local delivery progress and is never an order offset. Host validation
+bounds decoded canonical input to 262,144 bytes and each open batch to 512 KiB;
+the process protocol bounds encoded and decoded frames to 1 MiB. Core retains
+raw signing and content-key custody. Packages receive no transport, replication,
 private-key, or raw-key types. Version 1 permits one content key, creator-only
 bootstrap, current-holder grants, and no protection removal, update, deletion,
 or revocation-driven rotation.

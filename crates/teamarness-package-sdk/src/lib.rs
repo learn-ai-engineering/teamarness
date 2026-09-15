@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub use capability::CapabilityClient;
+pub use capability::{CapabilityClient, CapabilitySubscription};
 pub use lifecycle::LifecycleOperation;
 use teamarness_package_protocol::{Frame, JsonValue};
 use tokio::io::{AsyncRead, AsyncWrite};

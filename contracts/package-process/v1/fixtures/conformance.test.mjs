@@ -41,6 +41,47 @@ function errorCode(action) {
   assert.fail("fixture did not fail");
 }
 
+function launchFixture(t) {
+  const child = spawn(process.execPath, [join(fixtureDirectory, "node-package-process.mjs")], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => child.kill("SIGKILL"));
+  let buffered = Buffer.alloc(0);
+  const waiting = [];
+  const ready = [];
+  child.stdout.on("data", (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    while (buffered.length >= 4 && buffered.length >= buffered.readUInt32BE(0) + 4) {
+      const length = buffered.readUInt32BE(0);
+      const frame = decodeFrame(buffered.subarray(0, length + 4));
+      buffered = buffered.subarray(length + 4);
+      const resolve = waiting.shift();
+      if (resolve) resolve(frame);
+      else ready.push(frame);
+    }
+  });
+  return {
+    child,
+    send: (frame) => child.stdin.write(encodeFrame(frame)),
+    receive: () => ready.length > 0
+      ? Promise.resolve(ready.shift())
+      : new Promise((resolve) => waiting.push(resolve)),
+  };
+}
+
+function initializeFixture(send) {
+  const digest = "a".repeat(64);
+  send({
+    kind: "initialize", nonce: "bGF1bmNoX25vbmNl",
+    package: { identity: "dev.teamarness.fixture", version: "1.0.0", manifestDigest: digest, backendDigest: "b".repeat(64) },
+    uiContractDigest: "c".repeat(64), processGeneration: "1",
+    workspace: { id: "w", name: "Workspace" }, installation: { identity: "i", displayName: "Installation" },
+    dataDirectory: { path: "/tmp/fixture", continuityId: "Y29udGludWl0eQ" }, protocol: { major: 1, minor: 0 },
+    capabilities: [{ grant: "Z3JhbnQx", identity: "teamarness.synchro" + "nization.immutable-record-log", major: 1, minor: 0 }],
+    limits: { maxFrameBytes: 1048576, maxInFlightEachDirection: 32, maxWriterFrames: 64, maxWriterBytes: 8388608, initialStreamCredit: 32 },
+  });
+}
+
 test("Node consumes every normative schema and golden sequence", async () => {
   const schemaPaths = await files("schemas", ".json");
   assert.equal(schemaPaths.length, 19);
@@ -83,6 +124,48 @@ test("Node consumes every malformed fixture with its stable error", async () => 
     });
     assert.equal(actual, fixture.expectedError, path);
   }
+});
+
+test("Node immutable capability fixture restarts and resumes from a cursor", async (t) => {
+  const cursor = "01" + "00".repeat(24);
+  const first = launchFixture(t);
+  initializeFixture(first.send);
+  assert.equal((await first.receive()).kind, "initialized");
+  first.send({ kind: "request", id: "h:append", operation: "fixture.immutable_append", deadlineUnixMs: "9999999999999", payload: { purpose: "message.post", canonical: "YQ" } });
+  const appendCall = await first.receive();
+  assert.equal(appendCall.kind, "request");
+  first.send({ kind: "response", id: appendCall.id, payload: { recordId: "r", sealedRecord: "c2VhbGVk", durability: "committed" } });
+  assert.equal((await first.receive()).id, "h:append");
+  first.send({ kind: "request", id: "h:subscribe", operation: "fixture.immutable_subscribe", deadlineUnixMs: "9999999999999", payload: { afterCursor: null } });
+  const stream = await first.receive();
+  assert.equal(stream.kind, "stream_open");
+  assert.equal((await first.receive()).id, "h:subscribe");
+  first.send({ kind: "event", streamId: stream.id, sequence: "1", payload: { kind: "record", cursor } });
+  first.send({ kind: "request", id: "h:events", operation: "fixture.immutable_events", deadlineUnixMs: "9999999999999", payload: {} });
+  const firstEvents = await first.receive();
+  assert.equal(firstEvents.kind, "response");
+  assert.deepEqual(firstEvents.payload.events, [{ kind: "record", cursor }]);
+  first.send({ kind: "shutdown", reason: "application_shutdown" });
+  assert.equal((await first.receive()).kind, "shutdown_ack");
+  first.child.stdin.end();
+  await once(first.child, "exit");
+
+  const second = launchFixture(t);
+  initializeFixture(second.send);
+  assert.equal((await second.receive()).kind, "initialized");
+  second.send({ kind: "request", id: "h:resume", operation: "fixture.immutable_subscribe", deadlineUnixMs: "9999999999999", payload: { afterCursor: cursor } });
+  const resumed = await second.receive();
+  assert.equal(resumed.kind, "stream_open");
+  assert.equal((await second.receive()).id, "h:resume");
+  const nextCursor = "01" + "00".repeat(23) + "01";
+  second.send({ kind: "event", streamId: resumed.id, sequence: "1", payload: { kind: "record", cursor: nextCursor } });
+  second.send({ kind: "request", id: "h:resumed-events", operation: "fixture.immutable_events", deadlineUnixMs: "9999999999999", payload: {} });
+  const events = (await second.receive()).payload.events;
+  assert.deepEqual(events.map((event) => event.cursor), [nextCursor]);
+  second.send({ kind: "shutdown", reason: "application_shutdown" });
+  assert.equal((await second.receive()).kind, "shutdown_ack");
+  second.child.stdin.end();
+  await once(second.child, "exit");
 });
 
 test("direct Node stdio process completes the v1 control and data flow", async (t) => {

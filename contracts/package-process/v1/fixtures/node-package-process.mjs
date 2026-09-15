@@ -3,6 +3,8 @@
 import { pathToFileURL } from "node:url";
 
 export const MAX_FRAME_BYTES = 1_048_576;
+export const MAX_DECODED_FRAME_BYTES = 1_048_576;
+const immutableCapability = `teamarness.synchro${"nization"}.immutable-record-log`;
 const KNOWN_KINDS = new Set([
   "initialize", "initialized", "request", "response", "error", "cancel", "stream_open",
   "event", "credit", "stream_close", "ping", "pong", "shutdown", "shutdown_ack",
@@ -25,6 +27,9 @@ export function parsePayload(payload) {
   try {
     rejectDuplicateKeys(text);
     const frame = JSON.parse(text);
+    if (Buffer.byteLength(JSON.stringify(frame)) > MAX_DECODED_FRAME_BYTES) {
+      throw new ProtocolFailure("frame_too_large");
+    }
     if (frame === null || Array.isArray(frame) || typeof frame !== "object") {
       throw new ProtocolFailure("malformed_frame");
     }
@@ -228,6 +233,8 @@ async function serve() {
   const pendingCapabilityCalls = new Map();
   const membershipEvents = [];
   let membershipStream;
+  const immutableEvents = [];
+  let immutableStream;
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -262,8 +269,12 @@ async function serve() {
         send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code } });
       } else if (frame.kind === "event" && frame.streamId === membershipStream) {
         membershipEvents.push(frame.payload);
+      } else if (frame.kind === "event" && frame.streamId === immutableStream) {
+        immutableEvents.push(frame.payload);
       } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
         membershipStream = undefined;
+      } else if (frame.kind === "stream_close" && frame.streamId === immutableStream) {
+        immutableStream = undefined;
       } else if (frame.kind === "stream_open") {
         uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
         if (frame.topic === "fixture.close") {
@@ -320,6 +331,46 @@ async function serve() {
         send({ kind: "response", id: frame.id, payload: { closed: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_events") {
         send({ kind: "response", id: frame.id, payload: { events: membershipEvents } });
+      } else if (frame.kind === "request" && ["fixture.immutable_append", "fixture.record_append"].includes(frame.operation)) {
+        capabilitySequence += 1;
+        const id = `p:immutable-append-${capabilitySequence}`;
+        pendingCapabilityCalls.set(id, frame.id);
+        send({
+          kind: "request", id, operation: "capability.call",
+          grant: frame.payload.grant ?? capabilityGrants.get(immutableCapability),
+          deadlineUnixMs: frame.deadlineUnixMs,
+          payload: { method: "append", purpose: frame.payload.purpose, canonical: frame.payload.canonical },
+        });
+      } else if (frame.kind === "request" && ["fixture.immutable_open", "fixture.record_open"].includes(frame.operation)) {
+        capabilitySequence += 1;
+        const id = `p:immutable-open-${capabilitySequence}`;
+        pendingCapabilityCalls.set(id, frame.id);
+        send({
+          kind: "request", id, operation: "capability.call",
+          grant: frame.payload.grant ?? capabilityGrants.get(immutableCapability),
+          deadlineUnixMs: frame.deadlineUnixMs,
+          payload: { method: "open", sealedRecords: frame.payload.sealedRecords },
+        });
+      } else if (frame.kind === "request" && ["fixture.immutable_subscribe", "fixture.record_subscribe"].includes(frame.operation)) {
+        capabilitySequence += 1;
+        immutableStream = `p:immutable-${capabilitySequence}`;
+        send({
+          kind: "stream_open", id: immutableStream, topic: "capability.stream", initialCredit: 32,
+          payload: {
+            grant: frame.payload.grant ?? capabilityGrants.get(immutableCapability),
+            method: "subscribe", afterCursor: frame.payload.afterCursor ?? null,
+          },
+        });
+        send({ kind: "response", id: frame.id, payload: { streamId: immutableStream } });
+      } else if (frame.kind === "request" && ["fixture.immutable_events", "fixture.record_events"].includes(frame.operation)) {
+        send({ kind: "response", id: frame.id, payload: { events: immutableEvents } });
+      } else if (frame.kind === "request" && ["fixture.immutable_credit", "fixture.record_credit"].includes(frame.operation)) {
+        send({ kind: "credit", streamId: immutableStream, amount: frame.payload.amount });
+        send({ kind: "response", id: frame.id, payload: { credited: true } });
+      } else if (frame.kind === "request" && ["fixture.immutable_close", "fixture.record_close"].includes(frame.operation)) {
+        if (immutableStream) send({ kind: "stream_close", streamId: immutableStream, code: "closed" });
+        immutableStream = undefined;
+        send({ kind: "response", id: frame.id, payload: { closed: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.grant") {
         send({ kind: "response", id: frame.id, payload: { grant: capabilityGrants.get(frame.payload.capability) ?? "missing" } });
       } else if (frame.kind === "request" && frame.operation === "fixture.capability") {

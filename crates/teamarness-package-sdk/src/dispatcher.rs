@@ -5,7 +5,7 @@ use teamarness_package_protocol::{Frame, FrameKind, JsonValue, MAX_IN_FLIGHT_EAC
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::capability::{CapabilityClient, PendingCapabilities};
+use crate::capability::{CapabilityClient, CapabilityStreams, PendingCapabilities};
 use crate::priority_writer::PriorityWriter;
 use crate::{Backend, BackendError, BackendRequest, Initialization, SdkError, object};
 
@@ -22,7 +22,12 @@ pub(crate) async fn run(
     writer.control(initialized(&initialize)?).await?;
 
     let pending_capabilities: PendingCapabilities = Arc::new(Mutex::new(BTreeMap::new()));
-    let capabilities = CapabilityClient::new(writer.clone(), pending_capabilities.clone());
+    let capability_streams: CapabilityStreams = Arc::new(Mutex::new(BTreeMap::new()));
+    let capabilities = CapabilityClient::new(
+        writer.clone(),
+        pending_capabilities.clone(),
+        capability_streams.clone(),
+    );
     let lifecycle = Arc::new(Mutex::new(()));
     let (done_tx, mut done_rx) = mpsc::channel::<String>(MAX_IN_FLIGHT_EACH_DIRECTION);
     let mut tasks: BTreeMap<String, JoinHandle<()>> = BTreeMap::new();
@@ -79,6 +84,29 @@ pub(crate) async fn run(
                                 &target,
                                 &BackendError::new("cancelled", true, empty_object()),
                             )).await?;
+                        }
+                    }
+                    FrameKind::Event => {
+                        let id = string_field(&frame, "streamId")?;
+                        let sequence = frame
+                            .field("sequence")
+                            .and_then(JsonValue::as_str)
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or(SdkError::Protocol("event_sequence"))?;
+                        let payload = frame
+                            .field("payload")
+                            .cloned()
+                            .ok_or(SdkError::Protocol("malformed_frame"))?;
+                        if crate::capability::CapabilityClient::event(
+                            &capability_streams,
+                            &id,
+                            sequence,
+                            payload,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Err(SdkError::Protocol("event_sequence"));
                         }
                     }
                     FrameKind::Response | FrameKind::Error => {
@@ -173,6 +201,12 @@ pub(crate) async fn run(
                         let id = string_field(&frame, "streamId")?;
                         if let Some((task, _)) = streams.remove(&id) {
                             task.abort();
+                        } else {
+                            let code = frame.field("code").and_then(JsonValue::as_str);
+                            let error = code
+                                .filter(|code| !matches!(*code, "completed" | "closed" | "dropped"))
+                                .map(|code| BackendError::new(code, true, empty_object()));
+                            crate::capability::CapabilityClient::close_stream(&capability_streams, &id, error).await;
                         }
                     }
                     FrameKind::Shutdown => {

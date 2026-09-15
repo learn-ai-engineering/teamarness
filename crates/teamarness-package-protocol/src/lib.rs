@@ -18,6 +18,8 @@ pub use state::{ContractState, Direction};
 pub use version::{ProtocolRange, ProtocolVersion, negotiate_version};
 
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
+/// Maximum canonical JSON representation after strict decoding.
+pub const MAX_DECODED_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_IN_FLIGHT_EACH_DIRECTION: usize = 32;
 pub const MAX_WRITER_FRAMES: usize = 64;
 pub const MAX_WRITER_BYTES: usize = 8_388_608;

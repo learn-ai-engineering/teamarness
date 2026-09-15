@@ -30,6 +30,7 @@ enum CapabilityKind {
     WorkspaceContext,
     Membership,
     Signing,
+    ImmutableRecordLog,
     #[cfg(test)]
     Neutral,
 }
@@ -139,6 +140,7 @@ impl GenerationCapabilities {
             CapabilityKind::WorkspaceContext => self.workspace_context(method, object),
             CapabilityKind::Membership => self.membership(method, object),
             CapabilityKind::Signing => self.signing(method, object),
+            CapabilityKind::ImmutableRecordLog => self.immutable_record(method, object),
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
         }
@@ -158,17 +160,29 @@ impl GenerationCapabilities {
         let object = payload
             .as_object()
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
-        exact_fields(object, &["grant", "method", "afterEpoch"])?;
         let grant = self.bound_grant(Some(string_field(object, "grant")?))?;
-        if grant.descriptor.kind != CapabilityKind::Membership
-            || string_field(object, "method")? != "subscribe"
-        {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
-        }
-        let after_epoch = decimal_field(object, "afterEpoch")?;
+        let method = string_field(object, "method")?;
         let core_workspace =
             teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
                 .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+        let after_epoch =
+            if grant.descriptor.kind == CapabilityKind::Membership && method == "subscribe" {
+                exact_fields(object, &["grant", "method", "afterEpoch"])?;
+                Some(decimal_field(object, "afterEpoch")?)
+            } else {
+                None
+            };
+        let after_cursor = if grant.descriptor.kind == CapabilityKind::ImmutableRecordLog
+            && method == "subscribe"
+        {
+            exact_fields(object, &["grant", "method", "afterCursor"])?;
+            Some(optional_cursor(object.get("afterCursor"))?)
+        } else {
+            None
+        };
+        if after_epoch.is_none() && after_cursor.is_none() {
+            return Err(PackageErrorCode::CapabilityRequestInvalid);
+        }
         let (commands, command_receiver) = mpsc::channel(8);
         let mut streams = self.streams.lock().await;
         if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
@@ -177,17 +191,41 @@ impl GenerationCapabilities {
         drop(streams);
         let core = self.core.clone();
         let all_streams = self.streams.clone();
-        tokio::spawn(run_membership_stream(
-            core,
-            core_workspace,
-            stream_id,
-            after_epoch,
-            initial_credit,
-            command_receiver,
-            output,
-            all_streams,
-            self.cancelled.subscribe(),
-        ));
+        match grant.descriptor.kind {
+            CapabilityKind::Membership => {
+                let after_epoch = after_epoch.expect("validated membership cursor");
+                tokio::spawn(run_membership_stream(
+                    core,
+                    core_workspace,
+                    stream_id,
+                    after_epoch,
+                    initial_credit,
+                    command_receiver,
+                    output,
+                    all_streams,
+                    self.cancelled.subscribe(),
+                ));
+            }
+            CapabilityKind::ImmutableRecordLog => {
+                let after_cursor = after_cursor.expect("validated record cursor");
+                tokio::spawn(run_record_stream(
+                    core,
+                    core_workspace,
+                    self.scope.package_identity.as_str().to_owned(),
+                    stream_id,
+                    after_cursor,
+                    initial_credit,
+                    command_receiver,
+                    output,
+                    all_streams,
+                    self.cancelled.subscribe(),
+                ));
+            }
+            _ => {
+                self.streams.lock().await.remove(&stream_id);
+                return Err(PackageErrorCode::CapabilityRequestInvalid);
+            }
+        }
         Ok(())
     }
 
@@ -295,6 +333,88 @@ impl GenerationCapabilities {
                     "wasMember":was_member,
                     "warning":"informational_not_authorization",
                 }))
+            }
+            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    }
+
+    fn immutable_record(
+        &self,
+        method: &str,
+        object: &Map<String, Value>,
+    ) -> Result<Value, PackageErrorCode> {
+        let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+        let package = self.scope.package_identity.as_str();
+        match method {
+            "append" => {
+                exact_fields(object, &["method", "purpose", "canonical"])?;
+                let purpose = validated_purpose(string_field(object, "purpose")?)?;
+                let canonical = decode_bounded(string_field(object, "canonical")?, 262_144)?;
+                let record = self
+                    .core
+                    .append_record(workspace, package, purpose, &canonical)
+                    .map_err(sync_error)?;
+                Ok(json!({
+                    "recordId": record.record_id().to_string(),
+                    "orderKey": record.order_key().to_string(),
+                    "author": record.author().to_string(),
+                    "signature": encode_signature(&record.signature())?,
+                    "sealedRecord": encode_base64(record.sealed_record()),
+                    "durability": record.durability(),
+                }))
+            }
+            "open" => {
+                exact_fields(object, &["method", "sealedRecords"])?;
+                let values = object
+                    .get("sealedRecords")
+                    .and_then(Value::as_array)
+                    .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+                if !(1..=32).contains(&values.len()) {
+                    return Err(PackageErrorCode::CapabilityRequestInvalid);
+                }
+                let mut sealed = Vec::with_capacity(values.len());
+                let mut total = 0_usize;
+                for value in values {
+                    let bytes = decode_bounded(
+                        value
+                            .as_str()
+                            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?,
+                        512 * 1024,
+                    )?;
+                    total = total
+                        .checked_add(bytes.len())
+                        .filter(|total| *total <= 512 * 1024)
+                        .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+                    sealed.push(bytes);
+                }
+                let results = match self.core.open_records(workspace, package, &sealed) {
+                    Ok(records) => records
+                        .into_iter()
+                        .map(|record| {
+                            Ok(json!({
+                                "status":"ready",
+                                "recordId":record.record_id().to_string(),
+                                "orderKey":record.order_key().to_string(),
+                                "author":record.author().to_string(),
+                                "purpose":record.purpose(),
+                                "signature":encode_signature(&record.signature())?,
+                                "canonical":encode_base64(record.canonical()),
+                            }))
+                        })
+                        .collect::<Result<Vec<_>, PackageErrorCode>>()?,
+                    Err(error) => {
+                        let status = match error {
+                            teamarness_core::SynchronizationError::WrongScope => "wrong_scope",
+                            teamarness_core::SynchronizationError::CorruptRecord => "corrupt",
+                            _ => "waiting_for_history_access",
+                        };
+                        (0..sealed.len())
+                            .map(|_| json!({"status":status}))
+                            .collect()
+                    }
+                };
+                Ok(json!({"results":results}))
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
@@ -443,6 +563,12 @@ impl Registry {
             minor: 0,
             kind: CapabilityKind::Signing,
         });
+        registry.register(Descriptor {
+            identity: "teamarness.synchronization.immutable-record-log",
+            major: 1,
+            minor: 0,
+            kind: CapabilityKind::ImmutableRecordLog,
+        });
         registry
     }
 
@@ -558,6 +684,151 @@ async fn run_membership_stream(
                 }
             }
         }
+    }
+    streams.lock().await.remove(&stream_id);
+    let _ = output.close(&stream_id, "capability_unavailable").await;
+}
+
+fn sync_error(error: teamarness_core::SynchronizationError) -> PackageErrorCode {
+    match error {
+        teamarness_core::SynchronizationError::NotCurrentMember
+        | teamarness_core::SynchronizationError::RevokedMember => {
+            PackageErrorCode::CapabilityUnavailable
+        }
+        teamarness_core::SynchronizationError::WorkspaceNotFound
+        | teamarness_core::SynchronizationError::InvalidInput
+        | teamarness_core::SynchronizationError::WrongScope
+        | teamarness_core::SynchronizationError::CorruptRecord
+        | teamarness_core::SynchronizationError::CursorScopeMismatch
+        | teamarness_core::SynchronizationError::CursorAhead => {
+            PackageErrorCode::CapabilityRequestInvalid
+        }
+        teamarness_core::SynchronizationError::RuntimeUnavailable
+        | teamarness_core::SynchronizationError::Storage(_) => {
+            PackageErrorCode::CapabilityUnavailable
+        }
+        _ => PackageErrorCode::CapabilityRequestInvalid,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn encode_signature(
+    signature: &teamarness_core::PublicSignature,
+) -> Result<String, PackageErrorCode> {
+    Ok(encode_base64(&decode_hex::<64>(&signature.to_string())?))
+}
+
+fn decode_bounded(value: &str, max: usize) -> Result<Vec<u8>, PackageErrorCode> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+    if bytes.is_empty() || bytes.len() > max {
+        return Err(PackageErrorCode::CapabilityRequestInvalid);
+    }
+    Ok(bytes)
+}
+
+fn optional_cursor(
+    value: Option<&Value>,
+) -> Result<Option<teamarness_core::Cursor>, PackageErrorCode> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::String(value)) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid),
+        _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_record_stream(
+    core: Arc<CoreRuntime>,
+    workspace: teamarness_core::WorkspaceId,
+    package: String,
+    stream_id: String,
+    mut after: Option<teamarness_core::Cursor>,
+    mut credit: u64,
+    mut commands: mpsc::Receiver<StreamCommand>,
+    output: HostStreamSender,
+    streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let mut sequence = 0_u64;
+    loop {
+        if *cancelled.borrow() {
+            break;
+        }
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                StreamCommand::Credit(amount) => {
+                    credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
+                }
+                StreamCommand::Close => {
+                    streams.lock().await.remove(&stream_id);
+                    return;
+                }
+            }
+        }
+        while credit == 0 {
+            tokio::select! {
+                command = commands.recv() => match command {
+                    Some(StreamCommand::Credit(amount)) => {
+                        credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
+                    }
+                    Some(StreamCommand::Close) | None => {
+                        streams.lock().await.remove(&stream_id);
+                        return;
+                    }
+                },
+                result = cancelled.changed() => {
+                    if result.is_err() || *cancelled.borrow() {
+                        streams.lock().await.remove(&stream_id);
+                        return;
+                    }
+                }
+            }
+        }
+        let core_for_next = core.clone();
+        let package_for_next = package.clone();
+        let next = tokio::task::spawn_blocking(move || {
+            let mut subscription = core_for_next
+                .subscribe_records(workspace, &package_for_next, after)
+                .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+            subscription
+                .next_event_timeout(std::time::Duration::from_millis(50))
+                .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
+        })
+        .await;
+        let event = match next {
+            Ok(Ok(Some(event))) => event,
+            Ok(Ok(None)) => continue,
+            _ => break,
+        };
+        sequence = sequence.saturating_add(1);
+        let signature = match encode_signature(&event.record().signature()) {
+            Ok(signature) => signature,
+            Err(_) => break,
+        };
+        let payload = json!({
+            "kind":"record",
+            "cursor":event.cursor().to_string(),
+            "recordId":event.record_id().to_string(),
+            "orderKey":event.order_key().to_string(),
+            "author":event.author().to_string(),
+            "purpose":event.purpose(),
+            "signature":signature,
+            "canonical":encode_base64(event.canonical()),
+            "sealedRecord":encode_base64(event.sealed_record()),
+        });
+        if output.event(&stream_id, sequence, payload).await.is_err() {
+            break;
+        }
+        after = Some(event.cursor());
+        credit -= 1;
     }
     streams.lock().await.remove(&stream_id);
     let _ = output.close(&stream_id, "capability_unavailable").await;
