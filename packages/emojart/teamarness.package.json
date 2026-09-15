@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "identity": "dev.teamarness.emojart",
+  "version": "1.0.0",
+  "presentation": {
+    "displayName": "Emojart"
+  },
+  "protocol": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "backends": [
+    {
+      "target": "aarch64-apple-darwin",
+      "path": "backend/teamarness-emojart-package-aarch64-apple-darwin",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "ui": {
+    "entrypoint": {
+      "path": "ui/index.js",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "assets": [],
+    "contract": {
+      "path": "ui/contract.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "capabilities": [],
+  "extensions": {
+    "dev.teamarness.build": {
+      "generatedFields": ["backends.0.size", "backends.0.sha256", "ui.entrypoint.size", "ui.entrypoint.sha256", "ui.contract.sha256"]
+    }
+  }
+}

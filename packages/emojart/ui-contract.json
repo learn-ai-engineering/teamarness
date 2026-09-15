@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "empty": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "algorithmId": {
+      "type": "string",
+      "enum": ["waves", "ripples", "sierpinski"]
+    },
+    "paletteId": {
+      "type": "string",
+      "enum": ["garden", "ocean", "space", "fruit"]
+    },
+    "recipe": {
+      "type": "object",
+      "properties": {
+        "generatorVersion": { "const": 1 },
+        "algorithm": { "$ref": "#/$defs/algorithmId" },
+        "palette": { "$ref": "#/$defs/paletteId" },
+        "seed": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "width": { "const": 16 },
+        "height": { "const": 12 }
+      },
+      "required": ["generatorVersion", "algorithm", "palette", "seed", "width", "height"],
+      "additionalProperties": false
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 192,
+      "maxItems": 192,
+      "items": {
+        "type": "string",
+        "enum": ["🌱", "🌿", "🍀", "🌸", "🌻", "💧", "🐚", "🐠", "🐬", "🌊", "🌑", "🌒", "🌓", "🌔", "🌕", "🍓", "🍊", "🍋", "🍏", "🫐"]
+      }
+    },
+    "draft": {
+      "type": "object",
+      "properties": {
+        "recipe": { "$ref": "#/$defs/recipe" },
+        "cells": { "$ref": "#/$defs/cells" }
+      },
+      "required": ["recipe", "cells"],
+      "additionalProperties": false
+    },
+    "savedArtwork": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^artwork-[1-9][0-9]*$" },
+        "recipe": { "$ref": "#/$defs/recipe" },
+        "cells": { "$ref": "#/$defs/cells" }
+      },
+      "required": ["id", "recipe", "cells"],
+      "additionalProperties": false
+    },
+    "algorithmChoice": {
+      "oneOf": [
+        { "const": { "id": "waves", "label": "Waves" } },
+        { "const": { "id": "ripples", "label": "Ripples" } },
+        { "const": { "id": "sierpinski", "label": "Sierpiński" } }
+      ]
+    },
+    "paletteChoice": {
+      "oneOf": [
+        { "const": { "id": "garden", "label": "Garden", "values": ["🌱", "🌿", "🍀", "🌸", "🌻"] } },
+        { "const": { "id": "ocean", "label": "Ocean", "values": ["💧", "🐚", "🐠", "🐬", "🌊"] } },
+        { "const": { "id": "space", "label": "Space", "values": ["🌑", "🌒", "🌓", "🌔", "🌕"] } },
+        { "const": { "id": "fruit", "label": "Fruit", "values": ["🍓", "🍊", "🍋", "🍏", "🫐"] } }
+      ]
+    },
+    "readResponse": {
+      "type": "object",
+      "properties": {
+        "algorithms": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/algorithmChoice" }
+        },
+        "palettes": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/paletteChoice" }
+        },
+        "artworks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/savedArtwork" }
+        }
+      },
+      "required": ["algorithms", "palettes", "artworks"],
+      "additionalProperties": false
+    },
+    "generateRequest": {
+      "type": "object",
+      "properties": {
+        "algorithm": { "$ref": "#/$defs/algorithmId" },
+        "palette": { "$ref": "#/$defs/paletteId" }
+      },
+      "required": ["algorithm", "palette"],
+      "additionalProperties": false
+    },
+    "saveRequest": {
+      "type": "object",
+      "properties": {
+        "recipe": { "$ref": "#/$defs/recipe" }
+      },
+      "required": ["recipe"],
+      "additionalProperties": false
+    }
+  },
+  "requests": {
+    "emojart.read": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/readResponse" }
+    },
+    "emojart.generate": {
+      "request": { "$ref": "#/$defs/generateRequest" },
+      "response": { "$ref": "#/$defs/draft" }
+    },
+    "emojart.save": {
+      "request": { "$ref": "#/$defs/saveRequest" },
+      "response": { "$ref": "#/$defs/savedArtwork" }
+    }
+  },
+  "subscriptions": {}
+}

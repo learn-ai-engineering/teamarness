@@ -1,0 +1,18 @@
+[package]
+name = "teamarness-emojart-package"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teamarness-package-protocol = { path = "../../../crates/teamarness-package-protocol" }
+teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
+tokio.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true

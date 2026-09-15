@@ -5618,6 +5618,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamarness-emojart-package"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "teamarness-package-protocol",
+ "teamarness-package-sdk",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "teamarness-package-host"
 version = "0.1.0"
 dependencies = [
