@@ -388,11 +388,18 @@ impl GenerationCapabilities {
                         .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
                     sealed.push(bytes);
                 }
-                let results = match self.core.open_records(workspace, package, &sealed) {
-                    Ok(records) => records
-                        .into_iter()
-                        .map(|record| {
-                            Ok(json!({
+                let mut results = Vec::with_capacity(sealed.len());
+                for envelope in &sealed {
+                    match self
+                        .core
+                        .open_records(workspace, package, std::slice::from_ref(envelope))
+                    {
+                        Ok(records) => {
+                            let record = records
+                                .into_iter()
+                                .next()
+                                .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+                            results.push(json!({
                                 "status":"ready",
                                 "recordId":record.record_id().to_string(),
                                 "orderKey":record.order_key().to_string(),
@@ -400,20 +407,18 @@ impl GenerationCapabilities {
                                 "purpose":record.purpose(),
                                 "signature":encode_signature(&record.signature())?,
                                 "canonical":encode_base64(record.canonical()),
-                            }))
-                        })
-                        .collect::<Result<Vec<_>, PackageErrorCode>>()?,
-                    Err(error) => {
-                        let status = match error {
-                            teamarness_core::SynchronizationError::WrongScope => "wrong_scope",
-                            teamarness_core::SynchronizationError::CorruptRecord => "corrupt",
-                            _ => "waiting_for_history_access",
-                        };
-                        (0..sealed.len())
-                            .map(|_| json!({"status":status}))
-                            .collect()
+                            }));
+                        }
+                        Err(error) => {
+                            let status = match error {
+                                teamarness_core::SynchronizationError::WrongScope => "wrong_scope",
+                                teamarness_core::SynchronizationError::CorruptRecord => "corrupt",
+                                _ => "waiting_for_history_access",
+                            };
+                            results.push(json!({"status":status}));
+                        }
                     }
-                };
+                }
                 Ok(json!({"results":results}))
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),

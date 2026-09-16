@@ -725,16 +725,13 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         package: &str,
         operation: p2panda_core::Operation<()>,
     ) -> Result<(), ()> {
-        if operation.header.verifying_key.as_bytes() != peer.as_bytes() {
-            return Err(());
-        }
+        let author = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
+            .map_err(|_| ())?;
         let state = self.state.upgrade().ok_or(())?;
         let mut state = state.lock().map_err(|_| ())?;
-        if !state
-            .memberships
-            .get(&workspace)
-            .is_some_and(|projection| projection.contains_member(peer))
-        {
+        if !state.memberships.get(&workspace).is_some_and(|projection| {
+            projection.contains_member(peer) && projection.has_membership_history(author)
+        }) {
             return Err(());
         }
         let record = crate::synchronization::insert_remote_operation(
@@ -2775,6 +2772,119 @@ mod tests {
         b.shutdown().await.unwrap();
         drop(a);
         drop(b);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_peer_forwards_record_from_historical_member() {
+        let root = std::env::temp_dir().join(format!(
+            "teamarness-historical-record-forwarding-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let alice = CoreRuntime::open_with_clock_and_readiness(
+            CoreRuntimeConfig::new(root.join("alice")),
+            Box::new(SystemClock),
+            true,
+        )
+        .await
+        .unwrap();
+        let workspace = alice.create_workspace("Historical forwarding").unwrap();
+        let bob_invitation = alice
+            .create_workspace_invitation(workspace.id())
+            .await
+            .unwrap();
+        let bob = CoreRuntime::open_with_clock_and_readiness(
+            CoreRuntimeConfig::new(root.join("bob")),
+            Box::new(SystemClock),
+            true,
+        )
+        .await
+        .unwrap();
+        bob.join_workspace(&bob_invitation).await.unwrap();
+
+        let package = "teamarness.test";
+        alice
+            .append_record(workspace.id(), package, "message.post", b"seed")
+            .unwrap();
+        let bob_grant = alice
+            .export_protection_grant(workspace.id(), package, bob.public_identity())
+            .unwrap();
+        bob.import_protection_grant(workspace.id(), package, &bob_grant)
+            .unwrap();
+        let historical = bob
+            .append_record(workspace.id(), package, "message.post", b"historical")
+            .unwrap();
+        alice
+            .revoke_member(workspace.id(), bob.public_identity())
+            .unwrap();
+
+        let carol_invitation = alice
+            .create_workspace_invitation(workspace.id())
+            .await
+            .unwrap();
+        let carol = CoreRuntime::open_with_clock_and_readiness(
+            CoreRuntimeConfig::new(root.join("carol")),
+            Box::new(SystemClock),
+            true,
+        )
+        .await
+        .unwrap();
+        carol.join_workspace(&carol_invitation).await.unwrap();
+        let carol_grant = alice
+            .export_protection_grant(workspace.id(), package, carol.public_identity())
+            .unwrap();
+        carol
+            .import_protection_grant(workspace.id(), package, &carol_grant)
+            .unwrap();
+
+        let bob_receiver = RuntimeSyncReceiver {
+            state: Arc::downgrade(&bob.state),
+            clock: Arc::new(SystemClock),
+        };
+        let operation = crate::synchronization::SyncReceiver::operations(
+            &bob_receiver,
+            workspace.id(),
+            package,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, operation)| operation)
+        .find(|operation| {
+            operation.header.verifying_key.as_bytes() == bob.public_identity().as_bytes()
+        })
+        .unwrap();
+        let carol_receiver = RuntimeSyncReceiver {
+            state: Arc::downgrade(&carol.state),
+            clock: Arc::new(SystemClock),
+        };
+        crate::synchronization::SyncReceiver::receive_operation(
+            &carol_receiver,
+            alice.public_identity(),
+            workspace.id(),
+            package,
+            operation,
+        )
+        .expect("a current peer may forward a historically eligible author's record");
+
+        let mut subscription = carol
+            .subscribe_records(workspace.id(), package, None)
+            .unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(event) = subscription
+            .next_event_timeout(std::time::Duration::ZERO)
+            .unwrap()
+        {
+            seen.insert(event.record_id());
+        }
+        assert!(seen.contains(&historical.record_id()));
+
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+        carol.shutdown().await.unwrap();
+        drop(alice);
+        drop(bob);
+        drop(carol);
         fs::remove_dir_all(root).unwrap();
     }
 

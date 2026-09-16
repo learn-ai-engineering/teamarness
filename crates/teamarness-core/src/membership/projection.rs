@@ -60,6 +60,16 @@ impl WorkspaceProjection {
             .any(|member| member.identity() == identity)
     }
 
+    pub(crate) fn has_membership_history(&self, identity: PublicIdentity) -> bool {
+        self.creator == identity
+            || self.operations.values().any(|operation| {
+                matches!(
+                    &operation.action,
+                    MembershipAction::Admit { target, .. } if *target == identity
+                )
+            })
+    }
+
     pub(crate) fn heads(&self) -> Vec<MembershipOperationId> {
         let dependencies = self
             .operations

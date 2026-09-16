@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use teamarness_package_host::{
     OpenUiMount, PackageErrorCode, PackageHost, PackageHostCommand, PackageHostOutcome,
     PackageValue, ReconcileWorkspaces, UiRequest, UiRequestId,
@@ -336,6 +337,86 @@ async fn immutable_record_capability_appends_and_opens_through_core() {
     };
     assert!(
         matches!(results.first(), Some(PackageValue::Object(result)) if result.get("status") == Some(&PackageValue::String("ready".into())))
+    );
+}
+
+#[tokio::test]
+async fn immutable_record_open_classifies_each_envelope_independently() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let appended = call(
+        &host,
+        mount.clone(),
+        "mixed-open-append",
+        capability(
+            "teamarness.synchronization.immutable-record-log",
+            "append",
+            object([
+                ("purpose", PackageValue::String("message.post".into())),
+                ("canonical", PackageValue::String("cmVhZHk".into())),
+            ]),
+        ),
+    )
+    .await;
+    let ready = appended.get("sealedRecord").cloned().unwrap();
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    let wrong_scope = fixture
+        .core
+        .append_record(
+            workspace.id(),
+            "dev.teamarness.other",
+            "message.post",
+            b"wrong scope",
+        )
+        .unwrap();
+    let opened = call(
+        &host,
+        mount,
+        "mixed-open",
+        capability(
+            "teamarness.synchronization.immutable-record-log",
+            "open",
+            object([(
+                "sealedRecords",
+                PackageValue::Array(vec![
+                    ready,
+                    PackageValue::String("AA".into()),
+                    PackageValue::String(URL_SAFE_NO_PAD.encode(wrong_scope.sealed_record())),
+                ]),
+            )]),
+        ),
+    )
+    .await;
+    let PackageValue::Array(results) = opened.get("results").unwrap() else {
+        panic!("open result was not an array")
+    };
+    let statuses = results
+        .iter()
+        .map(|result| {
+            let PackageValue::Object(result) = result else {
+                panic!("open item was not an object")
+            };
+            result.get("status").cloned().unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            PackageValue::String("ready".into()),
+            PackageValue::String("corrupt".into()),
+            PackageValue::String("wrong_scope".into()),
+        ]
     );
 }
 

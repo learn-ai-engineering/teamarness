@@ -17,6 +17,7 @@ One Core-owned synchronization worker consumes durable wakes, schedules at most 
 - Restart validates the P2Panda projection and sealed envelopes before capability calls are accepted.
 - A finite session may require continuation; durable wake generations preserve that work without unbounded transport.
 - Core retains raw content-key custody and the version-1 one-key/no-rotation limitation. Package persistence and diagnostics remain ciphertext-only.
+- A current connected Member may attest and forward a record signed by any identity in accepted Workspace Membership history. Version 1 does not bind records to a Membership Version or trusted authored time, so Core cannot independently prove that a forwarded record from a later-revoked author predates revocation. Strong temporal revocation requires the Phase 5 key rotation and record-version work; Phase 4 relies on the current forwarder's authorization while preserving the original author's signature.
 - Invalid remote operations are isolated from valid peers and cannot poison the accepted Teamarness journal through a partial write.
 - The shared Network remains the sole Endpoint/Router owner. Downstream Host, SDK, and Package phases must not expose or depend on P2Panda/Iroh types.
 
