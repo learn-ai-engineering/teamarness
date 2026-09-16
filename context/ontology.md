@@ -63,7 +63,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 |---|---|
 | **Channel** | A named, append-only message stream within a workspace. Has an owning creator and a lifecycle (active, permanently hidden); synthetic `#general` is always present and cannot be hidden |
 | **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a Channel through the generic immutable-record capability. Transport details remain Core-owned |
-| **Channel Membership** | Package-owned membership determining who can read and post in a specific channel. Bounded by canonical workspace membership |
+| **Channel Membership** | Package-owned policy determining who can read and post in a specific Channel, bounded by Canonical Membership. Phase 4 has no separate Channel Membership records because every current Workspace Member participates in every Channel |
 | **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns records and domain policy; `teamarness.synchronization.immutable-record-log` owns reusable transport, replication, retry, and backpressure |
 
 ## Transport (Iroh)

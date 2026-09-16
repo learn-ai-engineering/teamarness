@@ -3,7 +3,7 @@
 //! The Conversations Package domain and durable projection.  This crate deliberately
 //! depends only on the language-neutral Package SDK; transport and key custody stay in Core.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::pin::Pin;
@@ -246,11 +246,9 @@ fn validate_slug(v: &str) -> Result<(), DomainError> {
     if !(1..=48).contains(&v.len())
         || !v.is_ascii()
         || v.bytes()
-            .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'))
+            .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
         || v.starts_with('-')
-        || v.starts_with('_')
         || v.ends_with('-')
-        || v.ends_with('_')
     {
         Err(DomainError::InvalidSlug)
     } else {
@@ -297,6 +295,7 @@ fn take_text(b: &[u8], p: &mut usize) -> Result<String, DomainError> {
 pub enum IngestResult {
     Applied,
     Duplicate,
+    Deferred(String),
     Quarantined(String),
 }
 #[derive(Debug, Clone)]
@@ -338,7 +337,207 @@ struct StoreInner {
     conn: Connection,
     slugs: BTreeMap<String, String>,
     markdown: HashMap<String, String>,
+    deferred: HashMap<String, DomainRecord>,
 }
+
+struct ProjectionOutcome {
+    result: IngestResult,
+    slug: Option<(String, String)>,
+    markdown: Option<(String, String)>,
+    deferred: Option<DomainRecord>,
+    retry_channel: Option<String>,
+    removed_messages: Vec<String>,
+}
+
+impl ProjectionOutcome {
+    fn applied() -> Self {
+        Self {
+            result: IngestResult::Applied,
+            slug: None,
+            markdown: None,
+            deferred: None,
+            retry_channel: None,
+            removed_messages: Vec::new(),
+        }
+    }
+}
+
+fn project_domain(
+    tx: &rusqlite::Transaction<'_>,
+    record_id: &str,
+    order_key: &str,
+    author: &str,
+    ordinal: i64,
+    domain: &DomainRecord,
+) -> Result<ProjectionOutcome, rusqlite::Error> {
+    if domain.kind()
+        != tx.query_row(
+            "SELECT purpose FROM records WHERE record_id=?1",
+            [record_id],
+            |row| row.get::<_, String>(0),
+        )?
+    {
+        quarantine(tx, record_id, "purpose_mismatch")?;
+        return Ok(ProjectionOutcome {
+            result: IngestResult::Quarantined("purpose_mismatch".into()),
+            ..ProjectionOutcome::applied()
+        });
+    }
+    let signer_matches = match domain {
+        DomainRecord::ChannelCreate { creator, .. } | DomainRecord::ChannelHide { creator, .. } => {
+            creator == author
+        }
+        DomainRecord::MessagePost {
+            author: domain_author,
+            ..
+        } => domain_author == author,
+    };
+    if !signer_matches {
+        quarantine(tx, record_id, "signer_mismatch")?;
+        return Ok(ProjectionOutcome {
+            result: IngestResult::Quarantined("signer_mismatch".into()),
+            ..ProjectionOutcome::applied()
+        });
+    }
+
+    match domain {
+        DomainRecord::ChannelCreate { id, creator, slug } => {
+            let channel_id = hex_id(*id);
+            tx.execute(
+                "INSERT OR IGNORE INTO channels(channel_id,creator,create_order,hidden_order) VALUES(?1,?2,?3,NULL)",
+                params![channel_id, creator, order_key],
+            )?;
+            tx.execute(
+                "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
+                [record_id],
+            )?;
+            Ok(ProjectionOutcome {
+                slug: Some((channel_id.clone(), slug.clone())),
+                retry_channel: Some(channel_id),
+                ..ProjectionOutcome::applied()
+            })
+        }
+        DomainRecord::ChannelHide {
+            channel_id,
+            creator,
+            ..
+        } => {
+            let channel_id = hex_id(*channel_id);
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT creator FROM channels WHERE channel_id=?1",
+                    [&channel_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if channel_id == hex_id(GENERAL_ID) {
+                quarantine(tx, record_id, "general_cannot_hide")?;
+                return Ok(ProjectionOutcome {
+                    result: IngestResult::Quarantined("general_cannot_hide".into()),
+                    ..ProjectionOutcome::applied()
+                });
+            }
+            let Some(owner) = owner else {
+                quarantine(tx, record_id, "waiting_for_channel")?;
+                return Ok(ProjectionOutcome {
+                    result: IngestResult::Deferred("waiting_for_channel".into()),
+                    deferred: Some(domain.clone()),
+                    ..ProjectionOutcome::applied()
+                });
+            };
+            if owner != *creator {
+                quarantine(tx, record_id, "hide_not_creator")?;
+                return Ok(ProjectionOutcome {
+                    result: IngestResult::Quarantined("hide_not_creator".into()),
+                    ..ProjectionOutcome::applied()
+                });
+            }
+            tx.execute(
+                "UPDATE channels SET hidden_order=CASE WHEN hidden_order IS NULL OR hidden_order>?2 THEN ?2 ELSE hidden_order END WHERE channel_id=?1",
+                params![channel_id, order_key],
+            )?;
+            tx.execute(
+                "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
+                [record_id],
+            )?;
+            let hidden_order: String = tx.query_row(
+                "SELECT hidden_order FROM channels WHERE channel_id=?1",
+                [&channel_id],
+                |row| row.get(0),
+            )?;
+            let removed_messages = {
+                let mut statement = tx.prepare(
+                    "SELECT message_id,record_id FROM messages WHERE channel_id=?1 AND order_key>?2",
+                )?;
+                let rows = statement.query_map(params![channel_id, hidden_order], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (_, message_record_id) in &removed_messages {
+                quarantine(tx, message_record_id, "channel_hidden")?;
+            }
+            tx.execute(
+                "DELETE FROM messages WHERE channel_id=?1 AND order_key>?2",
+                params![channel_id, hidden_order],
+            )?;
+            Ok(ProjectionOutcome {
+                removed_messages: removed_messages
+                    .into_iter()
+                    .map(|(message_id, _)| message_id)
+                    .collect(),
+                ..ProjectionOutcome::applied()
+            })
+        }
+        DomainRecord::MessagePost {
+            id,
+            channel_id,
+            author: domain_author,
+            markdown,
+        } => {
+            let channel_id = hex_id(*channel_id);
+            let hidden_order: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT hidden_order FROM channels WHERE channel_id=?1",
+                    [&channel_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(hidden_order) = hidden_order else {
+                quarantine(tx, record_id, "waiting_for_channel")?;
+                return Ok(ProjectionOutcome {
+                    result: IngestResult::Deferred("waiting_for_channel".into()),
+                    deferred: Some(domain.clone()),
+                    ..ProjectionOutcome::applied()
+                });
+            };
+            if hidden_order
+                .as_deref()
+                .is_some_and(|hidden_order| order_key > hidden_order)
+            {
+                quarantine(tx, record_id, "channel_hidden")?;
+                return Ok(ProjectionOutcome {
+                    result: IngestResult::Quarantined("channel_hidden".into()),
+                    ..ProjectionOutcome::applied()
+                });
+            }
+            let message_id = hex_id(*id);
+            tx.execute(
+                "INSERT OR IGNORE INTO messages(message_id,channel_id,order_key,author,record_id,ingestion_ordinal) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![message_id, channel_id, order_key, domain_author, record_id, ordinal],
+            )?;
+            tx.execute(
+                "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
+                [record_id],
+            )?;
+            Ok(ProjectionOutcome {
+                markdown: Some((message_id, markdown.clone())),
+                ..ProjectionOutcome::applied()
+            })
+        }
+    }
+}
+
 impl ConversationStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
         let path = path.as_ref().to_owned();
@@ -349,6 +548,7 @@ impl ConversationStore {
                 conn: c,
                 slugs: BTreeMap::new(),
                 markdown: HashMap::new(),
+                deferred: HashMap::new(),
             })),
         };
         s.ensure_general()?;
@@ -385,133 +585,209 @@ impl ConversationStore {
         cursor: Option<&str>,
     ) -> Result<IngestResult, rusqlite::Error> {
         let parsed = DomainRecord::decode(canonical);
-        let mut x = self.inner.lock().unwrap();
-        let tx = x.conn.transaction()?;
-        let old:Option<(String,String,String,String,Vec<u8>)>=tx.query_row("SELECT order_key,author,purpose,signature,sealed_record FROM records WHERE record_id=?1",[record_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-        if let Some((o, a, p, s, se)) = old {
-            if o == order_key && a == author && p == purpose && s == signature && se == sealed {
-                if let Some(c) = cursor {
-                    tx.execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [c])?;
+        let mut inner = self.inner.lock().unwrap();
+        let transaction = inner.conn.transaction()?;
+        let existing: Option<(String, String, String, String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT order_key,author,purpose,signature,sealed_record FROM records WHERE record_id=?1",
+                [record_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        if let Some((
+            stored_order,
+            stored_author,
+            stored_purpose,
+            stored_signature,
+            stored_sealed,
+        )) = existing
+        {
+            if stored_order == order_key
+                && stored_author == author
+                && stored_purpose == purpose
+                && stored_signature == signature
+                && stored_sealed == sealed
+            {
+                if let Some(cursor) = cursor {
+                    transaction
+                        .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])?;
                 }
-                tx.commit()?;
+                transaction.commit()?;
                 return Ok(IngestResult::Duplicate);
             }
-            tx.execute(
-                "UPDATE records SET quarantine_code='immutable_field_mismatch' WHERE record_id=?1",
-                [record_id],
-            )?;
-            tx.commit()?;
+            quarantine(&transaction, record_id, "immutable_field_mismatch")?;
+            transaction.commit()?;
             return Ok(IngestResult::Quarantined("immutable_field_mismatch".into()));
         }
-        let ordinal: i64 = tx.query_row(
+        let ordinal: i64 = transaction.query_row(
             "SELECT next_ingestion_ordinal FROM metadata WHERE singleton=1",
             [],
-            |r| r.get(0),
+            |row| row.get(0),
         )?;
-        tx.execute("INSERT INTO records(record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,quarantine_code) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",params![record_id,order_key,author,purpose,signature,sealed,cursor,ordinal+1])?;
-        tx.execute(
+        let ordinal = ordinal + 1;
+        transaction.execute(
+            "INSERT INTO records(record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,quarantine_code) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
+            params![record_id, order_key, author, purpose, signature, sealed, cursor, ordinal],
+        )?;
+        transaction.execute(
             "UPDATE metadata SET cursor=?1,next_ingestion_ordinal=?2 WHERE singleton=1",
-            params![cursor, ordinal + 1],
+            params![cursor, ordinal],
         )?;
-        let mut result = IngestResult::Applied;
-        let mut slug_cache = None;
-        let mut markdown_cache = None;
-        if let Ok(domain) = parsed {
-            if domain.kind() != purpose {
-                tx.execute(
-                    "UPDATE records SET quarantine_code='purpose_mismatch' WHERE record_id=?1",
-                    [record_id],
-                )?;
-                result = IngestResult::Quarantined("purpose_mismatch".into());
-            } else {
-                let signer_matches = match &domain {
-                    DomainRecord::ChannelCreate { creator, .. }
-                    | DomainRecord::ChannelHide { creator, .. } => creator == author,
-                    DomainRecord::MessagePost {
-                        author: domain_author,
-                        ..
-                    } => domain_author == author,
-                };
-                if !signer_matches {
-                    quarantine(&tx, record_id, "signer_mismatch")?;
-                    result = IngestResult::Quarantined("signer_mismatch".into());
-                } else {
-                    match &domain {
-                        DomainRecord::ChannelCreate { id, creator, slug } => {
-                            let cid = hex_id(*id);
-                            let exists: Option<String> = tx
-                                .query_row(
-                                    "SELECT channel_id FROM channels WHERE channel_id=?1",
-                                    [&cid],
-                                    |r| r.get(0),
-                                )
-                                .optional()?;
-                            if exists.is_none() {
-                                tx.execute("INSERT INTO channels(channel_id,creator,create_order,hidden_order) VALUES(?1,?2,?3,NULL)",params![cid,creator,order_key])?;
-                            }
-                            slug_cache = Some((cid, slug.clone()));
-                        }
-                        DomainRecord::ChannelHide {
-                            id: _,
-                            channel_id,
-                            creator,
-                        } => {
-                            let cid = hex_id(*channel_id);
-                            let owner: Option<String> = tx
-                                .query_row(
-                                    "SELECT creator FROM channels WHERE channel_id=?1",
-                                    [&cid],
-                                    |r| r.get(0),
-                                )
-                                .optional()?;
-                            if cid == hex_id(GENERAL_ID) {
-                                quarantine(&tx, record_id, "general_cannot_hide")?;
-                                result = IngestResult::Quarantined("general_cannot_hide".into());
-                            } else if owner.as_deref() != Some(creator) {
-                                quarantine(&tx, record_id, "hide_not_creator")?;
-                                result = IngestResult::Quarantined("hide_not_creator".into());
-                            } else {
-                                tx.execute("UPDATE channels SET hidden_order=CASE WHEN hidden_order IS NULL OR hidden_order>?2 THEN ?2 ELSE hidden_order END WHERE channel_id=?1",params![cid,order_key])?;
-                            }
-                        }
-                        DomainRecord::MessagePost {
-                            id,
-                            channel_id,
-                            author: domain_author,
-                            markdown,
-                        } => {
-                            let cid = hex_id(*channel_id);
-                            let exists: Option<String> = tx
-                                .query_row(
-                                    "SELECT channel_id FROM channels WHERE channel_id=?1",
-                                    [&cid],
-                                    |r| r.get(0),
-                                )
-                                .optional()?;
-                            if exists.is_none() {
-                                quarantine(&tx, record_id, "unknown_channel")?;
-                                result = IngestResult::Quarantined("unknown_channel".into());
-                            } else {
-                                tx.execute("INSERT OR IGNORE INTO messages(message_id,channel_id,order_key,author,record_id,ingestion_ordinal) VALUES(?1,?2,?3,?4,?5,?6)",params![hex_id(*id),cid,order_key,domain_author,record_id,ordinal+1])?;
-                                markdown_cache = Some((hex_id(*id), markdown.clone()));
-                            }
-                        }
-                    }
+        let outcome = match parsed {
+            Ok(domain) => {
+                project_domain(&transaction, record_id, order_key, author, ordinal, &domain)?
+            }
+            Err(_) => {
+                quarantine(&transaction, record_id, "malformed_record")?;
+                ProjectionOutcome {
+                    result: IngestResult::Quarantined("malformed_record".into()),
+                    ..ProjectionOutcome::applied()
                 }
             }
-        } else {
-            quarantine(&tx, record_id, "malformed_record")?;
-            result = IngestResult::Quarantined("malformed_record".into());
+        };
+        transaction.commit()?;
+        if let Some((id, slug)) = outcome.slug {
+            inner.slugs.insert(id, slug);
         }
-        tx.commit()?;
-        if let Some((id, slug)) = slug_cache {
-            x.slugs.insert(id, slug);
+        if let Some((id, markdown)) = outcome.markdown {
+            inner.markdown.insert(id, markdown);
         }
-        if let Some((id, markdown)) = markdown_cache {
-            x.markdown.insert(id, markdown);
+        for id in outcome.removed_messages {
+            inner.markdown.remove(&id);
+        }
+        if let Some(domain) = outcome.deferred {
+            inner.deferred.insert(record_id.to_owned(), domain);
+        }
+        let retry_channel = outcome.retry_channel;
+        let result = outcome.result;
+        drop(inner);
+        if let Some(channel_id) = retry_channel {
+            self.retry_cached_for_channel(&channel_id)?;
         }
         Ok(result)
     }
+
+    fn retry_cached_for_channel(&self, channel_id: &str) -> Result<(), rusqlite::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut deferred = inner
+            .deferred
+            .iter()
+            .filter_map(|(record_id, domain)| {
+                let target = match domain {
+                    DomainRecord::ChannelHide { channel_id, .. }
+                    | DomainRecord::MessagePost { channel_id, .. } => hex_id(*channel_id),
+                    DomainRecord::ChannelCreate { .. } => return None,
+                };
+                (target == channel_id).then(|| (record_id.clone(), domain.clone()))
+            })
+            .collect::<Vec<_>>();
+        deferred.sort_by(|(left, _), (right, _)| {
+            let order = |record_id: &str| {
+                inner
+                    .conn
+                    .query_row(
+                        "SELECT order_key FROM records WHERE record_id=?1",
+                        [record_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap_or_default()
+            };
+            order(left).cmp(&order(right)).then_with(|| left.cmp(right))
+        });
+        for (record_id, domain) in deferred {
+            let (order_key, author, ordinal): (String, String, i64) = inner.conn.query_row(
+                "SELECT order_key,author,ingestion_ordinal FROM records WHERE record_id=?1",
+                [&record_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let transaction = inner.conn.transaction()?;
+            let outcome = project_domain(
+                &transaction,
+                &record_id,
+                &order_key,
+                &author,
+                ordinal,
+                &domain,
+            )?;
+            transaction.commit()?;
+            if let Some((id, markdown)) = outcome.markdown {
+                inner.markdown.insert(id, markdown);
+            }
+            for id in outcome.removed_messages {
+                inner.markdown.remove(&id);
+            }
+            if !matches!(outcome.result, IngestResult::Deferred(_)) {
+                inner.deferred.remove(&record_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn deferred_records(&self) -> Result<Vec<StoredRecord>, rusqlite::Error> {
+        let inner = self.inner.lock().unwrap();
+        let mut statement = inner.conn.prepare(
+            "SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal FROM records WHERE quarantine_code='waiting_for_channel' ORDER BY order_key,record_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredRecord {
+                record_id: row.get(0)?,
+                order_key: row.get(1)?,
+                author: row.get(2)?,
+                purpose: row.get(3)?,
+                signature: row.get(4)?,
+                sealed_record: row.get(5)?,
+                cursor: row.get(6)?,
+                ingestion_ordinal: row.get::<_, i64>(7)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn retry_deferred(
+        &self,
+        record_id: &str,
+        canonical: &[u8],
+    ) -> Result<IngestResult, rusqlite::Error> {
+        let domain = match DomainRecord::decode(canonical) {
+            Ok(domain) => domain,
+            Err(_) => return Ok(IngestResult::Quarantined("malformed_record".into())),
+        };
+        let channel_id = match &domain {
+            DomainRecord::ChannelHide { channel_id, .. }
+            | DomainRecord::MessagePost { channel_id, .. } => hex_id(*channel_id),
+            DomainRecord::ChannelCreate { .. } => return Ok(IngestResult::Duplicate),
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.deferred.insert(record_id.to_owned(), domain);
+        }
+        self.retry_cached_for_channel(&channel_id)?;
+        let inner = self.inner.lock().unwrap();
+        let code: Option<String> = inner.conn.query_row(
+            "SELECT quarantine_code FROM records WHERE record_id=?1",
+            [record_id],
+            |row| row.get(0),
+        )?;
+        Ok(match code.as_deref() {
+            None => IngestResult::Applied,
+            Some("waiting_for_channel") => IngestResult::Deferred("waiting_for_channel".into()),
+            Some(code) => IngestResult::Quarantined(code.to_owned()),
+        })
+    }
+
+    pub fn channel_is_active(&self, channel_id: &str) -> Result<bool, rusqlite::Error> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .conn
+            .query_row(
+                "SELECT hidden_order IS NULL FROM channels WHERE channel_id=?1",
+                [channel_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+    }
+
     pub fn channels(&self) -> Result<Vec<ChannelView>, rusqlite::Error> {
         let x = self.inner.lock().unwrap();
         let mut q = x.conn.prepare(
@@ -532,24 +808,45 @@ impl ConversationStore {
                 counts.insert(id, n as u64);
             }
         }
-        let mut used = HashMap::<String, u32>::new();
-        for r in rows {
-            let (id, creator, hidden) = r?;
-            let base = if id == hex_id(GENERAL_ID) {
+        let channels = rows.collect::<Result<Vec<_>, _>>()?;
+        let base_slug = |id: &str| {
+            if id == hex_id(GENERAL_ID) {
                 "general".into()
             } else {
                 x.slugs
-                    .get(&id)
+                    .get(id)
                     .cloned()
                     .unwrap_or_else(|| format!("channel-{}", &id[..8]))
-            };
-            let count = used.entry(base.clone()).or_insert(0);
-            *count += 1;
-            let slug = if *count == 1 {
+            }
+        };
+        let mut base_counts = HashMap::<String, usize>::new();
+        for (id, _, _) in &channels {
+            *base_counts.entry(base_slug(id)).or_default() += 1;
+        }
+        let reserved = base_counts.keys().cloned().collect::<HashSet<_>>();
+        let mut used = HashMap::<String, usize>::new();
+        let mut assigned = HashSet::new();
+        for (id, creator, hidden) in channels {
+            let base = base_slug(&id);
+            let occurrence = used.entry(base.clone()).or_default();
+            *occurrence += 1;
+            let slug = if base_counts[&base] == 1 || *occurrence == 1 {
                 base
             } else {
-                format!("{base}-{}", *count)
+                let mut prefix = 8;
+                loop {
+                    let candidate = format!("{base}-{}", &id[..prefix]);
+                    if !reserved.contains(&candidate) && !assigned.contains(&candidate) {
+                        break candidate;
+                    }
+                    if prefix < id.len() {
+                        prefix = (prefix + 8).min(id.len());
+                    } else {
+                        break format!("{base}-{id}-{id}");
+                    }
+                }
             };
+            assigned.insert(slug.clone());
             out.push(ChannelView {
                 id: id.clone(),
                 slug,
@@ -732,7 +1029,8 @@ fn from_b64(v: &str) -> Result<Vec<u8>, BackendError> {
 
 #[derive(Clone)]
 pub struct ConversationsBackend {
-    active: Arc<AsyncMutex<Option<Active>>>,
+    active: Arc<AsyncMutex<Option<Running>>>,
+    lifecycle: Arc<AsyncMutex<()>>,
     changes: watch::Sender<u64>,
 }
 #[derive(Clone)]
@@ -740,11 +1038,17 @@ struct Active {
     store: ConversationStore,
     record_grant: String,
 }
+struct Running {
+    active: Active,
+    cancel: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
 impl Default for ConversationsBackend {
     fn default() -> Self {
         let (tx, _) = watch::channel(0);
         Self {
             active: Arc::new(AsyncMutex::new(None)),
+            lifecycle: Arc::new(AsyncMutex::new(())),
             changes: tx,
         }
     }
@@ -753,7 +1057,32 @@ impl ConversationsBackend {
     pub async fn serve() -> Result<(), teamarness_package_sdk::SdkError> {
         Package::builder(Arc::new(Self::default())).serve().await
     }
+
+    async fn active(&self) -> Result<Active, BackendError> {
+        self.active
+            .lock()
+            .await
+            .as_ref()
+            .map(|running| running.active.clone())
+            .ok_or_else(|| error("conversations.not_active", true))
+    }
+
+    async fn stop_active(&self) {
+        if let Some(running) = self.active.lock().await.take() {
+            let _ = running.cancel.send(true);
+            let _ = running.task.await;
+        }
+    }
+
+    async fn deactivate(&self) -> Result<JsonValue, BackendError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_active().await;
+        Ok(object([]))
+    }
+
     async fn activate(&self, r: &BackendRequest) -> Result<JsonValue, BackendError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_active().await;
         let data = r
             .initialization
             .data_directory()
@@ -816,44 +1145,83 @@ impl ConversationsBackend {
                 }
             }
         }
-        let backend = self.clone();
-        let state = active.clone();
-        tokio::spawn(async move {
-            loop {
-                match sub.recv().await {
-                    Some(Ok(event)) => match ingest_event(&state.store, &event) {
-                        Ok(_) => backend.changes.send_modify(|x| *x = x.saturating_add(1)),
-                        Err(error) => eprintln!(
-                            "conversations record ingestion failure: code={} retryable={}",
-                            error.code(),
-                            error.retryable()
-                        ),
-                    },
-                    Some(Err(error)) => {
-                        eprintln!(
-                            "conversations record subscription failure: code={} retryable={}",
-                            error.code(),
-                            error.retryable()
-                        );
-                        break;
-                    }
-                    None => {
-                        eprintln!("conversations record subscription closed");
-                        break;
+        // Deferred records remain sealed at rest. Recovery opens at most one capability batch
+        // at a time and retries projection only in memory after Channel controls are available.
+        for batch in store
+            .deferred_records()
+            .map_err(|_| error("conversations.storage_failed", true))?
+            .chunks(32)
+        {
+            let sealed = batch
+                .iter()
+                .map(|row| JsonValue::String(b64(&row.sealed_record)))
+                .collect();
+            let opened = r
+                .capabilities
+                .call(
+                    &sync,
+                    "open",
+                    object([("sealedRecords", JsonValue::Array(sealed))]),
+                )
+                .await
+                .map_err(|cause| capability_error("open-deferred-records", cause))?;
+            if let Some(results) = opened.get("results").and_then(JsonValue::as_array) {
+                for (row, result) in batch.iter().zip(results) {
+                    if let Some(canonical) = result.get("canonical").and_then(JsonValue::as_str) {
+                        let canonical = from_b64(canonical)?;
+                        store
+                            .retry_deferred(&row.record_id, &canonical)
+                            .map_err(|_| error("conversations.storage_failed", true))?;
                     }
                 }
             }
+        }
+        let backend = self.clone();
+        let state = active.clone();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = cancelled.changed() => {
+                        if result.is_err() || *cancelled.borrow() {
+                            break;
+                        }
+                    }
+                    event = sub.recv() => match event {
+                        Some(Ok(event)) => match ingest_event(&state.store, &event) {
+                            Ok(_) => backend.changes.send_modify(|revision| *revision = revision.saturating_add(1)),
+                            Err(error) => eprintln!(
+                                "conversations record ingestion failure: code={} retryable={}",
+                                error.code(),
+                                error.retryable()
+                            ),
+                        },
+                        Some(Err(error)) => {
+                            eprintln!(
+                                "conversations record subscription failure: code={} retryable={}",
+                                error.code(),
+                                error.retryable()
+                            );
+                            break;
+                        }
+                        None => {
+                            eprintln!("conversations record subscription closed");
+                            break;
+                        }
+                    }
+                }
+            }
+            sub.close().await;
         });
-        *self.active.lock().await = Some(active);
+        *self.active.lock().await = Some(Running {
+            active,
+            cancel,
+            task,
+        });
         Ok(object([]))
     }
     async fn snapshot(&self) -> Result<JsonValue, BackendError> {
-        let a = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| error("conversations.not_active", true))?;
+        let a = self.active().await?;
         let channels = a
             .store
             .channels()
@@ -872,12 +1240,7 @@ impl ConversationsBackend {
         purpose: &str,
         domain: DomainRecord,
     ) -> Result<JsonValue, BackendError> {
-        let a = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| error("conversations.not_active", true))?;
+        let a = self.active().await?;
         let canonical = domain.encode();
         let response = r
             .capabilities
@@ -911,12 +1274,7 @@ impl ConversationsBackend {
         before: Option<&str>,
         limit: usize,
     ) -> Result<JsonValue, BackendError> {
-        let a = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| error("conversations.not_active", true))?;
+        let a = self.active().await?;
         if decode_id(channel).is_none() {
             return Err(error("conversations.invalid_request", false));
         }
@@ -986,14 +1344,7 @@ impl Backend for ConversationsBackend {
         Box::pin(async move {
             match r.operation.as_str() {
                 "lifecycle.activate" | "lifecycle.recover" => self.activate(&r).await,
-                "lifecycle.suspend" => {
-                    *self.active.lock().await = None;
-                    Ok(object([]))
-                }
-                "lifecycle.dispose" => {
-                    *self.active.lock().await = None;
-                    Ok(object([]))
-                }
+                "lifecycle.suspend" | "lifecycle.dispose" => self.deactivate().await,
                 "conversations.snapshot" => self.snapshot().await,
                 "conversations.channel.create" | "channel.create" => {
                     let slug = str_field(&r.payload, "slug")?;
@@ -1026,6 +1377,14 @@ impl Backend for ConversationsBackend {
                 "conversations.message.post" | "message.post" => {
                     let cid = decode_id(&str_field(&r.payload, "channelId")?)
                         .ok_or_else(|| error("conversations.invalid_request", false))?;
+                    let active = self.active().await?;
+                    if !active
+                        .store
+                        .channel_is_active(&hex_id(cid))
+                        .map_err(|_| error("conversations.storage_failed", true))?
+                    {
+                        return Err(error("conversations.channel_hidden", false));
+                    }
                     let md = str_field(&r.payload, "markdown")?;
                     let author = r
                         .initialization
@@ -1049,10 +1408,10 @@ impl Backend for ConversationsBackend {
                         .and_then(JsonValue::as_u64)
                         .unwrap_or(PAGE_SIZE as u64) as usize;
                     let out = self.page(&r, &cid, before, limit).await?;
-                    if r.operation.ends_with("open")
-                        && let Some(a) = self.active.lock().await.clone()
-                    {
-                        a.store
+                    if r.operation.ends_with("open") {
+                        self.active()
+                            .await?
+                            .store
                             .mark_read(&cid)
                             .map_err(|_| error("conversations.storage_failed", true))?;
                     }
@@ -1061,12 +1420,7 @@ impl Backend for ConversationsBackend {
                 "conversations.channel.mark-read"
                 | "conversations.channel.mark_read"
                 | "channel.mark-read" => {
-                    let a = self
-                        .active
-                        .lock()
-                        .await
-                        .clone()
-                        .ok_or_else(|| error("conversations.not_active", true))?;
+                    let a = self.active().await?;
                     a.store
                         .mark_read(&str_field(&r.payload, "channelId")?)
                         .map_err(|_| error("conversations.storage_failed", true))?;
@@ -1140,6 +1494,7 @@ mod tests {
         let x = DomainRecord::message_post([1; 16], "author", "**hello**").unwrap();
         assert_eq!(DomainRecord::decode(&x.encode()).unwrap(), x);
         assert!(DomainRecord::channel_create_with_id([2; 16], "a", "Bad Slug").is_err());
+        assert!(DomainRecord::channel_create_with_id([2; 16], "a", "bad_slug").is_err());
         assert!(DomainRecord::message_post([1; 16], "a", "x".repeat(MAX_MARKDOWN + 1)).is_err());
     }
     #[test]
@@ -1155,7 +1510,8 @@ mod tests {
         let s = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
         let a = DomainRecord::channel_create_with_id([1; 16], "author", "team").unwrap();
         let b = DomainRecord::channel_create_with_id([2; 16], "author", "team").unwrap();
-        for (d, o) in [(&a, "01"), (&b, "02")] {
+        let c = DomainRecord::channel_create_with_id([3; 16], "author", "team-02020202").unwrap();
+        for (d, o) in [(&a, "01"), (&b, "02"), (&c, "03")] {
             let c = d.encode();
             assert_eq!(
                 s.ingest(
@@ -1173,8 +1529,43 @@ mod tests {
             )
         }
         let channels = s.channels().unwrap();
-        assert!(channels.iter().any(|c| c.slug == "team"));
-        assert!(channels.iter().any(|c| c.slug == "team-2"));
+        assert!(channels.iter().any(|channel| channel.slug == "team"));
+        assert!(
+            channels
+                .iter()
+                .any(|channel| channel.slug == "team-0202020202020202")
+        );
+        assert!(
+            channels
+                .iter()
+                .any(|channel| channel.slug == "team-02020202")
+        );
+
+        let reversed = ConversationStore::open(d.path().join("reversed.sqlite")).unwrap();
+        for (record, order) in [(&c, "03"), (&b, "02"), (&a, "01")] {
+            reversed
+                .ingest(
+                    &hex_id(record.id()),
+                    order,
+                    "author",
+                    record.kind(),
+                    "sig",
+                    &record.encode(),
+                    b"sealed",
+                    None,
+                )
+                .unwrap();
+        }
+        let presentation = |store: &ConversationStore| {
+            store
+                .channels()
+                .unwrap()
+                .into_iter()
+                .filter(|channel| channel.slug.starts_with("team"))
+                .map(|channel| (channel.id, channel.slug))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(presentation(&s), presentation(&reversed));
     }
     #[test]
     fn persistence_contains_sealed_bytes_and_opaque_indexes_only() {
@@ -1218,47 +1609,259 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_unknown_channel_records_are_quarantined_without_blocking_delivery() {
-        let d = tempfile::tempdir().unwrap();
-        let s = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
-        let unknown = DomainRecord::message_post([9; 16], "alice", "hello").unwrap();
+    fn message_before_channel_is_deferred_then_projected() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        let message = DomainRecord::message_post([8; 16], "alice", "hello").unwrap();
         assert_eq!(
-            s.ingest(
-                "one",
-                "01",
-                "alice",
-                unknown.kind(),
-                "s",
-                &unknown.encode(),
-                b"x",
-                None
-            )
-            .unwrap(),
-            IngestResult::Quarantined("unknown_channel".into())
+            store
+                .ingest(
+                    "message-record",
+                    "01",
+                    "alice",
+                    message.kind(),
+                    "s",
+                    &message.encode(),
+                    b"sealed-message",
+                    None,
+                )
+                .unwrap(),
+            IngestResult::Deferred("waiting_for_channel".into())
         );
+        assert!(
+            store
+                .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
+                .unwrap()
+                .is_empty()
+        );
+
         let channel = DomainRecord::channel_create_with_id([8; 16], "alice", "known").unwrap();
-        assert_eq!(
-            s.ingest(
-                "two",
+        store
+            .ingest(
+                "channel-record",
                 "02",
                 "alice",
                 channel.kind(),
                 "s",
                 &channel.encode(),
-                b"y",
-                None
+                b"sealed-channel",
+                None,
             )
-            .unwrap(),
+            .unwrap();
+        assert_eq!(
+            store
+                .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_message_recovery_uses_reopened_sealed_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("x.sqlite");
+        let message = DomainRecord::message_post([8; 16], "alice", "restart secret").unwrap();
+        {
+            let store = ConversationStore::open(&path).unwrap();
+            store
+                .ingest(
+                    "message-record",
+                    "01",
+                    "alice",
+                    message.kind(),
+                    "s",
+                    &message.encode(),
+                    b"sealed-message",
+                    None,
+                )
+                .unwrap();
+        }
+        let store = ConversationStore::open(&path).unwrap();
+        let channel = DomainRecord::channel_create_with_id([8; 16], "alice", "known").unwrap();
+        store
+            .ingest(
+                "channel-record",
+                "02",
+                "alice",
+                channel.kind(),
+                "s",
+                &channel.encode(),
+                b"sealed-channel",
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
+                .unwrap()
+                .is_empty()
+        );
+        let deferred = store.deferred_records().unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].sealed_record, b"sealed-message");
+        assert_eq!(
+            store
+                .retry_deferred("message-record", &message.encode())
+                .unwrap(),
             IngestResult::Applied
         );
         assert_eq!(
-            s.channels()
+            store
+                .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
                 .unwrap()
-                .iter()
-                .filter(|x| x.slug == "known")
-                .count(),
+                .len(),
             1
         );
+        drop(store);
+        let bytes = std::fs::read(path).unwrap();
+        assert!(
+            !bytes
+                .windows(b"restart secret".len())
+                .any(|window| window == b"restart secret")
+        );
+    }
+
+    #[test]
+    fn earliest_hide_removes_later_messages_but_keeps_earlier_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        let channel = DomainRecord::channel_create_with_id([8; 16], "alice", "known").unwrap();
+        store
+            .ingest(
+                "channel",
+                "01",
+                "alice",
+                channel.kind(),
+                "s",
+                &channel.encode(),
+                b"c",
+                None,
+            )
+            .unwrap();
+        let later = DomainRecord::message_post([8; 16], "bob", "later").unwrap();
+        store
+            .ingest(
+                "later",
+                "04",
+                "bob",
+                later.kind(),
+                "s",
+                &later.encode(),
+                b"l",
+                None,
+            )
+            .unwrap();
+        let hide = DomainRecord::channel_hide([8; 16], "alice").unwrap();
+        store
+            .ingest(
+                "hide",
+                "03",
+                "alice",
+                hide.kind(),
+                "s",
+                &hide.encode(),
+                b"h",
+                None,
+            )
+            .unwrap();
+        assert!(!store.channel_is_active(&hex_id([8; 16])).unwrap());
+        assert!(
+            store
+                .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
+                .unwrap()
+                .is_empty()
+        );
+
+        let earlier = DomainRecord::message_post([8; 16], "bob", "earlier").unwrap();
+        assert_eq!(
+            store
+                .ingest(
+                    "earlier",
+                    "02",
+                    "bob",
+                    earlier.kind(),
+                    "s",
+                    &earlier.encode(),
+                    b"e",
+                    None
+                )
+                .unwrap(),
+            IngestResult::Applied
+        );
+        assert_eq!(
+            store
+                .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
+                .unwrap()
+                .len(),
+            1
+        );
+        let after = DomainRecord::message_post([8; 16], "bob", "after").unwrap();
+        assert_eq!(
+            store
+                .ingest(
+                    "after",
+                    "05",
+                    "bob",
+                    after.kind(),
+                    "s",
+                    &after.encode(),
+                    b"a",
+                    None
+                )
+                .unwrap(),
+            IngestResult::Quarantined("channel_hidden".into())
+        );
+    }
+
+    #[test]
+    fn deferred_hide_and_messages_replay_in_order_after_channel_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        let earlier = DomainRecord::message_post([8; 16], "bob", "earlier").unwrap();
+        let hide = DomainRecord::channel_hide([8; 16], "alice").unwrap();
+        let later = DomainRecord::message_post([8; 16], "bob", "later").unwrap();
+        for (record_id, order, author, record) in [
+            ("later", "04", "bob", &later),
+            ("hide", "03", "alice", &hide),
+            ("earlier", "02", "bob", &earlier),
+        ] {
+            assert!(matches!(
+                store
+                    .ingest(
+                        record_id,
+                        order,
+                        author,
+                        record.kind(),
+                        "s",
+                        &record.encode(),
+                        record_id.as_bytes(),
+                        None,
+                    )
+                    .unwrap(),
+                IngestResult::Deferred(_)
+            ));
+        }
+        let channel = DomainRecord::channel_create_with_id([8; 16], "alice", "known").unwrap();
+        store
+            .ingest(
+                "channel",
+                "05",
+                "alice",
+                channel.kind(),
+                "s",
+                &channel.encode(),
+                b"channel",
+                None,
+            )
+            .unwrap();
+
+        let rows = store
+            .message_rows(&hex_id([8; 16]), None, PAGE_SIZE)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, hex_id(earlier.id()));
+        assert!(!store.channel_is_active(&hex_id([8; 16])).unwrap());
     }
 
     #[test]
@@ -1326,6 +1929,34 @@ mod tests {
                 .unread_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_deactivation_cancels_and_awaits_the_owned_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = ConversationsBackend::default();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_exited = Arc::clone(&exited);
+        let task = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            task_exited.store(true, std::sync::atomic::Ordering::Release);
+        });
+        *backend.active.lock().await = Some(Running {
+            active: Active {
+                store,
+                record_grant: "grant".into(),
+            },
+            cancel,
+            task,
+        });
+
+        backend.deactivate().await.unwrap();
+
+        assert!(backend.active.lock().await.is_none());
+        assert!(exited.load(std::sync::atomic::Ordering::Acquire));
+        backend.deactivate().await.unwrap();
     }
 
     #[test]

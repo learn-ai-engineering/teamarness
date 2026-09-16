@@ -36,7 +36,7 @@ The Tauri Shell SHALL own Package UI Mounts, Package navigation, Workspace contr
 
 ## TEAM-R09 — Conversations Package
 
-The Conversations Package SHALL own Channels, Messages, Channel Membership, conversation keys, domain policy, local projections, unread state, and its UI. It SHALL consume Canonical Membership as an eligibility ceiling and SHALL NOT mutate it. Its peer replication SHALL use a generic Package-scoped Synchronization Capability rather than a Conversations-specific Core Runtime branch.
+The Conversations Package SHALL own Channels, Messages, Channel participation and cryptographic policy, domain policy, local projections, unread state, and its UI. In Phase 4 every current Workspace Member participates in every Channel, so no separate Channel Membership records exist. Core SHALL retain raw conversation-key custody and perform generic protection and grant mechanics without exposing raw keys to the Package. Conversations SHALL consume Canonical Membership as an eligibility ceiling and SHALL NOT mutate it. Its peer replication SHALL use a generic Package-scoped Synchronization Capability rather than a Conversations-specific Core Runtime branch.
 
 ## TEAM-R10 — Local-First Operation
 
