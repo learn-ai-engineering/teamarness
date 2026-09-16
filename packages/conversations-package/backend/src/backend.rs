@@ -450,7 +450,7 @@ impl Backend for ConversationsBackend {
         Box<dyn std::future::Future<Output = Result<EventSubscription, BackendError>> + Send + '_>,
     > {
         Box::pin(async move {
-            if r.operation != "conversations.changes" && r.operation != "changes" {
+            if r.operation != "conversations.changes" {
                 return Err(error("conversations.unknown_subscription", false));
             }
             let (tx, sub) = event_channel(32);
