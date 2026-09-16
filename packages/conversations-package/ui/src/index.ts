@@ -1,3 +1,4 @@
+import { installPackageUiKit } from "@teamarness/package-ui-sdk";
 import type { PackageMountContext, PackageUnmount } from "@teamarness/package-ui-sdk";
 import { ConversationsController } from "./controller";
 import { ConversationsView } from "./view";
@@ -26,6 +27,7 @@ export type ConversationPage = Readonly<{
 export async function mount(
   context: PackageMountContext,
 ): Promise<PackageUnmount> {
+  const cleanupKit = installPackageUiKit(context.root);
   let disposed = false;
 
   const controller = new ConversationsController(context.client, () => {
@@ -53,5 +55,6 @@ export async function mount(
     controller.dispose();
     view.dispose();
     await subscription.close();
+    cleanupKit();
   };
 }

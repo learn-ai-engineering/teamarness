@@ -412,7 +412,7 @@ export class ConversationsController {
    * selection unless the channel was removed, in which case it falls back
    * to the first available channel.
    */
-  applySnapshot(snapshot: ConversationSnapshot): void {
+  applySnapshot(snapshot: ConversationSnapshot): void | Promise<void> {
     if (this.disposed) return;
     const channels = snapshot.channels;
     const availability = snapshot.availability ?? "current";

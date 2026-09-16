@@ -27,6 +27,7 @@ test("Conversations builder stages one Package Directory without editing applica
     backends: [{ target: "aarch64-apple-darwin", path: "backend/teamarness-conversations-package-aarch64-apple-darwin", size: 0, sha256: zeros }],
     ui: { entrypoint: { path: "ui/index.js", size: 0, sha256: zeros }, assets: [{ path: "ui/style.css", mediaType: "text/css", size: 0, sha256: zeros }], contract: { path: "ui-contract.json", sha256: zeros } },
     capabilities: [],
+    extensions: { "dev.teamarness.build": { generatedFields: ["backends.0.size", "backends.0.sha256", "ui.entrypoint.size", "ui.entrypoint.sha256", "ui.assets.0.size", "ui.assets.0.sha256", "ui.contract.sha256"] } },
   }));
   const output = join(root, "target/teamarness-packages/dev.teamarness.conversations");
   await buildConversationsPackage({ repositoryRoot: root, backendPath: backend, outputDirectory: output, skipBuilds: true, skipUiBuild: true });
@@ -35,4 +36,6 @@ test("Conversations builder stages one Package Directory without editing applica
   assert.equal(manifest.identity, "dev.teamarness.conversations");
   assert.equal(manifest.ui.assets[0].size, ".conversations {}\n".length);
   assert.equal((await stat(join(output, manifest.backends[0].path))).mode & 0o777, 0o700);
+  // Verify the build extension is preserved in the staged manifest.
+  assert.deepEqual(manifest.extensions, { "dev.teamarness.build": { generatedFields: ["backends.0.size", "backends.0.sha256", "ui.entrypoint.size", "ui.entrypoint.sha256", "ui.assets.0.size", "ui.assets.0.sha256", "ui.contract.sha256"] } });
 });

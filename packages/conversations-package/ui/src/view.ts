@@ -2,6 +2,17 @@ import { authorLabel, renderMarkdown } from "./markdown";
 import type { ConversationsController, ControllerState } from "./controller";
 import "./styles.css";
 
+const KIT_CLASS = {
+  panel: "teamarness-panel teamarness-stack",
+  control: "teamarness-control",
+  primary: "teamarness-control teamarness-control--primary",
+  secondary: "teamarness-control teamarness-control--secondary",
+  field: "teamarness-field",
+  input: "teamarness-input",
+  notice: "teamarness-notice",
+  noticeDanger: "teamarness-notice teamarness-notice--danger",
+} as const;
+
 /**
  * Builds the Conversations DOM once and updates regions in-place.
  * The composer (textarea + send button) is created during construction and
@@ -40,7 +51,7 @@ export class ConversationsView {
 
     // --- conversation panel ---
     this.panel = document.createElement("section");
-    this.panel.className = "conversation-panel";
+    this.panel.className = `conversation-panel ${KIT_CLASS.panel}`;
 
     // --- header slot (replaced on every render) ---
     this.headerSlot = document.createElement("div");
@@ -55,7 +66,7 @@ export class ConversationsView {
     // --- load-older button ---
     this.olderButton = document.createElement("button");
     this.olderButton.type = "button";
-    this.olderButton.className = "secondary-control older-messages";
+    this.olderButton.className = `${KIT_CLASS.secondary} older-messages`;
     this.olderButton.addEventListener("click", () => {
       void controller.loadOlder();
     });
@@ -63,7 +74,7 @@ export class ConversationsView {
 
     // --- composer (built once, never replaced) ---
     this.composer = document.createElement("form");
-    this.composer.className = "composer";
+    this.composer.className = `composer ${KIT_CLASS.field}`;
 
     const label = document.createElement("label");
     label.htmlFor = "message-markdown";
@@ -73,6 +84,7 @@ export class ConversationsView {
     this.textarea = document.createElement("textarea");
     this.textarea.id = "message-markdown";
     this.textarea.name = "markdown";
+    this.textarea.className = KIT_CLASS.input;
     this.textarea.required = true;
     this.textarea.maxLength = 32768;
     this.textarea.placeholder = "Write a message…";
@@ -83,6 +95,7 @@ export class ConversationsView {
 
     this.sendButton = document.createElement("button");
     this.sendButton.type = "submit";
+    this.sendButton.className = KIT_CLASS.primary;
     this.sendButton.textContent = "Send";
     this.composer.append(this.sendButton);
 
@@ -192,7 +205,7 @@ export class ConversationsView {
 
     const createBtn = document.createElement("button");
     createBtn.type = "button";
-    createBtn.className = "secondary-control";
+    createBtn.className = KIT_CLASS.secondary;
     createBtn.textContent = "Create Channel";
     createBtn.addEventListener("click", () => {
       this.controller.toggleCreate();
@@ -201,10 +214,11 @@ export class ConversationsView {
 
     if (state.creating) {
       const form = document.createElement("form");
-      form.className = "channel-create-form";
+      form.className = `channel-create-form ${KIT_CLASS.field}`;
       const input = document.createElement("input");
       input.id = "new-channel-slug";
       input.name = "slug";
+      input.className = KIT_CLASS.input;
       input.required = true;
       input.maxLength = 48;
       input.pattern = "[a-z0-9-]+";
@@ -212,6 +226,7 @@ export class ConversationsView {
       input.setAttribute("aria-label", "New Channel name");
       const submit = document.createElement("button");
       submit.type = "submit";
+      submit.className = KIT_CLASS.primary;
       submit.textContent = "Create";
       form.addEventListener("submit", (event) => {
         event.preventDefault();
@@ -242,7 +257,7 @@ export class ConversationsView {
     if (selected && selected.canHide && !state.confirmingHide) {
       const hideBtn = document.createElement("button");
       hideBtn.type = "button";
-      hideBtn.className = "danger-control";
+      hideBtn.className = `${KIT_CLASS.secondary} teamarness-danger`;
       hideBtn.textContent = "Hide Channel";
       hideBtn.addEventListener("click", () => {
         this.controller.showConfirmHide();
@@ -271,7 +286,7 @@ export class ConversationsView {
     // Hide confirmation dialog (place above history).
     if (state.confirmingHide) {
       const div = document.createElement("div");
-      div.className = "hide-confirmation";
+      div.className = `${KIT_CLASS.noticeDanger} hide-confirmation`;
       div.setAttribute("role", "alertdialog");
       div.setAttribute("aria-label", "Confirm permanent Channel hide");
 
@@ -281,7 +296,7 @@ export class ConversationsView {
 
       const confirmBtn = document.createElement("button");
       confirmBtn.type = "button";
-      confirmBtn.className = "danger-control";
+      confirmBtn.className = `${KIT_CLASS.secondary} teamarness-danger`;
       confirmBtn.textContent = "Permanently Hide";
       confirmBtn.addEventListener("click", () => {
         void this.controller.hideChannel();
@@ -289,7 +304,7 @@ export class ConversationsView {
 
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
-      cancelBtn.className = "secondary-control";
+      cancelBtn.className = KIT_CLASS.secondary;
       cancelBtn.textContent = "Cancel";
       cancelBtn.addEventListener("click", () => {
         this.controller.cancelConfirm();
@@ -302,13 +317,13 @@ export class ConversationsView {
     // Warning message.
     if (state.warning) {
       const el = document.createElement("p");
-      el.className = "warning";
+      el.className = `${KIT_CLASS.noticeDanger} warning`;
       el.setAttribute("role", "alert");
       el.textContent = state.warning;
       this.panel.insertBefore(el, this.history);
     } else if (!state.confirmingHide && state.warnings[0]) {
       const el = document.createElement("p");
-      el.className = "warning";
+      el.className = `${KIT_CLASS.noticeDanger} warning`;
       el.setAttribute("role", "alert");
       el.textContent = state.warnings[0];
       this.panel.insertBefore(el, this.history);
