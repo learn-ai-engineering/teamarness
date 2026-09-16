@@ -87,6 +87,11 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
     `), "desktop Shell readiness");
 
     if (createWorkspace) {
+      await waitForAccessible(accessibilityScript(childPid, `
+        set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
+        set workspaceNameField to my namedDescendant(selectedContent, "Workspace name", "AXTextField")
+        return name of workspaceNameField
+      `), "Workspace creation form");
       diagnostics.activeStage = "Workspace creation";
       await runAppleScript(accessibilityScript(childPid, `
         set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
