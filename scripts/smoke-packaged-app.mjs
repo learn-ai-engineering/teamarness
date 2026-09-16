@@ -128,7 +128,8 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
           return undefined;
         }
         const visible = contents.stdout;
-        return visible.includes("Signing round trip")
+        return visible.includes("UI kit Ready")
+          && visible.includes("Signing round trip")
           && visible.includes("Verified")
           && visible.includes("Increment counter");
       }, "custom-scheme Package UI");

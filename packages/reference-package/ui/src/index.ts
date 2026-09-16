@@ -7,6 +7,14 @@ import {
 } from "@teamarness/package-ui-sdk";
 import referenceAsset from "./probe.svg?no-inline";
 
+const REFERENCE_PACKAGE_CSS = `
+  :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
+  .reference-heading { margin: 0; }
+  .reference-details { display: grid; grid-template-columns: max-content 1fr; gap: .4rem .8rem; }
+  .reference-details dt { font-weight: 700; }
+  .reference-details dd { margin: 0; overflow-wrap: anywhere; }
+`;
+
 type ReferenceSnapshot = Readonly<{
   counter: number;
   backgroundMarker: number;
@@ -16,16 +24,62 @@ type ReferenceSnapshot = Readonly<{
   packageVersion: string;
 }>;
 
+function installPackageStyles(root: ShadowRoot): () => void {
+  const StyleSheet = globalThis.CSSStyleSheet;
+  if (typeof StyleSheet !== "function") {
+    throw new Error("The reference Package requires constructed CSSStyleSheet support");
+  }
+  if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
+    throw new Error("The reference Package requires ShadowRoot.adoptedStyleSheets support");
+  }
+  let sheet: CSSStyleSheet;
+  try {
+    sheet = new StyleSheet();
+  } catch (cause) {
+    throw new Error("The reference Package requires constructed CSSStyleSheet support", { cause });
+  }
+  if (typeof sheet.replaceSync !== "function") {
+    throw new Error("The reference Package requires CSSStyleSheet.replaceSync support");
+  }
+  sheet.replaceSync(REFERENCE_PACKAGE_CSS);
+  try {
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+  } catch (cause) {
+    throw new Error("The reference Package requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
+  }
+  if (!root.adoptedStyleSheets.includes(sheet)) {
+    throw new Error("The reference Package requires mutable ShadowRoot.adoptedStyleSheets support");
+  }
+
+  let cleaned = false;
+  return () => {
+    if (cleaned) return;
+    cleaned = true;
+    root.adoptedStyleSheets = root.adoptedStyleSheets.filter((candidate) => candidate !== sheet);
+  };
+}
+
+function packageUiKitIsReady(article: HTMLElement, control: HTMLElement): boolean {
+  const layout = getComputedStyle(article);
+  const controlStyle = getComputedStyle(control);
+  const inheritedAccent = controlStyle.getPropertyValue("--teamarness-color-accent").trim();
+  return layout.display === "flex"
+    && layout.flexDirection === "column"
+    && controlStyle.borderTopStyle === "solid"
+    && inheritedAccent.length > 0
+    && controlStyle.backgroundColor.length > 0
+    && controlStyle.backgroundColor === controlStyle.borderTopColor;
+}
+
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
   const cleanupKit = installPackageUiKit(context.root);
-  const style = document.createElement("style");
-  style.textContent = `
-    :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-    .reference-heading { margin: 0; }
-    .reference-details { display: grid; grid-template-columns: max-content 1fr; gap: .4rem .8rem; }
-    .reference-details dt { font-weight: 700; }
-    .reference-details dd { margin: 0; overflow-wrap: anywhere; }
-  `;
+  let cleanupPackageStyles: () => void;
+  try {
+    cleanupPackageStyles = installPackageStyles(context.root);
+  } catch (error) {
+    cleanupKit();
+    throw error;
+  }
   const article = document.createElement("article");
   article.className = "teamarness-panel teamarness-stack";
   const heading = document.createElement("h3");
@@ -45,6 +99,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     ["Package UI", "Ready"],
     ["Workspace", "Ready"],
     ["Theme contract", themeReady ? "Ready" : "Unavailable"],
+    ["UI kit", "Checking"],
     ["Package Backend", "Loading"],
     ["Membership access", "Loading"],
     ["Counter", "0"],
@@ -64,7 +119,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   increment.className = "teamarness-control teamarness-control--primary";
   increment.textContent = "Increment counter";
   article.append(heading, logo, details, increment);
-  context.root.append(style, article);
+  context.root.append(article);
+  const uiKitStatus = packageUiKitIsReady(article, increment) ? "Ready" : "Unavailable";
+  values.get("UI kit")!.textContent = uiKitStatus;
+  values.get("UI kit")!.setAttribute("aria-label", `UI kit ${uiKitStatus}`);
 
   const render = (snapshot: ReferenceSnapshot): void => {
     values.get("Package Backend")!.textContent = "Ready";
@@ -93,7 +151,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     increment.removeEventListener("click", onIncrement);
     await subscription.close();
     article.remove();
-    style.remove();
+    cleanupPackageStyles();
     cleanupKit();
   };
 }

@@ -1,5 +1,5 @@
 import type { Channel } from "@tauri-apps/api/core";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createPackageClient,
   createTauriPackageTransport,
@@ -25,28 +25,16 @@ const EXPECTED_THEME_TOKENS = [
   "--teamarness-radius-panel",
 ] as const satisfies readonly TeamarnessThemeToken[];
 
-function fakeShadowRoot(): ShadowRoot & { readonly children: HTMLElement[] } {
-  const children: HTMLElement[] = [];
-  const ownerDocument = {
-    createElement: () => {
-      const attributes = new Map<string, string>();
-      const element = {
-        textContent: "",
-        setAttribute: (name: string, value: string) => { attributes.set(name, value); },
-        hasAttribute: (name: string) => attributes.has(name),
-        remove: () => {
-          const index = children.indexOf(element as unknown as HTMLElement);
-          if (index >= 0) children.splice(index, 1);
-        },
-      };
-      return element as unknown as HTMLStyleElement;
-    },
-  };
-  return {
-    ownerDocument,
-    children,
-    append: (element: HTMLElement) => { children.push(element); },
-  } as unknown as ShadowRoot & { readonly children: HTMLElement[] };
+class FakeCSSStyleSheet {
+  cssText = "";
+
+  replaceSync(css: string): void {
+    this.cssText = css;
+  }
+}
+
+function fakeShadowRoot(initialSheets: CSSStyleSheet[] = []): ShadowRoot {
+  return { adoptedStyleSheets: initialSheets } as unknown as ShadowRoot;
 }
 
 function deferred(): { promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } {
@@ -77,20 +65,27 @@ function fakeTransport(log: string[]): PackageTransport & {
   return transport;
 }
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("Package presentation contract", () => {
   it("publishes the exact frozen theme-token authority", () => {
     expect(TEAMARNESS_THEME_TOKENS).toEqual(EXPECTED_THEME_TOKENS);
     expect(Object.isFrozen(TEAMARNESS_THEME_TOKENS)).toBe(true);
   });
 
-  it("installs one marked, class-scoped style and cleans up overlapping installers safely", () => {
-    const root = fakeShadowRoot();
+  it("adopts one class-scoped kit sheet and cleans up overlapping installers safely", () => {
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    const packageSheetBefore = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    const packageSheetAfter = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    const root = fakeShadowRoot([packageSheetBefore]);
     const cleanupFirst = installPackageUiKit(root);
     const cleanupSecond = installPackageUiKit(root);
 
-    expect(root.children).toHaveLength(1);
-    const style = root.children[0]!;
-    expect(style.hasAttribute("data-teamarness-ui-kit")).toBe(true);
+    expect(root.adoptedStyleSheets).toHaveLength(2);
+    expect(root.adoptedStyleSheets[0]).toBe(packageSheetBefore);
+    const kitSheet = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
     for (const className of [
       "teamarness-control",
       "teamarness-control--primary",
@@ -106,16 +101,33 @@ describe("Package presentation contract", () => {
       "teamarness-inline",
       "teamarness-focus",
     ]) {
-      expect(style.textContent).toContain(`.${className}`);
+      expect(kitSheet.cssText).toContain(`.${className}`);
     }
-    for (const token of TEAMARNESS_THEME_TOKENS) expect(style.textContent).toContain(`var(${token})`);
+    for (const token of TEAMARNESS_THEME_TOKENS) expect(kitSheet.cssText).toContain(`var(${token})`);
 
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets, packageSheetAfter];
     cleanupFirst();
     cleanupFirst();
-    expect(root.children).toHaveLength(1);
+    expect(root.adoptedStyleSheets).toEqual([packageSheetBefore, kitSheet, packageSheetAfter]);
     cleanupSecond();
     cleanupSecond();
-    expect(root.children).toHaveLength(0);
+    expect(root.adoptedStyleSheets).toEqual([packageSheetBefore, packageSheetAfter]);
+  });
+
+  it("fails rather than adding an inline fallback when constructed sheets are unsupported", () => {
+    vi.stubGlobal("CSSStyleSheet", undefined);
+    expect(() => installPackageUiKit(fakeShadowRoot())).toThrow(/constructed CSSStyleSheet support/);
+
+    vi.stubGlobal("CSSStyleSheet", class {});
+    expect(() => installPackageUiKit(fakeShadowRoot())).toThrow(/replaceSync support/);
+
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    expect(() => installPackageUiKit({} as ShadowRoot)).toThrow(/adoptedStyleSheets support/);
+    const immutableRoot = Object.defineProperty({}, "adoptedStyleSheets", {
+      get: () => [],
+      set: () => { throw new Error("read only"); },
+    }) as ShadowRoot;
+    expect(() => installPackageUiKit(immutableRoot)).toThrow(/mutable ShadowRoot\.adoptedStyleSheets support/);
   });
 });
 

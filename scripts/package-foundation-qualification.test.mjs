@@ -101,6 +101,27 @@ test("Package UI guidance publishes every theme token and opt-in kit class", asy
   }
 });
 
+test("Package styles preserve the strict host policy and avoid inline style APIs", async () => {
+  const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
+  const styleDirective = config.app.security.csp
+    .split(";")
+    .map((directive) => directive.trim().split(/\s+/))
+    .find(([name]) => name === "style-src");
+  assert.deepEqual(styleDirective, ["style-src", "'self'", "teamarness-package:"]);
+
+  for (const path of [
+    "packages/teamarness-package-ui-sdk/src/index.ts",
+    "packages/reference-package/ui/src/index.ts",
+  ]) {
+    const source = await read(path);
+    assert.doesNotMatch(source, /createElement\(\s*["']style["']/, `${path} must not create inline style elements`);
+    assert.doesNotMatch(source, /\bstyle\.textContent\b/, `${path} must not write style text content`);
+    assert.doesNotMatch(source, /setAttribute\(\s*["']style["']/, `${path} must not set style attributes`);
+    assert.doesNotMatch(source, /\.style(?:\.|\[|\s*=)/, `${path} must not mutate style attributes`);
+    assert.match(source, /adoptedStyleSheets/, `${path} must use adopted stylesheets`);
+  }
+});
+
 test("generated foundation and Tutorial policy remain independent", async () => {
   const packageJson = JSON.parse(await read("package.json"));
   const agents = await read("templates/package-foundation/v1/AGENTS.md");

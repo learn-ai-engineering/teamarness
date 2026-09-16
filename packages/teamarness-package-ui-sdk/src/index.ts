@@ -75,17 +75,51 @@ const PACKAGE_UI_KIT_CSS = `
   }
 `;
 
-const installedKits = new WeakMap<ShadowRoot, { readonly style: HTMLStyleElement; users: number }>();
+const installedKits = new WeakMap<ShadowRoot, { readonly sheet: CSSStyleSheet; users: number }>();
+
+function currentAdoptedSheets(root: ShadowRoot): readonly CSSStyleSheet[] {
+  if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
+    throw new Error("The Package UI kit requires ShadowRoot.adoptedStyleSheets support");
+  }
+  return root.adoptedStyleSheets;
+}
+
+function createKitSheet(): CSSStyleSheet {
+  const StyleSheet = globalThis.CSSStyleSheet;
+  if (typeof StyleSheet !== "function") {
+    throw new Error("The Package UI kit requires constructed CSSStyleSheet support");
+  }
+  let sheet: CSSStyleSheet;
+  try {
+    sheet = new StyleSheet();
+  } catch (cause) {
+    throw new Error("The Package UI kit requires constructed CSSStyleSheet support", { cause });
+  }
+  if (typeof sheet.replaceSync !== "function") {
+    throw new Error("The Package UI kit requires CSSStyleSheet.replaceSync support");
+  }
+  sheet.replaceSync(PACKAGE_UI_KIT_CSS);
+  return sheet;
+}
+
+function setAdoptedSheets(root: ShadowRoot, sheets: CSSStyleSheet[]): void {
+  try {
+    root.adoptedStyleSheets = sheets;
+  } catch (cause) {
+    throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
+  }
+}
 
 export function installPackageUiKit(root: ShadowRoot): () => void {
   let installation = installedKits.get(root);
   if (installation === undefined) {
-    const style = root.ownerDocument.createElement("style");
-    style.setAttribute("data-teamarness-ui-kit", "");
-    style.textContent = PACKAGE_UI_KIT_CSS;
-    installation = { style, users: 0 };
+    const sheet = createKitSheet();
+    setAdoptedSheets(root, [...currentAdoptedSheets(root), sheet]);
+    if (!currentAdoptedSheets(root).includes(sheet)) {
+      throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support");
+    }
+    installation = { sheet, users: 0 };
     installedKits.set(root, installation);
-    root.append(style);
   }
   installation.users += 1;
 
@@ -97,7 +131,7 @@ export function installPackageUiKit(root: ShadowRoot): () => void {
     if (current !== installation) return;
     current.users -= 1;
     if (current.users === 0) {
-      current.style.remove();
+      setAdoptedSheets(root, currentAdoptedSheets(root).filter((sheet) => sheet !== current.sheet));
       installedKits.delete(root);
     }
   };

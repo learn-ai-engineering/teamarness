@@ -35,7 +35,7 @@ Use the semantic purpose rather than assuming a particular light or dark value:
 
 ## Optional CSS kit
 
-Call `installPackageUiKit(root)` during mount. It installs one marked style element in that Shadow Root even when installers overlap. Keep the returned cleanup function and call it during unmount. Each cleanup is idempotent; the style remains until every overlapping installer has cleaned up.
+Call `installPackageUiKit(root)` during mount. It constructs one `CSSStyleSheet` and adds it to that Shadow Root's `adoptedStyleSheets`, even when installers overlap. Keep the returned cleanup function and call it during unmount. Each cleanup is idempotent. The sheet remains until every overlapping installer has cleaned up, and cleanup preserves every unrelated adopted sheet.
 
 ```ts
 import { installPackageUiKit, type PackageMountContext } from "@teamarness/package-ui-sdk";
@@ -75,6 +75,10 @@ The kit publishes these opt-in classes:
 | `.teamarness-focus` | Visible `:focus-visible` outline for a custom focusable element |
 
 The installer adds only local box sizing outside those classes. It does not select or modify Package content, and it does not install styles in `document`.
+
+The host's `style-src` rejects runtime inline `<style>` elements and `style` attributes. The installer does not bypass that policy. It fails the Package mount if constructed stylesheets or mutable `ShadowRoot.adoptedStyleSheets` are unavailable. Do not add an inline fallback, nonce, hash, `data:` style, or `blob:` style.
+
+Package-owned CSS must follow the same `style-src` policy. Construct a separate `CSSStyleSheet`, call `replaceSync()`, add it to the Package Shadow Root's `adoptedStyleSheets`, and remove only that sheet during unmount. Keep Package rules separate from the optional kit so ownership and cleanup remain clear.
 
 ## Package-owned composition
 
