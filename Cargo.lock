@@ -999,7 +999,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.5",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -6177,6 +6177,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 
@@ -6594,20 +6595,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "teamarness-tutorial-package"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.4.3",
- "jsonschema",
- "serde",
- "serde_json",
- "teamarness-package-protocol",
- "teamarness-package-sdk",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "teamarness-package-host"
 version = "0.1.0"
 dependencies = [
@@ -6650,6 +6637,20 @@ name = "teamarness-reference-package"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
+ "teamarness-package-protocol",
+ "teamarness-package-sdk",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "teamarness-tutorial-package"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "jsonschema",
+ "serde",
  "serde_json",
  "teamarness-package-protocol",
  "teamarness-package-sdk",
