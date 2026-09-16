@@ -1,15 +1,21 @@
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value as JsonValue};
 use teamarness_package_sdk::{
-    Backend, BackendError, BackendRequest, EventSubscription, Package, event_channel,
+    Backend, BackendError, BackendRequest, CapabilityClient, EventSubscription, Package,
+    event_channel,
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::domain::{DomainRecord, PAGE_SIZE, decode_id, hex_id};
+use crate::immutable_log::{
+    CapabilityLogAdapter, ImmutableRecordLog, LogError, LogEvent, LogSubscription,
+    OpenResultStatus, SyncStatus,
+};
 use crate::store::{ConversationStore, IngestResult};
 
 fn object<const N: usize>(entries: [(&str, JsonValue); N]) -> JsonValue {
@@ -39,6 +45,19 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
         "conversations.capability_unavailable",
         cause.retryable(),
         object([("causeCode", JsonValue::String(cause.code().to_owned()))]),
+    )
+}
+fn log_error(operation: &str, cause: LogError) -> BackendError {
+    let (code, retryable) = match &cause {
+        LogError::Transport(c) => (c.clone(), true),
+        LogError::InvalidResponse => ("conversations.invalid_record".into(), false),
+        LogError::StreamClosed => ("conversations.stream_closed".into(), true),
+    };
+    eprintln!("conversations log failure: operation={operation} code={code} retryable={retryable}");
+    BackendError::new(
+        "conversations.capability_unavailable",
+        retryable,
+        object([("causeCode", JsonValue::String(code))]),
     )
 }
 fn grant(init: &teamarness_package_sdk::Initialization, id: &str) -> Result<String, BackendError> {
@@ -72,6 +91,7 @@ pub struct ConversationsBackend {
 pub(crate) struct Active {
     pub(crate) store: ConversationStore,
     pub(crate) record_grant: String,
+    pub(crate) sync_status: Arc<AsyncMutex<SyncStatus>>,
 }
 pub(crate) struct Running {
     pub(crate) active: Active,
@@ -130,119 +150,59 @@ impl ConversationsBackend {
             &r.initialization,
             "teamarness.synchronization.immutable-record-log",
         )?;
+        let log = CapabilityLogAdapter::new(r.capabilities.clone(), sync.clone());
+
+        // Open control records (channel creates / hides) to rehydrate display data.
+        let control_records = store
+            .control_records()
+            .map_err(|_| error("conversations.storage_failed", true))?;
+        for batch in control_records.chunks(32) {
+            let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+            let results = log
+                .open(sealed)
+                .await
+                .map_err(|cause| log_error("open-control-records", cause))?;
+            for result in results {
+                if let OpenResultStatus::Ready { canonical } = &result.status {
+                    let _ = store.remember_opened(canonical);
+                }
+            }
+        }
+
+        // Open and retry deferred records (e.g. messages before their channel).
+        let deferred = store
+            .deferred_records()
+            .map_err(|_| error("conversations.storage_failed", true))?;
+        for batch in deferred.chunks(32) {
+            let records: Vec<_> = batch.to_vec();
+            let sealed: Vec<Vec<u8>> = records
+                .iter()
+                .map(|row| row.sealed_record.clone())
+                .collect();
+            let results = log
+                .open(sealed)
+                .await
+                .map_err(|cause| log_error("open-deferred-records", cause))?;
+            for (row, result) in records.iter().zip(results.iter()) {
+                if let OpenResultStatus::Ready { canonical } = &result.status {
+                    let _ = store.retry_deferred(&row.record_id, canonical);
+                }
+            }
+        }
+
+        let sync_status = Arc::new(AsyncMutex::new(SyncStatus::CatchingUp));
         let active = Active {
             store: store.clone(),
             record_grant: sync.clone(),
+            sync_status: sync_status.clone(),
         };
-        let cursor = store
-            .cursor()
-            .map_err(|_| error("conversations.storage_failed", true))?;
-        let mut sub = r
-            .capabilities
-            .subscribe(
-                &sync,
-                object([
-                    ("method", JsonValue::String("subscribe".into())),
-                    (
-                        "afterCursor",
-                        cursor.map_or(JsonValue::Null, JsonValue::String),
-                    ),
-                ]),
-            )
-            .await
-            .map_err(|cause| capability_error("subscribe", cause))?;
-        for batch in store
-            .control_records()
-            .map_err(|_| error("conversations.storage_failed", true))?
-            .chunks(32)
-        {
-            let sealed = batch
-                .iter()
-                .map(|row| JsonValue::String(b64(&row.sealed_record)))
-                .collect();
-            let opened = r
-                .capabilities
-                .call(
-                    &sync,
-                    "open",
-                    object([("sealedRecords", JsonValue::Array(sealed))]),
-                )
-                .await
-                .map_err(|cause| capability_error("open-control-records", cause))?;
-            if let Some(results) = opened.get("results").and_then(JsonValue::as_array) {
-                for result in results {
-                    if let Some(canonical) = result.get("canonical").and_then(JsonValue::as_str) {
-                        let bytes = from_b64(canonical)?;
-                        let _ = store.remember_opened(&bytes);
-                    }
-                }
-            }
-        }
-        for batch in store
-            .deferred_records()
-            .map_err(|_| error("conversations.storage_failed", true))?
-            .chunks(32)
-        {
-            let sealed = batch
-                .iter()
-                .map(|row| JsonValue::String(b64(&row.sealed_record)))
-                .collect();
-            let opened = r
-                .capabilities
-                .call(
-                    &sync,
-                    "open",
-                    object([("sealedRecords", JsonValue::Array(sealed))]),
-                )
-                .await
-                .map_err(|cause| capability_error("open-deferred-records", cause))?;
-            if let Some(results) = opened.get("results").and_then(JsonValue::as_array) {
-                for (row, result) in batch.iter().zip(results) {
-                    if let Some(canonical) = result.get("canonical").and_then(JsonValue::as_str) {
-                        let canonical = from_b64(canonical)?;
-                        store
-                            .retry_deferred(&row.record_id, &canonical)
-                            .map_err(|_| error("conversations.storage_failed", true))?;
-                    }
-                }
-            }
-        }
+
         let backend = self.clone();
-        let state = active.clone();
-        let (cancel, mut cancelled) = watch::channel(false);
+        let capabilities = r.capabilities.clone();
+        let (cancel, cancelled) = watch::channel(false);
+        let active_clone = active.clone();
         let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = cancelled.changed() => {
-                        if result.is_err() || *cancelled.borrow() {
-                            break;
-                        }
-                    }
-                    event = sub.recv() => match event {
-                        Some(Ok(event)) => match ingest_event(&state.store, &event) {
-                            Ok(_) => backend.changes.send_modify(|revision| *revision = revision.saturating_add(1)),
-                            Err(error) => eprintln!(
-                                "conversations record ingestion failure: code={} retryable={}",
-                                error.code(),
-                                error.retryable()
-                            ),
-                        },
-                        Some(Err(error)) => {
-                            eprintln!(
-                                "conversations record subscription failure: code={} retryable={}",
-                                error.code(),
-                                error.retryable()
-                            );
-                            break;
-                        }
-                        None => {
-                            eprintln!("conversations record subscription closed");
-                            break;
-                        }
-                    }
-                }
-            }
-            sub.close().await;
+            run_session(backend, active_clone, capabilities, sync, cancelled).await;
         });
         *self.active.lock().await = Some(Running {
             active,
@@ -251,8 +211,10 @@ impl ConversationsBackend {
         });
         Ok(object([]))
     }
+
     async fn snapshot(&self) -> Result<JsonValue, BackendError> {
         let a = self.active().await?;
+        let availability = a.sync_status.lock().await.availability().to_owned();
         let channels = a
             .store
             .channels()
@@ -281,10 +243,11 @@ impl ConversationsBackend {
         };
         Ok(object([
             ("channels", JsonValue::Array(visible)),
-            ("availability", JsonValue::String("current".into())),
+            ("availability", JsonValue::String(availability)),
             ("warnings", JsonValue::Array(warnings)),
         ]))
     }
+
     async fn append(
         &self,
         r: &BackendRequest,
@@ -328,6 +291,7 @@ impl ConversationsBackend {
         self.changes.send_modify(|x| *x = x.saturating_add(1));
         Ok(object([("ok", JsonValue::Bool(true))]))
     }
+
     async fn page(
         &self,
         r: &BackendRequest,
@@ -387,7 +351,10 @@ impl ConversationsBackend {
             }
         }
         let mut page = object([("messages", JsonValue::Array(messages))]);
-        if has_more && let Some(next) = last_order && let JsonValue::Object(ref mut o) = page {
+        if has_more
+            && let Some(next) = last_order
+            && let JsonValue::Object(ref mut o) = page
+        {
             o.insert("nextBefore".into(), JsonValue::String(next));
         }
         Ok(page)
@@ -507,18 +474,155 @@ impl Backend for ConversationsBackend {
         })
     }
 }
-fn ingest_event(store: &ConversationStore, v: &JsonValue) -> Result<IngestResult, BackendError> {
-    let id = str_field(v, "recordId")?;
-    let order = str_field(v, "orderKey")?;
-    let author = str_field(v, "author")?;
-    let purpose = str_field(v, "purpose")?;
-    let sig = str_field(v, "signature")?;
-    let canonical = from_b64(&str_field(v, "canonical")?)?;
-    let sealed = from_b64(&str_field(v, "sealedRecord")?)?;
-    let cursor = v.get("cursor").and_then(JsonValue::as_str);
-    store
-        .ingest(
-            &id, &order, &author, &purpose, &sig, &canonical, &sealed, cursor,
-        )
-        .map_err(|_| error("conversations.storage_failed", true))
+
+// ---------------------------------------------------------------------------
+// session loop
+// ---------------------------------------------------------------------------
+
+const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Run a cancellation-aware session loop that subscribes from the committed
+/// cursor, ingests events, and reconnects with exponential backoff on failure.
+async fn run_session(
+    backend: ConversationsBackend,
+    active: Active,
+    capabilities: CapabilityClient,
+    grant: String,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let log = CapabilityLogAdapter::new(capabilities, grant);
+    let mut backoff = INITIAL_BACKOFF;
+
+    // Start in catching-up; the first healthy record transitions to current.
+    *active.sync_status.lock().await = SyncStatus::CatchingUp;
+
+    'outer: loop {
+        // Check cancellation before expensive subscribe.
+        if *cancelled.borrow() {
+            break;
+        }
+
+        let cursor = match active.store.cursor() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("conversations cursor read failure: {e:?}");
+                *active.sync_status.lock().await =
+                    SyncStatus::Degraded("cursor_read_failed".into());
+                break;
+            }
+        };
+
+        let mut sub = match log.subscribe(cursor).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("conversations subscribe failure: {e}");
+                *active.sync_status.lock().await = SyncStatus::Degraded("subscribe_failed".into());
+                break;
+            }
+        };
+
+        // Inner receive loop — processes events from one subscription.
+        let outcome = receive_loop(&backend, &active, &mut sub, &mut cancelled).await;
+        sub.close().await;
+
+        match outcome {
+            ReceiveOutcome::Cancelled => break 'outer,
+            ReceiveOutcome::StreamEnded | ReceiveOutcome::TransportError => {
+                // Transition to catching-up and reconnect after backoff.
+                *active.sync_status.lock().await = SyncStatus::CatchingUp;
+
+                tokio::select! {
+                    _ = cancelled.changed() => break 'outer,
+                    _ = tokio::time::sleep(backoff) => {},
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+enum ReceiveOutcome {
+    Cancelled,
+    StreamEnded,
+    TransportError,
+}
+
+/// Inner loop: process events from one subscription until cancellation,
+/// stream close, or a transport error.
+async fn receive_loop(
+    backend: &ConversationsBackend,
+    active: &Active,
+    sub: &mut LogSubscription,
+    cancelled: &mut watch::Receiver<bool>,
+) -> ReceiveOutcome {
+    loop {
+        tokio::select! {
+            result = cancelled.changed() => {
+                if result.is_err() || *cancelled.borrow() {
+                    return ReceiveOutcome::Cancelled;
+                }
+            }
+            event = sub.recv() => match event {
+                Some(Ok(LogEvent::Record {
+                    record_id,
+                    order_key,
+                    author,
+                    purpose,
+                    signature,
+                    canonical,
+                    sealed_record,
+                    cursor,
+                })) => {
+                    match active.store.ingest(
+                        &record_id, &order_key, &author, &purpose, &signature,
+                        &canonical, &sealed_record, cursor.as_deref(),
+                    ) {
+                        Ok(_) => {
+                            backend.changes.send_modify(|x| *x = x.saturating_add(1));
+                            // Quiescence fallback: first successful record
+                            // ingestion transitions to current when no explicit
+                            // state event arrived.
+                            let mut status = active.sync_status.lock().await;
+                            if *status == SyncStatus::CatchingUp {
+                                *status = SyncStatus::Current;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("conversations record ingestion failure: {err:?}");
+                        }
+                    }
+                }
+                Some(Ok(LogEvent::State { availability })) => {
+                    if let Some(avail) = availability {
+                        let mut status = active.sync_status.lock().await;
+                        match avail.as_str() {
+                            "current" => *status = SyncStatus::Current,
+                            "catching_up" => *status = SyncStatus::CatchingUp,
+                            _ => {}
+                        }
+                    }
+                }
+                Some(Ok(LogEvent::Warning { code, message })) => {
+                    eprintln!(
+                        "conversations subscription warning: code={code} message={}",
+                        message.as_deref().unwrap_or("")
+                    );
+                }
+                Some(Err(err @ LogError::Transport(_))) => {
+                    eprintln!("conversations subscription transport failure: {err}");
+                    return ReceiveOutcome::TransportError;
+                }
+                Some(Err(err)) => {
+                    eprintln!("conversations event parse error: {err}");
+                    // Continue on parse errors — a single malformed event
+                    // does not tear down the subscription.
+                }
+                None => {
+                    eprintln!("conversations record subscription closed");
+                    return ReceiveOutcome::StreamEnded;
+                }
+            }
+        }
+    }
 }
