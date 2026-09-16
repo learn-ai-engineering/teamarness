@@ -20,12 +20,13 @@ export type TeamarnessThemeToken = (typeof TEAMARNESS_THEME_TOKENS)[number];
 const PACKAGE_UI_KIT_CSS = `
   :host, :host * { box-sizing: border-box; }
 
+  /* Inherit the complete surrounding font instead of selecting var(--teamarness-font-body). */
   .teamarness-control {
     border: 1px solid var(--teamarness-color-border);
     border-radius: var(--teamarness-radius-control);
     background: var(--teamarness-color-panel);
     color: var(--teamarness-color-text);
-    font-family: var(--teamarness-font-body);
+    font: inherit;
     padding: 0.55rem 0.8rem;
   }
   .teamarness-control--primary {

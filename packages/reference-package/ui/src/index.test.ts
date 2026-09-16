@@ -110,6 +110,12 @@ describe("reference Package UI", () => {
 
     expect(root.adoptedStyleSheets).toHaveLength(3);
     expect(root.adoptedStyleSheets[0]).toBe(sheetBefore);
+    const packageSheet = root.adoptedStyleSheets[2] as unknown as FakeCSSStyleSheet;
+    expect(packageSheet.cssText).toMatch(/\.reference-action\s*\{[^}]*align-self:\s*flex-start/);
+    const heading = createdElements.find((element) => element.textContent === "Reference Package");
+    expect(heading?.tagName).toBe("H2");
+    const action = createdElements.find((element) => element.textContent === "Increment counter");
+    expect(action?.className).toContain("reference-action");
     expect(createdElements.every((element) => element.tagName !== "STYLE")).toBe(true);
     const kitLabelIndex = createdElements.findIndex((element) => element.textContent === "UI kit");
     expect(kitLabelIndex).toBeGreaterThanOrEqual(0);

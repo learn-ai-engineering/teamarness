@@ -113,6 +113,15 @@ async function copyCanonicalSdkSources(destination) {
     await rm(target, { recursive: true, force: true });
     await cp(source, target, { recursive: true });
   }
+
+  const generatedGuidePath = join(vendorRoot, "package-ui-sdk/README.md");
+  const canonicalGuidePath = join(repositoryRoot, "packages/teamarness-package-ui-sdk/README.md");
+  const generatedNotice = await readFile(generatedGuidePath, "utf8");
+  const canonicalGuide = await readFile(canonicalGuidePath, "utf8");
+  const heading = canonicalGuide.slice(0, canonicalGuide.indexOf("\n"));
+  const noticeBody = generatedNotice.slice(generatedNotice.indexOf("\n") + 1).trim();
+  const canonicalBody = canonicalGuide.slice(canonicalGuide.indexOf("\n") + 1).trimStart();
+  await writeFile(generatedGuidePath, `${heading}\n\n${noticeBody}\n\n${canonicalBody}`);
 }
 
 async function replaceTokens(path, tokens) {

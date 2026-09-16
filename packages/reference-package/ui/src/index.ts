@@ -10,6 +10,7 @@ import referenceAsset from "./probe.svg?no-inline";
 const REFERENCE_PACKAGE_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
   .reference-heading { margin: 0; }
+  .reference-action { align-self: flex-start; }
   .reference-details { display: grid; grid-template-columns: max-content 1fr; gap: .4rem .8rem; }
   .reference-details dt { font-weight: 700; }
   .reference-details dd { margin: 0; overflow-wrap: anywhere; }
@@ -82,7 +83,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   }
   const article = document.createElement("article");
   article.className = "teamarness-panel teamarness-stack";
-  const heading = document.createElement("h3");
+  const heading = document.createElement("h2");
   heading.className = "reference-heading";
   heading.textContent = context.package.displayName;
   const logo = document.createElement("img");
@@ -116,7 +117,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   }
   const increment = document.createElement("button");
   increment.type = "button";
-  increment.className = "teamarness-control teamarness-control--primary";
+  increment.className = "reference-action teamarness-control teamarness-control--primary";
   increment.textContent = "Increment counter";
   article.append(heading, logo, details, increment);
   context.root.append(article);

@@ -86,6 +86,7 @@ describe("Package presentation contract", () => {
     expect(root.adoptedStyleSheets).toHaveLength(2);
     expect(root.adoptedStyleSheets[0]).toBe(packageSheetBefore);
     const kitSheet = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
+    expect(kitSheet.cssText).toMatch(/\.teamarness-control\s*\{[^}]*font:\s*inherit/);
     for (const className of [
       "teamarness-control",
       "teamarness-control--primary",

@@ -114,6 +114,7 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
   for (const path of [
     "packages/teamarness-package-ui-sdk/src/index.ts",
     "packages/reference-package/ui/src/index.ts",
+    "packages/tutorial/ui/src/index.ts",
   ]) {
     const source = await read(path);
     assert.doesNotMatch(source, /createElement\(\s*["']style["']/, `${path} must not create inline style elements`);

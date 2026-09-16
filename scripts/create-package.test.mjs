@@ -198,6 +198,14 @@ test("copies canonical SDK production trees and records exact provenance", async
     const canonicalUiSdk = JSON.parse(await readFile(join(repositoryRoot, "packages/teamarness-package-ui-sdk/package.json"), "utf8"));
     const generatedUiSdk = JSON.parse(await readFile(join(output, "vendor/teamarness/package-ui-sdk/package.json"), "utf8"));
     assert.deepEqual(generatedUiSdk.dependencies, canonicalUiSdk.dependencies);
+    const canonicalUiGuide = await readFile(join(repositoryRoot, "packages/teamarness-package-ui-sdk/README.md"), "utf8");
+    const generatedUiGuide = await readFile(join(output, "vendor/teamarness/package-ui-sdk/README.md"), "utf8");
+    assert.match(generatedUiGuide, /generated from the Teamarness checkout/);
+    assert.match(generatedUiGuide, /vendored so the project remains buildable/);
+    assert.ok(
+      generatedUiGuide.endsWith(canonicalUiGuide.slice(canonicalUiGuide.indexOf("\n") + 1).trimStart()),
+      "generated UI SDK guidance must embed the canonical guide without a second maintained copy",
+    );
 
     const generatedPackage = JSON.parse(await readFile(join(output, "package.json"), "utf8"));
     assert.match(generatedPackage.scripts.test, /node --test scripts\/assemble-package\.test\.mjs/);

@@ -5,6 +5,14 @@ import { mount } from "./index";
 
 type Listener = () => void;
 
+class FakeCSSStyleSheet {
+  cssText = "";
+
+  replaceSync(css: string): void {
+    this.cssText = css;
+  }
+}
+
 class FakeElement {
   readonly children: FakeElement[] = [];
   readonly attributes = new Map<string, string>();
@@ -15,6 +23,7 @@ class FakeElement {
   value = "";
   type = "";
   disabled = false;
+  adoptedStyleSheets: CSSStyleSheet[] = [];
 
   constructor(readonly tagName: string) {}
 
@@ -70,6 +79,7 @@ class FakeDocument {
 }
 
 globalThis.document = new FakeDocument() as unknown as Document;
+globalThis.CSSStyleSheet = FakeCSSStyleSheet as unknown as typeof CSSStyleSheet;
 
 describe("Tutorial UI mount", () => {
   it("places the unlabeled Palette and Pattern selects in phrase order", async () => {
@@ -87,6 +97,26 @@ describe("Tutorial UI mount", () => {
     expect(artwork?.getAttribute("role")).toBe("img");
     expect(artwork?.children).toHaveLength(192);
     expect(artwork?.children.every((cell) => cell.getAttribute("aria-hidden") === "true")).toBe(true);
+  });
+
+  it("adopts and removes only its constructed stylesheet without creating inline styles", async () => {
+    const root = new FakeElement("shadow-root");
+    const sheetBefore = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    const sheetAfter = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    root.adoptedStyleSheets = [sheetBefore];
+
+    const unmount = await mount(context(root));
+
+    expect(root.adoptedStyleSheets).toHaveLength(2);
+    expect(root.adoptedStyleSheets[0]).toBe(sheetBefore);
+    const tutorialSheet = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
+    expect(tutorialSheet.cssText).toMatch(/button\s*\{[^}]*color:\s*var\(--teamarness-color-background\)/);
+    expect(descendants(root, (element) => element.tagName === "style")).toHaveLength(0);
+
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheetAfter];
+    await unmount();
+    await unmount();
+    expect(root.adoptedStyleSheets).toEqual([sheetBefore, sheetAfter]);
   });
 });
 

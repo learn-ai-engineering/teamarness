@@ -22,6 +22,55 @@ type ReadResponse = Readonly<{
   artworks: readonly SavedArtwork[];
 }>;
 
+const TUTORIAL_PACKAGE_CSS = `
+  :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
+  article { display: grid; gap: .9rem; padding: 1rem; }
+  h2, p { margin: 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: .7rem; align-items: center; }
+  select, button { font: inherit; border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
+  button { border: 0; background: var(--teamarness-color-accent); color: var(--teamarness-color-background); cursor: pointer; }
+  .art { display: grid; grid-template-columns: repeat(16, 1.75rem); grid-auto-rows: 1.75rem; width: fit-content; max-width: 100%; overflow: auto; }
+  .cell { display: grid; place-items: center; font-size: 1.25rem; line-height: 1; }
+  .error { color: var(--teamarness-color-danger, #b42318); min-height: 1.2em; }
+  .saved { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .saved button[aria-pressed="true"] { outline: 2px solid currentColor; }
+`;
+
+function installTutorialStyles(root: ShadowRoot): () => void {
+  const StyleSheet = globalThis.CSSStyleSheet;
+  if (typeof StyleSheet !== "function") {
+    throw new Error("The Tutorial Package requires constructed CSSStyleSheet support");
+  }
+  if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
+    throw new Error("The Tutorial Package requires ShadowRoot.adoptedStyleSheets support");
+  }
+  let sheet: CSSStyleSheet;
+  try {
+    sheet = new StyleSheet();
+  } catch (cause) {
+    throw new Error("The Tutorial Package requires constructed CSSStyleSheet support", { cause });
+  }
+  if (typeof sheet.replaceSync !== "function") {
+    throw new Error("The Tutorial Package requires CSSStyleSheet.replaceSync support");
+  }
+  sheet.replaceSync(TUTORIAL_PACKAGE_CSS);
+  try {
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+  } catch (cause) {
+    throw new Error("The Tutorial Package requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
+  }
+  if (!root.adoptedStyleSheets.includes(sheet)) {
+    throw new Error("The Tutorial Package requires mutable ShadowRoot.adoptedStyleSheets support");
+  }
+
+  let cleaned = false;
+  return () => {
+    if (cleaned) return;
+    cleaned = true;
+    root.adoptedStyleSheets = root.adoptedStyleSheets.filter((candidate) => candidate !== sheet);
+  };
+}
+
 export type TutorialState = Readonly<{
   algorithms: readonly Choice[];
   palettes: readonly PaletteChoice[];
@@ -141,20 +190,7 @@ export function createTutorialController(
 }
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const style = document.createElement("style");
-  style.textContent = `
-    :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-    article { display: grid; gap: .9rem; padding: 1rem; }
-    h2, p { margin: 0; }
-    .controls { display: flex; flex-wrap: wrap; gap: .7rem; align-items: center; }
-    select, button { font: inherit; border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
-    button { border: 0; background: var(--teamarness-color-accent); cursor: pointer; }
-    .art { display: grid; grid-template-columns: repeat(16, 1.75rem); grid-auto-rows: 1.75rem; width: fit-content; max-width: 100%; overflow: auto; }
-    .cell { display: grid; place-items: center; font-size: 1.25rem; line-height: 1; }
-    .error { color: var(--teamarness-color-danger, #b42318); min-height: 1.2em; }
-    .saved { display: flex; flex-wrap: wrap; gap: .4rem; }
-    .saved button[aria-pressed="true"] { outline: 2px solid currentColor; }
-  `;
+  const cleanupStyles = installTutorialStyles(context.root);
   const article = document.createElement("article");
   const heading = document.createElement("h2");
   heading.textContent = context.package.displayName;
@@ -176,7 +212,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const savedList = document.createElement("div");
   savedList.className = "saved";
   article.append(heading, controls, error, grid, savedHeading, savedList);
-  context.root.append(style, article);
+  context.root.append(article);
 
   const render = (state: TutorialState): void => {
     replaceOptions(palette, state.palettes, state.palette);
@@ -228,7 +264,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     generate.removeEventListener("click", onGenerate);
     save.removeEventListener("click", onSave);
     article.remove();
-    style.remove();
+    cleanupStyles();
   };
 }
 
