@@ -14,6 +14,9 @@ const tutorialResources = join(app, "Contents/Resources/packages/dev.teamarness.
 const staged = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.reference");
 const stagedTutorial = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.tutorial");
 const dmg = join(repositoryRoot, "target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg");
+const diagnosticOutputLimit = 4_096;
+
+class SmokeTimeoutError extends Error {}
 
 if (process.platform !== "darwin" || process.arch !== "arm64") {
   throw new Error("The packaged application smoke requires Apple silicon macOS");
@@ -37,19 +40,49 @@ try {
 }
 
 async function smokeLaunch(dataDirectory, createWorkspace) {
+  const appStdout = createBoundedOutput();
+  const appStderr = createBoundedOutput();
+  const diagnostics = {
+    activeStage: "desktop process",
+    lastAccessibilityFailure: "",
+    privateValues: [dataDirectory],
+    appStdout,
+    appStderr,
+  };
   const desktop = spawn(executable, ["--data-dir", dataDirectory], {
     cwd: repositoryRoot,
     detached: false,
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  const childPid = await waitFor(() => desktop.pid, "desktop process");
+  desktop.stdout.on("data", appStdout.append);
+  desktop.stderr.on("data", appStderr.append);
+
+  let childPid;
   const backendPids = [];
+  const atStage = async (stage, operation) => {
+    diagnostics.activeStage = stage;
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof SmokeTimeoutError) {
+        throw new Error(formatTimeoutDiagnostics(error, diagnostics, childPid));
+      }
+      throw error;
+    }
+  };
+  const waitForAccessible = (source, label) => atStage(label, () =>
+    waitForAppleScript(source, label, (failure) => {
+      diagnostics.lastAccessibilityFailure = failure;
+    }));
+
   try {
-    await waitForAppleScript(accessibilityScript(childPid, `
+    childPid = await atStage("desktop process", () => waitFor(() => desktop.pid, "desktop process"));
+    await waitForAccessible(accessibilityScript(childPid, `
       return name of window 1
     `), "desktop window");
 
     if (createWorkspace) {
+      diagnostics.activeStage = "Workspace creation";
       await runAppleScript(accessibilityScript(childPid, `
         set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
         set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
@@ -63,81 +96,78 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
       assert.equal(await registrationExists(dataDirectory), false, "fresh bundled Tutorial created a registration file");
     }
 
+    await waitForAccessible(accessibilityScript(childPid, `
+      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
+      set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
+      set referencePackage to my namedDescendantStartingWith(teamPackages, "Reference Package", "AXButton")
+      return name of referencePackage
+    `), "bundled reference Package navigation");
+
     const referenceBackend = join(resources, "backend/teamarness-reference-package-aarch64-apple-darwin");
     const tutorialBackend = join(tutorialResources, "backend/teamarness-tutorial-package-aarch64-apple-darwin");
-    const referenceBackendPid = await waitFor(
-      () => bundledBackend(childPid, referenceBackend),
-      "bundled Reference Backend",
-    );
+    const referenceBackendPid = await atStage("bundled Package Backend", () =>
+      waitFor(() => bundledBackend(childPid, referenceBackend), "bundled Package Backend"));
     backendPids.push(referenceBackendPid);
     assertBundledBackend(referenceBackendPid, childPid, referenceBackend, "Reference");
-    const tutorialBackendPid = await waitFor(
-      () => bundledBackend(childPid, tutorialBackend),
-      "bundled Tutorial Backend",
-    );
+    const tutorialBackendPid = await atStage("bundled Tutorial Backend", () =>
+      waitFor(() => bundledBackend(childPid, tutorialBackend), "bundled Tutorial Backend"));
     backendPids.push(tutorialBackendPid);
     assertBundledBackend(tutorialBackendPid, childPid, tutorialBackend, "Tutorial");
 
-    await waitForAppleScript(accessibilityScript(childPid, `
+    await waitForAccessible(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
       set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
       set tutorialPackage to my namedDescendantStartingWith(teamPackages, "Tutorial", "AXButton")
       return name of tutorialPackage
     `), "bundled Tutorial navigation");
+    diagnostics.activeStage = "bundled Tutorial selection";
     await runAppleScript(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
       set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
       set tutorialPackage to my namedDescendantStartingWith(teamPackages, "Tutorial", "AXButton")
       click tutorialPackage
     `), "bundled Tutorial selection");
-    await waitFor(async () => {
+    await atStage("bundled Tutorial UI request response", () => waitFor(async () => {
       const contents = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
         set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
         set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
         return entire contents of packageInterface
       `)], { encoding: "utf8" });
-      return contents.status === 0
-        && contents.stdout.includes("Generate")
+      if (contents.status !== 0) {
+        diagnostics.lastAccessibilityFailure = appleScriptFailure(contents);
+        return undefined;
+      }
+      return contents.stdout.includes("Generate")
         && contents.stdout.includes("Save")
         && contents.stdout.includes("Waves")
         && contents.stdout.includes("Garden");
-    }, "bundled Tutorial UI request response");
+    }));
 
-    await waitForAppleScript(accessibilityScript(childPid, `
-      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
-      set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
-      set referencePackage to my namedDescendantStartingWith(teamPackages, "Reference Package", "AXButton")
-      return name of referencePackage
-    `), "bundled reference Package navigation");
+    diagnostics.activeStage = "bundled reference Package selection";
     await runAppleScript(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
       set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
       set referencePackage to my namedDescendantStartingWith(teamPackages, "Reference Package", "AXButton")
       click referencePackage
     `), "bundled reference Package selection");
-    let lastPackageUiFailure = "";
-    try {
-      await waitFor(async () => {
-        const contents = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
-          set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
-          set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
-          return entire contents of packageInterface
-        `)], { encoding: "utf8" });
-        if (contents.status !== 0) {
-          lastPackageUiFailure = appleScriptFailure(contents);
-          return undefined;
-        }
-        const visible = contents.stdout;
-        return visible.includes("UI kit Ready")
-          && visible.includes("Signing round trip")
-          && visible.includes("Verified")
-          && visible.includes("Increment counter");
-      }, "custom-scheme Package UI");
-    } catch (error) {
-      const detail = lastPackageUiFailure ? `; last accessibility error: ${lastPackageUiFailure}` : "";
-      throw new Error(`${error instanceof Error ? error.message : String(error)}${detail}`);
-    }
+    await atStage("custom-scheme Package UI", () => waitFor(async () => {
+      const contents = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
+        set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
+        set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
+        return entire contents of packageInterface
+      `)], { encoding: "utf8" });
+      if (contents.status !== 0) {
+        diagnostics.lastAccessibilityFailure = appleScriptFailure(contents);
+        return undefined;
+      }
+      const visible = contents.stdout;
+      return visible.includes("UI kit Ready")
+        && visible.includes("Signing round trip")
+        && visible.includes("Verified")
+        && visible.includes("Increment counter");
+    }, "custom-scheme Package UI"));
 
+    diagnostics.activeStage = "desktop shutdown request";
     await runAppleScript(`
       tell application "System Events"
         set appProcess to first process whose unix id is ${childPid}
@@ -147,15 +177,18 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
         end tell
       end tell
     `, "desktop shutdown");
-    await waitForExit(desktop, "desktop graceful shutdown");
+    await atStage("desktop graceful shutdown", () => waitForExit(desktop, "desktop graceful shutdown"));
     for (const backendPid of backendPids) {
-      await waitFor(() => !processExists(backendPid), `Package process ${backendPid} reaping`);
+      await atStage("Package process reaping", () =>
+        waitFor(() => !processExists(backendPid), `Package process ${backendPid} reaping`));
     }
   } finally {
-    if (processExists(childPid)) desktop.kill("SIGTERM");
-    await waitForExit(desktop, "desktop cleanup").catch(() => desktop.kill("SIGKILL"));
+    if (childPid && processExists(childPid)) desktop.kill("SIGTERM");
+    await atStage("desktop cleanup", () => waitForExit(desktop, "desktop cleanup"))
+      .catch(() => desktop.kill("SIGKILL"));
     for (const backendPid of backendPids) {
-      await waitFor(() => !processExists(backendPid), `Package process ${backendPid} cleanup`, 5_000);
+      await atStage("Package process cleanup", () =>
+        waitFor(() => !processExists(backendPid), `Package process ${backendPid} cleanup`, 5_000));
     }
   }
 }
@@ -203,6 +236,68 @@ function processRows() {
       command: match[4],
     }] : [];
   });
+}
+
+function childProcessTable(rootPid, privateValues) {
+  if (!rootPid) return "pid ppid pgid command\n<desktop process unavailable>";
+  try {
+    const rows = processRows();
+    const included = new Set([rootPid]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const row of rows) {
+        if (included.has(row.parentPid) && !included.has(row.pid)) {
+          included.add(row.pid);
+          changed = true;
+        }
+      }
+    }
+    const selected = rows.filter(({ pid }) => included.has(pid)).slice(0, 32);
+    const body = selected.length === 0
+      ? ["<no desktop process rows>"]
+      : selected.map(({ pid, parentPid, processGroup, command }) =>
+        `${pid} ${parentPid} ${processGroup} ${sanitizeDiagnosticText(command, privateValues).slice(0, 300)}`);
+    return ["pid ppid pgid command", ...body].join("\n");
+  } catch (error) {
+    return `pid ppid pgid command\n<process inspection unavailable: ${sanitizeDiagnosticText(String(error), privateValues)}>`;
+  }
+}
+
+function createBoundedOutput(limit = diagnosticOutputLimit) {
+  let output = "";
+  return {
+    append(chunk) {
+      output = `${output}${chunk.toString("utf8")}`.slice(-limit);
+    },
+    read() {
+      return output;
+    },
+  };
+}
+
+function formatTimeoutDiagnostics(error, diagnostics, childPid) {
+  const safe = (value) => sanitizeDiagnosticText(value || "<none>", diagnostics.privateValues);
+  return [
+    error.message,
+    `Active stage: ${safe(diagnostics.activeStage)}`,
+    `Last accessibility failure: ${safe(diagnostics.lastAccessibilityFailure)}`,
+    `App stdout, last ${diagnosticOutputLimit} characters: ${safe(diagnostics.appStdout.read())}`,
+    `App stderr, last ${diagnosticOutputLimit} characters: ${safe(diagnostics.appStderr.read())}`,
+    `Child-process table:\n${childProcessTable(childPid, diagnostics.privateValues)}`,
+  ].join("\n");
+}
+
+function sanitizeDiagnosticText(value, privateValues) {
+  let safe = String(value);
+  for (const privateValue of privateValues) {
+    if (privateValue) safe = safe.replaceAll(privateValue, "<private-data-directory>");
+  }
+  return safe
+    .replace(/teamarness-workspace-v1\.[^\s"'<>]+/giu, "<redacted-workspace-invitation>")
+    .replace(/((?:workspace[ _-]?invitation|invitation|private[ _-]?key|secret(?:[ _-]?key)?|database(?:[ _-]?(?:content|value))?)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,}]+)/giu, "$1<redacted>")
+    .replace(/\b[0-9a-f]{32,}\b/giu, "<redacted-long-value>")
+    .replace(/\b[A-Za-z0-9+/_-]{48,}={0,2}\b/gu, "<redacted-long-value>");
 }
 
 function accessibilityScript(pid, body) {
@@ -268,21 +363,15 @@ async function runAppleScript(source, label) {
   return result.stdout.trim();
 }
 
-async function waitForAppleScript(source, label) {
-  let lastFailure = "";
-  try {
-    return await waitFor(async () => {
-      const result = spawnSync("osascript", ["-e", source], { encoding: "utf8" });
-      if (result.status !== 0) {
-        lastFailure = appleScriptFailure(result);
-        return undefined;
-      }
-      return result.stdout.trim() || undefined;
-    }, label);
-  } catch (error) {
-    const detail = lastFailure ? `; last accessibility error: ${lastFailure}` : "";
-    throw new Error(`${error instanceof Error ? error.message : String(error)}${detail}`);
-  }
+async function waitForAppleScript(source, label, recordFailure) {
+  return waitFor(async () => {
+    const result = spawnSync("osascript", ["-e", source], { encoding: "utf8" });
+    if (result.status !== 0) {
+      recordFailure(appleScriptFailure(result));
+      return undefined;
+    }
+    return result.stdout.trim() || undefined;
+  }, label);
 }
 
 function appleScriptFailure(result) {
@@ -296,7 +385,7 @@ async function waitFor(operation, label, timeoutMs = 20_000) {
     if (value) return value;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error(`Timed out waiting for ${label}`);
+  throw new SmokeTimeoutError(`Timed out waiting for ${label}`);
 }
 
 async function registrationExists(dataDirectory) {
@@ -312,7 +401,7 @@ async function waitForExit(child, label) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
     new Promise((resolve) => child.once("exit", resolve)),
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 15_000)),
+    new Promise((_, reject) => setTimeout(() => reject(new SmokeTimeoutError(`Timed out waiting for ${label}`)), 15_000)),
   ]);
 }
 

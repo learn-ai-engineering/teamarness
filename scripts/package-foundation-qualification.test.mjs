@@ -122,6 +122,21 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
   }
 });
 
+test("packaged smoke waits for Package navigation and captures safe timeout diagnostics", async () => {
+  const source = await read("scripts/smoke-packaged-app.mjs");
+  const navigationWait = source.indexOf('"bundled reference Package navigation"');
+  const backendWait = source.indexOf('"bundled Package Backend"');
+
+  assert.ok(navigationWait >= 0, "packaged smoke must wait for bundled Package navigation");
+  assert.ok(backendWait > navigationWait, "packaged smoke must wait for navigation before inspecting the Backend");
+  assert.match(source, /createBoundedOutput/);
+  assert.match(source, /formatTimeoutDiagnostics/);
+  assert.match(source, /activeStage/);
+  assert.match(source, /lastAccessibilityFailure/);
+  assert.match(source, /childProcessTable/);
+  assert.match(source, /stdio:\s*\["ignore",\s*"pipe",\s*"pipe"\]/);
+});
+
 test("generated foundation and Tutorial policy remain independent", async () => {
   const packageJson = JSON.parse(await read("package.json"));
   const agents = await read("templates/package-foundation/v1/AGENTS.md");
