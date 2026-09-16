@@ -1,6 +1,8 @@
+pub(crate) mod migration;
 pub(crate) mod projection;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -9,6 +11,22 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::domain::{
     DomainError, DomainRecord, GENERAL_ID, hex_id, quarantine, row_message, slug_with_suffix,
 };
+
+#[derive(Debug)]
+pub enum StoreError {
+    Storage,
+    Migration,
+    Lock,
+    UnsupportedSchema,
+    LegacyValidation(String),
+    UncertainOutcome,
+}
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for StoreError {}
 
 #[derive(Debug, Clone)]
 pub struct StoredRecord {
@@ -49,10 +67,11 @@ pub enum IngestResult {
     Quarantined(String),
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ConversationStore {
     pub(crate) inner: Arc<Mutex<StoreInner>>,
 }
+#[derive(Debug)]
 pub(crate) struct StoreInner {
     pub(crate) conn: Connection,
     pub(crate) slugs: BTreeMap<String, String>,
@@ -60,11 +79,20 @@ pub(crate) struct StoreInner {
     pub(crate) deferred: HashMap<String, DomainRecord>,
 }
 
+fn lock(inner: &Mutex<StoreInner>) -> Result<std::sync::MutexGuard<'_, StoreInner>, StoreError> {
+    inner.lock().map_err(|_| StoreError::Lock)
+}
+
+fn rerr(e: rusqlite::Error) -> StoreError {
+    let _ = e;
+    StoreError::Storage
+}
+
 impl ConversationStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
-        let c = Connection::open(&path)?;
-        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS records(record_id TEXT PRIMARY KEY, order_key TEXT NOT NULL, author TEXT NOT NULL, purpose TEXT NOT NULL, signature TEXT NOT NULL, sealed_record BLOB NOT NULL, cursor TEXT, ingestion_ordinal INTEGER NOT NULL, quarantine_code TEXT); CREATE INDEX IF NOT EXISTS records_purpose ON records(purpose); CREATE TABLE IF NOT EXISTS channels(channel_id TEXT PRIMARY KEY, creator TEXT NOT NULL, create_order TEXT NOT NULL, hidden_order TEXT); CREATE TABLE IF NOT EXISTS messages(message_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, order_key TEXT NOT NULL, author TEXT NOT NULL, record_id TEXT NOT NULL, ingestion_ordinal INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS messages_channel_order ON messages(channel_id, order_key DESC); CREATE TABLE IF NOT EXISTS unread(channel_id TEXT PRIMARY KEY, last_read_ingestion_ordinal INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor TEXT, next_ingestion_ordinal INTEGER NOT NULL); INSERT OR IGNORE INTO metadata(singleton,cursor,next_ingestion_ordinal) VALUES(1,NULL,0);")?;
+        let mut c = Connection::open(&path).map_err(|_| StoreError::Storage)?;
+        migration::apply(&mut c)?;
         let s = Self {
             inner: Arc::new(Mutex::new(StoreInner {
                 conn: c,
@@ -76,23 +104,31 @@ impl ConversationStore {
         s.ensure_general()?;
         Ok(s)
     }
-    fn ensure_general(&self) -> Result<(), rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
-        x.conn.execute("INSERT OR IGNORE INTO channels(channel_id,creator,create_order,hidden_order) VALUES(?1,'system','',NULL)",[hex_id(GENERAL_ID)])?;
+    fn ensure_general(&self) -> Result<(), StoreError> {
+        let x = lock(&self.inner)?;
+        x.conn
+            .execute(
+                "INSERT OR IGNORE INTO channels(channel_id,creator,create_order,hidden_order) VALUES(?1,'system','',NULL)",
+                [hex_id(GENERAL_ID)],
+            )
+            .map_err(rerr)?;
         Ok(())
     }
-    pub fn cursor(&self) -> Result<Option<String>, rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
+    pub fn cursor(&self) -> Result<Option<String>, StoreError> {
+        let x = lock(&self.inner)?;
         x.conn
             .query_row("SELECT cursor FROM metadata WHERE singleton=1", [], |r| {
                 r.get(0)
             })
+            .map_err(rerr)
     }
-    pub fn record_count(&self) -> Result<u64, rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
-        x.conn.query_row("SELECT COUNT(*) FROM records", [], |r| {
-            r.get::<_, i64>(0).map(|v| v as u64)
-        })
+    pub fn record_count(&self) -> Result<u64, StoreError> {
+        let x = lock(&self.inner)?;
+        x.conn
+            .query_row("SELECT COUNT(*) FROM records", [], |r| {
+                r.get::<_, i64>(0).map(|v| v as u64)
+            })
+            .map_err(rerr)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn ingest(
@@ -105,17 +141,17 @@ impl ConversationStore {
         canonical: &[u8],
         sealed: &[u8],
         cursor: Option<&str>,
-    ) -> Result<IngestResult, rusqlite::Error> {
+    ) -> Result<IngestResult, StoreError> {
         let parsed = DomainRecord::decode(canonical);
-        let mut inner = self.inner.lock().unwrap();
-        let transaction = inner.conn.transaction()?;
+        let mut inner = lock(&self.inner)?;
+        let transaction = inner.conn.transaction().map_err(rerr)?;
         let existing: Option<(String, String, String, String, Vec<u8>)> = transaction
             .query_row(
                 "SELECT order_key,author,purpose,signature,sealed_record FROM records WHERE record_id=?1",
                 [record_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
-            .optional()?;
+            .optional().map_err(rerr)?;
         if let Some((
             stored_order,
             stored_author,
@@ -132,29 +168,34 @@ impl ConversationStore {
             {
                 if let Some(cursor) = cursor {
                     transaction
-                        .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])?;
+                        .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])
+                        .map_err(rerr)?;
                 }
-                transaction.commit()?;
+                transaction.commit().map_err(rerr)?;
                 return Ok(IngestResult::Duplicate);
             }
-            quarantine(&transaction, record_id, "immutable_field_mismatch")?;
-            transaction.commit()?;
+            quarantine(&transaction, record_id, "immutable_field_mismatch").map_err(rerr)?;
+            transaction.commit().map_err(rerr)?;
             return Ok(IngestResult::Quarantined("immutable_field_mismatch".into()));
         }
-        let ordinal: i64 = transaction.query_row(
-            "SELECT next_ingestion_ordinal FROM metadata WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )?;
+        let ordinal: i64 = transaction
+            .query_row(
+                "SELECT next_ingestion_ordinal FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(rerr)?;
         let ordinal = ordinal + 1;
         transaction.execute(
             "INSERT INTO records(record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,quarantine_code) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
             params![record_id, order_key, author, purpose, signature, sealed, cursor, ordinal],
-        )?;
-        transaction.execute(
-            "UPDATE metadata SET cursor=?1,next_ingestion_ordinal=?2 WHERE singleton=1",
-            params![cursor, ordinal],
-        )?;
+        ).map_err(rerr)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET cursor=?1,next_ingestion_ordinal=?2 WHERE singleton=1",
+                params![cursor, ordinal],
+            )
+            .map_err(rerr)?;
         let outcome = match parsed {
             Ok(domain) => projection::project_domain(
                 &transaction,
@@ -163,16 +204,17 @@ impl ConversationStore {
                 author,
                 ordinal,
                 &domain,
-            )?,
+            )
+            .map_err(rerr)?,
             Err(_) => {
-                quarantine(&transaction, record_id, "malformed_record")?;
+                quarantine(&transaction, record_id, "malformed_record").map_err(rerr)?;
                 projection::ProjectionOutcome {
                     result: IngestResult::Quarantined("malformed_record".into()),
                     ..projection::ProjectionOutcome::applied()
                 }
             }
         };
-        transaction.commit()?;
+        transaction.commit().map_err(rerr)?;
         if let Some((id, slug)) = outcome.slug {
             inner.slugs.insert(id, slug);
         }
@@ -194,8 +236,8 @@ impl ConversationStore {
         Ok(result)
     }
 
-    fn retry_cached_for_channel(&self, channel_id: &str) -> Result<(), rusqlite::Error> {
-        let mut inner = self.inner.lock().unwrap();
+    fn retry_cached_for_channel(&self, channel_id: &str) -> Result<(), StoreError> {
+        let mut inner = lock(&self.inner)?;
         let mut deferred = inner
             .deferred
             .iter()
@@ -222,12 +264,15 @@ impl ConversationStore {
             order(left).cmp(&order(right)).then_with(|| left.cmp(right))
         });
         for (record_id, domain) in deferred {
-            let (order_key, author, ordinal): (String, String, i64) = inner.conn.query_row(
-                "SELECT order_key,author,ingestion_ordinal FROM records WHERE record_id=?1",
-                [&record_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            let transaction = inner.conn.transaction()?;
+            let (order_key, author, ordinal): (String, String, i64) = inner
+                .conn
+                .query_row(
+                    "SELECT order_key,author,ingestion_ordinal FROM records WHERE record_id=?1",
+                    [&record_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(rerr)?;
+            let transaction = inner.conn.transaction().map_err(rerr)?;
             let outcome = projection::project_domain(
                 &transaction,
                 &record_id,
@@ -235,8 +280,9 @@ impl ConversationStore {
                 &author,
                 ordinal,
                 &domain,
-            )?;
-            transaction.commit()?;
+            )
+            .map_err(rerr)?;
+            transaction.commit().map_err(rerr)?;
             if let Some((id, markdown)) = outcome.markdown {
                 inner.markdown.insert(id, markdown);
             }
@@ -250,31 +296,33 @@ impl ConversationStore {
         Ok(())
     }
 
-    pub fn deferred_records(&self) -> Result<Vec<StoredRecord>, rusqlite::Error> {
-        let inner = self.inner.lock().unwrap();
+    pub fn deferred_records(&self) -> Result<Vec<StoredRecord>, StoreError> {
+        let inner = lock(&self.inner)?;
         let mut statement = inner.conn.prepare(
             "SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal FROM records WHERE quarantine_code='waiting_for_channel' ORDER BY order_key,record_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(StoredRecord {
-                record_id: row.get(0)?,
-                order_key: row.get(1)?,
-                author: row.get(2)?,
-                purpose: row.get(3)?,
-                signature: row.get(4)?,
-                sealed_record: row.get(5)?,
-                cursor: row.get(6)?,
-                ingestion_ordinal: row.get::<_, i64>(7)? as u64,
+        ).map_err(rerr)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(StoredRecord {
+                    record_id: row.get(0)?,
+                    order_key: row.get(1)?,
+                    author: row.get(2)?,
+                    purpose: row.get(3)?,
+                    signature: row.get(4)?,
+                    sealed_record: row.get(5)?,
+                    cursor: row.get(6)?,
+                    ingestion_ordinal: row.get::<_, i64>(7)? as u64,
+                })
             })
-        })?;
-        rows.collect()
+            .map_err(rerr)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(rerr)
     }
 
     pub fn retry_deferred(
         &self,
         record_id: &str,
         canonical: &[u8],
-    ) -> Result<IngestResult, rusqlite::Error> {
+    ) -> Result<IngestResult, StoreError> {
         let domain = match DomainRecord::decode(canonical) {
             Ok(domain) => domain,
             Err(_) => return Ok(IngestResult::Quarantined("malformed_record".into())),
@@ -285,16 +333,19 @@ impl ConversationStore {
             DomainRecord::ChannelCreate { .. } => return Ok(IngestResult::Duplicate),
         };
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock(&self.inner)?;
             inner.deferred.insert(record_id.to_owned(), domain);
         }
         self.retry_cached_for_channel(&channel_id)?;
-        let inner = self.inner.lock().unwrap();
-        let code: Option<String> = inner.conn.query_row(
-            "SELECT quarantine_code FROM records WHERE record_id=?1",
-            [record_id],
-            |row| row.get(0),
-        )?;
+        let inner = lock(&self.inner)?;
+        let code: Option<String> = inner
+            .conn
+            .query_row(
+                "SELECT quarantine_code FROM records WHERE record_id=?1",
+                [record_id],
+                |row| row.get(0),
+            )
+            .map_err(rerr)?;
         Ok(match code.as_deref() {
             None => IngestResult::Applied,
             Some("waiting_for_channel") => IngestResult::Deferred("waiting_for_channel".into()),
@@ -302,8 +353,8 @@ impl ConversationStore {
         })
     }
 
-    pub fn channel_is_active(&self, channel_id: &str) -> Result<bool, rusqlite::Error> {
-        let inner = self.inner.lock().unwrap();
+    pub fn channel_is_active(&self, channel_id: &str) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
         inner
             .conn
             .query_row(
@@ -312,39 +363,54 @@ impl ConversationStore {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(rerr)
             .map(|value| value.unwrap_or(false))
     }
 
-    pub(crate) fn has_projection_warnings(&self) -> Result<bool, rusqlite::Error> {
-        let inner = self.inner.lock().unwrap();
-        inner.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code IS NOT NULL AND quarantine_code!='waiting_for_channel')",
-            [],
-            |row| row.get(0),
-        )
+    pub(crate) fn has_projection_warnings(&self) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code IS NOT NULL AND quarantine_code!='waiting_for_channel')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
     }
 
-    pub fn channels(&self) -> Result<Vec<ChannelView>, rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
-        let mut q = x.conn.prepare(
-            "SELECT channel_id,creator,hidden_order FROM channels ORDER BY create_order,channel_id",
-        )?;
-        let rows = q.query_map([], |r| {
-            let id: String = r.get(0)?;
-            let creator: String = r.get(1)?;
-            let hidden: Option<String> = r.get(2)?;
-            Ok((id, creator, hidden.is_some()))
-        })?;
+    pub fn channels(&self) -> Result<Vec<ChannelView>, StoreError> {
+        let x = lock(&self.inner)?;
+        let mut q = x
+            .conn
+            .prepare(
+                "SELECT channel_id,creator,hidden_order FROM channels ORDER BY create_order,channel_id",
+            )
+            .map_err(rerr)?;
+        let rows = q
+            .query_map([], |r| {
+                let id: String = r.get(0)?;
+                let creator: String = r.get(1)?;
+                let hidden: Option<String> = r.get(2)?;
+                Ok((id, creator, hidden.is_some()))
+            })
+            .map_err(rerr)?;
         let mut out = Vec::new();
         let mut counts = HashMap::new();
         {
-            let mut st=x.conn.prepare("SELECT channel_id,COUNT(*) FROM messages m WHERE ingestion_ordinal>COALESCE((SELECT last_read_ingestion_ordinal FROM unread u WHERE u.channel_id=m.channel_id),0) GROUP BY channel_id")?;
-            for r in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-                let (id, n) = r?;
+            let mut st = x
+                .conn
+                .prepare("SELECT channel_id,COUNT(*) FROM messages m WHERE ingestion_ordinal>COALESCE((SELECT last_read_ingestion_ordinal FROM unread u WHERE u.channel_id=m.channel_id),0) GROUP BY channel_id")
+                .map_err(rerr)?;
+            for r in st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(rerr)?
+            {
+                let (id, n) = r.map_err(rerr)?;
                 counts.insert(id, n as u64);
             }
         }
-        let channels = rows.collect::<Result<Vec<_>, _>>()?;
+        let channels = rows.collect::<Result<Vec<_>, _>>().map_err(rerr)?;
         let base_slug = |id: &str| {
             if id == hex_id(GENERAL_ID) {
                 "general".into()
@@ -406,62 +472,79 @@ impl ConversationStore {
         channel: &str,
         before: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<MessageRow>, rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
+    ) -> Result<Vec<MessageRow>, StoreError> {
+        let x = lock(&self.inner)?;
         let sql = if before.is_some() {
             "SELECT m.message_id,m.order_key,m.author,m.record_id,r.sealed_record,m.ingestion_ordinal FROM messages m JOIN records r ON r.record_id=m.record_id WHERE m.channel_id=?1 AND m.order_key<?2 ORDER BY m.order_key DESC LIMIT ?3"
         } else {
             "SELECT m.message_id,m.order_key,m.author,m.record_id,r.sealed_record,m.ingestion_ordinal FROM messages m JOIN records r ON r.record_id=m.record_id WHERE m.channel_id=?1 ORDER BY m.order_key DESC LIMIT ?2"
         };
-        let mut s = x.conn.prepare(sql)?;
+        let mut s = x.conn.prepare(sql).map_err(rerr)?;
         let mut out = Vec::new();
         if let Some(b) = before {
-            for r in s.query_map(params![channel, b, limit as i64], row_message)? {
-                out.push(r?)
+            for r in s
+                .query_map(params![channel, b, limit as i64], row_message)
+                .map_err(rerr)?
+            {
+                out.push(r.map_err(rerr)?)
             }
         } else {
-            for r in s.query_map(params![channel, limit as i64], row_message)? {
-                out.push(r?)
+            for r in s
+                .query_map(params![channel, limit as i64], row_message)
+                .map_err(rerr)?
+            {
+                out.push(r.map_err(rerr)?)
             }
         }
         Ok(out)
     }
-    pub fn mark_read(&self, channel: &str) -> Result<(), rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
-        let n: i64 = x.conn.query_row(
-            "SELECT COALESCE(MAX(ingestion_ordinal),0) FROM messages WHERE channel_id=?1",
-            [channel],
-            |r| r.get(0),
-        )?;
-        x.conn.execute("INSERT INTO unread(channel_id,last_read_ingestion_ordinal) VALUES(?1,?2) ON CONFLICT(channel_id) DO UPDATE SET last_read_ingestion_ordinal=excluded.last_read_ingestion_ordinal",params![channel,n])?;
+    pub fn mark_read(&self, channel: &str) -> Result<(), StoreError> {
+        let x = lock(&self.inner)?;
+        let n: i64 = x
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(ingestion_ordinal),0) FROM messages WHERE channel_id=?1",
+                [channel],
+                |r| r.get(0),
+            )
+            .map_err(rerr)?;
+        x.conn.execute("INSERT INTO unread(channel_id,last_read_ingestion_ordinal) VALUES(?1,?2) ON CONFLICT(channel_id) DO UPDATE SET last_read_ingestion_ordinal=excluded.last_read_ingestion_ordinal",params![channel,n]).map_err(rerr)?;
         Ok(())
     }
-    pub fn read_ordinal(&self, channel: &str) -> Result<u64, rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
-        x.conn.query_row("SELECT COALESCE((SELECT last_read_ingestion_ordinal FROM unread WHERE channel_id=?1),0)",[channel],|r|r.get::<_,i64>(0).map(|v|v as u64))
+    pub fn read_ordinal(&self, channel: &str) -> Result<u64, StoreError> {
+        let x = lock(&self.inner)?;
+        x.conn
+            .query_row(
+                "SELECT COALESCE((SELECT last_read_ingestion_ordinal FROM unread WHERE channel_id=?1),0)",
+                [channel],
+                |r| r.get::<_, i64>(0).map(|v| v as u64),
+            )
+            .map_err(rerr)
     }
-    pub fn control_records(&self) -> Result<Vec<StoredRecord>, rusqlite::Error> {
-        let x = self.inner.lock().unwrap();
-        let mut statement = x.conn.prepare("SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal FROM records WHERE purpose IN ('channel.create','channel.hide') AND quarantine_code IS NULL ORDER BY order_key")?;
-        let rows = statement.query_map([], |r| {
-            Ok(StoredRecord {
-                record_id: r.get(0)?,
-                order_key: r.get(1)?,
-                author: r.get(2)?,
-                purpose: r.get(3)?,
-                signature: r.get(4)?,
-                sealed_record: r.get(5)?,
-                cursor: r.get(6)?,
-                ingestion_ordinal: r.get::<_, i64>(7)? as u64,
+    pub fn control_records(&self) -> Result<Vec<StoredRecord>, StoreError> {
+        let x = lock(&self.inner)?;
+        let mut statement = x.conn.prepare("SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal FROM records WHERE purpose IN ('channel.create','channel.hide') AND quarantine_code IS NULL ORDER BY order_key").map_err(rerr)?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(StoredRecord {
+                    record_id: r.get(0)?,
+                    order_key: r.get(1)?,
+                    author: r.get(2)?,
+                    purpose: r.get(3)?,
+                    signature: r.get(4)?,
+                    sealed_record: r.get(5)?,
+                    cursor: r.get(6)?,
+                    ingestion_ordinal: r.get::<_, i64>(7)? as u64,
+                })
             })
-        })?;
-        rows.collect()
+            .map_err(rerr)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(rerr)
     }
 
     /// Rehydrates non-secret display data after restart. The bytes are never stored.
     pub fn remember_opened(&self, canonical: &[u8]) -> Result<(), DomainError> {
         let domain = DomainRecord::decode(canonical)?;
-        let mut x = self.inner.lock().unwrap();
+        let mut x = lock(&self.inner).expect("store lock");
         match domain {
             DomainRecord::ChannelCreate { id, slug, .. } => {
                 x.slugs.insert(hex_id(id), slug);
@@ -484,7 +567,7 @@ impl ConversationStore {
         signature: &str,
         canonical: &[u8],
         sealed: &[u8],
-    ) -> Result<IngestResult, rusqlite::Error> {
+    ) -> Result<IngestResult, StoreError> {
         self.ingest(
             record_id, order_key, author, purpose, signature, canonical, sealed, None,
         )

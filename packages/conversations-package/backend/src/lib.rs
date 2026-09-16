@@ -9,12 +9,16 @@ pub(crate) mod store;
 
 pub use backend::ConversationsBackend;
 pub use domain::{DomainError, DomainRecord, GENERAL_ID, PAGE_SIZE, decode_id};
-pub use store::{ChannelView, ConversationStore, IngestResult, MessageView, StoredRecord};
+pub use store::{
+    ChannelView, ConversationStore, IngestResult, MessageView, StoreError, StoredRecord,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{MAX_MARKDOWN, hex_id};
+    use crate::store::StoreError;
+    use rusqlite::Connection;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::watch;
@@ -557,5 +561,83 @@ mod tests {
                 .unread_count,
             1
         );
+    }
+
+    #[test]
+    fn new_store_applies_schema_v1_and_reopens() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("fresh.sqlite");
+        {
+            let s = ConversationStore::open(&path).unwrap();
+            assert!(s.channels().is_ok());
+        }
+        // Reopen, migration is idempotent.
+        let s = ConversationStore::open(&path).unwrap();
+        assert!(!s.channels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_v0_store_is_adopted_without_projection_loss() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("legacy.sqlite");
+        // Manually create a v0-format database with all current tables.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE records(record_id TEXT PRIMARY KEY, order_key TEXT NOT NULL, author TEXT NOT NULL, purpose TEXT NOT NULL, signature TEXT NOT NULL, sealed_record BLOB NOT NULL, cursor TEXT, ingestion_ordinal INTEGER NOT NULL, quarantine_code TEXT);
+                 CREATE TABLE channels(channel_id TEXT PRIMARY KEY, creator TEXT NOT NULL, create_order TEXT NOT NULL, hidden_order TEXT);
+                 CREATE TABLE messages(message_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, order_key TEXT NOT NULL, author TEXT NOT NULL, record_id TEXT NOT NULL, ingestion_ordinal INTEGER NOT NULL);
+                 CREATE TABLE unread(channel_id TEXT PRIMARY KEY, last_read_ingestion_ordinal INTEGER NOT NULL);
+                 CREATE TABLE metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor TEXT, next_ingestion_ordinal INTEGER NOT NULL);
+                 INSERT INTO metadata(singleton,cursor,next_ingestion_ordinal) VALUES(1,NULL,0);
+                 INSERT INTO channels(channel_id,creator,create_order,hidden_order) VALUES('00000000000000000000000000000000','system','',NULL);",
+            )
+            .unwrap();
+        }
+        // Adoption succeeds.
+        let s = ConversationStore::open(&path).unwrap();
+        assert!(s.channels().unwrap().iter().any(|c| c.slug == "general"));
+        // Idempotent reopen.
+        let s2 = ConversationStore::open(&path).unwrap();
+        assert!(s2.channels().unwrap().iter().any(|c| c.slug == "general"));
+    }
+
+    #[test]
+    fn unknown_schema_version_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("future.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", 99).unwrap();
+            c.execute_batch(
+                "CREATE TABLE records(record_id TEXT PRIMARY KEY, order_key TEXT NOT NULL, author TEXT NOT NULL, purpose TEXT NOT NULL, signature TEXT NOT NULL, sealed_record BLOB NOT NULL, cursor TEXT, ingestion_ordinal INTEGER NOT NULL, quarantine_code TEXT);
+                 CREATE TABLE channels(channel_id TEXT PRIMARY KEY, creator TEXT NOT NULL, create_order TEXT NOT NULL, hidden_order TEXT);
+                 CREATE TABLE messages(message_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, order_key TEXT NOT NULL, author TEXT NOT NULL, record_id TEXT NOT NULL, ingestion_ordinal INTEGER NOT NULL);
+                 CREATE TABLE unread(channel_id TEXT PRIMARY KEY, last_read_ingestion_ordinal INTEGER NOT NULL);
+                 CREATE TABLE metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor TEXT, next_ingestion_ordinal INTEGER NOT NULL);",
+            )
+            .unwrap();
+        }
+        let err = ConversationStore::open(&path).unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedSchema));
+    }
+
+    #[test]
+    fn malformed_legacy_schema_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("broken.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            // v0 with only one table — validation must reject it.
+            c.execute_batch("CREATE TABLE records(record_id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        let err = ConversationStore::open(&path).unwrap_err();
+        match err {
+            StoreError::LegacyValidation(_) => {}
+            other => panic!("expected LegacyValidation, got {other:?}"),
+        }
     }
 }

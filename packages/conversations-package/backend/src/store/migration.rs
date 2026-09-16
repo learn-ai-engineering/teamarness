@@ -1,0 +1,99 @@
+use rusqlite::{Connection, TransactionBehavior};
+
+use crate::store::StoreError;
+
+const LATEST_SCHEMA_VERSION: i64 = 1;
+const MIGRATION_0001: &str = include_str!("../../migrations/0001_conversations.sql");
+
+pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StoreError::Storage)?;
+    let current_version = transaction
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|_| StoreError::Storage)?;
+
+    if current_version > LATEST_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema);
+    }
+
+    // Version 0 with no Conversations tables is treated as new.
+    // Version 0 with existing tables must pass validation before adoption.
+    if current_version < 1 {
+        let has_records: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if has_records == 0 {
+            // Fresh database.
+            transaction
+                .execute_batch(MIGRATION_0001)
+                .map_err(|_| StoreError::Migration)?;
+        } else {
+            // Legacy v0 database — validate before adopting.
+            let required_tables = ["records", "channels", "messages", "unread", "metadata"];
+            for table in required_tables {
+                let exists: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| StoreError::Storage)?;
+                if exists == 0 {
+                    return Err(StoreError::LegacyValidation(format!(
+                        "missing table: {table}"
+                    )));
+                }
+            }
+            // Validate records columns.
+            let record_columns: Vec<String> = {
+                let mut stmt = transaction
+                    .prepare("PRAGMA table_info('records')")
+                    .map_err(|_| StoreError::Storage)?;
+                let rows = stmt
+                    .query_map([], |row| row.get(1))
+                    .map_err(|_| StoreError::Storage)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| StoreError::Storage)?
+            };
+            let required_columns = [
+                "record_id",
+                "order_key",
+                "author",
+                "purpose",
+                "signature",
+                "sealed_record",
+                "cursor",
+                "ingestion_ordinal",
+                "quarantine_code",
+            ];
+            for col in required_columns {
+                if !record_columns.iter().any(|c| c == col) {
+                    return Err(StoreError::LegacyValidation(format!(
+                        "missing column: records.{col}"
+                    )));
+                }
+            }
+            // Adopt the legacy schema atomically.
+            transaction
+                .pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
+                .map_err(|_| StoreError::Migration)?;
+            transaction
+                .commit()
+                .map_err(|_| StoreError::UncertainOutcome)?;
+            return Ok(());
+        }
+    }
+
+    transaction
+        .pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
+        .map_err(|_| StoreError::Migration)?;
+
+    transaction
+        .commit()
+        .map_err(|_| StoreError::UncertainOutcome)
+}
