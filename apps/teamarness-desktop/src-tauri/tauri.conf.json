@@ -41,12 +41,14 @@
       "../../../packages/application-packages.v1.json": "packages/application-packages.v1.json",
       "../../../target/teamarness-packages/dev.teamarness.reference/": "packages/dev.teamarness.reference/",
       "../../../target/teamarness-packages/dev.teamarness.tutorial/": "packages/dev.teamarness.tutorial/",
-      "../../../target/teamarness-packages/dev.teamarness.conversations/": "packages/dev.teamarness.conversations/"
+      "../../../target/teamarness-packages/dev.teamarness.conversations/": "packages/dev.teamarness.conversations/",
+      "../../../target/teamarness-packages/dev.teamarness.repo-aware/": "packages/dev.teamarness.repo-aware/"
     },
     "externalBin": [
       "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
       "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
-      "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package"
+      "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package",
+      "../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package"
     ]
   }
 }

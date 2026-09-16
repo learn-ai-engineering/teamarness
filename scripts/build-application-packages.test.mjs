@@ -39,6 +39,7 @@ test("application builder stages every bundled Package and writes one complete i
   const referenceBackend = await packageFixture(root, "reference-package", "dev.teamarness.reference", "Reference", "ui/probe.svg");
   const tutorialBackend = await packageFixture(root, "tutorial", "dev.teamarness.tutorial", "Tutorial");
   const conversationsBackend = await packageFixture(root, "conversations-package", "dev.teamarness.conversations", "Conversations", "ui/style.css");
+  const repoAwareBackend = await packageFixture(root, "repo-aware", "dev.teamarness.repo-aware", "Repo-aware");
   const result = await buildApplicationPackages({
     repositoryRoot: root,
     skipBuilds: true,
@@ -46,6 +47,7 @@ test("application builder stages every bundled Package and writes one complete i
     referenceBackendPath: referenceBackend,
     tutorialBackendPath: tutorialBackend,
     conversationsBackendPath: conversationsBackend,
+    repoAwareBackendPath: repoAwareBackend,
   });
   const index = JSON.parse(await readFile(result.indexPath, "utf8"));
   assert.deepEqual(index.packages, APPLICATION_PACKAGE_DECLARATIONS.map(({ directory }) => ({ directory })));
@@ -53,8 +55,10 @@ test("application builder stages every bundled Package and writes one complete i
     "dev.teamarness.reference",
     "dev.teamarness.tutorial",
     "dev.teamarness.conversations",
+    "dev.teamarness.repo-aware",
   ]);
   assert.equal(JSON.parse(await readFile(join(result.directories[0], "teamarness.package.json"))).identity, "dev.teamarness.reference");
   assert.equal(JSON.parse(await readFile(join(result.directories[1], "teamarness.package.json"))).identity, "dev.teamarness.tutorial");
   assert.equal(JSON.parse(await readFile(join(result.directories[2], "teamarness.package.json"))).identity, "dev.teamarness.conversations");
+  assert.equal(JSON.parse(await readFile(join(result.directories[3], "teamarness.package.json"))).identity, "dev.teamarness.repo-aware");
 });

@@ -1,0 +1,16 @@
+[package]
+name = "teamarness-repo-aware-package"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+teamarness-package-protocol = { path = "../../../crates/teamarness-package-protocol" }
+teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "empty": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "registration": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "path": { "type": "string" },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "path", "addedAt"],
+      "additionalProperties": false
+    },
+    "registrations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/registration" }
+    },
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "registrationId": { "type": "string" },
+        "path": { "type": "string" },
+        "originRemote": { "type": ["string", "null"] },
+        "githubUrl": { "type": ["string", "null"] },
+        "head": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "branch" },
+                "name": { "type": "string" }
+              },
+              "required": ["kind", "name"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "detached" },
+                "commit": { "type": "string" }
+              },
+              "required": ["kind", "commit"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "commit": { "type": "string" },
+        "isClean": { "type": "boolean" },
+        "fetchedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["registrationId", "path", "head", "commit", "isClean", "fetchedAt"],
+      "additionalProperties": false
+    }
+  },
+  "requests": {
+    "repo_aware.register": {
+      "request": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "properties": {
+          "registration": { "$ref": "#/$defs/registration" }
+        },
+        "required": ["registration"],
+        "additionalProperties": false
+      }
+    },
+    "repo_aware.list": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": {
+        "type": "object",
+        "properties": {
+          "registrations": { "$ref": "#/$defs/registrations" }
+        },
+        "required": ["registrations"],
+        "additionalProperties": false
+      }
+    },
+    "repo_aware.snapshot": {
+      "request": {
+        "type": "object",
+        "properties": {
+          "registrationId": { "type": "string" }
+        },
+        "required": ["registrationId"],
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "properties": {
+          "registrationId": { "type": "string" },
+          "snapshot": { "$ref": "#/$defs/snapshot" }
+        },
+        "required": ["registrationId", "snapshot"],
+        "additionalProperties": false
+      }
+    },
+    "repo_aware.remove": {
+      "request": {
+        "type": "object",
+        "properties": {
+          "registrationId": { "type": "string" }
+        },
+        "required": ["registrationId"],
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "properties": {
+          "removed": { "const": true }
+        },
+        "required": ["removed"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "subscriptions": {}
+}

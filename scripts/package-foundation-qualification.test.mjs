@@ -189,6 +189,7 @@ test("generated foundation and bundled Package policies remain independent", asy
     { directory: "packages/dev.teamarness.reference" },
     { directory: "packages/dev.teamarness.tutorial" },
     { directory: "packages/dev.teamarness.conversations" },
+    { directory: "packages/dev.teamarness.repo-aware" },
   ]);
   const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
   assert.deepEqual(Object.keys(tutorial.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
@@ -203,15 +204,17 @@ test("generated foundation and bundled Package policies remain independent", asy
   ]);
 });
 
-test("delivery configuration includes both bundled Package Directories and source badges", async () => {
+test("delivery configuration includes all bundled Package Directories and source badges", async () => {
   const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
   assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.reference/"]);
   assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.tutorial/"]);
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.conversations/"]);
+assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.conversations/"]);
+  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.repo-aware/"]);
   assert.deepEqual(config.bundle.externalBin, [
     "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
     "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
     "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package",
+    "../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package",
   ]);
   const shell = await read("apps/teamarness-desktop/src/shell.ts");
   const presentation = await read("apps/teamarness-desktop/src/presentation.ts");

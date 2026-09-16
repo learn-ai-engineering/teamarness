@@ -4,6 +4,7 @@ node_modules/
 /apps/teamarness-desktop/dist/
 /packages/reference-package/ui/dist/
 /packages/tutorial/ui/dist/
+/packages/repo-aware/ui/dist/
 /apps/teamarness-desktop/src-tauri/gen/
 /.teamarness-dev/
 

@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_configuration_uses_both_generated_application_packages() {
+    fn bundle_configuration_uses_all_generated_application_packages() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let resources = config["bundle"]["resources"].as_object().unwrap();
@@ -377,10 +377,17 @@ mod tests {
             ))
         );
         assert_eq!(
+            resources.get("../../../target/teamarness-packages/dev.teamarness.repo-aware/"),
+            Some(&serde_json::Value::String(
+                "packages/dev.teamarness.repo-aware/".into()
+            ))
+        );
+        assert_eq!(
             config["bundle"]["externalBin"].as_array().unwrap(),
             &[
                 serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package".into()),
                 serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package".into()),
+                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package".into()),
             ]
         );
         let index: serde_json::Value = serde_json::from_str(include_str!(
@@ -392,6 +399,7 @@ mod tests {
             serde_json::json!([
                 { "directory": "packages/dev.teamarness.reference" },
                 { "directory": "packages/dev.teamarness.tutorial" },
+                { "directory": "packages/dev.teamarness.repo-aware" },
             ])
         );
     }

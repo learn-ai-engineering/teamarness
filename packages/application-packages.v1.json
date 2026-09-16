@@ -9,6 +9,9 @@
     },
     {
       "directory": "packages/dev.teamarness.conversations"
+    },
+    {
+      "directory": "packages/dev.teamarness.repo-aware"
     }
   ]
 }

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { buildConversationsPackage } from "./build-conversations-package.mjs";
 import { compareDeclaredPackageBytes, copyPackageDirectory } from "./package-directory.mjs";
 import { buildReferencePackage } from "./build-reference-package.mjs";
+import { buildRepoAwarePackage } from "./build-repo-aware-package.mjs";
 import { buildTutorialPackage } from "./build-tutorial-package.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -13,6 +14,7 @@ export const APPLICATION_PACKAGE_DECLARATIONS = Object.freeze([
   { identity: "dev.teamarness.reference", directory: "packages/dev.teamarness.reference" },
   { identity: "dev.teamarness.tutorial", directory: "packages/dev.teamarness.tutorial" },
   { identity: "dev.teamarness.conversations", directory: "packages/dev.teamarness.conversations" },
+  { identity: "dev.teamarness.repo-aware", directory: "packages/dev.teamarness.repo-aware" },
 ]);
 
 export async function buildApplicationPackages({
@@ -22,6 +24,7 @@ export async function buildApplicationPackages({
   referenceBackendPath,
   tutorialBackendPath,
   conversationsBackendPath,
+  repoAwareBackendPath,
 } = {}) {
   const outputRoot = join(root, "target/teamarness-packages");
   await rm(outputRoot, { recursive: true, force: true });
@@ -29,6 +32,7 @@ export async function buildApplicationPackages({
   const referenceDirectory = join(outputRoot, "dev.teamarness.reference");
   const tutorialDirectory = join(outputRoot, "dev.teamarness.tutorial");
   const conversationsDirectory = join(outputRoot, "dev.teamarness.conversations");
+  const repoAwareDirectory = join(outputRoot, "dev.teamarness.repo-aware");
   await buildReferencePackage({
     repositoryRoot: root,
     backendPath: referenceBackendPath,
@@ -50,6 +54,13 @@ export async function buildApplicationPackages({
     skipBuilds,
     skipUiBuild,
   });
+  await buildRepoAwarePackage({
+    repositoryRoot: root,
+    backendPath: repoAwareBackendPath,
+    outputDirectory: repoAwareDirectory,
+    skipBuilds,
+    skipUiBuild,
+  });
   const indexPath = join(root, "packages/application-packages.v1.json");
   const temporaryPath = `${indexPath}.tmp-${process.pid}`;
   const document = {
@@ -59,7 +70,7 @@ export async function buildApplicationPackages({
   await writeFile(temporaryPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
   await rename(temporaryPath, indexPath);
 
-  const directories = [referenceDirectory, tutorialDirectory, conversationsDirectory];
+  const directories = [referenceDirectory, tutorialDirectory, conversationsDirectory, repoAwareDirectory];
   const debugRoot = join(root, "target/debug/packages");
   await rm(debugRoot, { recursive: true, force: true });
   await mkdir(debugRoot, { recursive: true, mode: 0o700 });
