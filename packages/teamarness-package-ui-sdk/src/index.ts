@@ -77,6 +77,79 @@ const PACKAGE_UI_KIT_CSS = `
 `;
 
 const installedKits = new WeakMap<ShadowRoot, { readonly sheet: CSSStyleSheet; users: number }>();
+const installedSuppressors = new WeakMap<ShadowRoot, { readonly observer: MutationObserver }>();
+
+/**
+ * Attributes that suppress WebKit autocorrection / autocapitalisation /
+ * spelling suggestions on macOS Safari / WKWebView.
+ */
+const SUPPRESS_ATTRS: Record<string, string> = {
+  autocapitalize: "off",
+  autocorrect: "off",
+  spellcheck: "false",
+  writingsuggestions: "false",
+} as const;
+
+const INPUT_SELECTORS = "input,textarea,[contenteditable]";
+
+/**
+ * Walk a node (or its subtree) and suppress autocorrect attributes on
+ * every input, textarea, and contenteditable element.
+ */
+function suppressInputs(node: Node): void {
+  // Use tagName checks so this works in environments without
+  // global HTMLInputElement / HTMLTextAreaElement constructors.
+  if (node.nodeType === 1 /* ELEMENT_NODE */) {
+    const el = node as Element;
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") {
+      for (const [attr, value] of Object.entries(SUPPRESS_ATTRS)) {
+        el.setAttribute(attr, value);
+      }
+    }
+    for (const child of el.querySelectorAll<HTMLElement>(INPUT_SELECTORS)) {
+      for (const [attr, value] of Object.entries(SUPPRESS_ATTRS)) {
+        child.setAttribute(attr, value);
+      }
+    }
+  }
+}
+
+/**
+ * Start a MutationObserver that suppresses autocorrect on any
+ * input/textarea/contenteditable added to or within this shadow root.
+ */
+function installInputSuppressor(root: ShadowRoot): () => void {
+  if (installedSuppressors.has(root)) return () => undefined;
+  if (typeof MutationObserver !== "function") {
+    // Environment (e.g. test runner) lacks MutationObserver.
+    // Suppress any elements already present and bail.
+    suppressInputs(root);
+    return () => undefined;
+  }
+
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        suppressInputs(node);
+      }
+    }
+  });
+  observer.observe(root, { childList: true, subtree: true });
+
+  // Suppress any elements already in the root.
+  suppressInputs(root);
+
+  installedSuppressors.set(root, { observer });
+
+  let disconnected = false;
+  return () => {
+    if (disconnected) return;
+    disconnected = true;
+    observer.disconnect();
+    installedSuppressors.delete(root);
+  };
+}
 
 function currentAdoptedSheets(root: ShadowRoot): readonly CSSStyleSheet[] {
   if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
@@ -124,6 +197,10 @@ export function installPackageUiKit(root: ShadowRoot): () => void {
   }
   installation.users += 1;
 
+  // Start the input suppressor alongside the kit.  It is torn down when
+  // the last kit user calls their cleanup function.
+  const uninstallSuppressor = installInputSuppressor(root);
+
   let cleaned = false;
   return () => {
     if (cleaned) return;
@@ -132,6 +209,7 @@ export function installPackageUiKit(root: ShadowRoot): () => void {
     if (current !== installation) return;
     current.users -= 1;
     if (current.users === 0) {
+      uninstallSuppressor();
       setAdoptedSheets(root, currentAdoptedSheets(root).filter((sheet) => sheet !== current.sheet));
       installedKits.delete(root);
     }

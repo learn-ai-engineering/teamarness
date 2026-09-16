@@ -167,9 +167,9 @@ export function renderShell(
     return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Choose a Workspace</h1><p>Select an existing Workspace or add another.</p></header>
       <section class="screen-section" aria-labelledby="workspace-list-heading"><h2 id="workspace-list-heading">Your Workspaces</h2><ul class="workspace-list">${workspaceList}</ul></section>
       <section class="screen-section"><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
-      <input id="workspace-name" required maxlength="64"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
+      <input id="workspace-name" required maxlength="64" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
       <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Workspace Invitation</label>
-      <textarea id="invitation-value" required maxlength="8192"></textarea><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
+      <textarea id="invitation-value" required maxlength="8192" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"></textarea><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
   }
 
   const workspace = presentation.workspace;
