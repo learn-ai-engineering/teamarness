@@ -30,9 +30,10 @@ const shell = new Shell(frame, {
 
 const controller = new ShellController(bridge, (model) => {
   shell.updateWorkspace(model);
-  void packageShell.refresh()
-    .then((snapshot) => { shell.updatePackages(snapshot); })
-    .catch(() => { shell.updatePackageSnapshotFailure(); });
 });
 
+void packageShell.startSnapshotUpdates({
+  update: (snapshot) => { shell.updatePackages(snapshot); },
+  fail: () => { shell.updatePackageSnapshotFailure(); },
+}).catch(() => undefined);
 void controller.load();

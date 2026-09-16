@@ -99,11 +99,11 @@ export class PackageMountController {
     domLease.setThemeTokens(TEAMARNESS_THEME_TOKENS);
     const moduleUrl = resourceUrl(opened);
     let packageUnmount: PackageUnmount = () => undefined;
-    let closed = false;
+    let hostClosed = false;
     let faultReported = false;
 
     const recordFault = async (): Promise<void> => {
-      if (faultReported || closed) return;
+      if (faultReported || hostClosed) return;
       faultReported = true;
       try {
         await this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
@@ -118,24 +118,54 @@ export class PackageMountController {
     }));
     const stopWatching = this.dom.watchErrors(moduleUrl, reportFault);
 
+    let packageUnmounted = false;
+    let stoppedWatching = false;
+    let clientDisposed = false;
+    let domRemoved = false;
     const mounted: MountedPackageUi = Object.freeze({
       unmount: async (): Promise<void> => {
-        if (closed) return;
-        closed = true;
-        try {
-          await packageUnmount();
-        } catch {
-          if (!faultReported) {
-            faultReported = true;
-            await this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
+        if (hostClosed) return;
+        let firstError: unknown;
+        const capture = async (stage: () => void | Promise<void>): Promise<void> => {
+          try {
+            await stage();
+          } catch (error) {
+            firstError ??= error;
           }
-        } finally {
-          stopWatching();
-          await scopedClient.dispose();
-          await this.bridge.closeMount({ mount: opened.mount });
-          domLease.remove();
-          if (this.current === mounted) this.current = null;
+        };
+
+        if (!packageUnmounted) {
+          packageUnmounted = true;
+          try {
+            await packageUnmount();
+          } catch (error) {
+            firstError ??= error;
+            if (!faultReported) {
+              faultReported = true;
+              await capture(async () => {
+                await this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
+              });
+            }
+          }
         }
+        if (!stoppedWatching) {
+          stoppedWatching = true;
+          await capture(stopWatching);
+        }
+        if (!clientDisposed) {
+          clientDisposed = true;
+          await capture(scopedClient.dispose);
+        }
+        await capture(async () => {
+          await this.bridge.closeMount({ mount: opened.mount });
+          hostClosed = true;
+        });
+        if (!domRemoved) {
+          domRemoved = true;
+          await capture(() => { domLease.remove(); });
+        }
+        if (hostClosed && this.current === mounted) this.current = null;
+        if (firstError !== undefined) throw firstError;
       },
     });
     this.current = mounted;
@@ -155,8 +185,16 @@ export class PackageMountController {
       if (typeof packageUnmount !== "function") throw new Error("Package UI mount did not return an unmount function");
       return mounted;
     } catch (error) {
-      await recordFault();
-      await mounted.unmount();
+      try {
+        await recordFault();
+      } catch {
+        // Preserve the mount failure while cleanup continues.
+      }
+      try {
+        await mounted.unmount();
+      } catch {
+        // Preserve the mount failure after all cleanup stages have run.
+      }
       throw error;
     }
   }

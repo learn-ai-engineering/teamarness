@@ -161,6 +161,89 @@ describe("generic Package UI mount", () => {
     expect(test.calls).not.toContain("recover");
   });
 
+  it("runs every local cleanup stage after ordinary unmount failures and retries only incomplete host close", async () => {
+    const test = harness();
+    const packageError = new Error("package unmount failed");
+    let closeAttempts = 0;
+    test.bridge.reportUiFault = async ({ mount }) => {
+      test.calls.push(`fault:${mount}`);
+      throw new Error("fault report failed");
+    };
+    test.bridge.transport.closeSubscription = async () => {
+      test.calls.push("dispose-client");
+      throw new Error("client dispose failed");
+    };
+    test.bridge.closeMount = async ({ mount }) => {
+      closeAttempts += 1;
+      test.calls.push(`close:${mount}:${String(closeAttempts)}`);
+      if (closeAttempts === 1) throw new Error("host close failed");
+    };
+    const controller = new PackageMountController(test.bridge, test.dom, async () => ({
+      mount: async ({ client }) => {
+        await client.subscribe("fixture.changes", {}, async () => undefined);
+        return async () => {
+          test.calls.push("package-unmount");
+          throw packageError;
+        };
+      },
+    }));
+    await controller.mount(instance, {});
+
+    await expect(controller.unmount()).rejects.toBe(packageError);
+    expect(test.calls).toEqual([
+      "package-unmount",
+      "fault:mount-1",
+      "unwatch",
+      "dispose-client",
+      "close:mount-1:1",
+      "remove",
+    ]);
+
+    await expect(controller.unmount()).resolves.toBeUndefined();
+    expect(test.calls).toEqual([
+      "package-unmount",
+      "fault:mount-1",
+      "unwatch",
+      "dispose-client",
+      "close:mount-1:1",
+      "remove",
+      "close:mount-1:2",
+    ]);
+  });
+
+  it("preserves the mount failure while cleanup continues and incomplete host close remains retryable", async () => {
+    const test = harness();
+    const importError = new Error("import failed");
+    let closeAttempts = 0;
+    test.bridge.reportUiFault = async ({ mount }) => {
+      test.calls.push(`fault:${mount}`);
+      throw new Error("fault report failed");
+    };
+    test.bridge.closeMount = async ({ mount }) => {
+      closeAttempts += 1;
+      test.calls.push(`close:${mount}:${String(closeAttempts)}`);
+      if (closeAttempts === 1) throw new Error("host close failed");
+    };
+    const controller = new PackageMountController(test.bridge, test.dom, async () => { throw importError; });
+
+    await expect(controller.mount(instance, {})).rejects.toBe(importError);
+    expect(test.calls).toEqual([
+      "fault:mount-1",
+      "unwatch",
+      "close:mount-1:1",
+      "remove",
+    ]);
+
+    await expect(controller.unmount()).resolves.toBeUndefined();
+    expect(test.calls).toEqual([
+      "fault:mount-1",
+      "unwatch",
+      "close:mount-1:1",
+      "remove",
+      "close:mount-1:2",
+    ]);
+  });
+
   it("reports import and attributed UI failures without recovering the Backend", async () => {
     const test = harness();
     let attributedFault: (() => void) | undefined;
