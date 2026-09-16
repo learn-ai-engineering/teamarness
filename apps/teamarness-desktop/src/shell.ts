@@ -217,7 +217,7 @@ export class Shell {
       </ul>
       ${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}
       <section class="package-group" aria-labelledby="team-packages-heading"><h2 id="team-packages-heading">Team Packages</h2><ul>${team || "<li>None available</li>"}</ul></section>
-      <section class="package-group" aria-labelledby="private-packages-heading"><h2 id="private-packages-heading">Private Packages</h2><ul>${privatePackages || "<li>None available</li>"}</ul></section></nav>`;
+      <section class="package-group" aria-labelledby="private-packages-heading"><h2 id="private-packages-heading">Personal Packages</h2><ul>${privatePackages || "<li>None available</li>"}</ul></section></nav>`;
 
     if (!hasQueries(this.shellFrame.contextualNavigation)) return;
     this.shellFrame.contextualNavigation.querySelectorAll<HTMLButtonElement>("[data-screen]").forEach((button) => {
@@ -408,7 +408,8 @@ function packageButton(
   const localMarker = row.installationLocal
     ? '<span class="package-installation-marker">Runs only on this Installation</span>'
     : "";
-  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${localMarker}</button></li>`;
+  const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
+  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${sourceMarker}${localMarker}</button></li>`;
 }
 
 function renderPackageInstanceSettings(
@@ -422,11 +423,12 @@ function renderPackageInstanceSettings(
     const localMarker = row.installationLocal
       ? '<span class="package-installation-marker">Runs only on this Installation</span>'
       : "";
+    const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
     const instance = packageActionTargets[row.actionIndex];
     const rowFeedback = instance && feedback && samePackageInstance(instance, feedback.instance)
       ? renderPackageLifecycleFeedback(row, feedback)
       : "";
-    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${localMarker}</div>
+    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>
       ${rowFeedback}<div class="package-instance-actions">
         ${lifecycleButton("Suspend", "suspend", row.actionIndex, row.name, row.canSuspend)}
         ${lifecycleButton("Recover Backend", "recover", row.actionIndex, row.name, row.canRecover)}

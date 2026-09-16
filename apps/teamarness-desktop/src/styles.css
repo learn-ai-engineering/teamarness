@@ -170,8 +170,9 @@ button:disabled { cursor: wait; opacity: 0.6; }
 .package-group button span,
 .package-group button small { display: block; }
 .package-group button small,
-.package-installation-marker { margin-top: 0.2rem; color: var(--teamarness-color-text-muted); font-size: 0.72rem; font-weight: 500; }
-.package-installation-marker { display: block; }
+.package-source,
+.package-installation-marker { display: block; margin-top: 0.2rem; color: var(--teamarness-color-text-muted); font-size: 0.72rem; font-weight: 500; }
+.package-source { font-weight: 700; text-transform: uppercase; }
 
 .selected-content {
   height: 100%;

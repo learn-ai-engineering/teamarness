@@ -252,7 +252,9 @@ describe("persistent Shell frame", () => {
     expect(test.frame.workspaceRail.innerHTML).toContain("Installation");
     expect(test.frame.workspaceRail.innerHTML).toContain('id="theme-preference"');
     expect(test.frame.contextualNavigation.innerHTML).toContain("Team Packages");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Private Packages");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Personal Packages");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Package source: Team");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Package source: Personal");
     expect(test.frame.contextualNavigation.innerHTML).toContain("One");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Available");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Private One");

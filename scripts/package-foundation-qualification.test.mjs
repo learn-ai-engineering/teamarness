@@ -209,12 +209,13 @@ test("delivery configuration includes both bundled Package Directories and sourc
     "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
     "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
   ]);
-  const shell = await read("apps/teamarness-desktop/src/package-shell.ts");
+  const shell = await read("apps/teamarness-desktop/src/shell.ts");
+  const presentation = await read("apps/teamarness-desktop/src/presentation.ts");
   assert.match(shell, /Package source/);
   assert.match(shell, /Team/);
   assert.match(shell, /Personal/);
-  assert.match(shell, /catalog\?\.source/);
-  assert.match(shell, /catalog\?\.source === "local" \? "Personal" : "Team"/);
+  assert.match(presentation, /catalog\.source/);
+  assert.match(presentation, /catalog\.source === "local" \? "Personal" : "Team"/);
 });
 
 test("repository authoring records the temporary vendoring policy", async () => {

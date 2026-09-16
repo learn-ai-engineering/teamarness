@@ -23,6 +23,7 @@ export type PackageInstancePresentation = Readonly<{
   availability: string;
   actionIndex: number;
   installationLocal: boolean;
+  sourceLabel: "Team" | "Personal";
   canSuspend: boolean;
   canRecover: boolean;
   canDispose: boolean;
@@ -73,10 +74,12 @@ export function buildPackageNavigationPresentation(
       const catalog = snapshot.packages.find(({ identity }) => identity === instance.key.packageIdentity);
       if (!catalog) return [];
       const descriptor = lifecycleDescriptor(instance.lifecycle);
+      const sourceLabel: PackageInstancePresentation["sourceLabel"] = catalog.source === "local" ? "Personal" : "Team";
       return [{
         name: catalog.displayName,
         actionIndex,
         installationLocal: catalog.source === "local",
+        sourceLabel,
         ...descriptor,
       }];
     });
