@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 pub const GENERATOR_VERSION: u32 = 1;
 pub const GRID_WIDTH: u32 = 16;
 pub const GRID_HEIGHT: u32 = 12;
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const STATE_FILE_NAME: &str = "tutorial.v1.json";
 const TEMP_FILE_NAME: &str = "tutorial.v1.json.tmp";
 
@@ -49,13 +49,14 @@ pub const ALGORITHMS: [AlgorithmOption; 4] = [
 pub struct PaletteOption {
     pub id: &'static str,
     pub label: &'static str,
-    pub values: &'static [&'static str; 8],
+    pub values: &'static [&'static str; PALETTE_SIZE],
 }
 
-const GARDEN: [&str; 8] = ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝"];
-const OCEAN: [&str; 8] = ["💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳"];
-const SPACE: [&str; 8] = ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"];
-const FRUIT: [&str; 8] = ["🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"];
+const PALETTE_SIZE: usize = 5;
+const GARDEN: [&str; PALETTE_SIZE] = ["🌱", "🌿", "🍀", "🌸", "🌻"];
+const OCEAN: [&str; PALETTE_SIZE] = ["💧", "🐚", "🐠", "🐬", "🌊"];
+const MOON: [&str; PALETTE_SIZE] = ["🌑", "🌒", "🌓", "🌔", "🌕"];
+const FRUIT: [&str; PALETTE_SIZE] = ["🍓", "🍊", "🍋", "🍏", "🫐"];
 
 pub const PALETTES: [PaletteOption; 4] = [
     PaletteOption {
@@ -69,9 +70,9 @@ pub const PALETTES: [PaletteOption; 4] = [
         values: &OCEAN,
     },
     PaletteOption {
-        id: "space",
-        label: "Space",
-        values: &SPACE,
+        id: "moon",
+        label: "Moon",
+        values: &MOON,
     },
     PaletteOption {
         id: "fruit",
@@ -175,7 +176,7 @@ fn validate_recipe(recipe: &Recipe) -> Result<(), TutorialError> {
     Ok(())
 }
 
-fn palette_values(id: &str) -> Result<&'static [&'static str; 8], TutorialError> {
+fn palette_values(id: &str) -> Result<&'static [&'static str; PALETTE_SIZE], TutorialError> {
     PALETTES
         .iter()
         .find(|palette| palette.id == id)
@@ -215,12 +216,12 @@ fn spiral_index(x: u32, y: u32, seed: u32) -> usize {
 }
 
 fn patchwork_index(x: u32, y: u32, seed: u32) -> usize {
-    let mut state = seed;
+    let mut state = if seed == 0 { 0x9e37_79b9 } else { seed };
     let mut nearest = 0_usize;
     let mut nearest_distance = f64::INFINITY;
-    for region in 0..8_usize {
-        let point_x = f64::from((region as u32 % 4) * 4 + next_random(&mut state) % 4);
-        let point_y = f64::from((region as u32 / 4) * 6 + next_random(&mut state) % 6);
+    for region in 0..PALETTE_SIZE {
+        let point_x = f64::from(next_random(&mut state) % GRID_WIDTH);
+        let point_y = f64::from(next_random(&mut state) % GRID_HEIGHT);
         let distance = (f64::from(x) - point_x).powi(2) + (f64::from(y) - point_y).powi(2);
         if distance < nearest_distance {
             nearest = region;
@@ -238,7 +239,7 @@ fn next_random(state: &mut u32) -> u32 {
 }
 
 fn palette_index(value: f64) -> usize {
-    ((((value + 1.0) / 2.0) * 8.0).floor() as usize).min(7)
+    ((((value + 1.0) / 2.0) * PALETTE_SIZE as f64).floor() as usize).min(PALETTE_SIZE - 1)
 }
 
 const fn error(code: &'static str) -> TutorialError {
@@ -258,7 +259,10 @@ impl StateStore {
         let path = directory.join(STATE_FILE_NAME);
         let state = if path.exists() {
             let bytes = std::fs::read(&path)?;
-            let state: StateDocument = serde_json::from_slice(&bytes).map_err(invalid_data)?;
+            let mut state: StateDocument = serde_json::from_slice(&bytes).map_err(invalid_data)?;
+            if migrate_state(&mut state)? {
+                write_state(&directory, &state)?;
+            }
             validate_state(&state)?;
             state
         } else {
@@ -294,6 +298,27 @@ impl StateStore {
 pub enum StoreError {
     Recipe(TutorialError),
     Storage,
+}
+
+fn migrate_state(state: &mut StateDocument) -> Result<bool, std::io::Error> {
+    if state.schema_version != 1 {
+        return Ok(false);
+    }
+    if state.next_id == 0 {
+        return Err(invalid_data("invalid Tutorial state version or next ID"));
+    }
+    for artwork in &mut state.artworks {
+        if artwork.recipe.algorithm == "sierpinski" {
+            artwork.recipe.algorithm = "spiral".to_owned();
+        }
+        if artwork.recipe.palette == "space" {
+            artwork.recipe.palette = "moon".to_owned();
+        }
+        artwork.cells =
+            render(&artwork.recipe).map_err(|_| invalid_data("invalid saved recipe"))?;
+    }
+    state.schema_version = STATE_SCHEMA_VERSION;
+    Ok(true)
 }
 
 fn validate_state(state: &StateDocument) -> Result<(), std::io::Error> {

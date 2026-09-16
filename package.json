@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "node scripts/dev-profile.mjs dev",
     "dev:instance": "node scripts/dev-profile.mjs instance",
-    "build": "npm --workspace @teamarness/package-ui-sdk run build && npm --workspace @teamarness/tutorial-package-ui run build && npm run build:application-packages && npm --workspace teamarness-desktop run build",
+    "build": "npm --workspace @teamarness/package-ui-sdk run build && npm run build:application-packages && npm --workspace teamarness-desktop run build",
     "build:tutorial": "node scripts/build-tutorial-package.mjs",
     "build:application-packages": "node scripts/build-application-packages.mjs",
     "create:package": "node scripts/create-package.mjs",

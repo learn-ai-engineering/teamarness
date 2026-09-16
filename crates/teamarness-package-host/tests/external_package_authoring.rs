@@ -16,13 +16,14 @@ use teamarness_package_host::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run through scripts/create-package.integration.test.mjs with built Package Directories"]
 async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
-    let Ok(tutorial_source) = std::env::var("TEAMARNESS_BUNDLED_TUTORIAL_DIRECTORY") else {
-        return;
-    };
-    let Ok(local_source) = std::env::var("TEAMARNESS_GENERATED_PACKAGE_DIRECTORY") else {
-        return;
-    };
+    let tutorial_source = std::env::var("TEAMARNESS_BUNDLED_TUTORIAL_DIRECTORY")
+        .expect("integration driver must provide the bundled Tutorial Package Directory");
+    let local_source = std::env::var("TEAMARNESS_GENERATED_PACKAGE_DIRECTORY")
+        .expect("integration driver must provide the generated local Package Directory");
+    let local_display_name = std::env::var("TEAMARNESS_GENERATED_PACKAGE_DISPLAY_NAME")
+        .expect("integration driver must provide the generated Package display name");
     let root = tempfile::tempdir().unwrap();
     let application = root.path().join("application");
     let private = root.path().join("private");
@@ -113,15 +114,26 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
         .unwrap();
     assert_eq!(local.source, PackageSourceKind::Local);
     assert_eq!(local.trust, PackageTrustKind::TrustedNativeCodeV1);
-    let response = request(
+    assert!(
+        object(
+            &request(
+                &host,
+                instance_key("dev.teamarness.tutorial", &workspace),
+                "tutorial.read"
+            )
+            .await
+        )
+        .contains_key("algorithms")
+    );
+    let local_response = request(
         &host,
         instance_key("dev.teamarness.emojart", &workspace),
         "emojart.read",
     )
     .await;
     assert_eq!(
-        object(&response).get("displayName"),
-        Some(&PackageValue::String("Emojart".into()))
+        object(&local_response).get("displayName"),
+        Some(&PackageValue::String(local_display_name))
     );
     host.execute(PackageHostCommand::Shutdown(ShutdownHost))
         .await

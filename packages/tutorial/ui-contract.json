@@ -12,7 +12,7 @@
     },
     "paletteId": {
       "type": "string",
-      "enum": ["garden", "ocean", "space", "fruit"]
+      "enum": ["garden", "ocean", "moon", "fruit"]
     },
     "recipe": {
       "type": "object",
@@ -33,7 +33,7 @@
       "maxItems": 192,
       "items": {
         "type": "string",
-        "enum": ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝", "💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳", "🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀", "🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"]
+        "enum": ["🌱", "🌿", "🍀", "🌸", "🌻", "💧", "🐚", "🐠", "🐬", "🌊", "🌑", "🌒", "🌓", "🌔", "🌕", "🍓", "🍊", "🍋", "🍏", "🫐"]
       }
     },
     "draft": {
@@ -65,10 +65,10 @@
     },
     "paletteChoice": {
       "oneOf": [
-        { "const": { "id": "garden", "label": "Garden", "values": ["🌱", "🌿", "🍀", "🌸", "🌻", "🪻", "🌷", "🐝"] } },
-        { "const": { "id": "ocean", "label": "Ocean", "values": ["💧", "🐚", "🐠", "🐬", "🌊", "🪼", "🐙", "🐳"] } },
-        { "const": { "id": "space", "label": "Space", "values": ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"] } },
-        { "const": { "id": "fruit", "label": "Fruit", "values": ["🍓", "🍊", "🍋", "🍏", "🫐", "🍇", "🍉", "🍒"] } }
+        { "const": { "id": "garden", "label": "Garden", "values": ["🌱", "🌿", "🍀", "🌸", "🌻"] } },
+        { "const": { "id": "ocean", "label": "Ocean", "values": ["💧", "🐚", "🐠", "🐬", "🌊"] } },
+        { "const": { "id": "moon", "label": "Moon", "values": ["🌑", "🌒", "🌓", "🌔", "🌕"] } },
+        { "const": { "id": "fruit", "label": "Fruit", "values": ["🍓", "🍊", "🍋", "🍏", "🫐"] } }
       ]
     },
     "readResponse": {

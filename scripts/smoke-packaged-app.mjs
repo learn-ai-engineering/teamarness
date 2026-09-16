@@ -43,7 +43,7 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
     stdio: "ignore",
   });
   const childPid = await waitFor(() => desktop.pid, "desktop process");
-  let backendPid;
+  const backendPids = [];
   try {
     await waitForAppleScript(childPid, `
       set appProcess to first process whose unix id is ${childPid}
@@ -51,6 +51,14 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
     `, "desktop window");
 
     if (createWorkspace) {
+      await waitForAppleScript(childPid, `
+        set appProcess to first process whose unix id is ${childPid}
+        tell appProcess
+          set appUi to UI element 1 of scroll area 1 of group 1 of group 1 of window 1
+          set creationForm to group 2 of group 1 of group 1 of appUi
+          return name of button "Create" of creationForm
+        end tell
+      `, "Workspace creation form");
       await runAppleScript(`
         tell application "System Events"
           set appProcess to first process whose unix id is ${childPid}
@@ -67,15 +75,20 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
       assert.equal(await registrationExists(dataDirectory), false, "fresh bundled Tutorial created a registration file");
     }
 
-    backendPid = await waitFor(() => bundledBackend(childPid), "bundled Package Backend");
-    const processRow = processRows().find(({ pid }) => pid === backendPid);
-    assert.ok(processRow, "Backend process disappeared before inspection");
-    assert.equal(processRow.parentPid, childPid, "Backend is not a direct child of the app");
-    assert.equal(processRow.processGroup, backendPid, "Backend does not own a process group");
-    assert.ok(
-      processRow.command.startsWith(join(resources, "backend/teamarness-reference-package-aarch64-apple-darwin")),
-      "Backend did not resolve from the bundled Package Directory",
+    const referenceBackend = join(resources, "backend/teamarness-reference-package-aarch64-apple-darwin");
+    const tutorialBackend = join(tutorialResources, "backend/teamarness-tutorial-package-aarch64-apple-darwin");
+    const referenceBackendPid = await waitFor(
+      () => bundledBackend(childPid, referenceBackend),
+      "bundled Reference Backend",
     );
+    backendPids.push(referenceBackendPid);
+    assertBundledBackend(referenceBackendPid, childPid, referenceBackend, "Reference");
+    const tutorialBackendPid = await waitFor(
+      () => bundledBackend(childPid, tutorialBackend),
+      "bundled Tutorial Backend",
+    );
+    backendPids.push(tutorialBackendPid);
+    assertBundledBackend(tutorialBackendPid, childPid, tutorialBackend, "Tutorial");
 
     await waitForAppleScript(childPid, `
       set appProcess to first process whose unix id is ${childPid}
@@ -103,24 +116,33 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
           set appUi to UI element 1 of scroll area 1 of group 1 of group 1 of window 1
           set packageGroup to group "Package interface" of group 1 of appUi
           set navigationGroup to group 1 of packageGroup
+          click first button of navigationGroup whose name starts with "Tutorial"
+        end tell
+      end tell
+    `);
+    await waitFor(async () => {
+      const visible = packageContents(childPid);
+      return visible?.includes("Generate")
+        && visible.includes("Save")
+        && visible.includes("Waves")
+        && visible.includes("Garden");
+    }, "bundled Tutorial UI request response");
+
+    await runAppleScript(`
+      tell application "System Events"
+        set appProcess to first process whose unix id is ${childPid}
+        tell appProcess
+          set frontmost to true
+          set appUi to UI element 1 of scroll area 1 of group 1 of group 1 of window 1
+          set packageGroup to group "Package interface" of group 1 of appUi
+          set navigationGroup to group 1 of packageGroup
           click first button of navigationGroup whose name starts with "Reference Package"
         end tell
       end tell
     `);
     await waitFor(async () => {
-      const contents = spawnSync("osascript", ["-e", `
-        tell application "System Events"
-          set appProcess to first process whose unix id is ${childPid}
-          tell appProcess
-            set appUi to UI element 1 of scroll area 1 of group 1 of group 1 of window 1
-            set packageGroup to group "Package interface" of group 1 of appUi
-            return entire contents of group 2 of packageGroup
-          end tell
-        end tell
-      `], { encoding: "utf8" });
-      if (contents.status !== 0) return undefined;
-      const visible = contents.stdout;
-      return visible.includes("Signing round trip")
+      const visible = packageContents(childPid);
+      return visible?.includes("Signing round trip")
         && visible.includes("verified")
         && visible.includes("Increment counter");
     }, "custom-scheme Package UI");
@@ -135,12 +157,14 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
       end tell
     `);
     await waitForExit(desktop, "desktop graceful shutdown");
-    await waitFor(() => !processExists(backendPid), "Package process reaping");
+    for (const backendPid of backendPids) {
+      await waitFor(() => !processExists(backendPid), `Package process ${backendPid} reaping`);
+    }
   } finally {
     if (processExists(childPid)) desktop.kill("SIGTERM");
     await waitForExit(desktop, "desktop cleanup").catch(() => desktop.kill("SIGKILL"));
-    if (backendPid) {
-      await waitFor(() => !processExists(backendPid), "Package process cleanup", 5_000);
+    for (const backendPid of backendPids) {
+      await waitFor(() => !processExists(backendPid), `Package process ${backendPid} cleanup`, 5_000);
     }
   }
 }
@@ -160,9 +184,34 @@ async function inspectDmg() {
   }
 }
 
-function bundledBackend(parentPid) {
+function bundledBackend(parentPid, executablePath) {
   return processRows().find(({ parentPid: value, command }) =>
-    value === parentPid && command.startsWith(join(resources, "backend/teamarness-reference-package-aarch64-apple-darwin")))?.pid;
+    value === parentPid && command.startsWith(executablePath))?.pid;
+}
+
+function assertBundledBackend(pid, parentPid, executablePath, packageName) {
+  const processRow = processRows().find(({ pid: value }) => value === pid);
+  assert.ok(processRow, `${packageName} Backend process disappeared before inspection`);
+  assert.equal(processRow.parentPid, parentPid, `${packageName} Backend is not a direct child of the app`);
+  assert.equal(processRow.processGroup, pid, `${packageName} Backend does not own a process group`);
+  assert.ok(
+    processRow.command.startsWith(executablePath),
+    `${packageName} Backend did not resolve from its bundled Package Directory`,
+  );
+}
+
+function packageContents(childPid) {
+  const contents = spawnSync("osascript", ["-e", `
+    tell application "System Events"
+      set appProcess to first process whose unix id is ${childPid}
+      tell appProcess
+        set appUi to UI element 1 of scroll area 1 of group 1 of group 1 of window 1
+        set packageGroup to group "Package interface" of group 1 of appUi
+        return entire contents of group 2 of packageGroup
+      end tell
+    end tell
+  `], { encoding: "utf8" });
+  return contents.status === 0 ? contents.stdout : undefined;
 }
 
 function processRows() {

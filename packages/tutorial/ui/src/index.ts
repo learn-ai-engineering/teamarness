@@ -146,8 +146,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
     article { display: grid; gap: .9rem; padding: 1rem; }
     h2, p { margin: 0; }
-    .controls { display: flex; flex-wrap: wrap; gap: .7rem; align-items: end; }
-    label { display: grid; gap: .25rem; font-weight: 650; }
+    .controls { display: flex; flex-wrap: wrap; gap: .7rem; align-items: center; }
     select, button { font: inherit; border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
     button { border: 0; background: var(--teamarness-color-accent); cursor: pointer; }
     .art { display: grid; grid-template-columns: repeat(16, 1.75rem); grid-auto-rows: 1.75rem; width: fit-content; max-width: 100%; overflow: auto; }
@@ -161,11 +160,11 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   heading.textContent = context.package.displayName;
   const controls = document.createElement("div");
   controls.className = "controls";
-  const algorithm = selectControl("Pattern");
   const palette = selectControl("Palette");
+  const algorithm = selectControl("Pattern");
   const generate = button("Generate");
   const save = button("Save");
-  controls.append(algorithm.label, palette.label, generate, save);
+  controls.append(palette, algorithm, generate, save);
   const error = document.createElement("p");
   error.className = "error";
   error.setAttribute("role", "status");
@@ -180,15 +179,15 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   context.root.append(style, article);
 
   const render = (state: TutorialState): void => {
-    replaceOptions(algorithm.select, state.algorithms, state.algorithm);
-    replaceOptions(palette.select, state.palettes, state.palette);
+    replaceOptions(palette, state.palettes, state.palette);
+    replaceOptions(algorithm, state.algorithms, state.algorithm);
     error.textContent = state.error ?? "";
     save.disabled = !state.draft;
     grid.replaceChildren();
     if (state.draft) {
       const algorithmLabel = state.algorithms.find(({ id }) => id === state.draft?.recipe.algorithm)?.label ?? state.draft.recipe.algorithm;
       const paletteLabel = state.palettes.find(({ id }) => id === state.draft?.recipe.palette)?.label ?? state.draft.recipe.palette;
-      grid.setAttribute("aria-label", `${algorithmLabel} artwork in the ${paletteLabel} palette`);
+      grid.setAttribute("aria-label", `${paletteLabel} ${algorithmLabel} artwork`);
       for (const value of state.draft.cells) {
         const cell = document.createElement("span");
         cell.className = "cell";
@@ -201,7 +200,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     }
     savedList.replaceChildren();
     for (const artwork of state.artworks) {
-      const savedButton = button(`${labelFor(state.algorithms, artwork.recipe.algorithm)} · ${labelFor(state.palettes, artwork.recipe.palette)} · ${artwork.id}`);
+      const savedButton = button(`${labelFor(state.palettes, artwork.recipe.palette)} ${labelFor(state.algorithms, artwork.recipe.algorithm)} · ${artwork.id}`);
       savedButton.setAttribute("aria-pressed", String(artwork.id === state.selectedArtworkId));
       savedButton.addEventListener("click", () => { controller.selectArtwork(artwork.id); });
       savedList.append(savedButton);
@@ -209,12 +208,12 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   };
   const controller = createTutorialController(context.client, render);
 
-  const onAlgorithm = (): void => { controller.setAlgorithm(algorithm.select.value); };
-  const onPalette = (): void => { controller.setPalette(palette.select.value); };
+  const onAlgorithm = (): void => { controller.setAlgorithm(algorithm.value); };
+  const onPalette = (): void => { controller.setPalette(palette.value); };
   const onGenerate = (): void => { void controller.generate(); };
   const onSave = (): void => { void controller.save(); };
-  algorithm.select.addEventListener("change", onAlgorithm);
-  palette.select.addEventListener("change", onPalette);
+  algorithm.addEventListener("change", onAlgorithm);
+  palette.addEventListener("change", onPalette);
   generate.addEventListener("click", onGenerate);
   save.addEventListener("click", onSave);
   await controller.start();
@@ -224,8 +223,8 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     if (unmounted) return;
     unmounted = true;
     controller.dispose();
-    algorithm.select.removeEventListener("change", onAlgorithm);
-    palette.select.removeEventListener("change", onPalette);
+    algorithm.removeEventListener("change", onAlgorithm);
+    palette.removeEventListener("change", onPalette);
     generate.removeEventListener("click", onGenerate);
     save.removeEventListener("click", onSave);
     article.remove();
@@ -233,13 +232,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   };
 }
 
-function selectControl(text: string): { label: HTMLLabelElement; select: HTMLSelectElement } {
-  const label = document.createElement("label");
-  label.append(text);
+function selectControl(accessibleName: string): HTMLSelectElement {
   const select = document.createElement("select");
-  select.setAttribute("aria-label", text);
-  label.append(select);
-  return { label, select };
+  select.setAttribute("aria-label", accessibleName);
+  return select;
 }
 
 function replaceOptions(select: HTMLSelectElement, choices: readonly Choice[], selected: string): void {

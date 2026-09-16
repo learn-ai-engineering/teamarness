@@ -111,7 +111,7 @@ export class BrowserPackageShellView implements PackageShellView {
       button.textContent = `${catalog?.displayName ?? instance.key.packageIdentity} · ${instance.key.workspaceId} · ${instance.lifecycle} · ${generation}`;
       const source = document.createElement("span");
       source.className = "package-source";
-      source.textContent = catalog?.source === "local" ? "Local" : "Bundled";
+      source.textContent = catalog?.source === "local" ? "Personal" : "Team";
       source.setAttribute("aria-label", `Package source: ${source.textContent}`);
       button.append(source);
       button.dataset.packageIdentity = instance.key.packageIdentity;

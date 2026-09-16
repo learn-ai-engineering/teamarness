@@ -17,8 +17,8 @@ fn renders_independent_examples_for_each_algorithm() {
     assert_eq!(
         &waves[..16],
         [
-            "🌻", "🍀", "🍀", "🪻", "🌷", "🌻", "🍀", "🍀", "🪻", "🌷", "🌻", "🍀", "🍀", "🪻",
-            "🌷", "🌻"
+            "🍀", "🌿", "🌿", "🌸", "🌸", "🍀", "🌿", "🌿", "🌸", "🌸", "🍀", "🌿", "🌿", "🌸",
+            "🌸", "🍀"
         ]
     );
 
@@ -26,8 +26,8 @@ fn renders_independent_examples_for_each_algorithm() {
     assert_eq!(
         &ripples[..16],
         [
-            "🐙", "🐚", "🪼", "🐬", "🐚", "🐳", "🐙", "🐬", "🐬", "🐙", "🐳", "🐚", "🐬", "🪼",
-            "🐚", "🐙"
+            "🌊", "💧", "🐬", "🐠", "💧", "🌊", "🐬", "🐠", "🐠", "🐬", "🌊", "💧", "🐠", "🐬",
+            "💧", "🌊"
         ]
     );
 
@@ -35,16 +35,16 @@ fn renders_independent_examples_for_each_algorithm() {
     assert_eq!(
         &spiral[..16],
         [
-            "🍒", "🍏", "🍓", "🍓", "🍊", "🍋", "🍏", "🍏", "🍋", "🍓", "🍓", "🍊", "🍇", "🍒",
-            "🍉", "🍊"
+            "🫐", "🍋", "🍓", "🍓", "🍓", "🍊", "🍋", "🍋", "🍊", "🍓", "🍓", "🍓", "🍏", "🫐",
+            "🍏", "🍊"
         ]
     );
     let patchwork = render(&recipe("patchwork", "fruit", 0x1234_5678)).unwrap();
     assert_eq!(
         &patchwork[..16],
         [
-            "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍊", "🍏", "🍏", "🍏", "🍏", "🍏",
-            "🍏", "🍏"
+            "🍊", "🍊", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋", "🍋",
+            "🍋", "🍋"
         ]
     );
 }
@@ -52,17 +52,23 @@ fn renders_independent_examples_for_each_algorithm() {
 #[test]
 fn recipes_are_reproducible_bounded_and_seed_sensitive() {
     for algorithm in ["waves", "ripples", "spiral", "patchwork"] {
-        let first = render(&recipe(algorithm, "space", 7)).unwrap();
-        assert_eq!(first, render(&recipe(algorithm, "space", 7)).unwrap());
-        assert_ne!(first, render(&recipe(algorithm, "space", 91)).unwrap());
+        let first = render(&recipe(algorithm, "moon", 7)).unwrap();
+        assert_eq!(first, render(&recipe(algorithm, "moon", 7)).unwrap());
+        assert_ne!(first, render(&recipe(algorithm, "moon", 91)).unwrap());
         assert_eq!(first.len(), 192);
         assert!(
             first
                 .iter()
-                .all(|cell| ["🌑", "🌒", "🌓", "🌔", "🌕", "⭐", "🪐", "🚀"]
-                    .contains(&cell.as_str()))
+                .all(|cell| ["🌑", "🌒", "🌓", "🌔", "🌕"].contains(&cell.as_str()))
         );
     }
+}
+
+#[test]
+fn patchwork_seed_zero_produces_multiple_regions() {
+    let cells = render(&recipe("patchwork", "garden", 0)).unwrap();
+
+    assert!(cells.iter().any(|cell| cell != &cells[0]));
 }
 
 #[test]

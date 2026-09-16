@@ -8,7 +8,7 @@ import { buildTutorialPackage } from "./build-tutorial-package.mjs";
 
 const digestPlaceholder = "0".repeat(64);
 
-test("build stages only the installation-local Tutorial Package Directory", async () => {
+test("build stages the Tutorial application Package Directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "teamarness-tutorial-build-"));
   await mkdir(join(root, "packages/tutorial/ui/dist"), { recursive: true });
   await mkdir(join(root, "packages/tutorial/backend"), { recursive: true });

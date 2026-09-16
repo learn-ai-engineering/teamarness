@@ -200,6 +200,10 @@ fn identity_ranges_and_target_selection_are_strict() {
             teamarness_package_host::PackageErrorCode::InvalidPackageIdentity,
         ),
         (
+            serde_json::json!({"identity": "dev.example-"}),
+            teamarness_package_host::PackageErrorCode::InvalidPackageIdentity,
+        ),
+        (
             serde_json::json!({"protocol": {"major": 2, "minMinor": 0, "maxMinor": 0}}),
             teamarness_package_host::PackageErrorCode::ManifestUnsupported,
         ),

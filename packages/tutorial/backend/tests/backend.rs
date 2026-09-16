@@ -151,7 +151,7 @@ async fn backend_runs_the_request_and_lifecycle_contract_with_stable_errors() {
             .iter()
             .map(|value| value["values"].as_array().unwrap().len())
             .collect::<Vec<_>>(),
-        [8, 8, 8, 8]
+        [5, 5, 5, 5]
     );
     assert_eq!(read_payload["artworks"], serde_json::json!([]));
 

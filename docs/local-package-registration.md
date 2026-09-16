@@ -73,7 +73,7 @@ A local Package with the same Package Identity as an application Package needs a
 
 No source wins by file order or Package version. Teamarness accepts a replacement only when the directory is canonical and readable, the manifest identity equals `expectedIdentity`, trust evidence is complete, and `overrideApplication` is true. If a declared override is invalid, that Package Identity stays unavailable. Teamarness does not silently fall back to bundled code. Unrelated valid Packages and the Core Runtime continue.
 
-Restart Teamarness after creating, changing, or removing the registration. The Shell labels the admitted source `Local` and its trust `trusted_native_code_v1`. Bundled Tutorial is admitted from application resources without this file and is labeled `Bundled`. Confirm both labels before testing the local build. Source kind is not a security verdict and does not grant Workspace enablement, synchronization, sharing, networking, or collaboration.
+Restart Teamarness after creating, changing, or removing the registration. The Shell presents Package Source `local` as `Personal`; its trust remains `trusted_native_code_v1`. Bundled Tutorial is admitted from application resources without this file, and the Shell presents Package Source `bundled` as `Team`. Confirm both UI aliases before testing the local build. Package Source remains separate from trust, registration scope, Workspace enablement, synchronization, sharing, networking, and collaboration.
 
 ## Data continuity
 
@@ -84,9 +84,9 @@ To test continuity without inspecting private database contents:
 1. Start on bundled code and make one visible Package state change.
 2. Stop Teamarness cleanly.
 3. add the explicit local override and restart;
-4. confirm the local source and trust labels and the visible state;
+4. confirm the local Package Source is presented as `Personal`, confirm its trust, and inspect the visible state;
 5. stop Teamarness, remove the registration, and restart;
-6. confirm the bundled source label and the same visible state.
+6. confirm the bundled Package Source is presented as `Team` and inspect the same visible state.
 
 Disposal stops Package-owned resources but does not delete the Package Data Directory. Teamarness has no Package-data deletion, backup, or migration service in this phase.
 

@@ -86,9 +86,9 @@ A Package Backend is trusted native code. It has the current user's ambient file
 
 A same-webview Package UI can access the Shell DOM and any Tauri command it knows. A Shadow Root limits style collisions only. It does not reduce DOM, JavaScript, network, or Tauri-command authority. Review both Backend and UI code before trusting a Package.
 
-## Bundled and local source kinds
+## Bundled and local Package Source kinds
 
-`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local and is admitted through the owner-only registration file. The Shell labels these sources `Bundled` and `Local` from catalog source data. These labels are not trust verdicts and do not imply Workspace enablement, synchronization, sharing, networking, or collaboration.
+`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local and is admitted through the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
 
 ## Local development loop
 
@@ -96,11 +96,11 @@ A same-webview Package UI can access the Shell DOM and any Tauri command it know
 2. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`.
 3. Copy the directory outside the Teamarness repository if you want to test the real separate-source path.
 4. Follow [Local Package registration](local-package-registration.md). Use the manifest identity as `expectedIdentity`, accept the native-code risks, and restart Teamarness.
-5. Check the Shell's source, trust, version, lifecycle, and generation values. Exercise requests, subscriptions, suspend, recover, dispose, restart, and data continuity.
+5. Check the Shell's source, lifecycle, and generation values. Exercise requests, subscriptions, suspend, recover, dispose, restart, and data continuity.
 6. Rebuild in place when needed, then restart. There is no source watch or hot reload for Backend bytes.
 
 ## Promotion to application distribution
 
-Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to the application build. Add its resource-relative directory to `packages/application-packages.v1.json`, copy the complete directory into Tauri resources, and compare every manifest-declared byte, size, and digest with the locally tested directory. Remove the installation override and restart to confirm the bundled source uses the same Package Data Directory.
+Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds a reviewed declaration to the application Package builder and updates the matching Tauri resource and external-binary configuration. The builder remains the only writer of `packages/application-packages.v1.json`; Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages` to stage and verify the declared Package Directories, then remove the installation override and restart to confirm the bundled source uses the same Package Data Directory.
 
 Signing and notarization, Gatekeeper remediation, other operating systems, remote Package fetching, Package updates, hot reload, enablement policy, and synchronization engines remain outside the current delivery claims.

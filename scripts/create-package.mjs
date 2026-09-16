@@ -3,7 +3,7 @@ import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const FOUNDATION_TEMPLATE_VERSION = 1;
-export const PACKAGE_IDENTITY_PATTERN = /^[a-z][a-z0-9-]{0,62}(?:\.[a-z][a-z0-9-]{0,62})+$/;
+export const PACKAGE_IDENTITY_PATTERN = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 export const repositoryRoot = dirname(scriptDirectory);
@@ -36,11 +36,18 @@ export function parseArgs(argv) {
 }
 
 export function validateArguments({ output, identity, displayName }) {
-  if (!PACKAGE_IDENTITY_PATTERN.test(identity)) {
-    throw new Error("identity must match the Package Identity grammar");
+  if (identity.length > 128 || !PACKAGE_IDENTITY_PATTERN.test(identity)) {
+    throw new Error("identity must match the Package Identity grammar and contain at most 128 characters");
   }
-  if (displayName.length === 0 || displayName.length > 128) {
-    throw new Error("display-name must contain 1 to 128 characters");
+  if (
+    typeof displayName !== "string"
+    || !displayName.isWellFormed()
+    || displayName.length === 0
+    || displayName.trim() !== displayName
+    || /\p{Cc}/u.test(displayName)
+    || Buffer.byteLength(displayName, "utf8") > 128
+  ) {
+    throw new Error("display-name must be trimmed valid Unicode without control characters and contain 1 to 128 UTF-8 bytes");
   }
   if (!output) throw new Error("output is required");
 }
@@ -88,9 +95,12 @@ export async function createPackageProject(options) {
 async function copyTemplate(destination, args) {
   await cp(templateDirectory, destination, { recursive: true, force: true });
   const namespace = args.identity.split(".").at(-1);
+  const serializedDisplayName = JSON.stringify(args.displayName);
   await replaceTokens(destination, {
     __PACKAGE_IDENTITY__: args.identity,
-    __PACKAGE_DISPLAY_NAME__: args.displayName,
+    __PACKAGE_DISPLAY_NAME_MARKDOWN__: args.displayName,
+    __PACKAGE_DISPLAY_NAME_JSON__: serializedDisplayName,
+    __PACKAGE_DISPLAY_NAME_RUST__: serializedDisplayName,
     __REQUEST_NAMESPACE__: namespace,
   });
 }
@@ -113,8 +123,11 @@ async function replaceTokens(path, tokens) {
   }
   if (!info.isFile() || !textExtensions.has(extname(path))) return;
   const original = await readFile(path, "utf8");
-  let replaced = original;
-  for (const [token, value] of Object.entries(tokens)) replaced = replaced.replaceAll(token, value);
+  const tokenPattern = new RegExp(
+    Object.keys(tokens).map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
+    "g",
+  );
+  const replaced = original.replace(tokenPattern, (token) => tokens[token]);
   if (replaced !== original) await writeFile(path, replaced);
 }
 

@@ -8,6 +8,9 @@ use teamarness_package_protocol::JsonValue;
 use teamarness_package_sdk::{Backend, BackendError, BackendRequest, Package};
 
 const NAMESPACE: &str = "__REQUEST_NAMESPACE__";
+// Token substitution changes the literal width, so rustfmt must leave this declaration stable.
+#[rustfmt::skip]
+const DISPLAY_NAME: &str = __PACKAGE_DISPLAY_NAME_RUST__;
 
 #[derive(Default)]
 pub struct GeneratedBackend;
@@ -25,12 +28,20 @@ impl Backend for GeneratedBackend {
     ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
         Box::pin(async move {
             match request.operation.as_str() {
-                "lifecycle.activate" | "lifecycle.recover" | "lifecycle.suspend" | "lifecycle.dispose" => Ok(object([])),
+                "lifecycle.activate" | "lifecycle.recover" | "lifecycle.suspend"
+                | "lifecycle.dispose" => Ok(object([])),
                 operation if operation == format!("{NAMESPACE}.read") => Ok(object([
-                    ("message", JsonValue::String(format!("Hello from {NAMESPACE}"))),
-                    ("displayName", JsonValue::String("__PACKAGE_DISPLAY_NAME__".into())),
+                    (
+                        "message",
+                        JsonValue::String(format!("Hello from {NAMESPACE}")),
+                    ),
+                    ("displayName", JsonValue::String(DISPLAY_NAME.into())),
                 ])),
-                _ => Err(BackendError::new("package.unknown_operation", false, object([]))),
+                _ => Err(BackendError::new(
+                    "package.unknown_operation",
+                    false,
+                    object([]),
+                )),
             }
         })
     }

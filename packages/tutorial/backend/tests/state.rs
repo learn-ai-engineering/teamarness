@@ -32,6 +32,54 @@ fn open_initializes_state_and_save_allocates_stable_ids_across_reopen() {
 }
 
 #[test]
+fn open_migrates_version_one_saved_art_to_current_recipes() {
+    let root = tempfile::tempdir().unwrap();
+    let old_state = serde_json::json!({
+        "schemaVersion": 1,
+        "nextId": 2,
+        "artworks": [{
+            "id": "artwork-1",
+            "recipe": {
+                "generatorVersion": 1,
+                "algorithm": "sierpinski",
+                "palette": "space",
+                "seed": 7,
+                "width": 16,
+                "height": 12
+            },
+            "cells": vec!["🚀"; 192]
+        }]
+    });
+    fs::write(
+        root.path().join("tutorial.v1.json"),
+        serde_json::to_vec_pretty(&old_state).unwrap(),
+    )
+    .unwrap();
+
+    let store = StateStore::open(root.path()).unwrap();
+    let migrated = &store.artworks()[0];
+    assert_eq!(migrated.id, "artwork-1");
+    assert_eq!(migrated.recipe.algorithm, "spiral");
+    assert_eq!(migrated.recipe.palette, "moon");
+    assert_eq!(migrated.recipe.seed, 7);
+    assert_eq!(migrated.cells.len(), 192);
+    assert!(
+        migrated
+            .cells
+            .iter()
+            .all(|cell| ["🌑", "🌒", "🌓", "🌔", "🌕"].contains(&cell.as_str()))
+    );
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("tutorial.v1.json")).unwrap()).unwrap();
+    assert_eq!(saved["schemaVersion"], 2);
+    assert_eq!(saved["artworks"][0]["id"], "artwork-1");
+    assert_eq!(saved["artworks"][0]["recipe"]["algorithm"], "spiral");
+    assert_eq!(saved["artworks"][0]["recipe"]["palette"], "moon");
+    assert_eq!(saved["artworks"][0]["recipe"]["seed"], 7);
+}
+
+#[test]
 fn failed_atomic_replacement_preserves_the_last_complete_state() {
     let root = tempfile::tempdir().unwrap();
     let mut store = StateStore::open(root.path()).unwrap();

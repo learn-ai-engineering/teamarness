@@ -1,6 +1,8 @@
-# __PACKAGE_DISPLAY_NAME__ Package
+# __PACKAGE_DISPLAY_NAME_MARKDOWN__ Package
 
 This project is a standalone Teamarness Package foundation generated for `__PACKAGE_IDENTITY__`.
+
+Before asking an AI agent to change the Package, have it read [`AGENTS.md`](AGENTS.md). That file explains the Teamarness runtime boundary, project ownership, contract-first workflow, data scope, artifact rules, SDK policy, security model, and required checks.
 
 ## Build and check
 

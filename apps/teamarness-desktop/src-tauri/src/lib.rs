@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_configuration_uses_the_generated_reference_package() {
+    fn bundle_configuration_uses_both_generated_application_packages() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let resources = config["bundle"]["resources"].as_object().unwrap();

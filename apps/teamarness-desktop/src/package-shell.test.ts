@@ -159,6 +159,7 @@ class TestElement {
   private onClick: (() => void) | undefined;
 
   public setAttribute(name: string, value: string): void { this.attributes[name] = value; }
+  public getAttribute(name: string): string | null { return this.attributes[name] ?? null; }
   public addEventListener(type: string, listener: () => void): void {
     if (type === "click") this.onClick = listener;
   }
@@ -185,8 +186,10 @@ it("renders Package-neutral lifecycle controls with observable lifecycle and gen
   view.render(snapshot, actions);
 
   expect(navigation.children[1]?.children[0]?.textContent).toContain("active · generation 7");
-  expect(navigation.children[1]?.children[0]?.children[0]?.textContent).toBe("Bundled");
-  expect(navigation.children[1]?.children[1]?.children[0]?.textContent).toBe("Local");
+  expect(navigation.children[1]?.children[0]?.children[0]?.textContent).toBe("Team");
+  expect(navigation.children[1]?.children[0]?.children[0]?.getAttribute("aria-label")).toBe("Package source: Team");
+  expect(navigation.children[1]?.children[1]?.children[0]?.textContent).toBe("Personal");
+  expect(navigation.children[1]?.children[1]?.children[0]?.getAttribute("aria-label")).toBe("Package source: Personal");
   const controls = navigation.children[2]?.children ?? [];
   expect(controls.map(({ textContent }) => textContent)).toEqual([
     "Reload UI",

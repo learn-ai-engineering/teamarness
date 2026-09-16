@@ -5,16 +5,38 @@ import { test } from "node:test";
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
-test("Package authoring guidance distinguishes checked-in, bundled, and local sources", async () => {
+test("Package authoring guidance follows the local Package development path", async () => {
   const guide = await read("docs/build-your-first-package.md");
   const readme = await read("README.md");
   for (const phrase of [
-    "Checked-in source",
-    "Bundled Package",
-    "Learner-owned local Package",
-    "packages/tutorial/",
-    "packages/dev.teamarness.tutorial/",
-    "dev.teamarness.tutorial",
+    "Checked-in Tutorial source",
+    "`packages/tutorial/`",
+    "`packages/dev.teamarness.tutorial/`",
+    "`dev.teamarness.tutorial`",
+    "Package Source values `bundled` and `local`",
+    "Shell presents bundled Tutorial as `Team` and registered local Emojart as `Personal`",
+    "Team` and `Personal` are UI aliases, not trust verdicts",
+    "registration scope, Workspace enablement, synchronization, sharing, networking, or collaboration",
+    "Teamarness Core Runtime",
+    "Package Host",
+    "Package UI",
+    "Package Backend",
+    "Package Data Directory",
+    "Save several pieces and click between them",
+    "The canonical recipe includes",
+    "Changing only the seed must change the cells",
+    "A changed seed field with identical cells does not pass",
+    "horizontal and vertical sine waves",
+    "radial distance from the grid center",
+    "polar angle with normalized distance",
+    "five seed-stable control points",
+    "Do not add independent random noise to each cell",
+    "palette dropdown first",
+    "no visible labels",
+    "$HOME/Projects/teamarness/local-packages",
+    "separate project directory",
+    "registration entry is the only connection",
+    "teamarness.package.json",
     "dev.teamarness.emojart",
     "npm run create:package --",
     "--output",
@@ -44,8 +66,19 @@ test("Package authoring guidance distinguishes checked-in, bundled, and local so
 
 test("generated foundation and Tutorial policy remain independent", async () => {
   const packageJson = JSON.parse(await read("package.json"));
+  const agents = await read("templates/package-foundation/v1/AGENTS.md");
+  assert.match(agents, /Teamarness Core Runtime/);
+  assert.match(agents, /Package Host/);
+  assert.match(agents, /PackageClient/);
+  assert.match(agents, /Package Data Directory/);
+  assert.match(agents, /Semantic Capabilities/);
+  assert.match(agents, /metadata changes while the meaningful output stays fixed/);
   assert.equal(packageJson.scripts["create:package"], "node scripts/create-package.mjs");
   assert.equal(packageJson.scripts["build:application-packages"], "node scripts/build-application-packages.mjs");
+  assert.equal(
+    packageJson.scripts.build,
+    "npm --workspace @teamarness/package-ui-sdk run build && npm run build:application-packages && npm --workspace teamarness-desktop run build",
+  );
   assert.equal(packageJson.scripts[["setup", "tutorial"].join(":")], undefined);
   assert.ok(!packageJson.workspaces.includes(["packages", "emojart", "ui"].join("/")));
   assert.ok((await readdir(new URL("packages/", root))).includes("tutorial"));
@@ -59,10 +92,13 @@ test("generated foundation and Tutorial policy remain independent", async () => 
   assert.deepEqual(Object.keys(tutorial.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
   assert.deepEqual(tutorial.subscriptions, {});
   assert.deepEqual(tutorial["$defs"].algorithmId.enum, ["waves", "ripples", "spiral", "patchwork"]);
-  assert.deepEqual(tutorial["$defs"].paletteId.enum, ["garden", "ocean", "space", "fruit"]);
-  for (const emoji of ["🪻", "🌷", "🐝", "🪼", "🐙", "🐳", "⭐", "🪐", "🚀", "🍇", "🍉", "🍒"]) {
-    assert.ok(JSON.stringify(tutorial).includes(emoji), `contract must include ${emoji}`);
-  }
+  assert.deepEqual(tutorial["$defs"].paletteId.enum, ["garden", "ocean", "moon", "fruit"]);
+  assert.deepEqual(tutorial["$defs"].paletteChoice.oneOf, [
+    { const: { id: "garden", label: "Garden", values: ["🌱", "🌿", "🍀", "🌸", "🌻"] } },
+    { const: { id: "ocean", label: "Ocean", values: ["💧", "🐚", "🐠", "🐬", "🌊"] } },
+    { const: { id: "moon", label: "Moon", values: ["🌑", "🌒", "🌓", "🌔", "🌕"] } },
+    { const: { id: "fruit", label: "Fruit", values: ["🍓", "🍊", "🍋", "🍏", "🫐"] } },
+  ]);
 });
 
 test("delivery configuration includes both bundled Package Directories and source badges", async () => {
@@ -75,14 +111,31 @@ test("delivery configuration includes both bundled Package Directories and sourc
   ]);
   const shell = await read("apps/teamarness-desktop/src/package-shell.ts");
   assert.match(shell, /Package source/);
-  assert.match(shell, /Bundled/);
-  assert.match(shell, /Local/);
+  assert.match(shell, /Team/);
+  assert.match(shell, /Personal/);
   assert.match(shell, /catalog\?\.source/);
+  assert.match(shell, /catalog\?\.source === "local" \? "Personal" : "Team"/);
 });
 
 test("repository authoring records the temporary vendoring policy", async () => {
   const decision = await read("context/.decisions/0008-vendored-package-authoring.md");
   const roadmap = await read("context/roadmap.md");
+  const authorGuide = await read("docs/package-author-guide.md");
+  const registrationGuide = await read("docs/local-package-registration.md");
+  assert.match(authorGuide, /Package Source values `bundled` and `local`/);
+  assert.match(authorGuide, /`Team` and `Personal`/);
+  assert.match(registrationGuide, /Package Source `local` as `Personal`/);
+  assert.match(registrationGuide, /Package Source `bundled` as `Team`/);
+  for (const guide of [authorGuide, registrationGuide]) {
+    for (const boundary of ["trust", "registration scope", "Workspace enablement", "synchronization", "sharing", "networking", "collaboration"]) {
+      assert.match(guide, new RegExp(boundary));
+    }
+  }
+  assert.match(authorGuide, /application maintainer/);
+  assert.match(authorGuide, /builder remains the only writer/);
+  assert.match(authorGuide, /npm run build:application-packages/);
+  assert.doesNotMatch(authorGuide, /Check the Shell's source, trust, version/);
+  assert.doesNotMatch(authorGuide, /Add its resource-relative directory/);
   for (const phrase of ["vendored", "versioned", "upgrade policy", "no updater", "production authoring"]) {
     assert.ok(decision.toLowerCase().includes(phrase), `decision must include ${phrase}`);
   }

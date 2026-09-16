@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile, cp } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
-const manifestPath = join(root, "teamarness.package.json");
+const scriptPath = fileURLToPath(import.meta.url);
+const root = dirname(dirname(scriptPath));
 
 export async function assemblePackage({ projectRoot = root } = {}) {
   const manifestFile = join(projectRoot, "teamarness.package.json");
@@ -37,6 +38,6 @@ function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (process.argv[1] === scriptPath) {
   await assemblePackage();
 }

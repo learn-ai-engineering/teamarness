@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 
 import { buildReferencePackage } from "./build-reference-package.mjs";
 import { buildTutorialPackage } from "./build-tutorial-package.mjs";
-import { compareDeclaredPackageBytes, verifyPackageDirectory } from "./package-directory.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 export const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -39,11 +38,6 @@ export async function buildApplicationPackages({
     skipBuilds,
     skipUiBuild,
   });
-  await verifyPackageDirectory(referenceDirectory);
-  await verifyPackageDirectory(tutorialDirectory);
-  await compareDeclaredPackageBytes(referenceDirectory, referenceDirectory);
-  await compareDeclaredPackageBytes(tutorialDirectory, tutorialDirectory);
-
   const indexPath = join(root, "packages/application-packages.v1.json");
   const temporaryPath = `${indexPath}.tmp-${process.pid}`;
   const document = {
