@@ -442,8 +442,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
       card.style.display = "none";
     }
 
-    // Button states
-    addButton.disabled = state.pending !== "none" || !pathInput.value.trim();
+    // Disable during pending operations. Input-emptiness is handled by the
+    // onAdd guard — render is only called on state changes, not input events.
+    addButton.disabled = state.pending !== "none";
     refreshButton.disabled = state.pending !== "none";
     removeButton.disabled = state.pending !== "none";
 
