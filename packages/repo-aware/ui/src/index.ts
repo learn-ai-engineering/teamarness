@@ -301,6 +301,15 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   pathInput.setAttribute("aria-label", "Repository path");
   pathInput.placeholder = "/absolute/path/to/repo";
   const addButton = button("Add");
+  // Starts disabled — empty input. The input listener toggles this.
+  addButton.disabled = true;
+  addButton.dataset.pendingLocked = "false";
+
+  const onInput = (): void => {
+    const empty = !pathInput.value.trim();
+    addButton.disabled = addButton.dataset.pendingLocked === "true" || empty;
+  };
+  pathInput.addEventListener("input", onInput);
   onboardingSection.append(onboardingDesc, inputRow);
   inputRow.append(pathInput, addButton);
 
@@ -442,9 +451,12 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
       card.style.display = "none";
     }
 
-    // Disable during pending operations. Input-emptiness is handled by the
-    // onAdd guard — render is only called on state changes, not input events.
-    addButton.disabled = state.pending !== "none";
+    // Disable during pending operations. Render runs on state changes, so we
+    // also snapshot the pending state in a dataset that the input listener reads
+    // to combine with input emptiness between renders.
+    const pendingLocked = state.pending !== "none";
+    addButton.dataset.pendingLocked = String(pendingLocked);
+    addButton.disabled = pendingLocked || !pathInput.value.trim();
     refreshButton.disabled = state.pending !== "none";
     removeButton.disabled = state.pending !== "none";
 

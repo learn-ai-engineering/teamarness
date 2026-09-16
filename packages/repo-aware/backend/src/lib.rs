@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use error::ErrorInfo;
 use registration::validate_git_checkout;
-use snapshot::compute_snapshot;
+use snapshot::compute_snapshot_impl;
 use state::StateStore;
 
 #[derive(Debug)]
@@ -106,15 +106,31 @@ impl RepoAwareBackend {
             .as_object()
             .and_then(|obj| obj.get("registrationId"))
             .and_then(JsonValue::as_str)
+            .map(|s| s.to_owned())
             .ok_or_else(|| Self::backend_error(error::INVALID_REQUEST))?;
 
-        let active = self.active.lock().await;
-        let store = active
-            .as_ref()
-            .ok_or_else(|| Self::backend_error(error::STORAGE_FAILED))?;
+        let (path, cancel) = {
+            let active = self.active.lock().await;
+            let store = active
+                .as_ref()
+                .ok_or_else(|| Self::backend_error(error::STORAGE_FAILED))?;
 
-        let cancel = Arc::new(AtomicBool::new(false));
-        let snapshot = compute_snapshot(registration_id, store, cancel)?;
+            let registration = store
+                .registrations()
+                .into_iter()
+                .find(|r| r.id == registration_id)
+                .ok_or_else(|| Self::backend_error(error::REGISTRATION_NOT_FOUND))?;
+
+            (registration.path.to_owned(), Arc::new(AtomicBool::new(false)))
+        };
+
+        let cancel_clone = cancel.clone();
+        let rid = registration_id.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            compute_snapshot_impl(&rid, &path, cancel_clone)
+        })
+        .await
+        .map_err(|_| Self::backend_error(error::SNAPSHOT_INTERRUPTED))?;
 
         serde_json::to_value(serde_json::json!({
             "registrationId": registration_id,

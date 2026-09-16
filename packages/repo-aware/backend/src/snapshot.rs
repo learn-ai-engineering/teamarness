@@ -89,8 +89,16 @@ pub fn compute_snapshot(
         .into_iter()
         .find(|r| r.id == registration_id)
         .ok_or(error::REGISTRATION_NOT_FOUND)?;
+    compute_snapshot_impl(registration_id, registration.path.as_str(), cancel)
+}
 
-    let path = &registration.path;
+/// Core snapshot computation — I/O-bound gix work. Call inside
+/// `tokio::task::spawn_blocking` when invoked from an async context.
+pub fn compute_snapshot_impl(
+    registration_id: &str,
+    path: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<Snapshot, ErrorInfo> {
     let path_ref = Path::new(path);
 
     if !path_ref.exists() {
@@ -182,7 +190,7 @@ pub fn compute_snapshot(
 
     Ok(Snapshot {
         registration_id: registration_id.to_owned(),
-        path: path.clone(),
+        path: path.to_owned(),
         origin_remote,
         github_url,
         head,
