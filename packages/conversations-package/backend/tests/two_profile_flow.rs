@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+use teamarness_core::{CoreRuntime, CoreRuntimeConfig, OnboardingError, WorkspaceInvitation};
 use teamarness_package_host::{
     InstallationPublicIdentity, OpenUiMount, PackageHost, PackageHostCommand, PackageHostConfig,
     PackageHostOutcome, PackageIdentity, PackageInstanceKey, PackageValue, ShutdownHost, UiRequest,
@@ -21,150 +21,238 @@ const PACKAGE_ID: &str = "dev.teamarness.conversations";
 const GENERAL_ID: &str = "00000000000000000000000000000000";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn two_profiles_save_and_project_synchronized_channels_and_messages() {
+async fn complete_two_profile_recovery_matrix() {
     let root = tempfile::tempdir().unwrap();
     let application = stage_package(root.path());
+    let alice_core_path = root.path().join("alice-core");
+    let bob_core_path = root.path().join("bob-core");
+    let alice_private = root.path().join("alice-private");
+    let bob_private = root.path().join("bob-private");
 
     let alice_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("alice-core")))
+        CoreRuntime::open(CoreRuntimeConfig::new(&alice_core_path))
             .await
             .unwrap(),
     );
     let workspace = alice_core.create_workspace("Conversations flow").unwrap();
-    let invitation = alice_core
-        .create_workspace_invitation(workspace.id())
-        .await
-        .unwrap();
+    let workspace_id = workspace.id();
+    let key = PackageInstanceKey::new(
+        PackageIdentity::from_str(PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace_id.to_string()).unwrap(),
+    );
+    let alice_host = open_host(&application, alice_private.clone(), alice_core.clone()).await;
+    let alice_mount = open_mount(&alice_host, &key).await;
+
+    post_message(
+        &alice_host,
+        &alice_mount,
+        GENERAL_ID,
+        "qualification-sentinel-pre-admission",
+    )
+    .await;
+    request(
+        &alice_host,
+        &alice_mount,
+        "pre-admission-channel",
+        "conversations.channel.create",
+        object([("slug", PackageValue::String("shared-channel".into()))]),
+    )
+    .await;
+    let alice_snapshot = snapshot(&alice_host, &alice_mount, "alice-pre-admission").await;
+    let shared_channel = channel_id(&alice_snapshot, "shared-channel").unwrap();
+
+    let invitation = create_invitation(&alice_core, workspace_id).await;
     let bob_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("bob-core")))
+        CoreRuntime::open(CoreRuntimeConfig::new(&bob_core_path))
             .await
             .unwrap(),
     );
     bob_core.join_workspace(&invitation).await.unwrap();
-
-    let workspace_id = WorkspaceId::new(workspace.id().to_string()).unwrap();
-    let alice_host = open_host(
-        &application,
-        root.path().join("alice-private"),
-        alice_core.clone(),
-    )
-    .await;
-    let bob_host = open_host(
-        &application,
-        root.path().join("bob-private"),
-        bob_core.clone(),
-    )
-    .await;
-    let key = PackageInstanceKey::new(PackageIdentity::from_str(PACKAGE_ID).unwrap(), workspace_id);
-    let alice_mount = open_mount(&alice_host, &key).await;
+    drop(invitation);
+    let bob_host = open_host(&application, bob_private.clone(), bob_core.clone()).await;
     let bob_mount = open_mount(&bob_host, &key).await;
 
-    request(
+    assert!(
+        wait_until(|| async {
+            let bob_snapshot = snapshot(&bob_host, &bob_mount, "bob-admission-history").await;
+            let bob_page = channel_page(&bob_host, &bob_mount, GENERAL_ID).await;
+            has_channel(&bob_snapshot, "shared-channel")
+                && has_message(&bob_page, "qualification-sentinel-pre-admission")
+        })
+        .await,
+        "newly admitted Bob did not receive Alice's existing history"
+    );
+
+    stop_profile(alice_host, alice_core).await;
+    stop_profile(bob_host, bob_core).await;
+
+    let (alice_core, alice_host, alice_mount) =
+        reopen_profile(&application, &alice_core_path, &alice_private, &key).await;
+    post_message(
         &alice_host,
         &alice_mount,
-        "alice-general-message",
-        "conversations.message.post",
-        object([
-            ("channelId", PackageValue::String(GENERAL_ID.into())),
-            ("markdown", PackageValue::String("hello from alice".into())),
-        ]),
+        GENERAL_ID,
+        "qualification-sentinel-alice-offline",
     )
     .await;
     request(
         &alice_host,
         &alice_mount,
-        "alice-channel",
+        "alice-offline-channel",
         "conversations.channel.create",
-        object([("slug", PackageValue::String("alice-channel".into()))]),
+        object([("slug", PackageValue::String("offline-team".into()))]),
     )
     .await;
+    stop_profile(alice_host, alice_core).await;
 
-    let converged = wait_until(|| async {
-        let snapshot = request(
-            &bob_host,
-            &bob_mount,
-            "bob-snapshot",
-            "conversations.snapshot",
-            object([]),
-        )
-        .await;
-        let page = request(
-            &bob_host,
-            &bob_mount,
-            "bob-general-page",
-            "conversations.channel.page",
-            object([
-                ("channelId", PackageValue::String(GENERAL_ID.into())),
-                ("limit", PackageValue::Unsigned(50)),
-            ]),
-        )
-        .await;
-        has_channel(&snapshot, "alice-channel") && has_message(&page, "hello from alice")
-    })
-    .await;
-    if !converged {
-        shutdown(alice_host).await;
-        shutdown(bob_host).await;
-        alice_core.shutdown().await.unwrap();
-        bob_core.shutdown().await.unwrap();
-        panic!("timed out waiting for Bob to project Alice's channel and message");
-    }
-
-    request(
+    let (bob_core, bob_host, bob_mount) =
+        reopen_profile(&application, &bob_core_path, &bob_private, &key).await;
+    post_message(
         &bob_host,
         &bob_mount,
-        "bob-general-message",
-        "conversations.message.post",
-        object([
-            ("channelId", PackageValue::String(GENERAL_ID.into())),
-            ("markdown", PackageValue::String("hello from bob".into())),
-        ]),
+        GENERAL_ID,
+        "qualification-sentinel-bob-offline",
     )
     .await;
     request(
         &bob_host,
         &bob_mount,
-        "bob-channel",
+        "bob-offline-channel",
         "conversations.channel.create",
-        object([("slug", PackageValue::String("bob-channel".into()))]),
+        object([("slug", PackageValue::String("offline-team".into()))]),
     )
     .await;
+    stop_profile(bob_host, bob_core).await;
 
-    let converged = wait_until(|| async {
-        let snapshot = request(
-            &alice_host,
-            &alice_mount,
-            "alice-snapshot",
-            "conversations.snapshot",
-            object([]),
-        )
-        .await;
-        let page = request(
-            &alice_host,
-            &alice_mount,
-            "alice-general-page",
-            "conversations.channel.page",
+    let (alice_core, alice_host, alice_mount) =
+        reopen_profile(&application, &alice_core_path, &alice_private, &key).await;
+    let (bob_core, bob_host, bob_mount) =
+        reopen_profile(&application, &bob_core_path, &bob_private, &key).await;
+
+    assert!(
+        wait_until_with_deadline(Duration::from_secs(30), || async {
+            let alice_messages = message_projection(&alice_host, &alice_mount).await;
+            let bob_messages = message_projection(&bob_host, &bob_mount).await;
+            let alice_channels =
+                channel_projection(&snapshot(&alice_host, &alice_mount, "alice-reconnected").await);
+            let bob_channels =
+                channel_projection(&snapshot(&bob_host, &bob_mount, "bob-reconnected").await);
+            alice_messages.len() == 3
+                && alice_messages == bob_messages
+                && alice_channels == bob_channels
+                && alice_channels
+                    .iter()
+                    .filter(|(_, slug, _)| slug.starts_with("offline-team"))
+                    .count()
+                    == 2
+        })
+        .await,
+        "disconnected projections did not reconcile automatically"
+    );
+    let alice_projection = message_projection(&alice_host, &alice_mount).await;
+    let bob_projection = message_projection(&bob_host, &bob_mount).await;
+    assert_eq!(alice_projection, bob_projection);
+    assert_projection_is_duplicate_free(&alice_projection);
+
+    request(
+        &alice_host,
+        &alice_mount,
+        "hide-shared-channel",
+        "conversations.channel.hide",
+        object([
+            ("channelId", PackageValue::String(shared_channel.clone())),
+            ("confirm", PackageValue::Boolean(true)),
+        ]),
+    )
+    .await;
+    assert!(
+        wait_until(|| async {
+            channel_is_hidden(
+                &snapshot(&bob_host, &bob_mount, "bob-hidden-channel").await,
+                &shared_channel,
+            )
+        })
+        .await,
+        "Channel hide did not converge"
+    );
+    assert!(
+        request_fails(
+            &bob_host,
+            &bob_mount,
+            "post-hidden-channel",
+            "conversations.message.post",
             object([
-                ("channelId", PackageValue::String(GENERAL_ID.into())),
-                ("limit", PackageValue::Unsigned(50)),
+                ("channelId", PackageValue::String(shared_channel.clone())),
+                (
+                    "markdown",
+                    PackageValue::String("qualification-sentinel-hidden-post".into()),
+                ),
             ]),
         )
-        .await;
-        has_channel(&snapshot, "bob-channel") && has_message(&page, "hello from bob")
-    })
-    .await;
-    if !converged {
-        shutdown(alice_host).await;
-        shutdown(bob_host).await;
-        alice_core.shutdown().await.unwrap();
-        bob_core.shutdown().await.unwrap();
-        panic!("timed out waiting for Alice to project Bob's channel and message");
-    }
+        .await,
+        "post-hide Message was accepted locally"
+    );
 
-    shutdown(alice_host).await;
-    shutdown(bob_host).await;
-    alice_core.shutdown().await.unwrap();
-    bob_core.shutdown().await.unwrap();
+    let projection_before_malformed = message_projection(&alice_host, &alice_mount).await;
+    alice_core
+        .append_record(
+            workspace_id,
+            PACKAGE_ID,
+            "message.post",
+            b"malformed-qualification-record",
+        )
+        .unwrap();
+    assert!(
+        wait_until(|| async {
+            snapshot_has_warning(&snapshot(&alice_host, &alice_mount, "alice-warning").await)
+                && snapshot_has_warning(&snapshot(&bob_host, &bob_mount, "bob-warning").await)
+        })
+        .await,
+        "malformed record warning did not converge"
+    );
+    let alice_projection = message_projection(&alice_host, &alice_mount).await;
+    let bob_projection = message_projection(&bob_host, &bob_mount).await;
+    assert_eq!(projection_before_malformed, alice_projection);
+    assert_eq!(alice_projection, bob_projection);
+
+    stop_profile(bob_host, bob_core).await;
+    let (bob_core, bob_host, bob_mount) =
+        reopen_profile(&application, &bob_core_path, &bob_private, &key).await;
+    assert_eq!(
+        message_projection(&alice_host, &alice_mount).await,
+        message_projection(&bob_host, &bob_mount).await,
+        "Bob did not resume the persisted projection after restart"
+    );
+    assert!(snapshot_has_warning(
+        &snapshot(&bob_host, &bob_mount, "bob-restart-warning").await
+    ));
+    post_message(
+        &alice_host,
+        &alice_mount,
+        GENERAL_ID,
+        "qualification-sentinel-after-restart",
+    )
+    .await;
+    assert!(
+        wait_until(|| async {
+            has_message(
+                &channel_page(&bob_host, &bob_mount, GENERAL_ID).await,
+                "qualification-sentinel-after-restart",
+            )
+        })
+        .await,
+        "Bob's resumed cursor did not deliver a later Message"
+    );
+    let alice_projection = message_projection(&alice_host, &alice_mount).await;
+    let bob_projection = message_projection(&bob_host, &bob_mount).await;
+    assert_eq!(alice_projection, bob_projection);
+    assert_projection_is_duplicate_free(&bob_projection);
+
+    stop_profile(alice_host, alice_core).await;
+    stop_profile(bob_host, bob_core).await;
+    for directory in [alice_core_path, bob_core_path, alice_private, bob_private] {
+        assert_no_plaintext_sentinel(&directory);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -183,8 +271,12 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
 
     let root = tempfile::tempdir().unwrap();
     let application = stage_package(root.path());
+    let alice_core_path = root.path().join("alice-core");
+    let bob_core_path = root.path().join("bob-core");
+    let alice_private = root.path().join("alice-private");
+    let bob_private = root.path().join("bob-private");
     let alice_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("alice-core")))
+        CoreRuntime::open(CoreRuntimeConfig::new(&alice_core_path))
             .await
             .unwrap(),
     );
@@ -194,34 +286,36 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
         PackageIdentity::from_str(PACKAGE_ID).unwrap(),
         workspace_id.clone(),
     );
-    let invitation = alice_core
-        .create_workspace_invitation(workspace.id())
-        .await
-        .unwrap();
+    let invitation = create_invitation(&alice_core, workspace.id()).await;
     let bob_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("bob-core")))
+        CoreRuntime::open(CoreRuntimeConfig::new(&bob_core_path))
             .await
             .unwrap(),
     );
     bob_core.join_workspace(&invitation).await.unwrap();
     drop(invitation);
 
-    let alice_host = open_host(
-        &application,
-        root.path().join("alice-private"),
-        alice_core.clone(),
-    )
-    .await;
+    let alice_host = open_host(&application, alice_private.clone(), alice_core.clone()).await;
     let alice_mount = open_mount(&alice_host, &key).await;
-    let bob_host = open_host(
-        &application,
-        root.path().join("bob-private"),
-        bob_core.clone(),
-    )
-    .await;
+    let bob_host = open_host(&application, bob_private.clone(), bob_core.clone()).await;
     let bob_mount = open_mount(&bob_host, &key).await;
 
-    let catch_up_started = Instant::now();
+    post_message(
+        &alice_host,
+        &alice_mount,
+        GENERAL_ID,
+        "qualification-sentinel-timing-seed",
+    )
+    .await;
+    assert!(
+        wait_until(|| async {
+            unread_count(&snapshot(&bob_host, &bob_mount, "timing-seed").await) == 1
+        })
+        .await,
+        "Bob did not establish the initial synchronized scope"
+    );
+    stop_profile(bob_host, bob_core).await;
+
     for index in 0..QUEUED_MESSAGES {
         request(
             &alice_host,
@@ -239,25 +333,12 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
         .await;
     }
     let alice_projection = message_projection(&alice_host, &alice_mount).await;
-    assert_eq!(alice_projection.len(), QUEUED_MESSAGES);
+    assert_eq!(alice_projection.len(), QUEUED_MESSAGES + 1);
     assert_projection_is_duplicate_free(&alice_projection);
-    alice_core
-        .replicate_records_to(workspace.id(), PACKAGE_ID, bob_core.public_identity())
-        .await
-        .unwrap();
-    let mut core_subscription = bob_core
-        .subscribe_records(workspace.id(), PACKAGE_ID, None)
-        .unwrap();
-    let mut core_records = 0;
-    while core_subscription
-        .next_event_timeout(Duration::ZERO)
-        .unwrap()
-        .is_some()
-    {
-        core_records += 1;
-    }
-    assert_eq!(core_records, QUEUED_MESSAGES);
 
+    let catch_up_started = Instant::now();
+    let (bob_core, bob_host, bob_mount) =
+        reopen_profile(&application, &bob_core_path, &bob_private, &key).await;
     let caught_up = wait_until_with_deadline(CATCH_UP_TARGET, || async {
         unread_count(
             &request(
@@ -268,7 +349,7 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
                 object([]),
             )
             .await,
-        ) == QUEUED_MESSAGES
+        ) == QUEUED_MESSAGES + 1
     })
     .await;
     if !caught_up {
@@ -351,15 +432,26 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
     drop(alice_core);
     drop(bob_core);
 
-    for directory in [
-        root.path().join("alice-core"),
-        root.path().join("bob-core"),
-        root.path().join("alice-private"),
-        root.path().join("bob-private"),
-    ] {
+    for directory in [alice_core_path, bob_core_path, alice_private, bob_private] {
         assert_no_plaintext_sentinel(&directory);
     }
     eprintln!("conversations qualification persistence scan: plaintext_sentinel=absent");
+}
+
+async fn create_invitation(
+    core: &CoreRuntime,
+    workspace: teamarness_core::WorkspaceId,
+) -> WorkspaceInvitation {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match core.create_workspace_invitation(workspace).await {
+            Ok(invitation) => return invitation,
+            Err(OnboardingError::Readiness) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => panic!("workspace invitation failed during qualification: {error}"),
+        }
+    }
 }
 
 async fn open_host(application: &Path, private: PathBuf, core: Arc<CoreRuntime>) -> PackageHost {
@@ -372,6 +464,32 @@ async fn open_host(application: &Path, private: PathBuf, core: Arc<CoreRuntime>)
         InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
     );
     PackageHost::open(config, core).await.unwrap()
+}
+
+async fn reopen_profile(
+    application: &Path,
+    core_path: &Path,
+    private_path: &Path,
+    key: &PackageInstanceKey,
+) -> (
+    Arc<CoreRuntime>,
+    PackageHost,
+    teamarness_package_host::UiMountId,
+) {
+    let core = Arc::new(
+        CoreRuntime::open(CoreRuntimeConfig::new(core_path))
+            .await
+            .unwrap(),
+    );
+    let host = open_host(application, private_path.to_owned(), core.clone()).await;
+    let mount = open_mount(&host, key).await;
+    (core, host, mount)
+}
+
+async fn stop_profile(host: PackageHost, core: Arc<CoreRuntime>) {
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+    drop(core);
 }
 
 async fn open_mount(
@@ -388,6 +506,79 @@ async fn open_mount(
         PackageHostOutcome::UiMountOpened { mount, .. } => mount,
         outcome => panic!("unexpected mount outcome: {outcome:?}"),
     }
+}
+
+async fn snapshot(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    request_id: &str,
+) -> PackageValue {
+    request(
+        host,
+        mount,
+        request_id,
+        "conversations.snapshot",
+        object([]),
+    )
+    .await
+}
+
+async fn channel_page(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    channel_id: &str,
+) -> PackageValue {
+    request(
+        host,
+        mount,
+        "channel-page",
+        "conversations.channel.page",
+        object([
+            ("channelId", PackageValue::String(channel_id.into())),
+            ("limit", PackageValue::Unsigned(32)),
+        ]),
+    )
+    .await
+}
+
+async fn post_message(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    channel_id: &str,
+    markdown: &str,
+) {
+    request(
+        host,
+        mount,
+        "post-message",
+        "conversations.message.post",
+        object([
+            ("channelId", PackageValue::String(channel_id.into())),
+            ("markdown", PackageValue::String(markdown.into())),
+        ]),
+    )
+    .await;
+}
+
+async fn request_fails(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    request_id: &str,
+    operation: &str,
+    payload: PackageValue,
+) -> bool {
+    host.execute(PackageHostCommand::UiRequest(UiRequest {
+        mount: mount.clone(),
+        request: UiRequestId::new(format!(
+            "{request_id}-{}",
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap(),
+        operation: operation.into(),
+        payload,
+    }))
+    .await
+    .is_err()
 }
 
 async fn request(
@@ -552,6 +743,54 @@ fn assert_no_plaintext_sentinel(path: &Path) {
             );
         }
     }
+}
+
+fn channel_projection(value: &PackageValue) -> Vec<(String, String, bool)> {
+    let PackageValue::Object(fields) = value else {
+        return Vec::new();
+    };
+    let Some(PackageValue::Array(channels)) = fields.get("channels") else {
+        return Vec::new();
+    };
+    let mut projection = channels
+        .iter()
+        .filter_map(|channel| {
+            let PackageValue::Object(fields) = channel else {
+                return None;
+            };
+            let PackageValue::String(id) = fields.get("id")? else {
+                return None;
+            };
+            let PackageValue::String(slug) = fields.get("slug")? else {
+                return None;
+            };
+            let PackageValue::Boolean(hidden) = fields.get("hidden")? else {
+                return None;
+            };
+            Some((id.clone(), slug.clone(), *hidden))
+        })
+        .collect::<Vec<_>>();
+    projection.sort();
+    projection
+}
+
+fn channel_id(value: &PackageValue, slug: &str) -> Option<String> {
+    channel_projection(value)
+        .into_iter()
+        .find_map(|(id, candidate, _)| (candidate == slug).then_some(id))
+}
+
+fn channel_is_hidden(value: &PackageValue, channel_id: &str) -> bool {
+    channel_projection(value)
+        .iter()
+        .any(|(id, _, hidden)| id == channel_id && *hidden)
+}
+
+fn snapshot_has_warning(value: &PackageValue) -> bool {
+    let PackageValue::Object(fields) = value else {
+        return false;
+    };
+    matches!(fields.get("warnings"), Some(PackageValue::Array(warnings)) if !warnings.is_empty())
 }
 
 fn has_channel(value: &PackageValue, slug: &str) -> bool {

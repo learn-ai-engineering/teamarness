@@ -788,6 +788,15 @@ impl ConversationStore {
             .map(|value| value.unwrap_or(false))
     }
 
+    fn has_projection_warnings(&self) -> Result<bool, rusqlite::Error> {
+        let inner = self.inner.lock().unwrap();
+        inner.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code IS NOT NULL AND quarantine_code!='waiting_for_channel')",
+            [],
+            |row| row.get(0),
+        )
+    }
+
     pub fn channels(&self) -> Result<Vec<ChannelView>, rusqlite::Error> {
         let x = self.inner.lock().unwrap();
         let mut q = x.conn.prepare(
@@ -1226,12 +1235,24 @@ impl ConversationsBackend {
             .store
             .channels()
             .map_err(|_| error("conversations.storage_failed", true))?;
+        let warnings = if a
+            .store
+            .has_projection_warnings()
+            .map_err(|_| error("conversations.storage_failed", true))?
+        {
+            vec![JsonValue::String(
+                "Some synchronized records could not be applied.".into(),
+            )]
+        } else {
+            Vec::new()
+        };
         Ok(object([
             (
                 "channels",
                 JsonValue::Array(channels.into_iter().map(channel_json).collect()),
             ),
             ("availability", JsonValue::String("current".into())),
+            ("warnings", JsonValue::Array(warnings)),
         ]))
     }
     async fn append(
