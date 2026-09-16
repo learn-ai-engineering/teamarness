@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +25,8 @@ const VERSION: u8 = 1;
 const BATCH_TAG: u8 = 1;
 const ACK_TAG: u8 = 2;
 const MAX_PACKAGE_IDENTITY: usize = 256;
+const APPLICATION_ACK_REQUEST: &[u8] = b"teamarness/log-sync/applied/1";
+const APPLICATION_ACK: &[u8] = b"teamarness/log-sync/applied/1/ok";
 
 /// A bounded package-sync batch.  The wire representation intentionally carries
 /// opaque sealed records only; P2Panda and endpoint types do not cross this seam.
@@ -33,6 +35,7 @@ pub(crate) struct SyncBatch {
     pub(crate) workspace: [u8; 16],
     pub(crate) membership: Vec<Vec<u8>>,
     pub(crate) package: String,
+    pub(crate) protection_grant: Option<Vec<u8>>,
     pub(crate) records: Vec<Vec<u8>>,
 }
 
@@ -49,6 +52,9 @@ pub(crate) fn encode_batch(batch: &SyncBatch) -> Result<Vec<u8>, ()> {
     }
     body.extend_from_slice(&(package.len() as u16).to_be_bytes());
     body.extend_from_slice(package);
+    let grant = batch.protection_grant.as_deref().unwrap_or_default();
+    body.extend_from_slice(&(u32::try_from(grant.len()).map_err(|_| ())?).to_be_bytes());
+    body.extend_from_slice(grant);
     body.extend_from_slice(&(batch.records.len() as u16).to_be_bytes());
     for record in &batch.records {
         body.extend_from_slice(&(u32::try_from(record.len()).map_err(|_| ())?).to_be_bytes());
@@ -89,6 +95,13 @@ pub(crate) fn decode_batch(frame_bytes: &[u8]) -> Result<SyncBatch, ()> {
         return Err(());
     }
     let package = String::from_utf8(take(body, &mut at, package_len)?.to_vec()).map_err(|_| ())?;
+    let grant_len =
+        usize::try_from(u32::from_be_bytes(take_array::<4>(body, &mut at)?)).map_err(|_| ())?;
+    let protection_grant = if grant_len == 0 {
+        None
+    } else {
+        Some(take(body, &mut at, grant_len)?.to_vec())
+    };
     let count = usize::from(take_array::<2>(body, &mut at).map(u16::from_be_bytes)?);
     if count > MAX_SYNC_OPERATIONS {
         return Err(());
@@ -106,6 +119,7 @@ pub(crate) fn decode_batch(frame_bytes: &[u8]) -> Result<SyncBatch, ()> {
         workspace,
         membership,
         package,
+        protection_grant,
         records,
     };
     validate_batch(&batch)?;
@@ -126,6 +140,7 @@ fn validate_batch(batch: &SyncBatch) -> Result<(), ()> {
         .records
         .iter()
         .chain(batch.membership.iter())
+        .chain(batch.protection_grant.iter())
         .try_fold(0usize, |total, record| {
             total.checked_add(record.len()).ok_or(())
         })?;
@@ -163,6 +178,19 @@ type ReplicationOperation = ([u8; 32], Operation<()>);
 
 pub(crate) trait SyncReceiver: Send + Sync {
     fn receive(&self, peer: PublicIdentity, batch: SyncBatch) -> Result<usize, ()>;
+
+    fn protection_grant(
+        &self,
+        _workspace: WorkspaceId,
+        _package: &str,
+        _recipient: PublicIdentity,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        Ok(None)
+    }
+
+    fn authors(&self, _workspace: WorkspaceId) -> Result<Vec<PublicIdentity>, ()> {
+        Ok(Vec::new())
+    }
 
     fn operations(
         &self,
@@ -281,24 +309,119 @@ enum LogSyncWire {
     Message(LogSyncMessage<[u8; 32]>),
 }
 
+fn apply_log_sync_event(
+    receiver: &Arc<dyn SyncReceiver>,
+    peer: PublicIdentity,
+    workspace: WorkspaceId,
+    package: &str,
+    event: LogSyncEvent<()>,
+) -> Result<bool, String> {
+    if let LogSyncEvent::OperationReceived { operation, .. } = event {
+        receiver
+            .receive_operation(peer, workspace, package, *operation)
+            .map_err(|_| "failed to apply synchronized operation".to_owned())?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+async fn request_application_ack(connection: &Connection) -> Result<(), String> {
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .map_err(|error| error.to_string())?;
+    send.write_all(APPLICATION_ACK_REQUEST)
+        .await
+        .map_err(|error| error.to_string())?;
+    send.finish().map_err(|error| error.to_string())?;
+    let ack = receive
+        .read_to_end(APPLICATION_ACK.len())
+        .await
+        .map_err(|error| error.to_string())?;
+    if ack != APPLICATION_ACK {
+        return Err("missing log sync application acknowledgement".to_owned());
+    }
+    Ok(())
+}
+
+async fn acknowledge_application(connection: &Connection) -> Result<(), String> {
+    let (mut send, mut receive) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| error.to_string())?;
+    let request = receive
+        .read_to_end(APPLICATION_ACK_REQUEST.len())
+        .await
+        .map_err(|error| error.to_string())?;
+    if request != APPLICATION_ACK_REQUEST {
+        return Err("invalid log sync application acknowledgement request".to_owned());
+    }
+    send.write_all(APPLICATION_ACK)
+        .await
+        .map_err(|error| error.to_string())?;
+    send.finish().map_err(|error| error.to_string())?;
+    send.stopped().await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct LogSyncWriterState {
+    pending: AtomicUsize,
+    failed: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl LogSyncWriterState {
+    fn complete(&self, success: bool) {
+        if !success {
+            self.failed.store(true, Ordering::Release);
+        }
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
+
+    async fn flushed(&self) -> Result<(), String> {
+        loop {
+            let changed = self.changed.notified();
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return if self.failed.load(Ordering::Acquire) {
+                    Err("log sync writer failed".to_owned())
+                } else {
+                    Ok(())
+                };
+            }
+            changed.await;
+        }
+    }
+}
+
 struct LogSyncIo {
     outbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    writer_state: Arc<LogSyncWriterState>,
     inbound: tokio::sync::mpsc::UnboundedReceiver<Result<LogSyncWire, String>>,
 }
 
 impl LogSyncIo {
     fn new(mut send: iroh::endpoint::SendStream, mut receive: iroh::endpoint::RecvStream) -> Self {
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let writer_state = Arc::new(LogSyncWriterState::default());
+        let writer_status = Arc::clone(&writer_state);
         let (inbound_tx, inbound) =
             tokio::sync::mpsc::unbounded_channel::<Result<LogSyncWire, String>>();
         tokio::spawn(async move {
             while let Some(bytes) = outbound_rx.recv().await {
-                let Ok(length) = u32::try_from(bytes.len()) else {
-                    break;
+                let success = if let Ok(length) = u32::try_from(bytes.len()) {
+                    send.write_all(&length.to_be_bytes()).await.is_ok()
+                        && send.write_all(&bytes).await.is_ok()
+                } else {
+                    false
                 };
-                if send.write_all(&length.to_be_bytes()).await.is_err()
-                    || send.write_all(&bytes).await.is_err()
-                {
+                writer_status.complete(success);
+                if !success {
+                    while outbound_rx.try_recv().is_ok() {
+                        writer_status.complete(false);
+                    }
                     break;
                 }
             }
@@ -325,7 +448,11 @@ impl LogSyncIo {
                 }
             }
         });
-        Self { outbound, inbound }
+        Self {
+            outbound,
+            writer_state,
+            inbound,
+        }
     }
 
     pub(crate) fn send_wire(&mut self, wire: LogSyncWire) -> Result<(), String> {
@@ -333,9 +460,11 @@ impl LogSyncIo {
         if bytes.len() > MAX_SYNC_BYTES {
             return Err("log sync frame exceeds bound".to_owned());
         }
-        self.outbound
-            .send(bytes)
-            .map_err(|_| "log sync writer closed".to_owned())
+        self.writer_state.pending.fetch_add(1, Ordering::AcqRel);
+        self.outbound.send(bytes).map_err(|_| {
+            self.writer_state.complete(false);
+            "log sync writer closed".to_owned()
+        })
     }
 
     async fn hello(&mut self) -> Result<(WorkspaceId, String), String> {
@@ -428,6 +557,19 @@ pub(crate) async fn outbound_log_session(
         operations.clone(),
     );
     let mut logs = std::collections::BTreeMap::new();
+    let package_log = crate::synchronization::operation_store::log_id(
+        crate::synchronization::scope_digest(&package, workspace),
+    );
+    for author in receiver
+        .authors(workspace)
+        .map_err(|_| "failed to load workspace authors".to_owned())?
+    {
+        let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
+            .map_err(|error| error.to_string())?;
+        logs.entry(author)
+            .or_insert_with(Vec::new)
+            .push(package_log);
+    }
     for (log_id, operation) in operations {
         logs.entry(operation.header.verifying_key)
             .or_insert_with(Vec::new)
@@ -437,8 +579,10 @@ pub(crate) async fn outbound_log_session(
         ids.sort();
         ids.dedup();
     }
-    let (events, mut event_rx) = tokio::sync::broadcast::channel::<LogSyncEvent<()>>(64);
+    let (events, mut event_rx) =
+        tokio::sync::broadcast::channel::<LogSyncEvent<()>>(MAX_SYNC_OPERATIONS + 1);
     let protocol = p2panda_sync::protocols::LogSync::new(store, logs, events);
+    let writer_state = Arc::clone(&io.writer_state);
     let (mut sink, mut stream) = io.split();
     let mut running = Box::pin(crate::synchronization::p2panda_adapter::run_finite(
         protocol,
@@ -450,18 +594,38 @@ pub(crate) async fn outbound_log_session(
         tokio::select! {
             result = &mut running => {
                 result.map_err(|error| error.to_string())?;
-                while let Ok(LogSyncEvent::OperationReceived { operation, .. }) = event_rx.try_recv() {
-                    if receiver.receive_operation(peer, workspace, &package, *operation).is_ok() {
+                drop(running);
+                writer_state.flushed().await?;
+                loop {
+                    match event_rx.try_recv() {
+                        Ok(event) => {
+                            if apply_log_sync_event(&receiver, peer, workspace, &package, event)? {
+                                accepted += 1;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                            | tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                            return Err("log sync event delivery lagged".to_owned());
+                        }
+                    }
+                }
+                drop(sink);
+                drop(stream);
+                request_application_ack(&connection).await?;
+                return Ok(accepted);
+            }
+            event = event_rx.recv() => match event {
+                Ok(event) => {
+                    if apply_log_sync_event(&receiver, peer, workspace, &package, event)? {
                         accepted += 1;
                     }
                 }
-                return Ok(accepted);
-            }
-            event = event_rx.recv() => {
-                if let Ok(LogSyncEvent::OperationReceived { operation, .. }) = event
-                    && receiver.receive_operation(peer, workspace, &package, *operation).is_ok()
-                {
-                    accepted += 1;
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err("log sync event delivery lagged".to_owned());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err("log sync event delivery closed".to_owned());
                 }
             }
         }
@@ -512,6 +676,19 @@ async fn run_log_session(
         operations.clone(),
     );
     let mut logs = std::collections::BTreeMap::new();
+    let package_log = crate::synchronization::operation_store::log_id(
+        crate::synchronization::scope_digest(&package, workspace),
+    );
+    for author in receiver
+        .authors(workspace)
+        .map_err(|_| "failed to load workspace authors".to_owned())?
+    {
+        let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
+            .map_err(|error| error.to_string())?;
+        logs.entry(author)
+            .or_insert_with(Vec::new)
+            .push(package_log);
+    }
     for (log_id, operation) in operations {
         logs.entry(operation.header.verifying_key)
             .or_insert_with(Vec::new)
@@ -521,8 +698,10 @@ async fn run_log_session(
         ids.sort();
         ids.dedup();
     }
-    let (events, mut event_rx) = tokio::sync::broadcast::channel::<LogSyncEvent<()>>(64);
+    let (events, mut event_rx) =
+        tokio::sync::broadcast::channel::<LogSyncEvent<()>>(MAX_SYNC_OPERATIONS + 1);
     let protocol = p2panda_sync::protocols::LogSync::new(store, logs, events);
+    let writer_state = Arc::clone(&io.writer_state);
     let (mut sink, mut stream) = io.split();
     let mut running = Box::pin(crate::synchronization::p2panda_adapter::run_finite(
         protocol,
@@ -533,14 +712,34 @@ async fn run_log_session(
         tokio::select! {
             result = &mut running => {
                 result.map_err(|error| error.to_string())?;
-                while let Ok(LogSyncEvent::OperationReceived { operation, .. }) = event_rx.try_recv() {
-                    let _ = receiver.receive_operation(peer, workspace, &package, *operation);
+                drop(running);
+                writer_state.flushed().await?;
+                loop {
+                    match event_rx.try_recv() {
+                        Ok(event) => {
+                            apply_log_sync_event(&receiver, peer, workspace, &package, event)?;
+                        }
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                            | tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                            return Err("log sync event delivery lagged".to_owned());
+                        }
+                    }
                 }
+                drop(sink);
+                drop(stream);
+                acknowledge_application(&connection).await?;
                 return Ok(());
             }
-            event = event_rx.recv() => {
-                if let Ok(LogSyncEvent::OperationReceived { operation, .. }) = event {
-                    let _ = receiver.receive_operation(peer, workspace, &package, *operation);
+            event = event_rx.recv() => match event {
+                Ok(event) => {
+                    apply_log_sync_event(&receiver, peer, workspace, &package, event)?;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err("log sync event delivery lagged".to_owned());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err("log sync event delivery closed".to_owned());
                 }
             }
         }
@@ -580,6 +779,7 @@ mod tests {
             workspace: [7; 16],
             membership: vec![],
             package: "teamarness.conversations".to_owned(),
+            protection_grant: Some(vec![9; 32]),
             records: (0..count).map(|n| vec![n as u8]).collect(),
         }
     }

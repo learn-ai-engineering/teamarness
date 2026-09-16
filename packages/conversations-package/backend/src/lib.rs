@@ -20,7 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 pub const GENERAL_ID: [u8; 16] = [0; 16];
 const MAGIC: &[u8] = b"TCONV\x01";
 const MAX_MARKDOWN: usize = 32 * 1024;
-const PAGE_SIZE: usize = 50;
+const PAGE_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainRecord {
@@ -106,7 +106,6 @@ impl DomainRecord {
     ) -> Result<Self, DomainError> {
         let author = author.into();
         let markdown = markdown.into();
-        validate_id(channel_id)?;
         validate_identity(&author)?;
         validate_markdown(&markdown)?;
         Ok(Self::MessagePost {
@@ -213,7 +212,6 @@ impl DomainRecord {
         markdown: String,
     ) -> Result<Self, DomainError> {
         validate_id(id)?;
-        validate_id(channel_id)?;
         validate_identity(&author)?;
         validate_markdown(&markdown)?;
         Ok(Self::MessagePost {
@@ -528,7 +526,7 @@ impl ConversationStore {
         let mut out = Vec::new();
         let mut counts = HashMap::new();
         {
-            let mut st=x.conn.prepare("SELECT channel_id,COUNT(*) FROM messages m WHERE ingestion_ordinal>(SELECT COALESCE(last_read_ingestion_ordinal,0) FROM unread u WHERE u.channel_id=m.channel_id) GROUP BY channel_id")?;
+            let mut st=x.conn.prepare("SELECT channel_id,COUNT(*) FROM messages m WHERE ingestion_ordinal>COALESCE((SELECT last_read_ingestion_ordinal FROM unread u WHERE u.channel_id=m.channel_id),0) GROUP BY channel_id")?;
             for r in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
                 let (id, n) = r?;
                 counts.insert(id, n as u64);
@@ -698,6 +696,19 @@ fn str_field(v: &JsonValue, k: &str) -> Result<String, BackendError> {
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, object([]))
 }
+
+fn capability_error(operation: &str, cause: BackendError) -> BackendError {
+    eprintln!(
+        "conversations capability failure: operation={operation} code={} retryable={}",
+        cause.code(),
+        cause.retryable()
+    );
+    BackendError::new(
+        "conversations.capability_unavailable",
+        cause.retryable(),
+        object([("causeCode", JsonValue::String(cause.code().to_owned()))]),
+    )
+}
 fn grant(init: &teamarness_package_sdk::Initialization, id: &str) -> Result<String, BackendError> {
     init.capabilities()
         .as_array()
@@ -766,13 +777,16 @@ impl ConversationsBackend {
             .capabilities
             .subscribe(
                 &sync,
-                object([(
-                    "afterCursor",
-                    cursor.map_or(JsonValue::Null, JsonValue::String),
-                )]),
+                object([
+                    ("method", JsonValue::String("subscribe".into())),
+                    (
+                        "afterCursor",
+                        cursor.map_or(JsonValue::Null, JsonValue::String),
+                    ),
+                ]),
             )
             .await
-            .map_err(|_| error("conversations.capability_unavailable", true))?;
+            .map_err(|cause| capability_error("subscribe", cause))?;
         // Slugs are domain plaintext and are intentionally rebuilt through bounded Core opens.
         // Message bodies are opened only when a page is requested.
         for batch in store
@@ -792,7 +806,7 @@ impl ConversationsBackend {
                     object([("sealedRecords", JsonValue::Array(sealed))]),
                 )
                 .await
-                .map_err(|_| error("conversations.capability_unavailable", true))?;
+                .map_err(|cause| capability_error("open-control-records", cause))?;
             if let Some(results) = opened.get("results").and_then(JsonValue::as_array) {
                 for result in results {
                     if let Some(canonical) = result.get("canonical").and_then(JsonValue::as_str) {
@@ -805,9 +819,28 @@ impl ConversationsBackend {
         let backend = self.clone();
         let state = active.clone();
         tokio::spawn(async move {
-            while let Some(Ok(event)) = sub.recv().await {
-                if ingest_event(&state.store, &event).is_ok() {
-                    backend.changes.send_modify(|x| *x = x.saturating_add(1));
+            loop {
+                match sub.recv().await {
+                    Some(Ok(event)) => match ingest_event(&state.store, &event) {
+                        Ok(_) => backend.changes.send_modify(|x| *x = x.saturating_add(1)),
+                        Err(error) => eprintln!(
+                            "conversations record ingestion failure: code={} retryable={}",
+                            error.code(),
+                            error.retryable()
+                        ),
+                    },
+                    Some(Err(error)) => {
+                        eprintln!(
+                            "conversations record subscription failure: code={} retryable={}",
+                            error.code(),
+                            error.retryable()
+                        );
+                        break;
+                    }
+                    None => {
+                        eprintln!("conversations record subscription closed");
+                        break;
+                    }
                 }
             }
         });
@@ -857,7 +890,7 @@ impl ConversationsBackend {
                 ]),
             )
             .await
-            .map_err(|_| error("conversations.capability_unavailable", true))?;
+            .map_err(|cause| capability_error(purpose, cause))?;
         let record_id = str_field(&response, "recordId")?;
         let order = str_field(&response, "orderKey")?;
         let author = str_field(&response, "author")?;
@@ -891,6 +924,12 @@ impl ConversationsBackend {
             .store
             .message_rows(channel, before, limit.min(PAGE_SIZE))
             .map_err(|_| error("conversations.storage_failed", true))?;
+        if rows.is_empty() {
+            return Ok(object([
+                ("messages", JsonValue::Array(Vec::new())),
+                ("hasMore", JsonValue::Bool(false)),
+            ]));
+        }
         let sealed = rows.iter().map(|x| JsonValue::String(b64(&x.4))).collect();
         let opened = r
             .capabilities
@@ -900,7 +939,7 @@ impl ConversationsBackend {
                 object([("sealedRecords", JsonValue::Array(sealed))]),
             )
             .await
-            .map_err(|_| error("conversations.capability_unavailable", true))?;
+            .map_err(|cause| capability_error("open-message-page", cause))?;
         let results = opened
             .get("results")
             .and_then(JsonValue::as_array)
@@ -1104,6 +1143,13 @@ mod tests {
         assert!(DomainRecord::message_post([1; 16], "a", "x".repeat(MAX_MARKDOWN + 1)).is_err());
     }
     #[test]
+    fn general_channel_accepts_messages_but_cannot_be_hidden() {
+        let message = DomainRecord::message_post(GENERAL_ID, "author", "hello").unwrap();
+        assert_eq!(DomainRecord::decode(&message.encode()).unwrap(), message);
+        assert!(DomainRecord::channel_hide(GENERAL_ID, "author").is_err());
+    }
+
+    #[test]
     fn general_and_duplicate_slug_order_are_stable() {
         let d = tempfile::tempdir().unwrap();
         let s = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
@@ -1252,6 +1298,34 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), PAGE_SIZE);
         }
+    }
+
+    #[test]
+    fn unread_defaults_to_all_messages_before_first_read() {
+        let d = tempfile::tempdir().unwrap();
+        let s = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
+        let message = DomainRecord::message_post(GENERAL_ID, "alice", "one").unwrap();
+        s.ingest(
+            &hex_id(message.id()),
+            "01",
+            "alice",
+            message.kind(),
+            "s",
+            &message.encode(),
+            b"x",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            s.channels()
+                .unwrap()
+                .iter()
+                .find(|channel| channel.id == hex_id(GENERAL_ID))
+                .unwrap()
+                .unread_count,
+            1
+        );
     }
 
     #[test]

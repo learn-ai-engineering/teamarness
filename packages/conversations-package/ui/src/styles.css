@@ -8,7 +8,6 @@
 .channel-button { width: 100%; }
 .channel-button[aria-pressed="true"] { background: var(--teamarness-color-accent, #7de2c4); color: #07110f; }
 .channel-button:hover, .secondary-control:hover, .message-author:hover { border-color: currentColor; }
-.unread-count { float: right; font-weight: 700; }
 .channel-create-form, .composer { display: grid; gap: .5rem; margin-top: .75rem; }
 .channel-create-form input, .composer textarea { width: 100%; border: 1px solid currentColor; border-radius: var(--teamarness-radius-control, 6px); color: inherit; background: var(--teamarness-color-background, #101817); padding: .55rem; }
 .channel-create-form button, .composer button { background: var(--teamarness-color-accent, #7de2c4); border: 0; border-radius: var(--teamarness-radius-control, 6px); color: #07110f; cursor: pointer; font-weight: 700; padding: .55rem .75rem; }

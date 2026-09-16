@@ -21,6 +21,7 @@
     "test": "node --test scripts/dev-profile.test.mjs scripts/package-directory.test.mjs scripts/build-reference-package.test.mjs scripts/build-tutorial-package.test.mjs scripts/build-conversations-package.test.mjs scripts/build-application-packages.test.mjs scripts/create-package.test.mjs scripts/create-package.integration.test.mjs scripts/package-foundation-qualification.test.mjs contracts/package-process/v1/fixtures/*.test.mjs && npm --workspace @teamarness/package-ui-sdk test && npm --workspace @teamarness/reference-package-ui test && npm --workspace @teamarness/tutorial-package-ui test && npm --workspace @teamarness/conversations-package-ui test && npm --workspace teamarness-desktop test",
     "test:dev-profile": "node --test scripts/dev-profile.test.mjs",
     "verify:phase5-webkit:prepare": "npm run build && node packages/reference-package/ui/prepare-webkit-probe.mjs",
+    "verify:conversations": "node scripts/verify-conversations.mjs",
     "verify:packaged-app": "node scripts/smoke-packaged-app.mjs",
     "tauri": "npm --workspace teamarness-desktop run tauri --"
   }

@@ -575,6 +575,47 @@ pub(crate) struct RuntimeSyncReceiver {
 }
 
 impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
+    fn protection_grant(
+        &self,
+        workspace: WorkspaceId,
+        package: &str,
+        recipient: PublicIdentity,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let state = self.state.upgrade().ok_or(())?;
+        let mut state = state.lock().map_err(|_| ())?;
+        let projection = state.memberships.get(&workspace).ok_or(())?;
+        let local = PublicIdentity(state.secret_key.public());
+        if !projection.contains_member(local) || !projection.contains_member(recipient) {
+            return Err(());
+        }
+        let admission = *projection.snapshot().version().as_bytes();
+        let secret_key = state.secret_key.clone();
+        match crate::synchronization::export_protection_grant(
+            &mut state.connection,
+            &secret_key,
+            workspace,
+            package,
+            recipient,
+            admission,
+        ) {
+            Ok(grant) => Ok(Some(grant)),
+            Err(crate::SynchronizationError::WorkspaceNotFound) => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn authors(&self, workspace: WorkspaceId) -> Result<Vec<PublicIdentity>, ()> {
+        let state = self.state.upgrade().ok_or(())?;
+        let state = state.lock().map_err(|_| ())?;
+        let projection = state.memberships.get(&workspace).ok_or(())?;
+        Ok(projection
+            .snapshot()
+            .members()
+            .iter()
+            .map(|member| member.identity())
+            .collect())
+    }
+
     fn receive(
         &self,
         peer: PublicIdentity,
@@ -606,12 +647,25 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             )
             .map_err(|_| ())?;
         }
-        let current = state
-            .memberships
-            .get(&workspace)
-            .is_some_and(|projection| projection.contains_member(peer));
+        let local = PublicIdentity(state.secret_key.public());
+        let current = state.memberships.get(&workspace).is_some_and(|projection| {
+            projection.contains_member(local) && projection.contains_member(peer)
+        });
         if !current {
             return Err(());
+        }
+        if let Some(grant) = batch.protection_grant.as_deref() {
+            if crate::synchronization::protection_control_author(grant).map_err(|_| ())? != peer {
+                return Err(());
+            }
+            crate::synchronization::import_protection_grant(
+                &mut state.connection,
+                local,
+                workspace,
+                &batch.package,
+                grant,
+            )
+            .map_err(|_| ())?;
         }
         let mut accepted = 0;
         for sealed in batch.records {
@@ -656,10 +710,11 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             scope,
         )
         .map_err(|_| ())?;
+        let log_id = crate::synchronization::operation_log_id(scope);
         Ok(store
             .operations()
             .into_iter()
-            .map(|operation| (scope, operation))
+            .map(|operation| (log_id, operation))
             .collect())
     }
 
@@ -689,13 +744,18 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             &operation,
         )
         .map_err(|_| ())?;
+        let record_id = record.record_id();
         if let Some(event) =
             crate::synchronization::event_for_record(&state.connection, workspace, package, record)
-            && let Some(listeners) = state
+        {
+            if let Some(listeners) = state
                 .record_subscribers
                 .get_mut(&(workspace, package.to_owned()))
-        {
-            listeners.retain(|sender| sender.send(event.clone()).is_ok());
+            {
+                listeners.retain(|sender| sender.send(event.clone()).is_ok());
+            }
+        } else {
+            eprintln!("remote record event unavailable: package={package} record={record_id}");
         }
         Ok(())
     }
@@ -2492,6 +2552,7 @@ mod tests {
     use super::*;
     use crate::invitation::{sign_claim, sign_token};
     use crate::membership::{AdmissionProof, MembershipAction, MembershipEnvelope};
+    use crate::{RecordEvent, RecordId};
 
     struct RecordingClock {
         calls: Arc<AtomicU64>,
@@ -2504,8 +2565,34 @@ mod tests {
         }
     }
 
+    async fn wait_for_record(
+        runtime: &CoreRuntime,
+        workspace: WorkspaceId,
+        package: &str,
+        record_id: RecordId,
+    ) -> RecordEvent {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(mut subscription) = runtime.subscribe_records(workspace, package, None) {
+                while let Some(event) = subscription
+                    .next_event_timeout(std::time::Duration::ZERO)
+                    .unwrap()
+                {
+                    if event.record_id() == record_id {
+                        return event;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "record did not arrive before the test deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn production_log_sync_converges_across_partition_and_restart() {
+    async fn production_log_sync_grants_scope_converges_and_survives_restart() {
         let root = std::env::temp_dir().join(format!(
             "teamarness-production-log-sync-{}",
             std::process::id()
@@ -2525,9 +2612,6 @@ mod tests {
             .unwrap();
         let workspace = a.create_workspace("Production sync").unwrap();
         let package = "teamarness.test";
-        let first = a
-            .append_record(workspace.id(), package, "message.post", b"first")
-            .unwrap();
         let invitation = a
             .create_workspace_invitation_for_test(workspace.id(), 1, 60_000)
             .unwrap();
@@ -2535,42 +2619,56 @@ mod tests {
             .await
             .unwrap();
         b.join_workspace(&invitation).await.unwrap();
-        let grant = a
-            .export_protection_grant(workspace.id(), package, b.public_identity())
+
+        let first = a
+            .append_record(workspace.id(), package, "message.post", b"first")
             .unwrap();
-        b.import_protection_grant(workspace.id(), package, &grant)
-            .unwrap();
+        let received = wait_for_record(&b, workspace.id(), package, first.record_id()).await;
+        assert_eq!(received.record_id(), first.record_id());
 
         let a_local = a
             .append_record(workspace.id(), package, "message.post", b"a-local")
             .unwrap();
+        let received_a_local =
+            wait_for_record(&b, workspace.id(), package, a_local.record_id()).await;
+        assert_eq!(received_a_local.record_id(), a_local.record_id());
+
         let b_local = b
             .append_record(workspace.id(), package, "message.post", b"b-local")
             .unwrap();
-        let (a_to_b, b_to_a) = tokio::join!(
-            a.replicate_records_to(workspace.id(), package, b.public_identity()),
-            b.replicate_records_to(workspace.id(), package, a.public_identity()),
-        );
-        assert!(a_to_b.unwrap() > 0);
-        assert!(b_to_a.unwrap() > 0);
-
-        let mut b_records = b.subscribe_records(workspace.id(), package, None).unwrap();
-        let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..3 {
-            let event = b_records
-                .next_event_timeout(std::time::Duration::from_secs(1))
-                .unwrap()
-                .unwrap();
-            seen.insert((event.record_id(), event.order_key()));
+        let received_b_local =
+            wait_for_record(&a, workspace.id(), package, b_local.record_id()).await;
+        let mut a_records = a.subscribe_records(workspace.id(), package, None).unwrap();
+        let mut a_seen = std::collections::BTreeSet::new();
+        while let Some(event) = a_records
+            .next_event_timeout(std::time::Duration::ZERO)
+            .unwrap()
+        {
+            a_seen.insert((event.record_id(), event.order_key()));
         }
-        assert!(seen.contains(&(first.record_id(), first.order_key())));
-        assert!(seen.contains(&(a_local.record_id(), a_local.order_key())));
-        assert!(seen.contains(&(b_local.record_id(), b_local.order_key())));
+        assert_eq!(received_b_local.record_id(), b_local.record_id());
+        let mut b_records = b.subscribe_records(workspace.id(), package, None).unwrap();
+        let mut b_seen = std::collections::BTreeSet::new();
+        while let Some(event) = b_records
+            .next_event_timeout(std::time::Duration::ZERO)
+            .unwrap()
+        {
+            b_seen.insert((event.record_id(), event.order_key()));
+        }
+        for expected in [
+            (first.record_id(), first.order_key()),
+            (a_local.record_id(), a_local.order_key()),
+            (b_local.record_id(), b_local.order_key()),
+        ] {
+            assert!(a_seen.contains(&expected));
+            assert!(b_seen.contains(&expected));
+        }
 
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
         drop(a);
         drop(b);
+
         let a = CoreRuntime::open_with_clock_and_readiness(a_config, clock(), true)
             .await
             .unwrap();
@@ -2580,34 +2678,99 @@ mod tests {
         let after_restart = a
             .append_record(workspace.id(), package, "message.post", b"after-restart")
             .unwrap();
-        let delivered = a
-            .replicate_records_to_address_for_test(
+        a.replicate_records_to_address_for_test(
+            workspace.id(),
+            package,
+            b.transport.endpoint_address(),
+            b.public_identity(),
+        )
+        .await
+        .unwrap();
+        let received_after_restart =
+            wait_for_record(&b, workspace.id(), package, after_restart.record_id()).await;
+        assert_eq!(
+            received_after_restart.record_id(),
+            after_restart.record_id()
+        );
+
+        let mut b_records = b.subscribe_records(workspace.id(), package, None).unwrap();
+        let mut b_seen = std::collections::BTreeSet::new();
+        while let Some(event) = b_records
+            .next_event_timeout(std::time::Duration::ZERO)
+            .unwrap()
+        {
+            assert!(b_seen.insert((event.record_id(), event.order_key())));
+        }
+        assert_eq!(b_seen.len(), 4);
+        assert!(b_seen.contains(&(after_restart.record_id(), after_restart.order_key())));
+
+        b.state
+            .lock()
+            .unwrap()
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_remote_record_insert
+                 BEFORE INSERT ON immutable_records
+                 BEGIN SELECT RAISE(ABORT, 'injected remote apply failure'); END;",
+            )
+            .unwrap();
+        let after_failure = a
+            .append_record(workspace.id(), package, "message.post", b"after-failure")
+            .unwrap();
+        assert!(
+            a.replicate_records_to_address_for_test(
                 workspace.id(),
                 package,
                 b.transport.endpoint_address(),
                 b.public_identity(),
             )
             .await
-            .unwrap();
-        assert_eq!(delivered, 0);
-        let opened = b
-            .open_records(
-                workspace.id(),
-                package,
-                &[after_restart.sealed_record().to_vec()],
+            .is_err()
+        );
+        let scope = crate::synchronization::scope_digest(package, workspace.id());
+        let (wake_generation, consumed_generation) = a
+            .state
+            .lock()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT wake_generation,consumed_generation FROM durable_wakes WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .unwrap();
-        assert_eq!(opened[0].record_id(), after_restart.record_id());
-        let duplicate = a
-            .replicate_records_to_address_for_test(
-                workspace.id(),
-                package,
-                b.transport.endpoint_address(),
-                b.public_identity(),
-            )
-            .await
+        assert!(wake_generation > consumed_generation);
+        b.state
+            .lock()
+            .unwrap()
+            .connection
+            .execute_batch("DROP TRIGGER fail_remote_record_insert;")
             .unwrap();
-        assert_eq!(duplicate, 0);
+        a.replicate_records_to_address_for_test(
+            workspace.id(),
+            package,
+            b.transport.endpoint_address(),
+            b.public_identity(),
+        )
+        .await
+        .unwrap();
+        let received_after_failure =
+            wait_for_record(&b, workspace.id(), package, after_failure.record_id()).await;
+        assert_eq!(
+            received_after_failure.record_id(),
+            after_failure.record_id()
+        );
+
+        let mut b_records = b.subscribe_records(workspace.id(), package, None).unwrap();
+        let mut b_seen = std::collections::BTreeSet::new();
+        while let Some(event) = b_records
+            .next_event_timeout(std::time::Duration::ZERO)
+            .unwrap()
+        {
+            assert!(b_seen.insert((event.record_id(), event.order_key())));
+        }
+        assert_eq!(b_seen.len(), 5);
+
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
         drop(a);

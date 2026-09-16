@@ -142,11 +142,12 @@ impl Network {
             .await
             .map_err(|_| OnboardingError::Authentication)?;
         send.finish().map_err(|_| OnboardingError::Authentication)?;
-        let ack = receive
-            .read_to_end(16)
+        let mut ack = [0_u8; 8];
+        receive
+            .read_exact(&mut ack)
             .await
             .map_err(|_| OnboardingError::Authentication)?;
-        if ack.len() != 8 || ack[4] != 1 || ack[5] != 2 {
+        if ack[4] != 1 || ack[5] != 2 {
             return Err(OnboardingError::InvalidInput);
         }
         Ok(usize::from(u16::from_be_bytes([ack[6], ack[7]])))
@@ -160,13 +161,45 @@ impl Network {
         package: String,
         peer: crate::PublicIdentity,
     ) -> Result<usize, OnboardingError> {
-        let _permit = self
-            .outbound
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| OnboardingError::Overload)?;
-        timeout(
+        self.send_log_sync_with_timeout(
+            address,
+            receiver,
+            workspace,
+            package,
+            peer,
             crate::synchronization::network_handler::SYNC_SESSION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn send_log_sync_with_timeout(
+        &self,
+        address: EndpointAddr,
+        receiver: Arc<dyn SyncReceiver>,
+        workspace: crate::WorkspaceId,
+        package: String,
+        peer: crate::PublicIdentity,
+        session_timeout: Duration,
+    ) -> Result<usize, OnboardingError> {
+        timeout(session_timeout, async {
+            if let Some(protection_grant) = receiver
+                .protection_grant(workspace, &package, peer)
+                .map_err(|_| OnboardingError::InvalidInput)?
+            {
+                let control = SyncBatch {
+                    workspace: *workspace.as_bytes(),
+                    membership: Vec::new(),
+                    package: package.clone(),
+                    protection_grant: Some(protection_grant),
+                    records: Vec::new(),
+                };
+                self.send_batch(address.clone(), &control).await?;
+            }
+            let _permit = self
+                .outbound
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| OnboardingError::Overload)?;
             crate::synchronization::network_handler::outbound_log_session(
                 &self.endpoint,
                 address,
@@ -174,11 +207,12 @@ impl Network {
                 workspace,
                 package,
                 peer,
-            ),
-        )
+            )
+            .await
+            .map_err(|_| OnboardingError::Authentication)
+        })
         .await
         .map_err(|_| OnboardingError::Timeout)?
-        .map_err(|_| OnboardingError::Authentication)
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
@@ -200,6 +234,38 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingReceiver(Mutex<Vec<SyncBatch>>);
+
+    #[derive(Debug)]
+    struct GrantReceiver;
+
+    impl SyncReceiver for GrantReceiver {
+        fn protection_grant(
+            &self,
+            _workspace: crate::WorkspaceId,
+            _package: &str,
+            _recipient: crate::PublicIdentity,
+        ) -> Result<Option<Vec<u8>>, ()> {
+            Ok(Some(vec![1]))
+        }
+
+        fn receive(&self, _peer: crate::PublicIdentity, _batch: SyncBatch) -> Result<usize, ()> {
+            Ok(0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StallingBatchHandler;
+
+    impl iroh::protocol::ProtocolHandler for StallingBatchHandler {
+        async fn accept(
+            &self,
+            connection: iroh::endpoint::Connection,
+        ) -> Result<(), iroh::protocol::AcceptError> {
+            let (_send, _receive) = connection.accept_bi().await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
 
     impl SyncReceiver for RecordingReceiver {
         fn receive(&self, _peer: crate::PublicIdentity, batch: SyncBatch) -> Result<usize, ()> {
@@ -231,6 +297,52 @@ mod tests {
         network.shutdown().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grant_prelude_obeys_the_complete_session_deadline() {
+        let server_endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(secret(5))
+            .alpns(vec![PACKAGE_BATCH_ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let server_router = Router::builder(server_endpoint.clone())
+            .accept(PACKAGE_BATCH_ALPN, StallingBatchHandler)
+            .spawn();
+        let client = Network::bind(
+            secret(6),
+            RelayMode::Disabled,
+            true,
+            Arc::new(OnboardingHandler::new(Duration::from_secs(1))),
+            None,
+        )
+        .await
+        .unwrap();
+        let address = server_endpoint.bound_sockets().into_iter().fold(
+            EndpointAddr::new(server_endpoint.id()),
+            EndpointAddr::with_ip_addr,
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.send_log_sync_with_timeout(
+                address,
+                Arc::new(GrantReceiver),
+                crate::WorkspaceId::from_bytes([9; 16]),
+                "teamarness.test".to_owned(),
+                crate::PublicIdentity::from_bytes(*server_endpoint.id().as_bytes()).unwrap(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the complete synchronization deadline must interrupt a stalled control ACK");
+        assert_eq!(result.unwrap_err(), OnboardingError::Timeout);
+        client.shutdown().await.unwrap();
+        server_router.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn bounded_sync_batch_is_delivered_through_the_shared_network() {
         let receiver = Arc::new(RecordingReceiver::default());
@@ -260,6 +372,7 @@ mod tests {
             workspace: [8; 16],
             membership: vec![],
             package: "teamarness.test".to_owned(),
+            protection_grant: None,
             records: vec![vec![1, 2, 3], vec![4]],
         };
         assert_eq!(client.send_batch(address, &batch).await.unwrap(), 2);

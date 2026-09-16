@@ -39,7 +39,15 @@ type UiState = {
   confirmingHide: boolean;
 };
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 32;
+
+function requestErrorCode(error: unknown): string {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && code.length > 0) return code;
+  }
+  return "unknown_error";
+}
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
   const state: UiState = {
@@ -160,8 +168,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
         markdown,
       });
       await loadSelected();
-    } catch {
-      state.warning = "Message could not be saved. Check the connection and try again.";
+    } catch (error) {
+      const code = requestErrorCode(error);
+      console.error("Conversations message post failed", { code, error });
+      state.warning = `Message could not be saved (${code}).`;
       state.loading = false;
       render();
     }
@@ -190,14 +200,6 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
       button.dataset.channelId = channel.id;
       button.setAttribute("aria-pressed", String(channel.id === state.selectedChannel));
       button.textContent = `#${channel.slug}`;
-      const unread = Number(channel.unreadCount);
-      if (unread > 0) {
-        const badge = document.createElement("span");
-        badge.className = "unread-count";
-        badge.textContent = String(unread);
-        badge.setAttribute("aria-label", `${unread} unread`);
-        button.append(" ", badge);
-      }
       button.addEventListener("click", () => { void selectChannel(channel.id); });
       item.append(button);
       channelList.append(item);
@@ -343,7 +345,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   await loadSelected();
   const activeSubscription = await context.client.subscribe<ConversationSnapshot>("conversations.changes", {}, async (snapshot) => {
     state.snapshot = snapshot;
-    render();
+    await loadSelected();
   });
 
   return async () => {

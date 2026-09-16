@@ -42,11 +42,11 @@ Completed on 2026-09-14. The Tauri Shell now mounts Package UIs, applies Workspa
 
 **External authoring condition:** production Package authoring requires published, versioned Rust and TypeScript SDK artifacts plus a supported generated-project upgrade policy. Vendored foundation projects are not upgraded in place, and no updater is provided.
 
-### Phase 4 - Conversations Package foundation (Core complete; Package work pending)
+### Phase 4 - Conversations Package (implementation complete; verification in progress)
 
-Started on 2026-09-14. The Conversations domain is the first real Package, but its implementation waits until the generic Core capability is qualified. Core now owns the first generic Package-scoped Synchronization Capability: a durable, bounded immutable-record journal with production LogSync, authenticated sealed persistence, membership gates, durable wakes, and awaited lifecycle. Conversations will own Channels, signed Markdown Messages, Channel Membership, conversation keys, local schemas and projections, offline behavior, unread state, and UI in the downstream Package phases.
+Started on 2026-09-14. Core now owns the first generic Package-scoped Synchronization Capability: a durable, bounded immutable-record journal with production LogSync, authenticated sealed persistence, membership gates, durable wakes, and awaited lifecycle. The Conversations Package owns Channels, signed Markdown Messages, local schemas and projections, unread state, and its UI. Automated qualification covers encrypted two-profile synchronization, bounded history, persistence, Package composition, and delivery timing. Verify and Close remain before integration.
 
-**Outcome:** The generic Core foundation is qualified before downstream Package work; later phases will enable two peers to exchange encrypted messages in a `#general` channel through the Conversations Package UI.
+**Outcome:** Two separately stored peers exchange encrypted Messages and Channels through the Conversations Package UI without Conversations-specific Core, Host, or Shell routes.
 
 **Depends on:** Phase 3.
 

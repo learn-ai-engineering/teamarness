@@ -750,7 +750,7 @@ async fn run_record_stream(
     workspace: teamarness_core::WorkspaceId,
     package: String,
     stream_id: String,
-    mut after: Option<teamarness_core::Cursor>,
+    after: Option<teamarness_core::Cursor>,
     mut credit: u64,
     mut commands: mpsc::Receiver<StreamCommand>,
     output: HostStreamSender,
@@ -758,6 +758,7 @@ async fn run_record_stream(
     mut cancelled: watch::Receiver<bool>,
 ) {
     let mut sequence = 0_u64;
+    let mut subscription = None;
     loop {
         if *cancelled.borrow() {
             break;
@@ -792,21 +793,49 @@ async fn run_record_stream(
                 }
             }
         }
-        let core_for_next = core.clone();
-        let package_for_next = package.clone();
+        if subscription.is_none() {
+            let core_for_subscribe = core.clone();
+            let package_for_subscribe = package.clone();
+            let next = tokio::task::spawn_blocking(move || {
+                core_for_subscribe.subscribe_records(workspace, &package_for_subscribe, after)
+            })
+            .await;
+            match next {
+                Ok(Ok(value)) => subscription = Some(value),
+                Ok(Err(teamarness_core::SynchronizationError::WorkspaceNotFound)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    eprintln!("record stream subscribe failed: stream={stream_id} error={error}");
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "record stream subscribe task failed: stream={stream_id} error={error}"
+                    );
+                    break;
+                }
+            }
+        }
+
+        let mut current = subscription.take().expect("record subscription is present");
         let next = tokio::task::spawn_blocking(move || {
-            let mut subscription = core_for_next
-                .subscribe_records(workspace, &package_for_next, after)
-                .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-            subscription
-                .next_event_timeout(std::time::Duration::from_millis(50))
-                .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
+            let event = current.next_event_timeout(std::time::Duration::from_millis(50));
+            (current, event)
         })
         .await;
         let event = match next {
-            Ok(Ok(Some(event))) => event,
-            Ok(Ok(None)) => continue,
-            _ => break,
+            Ok((current, Ok(Some(event)))) => {
+                subscription = Some(current);
+                event
+            }
+            Ok((current, Ok(None))) => {
+                subscription = Some(current);
+                continue;
+            }
+            Ok((_current, Err(_))) => break,
+            Err(_) => break,
         };
         sequence = sequence.saturating_add(1);
         let signature = match encode_signature(&event.record().signature()) {
@@ -825,9 +854,9 @@ async fn run_record_stream(
             "sealedRecord":encode_base64(event.sealed_record()),
         });
         if output.event(&stream_id, sequence, payload).await.is_err() {
+            eprintln!("record stream delivery failed: stream={stream_id} sequence={sequence}");
             break;
         }
-        after = Some(event.cursor());
         credit -= 1;
     }
     streams.lock().await.remove(&stream_id);

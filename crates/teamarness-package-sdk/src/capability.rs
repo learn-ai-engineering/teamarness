@@ -40,7 +40,7 @@ impl CapabilitySubscription {
     /// Receives one event, returning `None` after the host closes the stream.
     pub async fn recv(&mut self) -> Option<Result<JsonValue, BackendError>> {
         let event = self.receiver.recv().await;
-        if event.is_some() {
+        if matches!(event, Some(Ok(_))) {
             let _ = self
                 .writer
                 .control(object([

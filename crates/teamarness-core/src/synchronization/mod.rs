@@ -12,6 +12,7 @@ mod scheduler;
 mod wakes;
 mod worker;
 
+pub(crate) use operation_store::log_id as operation_log_id;
 pub(crate) use worker::SyncWorker;
 
 pub(crate) use network_handler::{
@@ -900,6 +901,27 @@ pub(crate) fn export_protection_grant(
         .map_err(|_| storage_error())?
         .ok_or(SynchronizationError::WorkspaceNotFound)
         .and_then(fixed)?;
+    let author = secret.public();
+    let existing = conn
+        .query_row(
+            "SELECT control_bytes FROM protection_control_operations
+             WHERE scope_id=?1 AND operation_kind='grant'
+               AND author_public_identity=?2 AND recipient_public_identity=?3
+               AND admission_operation_id=?4
+             LIMIT 1",
+            rusqlite::params![
+                scope.as_slice(),
+                author.as_bytes().as_slice(),
+                recipient.as_bytes().as_slice(),
+                admission.as_slice()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|_| storage_error())?;
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
     let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, key);
     let control =
         protection_control::decode(&bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
@@ -1642,11 +1664,15 @@ pub(crate) fn event_for_record(
     record: ImmutableRecord,
 ) -> Option<RecordEvent> {
     let scope = scope_digest(package, workspace);
-    let (journal, sequence): (Vec<u8>, i64) = conn.query_row(
-        "SELECT journal_id, delivery_sequence FROM sync_scopes JOIN record_delivery USING(scope_id) WHERE sync_scopes.scope_id=?1 AND record_delivery.record_id=?2",
-        rusqlite::params![scope.as_slice(), record.record_id.as_bytes().as_slice()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).ok()?;
+    let (journal, sequence): (Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT sync_scopes.journal_id, record_delivery.delivery_sequence
+         FROM sync_scopes JOIN record_delivery USING(scope_id)
+         WHERE sync_scopes.scope_id=?1 AND record_delivery.record_id=?2",
+            rusqlite::params![scope.as_slice(), record.record_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
     let journal: [u8; 16] = journal.try_into().ok()?;
     let sequence = u64::try_from(sequence).ok()?;
     Some(RecordEvent {

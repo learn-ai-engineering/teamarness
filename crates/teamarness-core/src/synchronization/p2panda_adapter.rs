@@ -54,10 +54,11 @@ impl TeamarnessLogStore {
                 Ok((operation, bytes))
             })
             .collect::<Result<Vec<_>, TeamarnessLogStoreError>>()?;
+        let log_id = super::operation_store::log_id(scope_id);
         Ok(Self::from_operations(
             operations
                 .into_iter()
-                .map(|(operation, _)| (scope_id, operation)),
+                .map(|(operation, _)| (log_id, operation)),
         ))
     }
 

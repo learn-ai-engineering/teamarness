@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildConversationsPackage } from "./build-conversations-package.mjs";
+import { compareDeclaredPackageBytes, copyPackageDirectory } from "./package-directory.mjs";
 import { buildReferencePackage } from "./build-reference-package.mjs";
 import { buildTutorialPackage } from "./build-tutorial-package.mjs";
 
@@ -57,7 +58,22 @@ export async function buildApplicationPackages({
   };
   await writeFile(temporaryPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
   await rename(temporaryPath, indexPath);
-  return { indexPath, directories: [referenceDirectory, tutorialDirectory, conversationsDirectory] };
+
+  const directories = [referenceDirectory, tutorialDirectory, conversationsDirectory];
+  const debugRoot = join(root, "target/debug/packages");
+  await rm(debugRoot, { recursive: true, force: true });
+  await mkdir(debugRoot, { recursive: true, mode: 0o700 });
+  for (const directory of directories) {
+    const debugDirectory = join(debugRoot, directory.split("/").at(-1));
+    await copyPackageDirectory(directory, debugDirectory);
+    await compareDeclaredPackageBytes(directory, debugDirectory);
+  }
+  await writeFile(
+    join(debugRoot, "application-packages.v1.json"),
+    `${JSON.stringify(document, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  return { indexPath, directories };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {

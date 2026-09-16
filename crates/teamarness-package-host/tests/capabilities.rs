@@ -215,6 +215,78 @@ async fn routes_scoped_workspace_membership_and_signing_calls() {
 }
 
 #[tokio::test]
+async fn immutable_record_stream_waits_for_a_new_scope() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let opened = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new("immutable-subscribe").unwrap(),
+            operation: "fixture.immutable_subscribe".into(),
+            payload: object([]),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(opened, PackageHostOutcome::UiResponse { .. }));
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        host.snapshot().await.instances[0].lifecycle,
+        teamarness_package_host::LifecycleState::Active
+    );
+
+    let credited = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new("immutable-credit").unwrap(),
+            operation: "fixture.immutable_credit".into(),
+            payload: object([("amount", PackageValue::Integer(1))]),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(credited, PackageHostOutcome::UiResponse { .. }));
+
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    fixture
+        .core
+        .append_record(
+            workspace.id(),
+            "dev.teamarness.fixture",
+            "fixture.record",
+            b"hello",
+        )
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let events = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount,
+            request: UiRequestId::new("immutable-events").unwrap(),
+            operation: "fixture.immutable_events".into(),
+            payload: object([]),
+        }))
+        .await
+        .unwrap();
+    let PackageHostOutcome::UiResponse {
+        payload: PackageValue::Object(value),
+    } = events
+    else {
+        panic!("unexpected immutable event response")
+    };
+    assert!(matches!(value.get("events"), Some(PackageValue::Array(events)) if events.len() == 1));
+}
+
+#[tokio::test]
 async fn immutable_record_capability_appends_and_opens_through_core() {
     let requirements = [serde_json::json!({
         "identity":"teamarness.synchronization.immutable-record-log",
