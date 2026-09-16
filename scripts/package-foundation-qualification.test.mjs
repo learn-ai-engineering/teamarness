@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { test } from "node:test";
 
+import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
+
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
@@ -122,11 +124,36 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
   }
 });
 
+test("desktop cleanup preserves its timeout after emergency termination", async () => {
+  const timeout = new Error([
+    "Timed out waiting for desktop cleanup",
+    "Active stage: desktop cleanup",
+    "Last accessibility failure: missing window",
+    "App stdout, last 4096 characters: bounded stdout",
+    "App stderr, last 4096 characters: bounded stderr",
+    "Child-process table:",
+  ].join("\n"));
+  const signals = [];
+
+  await assert.rejects(
+    waitForDesktopCleanup(
+      async () => { throw timeout; },
+      (signal) => signals.push(signal),
+    ),
+    (error) => error === timeout,
+  );
+  assert.deepEqual(signals, ["SIGKILL"]);
+});
+
 test("packaged smoke waits for Package navigation and captures safe timeout diagnostics", async () => {
   const source = await read("scripts/smoke-packaged-app.mjs");
+  const shellReadinessWait = source.indexOf('"desktop Shell readiness"');
+  const workspaceCreation = source.indexOf('diagnostics.activeStage = "Workspace creation"');
   const navigationWait = source.indexOf('"bundled reference Package navigation"');
   const backendWait = source.indexOf('"bundled Package Backend"');
 
+  assert.ok(shellReadinessWait >= 0, "packaged smoke must wait for desktop Shell readiness");
+  assert.ok(workspaceCreation > shellReadinessWait, "packaged smoke must wait for Shell readiness before creating a Workspace");
   assert.ok(navigationWait >= 0, "packaged smoke must wait for bundled Package navigation");
   assert.ok(backendWait > navigationWait, "packaged smoke must wait for navigation before inspecting the Backend");
   assert.match(source, /createBoundedOutput/);

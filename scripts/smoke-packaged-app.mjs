@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { repositoryRoot } from "./build-application-packages.mjs";
+import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 import { compareDeclaredPackageBytes } from "./package-directory.mjs";
 
 const app = join(repositoryRoot, "target/release/bundle/macos/Teamarness.app");
@@ -80,6 +81,10 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
     await waitForAccessible(accessibilityScript(childPid, `
       return name of window 1
     `), "desktop window");
+    await waitForAccessible(accessibilityScript(childPid, `
+      set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
+      return name of workspaceSwitcher
+    `), "desktop Shell readiness");
 
     if (createWorkspace) {
       diagnostics.activeStage = "Workspace creation";
@@ -184,8 +189,10 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
     }
   } finally {
     if (childPid && processExists(childPid)) desktop.kill("SIGTERM");
-    await atStage("desktop cleanup", () => waitForExit(desktop, "desktop cleanup"))
-      .catch(() => desktop.kill("SIGKILL"));
+    await waitForDesktopCleanup(
+      () => atStage("desktop cleanup", () => waitForExit(desktop, "desktop cleanup")),
+      (signal) => desktop.kill(signal),
+    );
     for (const backendPid of backendPids) {
       await atStage("Package process cleanup", () =>
         waitFor(() => !processExists(backendPid), `Package process ${backendPid} cleanup`, 5_000));
