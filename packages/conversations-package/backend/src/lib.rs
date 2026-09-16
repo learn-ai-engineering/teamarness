@@ -20,6 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 pub const GENERAL_ID: [u8; 16] = [0; 16];
 const MAGIC: &[u8] = b"TCONV\x01";
 const MAX_MARKDOWN: usize = 32 * 1024;
+const MAX_SLUG_LEN: usize = 48;
 const PAGE_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +244,7 @@ fn validate_identity(v: &str) -> Result<(), DomainError> {
     }
 }
 fn validate_slug(v: &str) -> Result<(), DomainError> {
-    if !(1..=48).contains(&v.len())
+    if !(1..=MAX_SLUG_LEN).contains(&v.len())
         || !v.is_ascii()
         || v.bytes()
             .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
@@ -255,6 +256,13 @@ fn validate_slug(v: &str) -> Result<(), DomainError> {
         Ok(())
     }
 }
+fn slug_with_suffix(base: &str, suffix: &str) -> String {
+    let base_len = base
+        .len()
+        .min(MAX_SLUG_LEN.saturating_sub(suffix.len() + 1));
+    format!("{}-{suffix}", &base[..base_len])
+}
+
 fn validate_markdown(v: &str) -> Result<(), DomainError> {
     if v.is_empty() || v.len() > MAX_MARKDOWN || !v.is_char_boundary(v.len()) {
         Err(DomainError::InvalidMarkdown)
@@ -842,16 +850,24 @@ impl ConversationStore {
             let slug = if base_counts[&base] == 1 || *occurrence == 1 {
                 base
             } else {
-                let mut prefix = 8;
-                loop {
-                    let candidate = format!("{base}-{}", &id[..prefix]);
+                let mut prefix = 8.min(id.len());
+                'candidate: loop {
+                    let candidate = slug_with_suffix(&base, &id[..prefix]);
                     if !reserved.contains(&candidate) && !assigned.contains(&candidate) {
                         break candidate;
                     }
                     if prefix < id.len() {
                         prefix = (prefix + 8).min(id.len());
-                    } else {
-                        break format!("{base}-{id}-{id}");
+                        continue;
+                    }
+                    let mut discriminator = 2_u64;
+                    loop {
+                        let suffix = format!("{id}-{discriminator}");
+                        let candidate = slug_with_suffix(&base, &suffix);
+                        if !reserved.contains(&candidate) && !assigned.contains(&candidate) {
+                            break 'candidate candidate;
+                        }
+                        discriminator += 1;
                     }
                 }
             };
@@ -1588,6 +1604,48 @@ mod tests {
         };
         assert_eq!(presentation(&s), presentation(&reversed));
     }
+    #[test]
+    fn duplicate_slug_suffix_stays_within_slug_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        let base = "a".repeat(48);
+        let first = DomainRecord::channel_create_with_id([4; 16], "author", &base).unwrap();
+        let second = DomainRecord::channel_create_with_id([5; 16], "author", &base).unwrap();
+        for (record, order_key) in [(&first, "01"), (&second, "02")] {
+            assert_eq!(
+                store
+                    .ingest(
+                        &hex_id(record.id()),
+                        order_key,
+                        "author",
+                        record.kind(),
+                        "signature",
+                        &record.encode(),
+                        b"sealed",
+                        None,
+                    )
+                    .unwrap(),
+                IngestResult::Applied
+            );
+        }
+
+        let slugs = store
+            .channels()
+            .unwrap()
+            .into_iter()
+            .filter(|channel| channel.id != hex_id(GENERAL_ID))
+            .map(|channel| channel.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(slugs.len(), 2);
+        assert!(slugs.iter().all(|slug| slug.len() <= 48));
+        assert!(slugs.contains(&base));
+        assert!(
+            slugs
+                .iter()
+                .any(|slug| slug.len() == 48 && slug.ends_with("-05050505"))
+        );
+    }
+
     #[test]
     fn persistence_contains_sealed_bytes_and_opaque_indexes_only() {
         let d = tempfile::tempdir().unwrap();
