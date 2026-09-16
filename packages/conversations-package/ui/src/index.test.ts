@@ -10,17 +10,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { ConversationPage, ConversationSnapshot } from "./index";
 import { mount } from "./index";
 
-const GENERAL_ID = "00000000000000000000000000000000";
-
-function snapshot(unreadCount: number): ConversationSnapshot {
+function snapshot(): ConversationSnapshot {
   return {
     availability: "current",
     channels: [{
-      id: GENERAL_ID,
+      id: "00000000000000000000000000000000",
       slug: "general",
-      creator: "system",
-      hidden: false,
-      unreadCount,
+      canHide: false,
     }],
   };
 }
@@ -29,11 +25,9 @@ function page(markdown: string): ConversationPage {
   return {
     messages: [{
       id: markdown,
-      orderKey: markdown,
       author: "bob",
       markdown,
     }],
-    hasMore: false,
   };
 }
 
@@ -43,9 +37,8 @@ describe("conversation change delivery", () => {
     let deliverChange: ((value: ConversationSnapshot) => void | Promise<void>) | undefined;
     const close = vi.fn(async () => undefined);
     const request = vi.fn(async (operation: string): Promise<PackageValue> => {
-      if (operation === "conversations.snapshot") return snapshot(0);
+      if (operation === "conversations.snapshot") return snapshot();
       if (operation === "conversations.channel.open") return currentPage;
-      if (operation === "conversations.channel.mark-read") return {};
       throw new Error(`Unexpected operation: ${operation}`);
     });
     const client: PackageClient = {
@@ -80,7 +73,7 @@ describe("conversation change delivery", () => {
     expect(root.textContent).toContain("initial message");
 
     currentPage = page("message delivered while general is open");
-    await deliverChange?.(snapshot(1));
+    await deliverChange?.(snapshot());
 
     expect(root.textContent).toContain("message delivered while general is open");
     expect(root.querySelector(".unread-count")).toBeNull();

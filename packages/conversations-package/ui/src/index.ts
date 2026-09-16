@@ -5,16 +5,12 @@ import "./styles.css";
 export type ConversationChannel = Readonly<{
   id: string;
   slug: string;
-  creator: string;
-  hidden: boolean;
-  unreadCount: string | number;
+  canHide: boolean;
 }>;
 export type ConversationMessage = Readonly<{
   id: string;
-  orderKey: string;
   author: string;
   markdown: string;
-  ingestionOrdinal?: string;
   isLocal?: boolean;
 }>;
 export type ConversationSnapshot = Readonly<{
@@ -24,13 +20,14 @@ export type ConversationSnapshot = Readonly<{
 }>;
 export type ConversationPage = Readonly<{
   messages: readonly ConversationMessage[];
-  hasMore: boolean;
+  nextBefore?: string;
 }>;
 
 type UiState = {
   snapshot: ConversationSnapshot;
   selectedChannel: string | null;
   messages: ConversationMessage[];
+  nextBefore: string | null;
   hasMore: boolean;
   loading: boolean;
   loadingOlder: boolean;
@@ -54,6 +51,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     snapshot: { channels: [], availability: "waiting_for_history_access" },
     selectedChannel: null,
     messages: [],
+    nextBefore: null,
     hasMore: false,
     loading: true,
     loadingOlder: false,
@@ -67,31 +65,31 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const requestSnapshot = async (): Promise<void> => {
     const snapshot = await context.client.request<ConversationSnapshot>("conversations.snapshot", {});
     state.snapshot = snapshot;
-    const available = snapshot.channels.filter((channel) => !channel.hidden);
-    if (!state.selectedChannel || !available.some(({ id }) => id === state.selectedChannel)) {
-      state.selectedChannel = available.find(({ slug }) => slug === "general")?.id ?? available[0]?.id ?? null;
+    if (!state.selectedChannel || !snapshot.channels.some(({ id }) => id === state.selectedChannel)) {
+      state.selectedChannel = snapshot.channels.find(({ slug }) => slug === "general")?.id ?? snapshot.channels[0]?.id ?? null;
       state.messages = [];
+      state.nextBefore = null;
       state.hasMore = false;
     }
   };
-  const requestPage = async (beforeOrderKey?: string): Promise<ConversationPage> => {
-    if (!state.selectedChannel) return { messages: [], hasMore: false };
+  const requestPage = async (before?: string): Promise<ConversationPage> => {
+    if (!state.selectedChannel) return { messages: [], nextBefore: undefined };
     const payload: Record<string, string | number> = { channelId: state.selectedChannel, limit: PAGE_SIZE };
-    if (beforeOrderKey) payload.beforeOrderKey = beforeOrderKey;
-    return context.client.request<ConversationPage>(
-      beforeOrderKey ? "conversations.channel.page" : "conversations.channel.open",
-      payload,
-    );
+    if (before) payload.before = before;
+    return context.client.request<ConversationPage>("conversations.channel.page", payload);
   };
   const loadSelected = async (): Promise<void> => {
     state.loading = true;
     state.warning = null;
     render();
     try {
-      const page = await requestPage();
+      const page = await context.client.request<ConversationPage>("conversations.channel.open", {
+        channelId: state.selectedChannel,
+        limit: PAGE_SIZE,
+      });
       state.messages = [...page.messages];
-      state.hasMore = page.hasMore;
-      await context.client.request("conversations.channel.mark-read", { channelId: state.selectedChannel });
+      state.nextBefore = page.nextBefore ?? null;
+      state.hasMore = page.nextBefore !== undefined;
     } catch {
       state.warning = "Conversation history is temporarily unavailable.";
     } finally {
@@ -103,19 +101,20 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     if (state.selectedChannel === channelId) return;
     state.selectedChannel = channelId;
     state.messages = [];
+    state.nextBefore = null;
     state.hasMore = false;
     state.confirmingHide = false;
     await loadSelected();
   };
   const loadOlder = async (): Promise<void> => {
-    const oldest = state.messages.at(-1);
-    if (!state.hasMore || !oldest || state.loadingOlder) return;
+    if (!state.hasMore || !state.nextBefore || state.loadingOlder) return;
     state.loadingOlder = true;
     render();
     try {
-      const page = await requestPage(oldest.orderKey);
+      const page = await requestPage(state.nextBefore);
       state.messages = [...state.messages, ...page.messages];
-      state.hasMore = page.hasMore;
+      state.nextBefore = page.nextBefore ?? null;
+      state.hasMore = page.nextBefore !== undefined;
     } catch {
       state.warning = "Older history could not be loaded.";
     } finally {
@@ -178,7 +177,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   };
 
   render = (): void => {
-    const available = state.snapshot.channels.filter((channel) => !channel.hidden);
+    const available = state.snapshot.channels;
     const selected = available.find(({ id }) => id === state.selectedChannel) ?? null;
     const shell = document.createElement("div");
     shell.className = "conversations-shell";
@@ -244,7 +243,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     const heading = document.createElement("h2");
     heading.textContent = selected ? `#${selected.slug}` : "Conversations";
     header.append(heading);
-    if (selected && selected.id !== "00000000000000000000000000000000") {
+    if (selected && selected.canHide) {
       const hide = document.createElement("button");
       hide.type = "button";
       hide.className = "danger-control";

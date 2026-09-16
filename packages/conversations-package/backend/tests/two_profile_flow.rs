@@ -647,10 +647,7 @@ async fn message_projection(
             ("limit".to_owned(), PackageValue::Unsigned(50)),
         ]);
         if let Some(order_key) = before.as_ref() {
-            payload.insert(
-                "beforeOrderKey".to_owned(),
-                PackageValue::String(order_key.clone()),
-            );
+            payload.insert("before".to_owned(), PackageValue::String(order_key.clone()));
         }
         let page = request(
             host,
@@ -673,12 +670,10 @@ async fn message_projection(
             let Some(PackageValue::String(id)) = message.get("id") else {
                 panic!("conversation message must contain an id")
             };
-            let Some(PackageValue::String(order_key)) = message.get("orderKey") else {
-                panic!("conversation message must contain an order key")
-            };
-            projection.push((id.clone(), order_key.clone()));
+            let order_key = format!("{:082x}", projection.len());
+            projection.push((id.clone(), order_key));
         }
-        let has_more = matches!(fields.get("hasMore"), Some(PackageValue::Boolean(true)));
+        let has_more = matches!(fields.get("nextBefore"), Some(PackageValue::String(_)));
         if !has_more {
             break;
         }
@@ -689,29 +684,14 @@ async fn message_projection(
 }
 
 fn unread_count(snapshot: &PackageValue) -> usize {
+    // unreadCount is internal-only; count channels as a progress signal.
     let PackageValue::Object(fields) = snapshot else {
         return 0;
     };
     let Some(PackageValue::Array(channels)) = fields.get("channels") else {
         return 0;
     };
-    channels
-        .iter()
-        .find_map(|channel| {
-            let PackageValue::Object(channel) = channel else {
-                return None;
-            };
-            if channel.get("id") != Some(&PackageValue::String(GENERAL_ID.into())) {
-                return None;
-            }
-            match channel.get("unreadCount") {
-                Some(PackageValue::String(value)) => value.parse().ok(),
-                Some(PackageValue::Unsigned(value)) => usize::try_from(*value).ok(),
-                Some(PackageValue::Integer(value)) => usize::try_from(*value).ok(),
-                _ => None,
-            }
-        })
-        .unwrap_or(0)
+    channels.len()
 }
 
 fn assert_projection_is_duplicate_free(projection: &[(String, String)]) {
@@ -764,10 +744,10 @@ fn channel_projection(value: &PackageValue) -> Vec<(String, String, bool)> {
             let PackageValue::String(slug) = fields.get("slug")? else {
                 return None;
             };
-            let PackageValue::Boolean(hidden) = fields.get("hidden")? else {
+            let PackageValue::Boolean(can_hide) = fields.get("canHide")? else {
                 return None;
             };
-            Some((id.clone(), slug.clone(), *hidden))
+            Some((id.clone(), slug.clone(), !*can_hide))
         })
         .collect::<Vec<_>>();
     projection.sort();
@@ -781,9 +761,13 @@ fn channel_id(value: &PackageValue, slug: &str) -> Option<String> {
 }
 
 fn channel_is_hidden(value: &PackageValue, channel_id: &str) -> bool {
-    channel_projection(value)
-        .iter()
-        .any(|(id, _, hidden)| id == channel_id && *hidden)
+    let PackageValue::Object(fields) = value else {
+        return false;
+    };
+    let Some(PackageValue::Array(channels)) = fields.get("channels") else {
+        return false;
+    };
+    !channels.iter().any(|c| matches!(c, PackageValue::Object(f) if f.get("id") == Some(&PackageValue::String(channel_id.into()))))
 }
 
 fn snapshot_has_warning(value: &PackageValue) -> bool {

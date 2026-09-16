@@ -10,7 +10,7 @@ use teamarness_package_sdk::{
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::domain::{DomainRecord, PAGE_SIZE, decode_id, hex_id};
-use crate::store::{ChannelView, ConversationStore, IngestResult};
+use crate::store::{ConversationStore, IngestResult};
 
 fn object<const N: usize>(entries: [(&str, JsonValue); N]) -> JsonValue {
     let mut o = Map::new();
@@ -151,8 +151,6 @@ impl ConversationsBackend {
             )
             .await
             .map_err(|cause| capability_error("subscribe", cause))?;
-        // Slugs are domain plaintext and are intentionally rebuilt through bounded Core opens.
-        // Message bodies are opened only when a page is requested.
         for batch in store
             .control_records()
             .map_err(|_| error("conversations.storage_failed", true))?
@@ -180,8 +178,6 @@ impl ConversationsBackend {
                 }
             }
         }
-        // Deferred records remain sealed at rest. Recovery opens at most one capability batch
-        // at a time and retries projection only in memory after Channel controls are available.
         for batch in store
             .deferred_records()
             .map_err(|_| error("conversations.storage_failed", true))?
@@ -261,6 +257,17 @@ impl ConversationsBackend {
             .store
             .channels()
             .map_err(|_| error("conversations.storage_failed", true))?;
+        let visible = channels
+            .into_iter()
+            .filter(|c| !c.hidden)
+            .map(|c| {
+                object([
+                    ("id", JsonValue::String(c.id)),
+                    ("slug", JsonValue::String(c.slug)),
+                    ("canHide", JsonValue::Bool(c.creator != "system")),
+                ])
+            })
+            .collect();
         let warnings = if a
             .store
             .has_projection_warnings()
@@ -273,10 +280,7 @@ impl ConversationsBackend {
             Vec::new()
         };
         Ok(object([
-            (
-                "channels",
-                JsonValue::Array(channels.into_iter().map(channel_json).collect()),
-            ),
+            ("channels", JsonValue::Array(visible)),
             ("availability", JsonValue::String("current".into())),
             ("warnings", JsonValue::Array(warnings)),
         ]))
@@ -306,13 +310,23 @@ impl ConversationsBackend {
         let author = str_field(&response, "author")?;
         let signature = str_field(&response, "signature")?;
         let sealed = from_b64(&str_field(&response, "sealedRecord")?)?;
-        a.store
+        let outcome = a
+            .store
             .ingest(
                 &record_id, &order, &author, purpose, &signature, &canonical, &sealed, None,
             )
             .map_err(|_| error("conversations.storage_failed", true))?;
+        match outcome {
+            IngestResult::Applied | IngestResult::Duplicate => {}
+            IngestResult::Deferred(_) => {
+                return Err(error("conversations.deferred", true));
+            }
+            IngestResult::Quarantined(_) => {
+                return Err(error("conversations.rejected", false));
+            }
+        }
         self.changes.send_modify(|x| *x = x.saturating_add(1));
-        Ok(response)
+        Ok(object([("ok", JsonValue::Bool(true))]))
     }
     async fn page(
         &self,
@@ -325,16 +339,15 @@ impl ConversationsBackend {
         if decode_id(channel).is_none() {
             return Err(error("conversations.invalid_request", false));
         }
+        let page_limit = limit.min(PAGE_SIZE);
         let rows = a
             .store
-            .message_rows(channel, before, limit.min(PAGE_SIZE))
+            .message_rows(channel, before, page_limit)
             .map_err(|_| error("conversations.storage_failed", true))?;
         if rows.is_empty() {
-            return Ok(object([
-                ("messages", JsonValue::Array(Vec::new())),
-                ("hasMore", JsonValue::Bool(false)),
-            ]));
+            return Ok(object([("messages", JsonValue::Array(Vec::new()))]));
         }
+        let has_more = rows.len() == page_limit;
         let sealed = rows.iter().map(|x| JsonValue::String(b64(&x.4))).collect();
         let opened = r
             .capabilities
@@ -355,8 +368,10 @@ impl ConversationsBackend {
             .get("identity")
             .and_then(JsonValue::as_str)
             .unwrap_or("");
+        let last_order = rows.last().map(|r| r.1.clone());
         let mut messages = Vec::new();
-        for ((id, order, author, _rid, _sealed, ordinal), value) in rows.into_iter().zip(results) {
+        for ((id, _order, author, _rid, _sealed, _ordinal), value) in rows.into_iter().zip(results)
+        {
             let canon = value
                 .get("canonical")
                 .and_then(JsonValue::as_str)
@@ -365,21 +380,17 @@ impl ConversationsBackend {
             if let Some(DomainRecord::MessagePost { markdown, .. }) = canon {
                 messages.push(object([
                     ("id", JsonValue::String(id)),
-                    ("orderKey", JsonValue::String(order)),
                     ("author", JsonValue::String(author.clone())),
                     ("isLocal", JsonValue::Bool(author == local_identity)),
                     ("markdown", JsonValue::String(markdown)),
-                    ("ingestionOrdinal", JsonValue::String(ordinal.to_string())),
                 ]));
             }
         }
-        Ok(object([
-            ("messages", JsonValue::Array(messages)),
-            (
-                "hasMore",
-                JsonValue::Bool(results.len() == limit.min(PAGE_SIZE)),
-            ),
-        ]))
+        let mut page = object([("messages", JsonValue::Array(messages))]);
+        if has_more && let Some(next) = last_order && let JsonValue::Object(ref mut o) = page {
+            o.insert("nextBefore".into(), JsonValue::String(next));
+        }
+        Ok(page)
     }
 }
 impl Backend for ConversationsBackend {
@@ -393,7 +404,7 @@ impl Backend for ConversationsBackend {
                 "lifecycle.activate" | "lifecycle.recover" => self.activate(&r).await,
                 "lifecycle.suspend" | "lifecycle.dispose" => self.deactivate().await,
                 "conversations.snapshot" => self.snapshot().await,
-                "conversations.channel.create" | "channel.create" => {
+                "conversations.channel.create" => {
                     let slug = str_field(&r.payload, "slug")?;
                     let author = r
                         .initialization
@@ -405,7 +416,7 @@ impl Backend for ConversationsBackend {
                         .map_err(|_| error("conversations.invalid_slug", false))?;
                     self.append(&r, "channel.create", d).await
                 }
-                "conversations.channel.hide" | "channel.hide" => {
+                "conversations.channel.hide" => {
                     if r.payload.get("confirm").and_then(JsonValue::as_bool) != Some(true) {
                         return Err(error("conversations.confirmation_required", false));
                     }
@@ -421,7 +432,7 @@ impl Backend for ConversationsBackend {
                         .map_err(|_| error("conversations.invalid_request", false))?;
                     self.append(&r, "channel.hide", d).await
                 }
-                "conversations.message.post" | "message.post" => {
+                "conversations.message.post" => {
                     let cid = decode_id(&str_field(&r.payload, "channelId")?)
                         .ok_or_else(|| error("conversations.invalid_request", false))?;
                     let active = self.active().await?;
@@ -443,12 +454,9 @@ impl Backend for ConversationsBackend {
                         .map_err(|_| error("conversations.invalid_markdown", false))?;
                     self.append(&r, "message.post", d).await
                 }
-                "conversations.channel.open"
-                | "conversations.channel.page"
-                | "channel.open"
-                | "channel.page" => {
+                "conversations.channel.open" | "conversations.channel.page" => {
                     let cid = str_field(&r.payload, "channelId")?;
-                    let before = r.payload.get("beforeOrderKey").and_then(JsonValue::as_str);
+                    let before = r.payload.get("before").and_then(JsonValue::as_str);
                     let limit = r
                         .payload
                         .get("limit")
@@ -463,15 +471,6 @@ impl Backend for ConversationsBackend {
                             .map_err(|_| error("conversations.storage_failed", true))?;
                     }
                     Ok(out)
-                }
-                "conversations.channel.mark-read"
-                | "conversations.channel.mark_read"
-                | "channel.mark-read" => {
-                    let a = self.active().await?;
-                    a.store
-                        .mark_read(&str_field(&r.payload, "channelId")?)
-                        .map_err(|_| error("conversations.storage_failed", true))?;
-                    Ok(object([]))
                 }
                 _ => Err(error("conversations.unknown_operation", false)),
             }
@@ -522,13 +521,4 @@ fn ingest_event(store: &ConversationStore, v: &JsonValue) -> Result<IngestResult
             &id, &order, &author, &purpose, &sig, &canonical, &sealed, cursor,
         )
         .map_err(|_| error("conversations.storage_failed", true))
-}
-fn channel_json(c: ChannelView) -> JsonValue {
-    object([
-        ("id", JsonValue::String(c.id)),
-        ("slug", JsonValue::String(c.slug)),
-        ("creator", JsonValue::String(c.creator)),
-        ("hidden", JsonValue::Bool(c.hidden)),
-        ("unreadCount", JsonValue::String(c.unread_count.to_string())),
-    ])
 }
