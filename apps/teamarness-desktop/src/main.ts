@@ -32,7 +32,7 @@ const controller = new ShellController(bridge, (model) => {
   shell.updateWorkspace(model);
   void packageShell.refresh()
     .then((snapshot) => { shell.updatePackages(snapshot); })
-    .catch(() => undefined);
+    .catch(() => { shell.updatePackageSnapshotFailure(); });
 });
 
 void controller.load();

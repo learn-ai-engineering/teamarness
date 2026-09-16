@@ -25,7 +25,7 @@ function view(failures: { value: number } = { value: 0 }): PackageShellView {
   };
 }
 
-it("targets lifecycle actions at the supplied Package Instance and returns refreshed results", async () => {
+it("targets lifecycle actions at the supplied Package Instance and returns typed refreshed results", async () => {
   const calls: string[] = [];
   let snapshotCalls = 0;
   const mounts = {
@@ -38,9 +38,9 @@ it("targets lifecycle actions at the supplied Package Instance and returns refre
   const shell = new PackageShell({ snapshot: async () => { snapshotCalls += 1; return snapshot; } }, mounts, view());
   await shell.refresh();
   await shell.select(first);
-  await expect(shell.suspendBackend(second)).resolves.toBe(snapshot);
-  await expect(shell.recoverBackend(second)).resolves.toBe(snapshot);
-  await expect(shell.disposeBackend(second)).resolves.toBe(snapshot);
+  await expect(shell.suspendBackend(second)).resolves.toEqual({ snapshot, failure: null });
+  await expect(shell.recoverBackend(second)).resolves.toEqual({ snapshot, failure: null });
+  await expect(shell.disposeBackend(second)).resolves.toEqual({ snapshot, failure: null });
 
   expect(calls).toEqual([
     "mount:com.example.one",
@@ -84,23 +84,38 @@ it("unmounts a hidden Package UI without a Backend lifecycle call", async () => 
   expect(calls).toEqual(["unmount"]);
 });
 
-it("contains invalid post-disposal actions in Shell-owned recovery", async () => {
+it("returns an operation failure with the refreshed snapshot without replacing the selected mount", async () => {
   const failures = { value: 0 };
-  let snapshotCalls = 0;
   const mounts = {
     mount: async () => ({}),
     unmount: async () => undefined,
-    suspendBackend: async () => { throw new Error("disposed"); },
+    suspendBackend: async () => { throw new Error("suspend failed"); },
     recoverBackend: async () => undefined,
-    disposeBackend: async () => { throw new Error("dispose returned Backend error"); },
+    disposeBackend: async () => undefined,
   };
-  const shell = new PackageShell({ snapshot: async () => { snapshotCalls += 1; return snapshot; } }, mounts, view(failures));
+  const shell = new PackageShell({ snapshot: async () => snapshot }, mounts, view(failures));
   await shell.select(first);
-  await shell.disposeBackend(first);
-  await shell.suspendBackend(first);
 
-  expect(failures.value).toBe(2);
-  expect(snapshotCalls).toBe(2);
+  await expect(shell.suspendBackend(second)).resolves.toEqual({ snapshot, failure: "operation" });
+  expect(failures.value).toBe(0);
+});
+
+it("returns refresh and combined lifecycle failures while preserving the last usable result", async () => {
+  const failures = { value: 0 };
+  let operationFails = false;
+  const mounts = {
+    mount: async () => ({}),
+    unmount: async () => undefined,
+    suspendBackend: async () => { if (operationFails) throw new Error("suspend failed"); },
+    recoverBackend: async () => undefined,
+    disposeBackend: async () => undefined,
+  };
+  const shell = new PackageShell({ snapshot: async () => { throw new Error("snapshot failed"); } }, mounts, view(failures));
+
+  await expect(shell.suspendBackend(second)).resolves.toEqual({ snapshot: null, failure: "refresh" });
+  operationFails = true;
+  await expect(shell.suspendBackend(second)).resolves.toEqual({ snapshot: null, failure: "operation-and-refresh" });
+  expect(failures.value).toBe(0);
 });
 
 it("shows Shell recovery when the selected mount reports a terminal stream failure", async () => {

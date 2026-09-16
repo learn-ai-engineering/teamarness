@@ -225,6 +225,18 @@ h1, h2, p { margin-top: 0; }
 .package-instance-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .package-instance-actions button { flex: 0 1 auto; }
 .package-instance-actions button:disabled { cursor: not-allowed; }
+.package-snapshot-failure,
+.package-lifecycle-feedback {
+  padding: 0.75rem;
+  color: var(--teamarness-color-text);
+  background: var(--teamarness-color-background);
+  border: 1px solid var(--teamarness-color-danger);
+  border-radius: var(--teamarness-radius-control);
+}
+.package-snapshot-failure p,
+.package-lifecycle-feedback p { margin-bottom: 0.65rem; }
+.package-snapshot-failure button,
+.package-lifecycle-feedback button { width: 100%; }
 .shell-status:empty,
 .shell-alert:empty { display: none; }
 .shell-alert:not(:empty) { margin-bottom: 1rem; padding: 1rem; background: var(--teamarness-color-panel); border: 1px solid var(--teamarness-color-danger); border-radius: var(--teamarness-radius-panel); }

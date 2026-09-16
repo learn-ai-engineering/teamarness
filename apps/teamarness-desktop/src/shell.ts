@@ -1,4 +1,5 @@
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
+import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import {
   buildPackageNavigationPresentation,
   buildShellPresentation,
@@ -24,11 +25,20 @@ export type ShellFrame = Readonly<{
 }>;
 
 type PackageRouter = Readonly<{
+  refresh(): Promise<PackageHostSnapshot>;
   select(instance: PackageInstanceKey): Promise<void>;
   hide(): Promise<void>;
-  suspendBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null>;
-  recoverBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null>;
-  disposeBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null>;
+  suspendBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
+  recoverBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
+  disposeBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
+}>;
+
+type PackageLifecycleAction = "suspend" | "recover" | "dispose";
+
+type PackageLifecycleFeedback = Readonly<{
+  action: PackageLifecycleAction;
+  instance: PackageInstanceKey;
+  failure: PackageLifecycleFailure;
 }>;
 
 type WorkspaceActions = Readonly<{
@@ -52,8 +62,10 @@ export class Shell {
   private workspaceModel: ShellModel | null = null;
   private workspacePresentation: ShellPresentation | null = null;
   private packageSnapshot: PackageHostSnapshot | null = null;
+  private packageSnapshotFailed = false;
+  private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
   private observedActiveWorkspaceId: string | null = null;
-  private packageRoutes: readonly PackageInstanceKey[] = [];
+  private packageActionTargets: readonly PackageInstanceKey[] = [];
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
 
@@ -86,8 +98,18 @@ export class Shell {
 
   public updatePackages(snapshot: PackageHostSnapshot): void {
     this.packageSnapshot = snapshot;
-    this.renderContextualNavigation();
-    if (this.selectedRoute.kind === "workspace-settings") this.renderSelectedScreen();
+    this.packageSnapshotFailed = false;
+    if (this.packageLifecycleFeedback?.failure === "refresh") {
+      this.packageLifecycleFeedback = null;
+    } else if (this.packageLifecycleFeedback?.failure === "operation-and-refresh") {
+      this.packageLifecycleFeedback = { ...this.packageLifecycleFeedback, failure: "operation" };
+    }
+    this.renderPackageConsumers();
+  }
+
+  public updatePackageSnapshotFailure(): void {
+    this.packageSnapshotFailed = true;
+    this.renderPackageConsumers();
   }
 
   public async navigate(route: ShellRoute): Promise<void> {
@@ -173,26 +195,27 @@ export class Shell {
     const active = activeIndex === null ? undefined : model.workspaces[activeIndex];
     const activePresentation = activeIndex === null ? undefined : presentation.workspaceChoices[activeIndex];
     if (!active || !activePresentation) {
-      this.packageRoutes = [];
+      this.packageActionTargets = [];
       this.shellFrame.contextualNavigation.innerHTML = '<div class="contextual-navigation__empty"><p>Choose a Workspace</p></div>';
       return;
     }
 
-    this.packageRoutes = this.packageSnapshot?.instances
+    this.packageActionTargets = this.packageSnapshot?.instances
       .filter(({ key }) => key.workspaceId === active.id)
       .map(({ key }) => key) ?? [];
     this.packagePresentation = buildPackageNavigationPresentation(this.packageSnapshot, active.id);
     const team = this.packagePresentation.teamPackages
-      .map((row) => packageButton(row, this.selectedRoute, this.packageRoutes)).join("");
+      .map((row) => packageButton(row, this.selectedRoute, this.packageActionTargets)).join("");
     const privatePackages = this.packagePresentation.privatePackages
-      .map((row) => packageButton(row, this.selectedRoute, this.packageRoutes)).join("");
+      .map((row) => packageButton(row, this.selectedRoute, this.packageActionTargets)).join("");
 
     this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></header>
       <nav class="contextual-navigation__body" aria-label="Active Workspace"><ul class="screen-navigation">
         ${screenButton("Overview", "workspace-overview", active.id, this.selectedRoute)}
-        ${screenButton("Invitations", "workspace-invitations", active.id, this.selectedRoute)}
+        ${screenButton("Workspace Invitations", "workspace-invitations", active.id, this.selectedRoute)}
         ${screenButton("Settings", "workspace-settings", active.id, this.selectedRoute)}
       </ul>
+      ${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}
       <section class="package-group" aria-labelledby="team-packages-heading"><h2 id="team-packages-heading">Team Packages</h2><ul>${team || "<li>None available</li>"}</ul></section>
       <section class="package-group" aria-labelledby="private-packages-heading"><h2 id="private-packages-heading">Private Packages</h2><ul>${privatePackages || "<li>None available</li>"}</ul></section></nav>`;
 
@@ -207,10 +230,11 @@ export class Shell {
     });
     this.shellFrame.contextualNavigation.querySelectorAll<HTMLButtonElement>("[data-package-index]").forEach((button) => {
       button.addEventListener("click", () => {
-        const instance = this.packageRoutes[Number(button.dataset.packageIndex)];
+        const instance = this.packageActionTargets[Number(button.dataset.packageIndex)];
         if (instance) void this.navigate({ kind: "package-instance", instance });
       });
     });
+    this.bindPackageSnapshotRetry(this.shellFrame.contextualNavigation);
   }
 
   private deactivatePackage(): void {
@@ -223,14 +247,18 @@ export class Shell {
 
   private renderSelectedScreen(): void {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
-    let content = renderShell(this.workspacePresentation, this.selectedRoute);
-    if (this.selectedRoute.kind === "workspace-settings") {
-      content = content.replace(
-        "<p>No Package management actions are available on this screen yet.</p>",
-        renderPackageInstanceSettings(this.packagePresentation),
-      );
-    }
-    this.shellFrame.shellScreen.innerHTML = content;
+    const packageSettings = this.selectedRoute.kind === "workspace-settings"
+      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${renderPackageInstanceSettings(
+        this.packagePresentation,
+        this.packageActionTargets,
+        this.packageLifecycleFeedback,
+      )}`
+      : undefined;
+    this.shellFrame.shellScreen.innerHTML = renderShell(
+      this.workspacePresentation,
+      this.selectedRoute,
+      { packageSettings },
+    );
     this.bindSelectedScreen();
   }
 
@@ -265,28 +293,66 @@ export class Shell {
     this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => {
       void this.options.workspaceActions.retry();
     });
+    this.bindPackageSnapshotRetry(this.shellFrame.shellScreen);
     this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-action]").forEach((button) => {
       button.addEventListener("click", () => {
         const index = Number(button.dataset.packageActionIndex);
-        const instance = this.packageRoutes[index];
+        const instance = this.packageActionTargets[index];
         const row = packageRows(this.packagePresentation).find(({ actionIndex }) => actionIndex === index);
         const action = button.dataset.packageAction;
         if (!instance || !row || !lifecycleActionAllowed(row, action)) return;
         void this.runPackageLifecycle(action, instance);
       });
     });
+    this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-failure-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const feedback = this.packageLifecycleFeedback;
+        const action = button.dataset.packageFailureAction;
+        if (!feedback || !isLifecycleAction(action) || action !== feedback.action) return;
+        void this.runPackageLifecycle(action, feedback.instance);
+      });
+    });
+  }
+
+  private renderPackageConsumers(): void {
+    this.renderContextualNavigation();
+    if (this.selectedRoute.kind === "workspace-settings") this.renderSelectedScreen();
+  }
+
+  private bindPackageSnapshotRetry(region: HTMLElement): void {
+    region.querySelector<HTMLButtonElement>("[data-package-snapshot-retry]")?.addEventListener("click", () => {
+      void this.retryPackageSnapshot();
+    });
+  }
+
+  private async retryPackageSnapshot(): Promise<void> {
+    try {
+      this.updatePackages(await this.options.packageShell.refresh());
+    } catch {
+      this.updatePackageSnapshotFailure();
+    }
   }
 
   private async runPackageLifecycle(
-    action: "suspend" | "recover" | "dispose",
+    action: PackageLifecycleAction,
     instance: PackageInstanceKey,
   ): Promise<void> {
-    const snapshot = action === "suspend"
+    const result = action === "suspend"
       ? await this.options.packageShell.suspendBackend(instance)
       : action === "recover"
         ? await this.options.packageShell.recoverBackend(instance)
         : await this.options.packageShell.disposeBackend(instance);
-    if (snapshot) this.updatePackages(snapshot);
+    if (result.snapshot) {
+      this.packageSnapshot = result.snapshot;
+      this.packageSnapshotFailed = false;
+    }
+    if (result.failure === "refresh" || result.failure === "operation-and-refresh") {
+      this.packageSnapshotFailed = true;
+    }
+    this.packageLifecycleFeedback = result.failure
+      ? { action, instance, failure: result.failure }
+      : null;
+    this.renderPackageConsumers();
   }
 }
 
@@ -331,9 +397,9 @@ function screenButton(label: string, kind: Exclude<ShellRoute["kind"], "workspac
 function packageButton(
   row: PackageInstancePresentation,
   route: ShellRoute,
-  packageRoutes: readonly PackageInstanceKey[],
+  packageActionTargets: readonly PackageInstanceKey[],
 ): string {
-  const instance = packageRoutes[row.actionIndex];
+  const instance = packageActionTargets[row.actionIndex];
   const current = route.kind === "package-instance" && instance
     && route.instance.packageIdentity === instance.packageIdentity
     && route.instance.workspaceId === instance.workspaceId
@@ -345,20 +411,53 @@ function packageButton(
   return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${localMarker}</button></li>`;
 }
 
-function renderPackageInstanceSettings(presentation: PackageNavigationPresentation): string {
+function renderPackageInstanceSettings(
+  presentation: PackageNavigationPresentation,
+  packageActionTargets: readonly PackageInstanceKey[],
+  feedback: PackageLifecycleFeedback | null,
+): string {
   const rows = packageRows(presentation);
   if (rows.length === 0) return '<p class="empty-state">No Packages are available for this Workspace.</p>';
   return `<div class="package-instance-list">${rows.map((row) => {
     const localMarker = row.installationLocal
       ? '<span class="package-installation-marker">Runs only on this Installation</span>'
       : "";
+    const instance = packageActionTargets[row.actionIndex];
+    const rowFeedback = instance && feedback && samePackageInstance(instance, feedback.instance)
+      ? renderPackageLifecycleFeedback(row, feedback)
+      : "";
     return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${localMarker}</div>
-      <div class="package-instance-actions">
+      ${rowFeedback}<div class="package-instance-actions">
         ${lifecycleButton("Suspend", "suspend", row.actionIndex, row.name, row.canSuspend)}
         ${lifecycleButton("Recover Backend", "recover", row.actionIndex, row.name, row.canRecover)}
         ${lifecycleButton("Dispose", "dispose", row.actionIndex, row.name, row.canDispose)}
       </div></article>`;
   }).join("")}</div>`;
+}
+
+function renderPackageLifecycleFeedback(
+  row: PackageInstancePresentation,
+  feedback: PackageLifecycleFeedback,
+): string {
+  const verb = feedback.action === "suspend" ? "suspend" : feedback.action === "recover" ? "recover" : "dispose of";
+  const past = feedback.action === "suspend" ? "Suspended" : feedback.action === "recover" ? "Recovered" : "Disposed of";
+  const refreshFailed = feedback.failure === "refresh" || feedback.failure === "operation-and-refresh";
+  const operationFailed = feedback.failure === "operation" || feedback.failure === "operation-and-refresh";
+  const message = operationFailed
+    ? `Could not ${verb} ${row.name}${refreshFailed ? ", and Package information could not be refreshed" : ""}.`
+    : `${past} ${row.name}, but Package information could not be refreshed.`;
+  const retry = operationFailed
+    ? `<button type="button" data-package-failure-action="${feedback.action}">Retry ${escape(lifecycleActionLabel(feedback.action))}</button>`
+    : "";
+  return `<div class="package-lifecycle-feedback" role="alert"><p>${escape(message)}</p>${retry}</div>`;
+}
+
+function renderPackageSnapshotFailure(failed: boolean, hasSnapshot: boolean): string {
+  if (!failed) return "";
+  const message = hasSnapshot
+    ? "Package information may be out of date. Showing the latest available Package information."
+    : "Package information is unavailable.";
+  return `<div class="package-snapshot-failure" role="alert"><p>${message}</p><button type="button" data-package-snapshot-retry>Retry Package information</button></div>`;
 }
 
 function lifecycleButton(label: string, action: string, index: number, name: string, enabled: boolean): string {
@@ -369,10 +468,22 @@ function packageRows(presentation: PackageNavigationPresentation): readonly Pack
   return [...presentation.teamPackages, ...presentation.privatePackages];
 }
 
-function lifecycleActionAllowed(row: PackageInstancePresentation, action: string | undefined): action is "suspend" | "recover" | "dispose" {
+function lifecycleActionAllowed(row: PackageInstancePresentation, action: string | undefined): action is PackageLifecycleAction {
   return (action === "suspend" && row.canSuspend)
     || (action === "recover" && row.canRecover)
     || (action === "dispose" && row.canDispose);
+}
+
+function isLifecycleAction(action: string | undefined): action is PackageLifecycleAction {
+  return action === "suspend" || action === "recover" || action === "dispose";
+}
+
+function lifecycleActionLabel(action: PackageLifecycleAction): string {
+  return action === "suspend" ? "Suspend" : action === "recover" ? "Recover Backend" : "Dispose";
+}
+
+function samePackageInstance(left: PackageInstanceKey, right: PackageInstanceKey): boolean {
+  return left.packageIdentity === right.packageIdentity && left.workspaceId === right.workspaceId;
 }
 
 function escape(value: string): string {

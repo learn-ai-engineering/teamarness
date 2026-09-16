@@ -72,13 +72,12 @@ export function buildPackageNavigationPresentation(
     .flatMap((instance, actionIndex) => {
       const catalog = snapshot.packages.find(({ identity }) => identity === instance.key.packageIdentity);
       if (!catalog) return [];
-      const capabilities = lifecycleCapabilities(instance.lifecycle);
+      const descriptor = lifecycleDescriptor(instance.lifecycle);
       return [{
         name: catalog.displayName,
-        availability: lifecycleAvailability(instance.lifecycle),
         actionIndex,
         installationLocal: catalog.source === "local",
-        ...capabilities,
+        ...descriptor,
       }];
     });
   return {
@@ -87,50 +86,47 @@ export function buildPackageNavigationPresentation(
   };
 }
 
-function lifecycleAvailability(lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"]): string {
+type LifecycleDescriptor = Pick<
+  PackageInstancePresentation,
+  "availability" | "canSuspend" | "canRecover" | "canDispose"
+>;
+
+function lifecycleDescriptor(
+  lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"],
+): LifecycleDescriptor {
   switch (lifecycle) {
     case "admitted":
+      return { availability: "Getting ready", canSuspend: false, canRecover: false, canDispose: true };
     case "activating":
     case "recovering":
-      return "Getting ready";
+      return { availability: "Getting ready", canSuspend: false, canRecover: false, canDispose: false };
     case "active":
-      return "Available";
+      return { availability: "Available", canSuspend: true, canRecover: false, canDispose: true };
     case "suspending":
-      return "Pausing";
+      return { availability: "Pausing", canSuspend: false, canRecover: false, canDispose: false };
     case "suspended":
-      return "Paused";
+      return { availability: "Paused", canSuspend: false, canRecover: true, canDispose: true };
     case "failed":
     case "crash_loop":
-      return "Needs recovery";
+      return { availability: "Needs recovery", canSuspend: false, canRecover: true, canDispose: true };
     case "disposing":
-      return "Removing";
+      return { availability: "Removing", canSuspend: false, canRecover: false, canDispose: false };
     case "disposed":
-      return "Unavailable";
+      return { availability: "Unavailable", canSuspend: false, canRecover: false, canDispose: false };
   }
-}
-
-function lifecycleCapabilities(
-  lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"],
-): Pick<PackageInstancePresentation, "canSuspend" | "canRecover" | "canDispose"> {
-  return {
-    canSuspend: lifecycle === "active",
-    canRecover: lifecycle === "suspended" || lifecycle === "failed" || lifecycle === "crash_loop",
-    canDispose: lifecycle === "admitted" || lifecycle === "active" || lifecycle === "suspended"
-      || lifecycle === "failed" || lifecycle === "crash_loop",
-  };
 }
 
 function errorMessage(code: BridgeErrorCode): string {
   const messages: Record<BridgeErrorCode, string> = {
     invalid_input: "The supplied value is invalid.",
-    authentication: "Workspace invitation authentication failed.",
-    expired: "The Workspace invitation has expired.",
-    already_used: "Another Installation already used this invitation.",
-    readiness: "Invitation addressing is not ready. Try again.",
+    authentication: "Workspace Invitation authentication failed.",
+    expired: "The Workspace Invitation has expired.",
+    already_used: "Another Installation already used this Workspace Invitation.",
+    readiness: "Workspace Invitation addressing is not ready. Try again.",
     timeout: "Workspace onboarding timed out. Try again.",
     overload: "Workspace onboarding is busy. Try again.",
     invalid_bootstrap: "The received Workspace history is invalid.",
-    local_conflict: "Local Workspace state conflicts with this invitation.",
+    local_conflict: "Local Workspace state conflicts with this Workspace Invitation.",
     admission_no_longer_current: "This admission is no longer current.",
     uncertain_storage_outcome: "Storage outcome is uncertain. Restart Teamarness.",
     shutdown: "Teamarness is shutting down. Try again after reopening.",

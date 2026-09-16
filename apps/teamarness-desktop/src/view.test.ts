@@ -72,6 +72,8 @@ describe("Shell Workspace screens", () => {
     expect(normal).toContain(workspace.name);
     expect(normal).toContain('id="create-workspace"');
     expect(normal).toContain('id="join-workspace"');
+    expect(normal).toContain('<label for="invitation-value">Workspace Invitation</label>');
+    expect(normal.replaceAll("Workspace Invitation", "")).not.toMatch(/\bInvitations?\b/);
 
     const loading = await rendered(model({ workspaces: [], memberships: {}, activeWorkspaceId: null, loading: true }), chooser);
     expect(loading).toContain("Loading Workspaces…");
@@ -81,10 +83,11 @@ describe("Shell Workspace screens", () => {
     expect(empty).toContain("No Workspaces yet");
   });
 
-  it("renders supported invitation and read-only settings screens only", async () => {
+  it("renders supported Workspace Invitation and read-only settings screens only", async () => {
     const invitations = await rendered(model(), { kind: "workspace-invitations", workspaceId: workspace.id });
     expect(invitations).toContain('id="copy-invitation"');
-    expect(invitations).toContain("sensitive bearer admission material");
+    expect(invitations).toContain("Workspace Invitations are sensitive bearer admission material");
+    expect(invitations.replaceAll("Workspace Invitation", "")).not.toMatch(/\bInvitations?\b/);
 
     const settings = await rendered(model(), { kind: "workspace-settings", workspaceId: workspace.id });
     expect(settings).toContain("Workspace details");
@@ -112,7 +115,7 @@ describe("Shell Workspace screens", () => {
     const controller = new ShellController(fakeBridge(), () => undefined, async (value) => { copied.push(value); });
     await controller.copyInvitation(workspace.id);
     expect(copied).toEqual([invitation.value]);
-    expect(controller.snapshot().notice).toContain("Sensitive bearer");
+    expect(controller.snapshot().notice).toBe("Workspace Invitation copied. Keep it private.");
     expect(await rendered(controller.snapshot(), { kind: "workspace-invitations", workspaceId: workspace.id }))
       .not.toContain(invitation.value);
   });
@@ -143,6 +146,26 @@ describe("Shell Workspace screens", () => {
     expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);
     expect(html).not.toContain(membership.version);
     for (const member of membership.members) expect(html).not.toContain(member.identity);
+  });
+
+  it("uses Workspace Invitation in every visible onboarding error", async () => {
+    const onboardingErrors = ["authentication", "expired", "already_used", "readiness", "local_conflict"] as const;
+    for (const code of onboardingErrors) {
+      const presentation = await buildShellPresentation(model({ error: code }), workspace.id);
+      expect(presentation.error?.message).toContain("Workspace Invitation");
+      expect(presentation.error?.message.replaceAll("Workspace Invitation", "")).not.toMatch(/\bInvitation\b/);
+    }
+  });
+
+  it("accepts Package settings content as an explicit renderer input", async () => {
+    const presentation = await buildShellPresentation(model(), workspace.id);
+    const html = renderShell(
+      presentation,
+      { kind: "workspace-settings", workspaceId: workspace.id },
+      { packageSettings: '<p class="package-test-state">Package state</p>' },
+    );
+    expect(html).toContain('<p class="package-test-state">Package state</p>');
+    expect(html).not.toContain("No Package management actions are available on this screen yet.");
   });
 
   it("shows bridge failure and retry states", async () => {

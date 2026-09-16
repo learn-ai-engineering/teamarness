@@ -15,6 +15,13 @@ export interface PackageSnapshotBridge {
   snapshot(): Promise<PackageHostSnapshot>;
 }
 
+export type PackageLifecycleFailure = "operation" | "refresh" | "operation-and-refresh";
+
+export type PackageLifecycleResult = Readonly<{
+  snapshot: PackageHostSnapshot | null;
+  failure: PackageLifecycleFailure | null;
+}>;
+
 interface MountController {
   mount(instance: PackageInstanceKey, target: unknown, onFailure: () => void): Promise<unknown>;
   unmount(): Promise<void>;
@@ -49,15 +56,15 @@ export class PackageShell {
     await this.loadSelected();
   }
 
-  public async suspendBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null> {
+  public async suspendBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult> {
     return this.runLifecycle(instance, (target) => this.mounts.suspendBackend(target));
   }
 
-  public async recoverBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null> {
+  public async recoverBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult> {
     return this.runLifecycle(instance, (target) => this.mounts.recoverBackend(target));
   }
 
-  public async disposeBackend(instance: PackageInstanceKey): Promise<PackageHostSnapshot | null> {
+  public async disposeBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult> {
     return this.runLifecycle(instance, (target) => this.mounts.disposeBackend(target));
   }
 
@@ -73,21 +80,24 @@ export class PackageShell {
   private async runLifecycle(
     instance: PackageInstanceKey,
     operation: (target: PackageInstanceKey) => Promise<void>,
-  ): Promise<PackageHostSnapshot | null> {
-    let failed = false;
+  ): Promise<PackageLifecycleResult> {
+    let operationFailed = false;
     try {
       await operation(instance);
     } catch {
-      failed = true;
+      operationFailed = true;
     }
     let snapshot: PackageHostSnapshot | null = null;
+    let refreshFailed = false;
     try {
       snapshot = await this.refresh();
     } catch {
-      failed = true;
+      refreshFailed = true;
     }
-    if (failed) this.view.showFailure(this.recoveryActions());
-    return snapshot;
+    const failure = operationFailed && refreshFailed
+      ? "operation-and-refresh"
+      : operationFailed ? "operation" : refreshFailed ? "refresh" : null;
+    return Object.freeze({ snapshot, failure });
   }
 
   private async loadSelected(): Promise<void> {

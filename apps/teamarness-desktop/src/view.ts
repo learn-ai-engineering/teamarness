@@ -86,7 +86,7 @@ export class ShellController {
     await this.perform(async () => {
       const invitation = await this.bridge.createWorkspaceInvitation(workspaceId);
       await this.copy(invitation.value);
-      this.set({ notice: "Sensitive bearer admission material copied" });
+      this.set({ notice: "Workspace Invitation copied. Keep it private." });
     });
   }
 
@@ -142,7 +142,15 @@ const escape = (value: string): string => value
   .replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;");
 
-export function renderShell(presentation: ShellPresentation, route: ShellRoute): string {
+export type ShellRendererInput = Readonly<{
+  packageSettings?: string;
+}>;
+
+export function renderShell(
+  presentation: ShellPresentation,
+  route: ShellRoute,
+  input: ShellRendererInput = {},
+): string {
   const statusMessage = presentation.loading ? "Working…" : presentation.notice ?? "";
   const status = `<p class="shell-status" role="status" aria-live="polite">${escape(statusMessage)}</p>`;
   const error = `<div class="shell-alert" role="alert">${presentation.error
@@ -155,12 +163,12 @@ export function renderShell(presentation: ShellPresentation, route: ShellRoute):
       `<li><button type="button" data-choose-workspace="${index}">${escape(name)}</button></li>`).join("");
     const workspaceList = choices || (presentation.loading
       ? '<li class="empty-state">Loading Workspaces…</li>'
-      : '<li class="empty-state">No Workspaces yet. Create one or join with an invitation.</li>');
+      : '<li class="empty-state">No Workspaces yet. Create one or join with a Workspace Invitation.</li>');
     return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Choose a Workspace</h1><p>Select an existing Workspace or add another.</p></header>
       <section class="screen-section" aria-labelledby="workspace-list-heading"><h2 id="workspace-list-heading">Your Workspaces</h2><ul class="workspace-list">${workspaceList}</ul></section>
       <section class="screen-section"><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
       <input id="workspace-name" required maxlength="64"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
-      <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Invitation</label>
+      <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Workspace Invitation</label>
       <textarea id="invitation-value" required maxlength="8192"></textarea><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
   }
 
@@ -168,14 +176,14 @@ export function renderShell(presentation: ShellPresentation, route: ShellRoute):
   if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1><p>Choose another Workspace or retry.</p></section>`;
 
   if (route.kind === "workspace-invitations") {
-    return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Invitations</h1><p>Create a one-use invitation for this Workspace.</p></header>
-      <section class="screen-section notice-panel"><h2>Invite another Installation</h2><button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy invitation</button>
-      <p class="sensitive">Invitations are sensitive bearer admission material. Share them privately.</p></section></section>`;
+    return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Workspace Invitations</h1><p>Create a one-use Workspace Invitation.</p></header>
+      <section class="screen-section notice-panel"><h2>Invite another Installation</h2><button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
+      <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section></section>`;
   }
   if (route.kind === "workspace-settings") {
     return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Workspace settings</h1><p>Workspace details are read-only in this version.</p></header>
       <section class="screen-section settings-panel" aria-labelledby="workspace-details-heading"><h2 id="workspace-details-heading">Workspace details</h2><dl><div><dt>Name</dt><dd>${escape(workspace.name)}</dd></div><div><dt>Members</dt><dd>${workspace.memberCount}</dd></div></dl></section>
-      <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2><p>No Package management actions are available on this screen yet.</p></section></section>`;
+      <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
   }
 
   const memberRows = workspace.members.map((member) => `<li class="member-row"><span><strong>${escape(member.name)}</strong><small>${escape(member.detail)}</small></span><span class="member-role">${member.role}</span></li>`).join("");

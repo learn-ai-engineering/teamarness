@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { Installation, Membership, Workspace } from "./contracts";
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
+import type { PackageLifecycleResult } from "./package-shell";
 import { Shell, type ShellFrame, type ShellRoute } from "./shell";
 import type { ShellModel } from "./view";
 
@@ -74,10 +75,22 @@ class SettingsRegion extends Region {
   public readonly dispose = new TestControl();
   public readonly invalidRecover = new TestControl();
   public readonly invalidSuspend = new TestControl();
+  public readonly retryLifecycle = new TestControl();
+  public readonly retrySnapshot = new TestControl();
 
-  public querySelector(): null { return null; }
+  public querySelector(selector: string): TestControl | null {
+    if (selector === "[data-package-snapshot-retry]" && this.innerHTML.includes("data-package-snapshot-retry")) {
+      return this.retrySnapshot;
+    }
+    return null;
+  }
 
   public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector === "[data-package-failure-action]") {
+      this.retryLifecycle.dataset.packageFailureAction = "recover";
+      this.retryLifecycle.dataset.packageActionIndex = "1";
+      return this.innerHTML.includes("data-package-failure-action") ? [this.retryLifecycle] : [];
+    }
     if (selector !== "[data-package-action]") return [];
     this.suspend.dataset.packageAction = "suspend";
     this.suspend.dataset.packageActionIndex = "0";
@@ -117,7 +130,13 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
   };
 }
 
-function harness(shellScreen: HTMLElement = new Region() as unknown as HTMLElement): {
+function harness(
+  shellScreen: HTMLElement = new Region() as unknown as HTMLElement,
+  packageBehavior: Readonly<{
+    refresh?: () => Promise<PackageHostSnapshot>;
+    lifecycle?: (action: "suspend" | "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
+  }> = {},
+): {
   shell: Shell;
   frame: ShellFrame;
   calls: string[];
@@ -133,11 +152,21 @@ function harness(shellScreen: HTMLElement = new Region() as unknown as HTMLEleme
   };
   const shell = new Shell(frame, {
     packageShell: {
+      refresh: packageBehavior.refresh ?? (async () => packages),
       select: async (instance) => { calls.push(`mount:${instance.packageIdentity}`); },
       hide: async () => { calls.push("unmount"); },
-      suspendBackend: async (instance) => { calls.push(`suspend:${instance.packageIdentity}`); return packages; },
-      recoverBackend: async (instance) => { calls.push(`recover:${instance.packageIdentity}`); return packages; },
-      disposeBackend: async (instance) => { calls.push(`dispose:${instance.packageIdentity}`); return packages; },
+      suspendBackend: async (instance) => {
+        calls.push(`suspend:${instance.packageIdentity}`);
+        return packageBehavior.lifecycle?.("suspend", instance) ?? { snapshot: packages, failure: null };
+      },
+      recoverBackend: async (instance) => {
+        calls.push(`recover:${instance.packageIdentity}`);
+        return packageBehavior.lifecycle?.("recover", instance) ?? { snapshot: packages, failure: null };
+      },
+      disposeBackend: async (instance) => {
+        calls.push(`dispose:${instance.packageIdentity}`);
+        return packageBehavior.lifecycle?.("dispose", instance) ?? { snapshot: packages, failure: null };
+      },
     },
     theme: {
       getPreference: () => "system",
@@ -170,7 +199,7 @@ describe("persistent Shell frame", () => {
 
     expect(test.shell.frame()).toBe(frame);
     expect(test.shell.frame().packageMount).toBe(mount);
-    expect(test.frame.shellScreen.innerHTML).toContain("Invitations");
+    expect(test.frame.shellScreen.innerHTML).toContain("Workspace Invitations");
   });
 
   it("selects overview at startup and whenever the active Workspace switches", async () => {
@@ -271,6 +300,75 @@ describe("persistent Shell frame", () => {
       `recover:${privatePackageKey.packageIdentity}`,
       `dispose:${privatePackageKey.packageIdentity}`,
     ]);
+  });
+
+  it("keeps a failed Package snapshot visible and retries it from the owning screens", async () => {
+    const screen = new SettingsRegion();
+    let refreshes = 0;
+    const test = harness(screen as unknown as HTMLElement, {
+      refresh: async () => { refreshes += 1; return packages; },
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackageSnapshotFailure();
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Package information is unavailable");
+
+    test.shell.updatePackages(packages);
+    test.shell.updatePackageSnapshotFailure();
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Package information may be out of date");
+    expect(screen.innerHTML).toContain("Showing the latest available Package information");
+    expect(screen.innerHTML).toContain("Retry Package information");
+
+    screen.retrySnapshot.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(refreshes).toBe(1);
+    expect(test.frame.contextualNavigation.innerHTML).not.toContain("out of date");
+    expect(screen.innerHTML).not.toContain("latest available Package information");
+  });
+
+  it("keeps lifecycle operation failure in settings and retries the Package that was acted on", async () => {
+    const screen = new SettingsRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      lifecycle: async () => ({ snapshot: packages, failure: "operation" }),
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.recover.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.innerHTML).toContain("Could not recover Private One.");
+    expect(screen.innerHTML).not.toContain("out of date");
+
+    screen.retryLifecycle.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(test.calls.filter((call) => call.startsWith("recover:"))).toEqual([
+      `recover:${privatePackageKey.packageIdentity}`,
+      `recover:${privatePackageKey.packageIdentity}`,
+    ]);
+    expect(test.calls).not.toContain(`recover:${packageKey.packageIdentity}`);
+  });
+
+  it.each([
+    ["refresh", "Suspended One, but Package information could not be refreshed."],
+    ["operation-and-refresh", "Could not suspend One, and Package information could not be refreshed."],
+  ] as const)("preserves and marks the latest snapshot when lifecycle result is %s", async (failure, wording) => {
+    const screen = new SettingsRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      lifecycle: async () => ({ snapshot: null, failure }),
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.suspend.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.innerHTML).toContain(wording);
+    expect(screen.innerHTML).toContain("Showing the latest available Package information");
+    expect(screen.innerHTML).toContain("One");
+    expect(screen.innerHTML).toContain("Private One");
   });
 
   it.each([
