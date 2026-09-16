@@ -2,7 +2,7 @@
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = teamarness_repo_aware_package::RepoAwareBackend
+    if let Err(error) = teamarness_repo_aware_package::RepoAwareBackend::default()
         .serve()
         .await
     {

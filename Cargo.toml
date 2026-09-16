@@ -43,3 +43,5 @@ tauri = "=2.11.5"
 tauri-build = "=2.6.3"
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
+uuid = { version = "=1.26.1", default-features = false, features = ["v4"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["now", "serde"] }
