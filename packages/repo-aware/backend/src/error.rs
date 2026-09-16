@@ -39,6 +39,14 @@ pub const STORAGE_FAILED: ErrorInfo = ErrorInfo {
     code: "repo_aware.storage_failed",
     retryable: true,
 };
+pub const REPOSITORY_UNAVAILABLE: ErrorInfo = ErrorInfo {
+    code: "repo_aware.repository_unavailable",
+    retryable: true,
+};
+pub const SNAPSHOT_INTERRUPTED: ErrorInfo = ErrorInfo {
+    code: "repo_aware.snapshot_interrupted",
+    retryable: true,
+};
 pub const INVALID_REQUEST: ErrorInfo = ErrorInfo {
     code: "repo_aware.invalid_request",
     retryable: false,

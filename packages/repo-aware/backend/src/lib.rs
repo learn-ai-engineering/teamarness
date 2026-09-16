@@ -2,10 +2,12 @@
 
 pub mod error;
 pub mod registration;
+pub mod snapshot;
 pub mod state;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use teamarness_package_protocol::JsonValue;
@@ -14,6 +16,7 @@ use tokio::sync::Mutex;
 
 use error::ErrorInfo;
 use registration::validate_git_checkout;
+use snapshot::compute_snapshot;
 use state::StateStore;
 
 #[derive(Debug)]
@@ -97,6 +100,28 @@ impl RepoAwareBackend {
 
         Ok(serde_json::json!({ "removed": true }))
     }
+
+    async fn snapshot(&self, payload: JsonValue) -> Result<JsonValue, BackendError> {
+        let registration_id = payload
+            .as_object()
+            .and_then(|obj| obj.get("registrationId"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| Self::backend_error(error::INVALID_REQUEST))?;
+
+        let active = self.active.lock().await;
+        let store = active
+            .as_ref()
+            .ok_or_else(|| Self::backend_error(error::STORAGE_FAILED))?;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let snapshot = compute_snapshot(registration_id, store, cancel)?;
+
+        serde_json::to_value(serde_json::json!({
+            "registrationId": registration_id,
+            "snapshot": snapshot,
+        }))
+        .map_err(|_| Self::backend_error(error::STORAGE_FAILED))
+    }
 }
 
 impl Backend for RepoAwareBackend {
@@ -115,7 +140,7 @@ impl Backend for RepoAwareBackend {
                 "repo_aware.list" => self.list().await,
                 "repo_aware.register" => self.register(request.payload).await,
                 "repo_aware.snapshot" => {
-                    Err(Self::backend_error(error::INVALID_REQUEST))
+                    self.snapshot(request.payload).await
                 }
                 "repo_aware.remove" => self.remove(request.payload).await,
                 _ => Err(Self::backend_error(error::INVALID_REQUEST)),
