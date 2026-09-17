@@ -130,7 +130,7 @@ impl RepoAwareBackend {
             compute_snapshot_impl(&rid, &path, cancel_clone)
         })
         .await
-        .map_err(|_| Self::backend_error(error::SNAPSHOT_INTERRUPTED))?;
+        .map_err(|_| Self::backend_error(error::SNAPSHOT_INTERRUPTED))??;
 
         serde_json::to_value(serde_json::json!({
             "registrationId": registration_id,
