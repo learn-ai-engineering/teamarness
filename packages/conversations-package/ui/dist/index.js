@@ -21,7 +21,7 @@ Object.freeze([
 	"--teamarness-radius-control",
 	"--teamarness-radius-panel"
 ]);
-var n = "\n  :host, :host * { box-sizing: border-box; }\n\n  /* Inherit the complete surrounding font instead of selecting var(--teamarness-font-body). */\n  .teamarness-control {\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-control);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n    font: inherit;\n    padding: 0.55rem 0.8rem;\n  }\n  .teamarness-control--primary {\n    border-color: var(--teamarness-color-accent);\n    background: var(--teamarness-color-accent);\n    color: var(--teamarness-color-background);\n  }\n  .teamarness-control--secondary {\n    border-color: var(--teamarness-color-border);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n  }\n  .teamarness-field { display: grid; gap: 0.35rem; color: var(--teamarness-color-text); }\n  .teamarness-input {\n    width: 100%;\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-control);\n    background: var(--teamarness-color-background);\n    color: var(--teamarness-color-text);\n    font: inherit;\n    padding: 0.55rem 0.65rem;\n  }\n  .teamarness-help { color: var(--teamarness-color-text-muted); }\n  .teamarness-validation { color: var(--teamarness-color-danger); font-family: var(--teamarness-font-mono); }\n  .teamarness-notice {\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-control);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n    padding: 0.75rem;\n  }\n  .teamarness-notice--danger { border-color: var(--teamarness-color-danger); color: var(--teamarness-color-danger); }\n  .teamarness-panel {\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-panel);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n    padding: 1rem;\n  }\n  .teamarness-stack { display: flex; flex-direction: column; gap: 0.75rem; }\n  .teamarness-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }\n  .teamarness-focus:focus-visible,\n  .teamarness-control:focus-visible,\n  .teamarness-input:focus-visible {\n    outline: 3px solid var(--teamarness-color-focus);\n    outline-offset: 2px;\n  }\n", r = /* @__PURE__ */ new WeakMap(), i = /* @__PURE__ */ new WeakMap(), a = {
+var n = "\n  :host, :host * { box-sizing: border-box; }\n\n  /* Inherit the complete surrounding font instead of selecting var(--teamarness-font-body). */\n  .teamarness-control {\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-control);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n    font: inherit;\n    padding: 0.55rem 0.8rem;\n  }\n  .teamarness-control--primary {\n    border-color: var(--teamarness-color-accent);\n    background: var(--teamarness-color-accent);\n    color: var(--teamarness-color-background);\n  }\n  .teamarness-control--secondary {\n    border-color: var(--teamarness-color-border);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n  }\n  .teamarness-field { display: grid; gap: 0.35rem; color: var(--teamarness-color-text); }\n  .teamarness-input {\n    width: 100%;\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-control);\n    background: var(--teamarness-color-background);\n    color: var(--teamarness-color-text);\n    font: inherit;\n    padding: 0.55rem 0.65rem;\n  }\n  .teamarness-help { color: var(--teamarness-color-text-muted); }\n  .teamarness-validation { color: var(--teamarness-color-danger); font-family: var(--teamarness-font-mono); }\n  .teamarness-notice {\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-control);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n    padding: 0.75rem;\n  }\n  .teamarness-notice--danger { border-color: var(--teamarness-color-danger); color: var(--teamarness-color-danger); }\n  .teamarness-panel {\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-panel);\n    background: var(--teamarness-color-panel);\n    color: var(--teamarness-color-text);\n    padding: 1rem;\n  }\n  .teamarness-stack { display: flex; flex-direction: column; gap: 0.75rem; }\n  .teamarness-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }\n  /* Page structure: opt-in primitives whose values mirror the Shell's own screens. */\n  .teamarness-page { display: block; padding: clamp(1.25rem, 4vw, 3rem); color: var(--teamarness-color-text); }\n  .teamarness-page > * + * { margin-top: 2rem; }\n  .teamarness-page--readable { max-width: 48rem; }\n  .teamarness-page-header { display: block; }\n  .teamarness-eyebrow {\n    margin: 0 0 0.4rem;\n    color: var(--teamarness-color-accent);\n    font-size: 0.75rem;\n    font-weight: 800;\n    letter-spacing: 0.08em;\n    text-transform: uppercase;\n  }\n  .teamarness-page-title { margin: 0 0 0.5rem; font-size: clamp(1.7rem, 4vw, 2.5rem); }\n  .teamarness-page-subtitle { max-width: 40rem; margin: 0; color: var(--teamarness-color-text-muted); }\n  .teamarness-section {\n    padding: 1.25rem;\n    background: var(--teamarness-color-panel);\n    border: 1px solid var(--teamarness-color-border);\n    border-radius: var(--teamarness-radius-panel);\n  }\n  .teamarness-section-title { margin: 0 0 0.75rem; font-size: 1.05rem; }\n  .teamarness-focus:focus-visible,\n  .teamarness-control:focus-visible,\n  .teamarness-input:focus-visible {\n    outline: 3px solid var(--teamarness-color-focus);\n    outline-offset: 2px;\n  }\n", r = /* @__PURE__ */ new WeakMap(), i = /* @__PURE__ */ new WeakMap(), a = {
 	autocapitalize: "off",
 	autocorrect: "off",
 	spellcheck: "false",
@@ -1215,7 +1215,7 @@ function vt(e) {
 	return e >= 55296 && e <= 57343 || e > 1114111 ? 65533 : gt.get(e) ?? e;
 }
 //#endregion
-//#region ../../../node_modules/entities/lib/esm/decode.js
+//#region ../../../node_modules/markdown-it/node_modules/entities/lib/esm/decode.js
 var N;
 (function(e) {
 	e[e.NUM = 35] = "NUM", e[e.SEMI = 59] = "SEMI", e[e.EQUALS = 61] = "EQUALS", e[e.ZERO = 48] = "ZERO", e[e.NINE = 57] = "NINE", e[e.LOWER_A = 97] = "LOWER_A", e[e.LOWER_F = 102] = "LOWER_F", e[e.LOWER_X = 120] = "LOWER_X", e[e.LOWER_Z = 122] = "LOWER_Z", e[e.UPPER_A = 65] = "UPPER_A", e[e.UPPER_F = 70] = "UPPER_F", e[e.UPPER_Z = 90] = "UPPER_Z";
@@ -3690,12 +3690,18 @@ var $ = {
 	textarea;
 	sendButton;
 	disposed = !1;
-	constructor(e, t) {
-		this.root = e, this.controller = t, this.shell = document.createElement("div"), this.shell.className = "conversations-shell", this.shell.dataset.narrowLayout = "true", this.rail = document.createElement("aside"), this.rail.className = "channel-rail", this.rail.setAttribute("aria-label", "Channels"), this.panel = document.createElement("section"), this.panel.className = `conversation-panel ${$.panel}`, this.headerSlot = document.createElement("div"), this.panel.append(this.headerSlot), this.history = document.createElement("ol"), this.history.className = "message-history", this.history.setAttribute("aria-label", "Messages"), this.panel.append(this.history), this.olderButton = document.createElement("button"), this.olderButton.type = "button", this.olderButton.className = `${$.secondary} older-messages`, this.olderButton.addEventListener("click", () => {
+	constructor(e, t, n) {
+		this.root = e, this.controller = t;
+		let r = document.createElement("div");
+		r.className = "teamarness-page conversations-page";
+		let i = document.createElement("header");
+		i.className = "teamarness-page-header";
+		let a = document.createElement("h1");
+		a.className = "teamarness-page-title", a.textContent = n, i.append(a), this.shell = document.createElement("div"), this.shell.className = "conversations-shell", this.shell.dataset.narrowLayout = "true", this.rail = document.createElement("aside"), this.rail.className = "channel-rail", this.rail.setAttribute("aria-label", "Channels"), this.panel = document.createElement("section"), this.panel.className = `conversation-panel ${$.panel}`, this.headerSlot = document.createElement("div"), this.panel.append(this.headerSlot), this.history = document.createElement("ol"), this.history.className = "message-history", this.history.setAttribute("aria-label", "Messages"), this.panel.append(this.history), this.olderButton = document.createElement("button"), this.olderButton.type = "button", this.olderButton.className = `${$.secondary} older-messages`, this.olderButton.addEventListener("click", () => {
 			t.loadOlder();
 		}), this.panel.append(this.olderButton), this.composer = document.createElement("form"), this.composer.className = `composer ${$.field}`;
-		let n = document.createElement("label");
-		n.htmlFor = "message-markdown", n.textContent = "Message (Markdown)", this.composer.append(n), this.textarea = document.createElement("textarea"), this.textarea.id = "message-markdown", this.textarea.name = "markdown", this.textarea.className = $.input, this.textarea.required = !0, this.textarea.maxLength = 32768, this.textarea.placeholder = "Write a message…", this.textarea.addEventListener("input", () => {
+		let o = document.createElement("label");
+		o.htmlFor = "message-markdown", o.textContent = "Message (Markdown)", this.composer.append(o), this.textarea = document.createElement("textarea"), this.textarea.id = "message-markdown", this.textarea.name = "markdown", this.textarea.className = $.input, this.textarea.required = !0, this.textarea.maxLength = 32768, this.textarea.placeholder = "Write a message…", this.textarea.addEventListener("input", () => {
 			t.draft = this.textarea.value;
 		}), this.composer.append(this.textarea), this.sendButton = document.createElement("button"), this.sendButton.type = "submit", this.sendButton.className = $.primary, this.sendButton.textContent = "Send", this.composer.append(this.sendButton), this.composer.addEventListener("submit", (e) => {
 			e.preventDefault();
@@ -3703,7 +3709,7 @@ var $ = {
 			t.postMessage(n).then(() => {
 				this.disposed || !t.state.loading && !t.state.warning && (this.textarea.value = "", t.draft = "");
 			});
-		}), this.panel.append(this.composer), this.shell.append(this.rail, this.panel), e.replaceChildren(this.shell);
+		}), this.panel.append(this.composer), this.shell.append(this.rail, this.panel), r.append(i, this.shell), e.replaceChildren(r);
 	}
 	render() {
 		if (this.disposed) return;
@@ -3805,7 +3811,7 @@ var $ = {
 async function Bi(e) {
 	let t = f(e.root), n = !1, r = new h(e.client, () => {
 		n || i.render();
-	}), i = new zi(e.root, r);
+	}), i = new zi(e.root, r, e.package.displayName);
 	await r.initialize(), i.render();
 	let a = await e.client.subscribe("conversations.changes", {}, async (e) => {
 		n || (await r.applySnapshot(e), i.render());

@@ -35,9 +35,20 @@ export class ConversationsView {
   constructor(
     root: ShadowRoot | HTMLElement,
     controller: ConversationsController,
+    title: string,
   ) {
     this.root = root;
     this.controller = controller;
+
+    // --- page header ---
+    const page = document.createElement("div");
+    page.className = "teamarness-page conversations-page";
+    const pageHeader = document.createElement("header");
+    pageHeader.className = "teamarness-page-header";
+    const pageTitle = document.createElement("h1");
+    pageTitle.className = "teamarness-page-title";
+    pageTitle.textContent = title;
+    pageHeader.append(pageTitle);
 
     // --- shell ---
     this.shell = document.createElement("div");
@@ -114,7 +125,8 @@ export class ConversationsView {
 
     this.panel.append(this.composer);
     this.shell.append(this.rail, this.panel);
-    root.replaceChildren(this.shell);
+    page.append(pageHeader, this.shell);
+    root.replaceChildren(page);
   }
 
   // ------------------------------------------------------------------

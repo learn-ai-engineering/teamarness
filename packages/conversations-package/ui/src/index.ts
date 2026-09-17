@@ -33,7 +33,7 @@ export async function mount(
   const controller = new ConversationsController(context.client, () => {
     if (!disposed) view.render();
   });
-  const view = new ConversationsView(context.root, controller);
+  const view = new ConversationsView(context.root, controller, context.package.displayName);
 
   await controller.initialize();
   view.render();

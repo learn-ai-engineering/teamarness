@@ -124,6 +124,12 @@ describe("package UI kit integration", () => {
     // Kit should have added at least one stylesheet to adoptedStyleSheets.
     expect(root.adoptedStyleSheets.length).toBeGreaterThan(initialSheetCount);
 
+    // The page header names the Package.
+    const title = root.querySelector("h1");
+    expect(title?.textContent).toBe("Conversations");
+    expect(title?.className).toContain("teamarness-page-title");
+    expect(root.querySelector(".teamarness-page")?.lastElementChild?.className).toContain("conversations-shell");
+
     // The section element should have the kit panel class.
     const section = root.querySelector("section");
     expect(section?.className).toContain("teamarness-panel");
