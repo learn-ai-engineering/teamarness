@@ -9,6 +9,10 @@ license.workspace = true
 p2panda-sync-adapter = []
 
 [dependencies]
+curve25519-dalek.workspace = true
+hpke-rs.workspace = true
+hpke-rs-crypto.workspace = true
+hpke-rs-rust-crypto.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true
 iroh-tickets.workspace = true
@@ -23,7 +27,9 @@ getrandom.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

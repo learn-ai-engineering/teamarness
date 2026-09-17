@@ -7556,8 +7556,12 @@ dependencies = [
 name = "teamarness-core"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek 5.0.0",
  "futures-util",
  "getrandom 0.4.3",
+ "hpke-rs",
+ "hpke-rs-crypto",
+ "hpke-rs-rust-crypto",
  "iroh",
  "iroh-base",
  "iroh-tickets",
@@ -7570,7 +7574,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

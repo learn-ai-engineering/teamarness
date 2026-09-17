@@ -70,6 +70,8 @@ pub enum StorageError {
     CorruptIdentity,
     /// Durable workspace trust anchors or canonical genesis records disagree.
     CorruptWorkspace,
+    /// The core database holds retired version-1 protection controls; reset this data directory.
+    LegacyProtectionState,
     /// SQLite may have committed, so the active runtime cannot safely continue.
     UncertainOutcome,
     /// The active runtime is poisoned and must be reopened.
@@ -87,6 +89,9 @@ impl fmt::Display for StorageError {
             Self::UnsupportedSchema => "core database schema is newer than this runtime",
             Self::CorruptIdentity => "durable installation identity is corrupt",
             Self::CorruptWorkspace => "durable workspace trust anchor is corrupt",
+            Self::LegacyProtectionState => {
+                "the core database holds retired version-1 protection controls; reset this data directory"
+            }
             Self::UncertainOutcome => "database commit outcome is uncertain",
             Self::RuntimePoisoned => "the runtime must be reopened before another command",
         };

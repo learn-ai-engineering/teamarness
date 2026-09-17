@@ -692,9 +692,10 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             if crate::synchronization::protection_control_author(grant).map_err(|_| ())? != peer {
                 return Err(());
             }
+            let secret = state.secret_key.clone();
             crate::synchronization::import_protection_grant(
                 &mut state.connection,
-                local,
+                &secret,
                 workspace,
                 &batch.package,
                 grant,
@@ -1566,7 +1567,8 @@ impl CoreRuntime {
 
     /// Creates an authenticated Core-held welcome grant for a current recipient.
     ///
-    /// The returned bytes are an opaque control operation; they contain no plaintext content key.
+    /// Creates a control that is HPKE-sealed to `recipient` and signed by this
+    /// Installation; only the recipient's private key can recover the content key.
     pub fn export_protection_grant(
         &self,
         workspace_id: WorkspaceId,
@@ -1623,9 +1625,10 @@ impl CoreRuntime {
         if !projection.contains_member(author) {
             return Err(crate::SynchronizationError::NotCurrentMember);
         }
+        let secret = state.secret_key.clone();
         crate::synchronization::import_protection_grant(
             &mut state.connection,
-            self.public_identity,
+            &secret,
             workspace_id,
             package_identity,
             grant,

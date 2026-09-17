@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{Manager, RunEvent};
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+use teamarness_core::{CoreError, CoreRuntime, CoreRuntimeConfig, StorageError};
 use teamarness_package_host::{
     InstallationPublicIdentity, PackageHost, PackageHostCommand, PackageHostConfig,
     PackageInstanceKey, ShutdownHost, UiMountId,
@@ -173,7 +173,12 @@ async fn open_runtime_modules(
     let runtime = Arc::new(
         CoreRuntime::open(CoreRuntimeConfig::new(data_directory.clone()))
             .await
-            .map_err(|_| "Core Runtime startup failed")?,
+            .map_err(|error| match error {
+                CoreError::Storage(StorageError::LegacyProtectionState) => {
+                    "This data directory was created by an older development build whose key grants are no longer supported. Delete it to start fresh."
+                }
+                _ => "Core Runtime startup failed",
+            })?,
     );
     let installation = InstallationPublicIdentity::new(runtime.public_identity().to_string())
         .map_err(|_| "Installation identity is incompatible with Package Host")?;

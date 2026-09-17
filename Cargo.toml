@@ -45,3 +45,8 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 uuid = { version = "=1.26.1", default-features = false, features = ["v4"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["now", "serde"] }
+curve25519-dalek = { version = "=5.0.0", default-features = false }
+hpke-rs = "=0.7.0"
+hpke-rs-crypto = "=0.7.0"
+hpke-rs-rust-crypto = "=0.7.0"
+zeroize = "=1.9.0"

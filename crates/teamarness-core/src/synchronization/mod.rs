@@ -809,6 +809,16 @@ impl fmt::Display for SynchronizationError {
     }
 }
 impl std::error::Error for SynchronizationError {}
+/// Keeps a refusal of retired version-1 protection controls distinguishable
+/// from an ordinary corrupt record, so startup can tell the user to reset.
+fn storage_or_corrupt(error: StorageError) -> SynchronizationError {
+    if matches!(error, StorageError::LegacyProtectionState) {
+        SynchronizationError::Storage(error)
+    } else {
+        SynchronizationError::CorruptRecord
+    }
+}
+
 impl From<StorageError> for SynchronizationError {
     fn from(e: StorageError) -> Self {
         Self::Storage(e)
@@ -940,10 +950,13 @@ pub(crate) fn export_protection_grant(
         )
         .optional()
         .map_err(|_| storage_error())?;
-    if let Some(existing) = existing {
+    if let Some(existing) = existing
+        && existing.starts_with(protection_control::DOMAIN_V2)
+    {
         return Ok(existing);
     }
-    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, key);
+    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, key)
+        .map_err(storage_or_corrupt)?;
     let control =
         protection_control::decode(&bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
     let tx = conn
@@ -973,23 +986,31 @@ pub(crate) fn protection_control_author(
 
 pub(crate) fn import_protection_grant(
     conn: &mut rusqlite::Connection,
-    local_identity: PublicIdentity,
+    local_secret: &SecretKey,
     workspace: WorkspaceId,
     package: &str,
     bytes: &[u8],
 ) -> Result<usize, SynchronizationError> {
-    let control =
-        protection_control::decode(bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
+    let local_identity = PublicIdentity::from_bytes(*local_secret.public().as_bytes())
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let control = protection_control::decode(bytes).map_err(storage_or_corrupt)?;
     let scope = scope_digest(package, workspace);
     if control.scope != scope
         || control.workspace != workspace
         || control.recipient != local_identity
-        || !matches!(control.kind, 1 | 3)
+        || !matches!(
+            control.kind,
+            protection_control::KIND_CREATE | protection_control::KIND_GRANT
+        )
     {
         return Err(SynchronizationError::WrongScope);
     }
-    let key = protection_control::decrypt_key(&control)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let key = protection_control::open_control(
+        &control,
+        &bytes[..protection_control::AAD_END],
+        local_secret,
+    )
+    .map_err(storage_or_corrupt)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| storage_error())?;
@@ -1013,7 +1034,7 @@ pub(crate) fn import_protection_grant(
             rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.as_slice()],
         ).map_err(|_| storage_error())?;
         let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
-        bundle.extend_from_slice(&key);
+        bundle.extend_from_slice(key.as_slice());
         tx.execute(
             "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
             rusqlite::params![scope.as_slice(), bundle, control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
@@ -1028,7 +1049,11 @@ pub(crate) fn import_protection_grant(
         &tx,
         scope,
         RecordId::digest(bytes).as_bytes(),
-        if control.kind == 1 { "create" } else { "grant" },
+        if control.kind == protection_control::KIND_CREATE {
+            "create"
+        } else {
+            "grant"
+        },
         &control,
         bytes,
     )
@@ -1156,7 +1181,8 @@ pub(crate) fn append(
         == 0
     {
         let control =
-            protection_control::create(secret, scope, workspace, signed.author, [0; 32], key);
+            protection_control::create(secret, scope, workspace, signed.author, [0; 32], key)
+                .map_err(|_| storage_error())?;
         let parsed = protection_control::decode(&control).map_err(|_| storage_error())?;
         protection_control::insert(
             &tx,
@@ -1702,6 +1728,65 @@ pub(crate) fn event_for_record(
     })
 }
 
+/// Refuses a data directory that still holds retired version-1 protection
+/// controls, and proves that every control addressed to this Installation still
+/// opens to the content key its scope records.
+fn validate_protection_controls(
+    conn: &rusqlite::Connection,
+    secret: &SecretKey,
+) -> Result<(), StorageError> {
+    let local = PublicIdentity::from_bytes(*secret.public().as_bytes())
+        .map_err(|_| StorageError::CorruptIdentity)?;
+    let controls: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT scope_id,recipient_public_identity,control_bytes
+                 FROM protection_control_operations",
+            )
+            .map_err(|_| StorageError::Database)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|_| StorageError::Database)?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|_| StorageError::CorruptWorkspace)?
+    };
+    for (scope, recipient, bytes) in controls {
+        let control = protection_control::decode(&bytes)?;
+        if recipient != control.recipient.as_bytes().as_slice() {
+            return Err(StorageError::CorruptWorkspace);
+        }
+        if control.recipient != local {
+            continue;
+        }
+        let key = protection_control::open_control(
+            &control,
+            &bytes[..protection_control::AAD_END],
+            secret,
+        )?;
+        let scope_key_id: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT content_key_id FROM sync_scopes WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::Database)?;
+        let Some(scope_key_id) = scope_key_id else {
+            return Err(StorageError::CorruptWorkspace);
+        };
+        if scope_key_id != key_id(&key).as_slice() {
+            return Err(StorageError::CorruptWorkspace);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn recover(
     conn: &mut rusqlite::Connection,
     secret: &SecretKey,
@@ -1740,6 +1825,7 @@ pub(crate) fn recover(
     };
     operation_store::repair(conn, secret)?;
     operation_store::validate(conn)?;
+    validate_protection_controls(conn, secret)?;
     for (scope, package, workspace, key, id) in scopes {
         if scope_digest(&package, workspace) != scope || key_id(&key) != id {
             return Err(StorageError::CorruptWorkspace);

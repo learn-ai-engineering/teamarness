@@ -5,6 +5,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, StorageError};
 
+/// Rewrites every stored protection control through a byte-level edit, because
+/// SQLite string concatenation would turn the STRICT blob column into text.
+fn rewrite_control_bytes(connection: &Connection, edit: impl Fn(&mut Vec<u8>)) {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+        let mut statement = connection
+            .prepare("SELECT control_id, control_bytes FROM protection_control_operations")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    assert!(!rows.is_empty());
+    for (id, mut bytes) in rows {
+        edit(&mut bytes);
+        connection
+            .execute(
+                "UPDATE protection_control_operations SET control_bytes = ?2 WHERE control_id = ?1",
+                rusqlite::params![id, bytes],
+            )
+            .unwrap();
+    }
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 fn directory() -> PathBuf {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -93,14 +117,77 @@ async fn creator_bootstrap_is_recorded_as_authenticated_control() {
     drop(runtime);
 
     let connection = Connection::open(path.join("core.sqlite3")).unwrap();
-    let kind: String = connection
+    let (kind, length): (String, i64) = connection
         .query_row(
-            "SELECT operation_kind FROM protection_control_operations LIMIT 1",
+            "SELECT operation_kind, length(control_bytes) FROM protection_control_operations LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(kind, "create");
+    assert_eq!(length, 354);
+    fs::remove_dir_all(path).unwrap();
+}
+
+// Verifies: TEAM.SYS.ID-R08
+#[tokio::test]
+async fn restart_refuses_legacy_version_1_protection_controls() {
+    let path = directory();
+    let config = CoreRuntimeConfig::new(&path);
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let workspace = runtime.create_workspace("Legacy controls").unwrap();
+    runtime
+        .append_record(workspace.id(), "teamarness.test", "message.post", b"legacy")
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    connection
+        .execute("DROP TRIGGER protection_control_operations_no_update", [])
+        .unwrap();
+    rewrite_control_bytes(&connection, |bytes| {
+        bytes[..32].copy_from_slice(b"teamarness.protection-control/v1");
+    });
+    drop(connection);
+
+    assert!(matches!(
+        CoreRuntime::open(config).await,
+        Err(teamarness_core::CoreError::Storage(
+            StorageError::LegacyProtectionState
+        ))
+    ));
+    assert!(path.join("core.sqlite3").exists());
+    fs::remove_dir_all(path).unwrap();
+}
+
+// Verifies: TEAM.SYS.ID-R08
+#[tokio::test]
+async fn restart_rejects_tampered_protection_control() {
+    let path = directory();
+    let config = CoreRuntimeConfig::new(&path);
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let workspace = runtime.create_workspace("Tampered control").unwrap();
+    runtime
+        .append_record(workspace.id(), "teamarness.test", "message.post", b"tamper")
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    connection
+        .execute("DROP TRIGGER protection_control_operations_no_update", [])
+        .unwrap();
+    // Offset 242 is the first ciphertext byte, inside the signed prefix.
+    rewrite_control_bytes(&connection, |bytes| bytes[242] ^= 1);
+    drop(connection);
+
+    assert!(matches!(
+        CoreRuntime::open(config).await,
+        Err(teamarness_core::CoreError::Storage(
+            StorageError::CorruptWorkspace
+        ))
+    ));
     fs::remove_dir_all(path).unwrap();
 }
 
