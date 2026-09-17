@@ -510,7 +510,28 @@ impl RecordProtection for P2pandaRecordProtection {
         if RecordId::digest(canonical) != sealed.record_id || parsed.verify().is_err() {
             return Err(ValueParseError::new("record authentication"));
         }
+        // SEC-05: the author signs the package and workspace it wrote for, so a
+        // record sealed into another scope never opens there.
+        if parsed.package_identity != self.package_identity
+            || parsed.workspace_id != self.workspace_id
+        {
+            return Err(ValueParseError::new(SCOPE_BINDING));
+        }
         Ok(parsed)
+    }
+}
+
+/// The value name [`RecordProtection::open`] reports when a record is signed for
+/// a package or workspace other than the scope that sealed it.
+const SCOPE_BINDING: &str = "record scope binding";
+
+/// Distinguishes a record signed for another scope from an otherwise unreadable
+/// record, so one forged record is rejected as such instead of as corruption.
+fn map_open_error(error: &ValueParseError) -> SynchronizationError {
+    if error.value_name() == SCOPE_BINDING {
+        SynchronizationError::WrongScope
+    } else {
+        SynchronizationError::CorruptRecord
     }
 }
 
@@ -1211,7 +1232,7 @@ pub(crate) fn open_records(
             }
             let record = protector
                 .open(&sealed)
-                .map_err(|_| SynchronizationError::CorruptRecord)?;
+                .map_err(|error| map_open_error(&error))?;
             Ok(OpenedRecord {
                 record_id: sealed.record_id,
                 order_key: sealed.order_key,
@@ -1363,7 +1384,7 @@ pub(crate) fn insert_remote(
     };
     let signed = protector
         .open(&sealed)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+        .map_err(|error| map_open_error(&error))?;
     let record_id = RecordId::digest(&signed.canonical_bytes());
     if record_id != sealed.record_id {
         return Err(SynchronizationError::CorruptRecord);
@@ -1464,7 +1485,7 @@ pub(crate) fn insert_remote_operation(
     };
     let signed = protector
         .open(&sealed)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+        .map_err(|error| map_open_error(&error))?;
     if operation.header.verifying_key.as_bytes() != signed.author.as_bytes() {
         return Err(SynchronizationError::CorruptRecord);
     }
@@ -1879,6 +1900,72 @@ mod tests {
                 ..protector
             };
             assert!(wrong.open(&sealed).is_err());
+        }
+
+        fn seal_into(
+            record: &SignedRecordV1,
+            package_identity: &str,
+            workspace_id: WorkspaceId,
+        ) -> (P2pandaRecordProtection, SealedRecordV1) {
+            let protector = P2pandaRecordProtection {
+                package_identity: package_identity.to_owned(),
+                workspace_id,
+                content_key: [9; 32],
+            };
+            let id = RecordId::digest(&record.canonical_bytes());
+            let sealed = protector
+                .seal(record, OrderKey::from_height_and_id(2, id))
+                .unwrap();
+            (protector, sealed)
+        }
+
+        // Verifies: TEAM.SYS.TRANS-R06
+        #[test]
+        fn open_rejects_record_signed_for_another_package() {
+            let record = signed();
+            let (protector, sealed) = seal_into(&record, "other.package", record.workspace_id);
+
+            let Err(error) = protector.open(&sealed) else {
+                panic!("a record signed for another scope must not open");
+            };
+
+            assert_eq!(error.to_string(), "invalid record scope binding");
+            assert_eq!(map_open_error(&error), SynchronizationError::WrongScope);
+        }
+
+        // Verifies: TEAM.SYS.TRANS-R06
+        #[test]
+        fn open_rejects_record_signed_for_another_workspace() {
+            let record = signed();
+            let (protector, sealed) = seal_into(
+                &record,
+                &record.package_identity,
+                WorkspaceId::from_bytes([4; 16]),
+            );
+
+            let Err(error) = protector.open(&sealed) else {
+                panic!("a record signed for another scope must not open");
+            };
+
+            assert_eq!(error.to_string(), "invalid record scope binding");
+            assert_eq!(map_open_error(&error), SynchronizationError::WrongScope);
+        }
+
+        #[test]
+        fn open_accepts_record_for_its_own_scope() {
+            let record = signed();
+            let (protector, sealed) =
+                seal_into(&record, &record.package_identity, record.workspace_id);
+
+            let opened = protector.open(&sealed).unwrap();
+
+            assert_eq!(opened.canonical, record.canonical);
+            assert_eq!(opened.package_identity, record.package_identity);
+            assert_eq!(opened.workspace_id, record.workspace_id);
+            assert_eq!(
+                map_open_error(&ValueParseError::new("record decryption")),
+                SynchronizationError::CorruptRecord
+            );
         }
 
         #[test]

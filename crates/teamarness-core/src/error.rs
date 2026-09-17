@@ -11,6 +11,13 @@ impl ValueParseError {
     pub(crate) const fn new(value_name: &'static str) -> Self {
         Self { value_name }
     }
+
+    /// Names the value that failed to parse, so callers inside the crate can
+    /// distinguish one parse failure from another without matching strings in
+    /// the public `Display` text.
+    pub(crate) const fn value_name(&self) -> &'static str {
+        self.value_name
+    }
 }
 
 impl fmt::Display for ValueParseError {
