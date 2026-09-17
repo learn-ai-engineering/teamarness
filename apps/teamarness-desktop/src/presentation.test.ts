@@ -81,7 +81,6 @@ describe("display-safe Shell presentation", () => {
       notice: "Membership refreshed",
     }), workspace.id);
     expect(presented).toMatchObject({
-      installationName: installation.displayName,
       workspaceChoices: [{ name: workspace.name }],
       activeWorkspaceIndex: 0,
       workspace: { name: workspace.name, memberCount: membership.members.length },
@@ -109,7 +108,6 @@ describe("display-safe Shell presentation", () => {
       activeWorkspaceId: null,
       loading: true,
     }), null)).resolves.toMatchObject({
-      installationName: null,
       workspaceChoices: [],
       workspace: null,
       loading: true,
@@ -130,7 +128,6 @@ describe("display-safe Shell presentation", () => {
         actionIndex: 1,
         installationLocal: false,
         sourceLabel: "Team",
-        canSuspend: true,
         canRecover: false,
         canDispose: true,
       }],
@@ -140,7 +137,6 @@ describe("display-safe Shell presentation", () => {
         actionIndex: 0,
         installationLocal: true,
         sourceLabel: "Personal",
-        canSuspend: false,
         canRecover: true,
         canDispose: true,
       }],
@@ -195,10 +191,10 @@ describe("display-safe Shell presentation", () => {
       "Getting ready", "Getting ready", "Available", "Pausing", "Paused",
       "Getting ready", "Needs recovery", "Needs recovery", "Removing", "Unavailable",
     ]);
-    expect(rows.map(({ canSuspend, canRecover, canDispose }) => [canSuspend, canRecover, canDispose])).toEqual([
-      [false, false, true], [false, false, false], [true, false, true], [false, false, false],
-      [false, true, true], [false, false, false], [false, true, true], [false, true, true],
-      [false, false, false], [false, false, false],
+    expect(rows.map(({ canRecover, canDispose }) => [canRecover, canDispose])).toEqual([
+      [false, true], [false, false], [false, true], [false, false],
+      [true, true], [false, false], [true, true], [true, true],
+      [false, false], [false, false],
     ]);
   });
 });

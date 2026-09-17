@@ -161,11 +161,12 @@ export function renderShell(
   if (route.kind === "workspace-chooser") {
     const choices = presentation.workspaceChoices.map(({ name }, index) =>
       `<li><button type="button" data-choose-workspace="${index}">${escape(name)}</button></li>`).join("");
-    const workspaceList = choices || (presentation.loading
-      ? '<li class="empty-state">Loading Workspaces…</li>'
-      : '<li class="empty-state">No Workspaces yet. Create one or join with a Workspace Invitation.</li>');
-    return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Choose a Workspace</h1><p>Select an existing Workspace or add another.</p></header>
-      <section class="screen-section" aria-labelledby="workspace-list-heading"><h2 id="workspace-list-heading">Your Workspaces</h2><ul class="workspace-list">${workspaceList}</ul></section>
+    const workspaceList = choices || (presentation.loading ? '<li class="empty-state">Loading Workspaces…</li>' : "");
+    const workspaceListSection = workspaceList
+      ? `<section class="screen-section" aria-labelledby="workspace-list-heading"><h2 id="workspace-list-heading">Your Workspaces</h2><ul class="workspace-list">${workspaceList}</ul></section>`
+      : "";
+    return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Create or join a Workspace</h1><p>Create a new Workspace, or join one with a Workspace Invitation.</p></header>
+      ${workspaceListSection}
       <section class="screen-section"><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
       <input id="workspace-name" required maxlength="64" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
       <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Workspace Invitation</label>
@@ -177,7 +178,7 @@ export function renderShell(
 
   if (route.kind === "workspace-invitations") {
     return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Workspace Invitations</h1><p>Create a one-use Workspace Invitation.</p></header>
-      <section class="screen-section notice-panel"><h2>Invite another Installation</h2><button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
+      <section class="screen-section"><h2>Invite another Installation</h2><button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
       <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section></section>`;
   }
   if (route.kind === "workspace-settings") {

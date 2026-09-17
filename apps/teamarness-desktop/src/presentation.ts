@@ -4,7 +4,6 @@ import type { PackageHostSnapshot } from "./package-contracts";
 import type { ShellModel } from "./view";
 
 export type ShellPresentation = Readonly<{
-  installationName: string | null;
   workspaceChoices: readonly Readonly<{ name: string }>[];
   activeWorkspaceIndex: number | null;
   workspace: Readonly<{
@@ -24,7 +23,6 @@ export type PackageInstancePresentation = Readonly<{
   actionIndex: number;
   installationLocal: boolean;
   sourceLabel: "Team" | "Personal";
-  canSuspend: boolean;
   canRecover: boolean;
   canDispose: boolean;
 }>;
@@ -48,7 +46,6 @@ export async function buildShellPresentation(
     : model.workspaces.findIndex(({ id }) => id === model.activeWorkspaceId);
 
   return {
-    installationName: model.installation?.displayName ?? null,
     workspaceChoices: model.workspaces.map(({ name }) => ({ name })),
     activeWorkspaceIndex: activeWorkspaceIndex === -1 ? null : activeWorkspaceIndex,
     workspace: workspace ? {
@@ -91,7 +88,7 @@ export function buildPackageNavigationPresentation(
 
 type LifecycleDescriptor = Pick<
   PackageInstancePresentation,
-  "availability" | "canSuspend" | "canRecover" | "canDispose"
+  "availability" | "canRecover" | "canDispose"
 >;
 
 function lifecycleDescriptor(
@@ -99,23 +96,23 @@ function lifecycleDescriptor(
 ): LifecycleDescriptor {
   switch (lifecycle) {
     case "admitted":
-      return { availability: "Getting ready", canSuspend: false, canRecover: false, canDispose: true };
+      return { availability: "Getting ready", canRecover: false, canDispose: true };
     case "activating":
     case "recovering":
-      return { availability: "Getting ready", canSuspend: false, canRecover: false, canDispose: false };
+      return { availability: "Getting ready", canRecover: false, canDispose: false };
     case "active":
-      return { availability: "Available", canSuspend: true, canRecover: false, canDispose: true };
+      return { availability: "Available", canRecover: false, canDispose: true };
     case "suspending":
-      return { availability: "Pausing", canSuspend: false, canRecover: false, canDispose: false };
+      return { availability: "Pausing", canRecover: false, canDispose: false };
     case "suspended":
-      return { availability: "Paused", canSuspend: false, canRecover: true, canDispose: true };
+      return { availability: "Paused", canRecover: true, canDispose: true };
     case "failed":
     case "crash_loop":
-      return { availability: "Needs recovery", canSuspend: false, canRecover: true, canDispose: true };
+      return { availability: "Needs recovery", canRecover: true, canDispose: true };
     case "disposing":
-      return { availability: "Removing", canSuspend: false, canRecover: false, canDispose: false };
+      return { availability: "Removing", canRecover: false, canDispose: false };
     case "disposed":
-      return { availability: "Unavailable", canSuspend: false, canRecover: false, canDispose: false };
+      return { availability: "Unavailable", canRecover: false, canDispose: false };
   }
 }
 

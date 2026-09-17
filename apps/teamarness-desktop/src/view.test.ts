@@ -79,8 +79,13 @@ describe("Shell Workspace screens", () => {
     expect(loading).toContain("Loading Workspaces…");
     expect(loading).toContain("disabled");
 
+    expect(normal).toContain("Create or join a Workspace");
+    expect(normal).toContain("Your Workspaces");
+    expect(normal).not.toMatch(/Choose a Workspace/);
+
     const empty = await rendered(model({ workspaces: [], memberships: {}, activeWorkspaceId: null }), chooser);
-    expect(empty).toContain("No Workspaces yet");
+    expect(empty).toContain("Create or join a Workspace");
+    expect(empty).not.toContain("Your Workspaces");
   });
 
   it("renders supported Workspace Invitation and read-only settings screens only", async () => {

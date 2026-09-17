@@ -8,6 +8,7 @@ import {
   type ShellPresentation,
 } from "./presentation";
 import type { InstallationThemeController, ThemePreference } from "./theme";
+import { THEME_OPTIONS } from "./theme-icons";
 import { renderShell, type ShellModel } from "./view";
 
 export type ShellRoute =
@@ -28,12 +29,11 @@ type PackageRouter = Readonly<{
   refresh(): Promise<PackageHostSnapshot>;
   select(instance: PackageInstanceKey): Promise<void>;
   hide(): Promise<void>;
-  suspendBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   recoverBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   disposeBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
 }>;
 
-type PackageLifecycleAction = "suspend" | "recover" | "dispose";
+type PackageLifecycleAction = "recover" | "dispose";
 
 type PackageLifecycleFeedback = Readonly<{
   action: PackageLifecycleAction;
@@ -158,18 +158,11 @@ export class Shell {
       return `<li><button type="button" data-workspace-index="${index}"${current} aria-label="Switch to ${escape(workspace.name)}">${escape(workspaceMark(workspace.name))}</button></li>`;
     }).join("");
     const preference = this.options.theme.getPreference();
+    const addCurrent = this.selectedRoute.kind === "workspace-chooser" ? ' aria-current="page"' : "";
     this.shellFrame.workspaceRail.innerHTML = `<div class="workspace-rail__brand" aria-label="Teamarness">T</div>
       <ul class="workspace-switcher">${workspaces}</ul>
-      <button class="workspace-add" id="choose-workspace" type="button" aria-label="Add or join a Workspace">+</button>
-      <details class="installation-menu"><summary>Installation</summary>
-        ${presentation.installationName ? `<p>${escape(presentation.installationName)}</p>` : '<p>Loading…</p>'}
-        <label for="theme-preference">Theme</label>
-        <select id="theme-preference">
-          ${themeOption("system", "System", preference)}
-          ${themeOption("light", "Light", preference)}
-          ${themeOption("dark", "Dark", preference)}
-        </select>
-      </details>`;
+      <button class="workspace-add" id="choose-workspace" type="button" aria-label="Add or join a Workspace"${addCurrent}>+</button>
+      <div class="theme-switcher" role="group" aria-label="Theme">${THEME_OPTIONS.map((option) => themeButton(option, preference)).join("")}</div>`;
     if (!hasQueries(this.shellFrame.workspaceRail)) return;
     this.shellFrame.workspaceRail.querySelectorAll<HTMLButtonElement>("[data-workspace-index]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -180,10 +173,15 @@ export class Shell {
     this.shellFrame.workspaceRail.querySelector<HTMLButtonElement>("#choose-workspace")?.addEventListener("click", () => {
       void this.navigate({ kind: "workspace-chooser" });
     });
-    this.shellFrame.workspaceRail.querySelector<HTMLSelectElement>("#theme-preference")?.addEventListener("change", (event) => {
-      const value = (event.currentTarget as HTMLSelectElement).value;
-      if (isThemePreference(value)) this.options.theme.selectPreference(value);
-      this.renderWorkspaceRail();
+    this.shellFrame.workspaceRail.querySelectorAll<HTMLButtonElement>("[data-theme-preference]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const value = button.dataset.themePreference;
+        if (value === undefined || !isThemePreference(value)) return;
+        this.options.theme.selectPreference(value);
+        this.renderWorkspaceRail();
+        // Re-rendering replaces the buttons, so return keyboard focus to the chosen one.
+        this.shellFrame.workspaceRail.querySelector<HTMLButtonElement>(`[data-theme-preference="${value}"]`)?.focus();
+      });
     });
   }
 
@@ -196,7 +194,7 @@ export class Shell {
     const activePresentation = activeIndex === null ? undefined : presentation.workspaceChoices[activeIndex];
     if (!active || !activePresentation) {
       this.packageActionTargets = [];
-      this.shellFrame.contextualNavigation.innerHTML = '<div class="contextual-navigation__empty"><p>Choose a Workspace</p></div>';
+      this.shellFrame.contextualNavigation.innerHTML = '<header class="workspace-context"><p>Workspaces</p><h1>Add a Workspace</h1></header>';
       return;
     }
 
@@ -337,11 +335,9 @@ export class Shell {
     action: PackageLifecycleAction,
     instance: PackageInstanceKey,
   ): Promise<void> {
-    const result = action === "suspend"
-      ? await this.options.packageShell.suspendBackend(instance)
-      : action === "recover"
-        ? await this.options.packageShell.recoverBackend(instance)
-        : await this.options.packageShell.disposeBackend(instance);
+    const result = action === "recover"
+      ? await this.options.packageShell.recoverBackend(instance)
+      : await this.options.packageShell.disposeBackend(instance);
     if (result.snapshot) {
       this.packageSnapshot = result.snapshot;
       this.packageSnapshotFailed = false;
@@ -381,8 +377,9 @@ function workspaceMark(name: string): string {
   return name.trim().slice(0, 2).toLocaleUpperCase() || "W";
 }
 
-function themeOption(value: ThemePreference, label: string, selected: ThemePreference): string {
-  return `<option value="${value}"${value === selected ? " selected" : ""}>${label}</option>`;
+function themeButton(option: (typeof THEME_OPTIONS)[number], selected: ThemePreference): string {
+  const pressed = option.preference === selected ? "true" : "false";
+  return `<button type="button" class="theme-switcher__option" data-theme-preference="${option.preference}" aria-pressed="${pressed}" aria-label="${option.label}" title="${option.label}">${option.icon}</button>`;
 }
 
 function isThemePreference(value: string): value is ThemePreference {
@@ -429,11 +426,7 @@ function renderPackageInstanceSettings(
       ? renderPackageLifecycleFeedback(row, feedback)
       : "";
     return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>
-      ${rowFeedback}<div class="package-instance-actions">
-        ${lifecycleButton("Suspend", "suspend", row.actionIndex, row.name, row.canSuspend)}
-        ${lifecycleButton("Recover Backend", "recover", row.actionIndex, row.name, row.canRecover)}
-        ${lifecycleButton("Dispose", "dispose", row.actionIndex, row.name, row.canDispose)}
-      </div></article>`;
+      ${rowFeedback}${renderPackageInstanceActions(row)}</article>`;
   }).join("")}</div>`;
 }
 
@@ -441,8 +434,8 @@ function renderPackageLifecycleFeedback(
   row: PackageInstancePresentation,
   feedback: PackageLifecycleFeedback,
 ): string {
-  const verb = feedback.action === "suspend" ? "suspend" : feedback.action === "recover" ? "recover" : "dispose of";
-  const past = feedback.action === "suspend" ? "Suspended" : feedback.action === "recover" ? "Recovered" : "Disposed of";
+  const verb = feedback.action === "recover" ? "recover" : "dispose of";
+  const past = feedback.action === "recover" ? "Recovered" : "Disposed of";
   const refreshFailed = feedback.failure === "refresh" || feedback.failure === "operation-and-refresh";
   const operationFailed = feedback.failure === "operation" || feedback.failure === "operation-and-refresh";
   const message = operationFailed
@@ -462,8 +455,18 @@ function renderPackageSnapshotFailure(failed: boolean, hasSnapshot: boolean): st
   return `<div class="package-snapshot-failure" role="alert"><p>${message}</p><button type="button" data-package-snapshot-retry>Retry Package information</button></div>`;
 }
 
-function lifecycleButton(label: string, action: string, index: number, name: string, enabled: boolean): string {
-  return `<button type="button" data-package-action="${action}" data-package-action-index="${index}" aria-label="${label} ${escape(name)}"${enabled ? "" : " disabled"}>${label}</button>`;
+// Only Package Instances that need recovery get lifecycle controls; healthy rows stay quiet.
+function renderPackageInstanceActions(row: PackageInstancePresentation): string {
+  if (!row.canRecover) return "";
+  const buttons = [
+    lifecycleButton("Recover Backend", "recover", row.actionIndex, row.name),
+    row.canDispose ? lifecycleButton("Dispose", "dispose", row.actionIndex, row.name) : "",
+  ].join("");
+  return `<div class="package-instance-actions">${buttons}</div>`;
+}
+
+function lifecycleButton(label: string, action: PackageLifecycleAction, index: number, name: string): string {
+  return `<button type="button" data-package-action="${action}" data-package-action-index="${index}" aria-label="${label} ${escape(name)}">${label}</button>`;
 }
 
 function packageRows(presentation: PackageNavigationPresentation): readonly PackageInstancePresentation[] {
@@ -471,17 +474,15 @@ function packageRows(presentation: PackageNavigationPresentation): readonly Pack
 }
 
 function lifecycleActionAllowed(row: PackageInstancePresentation, action: string | undefined): action is PackageLifecycleAction {
-  return (action === "suspend" && row.canSuspend)
-    || (action === "recover" && row.canRecover)
-    || (action === "dispose" && row.canDispose);
+  return row.canRecover && (action === "recover" || (action === "dispose" && row.canDispose));
 }
 
 function isLifecycleAction(action: string | undefined): action is PackageLifecycleAction {
-  return action === "suspend" || action === "recover" || action === "dispose";
+  return action === "recover" || action === "dispose";
 }
 
 function lifecycleActionLabel(action: PackageLifecycleAction): string {
-  return action === "suspend" ? "Suspend" : action === "recover" ? "Recover Backend" : "Dispose";
+  return action === "recover" ? "Recover Backend" : "Dispose";
 }
 
 function samePackageInstance(left: PackageInstanceKey, right: PackageInstanceKey): boolean {

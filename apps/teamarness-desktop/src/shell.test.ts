@@ -70,11 +70,11 @@ class TestControl {
 }
 
 class SettingsRegion extends Region {
-  public readonly suspend = new TestControl();
   public readonly recover = new TestControl();
   public readonly dispose = new TestControl();
   public readonly invalidRecover = new TestControl();
-  public readonly invalidSuspend = new TestControl();
+  public readonly invalidDispose = new TestControl();
+  public readonly suspend = new TestControl();
   public readonly retryLifecycle = new TestControl();
   public readonly retrySnapshot = new TestControl();
 
@@ -92,17 +92,33 @@ class SettingsRegion extends Region {
       return this.innerHTML.includes("data-package-failure-action") ? [this.retryLifecycle] : [];
     }
     if (selector !== "[data-package-action]") return [];
-    this.suspend.dataset.packageAction = "suspend";
-    this.suspend.dataset.packageActionIndex = "0";
     this.recover.dataset.packageAction = "recover";
     this.recover.dataset.packageActionIndex = "1";
     this.dispose.dataset.packageAction = "dispose";
     this.dispose.dataset.packageActionIndex = "1";
     this.invalidRecover.dataset.packageAction = "recover";
     this.invalidRecover.dataset.packageActionIndex = "0";
-    this.invalidSuspend.dataset.packageAction = "suspend";
-    this.invalidSuspend.dataset.packageActionIndex = "1";
-    return [this.suspend, this.recover, this.dispose, this.invalidRecover, this.invalidSuspend];
+    this.invalidDispose.dataset.packageAction = "dispose";
+    this.invalidDispose.dataset.packageActionIndex = "0";
+    this.suspend.dataset.packageAction = "suspend";
+    this.suspend.dataset.packageActionIndex = "0";
+    return [this.recover, this.dispose, this.invalidRecover, this.invalidDispose, this.suspend];
+  }
+}
+
+class ThemeRailRegion extends Region {
+  public readonly dark = new TestControl();
+  public focusedSelector: string | null = null;
+
+  public querySelector(selector: string): (TestControl & { focus(): void }) | null {
+    if (!selector.startsWith("[data-theme-preference=")) return null;
+    return Object.assign(new TestControl(), { focus: () => { this.focusedSelector = selector; } });
+  }
+
+  public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector !== "[data-theme-preference]") return [];
+    this.dark.dataset.themePreference = "dark";
+    return [this.dark];
   }
 }
 
@@ -134,8 +150,9 @@ function harness(
   shellScreen: HTMLElement = new Region() as unknown as HTMLElement,
   packageBehavior: Readonly<{
     refresh?: () => Promise<PackageHostSnapshot>;
-    lifecycle?: (action: "suspend" | "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
+    lifecycle?: (action: "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
   }> = {},
+  workspaceRail: HTMLElement = new Region() as unknown as HTMLElement,
 ): {
   shell: Shell;
   frame: ShellFrame;
@@ -145,7 +162,7 @@ function harness(
   const calls: string[] = [];
   const routes: ShellRoute[] = [];
   const frame: ShellFrame = {
-    workspaceRail: new Region() as unknown as HTMLElement,
+    workspaceRail,
     contextualNavigation: new Region() as unknown as HTMLElement,
     shellScreen,
     packageMount: new Region() as unknown as HTMLElement,
@@ -155,10 +172,6 @@ function harness(
       refresh: packageBehavior.refresh ?? (async () => packages),
       select: async (instance) => { calls.push(`mount:${instance.packageIdentity}`); },
       hide: async () => { calls.push("unmount"); },
-      suspendBackend: async (instance) => {
-        calls.push(`suspend:${instance.packageIdentity}`);
-        return packageBehavior.lifecycle?.("suspend", instance) ?? { snapshot: packages, failure: null };
-      },
       recoverBackend: async (instance) => {
         calls.push(`recover:${instance.packageIdentity}`);
         return packageBehavior.lifecycle?.("recover", instance) ?? { snapshot: packages, failure: null };
@@ -249,8 +262,9 @@ describe("persistent Shell frame", () => {
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-overview", workspaceId: workspace.id });
 
-    expect(test.frame.workspaceRail.innerHTML).toContain("Installation");
-    expect(test.frame.workspaceRail.innerHTML).toContain('id="theme-preference"');
+    expect(test.frame.workspaceRail.innerHTML).not.toContain("Installation");
+    expect(test.frame.workspaceRail.innerHTML).not.toContain(installation.displayName);
+    expect(test.frame.workspaceRail.innerHTML).not.toContain("<select");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Team Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Personal Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Package source: Team");
@@ -284,21 +298,23 @@ describe("persistent Shell frame", () => {
     expect(screen.innerHTML).toContain("Package Instances");
     expect(screen.innerHTML).toContain("One");
     expect(screen.innerHTML).toContain("Private One");
-    expect(screen.innerHTML).toContain("Suspend");
-    expect(screen.innerHTML).toContain("Recover Backend");
-    expect(screen.innerHTML).toContain("Dispose");
+    expect(screen.innerHTML).not.toContain("Suspend");
+    expect(screen.innerHTML).not.toContain("disabled");
+    expect(screen.innerHTML.match(/Recover Backend Private One/g)).toHaveLength(1);
+    expect(screen.innerHTML.match(/Dispose Private One/g)).toHaveLength(1);
+    expect(screen.innerHTML).not.toContain("Recover Backend One");
+    expect(screen.innerHTML).not.toContain("Dispose One");
     expect(screen.innerHTML).not.toContain(packageKey.packageIdentity);
     expect(screen.innerHTML).not.toContain(privatePackageKey.packageIdentity);
 
     screen.invalidRecover.click();
-    screen.invalidSuspend.click();
+    screen.invalidDispose.click();
     screen.suspend.click();
     screen.recover.click();
     screen.dispose.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(test.calls).toEqual([
       "unmount",
-      `suspend:${packageKey.packageIdentity}`,
       `recover:${privatePackageKey.packageIdentity}`,
       `dispose:${privatePackageKey.packageIdentity}`,
     ]);
@@ -354,8 +370,8 @@ describe("persistent Shell frame", () => {
   });
 
   it.each([
-    ["refresh", "Suspended One, but Package information could not be refreshed."],
-    ["operation-and-refresh", "Could not suspend One, and Package information could not be refreshed."],
+    ["refresh", "Recovered Private One, but Package information could not be refreshed."],
+    ["operation-and-refresh", "Could not recover Private One, and Package information could not be refreshed."],
   ] as const)("preserves and marks the latest snapshot when lifecycle result is %s", async (failure, wording) => {
     const screen = new SettingsRegion();
     const test = harness(screen as unknown as HTMLElement, {
@@ -365,12 +381,44 @@ describe("persistent Shell frame", () => {
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
 
-    screen.suspend.click();
+    screen.recover.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(screen.innerHTML).toContain(wording);
     expect(screen.innerHTML).toContain("Showing the latest available Package information");
     expect(screen.innerHTML).toContain("One");
     expect(screen.innerHTML).toContain("Private One");
+  });
+
+  it("renders theme icon buttons that reflect and change the Installation theme preference", async () => {
+    const rail = new ThemeRailRegion();
+    const test = harness(undefined, {}, rail as unknown as HTMLElement);
+    await test.shell.updateWorkspace(model());
+
+    expect(rail.innerHTML).toContain('role="group" aria-label="Theme"');
+    expect(rail.innerHTML.match(/data-theme-preference=/g)).toHaveLength(3);
+    for (const label of ["System theme", "Light theme", "Dark theme"]) expect(rail.innerHTML).toContain(`aria-label="${label}"`);
+    expect(rail.innerHTML).toContain('data-theme-preference="system" aria-pressed="true"');
+    expect(rail.innerHTML).toContain('data-theme-preference="dark" aria-pressed="false"');
+
+    rail.dark.click();
+    expect(test.calls).toContain("theme:dark");
+    expect(rail.focusedSelector).toBe('[data-theme-preference="dark"]');
+  });
+
+  it("marks the add Workspace control current only on the Add Workspace screen", async () => {
+    const test = harness();
+    await test.shell.updateWorkspace(model());
+    expect(test.frame.workspaceRail.innerHTML).not.toMatch(/id="choose-workspace"[^>]*aria-current/);
+
+    await test.shell.navigate({ kind: "workspace-chooser" });
+    expect(test.frame.workspaceRail.innerHTML).toMatch(/id="choose-workspace"[^>]*aria-current="page"/);
+  });
+
+  it("labels contextual navigation as Add a Workspace when no Workspace exists", async () => {
+    const test = harness();
+    await test.shell.updateWorkspace({ ...model(null), workspaces: [], memberships: {} });
+    expect(test.frame.contextualNavigation.innerHTML).toContain("Add a Workspace");
+    expect(test.frame.contextualNavigation.innerHTML).not.toContain("Choose a Workspace");
   });
 
   it.each([
