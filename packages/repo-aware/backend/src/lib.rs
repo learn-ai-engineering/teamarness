@@ -7,8 +7,8 @@ pub mod state;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use teamarness_package_protocol::JsonValue;
 use teamarness_package_sdk::{Backend, BackendError, BackendRequest, EventSubscription, Package};
@@ -121,16 +121,18 @@ impl RepoAwareBackend {
                 .find(|r| r.id == registration_id)
                 .ok_or_else(|| Self::backend_error(error::REGISTRATION_NOT_FOUND))?;
 
-            (registration.path.to_owned(), Arc::new(AtomicBool::new(false)))
+            (
+                registration.path.to_owned(),
+                Arc::new(AtomicBool::new(false)),
+            )
         };
 
         let cancel_clone = cancel.clone();
         let rid = registration_id.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            compute_snapshot_impl(&rid, &path, cancel_clone)
-        })
-        .await
-        .map_err(|_| Self::backend_error(error::SNAPSHOT_INTERRUPTED))??;
+        let snapshot =
+            tokio::task::spawn_blocking(move || compute_snapshot_impl(&rid, &path, cancel_clone))
+                .await
+                .map_err(|_| Self::backend_error(error::SNAPSHOT_INTERRUPTED))??;
 
         serde_json::to_value(serde_json::json!({
             "registrationId": registration_id,
@@ -155,9 +157,7 @@ impl Backend for RepoAwareBackend {
                 "lifecycle.health" => Ok(serde_json::json!({ "healthy": true })),
                 "repo_aware.list" => self.list().await,
                 "repo_aware.register" => self.register(request.payload).await,
-                "repo_aware.snapshot" => {
-                    self.snapshot(request.payload).await
-                }
+                "repo_aware.snapshot" => self.snapshot(request.payload).await,
                 "repo_aware.remove" => self.remove(request.payload).await,
                 _ => Err(Self::backend_error(error::INVALID_REQUEST)),
             }

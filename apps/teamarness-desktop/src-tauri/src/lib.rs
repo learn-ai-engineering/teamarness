@@ -377,6 +377,12 @@ mod tests {
             ))
         );
         assert_eq!(
+            resources.get("../../../target/teamarness-packages/dev.teamarness.conversations/"),
+            Some(&serde_json::Value::String(
+                "packages/dev.teamarness.conversations/".into()
+            ))
+        );
+        assert_eq!(
             resources.get("../../../target/teamarness-packages/dev.teamarness.repo-aware/"),
             Some(&serde_json::Value::String(
                 "packages/dev.teamarness.repo-aware/".into()
@@ -387,6 +393,7 @@ mod tests {
             &[
                 serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package".into()),
                 serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package".into()),
+                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package".into()),
                 serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package".into()),
             ]
         );
@@ -399,6 +406,7 @@ mod tests {
             serde_json::json!([
                 { "directory": "packages/dev.teamarness.reference" },
                 { "directory": "packages/dev.teamarness.tutorial" },
+                { "directory": "packages/dev.teamarness.conversations" },
                 { "directory": "packages/dev.teamarness.repo-aware" },
             ])
         );

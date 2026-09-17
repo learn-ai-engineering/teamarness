@@ -54,6 +54,10 @@ pub const INVALID_REQUEST: ErrorInfo = ErrorInfo {
 
 impl From<ErrorInfo> for teamarness_package_sdk::BackendError {
     fn from(info: ErrorInfo) -> Self {
-        Self::new(info.code, info.retryable, teamarness_package_protocol::JsonValue::Object(Default::default()))
+        Self::new(
+            info.code,
+            info.retryable,
+            teamarness_package_protocol::JsonValue::Object(Default::default()),
+        )
     }
 }

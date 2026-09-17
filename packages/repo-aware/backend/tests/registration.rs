@@ -63,7 +63,10 @@ fn normalize_subdirectory_to_root() {
     let canonical = registration::validate_path(subdir.to_string_lossy().as_ref()).unwrap();
     // The canonical path is the subdirectory
     let canonical_git = std::fs::canonicalize(&git_path).unwrap();
-    assert_eq!(canonical, std::fs::canonicalize(&subdir).unwrap().to_string_lossy());
+    assert_eq!(
+        canonical,
+        std::fs::canonicalize(&subdir).unwrap().to_string_lossy()
+    );
 
     // Git root should be the checkout root
     let root = registration::git_root(&canonical).unwrap();

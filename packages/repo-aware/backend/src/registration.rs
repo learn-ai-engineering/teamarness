@@ -25,8 +25,7 @@ pub fn validate_path(path: &str) -> Result<String, ErrorInfo> {
 pub fn validate_git_checkout(path: &str) -> Result<(), ErrorInfo> {
     let repo = gix::open(path).map_err(|_| error::NOT_GIT_REPOSITORY)?;
 
-    repo.workdir()
-        .ok_or(error::NOT_GIT_REPOSITORY)?;
+    repo.workdir().ok_or(error::NOT_GIT_REPOSITORY)?;
 
     let mut head = repo.head().map_err(|_| error::NOT_GIT_REPOSITORY)?;
     if head.peel_to_commit().is_err() {

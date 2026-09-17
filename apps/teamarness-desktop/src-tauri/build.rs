@@ -23,5 +23,12 @@ const COMMANDS: &[&str] = &[
 fn main() {
     let attributes = tauri_build::Attributes::new()
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
-    tauri_build::try_build(attributes).expect("failed to build Tauri application metadata");
+    if let Err(error) = tauri_build::try_build(attributes) {
+        panic!(
+            "failed to build Tauri application metadata: {error:#}\n\
+             hint: the bundled Application Packages under target/teamarness-packages are staged by npm. \
+             Run `npm ci && npm run build` from the repository root before cargo builds of teamarness-desktop, \
+             or use `--exclude teamarness-desktop` for Rust-only workspace checks."
+        );
+    }
 }
