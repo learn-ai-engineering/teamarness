@@ -86,4 +86,8 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Direction (2026-09-17, developer):** Teams using Teamarness know each other, so each person gives a single name field (typically a first name, with no surname) when creating or joining a Workspace, and every other Member sees that name. Generated adjective-animal aliases are temporary and will be removed. Ownership, signing, rename, conflict, and fallback rules remain to be designed.
 
-**Intended destination:** The Shell and Package UI polish workstream (`ui-polish-member-names`) resolves this for one Installation per person. Phase 5 extends it to multiple devices.
+**Unresolved: Workspace-scoped or Installation-scoped name (2026-09-17).** The developer considered letting a person use a different name, or an emoji, in each Workspace. That conflicts with `TEAM.SYS.ID-R05`, which defines one Installation Display Name per Installation and does not allow emoji. No decision is made. Before choosing, compare the approaches and their trade-offs: a per-Workspace name, a per-Installation name, or a per-Installation default with per-Workspace overrides. Cover storage, validation, privacy, rename behavior, and multi-device support.
+
+**Sequencing (2026-09-17, developer):** Implementation waits for membership synchronization from the architecture review, because peers other than the issuer and joiner do not currently learn of admissions.
+
+**Intended destination:** The Member names follow-up workstream in `context/roadmap.md` resolves this for one Installation per person, after the architecture review delivers membership synchronization. Phase 5 extends it to multiple devices.

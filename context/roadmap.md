@@ -52,7 +52,7 @@ Started on 2026-09-14. Core now owns the first generic Package-scoped Synchroniz
 
 ### Phase 5 - Membership Management and Hardening
 
-Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. Recognizable member names move to the Shell and Package UI workstream (see **Current work** and `TEAM-DQ8`); this phase extends that model to multiple devices per human identity.
+Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. Recognizable member names are a planned follow-up workstream (see **Planned follow-up workstreams** and `TEAM-DQ8`); this phase extends that model to multiple devices per human identity.
 
 **Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member sees only post-admission content, and packages rotate keys after membership transitions.
 
@@ -72,17 +72,39 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 These two workstreams run in parallel on separate branches and worktrees. Phase 5 starts after them.
 
-### Shell and Package UI polish, with member names
+### Shell and Package UI polish
 
-Branch `ui-polish-member-names`. Fix UI defects and polish the Shell, the Conversations and Repo-aware Package UIs, the Package UI SDK, and theming. It also lets each person give a first name when they create or join a Workspace, and shows that name to every other Member. Names replace the temporary adjective-animal aliases. This work resolves `TEAM-DQ8` for one Installation per person.
+Branch `ui-polish-member-names`. Polish the Shell's Add Workspace screen, Installation controls, Workspace screens, and theme selector, and give every Package UI the same page structure as the Shell's Workspace screens through the Package UI SDK. Member names were split out on 2026-09-17 (see **Planned follow-up workstreams**); the branch name predates that change.
 
-**Outcome:** Members recognize each other by name across the Shell and Packages, invitation acceptance is reliably reachable, and the collected UI defects are fixed.
+**Outcome:** The collected Shell defects are fixed and Package UIs share one consistent page structure.
 
 ### Comprehensive code and architecture review
 
 Branch `architecture-review`. Review the whole system now that several Packages exist, covering architecture, code quality, synchronization, security, and how easy it is to author a Package. Findings become recorded decisions, open questions, deltas, or follow-up workstreams.
 
 **Outcome:** A prioritized, evidence-backed findings report and an agreed remediation sequence.
+
+## Planned follow-up workstreams
+
+Identified on 2026-09-17 during Scope of the UI polish workstream. Each needs its own Scope.
+
+### Member names
+
+Let each person give a name for each Workspace when they create or join it, and show that name to every other Member in the Shell and in Packages, replacing the temporary adjective-animal aliases. Resolves `TEAM-DQ8` for one Installation per person.
+
+**Depends on:** membership synchronization from the architecture review. Today only the issuer and the joiner learn of an admission, so a name carried by membership or a Workspace-scoped record could not reach every Member.
+
+### Shell notifications
+
+Replace the persistent status and error messages at the top of the selected-content pane with a Shell-owned notification mechanism that reserves or overlays space and dismisses non-error notifications automatically. Packages use the same mechanism through a generic capability, so notification presentation stays consistent.
+
+### Package visibility
+
+Let a person hide a Package from contextual navigation and show it again from Workspace settings, for example to hide the Tutorial and Reference Packages after first use.
+
+### Conversations UI overhaul
+
+Redesign the Conversations Package UI beyond the shared Package page structure.
 
 ## Maintenance rule
 
