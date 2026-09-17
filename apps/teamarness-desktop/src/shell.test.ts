@@ -106,6 +106,20 @@ class SettingsRegion extends Region {
   }
 }
 
+class NavRegion extends Region {
+  public readonly settings = new TestControl();
+
+  public querySelector(): TestControl | null {
+    return null;
+  }
+
+  public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector !== "[data-screen]") return [];
+    this.settings.dataset.screen = "workspace-settings";
+    return [this.settings];
+  }
+}
+
 class ThemeRailRegion extends Region {
   public readonly dark = new TestControl();
   public focusedSelector: string | null = null;
@@ -153,6 +167,7 @@ function harness(
     lifecycle?: (action: "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
   }> = {},
   workspaceRail: HTMLElement = new Region() as unknown as HTMLElement,
+  contextualNavigation: HTMLElement = new Region() as unknown as HTMLElement,
 ): {
   shell: Shell;
   frame: ShellFrame;
@@ -163,7 +178,7 @@ function harness(
   const routes: ShellRoute[] = [];
   const frame: ShellFrame = {
     workspaceRail,
-    contextualNavigation: new Region() as unknown as HTMLElement,
+    contextualNavigation,
     shellScreen,
     packageMount: new Region() as unknown as HTMLElement,
   };
@@ -207,7 +222,7 @@ describe("persistent Shell frame", () => {
     await test.shell.updateWorkspace(model());
     await test.shell.updateWorkspace({ ...model(), notice: "Updated" });
     test.shell.updatePackages(packages);
-    await test.shell.navigate({ kind: "workspace-invitations", workspaceId: workspace.id });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
     test.shell.updatePackages({ ...packages, revision: 2 });
 
     expect(test.shell.frame()).toBe(frame);
@@ -218,13 +233,13 @@ describe("persistent Shell frame", () => {
   it("selects overview at startup and whenever the active Workspace switches", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
-    expect(test.shell.route()).toEqual({ kind: "workspace-overview", workspaceId: workspace.id });
+    expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id });
 
     await test.shell.updateWorkspace(model(otherWorkspace.id));
-    expect(test.shell.route()).toEqual({ kind: "workspace-overview", workspaceId: otherWorkspace.id });
+    expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: otherWorkspace.id });
     expect(test.routes).toEqual([
-      { kind: "workspace-overview", workspaceId: workspace.id },
-      { kind: "workspace-overview", workspaceId: otherWorkspace.id },
+      { kind: "workspace-settings", workspaceId: workspace.id },
+      { kind: "workspace-settings", workspaceId: otherWorkspace.id },
     ]);
   });
 
@@ -235,8 +250,6 @@ describe("persistent Shell frame", () => {
 
     const routes: ShellRoute[] = [
       { kind: "workspace-chooser" },
-      { kind: "workspace-overview", workspaceId: workspace.id },
-      { kind: "workspace-invitations", workspaceId: workspace.id },
       { kind: "workspace-settings", workspaceId: workspace.id },
       { kind: "package-instance", instance: packageKey },
     ];
@@ -260,11 +273,13 @@ describe("persistent Shell frame", () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
-    await test.shell.navigate({ kind: "workspace-overview", workspaceId: workspace.id });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
 
     expect(test.frame.workspaceRail.innerHTML).not.toContain("Installation");
     expect(test.frame.workspaceRail.innerHTML).not.toContain(installation.displayName);
     expect(test.frame.workspaceRail.innerHTML).not.toContain("<select");
+    expect(test.frame.contextualNavigation.innerHTML).toContain('aria-label="Workspace settings"');
+    expect(test.frame.contextualNavigation.innerHTML).not.toContain("Overview");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Team Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Personal Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Package source: Team");
@@ -405,6 +420,24 @@ describe("persistent Shell frame", () => {
     expect(rail.focusedSelector).toBe('[data-theme-preference="dark"]');
   });
 
+  it("opens the single Workspace settings screen from the contextual gear control", async () => {
+    const nav = new NavRegion();
+    const test = harness(undefined, {}, undefined, nav as unknown as HTMLElement);
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    expect(nav.innerHTML).not.toMatch(/class="workspace-settings-link"[^>]*aria-current/);
+
+    nav.settings.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(nav.innerHTML).toMatch(/class="workspace-settings-link"[^>]*aria-current="page"/);
+    expect(test.frame.shellScreen.innerHTML).toContain("Workspace details");
+    expect(test.frame.shellScreen.innerHTML).toContain("Members");
+    expect(test.frame.shellScreen.innerHTML).toContain("Workspace Invitations");
+    expect(test.frame.shellScreen.innerHTML).toContain("Package Instances");
+  });
+
   it("marks the add Workspace control current only on the Add Workspace screen", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
@@ -449,8 +482,6 @@ describe("persistent Shell frame", () => {
     test.shell.updatePackages(packages);
     const routes: ShellRoute[] = [
       { kind: "workspace-chooser" },
-      { kind: "workspace-overview", workspaceId: workspace.id },
-      { kind: "workspace-invitations", workspaceId: workspace.id },
       { kind: "workspace-settings", workspaceId: workspace.id },
     ];
     for (const route of routes) {

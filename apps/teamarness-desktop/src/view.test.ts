@@ -46,7 +46,7 @@ describe("Shell Workspace screens", () => {
     const controls = { innerHTML: "" } as HTMLElement;
     const pane = { mountedUi: "mount-1" };
     const renderer = new ShellRenderer(controls, pane);
-    await renderer.render(model(), { kind: "workspace-overview", workspaceId: workspace.id });
+    await renderer.render(model(), { kind: "workspace-settings", workspaceId: workspace.id });
     await renderer.render(model({ workspaces: [], memberships: {}, activeWorkspaceId: null, notice: "Updated" }));
     expect(renderer.packagePane()).toBe(pane);
     expect(pane.mountedUi).toBe("mount-1");
@@ -57,7 +57,7 @@ describe("Shell Workspace screens", () => {
   it("loads the Installation and renders ordered display-safe Member names", async () => {
     const controller = new ShellController(fakeBridge(), () => undefined);
     await controller.load();
-    const route: ShellRoute = { kind: "workspace-overview", workspaceId: workspace.id };
+    const route: ShellRoute = { kind: "workspace-settings", workspaceId: workspace.id };
     const html = await rendered(controller.snapshot(), route);
     expect(controller.snapshot().installation).toEqual(installation);
     expect(controller.snapshot().activeWorkspaceId).toBe(workspace.id);
@@ -89,7 +89,7 @@ describe("Shell Workspace screens", () => {
   });
 
   it("renders supported Workspace Invitation and read-only settings screens only", async () => {
-    const invitations = await rendered(model(), { kind: "workspace-invitations", workspaceId: workspace.id });
+    const invitations = await rendered(model(), { kind: "workspace-settings", workspaceId: workspace.id });
     expect(invitations).toContain('id="copy-invitation"');
     expect(invitations).toContain("Workspace Invitations are sensitive bearer admission material");
     expect(invitations.replaceAll("Workspace Invitation", "")).not.toMatch(/\bInvitations?\b/);
@@ -121,7 +121,7 @@ describe("Shell Workspace screens", () => {
     await controller.copyInvitation(workspace.id);
     expect(copied).toEqual([invitation.value]);
     expect(controller.snapshot().notice).toBe("Workspace Invitation copied. Keep it private.");
-    expect(await rendered(controller.snapshot(), { kind: "workspace-invitations", workspaceId: workspace.id }))
+    expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id }))
       .not.toContain(invitation.value);
   });
 
@@ -145,7 +145,7 @@ describe("Shell Workspace screens", () => {
     currentMembership = membership;
     await controller.refreshMembership(workspace.id);
 
-    const html = await rendered(controller.snapshot(), { kind: "workspace-overview", workspaceId: workspace.id });
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
     expect(html).toContain('id="refresh-membership"');
     expect(html).toContain("Membership refreshed");
     expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);

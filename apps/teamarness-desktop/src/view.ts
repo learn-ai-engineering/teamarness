@@ -176,23 +176,18 @@ export function renderShell(
   const workspace = presentation.workspace;
   if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1><p>Choose another Workspace or retry.</p></section>`;
 
-  if (route.kind === "workspace-invitations") {
-    return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Workspace Invitations</h1><p>Create a one-use Workspace Invitation.</p></header>
-      <section class="screen-section"><h2>Invite another Installation</h2><button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
-      <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section></section>`;
-  }
-  if (route.kind === "workspace-settings") {
-    return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">${escape(workspace.name)}</p><h1>Workspace settings</h1><p>Workspace details are read-only in this version.</p></header>
-      <section class="screen-section settings-panel" aria-labelledby="workspace-details-heading"><h2 id="workspace-details-heading">Workspace details</h2><dl><div><dt>Name</dt><dd>${escape(workspace.name)}</dd></div><div><dt>Members</dt><dd>${workspace.memberCount}</dd></div></dl></section>
-      <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
-  }
-
   const memberRows = workspace.members.map((member) => `<li class="member-row"><span><strong>${escape(member.name)}</strong><small>${escape(member.detail)}</small></span><span class="member-role">${member.role}</span></li>`).join("");
   const members = memberRows || (workspace.membershipLoaded
     ? '<li class="empty-state">No Members are listed.</li>'
     : '<li class="empty-state">Membership is loading.</li>');
-  return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">Workspace overview</p><h1>${escape(workspace.name)}</h1><p>${workspace.memberCount === 1 ? "1 Member" : `${workspace.memberCount} Members`}</p></header><section class="screen-section" aria-labelledby="members-heading"><div class="section-heading"><h2 id="members-heading">Members</h2>
-    <button type="button" id="refresh-membership" ${presentation.loading ? "disabled" : ""}>Refresh members</button></div><ol class="members">${members}</ol></section></section>`;
+  return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">Workspace</p><h1>${escape(workspace.name)}</h1><p>${workspace.memberCount === 1 ? "1 Member" : `${workspace.memberCount} Members`}. Workspace details are read-only in this version.</p></header>
+    <section class="screen-section settings-panel" aria-labelledby="workspace-details-heading"><h2 id="workspace-details-heading">Workspace details</h2><dl><div><dt>Name</dt><dd>${escape(workspace.name)}</dd></div><div><dt>Members</dt><dd>${workspace.memberCount}</dd></div></dl></section>
+    <section class="screen-section" aria-labelledby="members-heading"><div class="section-heading"><h2 id="members-heading">Members</h2>
+      <button type="button" id="refresh-membership" ${presentation.loading ? "disabled" : ""}>Refresh members</button></div><ol class="members">${members}</ol></section>
+    <section class="screen-section" aria-labelledby="invitations-heading"><h2 id="invitations-heading">Workspace Invitations</h2><p>Create a one-use Workspace Invitation.</p>
+    <button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
+    <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section>
+    <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
 }
 
 function routeWorkspaceId(route: ShellRoute): string | null {
@@ -200,3 +195,4 @@ function routeWorkspaceId(route: ShellRoute): string | null {
     ? null
     : route.kind === "package-instance" ? route.instance.workspaceId : route.workspaceId;
 }
+

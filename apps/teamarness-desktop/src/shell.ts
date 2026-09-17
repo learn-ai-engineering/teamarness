@@ -13,8 +13,6 @@ import { renderShell, type ShellModel } from "./view";
 
 export type ShellRoute =
   | Readonly<{ kind: "workspace-chooser" }>
-  | Readonly<{ kind: "workspace-overview"; workspaceId: string }>
-  | Readonly<{ kind: "workspace-invitations"; workspaceId: string }>
   | Readonly<{ kind: "workspace-settings"; workspaceId: string }>
   | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>;
 
@@ -91,7 +89,7 @@ export class Shell {
     } else if (model.activeWorkspaceId !== null && model.activeWorkspaceId !== this.observedActiveWorkspaceId) {
       this.observedActiveWorkspaceId = model.activeWorkspaceId;
       this.deactivatePackage();
-      this.setRoute({ kind: "workspace-overview", workspaceId: model.activeWorkspaceId });
+      this.setRoute({ kind: "workspace-settings", workspaceId: model.activeWorkspaceId });
     }
     if (await this.preparePresentation()) this.renderAll();
   }
@@ -207,12 +205,10 @@ export class Shell {
     const privatePackages = this.packagePresentation.privatePackages
       .map((row) => packageButton(row, this.selectedRoute, this.packageActionTargets)).join("");
 
-    this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></header>
-      <nav class="contextual-navigation__body" aria-label="Active Workspace"><ul class="screen-navigation">
-        ${screenButton("Overview", "workspace-overview", active.id, this.selectedRoute)}
-        ${screenButton("Workspace Invitations", "workspace-invitations", active.id, this.selectedRoute)}
-        ${screenButton("Settings", "workspace-settings", active.id, this.selectedRoute)}
-      </ul>
+    const settingsCurrent = this.selectedRoute.kind === "workspace-settings" ? ' aria-current="page"' : "";
+    this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><div><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></div>
+      <button type="button" class="workspace-settings-link" data-screen="workspace-settings" aria-label="Workspace settings" title="Workspace settings"${settingsCurrent}>${SETTINGS_ICON}</button></header>
+      <nav class="contextual-navigation__body" aria-label="Active Workspace">
       ${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}
       <section class="package-group" aria-labelledby="team-packages-heading"><h2 id="team-packages-heading">Team Packages</h2><ul>${team || "<li>None available</li>"}</ul></section>
       <section class="package-group" aria-labelledby="private-packages-heading"><h2 id="private-packages-heading">Personal Packages</h2><ul>${privatePackages || "<li>None available</li>"}</ul></section></nav>`;
@@ -220,9 +216,8 @@ export class Shell {
     if (!hasQueries(this.shellFrame.contextualNavigation)) return;
     this.shellFrame.contextualNavigation.querySelectorAll<HTMLButtonElement>("[data-screen]").forEach((button) => {
       button.addEventListener("click", () => {
-        const screen = button.dataset.screen;
-        if (screen === "workspace-overview" || screen === "workspace-invitations" || screen === "workspace-settings") {
-          void this.navigate({ kind: screen, workspaceId: active.id });
+        if (button.dataset.screen === "workspace-settings") {
+          void this.navigate({ kind: "workspace-settings", workspaceId: active.id });
         }
       });
     });
@@ -386,10 +381,7 @@ function isThemePreference(value: string): value is ThemePreference {
   return value === "system" || value === "light" || value === "dark";
 }
 
-function screenButton(label: string, kind: Exclude<ShellRoute["kind"], "workspace-chooser" | "package-instance">, workspaceId: string, route: ShellRoute): string {
-  const current = route.kind === kind && routeWorkspaceId(route) === workspaceId ? ' aria-current="page"' : "";
-  return `<li><button type="button" data-screen="${kind}"${current}>${label}</button></li>`;
-}
+const SETTINGS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 
 function packageButton(
   row: PackageInstancePresentation,
