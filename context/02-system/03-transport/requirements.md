@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.TRANS`
 
-The Core Runtime transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each Installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for Workspace onboarding. Later generic Synchronization Capabilities use Core-owned transport without exposing raw endpoint handles to Packages. The first capability is the generic immutable-record log; it owns replication, retry, bounded sessions, and backpressure while Packages provide canonical domain bytes.
+The Core Runtime transport layer uses Iroh for QUIC connectivity, hole-punching, relay fallback, and peer discovery. Each Installation binds an Iroh `Endpoint` from its `SecretKey`. Phase 2 uses that endpoint for Workspace onboarding. Later generic Synchronization Capabilities use Core-owned transport without exposing raw endpoint handles to Packages. The Package-facing Synchronization Capability contract is owned by `TEAM.SYS.PKG-R10`.
 
 ## TEAM.SYS.TRANS-R01 — Iroh Endpoint Management
 
@@ -14,7 +14,7 @@ The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT
 
 ## TEAM.SYS.TRANS-R03 — Package Transport Access
 
-Packages SHALL access Teamarness-owned peer transport through versioned, typed Semantic Capabilities. Synchronization Capabilities SHALL own reusable Iroh connection, replication, convergence, retry, and backpressure machinery for Package-defined records. The generic immutable-record capability SHALL use finite production LogSync sessions over a Core-owned durable operation projection, with continuation recorded as durable wakes. Invalid or out-of-order operations SHALL be isolated without partially committing Teamarness records. The Core Runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, relay configuration, P2Panda types, or SQLite handles to Packages. A future custom-transport capability MAY provide a Package-scoped escape hatch without exposing those resources.
+Packages SHALL access Teamarness-owned peer transport through versioned, typed Semantic Capabilities. The generic immutable-record capability SHALL use finite production LogSync sessions over a Core-owned durable operation projection, with continuation recorded as durable wakes. Invalid or out-of-order operations SHALL be isolated without partially committing Teamarness records. The Core Runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, relay configuration, P2Panda types, or SQLite handles to Packages. A future custom-transport capability MAY provide a Package-scoped escape hatch without exposing those resources.
 
 ## TEAM.SYS.TRANS-R04 — Copyable Workspace Invitation
 
