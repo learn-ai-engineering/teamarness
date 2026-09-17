@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { BUNDLED_PACKAGES_PATH, readBundledPackages, repositoryRoot } from "./bundled-packages.mjs";
-import { buildPackage, resolveBundledPackage } from "./build-package.mjs";
+import { buildPackage, cargoTargetDirectory, resolveBundledPackage } from "./build-package.mjs";
 
 const bundledPackages = await readBundledPackages(repositoryRoot);
 
@@ -130,4 +130,15 @@ test("command line resolves bundled Packages by identity or source directory", a
     assert.equal((await resolveBundledPackage(`${entry.sourceDirectory}/`)).identity, entry.identity);
   }
   await assert.rejects(resolveBundledPackage("dev.teamarness.unknown"), /Unknown bundled Package/);
+});
+
+test("Backend lookup follows a custom CARGO_TARGET_DIR", async () => {
+  const targetDirectory = await mkdtemp(join(tmpdir(), "teamarness-cargo-target-"));
+  try {
+    assert.equal(cargoTargetDirectory(repositoryRoot, { ...process.env, CARGO_TARGET_DIR: targetDirectory }), targetDirectory);
+    const { CARGO_TARGET_DIR: _ignored, ...defaultEnv } = process.env;
+    assert.equal(cargoTargetDirectory(repositoryRoot, defaultEnv), join(repositoryRoot, "target"));
+  } finally {
+    await rm(targetDirectory, { recursive: true, force: true });
+  }
 });

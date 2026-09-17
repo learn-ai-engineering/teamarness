@@ -14,6 +14,10 @@ async function fixtureRoot() {
   const root = await mkdtemp(join(tmpdir(), "teamarness-assembler-test-"));
   await mkdir(join(root, "target/release"), { recursive: true });
   await mkdir(join(root, "ui/dist"), { recursive: true });
+  await mkdir(join(root, "src"), { recursive: true });
+  // A minimal Cargo project lets the assembler ask Cargo for the target directory.
+  await writeFile(join(root, "Cargo.toml"), '[package]\nname = "assembler-fixture"\nversion = "0.1.0"\nedition = "2024"\n\n[workspace]\n');
+  await writeFile(join(root, "src/main.rs"), "fn main() {}\n");
   await writeFile(join(root, "teamarness.package.json"), JSON.stringify({
     schemaVersion: 1,
     identity,
@@ -48,7 +52,8 @@ test("assembles exact final Package bytes, declarations, paths, and modes", asyn
 
     const sourceUi = await readFile(join(root, "ui/dist/index.js"));
     const sourceContract = await readFile(join(root, "ui-contract.json"));
-    const output = await assemblePackage({ projectRoot: root });
+    const { CARGO_TARGET_DIR: _ignored, ...env } = process.env;
+    const output = await assemblePackage({ projectRoot: root, env });
     assert.equal(output, join(root, "dist", identity));
 
     const manifestBytes = await readFile(join(output, "teamarness.package.json"));
@@ -74,6 +79,26 @@ test("assembles exact final Package bytes, declarations, paths, and modes", asyn
     }
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reads the Backend from a custom CARGO_TARGET_DIR", async () => {
+  const root = await fixtureRoot();
+  const targetDirectory = await mkdtemp(join(tmpdir(), "teamarness-assembler-target-"));
+  try {
+    const backend = Buffer.from("#!/bin/sh\necho custom target\n");
+    await mkdir(join(targetDirectory, "release"), { recursive: true });
+    await writeFile(join(targetDirectory, "release/teamarness-generated-package-backend"), backend);
+    await writeFile(join(root, "target/release/teamarness-generated-package-backend"), "stale default target");
+
+    const output = await assemblePackage({ projectRoot: root, env: { ...process.env, CARGO_TARGET_DIR: targetDirectory } });
+
+    const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json")));
+    assert.deepEqual(await readFile(join(output, manifest.backends[0].path)), backend);
+    assert.equal(manifest.backends[0].sha256, digest(backend));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(targetDirectory, { recursive: true, force: true });
   }
 });
 

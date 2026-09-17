@@ -34,7 +34,7 @@ export async function buildPackage({
   if (!skipBuilds) {
     if (!cargoPackage) throw new Error(`Package ${identity} cargoPackage is required to build its Backend`);
     run(root, "cargo", ["build", "-p", cargoPackage, "--release", "--locked"]);
-    builtBackend = join(root, "target/release", cargoPackage);
+    builtBackend = join(cargoTargetDirectory(root), "release", cargoPackage);
   }
   if (!skipUiBuild) {
     const uiPackage = JSON.parse(await readFile(join(source, "ui/package.json"), "utf8"));
@@ -73,6 +73,19 @@ export async function resolveBundledPackage(selector, root = repositoryRoot) {
     throw new Error(`Unknown bundled Package: ${selector ?? "(none)"}. Use an identity or source directory: ${known}`);
   }
   return match;
+}
+
+// Cargo resolves CARGO_TARGET_DIR and build.target-dir; only staging stays at <repo>/target.
+export function cargoTargetDirectory(root = repositoryRoot, env = process.env) {
+  const result = spawnSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+    cwd: root,
+    env,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    shell: false,
+  });
+  if (result.status !== 0) throw new Error(`cargo metadata failed with status ${result.status ?? "unknown"}`);
+  return JSON.parse(result.stdout).target_directory;
 }
 
 // Package-relative UI paths such as ui/style.css are built into ui/dist/style.css.
