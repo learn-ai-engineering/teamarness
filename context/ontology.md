@@ -21,6 +21,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Installation Display Name** | User-changeable, validated human-readable metadata for the local Installation. It does not replace the Public Identity and is not currently shared through canonical membership |
 | **Public Identity** | The public half of an installation identity (`EndpointId`), shared with workspaces as a member identifier |
 | **Member** | An installation identity admitted to a workspace. Membership is canonical and interval-based. A human may have multiple device identities; devices are first-class members |
+| **Manager** | A Member whose role authorizes admitting and revoking Members and issuing Invitations. In version 1 the Workspace creator is the only Manager (`MembershipRole::Manager`). Manager assignment and transfer are roadmap Phase 5 work |
 | **Membership Interval** | A bounded period `[admitted, revoked?)` during which an identity was a workspace member. Intervals are contiguous; a member cannot have gaps |
 | **Canonical Membership** | The signed, causally ordered, append-only membership operation DAG that is the sole authority for who is a workspace member. Built above Iroh's transport identity. Iroh connects peers; the membership DAG authorizes them |
 | **Invitation** | A single-use, cryptographically signed token that authorizes one Installation to join a Workspace. It carries the inviter identity, Workspace identity, and expiry. An exact retry by the already admitted Installation may recover the same committed admission; recovery is not a second use |
@@ -56,6 +57,11 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Registration Scope** | The authority boundary for a Package Registration: `application`, `installation`, or `workspace`. Phase 3 uses application registrations for bundled sources and installation registrations for configured local sources |
 | **Package Admission** | The Teamarness decision to accept a validated Package Source for execution as a Package Identity |
 | **Package Trust** | The authority Teamarness grants during Package Admission. A Package Manifest cannot grant trust to its own Package |
+| **Package Catalog** | The Package Host's list of admitted Packages, each with Package Identity, version, display name, Package Source kind, Package Trust kind, and UI contract digest. It excludes filesystem paths and loader URLs |
+| **Host Revision** | A monotonic number identifying one authoritative Package Host snapshot. Consumers use it to discard stale updates |
+| **Package Instance Lifecycle State** | One of `admitted`, `activating`, `active`, `suspending`, `suspended`, `recovering`, `failed`, `crash_loop`, `disposing`, `disposed`. `crash_loop` means automatic restarts were exhausted; `failed` needs explicit recovery or disposal. Shell UI wording may differ; see the Shell |
+| **Capability Grant** | An opaque, per-process-generation token that binds one Package Instance's declared Semantic Capability to its Package Identity, Workspace, and Installation. Grants are implicit in capability calls and are not transferable |
+| **Package Source Label** | A presentation alias shown by the Shell: `Team` for Package Source `bundled`, `Personal` for `local`. It is not a trust verdict and does not define Registration Scope, Workspace enablement, or sharing |
 
 ## Conversations
 
@@ -65,6 +71,18 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a Channel through the generic immutable-record capability. Transport details remain Core-owned |
 | **Channel Membership** | Package-owned policy determining who can read and post in a specific Channel, bounded by Canonical Membership. Phase 4 has no separate Channel Membership records because every current Workspace Member participates in every Channel |
 | **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns records and domain policy; `teamarness.synchronization.immutable-record-log` owns reusable transport, replication, retry, and backpressure |
+
+## Synchronization and Protection
+
+| Term | Definition |
+|---|---|
+| **Immutable Record** | A Package-defined canonical byte value appended once to a Package-and-Workspace record log through `teamarness.synchronization.immutable-record-log`, authenticated by its author, and never changed |
+| **Record ID** | The authenticated content-derived identifier of an Immutable Record (`RecordId`) |
+| **Order Key** | Core's versioned, convergent sort position for an Immutable Record (`OrderKey`). Every Installation sorts accepted records the same way. It is not wall-clock time |
+| **Cursor** | An Installation-local delivery position in a record subscription (`Cursor`). It is progress, not an order offset, and differs between Installations |
+| **Sealed Record** | The Teamarness-owned versioned binary envelope that carries an encrypted Immutable Record. Packages store and pass sealed records but open them only through the capability |
+| **Content Key** | The symmetric key that seals one Package-and-Workspace record log. Core holds it and never exposes it to Packages. Version 1 has one Content Key per scope and no rotation |
+| **Protection Grant** | Core-to-Core material that gives a current Member the Content Key for a scope. It is distinct from a Capability Grant |
 
 ## Transport (Iroh)
 
@@ -79,5 +97,4 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 
 | Term | Definition |
 |---|---|
-| **Repository Registration** | Binding a local Git clone to a workspace so packages can read it. Teamarness does not replicate repository files |
-| **Workspace Files** | Collaborative documents owned by the workspace-files package. Filesystem-first authority with signed operations, transported as Iroh blobs |
+| **Repository Registration** | A Package-owned record binding a local Git working tree, by canonical path, to one Installation and Workspace so that Package can read it. Registrations and repository content are not replicated |

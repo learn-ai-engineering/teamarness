@@ -10,7 +10,7 @@ The core runtime SHALL create and manage the Iroh `Endpoint`. The endpoint SHALL
 
 ## TEAM.SYS.TRANS-R02 — Relay Configuration
 
-The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT traversal fallback. Phase 2 SHALL use that default configuration. A later phase SHALL let teams configure custom relay servers. All relayed traffic SHALL be end-to-end encrypted; relays SHALL NOT have access to plaintext.
+The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT traversal fallback. Custom relay configuration is unscheduled; see `roadmap.md` Later (unscheduled). All relayed traffic SHALL be end-to-end encrypted; relays SHALL NOT have access to plaintext.
 
 ## TEAM.SYS.TRANS-R03 — Package Transport Access
 
