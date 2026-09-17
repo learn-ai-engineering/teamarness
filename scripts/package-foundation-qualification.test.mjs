@@ -222,7 +222,7 @@ test("delivery configuration includes all bundled Package Directories and source
 });
 
 test("repository authoring records the temporary vendoring policy", async () => {
-  const decision = await read("context/.decisions/0008-vendored-package-authoring.md");
+  const decision = await read("context/.decisions/0010-vendored-package-authoring.md");
   const roadmap = await read("context/roadmap.md");
   const authorGuide = await read("docs/package-author-guide.md");
   const registrationGuide = await read("docs/local-package-registration.md");

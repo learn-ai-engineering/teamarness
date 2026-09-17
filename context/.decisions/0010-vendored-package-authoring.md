@@ -1,7 +1,7 @@
-# ADR 0008: Vendored Package authoring foundation
+# 0010 — Vendored Package authoring foundation
 
-- Status: accepted
-- Date: 2026-09-15
+**Status:** accepted (2026-09-15)
+**Renumbered:** from duplicate `0008` by ADR 0011. The decision text is unchanged.
 
 ## Decision
 

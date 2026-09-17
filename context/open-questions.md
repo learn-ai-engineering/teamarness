@@ -60,7 +60,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Decision:** Use Tauri 2.11 with exact package pins, vanilla TypeScript, Vite, Vitest, and npm workspaces. Commit the Rust and npm lockfiles. Re-check patch versions if implementation begins after the research date, while preserving Tauri minor-version compatibility.
 
-**Rationale:** The official Tauri release index and package registries confirmed compatible current versions and support the repository's Node.js 24 and Rust 1.96 minimums. The shell and reference package do not need a frontend framework. See `.myflow/workstreams/shell-package-lifecycle/research/20260912T221751Z_tauri-package-execution-storage-and-core-boundary.md`.
+**Rationale:** The official Tauri release index and package registries confirmed compatible current versions and support the repository's Node.js 24 and Rust 1.96 minimums. The shell and reference package do not need a frontend framework. Research on 2026-09-12 found `tauri` 2.11.5, `tauri-build` 2.6.3, `@tauri-apps/api` 2.11.1, and `@tauri-apps/cli` 2.11.4 in the official release index. The Rust crate and the JavaScript API must share the 2.11 minor. Vite 8.3.0, TypeScript 7.0.2, and Vitest 5.0.0 accept Node.js 24. Tauri recommends the vanilla TypeScript template when no framework is needed, and committing lockfiles. No build was run at research time; later phases built and bundled with these pins.
 
 ---
 
@@ -70,7 +70,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Decision:** Keep onboarding behind high-level Core Runtime operations. Wrap the existing signed invitation in a bounded `WorkspaceInvitation` with an Iroh endpoint ticket. Bind both authenticated peers to the token and claim, commit admission before response delivery, validate and import the complete bootstrap atomically, and report local join only after that import. An exact retry recovers the original admission before expiry checks, then exports the issuer's complete current accepted set at one consistency boundary without creating another admission.
 
-**Rationale:** The issuer and joiner have independent databases, so retry must bridge two commit points rather than pretend they share a transaction. Current-state join completion preserves the matching-membership requirement if another admission or revocation commits before retry. The operation remains bounded and claim-specific; continuous membership synchronization is a separate protocol. See `context/.decisions/0005-iroh-workspace-onboarding.md` and `.myflow/workstreams/shell-package-lifecycle/design/20260913T002055Z_workspace-onboarding-protocol.md`.
+**Rationale:** The issuer and joiner have independent databases, so retry must bridge two commit points rather than pretend they share a transaction. Current-state join completion preserves the matching-membership requirement if another admission or revocation commits before retry. The operation remains bounded and claim-specific; continuous membership synchronization is a separate protocol. See `context/.decisions/0005-iroh-workspace-onboarding.md`. Its evidence summary is in ADR 0011. Every membership mutation pre-checks that the complete bootstrap stays within 8 MiB and 1,024 operations, so an exact retry can always be exported.
 
 ---
 
