@@ -112,6 +112,7 @@ fn reject_unborn_repository() {
     assert_eq!(result.unwrap_err().code, error::REPOSITORY_UNBORN.code);
 }
 
+/// Verifies: TEAM.SYS.REPO-R03
 #[test]
 fn reject_duplicate_canonical_path() {
     let git_root = tempfile::tempdir().unwrap();

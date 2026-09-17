@@ -299,6 +299,7 @@ mod tests {
         }
     }
 
+    /// Verifies: TEAM.SYS-R01, TEAM.SYS.SHELL-R05
     #[test]
     fn bridge_and_registry_source_deny_internal_and_product_concepts() {
         let reviewed = [

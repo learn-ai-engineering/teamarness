@@ -14,6 +14,7 @@ fn private_data_directory(test_name: &str) -> PathBuf {
     ))
 }
 
+/// Verifies: TEAM.SYS.MEM-R07
 #[tokio::test]
 async fn accepted_set_version_is_content_derived_and_restart_stable() {
     let directory = private_data_directory("membership-version");

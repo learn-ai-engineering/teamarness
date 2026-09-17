@@ -686,6 +686,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
     }
 }
 
+/// Verifies: TEAM.SYS.PKG-R03
 #[tokio::test]
 async fn rejects_capability_versions_before_process_activation() {
     for (requirement, code) in [

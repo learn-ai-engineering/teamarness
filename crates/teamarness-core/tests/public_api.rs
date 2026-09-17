@@ -87,6 +87,7 @@ async fn public_identity_has_a_stable_validated_string_serde_contract() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Verifies: TEAM.SYS.ID-R01, TEAM.SYS.TRANS-R03
 #[tokio::test]
 async fn external_consumers_cannot_cross_the_runtime_boundary() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui");

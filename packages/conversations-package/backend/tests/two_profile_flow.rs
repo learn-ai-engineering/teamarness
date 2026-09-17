@@ -15,6 +15,7 @@ use support::harness::{
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
 use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
 
+/// Verifies: TEAM.SYS.CONV-R06, TEAM.SYS.CONV-R10, TEAM.SYS.CONV-R11, TEAM.SYS.CONV-R12
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn complete_two_profile_recovery_matrix() {
     let application = support::harness::StagedApplication::new();

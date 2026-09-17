@@ -27,6 +27,7 @@ fn now_unix_ms() -> i64 {
     .unwrap()
 }
 
+/// Verifies: TEAM.SYS.MEM-R03
 #[tokio::test]
 async fn concurrent_exact_redemption_recovers_one_shared_admission() {
     let issuer_directory = private_data_directory("invitation-race-issuer");

@@ -98,6 +98,7 @@ fn transfer_enforces_text_payload_ticket_and_address_limits() {
     assert!(WorkspaceInvitation::from_str(&encode_transfer(TOKEN, &custom, &[])).is_err());
 }
 
+/// Verifies: TEAM.SYS.TRANS-R04
 #[test]
 fn transfer_rejects_ticket_identity_that_differs_from_signed_inviter() {
     let wrong_ticket = ticket_with_addresses(

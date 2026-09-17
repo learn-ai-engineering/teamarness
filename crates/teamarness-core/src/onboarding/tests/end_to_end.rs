@@ -120,6 +120,7 @@ async fn fresh_join_matches_the_export_boundary_and_survives_both_restarts() {
     close(reopened_joiner, &joiner_directory).await;
 }
 
+/// Verifies: TEAM.SYS.MEM-R09, TEAM.SYS.TRANS-R05
 #[tokio::test]
 async fn response_loss_recovers_one_admission_through_the_public_join_operation() {
     let (issuer_directory, issuer) = open("loss-issuer").await;

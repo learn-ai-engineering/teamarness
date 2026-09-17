@@ -71,6 +71,7 @@ async fn package_error_preserves_generation_and_unrelated_instance() {
     assert_eq!(other_after.process_generation, other.process_generation);
 }
 
+/// Verifies: TEAM.SYS.PKG-R02
 #[tokio::test]
 async fn lifecycle_error_fails_without_automatic_restarts_or_cross_instance_effects() {
     let fixture = common::Fixture::node(&[
