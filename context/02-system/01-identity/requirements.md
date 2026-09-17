@@ -25,3 +25,7 @@ The system SHALL support an Installation Display Name for the local Installation
 ## TEAM.SYS.ID-R06 — Device vs Human Identity
 
 The membership log SHALL accommodate both device-scoped and future human-scoped identity. The initial implementation SHALL treat each device as a first-class member. The schema SHALL reserve space for a human identity layer that groups multiple device identities.
+
+## TEAM.SYS.ID-R08 — Recipient-Bound Protection Grants
+
+A Protection Grant SHALL be decryptable only with the recipient Installation's private key. It SHALL bind its kind, scope, Workspace, author, recipient, admission, and Content Key identifier, and its author SHALL sign it through the domain-separated signing interface.
