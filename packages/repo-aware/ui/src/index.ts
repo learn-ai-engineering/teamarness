@@ -86,10 +86,23 @@ export function createRepoAwareController(
   };
 
   const fail = (error: unknown): void => {
-    update({
-      error: error instanceof Error ? error.message : "Request failed",
-      pending: "none",
-    });
+    if (error instanceof Error) {
+      update({ error: error.message, pending: "none" });
+      return;
+    }
+    if (typeof error === "string") {
+      update({ error, pending: "none" });
+      return;
+    }
+    // Tauri v2 serialises command errors as plain objects with code/stage/diagnosticId.
+    const structured = error as Record<string, unknown> | null | undefined;
+    if (structured && typeof structured === "object") {
+      const code = typeof structured.code === "string" ? structured.code : "unknown";
+      const stage = typeof structured.stage === "string" ? ` (${structured.stage})` : "";
+      update({ error: `${code}${stage}`, pending: "none" });
+      return;
+    }
+    update({ error: "Request failed", pending: "none" });
   };
 
   const loadList = async (): Promise<readonly Registration[]> => {
