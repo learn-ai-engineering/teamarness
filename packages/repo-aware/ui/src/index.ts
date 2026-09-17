@@ -1,7 +1,8 @@
-import type {
-  PackageClient,
-  PackageMountContext,
-  PackageUnmount,
+import {
+  installPackageUiKit,
+  type PackageClient,
+  type PackageMountContext,
+  type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -221,16 +222,16 @@ export function createRepoAwareController(
 
 const REPO_AWARE_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-  article { display: grid; gap: .9rem; padding: 1rem; }
-  h2, h3, p { margin: 0; }
+  .teamarness-section p, .dialog p { margin: 0; }
   .controls { display: flex; flex-wrap: wrap; gap: .7rem; align-items: center; }
-  input, button { font: inherit; border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
-  input { border: 1px solid var(--teamarness-color-border, #ccc); flex: 1; min-width: 12rem; }
-  button { border: 0; background: var(--teamarness-color-accent); color: var(--teamarness-color-background); cursor: pointer; }
+  .controls .teamarness-input { flex: 1; width: auto; min-width: 12rem; }
+  button { cursor: pointer; }
+  .dialog button { font: inherit; border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; border: 0; background: var(--teamarness-color-accent); color: var(--teamarness-color-background); }
   button:disabled { opacity: .5; cursor: default; }
-  .error { color: var(--teamarness-color-danger, #b42318); min-height: 1.2em; }
+  .error { color: var(--teamarness-color-danger, #b42318); min-height: 1.2em; margin-bottom: 0; }
+  .error:empty { min-height: 0; margin: 0; }
   .selector { display: flex; flex-direction: column; gap: .3rem; }
-  .selector button { text-align: left; background: transparent; color: inherit; border: 1px solid var(--teamarness-color-border, #ccc); border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
+  .selector button { font: inherit; text-align: left; background: transparent; color: inherit; border: 1px solid var(--teamarness-color-border, #ccc); border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
   .selector button[aria-selected="true"] { border-color: var(--teamarness-color-accent); background: color-mix(in srgb, var(--teamarness-color-accent) 10%, transparent); }
   .card { display: grid; gap: .3rem; padding: .7rem; border: 1px solid var(--teamarness-color-border, #ccc); border-radius: var(--teamarness-radius-control); }
   .card .label { font-weight: 600; }
@@ -281,9 +282,10 @@ function installStyles(root: ShadowRoot): () => void {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function button(text: string): HTMLButtonElement {
+function button(text: string, variant?: "primary" | "secondary"): HTMLButtonElement {
   const element = document.createElement("button");
   element.type = "button";
+  if (variant) element.className = `teamarness-control teamarness-control--${variant}`;
   element.textContent = text;
   return element;
 }
@@ -297,13 +299,29 @@ function abbreviateCommit(hash: string): string {
 // ─── Mount ───────────────────────────────────────────────────────────────────
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const cleanupStyles = installStyles(context.root);
+  const cleanupKit = installPackageUiKit(context.root);
+  let cleanupStyles: () => void;
+  try {
+    cleanupStyles = installStyles(context.root);
+  } catch (error) {
+    cleanupKit();
+    throw error;
+  }
   const article = document.createElement("article");
-  const heading = document.createElement("h2");
+  article.className = "teamarness-page";
+  const header = document.createElement("header");
+  header.className = "teamarness-page-header";
+  const heading = document.createElement("h1");
+  heading.className = "teamarness-page-title";
   heading.textContent = context.package.displayName;
-  article.append(heading);
+  const subtitle = document.createElement("p");
+  subtitle.className = "teamarness-page-subtitle";
+  subtitle.textContent = "Register local Git repositories and check their current state.";
+  header.append(heading, subtitle);
+  article.append(header);
 
-  const onboardingSection = document.createElement("div");
+  const onboardingSection = document.createElement("section");
+  onboardingSection.className = "teamarness-section teamarness-stack";
   onboardingSection.style.display = "none";
   const onboardingDesc = document.createElement("p");
   onboardingDesc.textContent = "Register a Git repository to get started.";
@@ -311,9 +329,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   inputRow.className = "controls";
   const pathInput = document.createElement("input");
   pathInput.type = "text";
+  pathInput.className = "teamarness-input";
   pathInput.setAttribute("aria-label", "Repository path");
   pathInput.placeholder = "/absolute/path/to/repo";
-  const addButton = button("Add");
+  const addButton = button("Add", "primary");
   // Starts disabled — empty input. The input listener toggles this.
   addButton.disabled = true;
   addButton.dataset.pendingLocked = "false";
@@ -326,12 +345,14 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   onboardingSection.append(onboardingDesc, inputRow);
   inputRow.append(pathInput, addButton);
 
-  const contentSection = document.createElement("div");
+  const contentSection = document.createElement("section");
+  contentSection.className = "teamarness-section teamarness-stack";
   contentSection.style.display = "none";
 
   const col = document.createElement("div");
   col.className = "selector";
-  const selectorLabel = document.createElement("h3");
+  const selectorLabel = document.createElement("h2");
+  selectorLabel.className = "teamarness-section-title";
   selectorLabel.textContent = "Repositories";
   col.append(selectorLabel);
   const selectorList = document.createElement("div");
@@ -351,8 +372,8 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const fetchedRow = document.createElement("p");
   const actionRow = document.createElement("div");
   actionRow.className = "actions";
-  const refreshButton = button("Refresh");
-  const removeButton = button("Remove");
+  const refreshButton = button("Refresh", "secondary");
+  const removeButton = button("Remove", "secondary");
   actionRow.append(refreshButton, removeButton);
   card.append(pathRow, originRow, githubRow, headRow, commitRow, statusRow, fetchedRow, actionRow);
   contentSection.append(card);
@@ -507,5 +528,6 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     addButton.removeEventListener("click", onAdd);
     article.remove();
     cleanupStyles();
+    cleanupKit();
   };
 }
