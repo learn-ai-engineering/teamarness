@@ -66,16 +66,17 @@ target/debug/teamarness-desktop --data-dir /absolute/private/teamarness-two
 Run all repository checks from the repository root:
 
 ```sh
-npm ci
-npm run build
-npm run typecheck
-npm run lint
-npm test
-cargo build --workspace --locked
-cargo test --workspace --locked
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+npm run check
 ```
+
+It runs, in order: `npm ci`, `npm run build`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked`, `npm run lint`, `npm run typecheck`, and `npm test`. The build must come before the Cargo checks because `teamarness-desktop` bundles the Package Directories that `npm run build` stages under `target/teamarness-packages`. For quick Rust-only checks without an npm build, exclude the desktop crate:
+
+```sh
+cargo test --workspace --exclude teamarness-desktop --locked
+cargo clippy --workspace --exclude teamarness-desktop --all-targets --all-features --locked -- -D warnings
+```
+
+The bundled Packages are listed once in `packages/bundled-packages.json`. After editing it, run `node scripts/bundled-packages.mjs --write` and `npm run build`; `npm test` fails while the Tauri bundle configuration or the application index disagrees with the list.
 
 The Core Runtime public API is `teamarness_core::CoreRuntime`. Identity secrets, raw key bytes, SQLite handles, Iroh transport handles, canonical membership bytes, and private membership adapters remain private. The Tauri bridge carries only owned Installation, Workspace, membership, invitation, and stable-error DTOs.
 
@@ -100,7 +101,7 @@ After the bundle command succeeds, run the automated packaged-app smoke on Apple
 npm run verify:packaged-app
 ```
 
-The smoke mounts the DMG for inspection, launches the `.app` twice with private temporary data, creates a Workspace, selects the bundled reference Package through macOS accessibility, checks its admitted UI and protocol response, and verifies process-group reaping after each graceful exit. It requires Accessibility permission for the launching terminal. The developer-owned app and DMG walkthroughs remain separate Verify checks.
+The smoke mounts the DMG for inspection, compares every bundled Package Directory with its staged bytes, launches the `.app` twice with private temporary data, creates a Workspace, checks that every bundled Package Backend launches from the application bundle, selects the bundled reference Package through macOS accessibility, checks its admitted UI and protocol response, and verifies process-group reaping after each graceful exit. It requires Accessibility permission for the launching terminal. The developer-owned app and DMG walkthroughs remain separate Verify checks.
 
 To run two packaged Installations with separate absolute directories, launch the application bundle twice:
 

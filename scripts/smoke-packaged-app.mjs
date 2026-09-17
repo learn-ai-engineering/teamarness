@@ -4,16 +4,19 @@ import { chmod, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { repositoryRoot } from "./build-application-packages.mjs";
+import { STAGING_ROOT, readBundledPackages, repositoryRoot } from "./bundled-packages.mjs";
 import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 import { compareDeclaredPackageBytes } from "./package-directory.mjs";
 
 const app = join(repositoryRoot, "target/release/bundle/macos/Teamarness.app");
 const executable = join(app, "Contents/MacOS/teamarness-desktop");
-const resources = join(app, "Contents/Resources/packages/dev.teamarness.reference");
-const tutorialResources = join(app, "Contents/Resources/packages/dev.teamarness.tutorial");
-const staged = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.reference");
-const stagedTutorial = join(repositoryRoot, "target/teamarness-packages/dev.teamarness.tutorial");
+const bundledPackages = (await readBundledPackages(repositoryRoot)).map(({ identity, manifest }) => ({
+  identity,
+  displayName: manifest.presentation.displayName,
+  resources: join(app, "Contents/Resources/packages", identity),
+  staged: join(repositoryRoot, STAGING_ROOT, identity),
+  backendPath: manifest.backends[0].path,
+}));
 const dmg = join(repositoryRoot, "target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg");
 const diagnosticOutputLimit = 4_096;
 
@@ -25,8 +28,9 @@ if (process.platform !== "darwin" || process.arch !== "arm64") {
 
 await assertFile(executable);
 await assertFile(dmg);
-await compareDeclaredPackageBytes(staged, resources);
-await compareDeclaredPackageBytes(stagedTutorial, tutorialResources);
+for (const { staged, resources } of bundledPackages) {
+  await compareDeclaredPackageBytes(staged, resources);
+}
 await inspectDmg();
 
 const dataDirectory = await mkdtemp(join(tmpdir(), "teamarness-packaged-smoke-"));
@@ -113,16 +117,14 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
       return name of referencePackage
     `), "bundled reference Package navigation");
 
-    const referenceBackend = join(resources, "backend/teamarness-reference-package-aarch64-apple-darwin");
-    const tutorialBackend = join(tutorialResources, "backend/teamarness-tutorial-package-aarch64-apple-darwin");
-    const referenceBackendPid = await atStage("bundled Package Backend", () =>
-      waitFor(() => bundledBackend(childPid, referenceBackend), "bundled Package Backend"));
-    backendPids.push(referenceBackendPid);
-    assertBundledBackend(referenceBackendPid, childPid, referenceBackend, "Reference");
-    const tutorialBackendPid = await atStage("bundled Tutorial Backend", () =>
-      waitFor(() => bundledBackend(childPid, tutorialBackend), "bundled Tutorial Backend"));
-    backendPids.push(tutorialBackendPid);
-    assertBundledBackend(tutorialBackendPid, childPid, tutorialBackend, "Tutorial");
+    // The Package Host eagerly activates every admitted Package, so every bundled Backend must launch.
+    for (const { identity, displayName, resources, backendPath } of bundledPackages) {
+      const backend = join(resources, backendPath);
+      const stage = `bundled Package Backend ${identity}`;
+      const backendPid = await atStage(stage, () => waitFor(() => bundledBackend(childPid, backend), stage));
+      backendPids.push(backendPid);
+      assertBundledBackend(backendPid, childPid, backend, displayName);
+    }
 
     await waitForAccessible(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")

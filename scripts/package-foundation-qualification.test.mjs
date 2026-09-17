@@ -152,7 +152,7 @@ test("packaged smoke waits for Package navigation and captures safe timeout diag
   const shellReadinessWait = source.indexOf('"desktop Shell readiness"');
   const workspaceCreation = source.indexOf('diagnostics.activeStage = "Workspace creation"');
   const navigationWait = source.indexOf('"bundled reference Package navigation"');
-  const backendWait = source.indexOf('"bundled Package Backend"');
+  const backendWait = source.indexOf("`bundled Package Backend ${identity}`");
 
   assert.ok(shellReadinessWait >= 0, "packaged smoke must wait for desktop Shell readiness");
   assert.ok(workspaceCreation > shellReadinessWait, "packaged smoke must wait for Shell readiness before creating a Workspace");
