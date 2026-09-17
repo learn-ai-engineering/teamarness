@@ -113,7 +113,8 @@ describe("reference Package UI", () => {
     const packageSheet = root.adoptedStyleSheets[2] as unknown as FakeCSSStyleSheet;
     expect(packageSheet.cssText).toMatch(/\.reference-action\s*\{[^}]*align-self:\s*flex-start/);
     const heading = createdElements.find((element) => element.textContent === "Reference Package");
-    expect(heading?.tagName).toBe("H2");
+    expect(heading?.tagName).toBe("H1");
+    expect(heading?.className).toContain("teamarness-page-title");
     const action = createdElements.find((element) => element.textContent === "Increment counter");
     expect(action?.className).toContain("reference-action");
     expect(createdElements.every((element) => element.tagName !== "STYLE")).toBe(true);
@@ -134,7 +135,8 @@ describe("reference Package UI", () => {
     expect(source).toContain("TEAMARNESS_THEME_TOKENS");
     expect(source).toContain("installPackageUiKit");
     expect(source).toContain("teamarness-control");
-    expect(source).toContain("teamarness-panel");
+    expect(source).toContain("teamarness-page");
+    expect(source).toContain("teamarness-section");
   });
 
   it("keeps qualification state while rendering only display-safe readiness labels", () => {

@@ -9,7 +9,6 @@ import referenceAsset from "./probe.svg?no-inline";
 
 const REFERENCE_PACKAGE_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-  .reference-heading { margin: 0; }
   .reference-action { align-self: flex-start; }
   .reference-details { display: grid; grid-template-columns: max-content 1fr; gap: .4rem .8rem; }
   .reference-details dt { font-weight: 700; }
@@ -60,8 +59,8 @@ function installPackageStyles(root: ShadowRoot): () => void {
   };
 }
 
-function packageUiKitIsReady(article: HTMLElement, control: HTMLElement): boolean {
-  const layout = getComputedStyle(article);
+function packageUiKitIsReady(section: HTMLElement, control: HTMLElement): boolean {
+  const layout = getComputedStyle(section);
   const controlStyle = getComputedStyle(control);
   const inheritedAccent = controlStyle.getPropertyValue("--teamarness-color-accent").trim();
   return layout.display === "flex"
@@ -82,10 +81,18 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     throw error;
   }
   const article = document.createElement("article");
-  article.className = "teamarness-panel teamarness-stack";
-  const heading = document.createElement("h2");
-  heading.className = "reference-heading";
+  article.className = "teamarness-page teamarness-page--readable";
+  const header = document.createElement("header");
+  header.className = "teamarness-page-header";
+  const heading = document.createElement("h1");
+  heading.className = "teamarness-page-title";
   heading.textContent = context.package.displayName;
+  const subtitle = document.createElement("p");
+  subtitle.className = "teamarness-page-subtitle";
+  subtitle.textContent = "Exercises the Package foundation contracts end to end.";
+  header.append(heading, subtitle);
+  const section = document.createElement("section");
+  section.className = "teamarness-section teamarness-stack";
   const logo = document.createElement("img");
   logo.src = referenceAsset;
   logo.alt = "Reference Package";
@@ -119,9 +126,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   increment.type = "button";
   increment.className = "reference-action teamarness-control teamarness-control--primary";
   increment.textContent = "Increment counter";
-  article.append(heading, logo, details, increment);
+  section.append(logo, details, increment);
+  article.append(header, section);
   context.root.append(article);
-  const uiKitStatus = packageUiKitIsReady(article, increment) ? "Ready" : "Unavailable";
+  const uiKitStatus = packageUiKitIsReady(section, increment) ? "Ready" : "Unavailable";
   values.get("UI kit")!.textContent = uiKitStatus;
   values.get("UI kit")!.setAttribute("aria-label", `UI kit ${uiKitStatus}`);
 
