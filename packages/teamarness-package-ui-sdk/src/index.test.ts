@@ -104,6 +104,18 @@ describe("Package presentation contract", () => {
     ]) {
       expect(kitSheet.cssText).toContain(`.${className}`);
     }
+    for (const className of [
+      "teamarness-page",
+      "teamarness-page--readable",
+      "teamarness-page-header",
+      "teamarness-eyebrow",
+      "teamarness-page-title",
+      "teamarness-page-subtitle",
+      "teamarness-section",
+      "teamarness-section-title",
+    ]) {
+      expect(kitSheet.cssText).toMatch(new RegExp(`\\.${className}\\s*\\{`));
+    }
     for (const token of TEAMARNESS_THEME_TOKENS) expect(kitSheet.cssText).toContain(`var(${token})`);
 
     root.adoptedStyleSheets = [...root.adoptedStyleSheets, packageSheetAfter];

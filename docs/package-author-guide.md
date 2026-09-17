@@ -78,6 +78,20 @@ The UI SDK's [Package UI theme and CSS kit guide](../packages/teamarness-package
 
 A Package owns its complete internal composition, including its Package-owned header, secondary navigation, forms, state feedback, and domain content. The Shell owns Workspace and Package selection, the mount, inherited token values, and generic recovery; do not copy Shell navigation into a Package. The optional `installPackageUiKit(root)` helper supplies only common controls, fields, validation, notices, panels, flow, and visible focus. It uses a constructed stylesheet in the Shadow Root's `adoptedStyleSheets`. Retain its cleanup callback and invoke it from your idempotent unmount function.
 
+The kit also includes opt-in page-structure classes whose values mirror the Shell's screens: `teamarness-page`, `teamarness-page--readable`, `teamarness-page-header`, `teamarness-eyebrow`, `teamarness-page-title`, `teamarness-page-subtitle`, `teamarness-section`, and `teamarness-section-title`. Use them when a Package page should read like a Shell screen:
+
+```html
+<main class="teamarness-page teamarness-page--readable">
+  <header class="teamarness-page-header">
+    <h1 class="teamarness-page-title">Milestones</h1>
+    <p class="teamarness-page-subtitle">Track what the team is shipping next.</p>
+  </header>
+  <section class="teamarness-section">
+    <h2 class="teamarness-section-title">Current milestone</h2>
+  </section>
+</main>
+```
+
 The host's `style-src` rejects runtime inline `<style>` elements and `style` attributes. Package-owned styling must respect that policy too. Use a separate constructed `CSSStyleSheet` in the Package Shadow Root, and remove only that sheet during unmount. Do not fall back to inline styles, nonces, hashes, `data:` styles, or `blob:` styles if constructed stylesheets are unavailable.
 
 The Shell loads admitted resources through `teamarness-package://`. The loader accepts only `GET` and `HEAD` for exact admitted paths. It rejects traversal, encoded separators, query selectors, stale tokens, undeclared files, changed cache bytes, and MIME changes. Responses disable sniffing and storage. Package code never receives the mount token or a source, cache, or data path.
@@ -104,7 +118,7 @@ A same-webview Package UI can access the Shell DOM and any Tauri command it know
 2. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`.
 3. Copy the directory outside the Teamarness repository if you want to test the real separate-source path.
 4. Follow [Local Package registration](local-package-registration.md). Use the manifest identity as `expectedIdentity`, accept the native-code risks, and restart Teamarness.
-5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, suspend, recover, dispose, restart, and data continuity. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
+5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. Workspace settings offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
 6. Rebuild in place when needed, then restart. There is no source watch or hot reload for Backend bytes.
 
 ## Promotion to application distribution

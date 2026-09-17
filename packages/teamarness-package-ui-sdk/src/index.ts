@@ -68,6 +68,28 @@ const PACKAGE_UI_KIT_CSS = `
   }
   .teamarness-stack { display: flex; flex-direction: column; gap: 0.75rem; }
   .teamarness-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+  /* Page structure: opt-in primitives whose values mirror the Shell's own screens. */
+  .teamarness-page { display: block; padding: clamp(1.25rem, 4vw, 3rem); color: var(--teamarness-color-text); }
+  .teamarness-page > * + * { margin-top: 2rem; }
+  .teamarness-page--readable { max-width: 48rem; }
+  .teamarness-page-header { display: block; }
+  .teamarness-eyebrow {
+    margin: 0 0 0.4rem;
+    color: var(--teamarness-color-accent);
+    font-size: 0.75rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .teamarness-page-title { margin: 0 0 0.5rem; font-size: clamp(1.7rem, 4vw, 2.5rem); }
+  .teamarness-page-subtitle { max-width: 40rem; margin: 0; color: var(--teamarness-color-text-muted); }
+  .teamarness-section {
+    padding: 1.25rem;
+    background: var(--teamarness-color-panel);
+    border: 1px solid var(--teamarness-color-border);
+    border-radius: var(--teamarness-radius-panel);
+  }
+  .teamarness-section-title { margin: 0 0 0.75rem; font-size: 1.05rem; }
   .teamarness-focus:focus-visible,
   .teamarness-control:focus-visible,
   .teamarness-input:focus-visible {

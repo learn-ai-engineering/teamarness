@@ -74,6 +74,34 @@ The kit publishes these opt-in classes:
 | `.teamarness-inline` | Wrapping horizontal flow with a standard gap |
 | `.teamarness-focus` | Visible `:focus-visible` outline for a custom focusable element |
 
+### Page structure
+
+The kit also publishes opt-in page-structure classes. Their values mirror the Shell's own screens, so a Package page can sit comfortably next to Shell settings without copying Shell CSS. Nothing applies them automatically.
+
+| Class | Purpose |
+|---|---|
+| `.teamarness-page` | Page padding, with spacing between top-level blocks |
+| `.teamarness-page--readable` | Readable maximum width for form and document pages, used with the page foundation |
+| `.teamarness-page-header` | Page header block |
+| `.teamarness-eyebrow` | Small accent label above a title |
+| `.teamarness-page-title` | Page title, usually the `h1` |
+| `.teamarness-page-subtitle` | Muted one-sentence summary under the title |
+| `.teamarness-section` | Grouped page section surface |
+| `.teamarness-section-title` | Section heading, usually an `h2` |
+
+```html
+<main class="teamarness-page teamarness-page--readable">
+  <header class="teamarness-page-header">
+    <h1 class="teamarness-page-title">Milestones</h1>
+    <p class="teamarness-page-subtitle">Track what the team is shipping next.</p>
+  </header>
+  <section class="teamarness-section" aria-labelledby="current-milestone">
+    <h2 class="teamarness-section-title" id="current-milestone">Current milestone</h2>
+    <!-- Package-owned domain content -->
+  </section>
+</main>
+```
+
 The installer adds only local box sizing outside those classes. It does not select or modify Package content, and it does not install styles in `document`.
 
 The host's `style-src` rejects runtime inline `<style>` elements and `style` attributes. The installer does not bypass that policy. It fails the Package mount if constructed stylesheets or mutable `ShadowRoot.adoptedStyleSheets` are unavailable. Do not add an inline fallback, nonce, hash, `data:` style, or `blob:` style.
