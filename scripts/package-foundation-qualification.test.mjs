@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { test } from "node:test";
 
+import { applicationIndexDocument, readBundledPackages, tauriBundleConfiguration } from "./bundled-packages.mjs";
 import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 
 const root = new URL("../", import.meta.url);
@@ -185,12 +186,14 @@ test("generated foundation and bundled Package policies remain independent", asy
   assert.ok((await readdir(new URL("packages/", root))).includes("tutorial"));
 
   const index = JSON.parse(await read("packages/application-packages.v1.json"));
-  assert.deepEqual(index.packages, [
-    { directory: "packages/dev.teamarness.reference" },
-    { directory: "packages/dev.teamarness.tutorial" },
-    { directory: "packages/dev.teamarness.conversations" },
-    { directory: "packages/dev.teamarness.repo-aware" },
+  const bundled = await readBundledPackages();
+  assert.deepEqual(bundled.map(({ identity }) => identity), [
+    "dev.teamarness.reference",
+    "dev.teamarness.tutorial",
+    "dev.teamarness.conversations",
+    "dev.teamarness.repo-aware",
   ]);
+  assert.deepEqual(index, applicationIndexDocument(bundled));
   const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
   assert.deepEqual(Object.keys(tutorial.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
   assert.deepEqual(tutorial.subscriptions, {});
@@ -206,16 +209,9 @@ test("generated foundation and bundled Package policies remain independent", asy
 
 test("delivery configuration includes all bundled Package Directories and source badges", async () => {
   const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.reference/"]);
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.tutorial/"]);
-assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.conversations/"]);
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.repo-aware/"]);
-  assert.deepEqual(config.bundle.externalBin, [
-    "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
-    "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
-    "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package",
-    "../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package",
-  ]);
+  const expected = tauriBundleConfiguration(await readBundledPackages());
+  assert.deepEqual(config.bundle.resources, expected.resources);
+  assert.deepEqual(config.bundle.externalBin, expected.externalBin);
   const shell = await read("apps/teamarness-desktop/src/shell.ts");
   const presentation = await read("apps/teamarness-desktop/src/presentation.ts");
   assert.match(shell, /Package source/);
@@ -259,10 +255,7 @@ test("delivery configuration has one local admitted loader and no deferred Packa
 
   const config = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json"));
   assert.deepEqual(config.bundle.targets, ["app", "dmg"]);
-  assert.ok(config.bundle.resources["../../../packages/application-packages.v1.json"]);
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.reference/"]);
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.tutorial/"]);
-  assert.ok(config.bundle.resources["../../../target/teamarness-packages/dev.teamarness.conversations/"]);
+  assert.deepEqual(config.bundle.resources, tauriBundleConfiguration(await readBundledPackages()).resources);
   assert.ok(config.app.security.csp.includes("teamarness-package:"));
   assert.ok(!config.app.security.csp.includes("file:"));
   assert.ok(!config.app.security.csp.includes("https:"));

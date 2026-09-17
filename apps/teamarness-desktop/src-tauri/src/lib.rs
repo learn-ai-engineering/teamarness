@@ -355,47 +355,50 @@ mod tests {
 
     #[test]
     fn bundle_configuration_uses_all_generated_application_packages() {
+        // packages/bundled-packages.json is the one bundled Package list; the Tauri
+        // bundle configuration and the application index are derived from it.
+        let bundled: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../packages/bundled-packages.json"))
+                .unwrap();
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut expected_resources = serde_json::Map::new();
+        expected_resources.insert(
+            "../../../packages/application-packages.v1.json".into(),
+            "packages/application-packages.v1.json".into(),
+        );
+        let mut expected_external_bin = Vec::new();
+        let mut expected_index = Vec::new();
+        let entries = bundled["packages"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            let source = entry["sourceDirectory"].as_str().unwrap();
+            let cargo_package = entry["cargoPackage"].as_str().unwrap();
+            let manifest_path = repository.join(source).join("teamarness.package.json");
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&manifest_path)
+                    .unwrap_or_else(|error| panic!("bundled Package manifest {source}: {error}")),
+            )
+            .unwrap();
+            let identity = manifest["identity"].as_str().unwrap();
+            let staged = format!("../../../target/teamarness-packages/{identity}");
+            expected_resources.insert(format!("{staged}/"), format!("packages/{identity}/").into());
+            expected_external_bin.push(serde_json::Value::String(format!(
+                "{staged}/backend/{cargo_package}"
+            )));
+            expected_index.push(serde_json::json!({ "directory": format!("packages/{identity}") }));
+        }
+
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let resources = config["bundle"]["resources"].as_object().unwrap();
         assert_eq!(
-            resources.get("../../../packages/application-packages.v1.json"),
-            Some(&serde_json::Value::String(
-                "packages/application-packages.v1.json".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.reference/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.reference/".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.tutorial/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.tutorial/".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.conversations/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.conversations/".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.repo-aware/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.repo-aware/".into()
-            ))
+            config["bundle"]["resources"].as_object().unwrap(),
+            &expected_resources,
+            "run `node scripts/bundled-packages.mjs --write`"
         );
         assert_eq!(
             config["bundle"]["externalBin"].as_array().unwrap(),
-            &[
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package".into()),
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package".into()),
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package".into()),
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package".into()),
-            ]
+            &expected_external_bin,
+            "run `node scripts/bundled-packages.mjs --write`"
         );
         let index: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../packages/application-packages.v1.json"
@@ -403,12 +406,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             index["packages"],
-            serde_json::json!([
-                { "directory": "packages/dev.teamarness.reference" },
-                { "directory": "packages/dev.teamarness.tutorial" },
-                { "directory": "packages/dev.teamarness.conversations" },
-                { "directory": "packages/dev.teamarness.repo-aware" },
-            ])
+            serde_json::Value::Array(expected_index),
+            "run `npm run build:application-packages`"
         );
     }
 

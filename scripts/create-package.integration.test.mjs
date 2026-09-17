@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import test from "node:test";
 
-import { buildTutorialPackage } from "./build-tutorial-package.mjs";
+import { buildPackage, resolveBundledPackage } from "./build-package.mjs";
 import { createPackageProject, repositoryRoot } from "./create-package.mjs";
 
 const run = promisify(execFile);
@@ -37,7 +37,11 @@ test("generated foundation passes its locked checks and assembles a Package Dire
     assert.match(manifest.ui.entrypoint.sha256, /^[0-9a-f]{64}$/);
     assert.match(manifest.ui.contract.sha256, /^[0-9a-f]{64}$/);
 
-    const tutorialDirectory = await buildTutorialPackage({
+    const tutorial = await resolveBundledPackage("dev.teamarness.tutorial");
+    const tutorialDirectory = await buildPackage({
+      sourceDirectory: tutorial.sourceDirectory,
+      cargoPackage: tutorial.cargoPackage,
+      expectedIdentity: tutorial.identity,
       outputDirectory: join(parent, "bundled tutorial"),
     });
     await run(
