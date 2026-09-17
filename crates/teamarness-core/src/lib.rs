@@ -47,10 +47,10 @@ pub use error::{
 pub use membership::MembershipOperationId;
 pub use onboarding::WorkspaceInvitation;
 pub use runtime::{
-    CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipEpoch, MembershipRole,
-    MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription, MembershipTransition,
-    MembershipVersion, PublicIdentity, PublicSignature, SigningContext, WorkspaceId,
-    WorkspaceSummary,
+    CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipChange, MembershipEpoch,
+    MembershipRole, MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription,
+    MembershipTransition, MembershipVersion, PublicIdentity, PublicSignature, SigningContext,
+    WorkspaceId, WorkspaceSummary,
 };
 pub use synchronization::{
     Cursor, ImmutableRecord, OpenedRecord, OrderKey, RecordEvent, RecordId, RecordSubscription,

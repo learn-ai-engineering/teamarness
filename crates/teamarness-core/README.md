@@ -30,7 +30,7 @@ The public API supports:
 - requesting a finite bounded immutable-record reconciliation with a current peer through the shared Core network; the production path uses a private P2Panda operation projection and LogSync, while the public capability remains semantic and package-neutral;
 - revoking an admitted member;
 - querying declared-time membership history; and
-- catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor.
+- catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor. Each transition reports the `MembershipChange` it made — the admitted or revoked Installation — and the Installation that authored it, identically for durable catch-up and live delivery.
 
 Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. The returned `WorkspaceInvitation` is an opaque, sensitive bearer value: applications may parse, display, copy, and submit its text, but must not interpret its private wire representation.
 

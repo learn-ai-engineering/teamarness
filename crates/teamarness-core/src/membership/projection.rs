@@ -15,8 +15,8 @@ use crate::onboarding::wire::{
     encode_success_with_limits,
 };
 use crate::{
-    MemberSnapshot, MembershipEpoch, MembershipOperationId, MembershipRole, MembershipSnapshot,
-    MembershipSnapshotDigest, MembershipVersion, PublicIdentity, WorkspaceId,
+    MemberSnapshot, MembershipChange, MembershipEpoch, MembershipOperationId, MembershipRole,
+    MembershipSnapshot, MembershipSnapshotDigest, MembershipVersion, PublicIdentity, WorkspaceId,
 };
 
 use super::{
@@ -91,6 +91,22 @@ pub(crate) struct AppliedMembership {
     pub(crate) snapshot_digest: MembershipSnapshotDigest,
     pub(crate) accepted: bool,
     pub(crate) quarantined: bool,
+    /// The change the causing operation made, or `None` when that operation is
+    /// a workspace `create`, which starts membership rather than changing it.
+    pub(crate) change: Option<MembershipChange>,
+    pub(crate) author: PublicIdentity,
+}
+
+/// Derives the reported change from a membership action. A `create` action
+/// starts a workspace and reports no change.
+pub(crate) fn change_from_action(action: &MembershipAction) -> Option<MembershipChange> {
+    match action {
+        MembershipAction::Create => None,
+        MembershipAction::Admit { target, .. } => {
+            Some(MembershipChange::Admitted { member: *target })
+        }
+        MembershipAction::Revoke { target } => Some(MembershipChange::Revoked { member: *target }),
+    }
 }
 
 pub(crate) fn recover(
@@ -936,7 +952,7 @@ pub(crate) fn redeem_invitation_with_fault_and_limits(
             limits,
         )
         .map_err(InvitationError::Membership)?;
-        let applied = applied_result(stored_projection, stored_admission_id, false, false);
+        let applied = applied_result(stored_projection, admission, false, false);
         transaction
             .commit()
             .map_err(|_| InvitationError::Storage(StorageError::UncertainOutcome))?;
@@ -1028,7 +1044,7 @@ pub(crate) fn redeem_invitation_with_fault_and_limits(
     let response =
         encode_current_bootstrap_with_limits(connection, &candidate, envelope.id, limits)
             .map_err(InvitationError::Membership)?;
-    let result = applied_result(&candidate, envelope.id, true, false);
+    let result = applied_result(&candidate, &envelope, true, false);
     durable.insert(envelope.workspace_id, candidate);
     *projections = durable;
     Ok(AdmissionExport {
@@ -1142,7 +1158,7 @@ fn apply_authenticated_with_limits(
         if let Some(id) = future_id {
             remove_future(connection, id)?;
         }
-        return Ok(applied_result(projection, envelope.id, false, false));
+        return Ok(applied_result(projection, &envelope, false, false));
     }
 
     let dependency_context = dependency_context(connection, projection, &envelope)?;
@@ -1155,7 +1171,7 @@ fn apply_authenticated_with_limits(
     ) {
         Err(MembershipError::FutureTimestamp) if future_id.is_none() => {
             store_future(connection, &envelope)?;
-            return Ok(applied_result(projection, envelope.id, false, true));
+            return Ok(applied_result(projection, &envelope, false, true));
         }
         Err(error) => return Err(error),
         Ok(()) => {}
@@ -1171,23 +1187,25 @@ fn apply_authenticated_with_limits(
     )?;
 
     persist_candidate(connection, &envelope, &candidate, future_id, limits)?;
-    let result = applied_result(&candidate, envelope.id, true, false);
+    let result = applied_result(&candidate, &envelope, true, false);
     projections.insert(envelope.workspace_id, candidate);
     Ok(result)
 }
 
 fn applied_result(
     projection: &WorkspaceProjection,
-    operation_id: MembershipOperationId,
+    envelope: &MembershipEnvelope,
     accepted: bool,
     quarantined: bool,
 ) -> AppliedMembership {
     AppliedMembership {
-        operation_id,
+        operation_id: envelope.id,
         snapshot: projection.snapshot(),
         snapshot_digest: snapshot_digest(&projection.snapshot),
         accepted,
         quarantined,
+        change: change_from_action(&envelope.action),
+        author: envelope.author,
     }
 }
 

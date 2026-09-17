@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use teamarness_core::{
-    CoreRuntimeConfig, IdentityError, MembershipEpoch, MembershipOperationId, MembershipVersion,
-    OnboardingError, SigningContext, WorkspaceId,
+    CoreRuntime, CoreRuntimeConfig, IdentityError, MembershipChange, MembershipEpoch,
+    MembershipOperationId, MembershipVersion, OnboardingError, SigningContext, WorkspaceId,
 };
 
 #[test]
@@ -74,4 +74,91 @@ fn onboarding_errors_have_a_stable_retryability_contract() {
         assert_eq!(error.is_retryable(), expected, "{error:?}");
         assert!(!error.to_string().is_empty());
     }
+}
+
+// Verifies: TEAM.SYS.MEM-R05
+#[tokio::test]
+async fn durable_and_live_transitions_report_the_same_change_and_author() {
+    let root = std::env::temp_dir().join(format!(
+        "teamarness-transition-change-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let alice = CoreRuntime::open(CoreRuntimeConfig::new(root.join("alice")))
+        .await
+        .unwrap();
+    let workspace = alice.create_workspace("Transition change").unwrap();
+    let mut live = alice
+        .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
+        .unwrap();
+
+    let bob_invitation = alice
+        .create_workspace_invitation(workspace.id())
+        .await
+        .unwrap();
+    let bob = CoreRuntime::open(CoreRuntimeConfig::new(root.join("bob")))
+        .await
+        .unwrap();
+    bob.join_workspace(&bob_invitation).await.unwrap();
+    let carol_invitation = alice
+        .create_workspace_invitation(workspace.id())
+        .await
+        .unwrap();
+    let carol = CoreRuntime::open(CoreRuntimeConfig::new(root.join("carol")))
+        .await
+        .unwrap();
+    carol.join_workspace(&carol_invitation).await.unwrap();
+    alice
+        .revoke_member(workspace.id(), bob.public_identity())
+        .unwrap();
+
+    let expected = vec![
+        MembershipChange::Admitted {
+            member: bob.public_identity(),
+        },
+        MembershipChange::Admitted {
+            member: carol.public_identity(),
+        },
+        MembershipChange::Revoked {
+            member: bob.public_identity(),
+        },
+    ];
+
+    let mut live_seen = Vec::new();
+    while live_seen.len() < expected.len() {
+        let transition = live
+            .next_transition_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .expect("live transition");
+        assert_eq!(transition.author(), alice.public_identity());
+        live_seen.push(transition.change());
+    }
+    assert_eq!(live_seen, expected);
+
+    let mut durable = alice
+        .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
+        .unwrap();
+    let mut durable_seen = Vec::new();
+    while durable_seen.len() < expected.len() {
+        let transition = durable
+            .next_transition_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .expect("durable transition");
+        assert_eq!(transition.author(), alice.public_identity());
+        durable_seen.push(transition.change());
+    }
+    assert_eq!(durable_seen, expected);
+
+    drop(live);
+    drop(durable);
+    carol.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+    alice.shutdown().await.unwrap();
+    drop(carol);
+    drop(bob);
+    drop(alice);
+    std::fs::remove_dir_all(root).unwrap();
 }

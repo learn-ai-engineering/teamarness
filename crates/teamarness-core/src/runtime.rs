@@ -432,6 +432,22 @@ impl PublicSignature {
     }
 }
 
+/// What a membership transition changed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// The transition admitted `member` to the workspace.
+    Admitted {
+        /// The admitted installation.
+        member: PublicIdentity,
+    },
+    /// The transition revoked `member` from the workspace.
+    Revoked {
+        /// The revoked installation.
+        member: PublicIdentity,
+    },
+}
+
 /// One durable, post-genesis membership transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipTransition {
@@ -440,6 +456,8 @@ pub struct MembershipTransition {
     version: MembershipVersion,
     cause: MembershipOperationId,
     snapshot_digest: MembershipSnapshotDigest,
+    change: MembershipChange,
+    author: PublicIdentity,
 }
 
 impl MembershipTransition {
@@ -449,6 +467,8 @@ impl MembershipTransition {
         version: MembershipVersion,
         cause: MembershipOperationId,
         snapshot_digest: MembershipSnapshotDigest,
+        change: MembershipChange,
+        author: PublicIdentity,
     ) -> Self {
         Self {
             workspace_id,
@@ -456,7 +476,21 @@ impl MembershipTransition {
             version,
             cause,
             snapshot_digest,
+            change,
+            author,
         }
+    }
+
+    /// Returns whether this transition admitted or revoked, and whom.
+    #[must_use]
+    pub const fn change(&self) -> MembershipChange {
+        self.change
+    }
+
+    /// Returns the installation that authored the causing operation.
+    #[must_use]
+    pub const fn author(&self) -> PublicIdentity {
+        self.author
     }
 
     /// Returns the workspace whose membership changed.
@@ -1798,7 +1832,9 @@ impl CoreRuntime {
         match result {
             Ok(export) => {
                 let accepted = export.applied.accepted;
-                let transition = Self::transition_from_applied(export.applied);
+                let transition = Self::transition_from_applied(export.applied).ok_or(
+                    InvitationError::Membership(MembershipError::ConflictingGenesis),
+                )?;
                 if accepted {
                     Self::publish_transition(&mut state, transition.clone());
                 }
@@ -2155,7 +2191,8 @@ impl CoreRuntime {
             limits,
         ) {
             Ok(applied) if applied.accepted => {
-                let transition = Self::transition_from_applied(applied);
+                let transition = Self::transition_from_applied(applied)
+                    .ok_or(MembershipError::ConflictingGenesis)?;
                 Self::publish_transition(&mut state, transition.clone());
                 self.sync_worker.cancel_peer(member);
                 Ok(transition)
@@ -2210,21 +2247,27 @@ impl CoreRuntime {
             }
         };
         for applied in applied {
-            Self::publish_transition(state, Self::transition_from_applied(applied));
+            if let Some(transition) = Self::transition_from_applied(applied) {
+                Self::publish_transition(state, transition);
+            }
         }
         Ok(())
     }
 
+    /// Returns `None` when the causing operation is a workspace `create`, which
+    /// starts membership instead of transitioning it.
     fn transition_from_applied(
         applied: crate::membership::projection::AppliedMembership,
-    ) -> MembershipTransition {
-        MembershipTransition::new(
+    ) -> Option<MembershipTransition> {
+        Some(MembershipTransition::new(
             applied.snapshot.workspace_id(),
             applied.snapshot.epoch(),
             applied.snapshot.version(),
             applied.operation_id,
             applied.snapshot_digest,
-        )
+            applied.change?,
+            applied.author,
+        ))
     }
 
     fn publish_transition(state: &mut RuntimeState, transition: MembershipTransition) {
@@ -2270,13 +2313,17 @@ impl CoreRuntime {
         };
         match result {
             Ok(applied) => {
-                if applied.accepted {
+                if applied.accepted
+                    && let Some(change) = applied.change
+                {
                     let transition = MembershipTransition::new(
                         applied.snapshot.workspace_id(),
                         applied.snapshot.epoch(),
                         applied.snapshot.version(),
                         applied.operation_id,
                         applied.snapshot_digest,
+                        change,
+                        applied.author,
                     );
                     Self::publish_transition(&mut state, transition);
                 }
@@ -2469,7 +2516,9 @@ pub(crate) fn respond_to_join(
         _ => crate::OnboardingError::InvalidInput,
     })?;
     for applied in applied {
-        CoreRuntime::publish_transition(&mut state, CoreRuntime::transition_from_applied(applied));
+        if let Some(transition) = CoreRuntime::transition_from_applied(applied) {
+            CoreRuntime::publish_transition(&mut state, transition);
+        }
     }
     let RuntimeState {
         connection,
@@ -2487,8 +2536,9 @@ pub(crate) fn respond_to_join(
         now_unix_ms,
     ) {
         Ok(export) => {
-            if export.applied.accepted {
-                let transition = CoreRuntime::transition_from_applied(export.applied);
+            if export.applied.accepted
+                && let Some(transition) = CoreRuntime::transition_from_applied(export.applied)
+            {
                 CoreRuntime::publish_transition(&mut state, transition);
             }
             Ok(export.response)
