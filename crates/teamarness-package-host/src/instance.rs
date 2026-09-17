@@ -31,6 +31,8 @@ struct InstanceState {
     request_tombstones: BTreeSet<(UiMountId, UiRequestId)>,
     subscriptions: BTreeMap<(UiMountId, UiSubscriptionId), SubscriptionState>,
     next_wire_id: u64,
+    /// Set once host shutdown begins; no generation may be started afterwards.
+    shutting_down: bool,
 }
 
 struct MountRecord {
@@ -59,6 +61,7 @@ impl InstanceActor {
                 request_tombstones: BTreeSet::new(),
                 subscriptions: BTreeMap::new(),
                 next_wire_id: 0,
+                shutting_down: false,
             }),
             lifecycle_gate: Mutex::new(()),
         }
@@ -81,6 +84,9 @@ impl InstanceActor {
             }
             let generation = {
                 let mut state = self.state.lock().await;
+                if state.shutting_down {
+                    return Err(WireFailure::new(PackageErrorCode::ShuttingDown));
+                }
                 if state
                     .active_since
                     .is_some_and(|since| since.elapsed() >= CRASH_WINDOW)
@@ -100,6 +106,13 @@ impl InstanceActor {
                     let process = Arc::new(process);
                     {
                         let mut state = self.state.lock().await;
+                        if state.shutting_down {
+                            // Shutdown began while this generation was spawning and
+                            // could not see it; reap it here instead of orphaning it.
+                            drop(state);
+                            process.shutdown().await;
+                            return Err(WireFailure::new(PackageErrorCode::ShuttingDown));
+                        }
                         state.process = Some(process.clone());
                         state.lifecycle = LifecycleState::Active;
                         state.active_since = Some(Instant::now());
@@ -449,8 +462,9 @@ impl InstanceActor {
                     let _gate = self.lifecycle_gate.lock().await;
                     let handling = {
                         let mut state = self.state.lock().await;
-                        if state.process.as_ref().map(|live| live.generation)
-                            == Some(process.generation)
+                        if !state.shutting_down
+                            && state.process.as_ref().map(|live| live.generation)
+                                == Some(process.generation)
                         {
                             clear_process_state(&mut state);
                             state.failures.push_back(Instant::now());
@@ -620,7 +634,9 @@ impl InstanceActor {
             let _gate = actor.lifecycle_gate.lock().await;
             let handling = {
                 let mut state = actor.state.lock().await;
-                if state.lifecycle != LifecycleState::Active
+                // A process exiting because host shutdown stopped it is not a crash.
+                if state.shutting_down
+                    || state.lifecycle != LifecycleState::Active
                     || state.process.as_ref().map(|live| live.generation)
                         != Some(process.generation)
                 {
@@ -653,6 +669,11 @@ impl InstanceActor {
     }
 
     pub(crate) async fn shutdown(&self) {
+        // Mark shutdown before waiting for the lifecycle gate so failure monitors and
+        // in-flight (re)starts stop creating generations, then serialize with any
+        // lifecycle transition that is already running so its process is visible here.
+        self.state.lock().await.shutting_down = true;
+        let _gate = self.lifecycle_gate.lock().await;
         let process = self.state.lock().await.process.clone();
         if let Some(process) = process {
             process.shutdown().await;
