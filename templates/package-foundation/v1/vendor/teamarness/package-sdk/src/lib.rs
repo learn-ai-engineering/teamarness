@@ -23,7 +23,7 @@ pub use capability::CapabilityClient;
 pub use lifecycle::LifecycleOperation;
 use teamarness_package_protocol::{Frame, JsonValue};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Initialization values bound to the current process generation.
 #[derive(Debug, Clone)]
@@ -246,12 +246,17 @@ impl Package {
     {
         let (writer, control, data) = priority_writer::PriorityWriter::channels();
         let writer = Arc::new(writer);
-        let writer_task = tokio::spawn(priority_writer::run(output, control, data));
+        let (stop_writer, writer_stopped) = oneshot::channel();
+        let writer_task = tokio::spawn(priority_writer::run(output, control, data, writer_stopped));
         let (frames_tx, frames_rx) = mpsc::channel(64);
         let reader_task = tokio::spawn(reader::run(input, frames_tx));
         let result = dispatcher::run(self.backend, writer.clone(), frames_rx).await;
         reader_task.abort();
         drop(writer);
+        // Package-owned tasks may still hold `CapabilityClient` clones, which keep
+        // writer senders alive. Stop the writer explicitly so the session always
+        // ends once the dispatcher has returned (shutdown frame or parent closure).
+        let _ = stop_writer.send(());
         match writer_task.await {
             Ok(Ok(())) | Err(_) => result,
             Ok(Err(error)) => Err(error),

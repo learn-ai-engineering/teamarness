@@ -1,0 +1,311 @@
+//! Process-level lifeline tests for the real Conversations Backend executable.
+//!
+//! The Package Host normally reaps the process group, but a host crash, a
+//! `SIGKILL`ed desktop, or a dev-server restart leaves the Backend with only its
+//! stdin lifeline. These tests drive the binary directly over framed stdio and
+//! assert it exits promptly once the host goes away or asks it to shut down.
+
+#![cfg(unix)]
+
+#[allow(dead_code)]
+mod support;
+
+use std::io::{Read, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+use teamarness_package_host::{PackageIdentity, PackageInstanceKey, WorkspaceId};
+use teamarness_package_protocol::{Frame, FrameKind, decode_frame, encode_frame};
+
+const EXIT_DEADLINE: Duration = Duration::from_secs(5);
+const DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const RECORD_GRANT: &str = "cmVjb3JkLWdyYW50";
+
+// Every test here spawns Conversations Backends as children of this test process,
+// and `host_shutdown_reaps_active_backend` counts those children. Serialize the
+// tests so a sibling test's child is never mistaken for a leaked Backend.
+static CHILD_PROCESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct Backend {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    frames: mpsc::Receiver<Frame>,
+    _data: tempfile::TempDir,
+}
+
+impl Backend {
+    fn launch() -> Self {
+        let data = tempfile::tempdir().expect("data directory");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_teamarness-conversations-package"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn Conversations Backend");
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("stdout");
+        let (sender, frames) = mpsc::channel();
+        thread::spawn(move || read_frames(stdout, &sender));
+        let mut backend = Self {
+            child,
+            stdin,
+            frames,
+            _data: data,
+        };
+        let path = backend._data.path().to_string_lossy().into_owned();
+        backend.send(json!({
+            "kind": "initialize",
+            "nonce": "bm9uY2U",
+            "package": {
+                "identity": "dev.teamarness.conversations",
+                "version": "0.1.0",
+                "manifestDigest": DIGEST,
+                "backendDigest": DIGEST,
+            },
+            "uiContractDigest": DIGEST,
+            "processGeneration": "1",
+            "workspace": {"id": "workspace"},
+            "installation": {"identity": "installation"},
+            "dataDirectory": {"path": path, "continuityId": "Y29udGludWl0eQ"},
+            "protocol": {"major": 1, "minor": 0},
+            "capabilities": [{
+                "identity": "teamarness.synchronization.immutable-record-log",
+                "grant": RECORD_GRANT,
+            }],
+            "limits": {},
+        }));
+        backend.expect(
+            |frame| frame.kind() == FrameKind::Initialized,
+            "initialized",
+        );
+        backend
+    }
+
+    /// Activates the Package and waits until its synchronization session has opened
+    /// the long-lived immutable-record-log capability stream, as it does under the
+    /// real host.
+    fn activate_with_open_capability_stream(&mut self) {
+        self.send(json!({
+            "kind": "request",
+            "id": "h:lifecycle-activate-1",
+            "operation": "lifecycle.activate",
+            "deadlineUnixMs": "99999999999999",
+            "payload": {},
+        }));
+        let mut activated = false;
+        let mut stream_opened = false;
+        let deadline = Instant::now() + EXIT_DEADLINE;
+        while !(activated && stream_opened) {
+            let frame = self.next_frame(deadline).expect("activation frames");
+            match frame.kind() {
+                FrameKind::Response => activated = true,
+                FrameKind::Error => panic!("activation failed: {frame:?}"),
+                FrameKind::StreamOpen
+                    if frame.field("topic").and_then(Value::as_str)
+                        == Some("capability.stream") =>
+                {
+                    stream_opened = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn open_changes_stream(&mut self) {
+        self.send(json!({
+            "kind": "stream_open",
+            "id": "h:changes-1",
+            "topic": "conversations.changes",
+            "initialCredit": 32,
+            "payload": {},
+        }));
+        self.expect(
+            |frame| {
+                frame.kind() == FrameKind::Event
+                    && frame.field("streamId").and_then(Value::as_str) == Some("h:changes-1")
+            },
+            "initial conversations.changes event",
+        );
+    }
+
+    fn send(&mut self, value: Value) {
+        let frame = Frame::try_from(value).expect("valid frame");
+        let bytes = encode_frame(&frame).expect("encoded frame");
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        stdin.write_all(&bytes).expect("write frame");
+        stdin.flush().expect("flush frame");
+    }
+
+    fn next_frame(&self, deadline: Instant) -> Option<Frame> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.frames.recv_timeout(remaining).ok()
+    }
+
+    fn expect(&self, predicate: impl Fn(&Frame) -> bool, what: &str) {
+        let deadline = Instant::now() + EXIT_DEADLINE;
+        loop {
+            let frame = self
+                .next_frame(deadline)
+                .unwrap_or_else(|| panic!("timed out waiting for {what}"));
+            if predicate(&frame) {
+                return;
+            }
+        }
+    }
+
+    /// Simulates host death: the parent's end of the stdin pipe closes.
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    fn exits_within(&mut self, duration: Duration) -> bool {
+        let deadline = Instant::now() + duration;
+        loop {
+            if self.child.try_wait().expect("try_wait").is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn read_frames(mut stdout: ChildStdout, sender: &mpsc::Sender<Frame>) {
+    loop {
+        let mut prefix = [0_u8; 4];
+        if stdout.read_exact(&mut prefix).is_err() {
+            return;
+        }
+        let length = u32::from_be_bytes(prefix) as usize;
+        let mut bytes = prefix.to_vec();
+        bytes.resize(4 + length, 0);
+        if stdout.read_exact(&mut bytes[4..]).is_err() {
+            return;
+        }
+        let Ok(frame) = decode_frame(&bytes) else {
+            return;
+        };
+        if sender.send(frame).is_err() {
+            return;
+        }
+    }
+}
+
+#[test]
+fn backend_exits_when_host_dies_before_activation() {
+    let _serial = CHILD_PROCESS_LOCK.blocking_lock();
+    let mut backend = Backend::launch();
+    backend.close_stdin();
+    assert!(
+        backend.exits_within(EXIT_DEADLINE),
+        "Conversations Backend outlived its host before activation"
+    );
+}
+
+#[test]
+fn backend_exits_when_host_dies_with_active_synchronization_session() {
+    let _serial = CHILD_PROCESS_LOCK.blocking_lock();
+    let mut backend = Backend::launch();
+    backend.activate_with_open_capability_stream();
+    backend.open_changes_stream();
+    backend.close_stdin();
+    assert!(
+        backend.exits_within(EXIT_DEADLINE),
+        "Conversations Backend was orphaned after host death with an active session"
+    );
+}
+
+#[test]
+fn backend_exits_after_shutdown_frame_with_active_synchronization_session() {
+    let _serial = CHILD_PROCESS_LOCK.blocking_lock();
+    let mut backend = Backend::launch();
+    backend.activate_with_open_capability_stream();
+    backend.open_changes_stream();
+    backend.send(json!({"kind": "shutdown", "reason": "application_shutdown"}));
+    backend.expect(
+        |frame| frame.kind() == FrameKind::ShutdownAck,
+        "shutdown_ack",
+    );
+    // The host SIGTERMs the process group right after the acknowledgement. If the
+    // host dies in that window, closing stdin must be enough for the Backend to exit.
+    backend.close_stdin();
+    assert!(
+        backend.exits_within(EXIT_DEADLINE),
+        "Conversations Backend acknowledged shutdown but did not exit"
+    );
+}
+
+fn conversations_children() -> Vec<u32> {
+    let parent = std::process::id();
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,stat=,command="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let ppid = fields.next()?.parse::<u32>().ok()?;
+            let stat = fields.next()?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            (ppid == parent
+                && !stat.starts_with('Z')
+                && command.contains("teamarness-conversations-package"))
+            .then_some(pid)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_shutdown_reaps_active_backend() {
+    let _serial = CHILD_PROCESS_LOCK.lock().await;
+    let application = support::harness::StagedApplication::new();
+    let core_path = application.root.path().join("core");
+    let private = application.root.path().join("private");
+    let core = Arc::new(
+        CoreRuntime::open(CoreRuntimeConfig::new(&core_path))
+            .await
+            .unwrap(),
+    );
+    let workspace = core.create_workspace("Lifeline").unwrap();
+    let key = PackageInstanceKey::new(
+        PackageIdentity::from_str(support::harness::PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace.id().to_string()).unwrap(),
+    );
+    let host =
+        support::harness::open_host(&application.application_path, private, core.clone()).await;
+    let _mount = support::harness::open_mount(&host, &key).await;
+    let children = conversations_children();
+    assert_eq!(
+        children.len(),
+        1,
+        "expected one Conversations Backend child"
+    );
+
+    support::harness::shutdown(host).await;
+    let reaped = support::harness::poll_until(EXIT_DEADLINE, || async {
+        conversations_children().is_empty()
+    })
+    .await;
+    core.shutdown().await.unwrap();
+    assert!(
+        reaped,
+        "host shutdown left the Conversations Backend running"
+    );
+}

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use teamarness_package_protocol::{Frame, JsonValue, MAX_WRITER_BYTES, encode_frame};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::SdkError;
 
@@ -71,10 +71,17 @@ impl PriorityWriter {
     }
 }
 
+/// Writes queued frames until every sender is gone or `stop` fires.
+///
+/// Package-owned background work may keep `CapabilityClient` clones (and so
+/// writer senders) alive indefinitely, so the dispatcher's end of the session
+/// cannot rely on the channels closing. When `stop` fires, the writer flushes
+/// only frames already queued (such as `shutdown_ack`) and returns.
 pub(crate) async fn run<W>(
     mut output: W,
     mut control: mpsc::Receiver<QueuedFrame>,
     mut data: mpsc::Receiver<QueuedFrame>,
+    mut stop: oneshot::Receiver<()>,
 ) -> Result<(), SdkError>
 where
     W: AsyncWrite + Unpin,
@@ -82,17 +89,30 @@ where
     loop {
         let queued = tokio::select! {
             biased;
+            _ = &mut stop => {
+                while let Ok(queued) = control.try_recv().or_else(|_| data.try_recv()) {
+                    write(&mut output, &queued).await?;
+                }
+                return Ok(());
+            }
             value = control.recv() => value,
             value = data.recv() => value,
         };
         let Some(queued) = queued else {
             return Ok(());
         };
-        let bytes = encode_frame(&queued.frame).map_err(SdkError::protocol)?;
-        output
-            .write_all(&bytes)
-            .await
-            .map_err(|_| SdkError::ParentClosed)?;
-        output.flush().await.map_err(|_| SdkError::ParentClosed)?;
+        write(&mut output, &queued).await?;
     }
+}
+
+async fn write<W>(output: &mut W, queued: &QueuedFrame) -> Result<(), SdkError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let bytes = encode_frame(&queued.frame).map_err(SdkError::protocol)?;
+    output
+        .write_all(&bytes)
+        .await
+        .map_err(|_| SdkError::ParentClosed)?;
+    output.flush().await.map_err(|_| SdkError::ParentClosed)
 }
