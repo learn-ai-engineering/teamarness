@@ -1,7 +1,8 @@
-import type {
-  PackageClient,
-  PackageMountContext,
-  PackageUnmount,
+import {
+  installPackageUiKit,
+  type PackageClient,
+  type PackageMountContext,
+  type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
 
 export type Choice = Readonly<{ id: string; label: string }>;
@@ -24,15 +25,10 @@ type ReadResponse = Readonly<{
 
 const TUTORIAL_PACKAGE_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-  article { display: grid; gap: .9rem; padding: 1rem; }
-  h2, p { margin: 0; }
-  .controls { display: flex; flex-wrap: wrap; gap: .7rem; align-items: center; }
-  select, button { font: inherit; border-radius: var(--teamarness-radius-control); padding: .45rem .65rem; }
-  button { border: 0; background: var(--teamarness-color-accent); color: var(--teamarness-color-background); cursor: pointer; }
+  button { cursor: pointer; }
   .art { display: grid; grid-template-columns: repeat(16, 1.75rem); grid-auto-rows: 1.75rem; width: fit-content; max-width: 100%; overflow: auto; }
   .cell { display: grid; place-items: center; font-size: 1.25rem; line-height: 1; }
-  .error { color: var(--teamarness-color-danger, #b42318); min-height: 1.2em; }
-  .saved { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .error { margin: 0; color: var(--teamarness-color-danger, #b42318); min-height: 1.2em; }
   .saved button[aria-pressed="true"] { outline: 2px solid currentColor; }
 `;
 
@@ -190,16 +186,33 @@ export function createTutorialController(
 }
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const cleanupStyles = installTutorialStyles(context.root);
+  const cleanupKit = installPackageUiKit(context.root);
+  let cleanupStyles: () => void;
+  try {
+    cleanupStyles = installTutorialStyles(context.root);
+  } catch (error) {
+    cleanupKit();
+    throw error;
+  }
   const article = document.createElement("article");
-  const heading = document.createElement("h2");
+  article.className = "teamarness-page";
+  const header = document.createElement("header");
+  header.className = "teamarness-page-header";
+  const heading = document.createElement("h1");
+  heading.className = "teamarness-page-title";
   heading.textContent = context.package.displayName;
+  const subtitle = document.createElement("p");
+  subtitle.className = "teamarness-page-subtitle";
+  subtitle.textContent = "Generate emoji art and save the recipes you like.";
+  header.append(heading, subtitle);
+  const artSection = document.createElement("section");
+  artSection.className = "teamarness-section teamarness-stack";
   const controls = document.createElement("div");
-  controls.className = "controls";
+  controls.className = "controls teamarness-inline";
   const palette = selectControl("Palette");
   const algorithm = selectControl("Pattern");
-  const generate = button("Generate");
-  const save = button("Save");
+  const generate = button("Generate", "primary");
+  const save = button("Save", "secondary");
   controls.append(palette, algorithm, generate, save);
   const error = document.createElement("p");
   error.className = "error";
@@ -207,11 +220,16 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const grid = document.createElement("div");
   grid.className = "art";
   grid.setAttribute("role", "img");
-  const savedHeading = document.createElement("h3");
+  artSection.append(controls, error, grid);
+  const savedSection = document.createElement("section");
+  savedSection.className = "teamarness-section";
+  const savedHeading = document.createElement("h2");
+  savedHeading.className = "teamarness-section-title";
   savedHeading.textContent = "Saved art";
   const savedList = document.createElement("div");
-  savedList.className = "saved";
-  article.append(heading, controls, error, grid, savedHeading, savedList);
+  savedList.className = "saved teamarness-inline";
+  savedSection.append(savedHeading, savedList);
+  article.append(header, artSection, savedSection);
   context.root.append(article);
 
   const render = (state: TutorialState): void => {
@@ -236,7 +254,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     }
     savedList.replaceChildren();
     for (const artwork of state.artworks) {
-      const savedButton = button(`${labelFor(state.palettes, artwork.recipe.palette)} ${labelFor(state.algorithms, artwork.recipe.algorithm)} · ${artwork.id}`);
+      const savedButton = button(`${labelFor(state.palettes, artwork.recipe.palette)} ${labelFor(state.algorithms, artwork.recipe.algorithm)} · ${artwork.id}`, "secondary");
       savedButton.setAttribute("aria-pressed", String(artwork.id === state.selectedArtworkId));
       savedButton.addEventListener("click", () => { controller.selectArtwork(artwork.id); });
       savedList.append(savedButton);
@@ -265,11 +283,13 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     save.removeEventListener("click", onSave);
     article.remove();
     cleanupStyles();
+    cleanupKit();
   };
 }
 
 function selectControl(accessibleName: string): HTMLSelectElement {
   const select = document.createElement("select");
+  select.className = "teamarness-control";
   select.setAttribute("aria-label", accessibleName);
   return select;
 }
@@ -286,9 +306,10 @@ function replaceOptions(select: HTMLSelectElement, choices: readonly Choice[], s
   select.value = selected;
 }
 
-function button(text: string): HTMLButtonElement {
+function button(text: string, variant: "primary" | "secondary"): HTMLButtonElement {
   const element = document.createElement("button");
   element.type = "button";
+  element.className = `teamarness-control teamarness-control--${variant}`;
   element.textContent = text;
   return element;
 }

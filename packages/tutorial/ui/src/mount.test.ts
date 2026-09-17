@@ -99,7 +99,20 @@ describe("Tutorial UI mount", () => {
     expect(artwork?.children.every((cell) => cell.getAttribute("aria-hidden") === "true")).toBe(true);
   });
 
-  it("adopts and removes only its constructed stylesheet without creating inline styles", async () => {
+  it("renders a page header and sections from the Package UI kit", async () => {
+    const root = new FakeElement("shadow-root");
+    await mount(context(root));
+
+    const [title] = descendants(root, (element) => element.tagName === "h1");
+    expect(title?.className).toBe("teamarness-page-title");
+    expect(title?.textContent).toBe("Tutorial");
+    expect(descendants(root, (element) => element.tagName === "section" && element.className.includes("teamarness-section"))).toHaveLength(2);
+    const [savedTitle] = descendants(root, (element) => element.tagName === "h2");
+    expect(savedTitle?.className).toBe("teamarness-section-title");
+    expect(savedTitle?.textContent).toBe("Saved art");
+  });
+
+  it("adopts and removes only its constructed stylesheets without creating inline styles", async () => {
     const root = new FakeElement("shadow-root");
     const sheetBefore = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
     const sheetAfter = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
@@ -107,10 +120,12 @@ describe("Tutorial UI mount", () => {
 
     const unmount = await mount(context(root));
 
-    expect(root.adoptedStyleSheets).toHaveLength(2);
+    expect(root.adoptedStyleSheets).toHaveLength(3);
     expect(root.adoptedStyleSheets[0]).toBe(sheetBefore);
-    const tutorialSheet = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
-    expect(tutorialSheet.cssText).toMatch(/button\s*\{[^}]*color:\s*var\(--teamarness-color-background\)/);
+    const kitSheet = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
+    expect(kitSheet.cssText).toContain(".teamarness-page-title");
+    const tutorialSheet = root.adoptedStyleSheets[2] as unknown as FakeCSSStyleSheet;
+    expect(tutorialSheet.cssText).toMatch(/\.art\s*\{[^}]*grid-template-columns/);
     expect(descendants(root, (element) => element.tagName === "style")).toHaveLength(0);
 
     root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheetAfter];
