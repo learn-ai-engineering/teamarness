@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Package Foundation implementation is the current baseline; external Package authoring remains foundation-only while SDK publication policy is deferred. Phase 4, Conversations Package, is in progress.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. External Package authoring remains foundation-only while SDK publication policy is deferred. Current work runs in two parallel workstreams (see **Current work**); Phase 5 follows them.
 
 ## Phases
 
@@ -42,9 +42,9 @@ Completed on 2026-09-14. The Tauri Shell now mounts Package UIs, applies Workspa
 
 **External authoring condition:** production Package authoring requires published, versioned Rust and TypeScript SDK artifacts plus a supported generated-project upgrade policy. Vendored foundation projects are not upgraded in place, and no updater is provided.
 
-### Phase 4 - Conversations Package (implementation complete; verification in progress)
+### Phase 4 - Conversations Package (complete)
 
-Started on 2026-09-14. Core now owns the first generic Package-scoped Synchronization Capability: a durable, bounded immutable-record journal with production LogSync, authenticated sealed persistence, membership gates, durable wakes, and awaited lifecycle. The Conversations Package owns Channels, signed Markdown Messages, local schemas and projections, unread state, and its UI. Automated qualification covers encrypted two-profile synchronization, bounded history, persistence, Package composition, and delivery timing. Verify and Close remain before integration.
+Started on 2026-09-14. Core now owns the first generic Package-scoped Synchronization Capability: a durable, bounded immutable-record journal with production LogSync, authenticated sealed persistence, membership gates, durable wakes, and awaited lifecycle. The Conversations Package owns Channels, signed Markdown Messages, local schemas and projections, unread state, and its UI. Automated qualification covers encrypted two-profile synchronization, bounded history, persistence, Package composition, and delivery timing. Completed on 2026-09-17 after automated and manual verification with two packaged profiles, and integrated into `main`.
 
 **Outcome:** Two separately stored peers exchange encrypted Messages and Channels through the Conversations Package UI without Conversations-specific Core, Host, or Shell routes.
 
@@ -52,19 +52,37 @@ Started on 2026-09-14. Core now owns the first generic Package-scoped Synchroniz
 
 ### Phase 5 - Membership Management and Hardening
 
-Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. This phase also resolves whether recognizable remote-member names are local aliases or signed shared Installation or human profile data.
+Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. Recognizable member names move to the Shell and Package UI workstream (see **Current work** and `TEAM-DQ8`); this phase extends that model to multiple devices per human identity.
 
 **Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member sees only post-admission content, and packages rotate keys after membership transitions.
 
 **Depends on:** Phase 4.
 
-### Phase 6 - Repository Integration
+### Phase 6 - Repository Integration (complete)
 
 Repository registration, local Git reading, and repository-backed package views. Teamarness does not replicate repository content. Iroh is not used for Git transport. Git remains the sole repository transport.
 
 **Outcome:** A user registers a local clone and a package renders repository-derived context.
 
+Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) registers local Git checkouts, validates and deduplicates their paths, and renders a refreshable snapshot showing path, origin, GitHub URL, branch, commit, and working-tree state. Registrations persist across restarts. It reads Git locally through `gix` and does not synchronize registrations between peers. `02-system/06-repos/requirements.md` still contains only a placeholder summary.
+
 **Depends on:** Phase 3.
+
+## Current work
+
+These two workstreams run in parallel on separate branches and worktrees. Phase 5 starts after them.
+
+### Shell and Package UI polish, with member names
+
+Branch `ui-polish-member-names`. Fix UI defects and polish the Shell, the Conversations and Repo-aware Package UIs, the Package UI SDK, and theming. It also lets each person give a first name when they create or join a Workspace, and shows that name to every other Member. Names replace the temporary adjective-animal aliases. This work resolves `TEAM-DQ8` for one Installation per person.
+
+**Outcome:** Members recognize each other by name across the Shell and Packages, invitation acceptance is reliably reachable, and the collected UI defects are fixed.
+
+### Comprehensive code and architecture review
+
+Branch `architecture-review`. Review the whole system now that several Packages exist, covering architecture, code quality, synchronization, security, and how easy it is to author a Package. Findings become recorded decisions, open questions, deltas, or follow-up workstreams.
+
+**Outcome:** A prioritized, evidence-backed findings report and an agreed remediation sequence.
 
 ## Maintenance rule
 

@@ -30,4 +30,4 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 
 ## Current state
 
-The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, and Package Foundation are complete. Phase 4, Conversations Package, is in progress. See `roadmap.md` for phase status and `open-questions.md` for unresolved design questions.
+The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, Package Foundation, Conversations Package, and Repository Integration are complete. Shell and Package UI polish with member names, and a comprehensive code and architecture review, are in progress. See `roadmap.md` for phase status and `open-questions.md` for unresolved design questions.

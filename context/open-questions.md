@@ -76,7 +76,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## TEAM-DQ8 - Recognizable remote-member names
 
-**Blocks:** Phase 5 member presentation, human identity, and multi-device design
+**Blocks:** Member presentation in the Shell and Packages; Phase 5 human identity and multi-device design
 
 **Question:** When a Workspace displays a remote Member, should its recognizable name be a local alias, a signed Installation Display Name shared with peers, a future human profile name, or a combination with explicit precedence?
 
@@ -84,4 +84,6 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **What must be resolved:** Define who owns and signs a name, whether it is local or shared, its privacy boundary, rename and conflict behavior, offline convergence, multi-device presentation, and the fallback when no trusted name exists. A display name or alias must never become membership or authorization authority.
 
-**Intended destination:** Phase 5, Membership Management and Hardening. Do not add name propagation to Phase 2 closeout.
+**Direction (2026-09-17, developer):** Teams using Teamarness know each other, so each person gives a single name field (typically a first name, with no surname) when creating or joining a Workspace, and every other Member sees that name. Generated adjective-animal aliases are temporary and will be removed. Ownership, signing, rename, conflict, and fallback rules remain to be designed.
+
+**Intended destination:** The Shell and Package UI polish workstream (`ui-polish-member-names`) resolves this for one Installation per person. Phase 5 extends it to multiple devices.
