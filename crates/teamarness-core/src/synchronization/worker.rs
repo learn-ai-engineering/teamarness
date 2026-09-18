@@ -57,6 +57,16 @@ pub(crate) trait SessionRunner: Send + Sync + 'static {
 }
 
 /// The production runner: real sessions over the shared Endpoint.
+/// The last record-session reports one Installation ran.
+#[cfg(test)]
+pub(crate) type SessionReports = Arc<
+    Mutex<std::collections::VecDeque<(PublicIdentity, crate::synchronization::ExchangeReport)>>,
+>;
+
+/// How many session reports a test can look back over.
+#[cfg(test)]
+const REPORT_RING: usize = 64;
+
 pub(crate) struct NetworkSessionRunner {
     network: Arc<Transport>,
     services: SyncServices,
@@ -64,6 +74,8 @@ pub(crate) struct NetworkSessionRunner {
     demand: Arc<MembershipDemand>,
     state: Weak<Mutex<RuntimeState>>,
     local: PublicIdentity,
+    #[cfg(test)]
+    reports: SessionReports,
 }
 
 impl NetworkSessionRunner {
@@ -74,6 +86,7 @@ impl NetworkSessionRunner {
         demand: Arc<MembershipDemand>,
         state: Weak<Mutex<RuntimeState>>,
         local: PublicIdentity,
+        #[cfg(test)] reports: SessionReports,
     ) -> Self {
         Self {
             network,
@@ -82,6 +95,8 @@ impl NetworkSessionRunner {
             demand,
             state,
             local,
+            #[cfg(test)]
+            reports,
         }
     }
 
@@ -111,6 +126,8 @@ impl SessionRunner for NetworkSessionRunner {
         let demand = Arc::clone(&self.demand);
         let state = Weak::clone(&self.state);
         let local = self.local;
+        #[cfg(test)]
+        let reports = Arc::clone(&self.reports);
         Box::pin(async move {
             let runner = Self {
                 network,
@@ -119,6 +136,8 @@ impl SessionRunner for NetworkSessionRunner {
                 demand,
                 state,
                 local,
+                #[cfg(test)]
+                reports,
             };
             let peer = job.key.peer();
             let workspace = job.key.workspace();
@@ -153,7 +172,13 @@ impl SessionRunner for NetworkSessionRunner {
                         *peer,
                     );
                     tokio::select! {
-                        result = session => record_outcome(&job.key, result),
+                        result = session => {
+                            #[cfg(test)]
+                            if let Ok(report) = &result {
+                                push_report(&runner.reports, *peer, *report);
+                            }
+                            record_outcome(&job.key, result)
+                        }
                         _ = stop.changed() => SessionOutcome::Cancelled,
                     }
                 }
@@ -177,6 +202,22 @@ impl SessionRunner for NetworkSessionRunner {
             outcome
         })
     }
+}
+
+/// Keeps the last reports a test can look back over.
+#[cfg(test)]
+fn push_report(
+    reports: &SessionReports,
+    peer: PublicIdentity,
+    report: crate::synchronization::ExchangeReport,
+) {
+    let mut reports = reports
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reports.len() >= REPORT_RING {
+        reports.pop_front();
+    }
+    reports.push_back((peer, report));
 }
 
 /// Tells the health registry what one record session saw of its peer.

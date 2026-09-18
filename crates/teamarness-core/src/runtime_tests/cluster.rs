@@ -237,6 +237,15 @@ impl SyncCluster {
         ids
     }
 
+    /// How many records one node's journal holds, without decrypting any.
+    pub(super) fn record_count(&self, name: &str, workspace: WorkspaceId, package: &str) -> usize {
+        if !self.is_running(name) {
+            return 0;
+        }
+        self.node(name)
+            .committed_record_count_for_test(workspace, package)
+    }
+
     /// Polls `check` until it holds, waking every live node's worker each second.
     pub(super) async fn wait_until(
         &self,

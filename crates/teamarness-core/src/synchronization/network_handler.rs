@@ -660,6 +660,9 @@ pub(crate) struct LogSyncHandler {
     inbound: Arc<Semaphore>,
     per_peer: Arc<Mutex<HashMap<PublicIdentity, usize>>>,
     active: Arc<AtomicUsize>,
+    /// How many inbound sessions each peer has been given a slot for, ever.
+    #[cfg(test)]
+    accepted: Arc<Mutex<HashMap<PublicIdentity, usize>>>,
     services: SyncServices,
     limits: SessionLimits,
 }
@@ -679,6 +682,8 @@ impl LogSyncHandler {
             inbound: Arc::new(Semaphore::new(limits.inbound_sessions)),
             per_peer: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            accepted: Arc::new(Mutex::new(HashMap::new())),
             services,
             limits,
         }
@@ -692,6 +697,17 @@ impl LogSyncHandler {
     #[cfg(test)]
     pub(crate) fn active_for_test(&self) -> usize {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// How many inbound sessions this peer has ever been given a slot for.
+    #[cfg(test)]
+    pub(crate) fn accepted_from_for_test(&self, peer: PublicIdentity) -> usize {
+        self.accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&peer)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Takes an inbound slot and a per-peer slot, or names which bound refused.
@@ -708,6 +724,15 @@ impl LogSyncHandler {
             *count += 1;
         }
         self.active.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        {
+            *self
+                .accepted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(peer)
+                .or_insert(0) += 1;
+        }
         Ok(InboundSlot {
             per_peer: Arc::clone(&self.per_peer),
             active: Arc::clone(&self.active),

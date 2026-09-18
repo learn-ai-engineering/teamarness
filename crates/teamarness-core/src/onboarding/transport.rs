@@ -143,6 +143,15 @@ impl Transport {
         self.network.inbound_package_sessions_for_test()
     }
 
+    /// How many inbound sessions one peer has ever been given a slot for.
+    #[cfg(test)]
+    pub(crate) fn inbound_package_sessions_from_for_test(
+        &self,
+        peer: crate::PublicIdentity,
+    ) -> usize {
+        self.network.inbound_package_sessions_from_for_test(peer)
+    }
+
     pub(crate) fn endpoint_id(&self) -> iroh_base::PublicKey {
         self.network.endpoint_id()
     }

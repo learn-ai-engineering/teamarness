@@ -608,6 +608,8 @@ pub struct CoreRuntime {
     /// What recent sessions said about reaching each peer, per scope.
     health: Arc<crate::synchronization::SyncHealthRegistry>,
     #[cfg(test)]
+    session_reports: crate::synchronization::worker::SessionReports,
+    #[cfg(test)]
     membership_replica: Arc<dyn crate::membership_sync::MembershipReplica>,
     #[cfg(test)]
     membership_paused: Arc<std::sync::atomic::AtomicBool>,
@@ -1437,6 +1439,8 @@ impl CoreRuntime {
         // Recovery has completed before the worker is started. The worker owns
         // wake consumption and scheduling, while all network awaits happen
         // outside the runtime state mutex.
+        #[cfg(test)]
+        let session_reports: crate::synchronization::worker::SessionReports = Arc::default();
         let runner = crate::synchronization::worker::NetworkSessionRunner::new(
             Arc::clone(&transport),
             services,
@@ -1444,6 +1448,8 @@ impl CoreRuntime {
             Arc::clone(&demand),
             Arc::downgrade(&state),
             public_identity,
+            #[cfg(test)]
+            Arc::clone(&session_reports),
         );
         let sync_worker = crate::synchronization::SyncWorker::start(
             sync_wake,
@@ -1463,6 +1469,8 @@ impl CoreRuntime {
             membership_demand: demand,
             health,
             #[cfg(test)]
+            session_reports,
+            #[cfg(test)]
             membership_replica,
             #[cfg(test)]
             membership_paused,
@@ -1477,6 +1485,66 @@ impl CoreRuntime {
     #[cfg(test)]
     pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
         self.transport.inbound_package_sessions_for_test()
+    }
+
+    /// How many records one scope's delivery journal holds.
+    ///
+    /// Counting rows is cheap; a test that polls until convergence must not
+    /// decrypt the whole journal on every pass.
+    #[cfg(test)]
+    pub(crate) fn committed_record_count_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+    ) -> usize {
+        let state = self.state.lock().expect("test runtime state");
+        let scope = crate::synchronization::scope_digest(package_identity, workspace_id);
+        state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM record_delivery WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| usize::try_from(count).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Opens a package synchronization connection and stops before the Hello,
+    /// or reports that the responder refused the stream.
+    #[cfg(test)]
+    pub(crate) async fn try_hold_package_sync_before_hello_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+    ) -> Option<(iroh::endpoint::Connection, iroh::endpoint::SendStream)> {
+        let connection = self
+            .transport
+            .endpoint()
+            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .await
+            .ok()?;
+        let (mut send, _receive) = connection.open_bi().await.ok()?;
+        send.write_all(&64_u32.to_be_bytes()).await.ok()?;
+        Some((connection, send))
+    }
+
+    /// How many inbound sessions one peer has ever been given a slot for.
+    #[cfg(test)]
+    pub(crate) fn inbound_sessions_from_for_test(&self, peer: PublicIdentity) -> usize {
+        self.transport.inbound_package_sessions_from_for_test(peer)
+    }
+
+    /// The last record-session reports this Installation ran, newest last.
+    #[cfg(test)]
+    pub(crate) fn session_reports_for_test(
+        &self,
+    ) -> Vec<(PublicIdentity, crate::synchronization::ExchangeReport)> {
+        self.session_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// What the restart that opened this runtime validated and isolated.

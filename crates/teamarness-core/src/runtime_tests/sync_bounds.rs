@@ -342,6 +342,15 @@ async fn corrupt_projection_row_fails_the_range_and_quarantines_the_scope() {
     cluster.finish().await;
 }
 
+/// A 64-byte record body that is unique for each index.
+///
+/// Appends are content-idempotent, so identical bytes would commit one record.
+fn body(index: u16) -> Vec<u8> {
+    let mut bytes = index.to_be_bytes().to_vec();
+    bytes.resize(64, 7);
+    bytes
+}
+
 /// Stops scheduling on the named nodes, so only explicit sessions run.
 fn pause_scheduling(cluster: &SyncCluster, names: &[&str]) {
     for name in names {
@@ -471,5 +480,270 @@ async fn catching_up_is_reported_between_truncated_sessions() {
         !states.contains(&crate::SyncAvailability::Offline),
         "the only peer answered every session: {states:?}"
     );
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catch_up_of_5000_records_converges_across_bounded_sessions() {
+    let cluster = SyncCluster::start("catch-up-5000", &["a", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("Large").unwrap();
+    let id = workspace.id();
+    let started = std::time::Instant::now();
+    for index in 0..5_000_u16 {
+        // Appends are content-idempotent, so every record's bytes differ.
+        cluster
+            .node("a")
+            .append_record(id, PACKAGE, "message.post", &body(index))
+            .unwrap();
+    }
+    let appended = started.elapsed();
+    assert_eq!(cluster.record_count("a", id, PACKAGE), 5_000);
+    cluster.admit("a", "b", id).await;
+
+    let converged = std::time::Instant::now();
+    cluster
+        .wait_until("b holds every record", Duration::from_secs(90), |c| {
+            c.record_count("b", id, PACKAGE) == 5_000
+        })
+        .await;
+    println!(
+        "5000-record catch-up: appended in {appended:?}, converged in {:?}",
+        converged.elapsed()
+    );
+
+    let reports = cluster.node("a").session_reports_for_test();
+    let b = cluster.identity("b");
+    let truncated = reports
+        .iter()
+        .filter(|(peer, report)| *peer == b && report.sent_truncated)
+        .count();
+    assert!(
+        truncated >= 2,
+        "a backlog above one session's bound continues in later sessions: {reports:?}"
+    );
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_large_backlogs_converge_in_both_directions() {
+    let mut cluster = SyncCluster::start("both-directions", &["a", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("Both ways").unwrap();
+    let id = workspace.id();
+    // The scope must exist before B is admitted, or B never receives a content
+    // key and its own appends have nowhere to land.
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"seed")
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .wait_until("b holds the seed record", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 2 && c.record_count("b", id, PACKAGE) == 1
+        })
+        .await;
+    cluster.stop("b").await;
+    for index in 0..3_000_u16 {
+        cluster
+            .node("a")
+            .append_record(id, PACKAGE, "message.post", &body(index))
+            .unwrap();
+    }
+    cluster.stop("a").await;
+    cluster.restart("b").await;
+    for index in 0..3_000_u16 {
+        cluster
+            .node("b")
+            .append_record(id, PACKAGE, "message.post", &body(index))
+            .unwrap();
+    }
+    cluster.restart("a").await;
+
+    cluster
+        .wait_until(
+            "both installations hold every record",
+            Duration::from_secs(90),
+            |c| {
+                c.record_count("a", id, PACKAGE) == 6_001
+                    && c.record_count("b", id, PACKAGE) == 6_001
+            },
+        )
+        .await;
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_member_connection_flood_is_refused_without_reading() {
+    let cluster = SyncCluster::start("connection-flood", &["a", "x"]).await;
+    let workspace = cluster.node("a").create_workspace("Flood").unwrap();
+    let id = workspace.id();
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"before")
+        .unwrap();
+
+    let address = cluster.address("a");
+    let mut held = Vec::new();
+    for _ in 0..20 {
+        // A refused stream is the point: the responder bounds concurrency
+        // before it reads anything, and X is not even a Member.
+        if let Some(connection) = cluster
+            .node("x")
+            .try_hold_package_sync_before_hello_for_test(address.clone())
+            .await
+        {
+            held.push(connection);
+        }
+    }
+    // The connections exist on X's side either way; what matters is how many
+    // the responder let into a session.
+    assert!(
+        cluster.node("a").inbound_package_sessions_for_test() <= 8,
+        "the responder never holds more than its inbound bound"
+    );
+    let accepted = cluster
+        .node("a")
+        .inbound_sessions_from_for_test(cluster.identity("x"));
+    assert!(
+        accepted <= 2,
+        "one peer never gets more than its per-peer bound: {accepted} accepted"
+    );
+
+    // A local append is not delayed by the flood. The bound is failure only.
+    let started = std::time::Instant::now();
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"during")
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the flood did not delay a local append"
+    );
+
+    // Every accepted session is closed by the hello timeout, so the slots free
+    // even though X never says anything.
+    let expiry = std::time::Instant::now() + Duration::from_secs(10);
+    while cluster.node("a").inbound_package_sessions_for_test() > 0 {
+        assert!(
+            cluster.node("a").inbound_package_sessions_for_test() <= 8,
+            "the inbound bound holds for as long as the flood does"
+        );
+        assert!(
+            std::time::Instant::now() < expiry,
+            "a silent peer holds a slot for at most the hello timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(held);
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07, TEAM.SYS.MEM-R06
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_during_backoff_prevents_redial() {
+    let mut cluster = SyncCluster::start("revoke-in-backoff", &["a", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("Revoked").unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 2
+        })
+        .await;
+    cluster.stop("b").await;
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"while away")
+        .unwrap();
+    // A's jobs to B now fail and back off.
+    cluster
+        .wait_until("a has failed to reach b", DEFAULT_DEADLINE, |c| {
+            c.node("a")
+                .scheduler_snapshot_for_test()
+                .iter()
+                .any(|peer| peer.peer == c.identity("b") && peer.failures >= 1)
+        })
+        .await;
+
+    cluster
+        .node("a")
+        .revoke_member(id, cluster.identity("b"))
+        .unwrap();
+    cluster.restart("b").await;
+    cluster
+        .node("b")
+        .pause_membership_replication_for_test(true);
+    let b = cluster.identity("b");
+    let before = cluster
+        .node("b")
+        .inbound_sessions_from_for_test(cluster.identity("a"));
+
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        cluster.node("a").sync_now_for_test();
+        assert!(
+            cluster
+                .node("a")
+                .scheduler_snapshot_for_test()
+                .iter()
+                .all(|peer| peer.peer != b),
+            "a revoked peer is not scheduled"
+        );
+        assert_eq!(
+            cluster
+                .node("b")
+                .inbound_sessions_from_for_test(cluster.identity("a")),
+            before,
+            "a revoked peer is never dialled out of backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_is_prompt_with_pending_backoff_and_an_inbound_session() {
+    let mut cluster = SyncCluster::start("prompt-shutdown", &["a", "b", "c"]).await;
+    let workspace = cluster.node("a").create_workspace("Shutdown").unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster.admit("a", "c", id).await;
+    cluster
+        .wait_until("both members hold the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 3 && c.members("c", id).len() == 3
+        })
+        .await;
+    // C goes away, so A's jobs to C fail and back off.
+    cluster.stop("c").await;
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"pending")
+        .unwrap();
+    cluster
+        .wait_until("a has failed to reach c", DEFAULT_DEADLINE, |c| {
+            c.node("a")
+                .scheduler_snapshot_for_test()
+                .iter()
+                .any(|peer| peer.peer == c.identity("c") && peer.failures >= 1)
+        })
+        .await;
+
+    // B holds an inbound session on A open while the shutdown starts.
+    let held = cluster
+        .node("b")
+        .hold_package_sync_before_hello_for_test(cluster.address("a"))
+        .await;
+
+    let started = std::time::Instant::now();
+    cluster.stop("a").await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown does not wait out backoff or an idle inbound session: {elapsed:?}"
+    );
+    drop(held);
     cluster.finish().await;
 }

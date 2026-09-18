@@ -210,6 +210,15 @@ impl Network {
         self.log_sync.active_for_test()
     }
 
+    /// How many inbound sessions one peer has ever been given a slot for.
+    #[cfg(test)]
+    pub(crate) fn inbound_package_sessions_from_for_test(
+        &self,
+        peer: crate::PublicIdentity,
+    ) -> usize {
+        self.log_sync.accepted_from_for_test(peer)
+    }
+
     #[cfg(test)]
     pub(crate) fn alpns(&self) -> &[Vec<u8>] {
         &self.alpns
