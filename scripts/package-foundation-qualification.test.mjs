@@ -174,6 +174,13 @@ test("packaged smoke waits for Package navigation and captures safe timeout diag
   assert.match(source, /lastAccessibilityFailure/);
   assert.match(source, /childProcessTable/);
   assert.match(source, /stdio:\s*\["ignore",\s*"pipe",\s*"pipe"\]/);
+
+  const probeNavigation = source.indexOf('"UI isolation probe navigation"');
+  const probeResult = source.indexOf('"UI isolation probe result"');
+  assert.ok(probeNavigation > backendWait, "the isolation probe launch must follow the bundled Backend inspection");
+  assert.ok(probeResult > probeNavigation, "the isolation probe must navigate before reading its verdict");
+  assert.match(source, /prepareUiIsolationProbe/);
+  assert.match(source, /ui-isolation-breach/);
 });
 
 test("generated foundation and bundled Package policies remain independent", async () => {

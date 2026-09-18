@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { STAGING_ROOT, readBundledPackages, repositoryRoot } from "./bundled-packages.mjs";
 import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 import { compareDeclaredPackageBytes } from "./package-directory.mjs";
+import { prepareUiIsolationProbe } from "./ui-isolation-probe/prepare.mjs";
 
 const app = join(repositoryRoot, "target/release/bundle/macos/Teamarness.app");
 const executable = join(app, "Contents/MacOS/teamarness-desktop");
@@ -37,14 +38,18 @@ const dataDirectory = await mkdtemp(join(tmpdir(), "teamarness-packaged-smoke-")
 try {
   await smokeLaunch(dataDirectory, true);
   await smokeLaunch(dataDirectory, false);
-  console.log("Packaged app smoke passed twice with admitted UI, protocol traffic, and clean process reaping.");
+  await probeLaunch(dataDirectory);
+  console.log(
+    "Packaged app smoke passed twice with admitted UI, protocol traffic, and clean process reaping, "
+    + "and the WKWebView UI isolation probe reached neither Tauri nor the Shell.",
+  );
 } finally {
   await chmod(dataDirectory, 0o700).catch(() => {});
   await makeWritable(dataDirectory);
   await rm(dataDirectory, { recursive: true, force: true });
 }
 
-async function smokeLaunch(dataDirectory, createWorkspace) {
+async function withDesktop(dataDirectory, body) {
   const appStdout = createBoundedOutput();
   const appStderr = createBoundedOutput();
   const diagnostics = {
@@ -82,6 +87,40 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
 
   try {
     childPid = await atStage("desktop process", () => waitFor(() => desktop.pid, "desktop process"));
+    return await body({ childPid, desktop, diagnostics, atStage, waitForAccessible, backendPids });
+  } finally {
+    if (childPid && processExists(childPid)) desktop.kill("SIGTERM");
+    await waitForDesktopCleanup(
+      () => atStage("desktop cleanup", () => waitForExit(desktop, "desktop cleanup")),
+      (signal) => desktop.kill(signal),
+    );
+    for (const backendPid of backendPids) {
+      await atStage("Package process cleanup", () =>
+        waitFor(() => !processExists(backendPid), `Package process ${backendPid} cleanup`, 5_000));
+    }
+  }
+}
+
+async function quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids }) {
+  diagnostics.activeStage = "desktop shutdown request";
+  await runAppleScript(`
+    tell application "System Events"
+      set appProcess to first process whose unix id is ${childPid}
+      tell appProcess
+        set frontmost to true
+        keystroke "q" using command down
+      end tell
+    end tell
+  `, "desktop shutdown");
+  await atStage("desktop graceful shutdown", () => waitForExit(desktop, "desktop graceful shutdown"));
+  for (const backendPid of backendPids) {
+    await atStage("Package process reaping", () =>
+      waitFor(() => !processExists(backendPid), `Package process ${backendPid} reaping`));
+  }
+}
+
+async function smokeLaunch(dataDirectory, createWorkspace) {
+  await withDesktop(dataDirectory, async ({ childPid, desktop, diagnostics, atStage, waitForAccessible, backendPids }) => {
     await waitForAccessible(accessibilityScript(childPid, `
       return name of window 1
     `), "desktop window");
@@ -179,32 +218,88 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
         && visible.includes("Increment counter");
     }, "custom-scheme Package UI"));
 
-    diagnostics.activeStage = "desktop shutdown request";
-    await runAppleScript(`
-      tell application "System Events"
-        set appProcess to first process whose unix id is ${childPid}
-        tell appProcess
-          set frontmost to true
-          keystroke "q" using command down
-        end tell
-      end tell
-    `, "desktop shutdown");
-    await atStage("desktop graceful shutdown", () => waitForExit(desktop, "desktop graceful shutdown"));
-    for (const backendPid of backendPids) {
-      await atStage("Package process reaping", () =>
-        waitFor(() => !processExists(backendPid), `Package process ${backendPid} reaping`));
-    }
-  } finally {
-    if (childPid && processExists(childPid)) desktop.kill("SIGTERM");
-    await waitForDesktopCleanup(
-      () => atStage("desktop cleanup", () => waitForExit(desktop, "desktop cleanup")),
-      (signal) => desktop.kill(signal),
-    );
-    for (const backendPid of backendPids) {
-      await atStage("Package process cleanup", () =>
-        waitFor(() => !processExists(backendPid), `Package process ${backendPid} cleanup`, 5_000));
-    }
+    await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });
+  });
+}
+
+async function probeLaunch(dataDirectory) {
+  const { displayName } = await prepareUiIsolationProbe(dataDirectory);
+  await withDesktop(dataDirectory, async ({ childPid, desktop, diagnostics, atStage, waitForAccessible, backendPids }) => {
+    await waitForAccessible(accessibilityScript(childPid, `
+      set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
+      return name of workspaceSwitcher
+    `), "desktop Shell readiness");
+
+    await waitForAccessible(accessibilityScript(childPid, `
+      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
+      set personalPackages to my namedDescendant(activeWorkspaceNavigation, "Personal Packages", "AXGroup")
+      set probePackage to my namedDescendantStartingWith(personalPackages, "${displayName}", "AXButton")
+      return name of probePackage
+    `), "UI isolation probe navigation");
+    diagnostics.activeStage = "UI isolation probe selection";
+    await runAppleScript(accessibilityScript(childPid, `
+      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
+      set personalPackages to my namedDescendant(activeWorkspaceNavigation, "Personal Packages", "AXGroup")
+      set probePackage to my namedDescendantStartingWith(personalPackages, "${displayName}", "AXButton")
+      click probePackage
+    `), "UI isolation probe selection");
+
+    await atStage("UI isolation probe result", () => waitFor(async () => {
+      const contents = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
+        set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
+        set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
+        return entire contents of packageInterface
+      `)], { encoding: "utf8" });
+      if (contents.status !== 0) {
+        diagnostics.lastAccessibilityFailure = appleScriptFailure(contents);
+        return undefined;
+      }
+      if (contents.stdout.includes("Isolation probe FAIL")) {
+        const failed = contents.stdout.split(",")
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.endsWith(": fail"));
+        throw new Error(`The packaged UI isolation probe failed: ${failed.join(", ") || contents.stdout.trim()}`);
+      }
+      return contents.stdout.includes("Isolation probe PASS");
+    }, "UI isolation probe result"));
+
+    await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });
+  });
+
+  const database = await findCoreDatabase(dataDirectory);
+  assert.equal(
+    countWorkspaces(database, "name LIKE 'ui-isolation-breach%'"),
+    0,
+    "a Package UI Frame reached a Shell command in the packaged application",
+  );
+  assert.equal(
+    countWorkspaces(database, "name = 'Packaged smoke'"),
+    1,
+    "the isolation probe database check did not observe the smoke Workspace",
+  );
+}
+
+async function findCoreDatabase(dataDirectory, depth = 0) {
+  if (depth > 4) return undefined;
+  const entries = await readdir(dataDirectory, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name === "core.sqlite3") return join(dataDirectory, entry.name);
   }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const found = await findCoreDatabase(join(dataDirectory, entry.name), depth + 1);
+    if (found) return found;
+  }
+  if (depth === 0) throw new Error("The packaged smoke found no core.sqlite3 under its data directory");
+  return undefined;
+}
+
+function countWorkspaces(database, predicate) {
+  const result = spawnSync("sqlite3", ["-readonly", database, `SELECT count(*) FROM workspaces WHERE ${predicate}`], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error("The packaged smoke could not read the Core database");
+  return Number(result.stdout.trim());
 }
 
 async function inspectDmg() {
