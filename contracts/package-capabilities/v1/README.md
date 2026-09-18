@@ -57,6 +57,11 @@ State events report `waiting_for_history_access`, `offline`, `catching_up`,
 codes. Every event consumes credit. A Package commits the cursor with its
 projection and may safely deduplicate a replay by `recordId`.
 
+If `afterCursor` belongs to another delivery journal or is ahead of the journal,
+the Host closes the stream with code `cursor_invalid`. The Package must clear its
+stored cursor and subscribe again from `null`; replayed records are deduplicated
+by `recordId`.
+
 ### `open`
 
 `{ "sealedRecords": [...] }` accepts 1–32 versioned envelopes and no more than

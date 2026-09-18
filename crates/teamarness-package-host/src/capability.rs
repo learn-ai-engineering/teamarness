@@ -17,6 +17,8 @@ const SIGNING_CONTEXT: &str = "package-signing/v1";
 const MAX_PURPOSE_BYTES: usize = 64;
 const MAX_SIGNING_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_STREAM_CREDIT: u64 = 32;
+/// The largest record page one blocking read may return, matching Core's bound.
+const RECORD_PAGE: u64 = 32;
 
 /// The Host-wide bound on concurrent blocking Core work for Package capability
 /// calls.
@@ -726,6 +728,45 @@ enum StreamCommand {
     Close,
 }
 
+/// Applies every queued stream command. Returns `false` when the stream must
+/// end.
+async fn drain_commands(commands: &mut mpsc::Receiver<StreamCommand>, credit: &mut u64) -> bool {
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            StreamCommand::Credit(amount) => {
+                *credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+            }
+            StreamCommand::Close => return false,
+        }
+    }
+    true
+}
+
+/// Waits for credit, a close, or generation cancellation. Returns `false` when
+/// the stream must end.
+async fn await_credit(
+    commands: &mut mpsc::Receiver<StreamCommand>,
+    credit: &mut u64,
+    cancelled: &mut watch::Receiver<bool>,
+) -> bool {
+    while *credit == 0 {
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(StreamCommand::Credit(amount)) => {
+                    *credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+                }
+                Some(StreamCommand::Close) | None => return false,
+            },
+            result = cancelled.changed() => {
+                if result.is_err() || *cancelled.borrow() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_membership_stream(
     core: Arc<CoreRuntime>,
@@ -738,27 +779,40 @@ async fn run_membership_stream(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let watch_core = core.clone();
+    let opened =
+        tokio::task::spawn_blocking(move || watch_core.membership_epoch_watch(workspace)).await;
+    let mut epochs = match opened {
+        Ok(Ok(receiver)) => receiver,
+        _ => {
+            streams.lock().await.remove(&stream_id);
+            let _ = output.close(&stream_id, "capability_unavailable").await;
+            return;
+        }
+    };
     let mut sequence = 0_u64;
     loop {
         if *cancelled.borrow() {
             break;
         }
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                StreamCommand::Credit(amount) => {
-                    credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
-                }
-                StreamCommand::Close => {
-                    streams.lock().await.remove(&stream_id);
-                    return;
-                }
-            }
+        if !drain_commands(&mut commands, &mut credit).await
+            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
+        {
+            streams.lock().await.remove(&stream_id);
+            return;
         }
-        while credit == 0 {
+        // The epoch is the only thing that says a transition exists, so the
+        // stream waits on it instead of reopening a subscription on a timer.
+        if *epochs.borrow_and_update() <= after_epoch {
             tokio::select! {
+                changed = epochs.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
                 command = commands.recv() => match command {
                     Some(StreamCommand::Credit(amount)) => {
-                        credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
+                        credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
                     }
                     Some(StreamCommand::Close) | None => {
                         streams.lock().await.remove(&stream_id);
@@ -772,14 +826,15 @@ async fn run_membership_stream(
                     }
                 }
             }
+            continue;
         }
-        let core_for_next = core.clone();
+        let next_core = core.clone();
         let next = tokio::task::spawn_blocking(move || {
-            let mut subscription = core_for_next
+            let mut subscription = next_core
                 .subscribe_membership_bounded(workspace, MembershipEpoch::new(after_epoch), 1)
                 .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
             subscription
-                .next_transition_timeout(std::time::Duration::from_millis(50))
+                .next_transition_timeout(std::time::Duration::ZERO)
                 .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
         })
         .await;
@@ -800,17 +855,6 @@ async fn run_membership_stream(
         }
         after_epoch = transition.epoch().value();
         credit -= 1;
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                StreamCommand::Credit(amount) => {
-                    credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
-                }
-                StreamCommand::Close => {
-                    streams.lock().await.remove(&stream_id);
-                    return;
-                }
-            }
-        }
     }
     streams.lock().await.remove(&stream_id);
     let _ = output.close(&stream_id, "capability_unavailable").await;
@@ -891,107 +935,123 @@ async fn run_record_stream(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let subscribe_core = core.clone();
+    let subscribe_package = package.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        subscribe_core.subscribe_records(workspace, &subscribe_package, after)
+    })
+    .await;
+    let mut subscription = match opened {
+        Ok(Ok(subscription)) => subscription,
+        // A cursor from another journal, or beyond this one, is the Package's
+        // to reset: it clears the cursor and replays by record identity.
+        Ok(Err(
+            teamarness_core::SynchronizationError::CursorAhead
+            | teamarness_core::SynchronizationError::CursorScopeMismatch,
+        )) => {
+            streams.lock().await.remove(&stream_id);
+            let _ = output.close(&stream_id, "cursor_invalid").await;
+            return;
+        }
+        Ok(Err(error)) => {
+            eprintln!("record stream subscribe failed: stream={stream_id} error={error}");
+            streams.lock().await.remove(&stream_id);
+            let _ = output.close(&stream_id, "capability_unavailable").await;
+            return;
+        }
+        Err(error) => {
+            eprintln!("record stream subscribe task failed: stream={stream_id} error={error}");
+            streams.lock().await.remove(&stream_id);
+            let _ = output.close(&stream_id, "capability_unavailable").await;
+            return;
+        }
+    };
     let mut sequence = 0_u64;
-    let mut subscription = None;
     loop {
         if *cancelled.borrow() {
             break;
         }
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                StreamCommand::Credit(amount) => {
-                    credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
+        if !drain_commands(&mut commands, &mut credit).await
+            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
+        {
+            streams.lock().await.remove(&stream_id);
+            return;
+        }
+        let limit = usize::try_from(credit.min(RECORD_PAGE)).unwrap_or(1);
+        let read = tokio::task::spawn_blocking(move || {
+            let page = subscription.next_page(limit);
+            (subscription, page)
+        })
+        .await;
+        let page = match read {
+            Ok((returned, Ok(page))) => {
+                subscription = returned;
+                page
+            }
+            Ok((_returned, Err(error))) => {
+                eprintln!("record stream read failed: stream={stream_id} error={error}");
+                break;
+            }
+            Err(error) => {
+                eprintln!("record stream read task failed: stream={stream_id} error={error}");
+                break;
+            }
+        };
+        let mut delivered = true;
+        for event in &page.events {
+            let Ok(signature) = encode_signature(&event.record().signature()) else {
+                delivered = false;
+                break;
+            };
+            sequence = sequence.saturating_add(1);
+            let payload = json!({
+                "kind":"record",
+                "cursor":event.cursor().to_string(),
+                "recordId":event.record_id().to_string(),
+                "orderKey":event.order_key().to_string(),
+                "author":event.author().to_string(),
+                "purpose":event.purpose(),
+                "signature":signature,
+                "canonical":encode_base64(event.canonical()),
+                "sealedRecord":encode_base64(event.sealed_record()),
+            });
+            if output.event(&stream_id, sequence, payload).await.is_err() {
+                eprintln!("record stream delivery failed: stream={stream_id} sequence={sequence}");
+                delivered = false;
+                break;
+            }
+            credit -= 1;
+        }
+        if !delivered {
+            break;
+        }
+        if !page.events.is_empty() {
+            continue;
+        }
+        // Nothing was ready. The subscription waits on the journal head rather
+        // than polling storage.
+        tokio::select! {
+            changed = subscription.changed() => {
+                if changed.is_err() {
+                    break;
                 }
-                StreamCommand::Close => {
+            }
+            command = commands.recv() => match command {
+                Some(StreamCommand::Credit(amount)) => {
+                    credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+                }
+                Some(StreamCommand::Close) | None => {
+                    streams.lock().await.remove(&stream_id);
+                    return;
+                }
+            },
+            result = cancelled.changed() => {
+                if result.is_err() || *cancelled.borrow() {
                     streams.lock().await.remove(&stream_id);
                     return;
                 }
             }
         }
-        while credit == 0 {
-            tokio::select! {
-                command = commands.recv() => match command {
-                    Some(StreamCommand::Credit(amount)) => {
-                        credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT)
-                    }
-                    Some(StreamCommand::Close) | None => {
-                        streams.lock().await.remove(&stream_id);
-                        return;
-                    }
-                },
-                result = cancelled.changed() => {
-                    if result.is_err() || *cancelled.borrow() {
-                        streams.lock().await.remove(&stream_id);
-                        return;
-                    }
-                }
-            }
-        }
-        if subscription.is_none() {
-            let core_for_subscribe = core.clone();
-            let package_for_subscribe = package.clone();
-            let next = tokio::task::spawn_blocking(move || {
-                core_for_subscribe.subscribe_records(workspace, &package_for_subscribe, after)
-            })
-            .await;
-            match next {
-                Ok(Ok(value)) => subscription = Some(value),
-                Ok(Err(teamarness_core::SynchronizationError::WorkspaceNotFound)) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-                Ok(Err(error)) => {
-                    eprintln!("record stream subscribe failed: stream={stream_id} error={error}");
-                    break;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "record stream subscribe task failed: stream={stream_id} error={error}"
-                    );
-                    break;
-                }
-            }
-        }
-
-        let mut current = subscription.take().expect("record subscription is present");
-        let next = tokio::task::spawn_blocking(move || {
-            let event = current.next_event_timeout(std::time::Duration::from_millis(50));
-            (current, event)
-        })
-        .await;
-        let event = match next {
-            Ok((current, Ok(Some(event)))) => {
-                subscription = Some(current);
-                event
-            }
-            Ok((current, Ok(None))) => {
-                subscription = Some(current);
-                continue;
-            }
-            Ok((_current, Err(_))) => break,
-            Err(_) => break,
-        };
-        sequence = sequence.saturating_add(1);
-        let signature = match encode_signature(&event.record().signature()) {
-            Ok(signature) => signature,
-            Err(_) => break,
-        };
-        let payload = json!({
-            "kind":"record",
-            "cursor":event.cursor().to_string(),
-            "recordId":event.record_id().to_string(),
-            "orderKey":event.order_key().to_string(),
-            "author":event.author().to_string(),
-            "purpose":event.purpose(),
-            "signature":signature,
-            "canonical":encode_base64(event.canonical()),
-            "sealedRecord":encode_base64(event.sealed_record()),
-        });
-        if output.event(&stream_id, sequence, payload).await.is_err() {
-            eprintln!("record stream delivery failed: stream={stream_id} sequence={sequence}");
-            break;
-        }
-        credit -= 1;
     }
     streams.lock().await.remove(&stream_id);
     let _ = output.close(&stream_id, "capability_unavailable").await;

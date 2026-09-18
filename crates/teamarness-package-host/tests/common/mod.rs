@@ -167,3 +167,25 @@ pub fn write_node_package_with_capabilities(
         "capabilities": capabilities
     })).unwrap()).unwrap();
 }
+
+/// Issues one Workspace invitation, waiting out endpoint readiness.
+///
+/// Readiness is a real-network condition, not the behaviour any Host test is
+/// about, so the deadline only bounds failure.
+pub async fn invite(
+    core: &CoreRuntime,
+    workspace: teamarness_core::WorkspaceId,
+) -> teamarness_core::WorkspaceInvitation {
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match core.create_workspace_invitation(workspace).await {
+            Ok(invitation) => return invitation,
+            Err(teamarness_core::OnboardingError::Readiness)
+                if std::time::Instant::now() < expiry =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("the invitation could not be issued: {error}"),
+        }
+    }
+}

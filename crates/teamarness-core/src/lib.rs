@@ -57,7 +57,27 @@ pub use runtime::{
     MembershipTransition, MembershipVersion, PublicIdentity, PublicSignature, SigningContext,
     WorkspaceId, WorkspaceSummary,
 };
+/// How many records subscriptions have decoded for one scope since the process
+/// began. See the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn records_decoded_for_tests(workspace: WorkspaceId, package: &str) -> usize {
+    synchronization::record_subscription::records_decoded_for_test(synchronization::scope_digest(
+        package, workspace,
+    ))
+}
+
+/// How many membership subscriptions have been opened for one Workspace since
+/// the process began. See the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn membership_subscriptions_opened_for_tests(workspace: WorkspaceId) -> usize {
+    runtime::membership_subscriptions_opened(workspace)
+}
+
 pub use synchronization::{
-    Cursor, ImmutableRecord, OpenedRecord, OrderKey, RecordEvent, RecordId, RecordSubscription,
-    SynchronizationError,
+    Cursor, ImmutableRecord, OpenedRecord, OrderKey, RecordAvailability, RecordEvent, RecordId,
+    RecordPage, RecordSubscription, SyncAvailability, SyncWarning, SynchronizationError,
 };

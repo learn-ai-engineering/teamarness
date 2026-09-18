@@ -61,11 +61,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         ))
         .await
         .unwrap();
-        let invitation = fixture
-            .core
-            .create_workspace_invitation(workspace.id())
-            .await
-            .unwrap();
+        let invitation = common::invite(&fixture.core, workspace.id()).await;
         joiner.join_workspace(&invitation).await.unwrap();
         joiner.shutdown().await.unwrap();
     }

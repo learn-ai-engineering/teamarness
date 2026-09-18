@@ -14,6 +14,7 @@ pub(crate) mod parking;
 pub(crate) mod peer_sessions;
 mod protection_control;
 pub(crate) mod quarantine;
+pub(crate) mod record_subscription;
 pub(crate) mod scheduler;
 #[cfg(test)]
 pub(crate) mod test_io;
@@ -22,6 +23,9 @@ pub(crate) mod worker;
 #[cfg(test)]
 pub(crate) use operation_store::log_id as operation_log_id;
 pub(crate) use quarantine::RecoveryReport;
+pub use record_subscription::{
+    RecordAvailability, RecordPage, RecordSubscription, SyncAvailability, SyncWarning,
+};
 pub(crate) use worker::SyncWorker;
 
 pub(crate) use exchange::ExchangeReport;
@@ -67,11 +71,8 @@ impl fmt::Debug for SyncServices {
     }
 }
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
 
 use iroh_base::{SecretKey, Signature};
 use p2panda_core::{Hash, Operation};
@@ -861,34 +862,6 @@ impl From<StorageError> for SynchronizationError {
     }
 }
 
-/// A blocking, at-least-once delivery subscription.
-pub struct RecordSubscription {
-    durable: VecDeque<RecordEvent>,
-    live: Receiver<RecordEvent>,
-}
-impl fmt::Debug for RecordSubscription {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RecordSubscription").finish_non_exhaustive()
-    }
-}
-impl RecordSubscription {
-    pub fn next_event(&mut self) -> Result<Option<RecordEvent>, SynchronizationError> {
-        Ok(self.durable.pop_front().or_else(|| self.live.recv().ok()))
-    }
-    pub fn next_event_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<RecordEvent>, SynchronizationError> {
-        if let Some(event) = self.durable.pop_front() {
-            return Ok(Some(event));
-        }
-        match self.live.recv_timeout(timeout) {
-            Ok(event) => Ok(Some(event)),
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(None),
-        }
-    }
-}
-
 pub(crate) fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) -> [u8; 32] {
     let mut input = Vec::with_capacity(SCOPE_DOMAIN.len() + package_identity.len() + 16);
     input.extend_from_slice(SCOPE_DOMAIN);
@@ -1575,110 +1548,6 @@ fn note_unopenable_record(
     Ok(())
 }
 
-pub(crate) fn subscribe(
-    conn: &rusqlite::Connection,
-    workspace: WorkspaceId,
-    package: &str,
-    after: Option<Cursor>,
-    live: Receiver<RecordEvent>,
-    now_unix_ms: i64,
-) -> Result<RecordSubscription, SynchronizationError> {
-    let scope = scope_digest(package, workspace);
-    let journal: Vec<u8> = conn
-        .query_row(
-            "SELECT journal_id FROM sync_scopes WHERE scope_id=?1",
-            [scope.as_slice()],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|_| storage_error())?
-        .ok_or(SynchronizationError::WorkspaceNotFound)?;
-    let journal = fixed::<16>(journal)?;
-    let start = match after {
-        Some(cursor) => {
-            let bytes = cursor.as_bytes();
-            if bytes[1..17] != journal {
-                return Err(SynchronizationError::CursorScopeMismatch);
-            }
-            i64::try_from(u64::from_be_bytes(
-                bytes[17..25].try_into().expect("cursor width"),
-            ))
-            .map_err(|_| SynchronizationError::CursorAhead)?
-        }
-        None => 0,
-    };
-    let mut statement = conn.prepare("SELECT d.delivery_sequence,r.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM record_delivery d JOIN immutable_records r ON r.record_id=d.record_id JOIN immutable_operations o ON o.record_id=r.record_id LEFT JOIN quarantined_records q ON q.record_id=r.record_id WHERE d.scope_id=?1 AND d.delivery_sequence>?2 AND q.record_id IS NULL ORDER BY d.delivery_sequence").map_err(|_| storage_error())?;
-    let rows = statement
-        .query_map(rusqlite::params![scope.as_slice(), start], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Vec<u8>>(5)?,
-                r.get::<_, Vec<u8>>(6)?,
-            ))
-        })
-        .map_err(|_| storage_error())?;
-    let mut durable = VecDeque::new();
-    for row in rows {
-        let (sequence, id, order, author, purpose, sig, sealed) =
-            row.map_err(|_| storage_error())?;
-        let record_id: [u8; 32] = fixed(id.clone())?;
-        let Ok(sealed_record) = SealedRecordV1::decode(&sealed) else {
-            quarantine::quarantine_record(
-                conn,
-                scope,
-                record_id,
-                quarantine::RecordFault::Decode,
-                now_unix_ms,
-            )?;
-            continue;
-        };
-        let key: [u8; 32] = conn
-            .query_row(
-                "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
-                [scope.as_slice()],
-                |r| r.get(0),
-            )
-            .map_err(|_| storage_error())
-            .and_then(fixed)?;
-        let protection = P2pandaRecordProtection {
-            package_identity: package.to_owned(),
-            workspace_id: workspace,
-            content_key: key,
-        };
-        let Ok(opened) = protection.open(&sealed_record) else {
-            quarantine::quarantine_record(
-                conn,
-                scope,
-                record_id,
-                quarantine::RecordFault::Open,
-                now_unix_ms,
-            )?;
-            continue;
-        };
-        let record = record_from_row((
-            &id,
-            &order,
-            &author,
-            &purpose,
-            &sig,
-            &opened.canonical,
-            &sealed,
-        ))?;
-        durable.push_back(RecordEvent {
-            record,
-            cursor: Cursor::new(
-                journal,
-                u64::try_from(sequence).map_err(|_| SynchronizationError::CorruptRecord)?,
-            ),
-        });
-    }
-    Ok(RecordSubscription { durable, live })
-}
-
 /// A row insert that violates a constraint is one peer's conflicting history,
 /// not a local fault; anything else from SQLite is a storage failure.
 fn insert_error(error: rusqlite::Error) -> RemoteInsertError {
@@ -1978,30 +1847,6 @@ pub(crate) fn insert_remote_operation(
         ))
         .map_err(|_| RemoteInsertError::Invalid)?,
         delivery_sequence,
-    })
-}
-
-pub(crate) fn event_for_record(
-    conn: &rusqlite::Connection,
-    workspace: WorkspaceId,
-    package: &str,
-    record: ImmutableRecord,
-) -> Option<RecordEvent> {
-    let scope = scope_digest(package, workspace);
-    let (journal, sequence): (Vec<u8>, i64) = conn
-        .query_row(
-            "SELECT sync_scopes.journal_id, record_delivery.delivery_sequence
-         FROM sync_scopes JOIN record_delivery USING(scope_id)
-         WHERE sync_scopes.scope_id=?1 AND record_delivery.record_id=?2",
-            rusqlite::params![scope.as_slice(), record.record_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok()?;
-    let journal: [u8; 16] = journal.try_into().ok()?;
-    let sequence = u64::try_from(sequence).ok()?;
-    Some(RecordEvent {
-        record,
-        cursor: Cursor::new(journal, sequence),
     })
 }
 

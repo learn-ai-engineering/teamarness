@@ -783,3 +783,281 @@ async fn capability_call_deadline_fires_while_core_is_busy() {
     }
     assert_eq!(committed, 1, "the timed-out append committed nothing");
 }
+
+/// Runs one fixture request and returns its response object.
+async fn fixture_request(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    request: &str,
+    operation: &str,
+    payload: PackageValue,
+) -> BTreeMap<String, PackageValue> {
+    match host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new(request).unwrap(),
+            operation: operation.into(),
+            payload,
+        }))
+        .await
+        .unwrap()
+    {
+        PackageHostOutcome::UiResponse {
+            payload: PackageValue::Object(value),
+        } => value,
+        other => panic!("unexpected fixture response: {other:?}"),
+    }
+}
+
+/// Polls the fixture's recorded immutable-stream state until `ready` holds.
+///
+/// The deadline only bounds failure; nothing here sleeps and then asserts.
+async fn poll_immutable(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    what: &str,
+    mut ready: impl FnMut(&BTreeMap<String, PackageValue>) -> bool,
+) -> BTreeMap<String, PackageValue> {
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let response = fixture_request(
+            host,
+            mount,
+            &format!("immutable-poll-{attempt}"),
+            "fixture.immutable_events",
+            object([]),
+        )
+        .await;
+        if ready(&response) {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+fn events_of(response: &BTreeMap<String, PackageValue>) -> &[PackageValue] {
+    match response.get("events") {
+        Some(PackageValue::Array(events)) => events,
+        _ => panic!("the fixture always reports an events array"),
+    }
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn record_stream_closes_with_cursor_invalid_for_a_future_cursor() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    fixture
+        .core
+        .append_record(
+            workspace.id(),
+            "dev.teamarness.fixture",
+            "fixture.record",
+            b"one",
+        )
+        .unwrap();
+    let mut records = fixture
+        .core
+        .subscribe_records(workspace.id(), "dev.teamarness.fixture", None)
+        .unwrap();
+    let committed = records
+        .next_event_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .expect("the record is committed");
+    // The same journal, far beyond its head: the Package must reset.
+    let mut cursor = committed.cursor().to_string();
+    let head = cursor.len() - 16;
+    cursor.replace_range(head.., &format!("{:016x}", 999_u64));
+
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-subscribe",
+        "fixture.immutable_subscribe",
+        object([("afterCursor", PackageValue::String(cursor))]),
+    )
+    .await;
+    let response = poll_immutable(&host, &mount, "the stream is closed", |response| {
+        matches!(response.get("closeCode"), Some(PackageValue::String(_)))
+    })
+    .await;
+    assert_eq!(
+        response.get("closeCode"),
+        Some(&PackageValue::String("cursor_invalid".into()))
+    );
+    assert!(events_of(&response).is_empty(), "no record was delivered");
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test]
+async fn slow_package_leaves_core_without_buffered_events() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    let package = "dev.teamarness.fixture";
+
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    for index in 0..1_000_u32 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                package,
+                "fixture.record",
+                &index.to_be_bytes(),
+            )
+            .unwrap();
+    }
+    // The fixture never credits beyond its initial 32, so the stream stops
+    // there. Core holds no queue, so nothing further is decrypted.
+    poll_immutable(&host, &mount, "the initial credit is spent", |response| {
+        events_of(response).len() >= 32
+    })
+    .await;
+    let decoded = teamarness_core::records_decoded_for_tests(workspace.id(), package);
+    assert!(
+        decoded <= 64,
+        "an uncredited stream decrypted {decoded} records"
+    );
+
+    for index in 1_000..1_500_u32 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                package,
+                "fixture.record",
+                &index.to_be_bytes(),
+            )
+            .unwrap();
+    }
+    let after = teamarness_core::records_decoded_for_tests(workspace.id(), package);
+    assert!(
+        after <= 64,
+        "500 more commits made the stream decrypt {after} records"
+    );
+    let response = fixture_request(
+        &host,
+        &mount,
+        "immutable-final",
+        "fixture.immutable_events",
+        object([]),
+    )
+    .await;
+    assert_eq!(
+        events_of(&response).len(),
+        32,
+        "delivery stops exactly at the granted credit"
+    );
+}
+
+/// Verifies: TEAM.SYS.MEM-R05
+#[tokio::test]
+async fn membership_stream_does_not_poll() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &[serde_json::json!({
+            "identity":"teamarness.membership","major":1,"minMinor":0,"maxMinor":0
+        })],
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+
+    fixture_request(
+        &host,
+        &mount,
+        "membership-open",
+        "fixture.membership_open",
+        object([("afterEpoch", PackageValue::String("0".into()))]),
+    )
+    .await;
+    // Three credit round trips each run the stream task's command arm, so the
+    // loop has certainly run between the two counter reads.
+    for attempt in 0..3 {
+        fixture_request(
+            &host,
+            &mount,
+            &format!("membership-credit-{attempt}"),
+            "fixture.membership_credit",
+            object([("amount", PackageValue::Integer(1))]),
+        )
+        .await;
+    }
+    let idle = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());
+
+    let joiner = teamarness_core::CoreRuntime::open(teamarness_core::CoreRuntimeConfig::new(
+        fixture._root.path().join("membership-joiner"),
+    ))
+    .await
+    .unwrap();
+    let invitation = common::invite(&fixture.core, workspace.id()).await;
+    joiner.join_workspace(&invitation).await.unwrap();
+    joiner.shutdown().await.unwrap();
+
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let response = fixture_request(
+            &host,
+            &mount,
+            "membership-events",
+            "fixture.membership_events",
+            object([]),
+        )
+        .await;
+        if matches!(response.get("events"), Some(PackageValue::Array(events)) if !events.is_empty())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "the admitted transition reaches the Package"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let after = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());
+    assert_eq!(
+        after - idle,
+        1,
+        "one transition opens exactly one Core subscription"
+    );
+}

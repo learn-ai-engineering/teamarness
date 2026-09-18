@@ -11,7 +11,7 @@ use crate::membership::replication::Disclosure;
 use crate::membership_sync::{ApplyOutcome, MembershipReplica, MembershipSummary, ReplicaError};
 use crate::synchronization::SynchronizationError;
 use crate::synchronization::parking::{self, ParkedOperation};
-use crate::synchronization::{ImmutableRecord, RemoteInsert, RemoteInsertError};
+use crate::synchronization::{RemoteInsert, RemoteInsertError};
 
 /// Applies everything parked for `author` now that its admission is known.
 pub(super) fn promote_author(
@@ -53,9 +53,16 @@ fn promote(
             &item.operation,
             now_unix_ms,
         ) {
-            Ok(RemoteInsert::Applied { record, .. }) => {
+            Ok(RemoteInsert::Applied {
+                delivery_sequence, ..
+            }) => {
                 parking::remove(&state.connection, item.operation_hash)?;
-                publish_record(state, workspace, &item.package, record);
+                crate::synchronization::record_subscription::publish_commit(
+                    state,
+                    workspace,
+                    &item.package,
+                    delivery_sequence,
+                );
                 applied += 1;
             }
             Ok(RemoteInsert::Duplicate(_)) => {
@@ -73,25 +80,6 @@ fn promote(
         }
     }
     Ok(applied)
-}
-
-fn publish_record(
-    state: &mut RuntimeState,
-    workspace: WorkspaceId,
-    package: &str,
-    record: ImmutableRecord,
-) {
-    let Some(event) =
-        crate::synchronization::event_for_record(&state.connection, workspace, package, record)
-    else {
-        return;
-    };
-    if let Some(listeners) = state
-        .record_subscribers
-        .get_mut(&(workspace, package.to_owned()))
-    {
-        listeners.retain(|sender| sender.send(event.clone()).is_ok());
-    }
 }
 
 /// The single reaction to any accepted membership transition.
@@ -118,6 +106,11 @@ pub(super) fn after_membership_accepted(
                 [workspace.as_bytes().as_slice()],
             );
         }
+    }
+    // A membership stream waits on this watch rather than polling.
+    if let Some(sender) = state.membership_epochs.get(&workspace) {
+        let epoch = transition.epoch().value();
+        sender.send_modify(|value| *value = (*value).max(epoch));
     }
     // The peer set changed, so what is due changed; the scheduler reloads
     // rather than waiting for its idle tick.

@@ -235,6 +235,7 @@ async function serve() {
   let membershipStream;
   const immutableEvents = [];
   let immutableStream;
+  let immutableCloseCode = null;
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -274,6 +275,7 @@ async function serve() {
       } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
         membershipStream = undefined;
       } else if (frame.kind === "stream_close" && frame.streamId === immutableStream) {
+        immutableCloseCode = frame.code ?? null;
         immutableStream = undefined;
       } else if (frame.kind === "stream_open") {
         uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
@@ -363,7 +365,7 @@ async function serve() {
         });
         send({ kind: "response", id: frame.id, payload: { streamId: immutableStream } });
       } else if (frame.kind === "request" && ["fixture.immutable_events", "fixture.record_events"].includes(frame.operation)) {
-        send({ kind: "response", id: frame.id, payload: { events: immutableEvents } });
+        send({ kind: "response", id: frame.id, payload: { events: immutableEvents, closeCode: immutableCloseCode } });
       } else if (frame.kind === "request" && ["fixture.immutable_credit", "fixture.record_credit"].includes(frame.operation)) {
         send({ kind: "credit", streamId: immutableStream, amount: frame.payload.amount });
         send({ kind: "response", id: frame.id, payload: { credited: true } });

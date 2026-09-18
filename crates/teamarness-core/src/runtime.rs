@@ -624,12 +624,26 @@ impl fmt::Debug for CoreRuntime {
     }
 }
 
+/// How many membership subscriptions have been opened since the process began.
+///
+/// A membership stream that waits on the epoch watch opens one per transition.
+#[cfg(feature = "test-hooks")]
+static MEMBERSHIP_SUBSCRIPTIONS_OPENED: Mutex<BTreeMap<WorkspaceId, usize>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn membership_subscriptions_opened(workspace: WorkspaceId) -> usize {
+    MEMBERSHIP_SUBSCRIPTIONS_OPENED
+        .lock()
+        .ok()
+        .and_then(|counts| counts.get(&workspace).copied())
+        .unwrap_or(0)
+}
+
 struct MembershipSubscriber {
     id: u64,
     sender: crate::subscription::TransitionSender,
 }
-
-type RecordSubscriber = std::sync::mpsc::Sender<crate::RecordEvent>;
 
 /// The Core side of every package synchronization session.
 ///
@@ -768,6 +782,11 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             &bundle.grant,
         )
         .map_err(|_| ())?;
+        // The scope now exists, so a subscription that was waiting for history
+        // access can proceed even when nothing was parked.
+        crate::synchronization::record_subscription::publish_scope_exists(
+            &state, workspace, package,
+        );
         // Records that arrived before the key can now be applied.
         replication::promote_scope(&mut state, workspace, package).map_err(|_| ())
     }
@@ -1090,23 +1109,15 @@ fn classify_operation(
         operation,
         now,
     ) {
-        Ok(crate::synchronization::RemoteInsert::Applied { record, .. }) => {
-            let record_id = record.record_id();
-            if let Some(event) = crate::synchronization::event_for_record(
-                &state.connection,
+        Ok(crate::synchronization::RemoteInsert::Applied {
+            delivery_sequence, ..
+        }) => {
+            crate::synchronization::record_subscription::publish_commit(
+                state,
                 workspace,
                 package,
-                record,
-            ) {
-                if let Some(listeners) = state
-                    .record_subscribers
-                    .get_mut(&(workspace, package.to_owned()))
-                {
-                    listeners.retain(|sender| sender.send(event.clone()).is_ok());
-                }
-            } else {
-                eprintln!("remote record event unavailable: package={package} record={record_id}");
-            }
+                delivery_sequence,
+            );
             Ok(OperationOutcome::Applied)
         }
         Ok(crate::synchronization::RemoteInsert::Duplicate(_)) => Ok(OperationOutcome::Duplicate),
@@ -1185,7 +1196,13 @@ pub(crate) struct RuntimeState {
     display_name: String,
     pub(crate) memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
     subscribers: BTreeMap<WorkspaceId, Vec<MembershipSubscriber>>,
-    record_subscribers: BTreeMap<(WorkspaceId, String), Vec<RecordSubscriber>>,
+    /// The per-scope head notifiers record subscriptions wait on. Shared rather
+    /// than owned, so quarantine and session health can wake a subscriber
+    /// without taking this lock.
+    pub(crate) record_heads: crate::synchronization::record_subscription::SharedRecordHeads,
+    /// One watch per Workspace carrying the local membership epoch, so a
+    /// membership stream waits instead of polling.
+    membership_epochs: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
     next_subscriber_id: u64,
     pub(crate) poisoned: bool,
 }
@@ -1210,7 +1227,8 @@ impl RuntimeState {
             display_name: crate::identity::DEFAULT_DISPLAY_NAME.to_owned(),
             memberships,
             subscribers: BTreeMap::new(),
-            record_subscribers: BTreeMap::new(),
+            record_heads: Arc::default(),
+            membership_epochs: BTreeMap::new(),
             next_subscriber_id: 0,
             poisoned: false,
         }
@@ -1332,7 +1350,8 @@ impl CoreRuntime {
             display_name,
             memberships,
             subscribers: BTreeMap::new(),
-            record_subscribers: BTreeMap::new(),
+            record_heads: Arc::default(),
+            membership_epochs: BTreeMap::new(),
             next_subscriber_id: 0,
             poisoned: false,
         }));
@@ -1977,7 +1996,7 @@ impl CoreRuntime {
             .is_some_and(|projection| projection.creator() == self.public_identity);
         let secret_key = state.secret_key.clone();
         let now = self.clock.now_unix_ms();
-        let (record, _delivery_sequence) = crate::synchronization::append(
+        let (record, delivery_sequence) = crate::synchronization::append(
             &mut state.connection,
             &secret_key,
             workspace_id,
@@ -1988,17 +2007,12 @@ impl CoreRuntime {
             is_creator,
             now,
         )?;
-        if let Some(event) = crate::synchronization::event_for_record(
-            &state.connection,
+        crate::synchronization::record_subscription::publish_commit(
+            &state,
             workspace_id,
             package_identity,
-            record.clone(),
-        ) && let Some(listeners) = state
-            .record_subscribers
-            .get_mut(&(workspace_id, package_identity.to_owned()))
-        {
-            listeners.retain(|sender| sender.send(event.clone()).is_ok());
-        }
+            delivery_sequence,
+        );
         self.sync_worker.wake();
         Ok(record)
     }
@@ -2082,7 +2096,7 @@ impl CoreRuntime {
         }
         let creator = projection.creator();
         let secret = state.secret_key.clone();
-        crate::synchronization::import_protection_grant(
+        let imported = crate::synchronization::import_protection_grant(
             &mut state.connection,
             &secret,
             workspace_id,
@@ -2090,7 +2104,13 @@ impl CoreRuntime {
             creator,
             origin,
             grant,
-        )
+        )?;
+        crate::synchronization::record_subscription::publish_scope_exists(
+            &state,
+            workspace_id,
+            package_identity,
+        );
+        Ok(imported)
     }
 
     /// Opens sealed records in request order after authenticating their scope and contents.
@@ -2118,35 +2138,80 @@ impl CoreRuntime {
     }
 
     /// Replays the installation-local immutable-record journal from an optional cursor.
+    ///
+    /// The subscription holds no queue: it remembers a position and reads pages
+    /// of committed records. Subscribing before the scope exists is allowed; the
+    /// subscription waits for the content key to arrive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::SynchronizationError::CursorScopeMismatch`] for a cursor
+    /// from another delivery journal and
+    /// [`crate::SynchronizationError::CursorAhead`] for one beyond the journal's
+    /// head.
     pub fn subscribe_records(
         &self,
         workspace_id: WorkspaceId,
         package_identity: &str,
         after: Option<crate::Cursor>,
     ) -> Result<crate::RecordSubscription, crate::SynchronizationError> {
-        let mut state = self
+        use crate::synchronization::record_subscription as records;
+        let state = self
             .state
             .lock()
             .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
         if state.poisoned {
             return Err(crate::SynchronizationError::RuntimeUnavailable);
         }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let now_unix_ms = state.clock.now_unix_ms();
-        let subscription = crate::synchronization::subscribe(
-            &state.connection,
+        let scope = crate::synchronization::scope_digest(package_identity, workspace_id);
+        let journal = records::journal_of(&state.connection, scope)?;
+        let position = records::validate_cursor(&state.connection, scope, journal, after)?;
+        let head = records::scope_head(&state, scope);
+        Ok(records::RecordSubscription::new(
+            Arc::downgrade(&self.state),
             workspace_id,
-            package_identity,
-            after,
-            receiver,
-            now_unix_ms,
-        )?;
-        state
-            .record_subscribers
-            .entry((workspace_id, package_identity.to_owned()))
-            .or_default()
-            .push(sender);
-        Ok(subscription)
+            package_identity.to_owned(),
+            scope,
+            journal,
+            position,
+            head,
+        ))
+    }
+
+    /// Watches one Workspace's local membership epoch.
+    ///
+    /// The Host uses it to open a membership subscription only when there is a
+    /// transition to read, instead of polling. `tokio::sync::watch` appears here
+    /// deliberately: Core already depends on Tokio, and the Host is its only
+    /// consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::WorkspaceNotFound`] when the Workspace is
+    /// not known locally.
+    pub fn membership_epoch_watch(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<tokio::sync::watch::Receiver<u64>, SubscriptionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SubscriptionError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(SubscriptionError::Storage(StorageError::RuntimePoisoned));
+        }
+        let epoch = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(SubscriptionError::WorkspaceNotFound)?
+            .snapshot()
+            .epoch()
+            .value();
+        Ok(state
+            .membership_epochs
+            .entry(workspace_id)
+            .or_insert_with(|| tokio::sync::watch::Sender::new(epoch))
+            .subscribe())
     }
 
     /// Reconciles the locally accepted immutable records with a current peer.
@@ -3235,6 +3300,10 @@ impl CoreRuntime {
         after_epoch: MembershipEpoch,
         catch_up_limit: Option<usize>,
     ) -> Result<MembershipSubscription, SubscriptionError> {
+        #[cfg(feature = "test-hooks")]
+        if let Ok(mut counts) = MEMBERSHIP_SUBSCRIPTIONS_OPENED.lock() {
+            *counts.entry(workspace_id).or_insert(0) += 1;
+        }
         let mut state = self
             .state
             .lock()

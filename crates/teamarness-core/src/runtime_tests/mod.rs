@@ -9,6 +9,7 @@ mod async_boundary;
 mod cluster;
 mod membership_replication;
 mod order_keys;
+mod record_delivery;
 mod recovery;
 mod sync_authorization;
 mod sync_bounds;
