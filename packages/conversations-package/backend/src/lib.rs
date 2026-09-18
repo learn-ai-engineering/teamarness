@@ -652,7 +652,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn session_ingests_real_record_and_transitions_to_current() {
+    async fn ingesting_a_record_does_not_mark_the_session_current() {
         let d = tempfile::tempdir().unwrap();
         let store = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
         // Pre-create a channel so records aren't deferred.
@@ -714,14 +714,13 @@ mod tests {
                     cursor.as_deref(),
                 )
                 .unwrap();
-            // simulate quiescence transition
-            let mut status = sync_status.lock().await;
-            if *status == SyncStatus::CatchingUp {
-                *status = SyncStatus::Current;
-            }
         }
 
-        assert_eq!(*sync_status.lock().await, SyncStatus::Current);
+        assert_eq!(
+            *sync_status.lock().await,
+            SyncStatus::CatchingUp,
+            "ingesting a record does not mark the session current"
+        );
         assert_eq!(
             store
                 .message_rows(&hex_id([1; 16]), None, crate::domain::PAGE_SIZE)
@@ -862,7 +861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_failure_sets_degraded_status() {
+    async fn subscribe_failure_sets_offline_status() {
         let log = crate::immutable_log::scripted::ScriptedLog::new();
         log.subscribe_errors
             .lock()
@@ -874,8 +873,91 @@ mod tests {
         let result = log.subscribe(None).await;
         assert!(result.is_err());
 
-        // Set degraded (as run_session would).
-        *sync_status.lock().await = SyncStatus::Degraded("subscribe_failed".into());
-        assert_eq!(sync_status.lock().await.availability(), "degraded");
+        // Report offline, as run_session would; the reason is in the log line.
+        *sync_status.lock().await = SyncStatus::Offline;
+        assert_eq!(sync_status.lock().await.availability(), "offline");
+    }
+    #[tokio::test]
+    async fn state_events_drive_sync_status_for_every_availability() {
+        let log = crate::immutable_log::scripted::ScriptedLog::new();
+        for availability in [
+            "waiting_for_history_access",
+            "offline",
+            "catching_up",
+            "current",
+            "degraded",
+        ] {
+            log.push_state(availability);
+        }
+        let mut sub = log.subscribe(None).await.unwrap();
+        let mut reported = Vec::new();
+        for _ in 0..5 {
+            let event = sub.recv().await.unwrap().unwrap();
+            let crate::immutable_log::LogEvent::State { availability } = event else {
+                panic!("the scripted log pushed state events")
+            };
+            reported.push(
+                availability
+                    .as_deref()
+                    .and_then(SyncStatus::from_availability),
+            );
+        }
+        assert_eq!(
+            reported,
+            vec![
+                Some(SyncStatus::WaitingForHistoryAccess),
+                Some(SyncStatus::Offline),
+                Some(SyncStatus::CatchingUp),
+                Some(SyncStatus::Current),
+                None,
+            ],
+            "the retired value is ignored rather than mapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_invalid_close_resets_the_cursor_and_resubscribes_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("conversations.sqlite")).unwrap();
+        let channel = DomainRecord::channel_create_with_id([1; 16], "alice", "general").unwrap();
+        store
+            .ingest(
+                &hex_id(channel.id()),
+                "ch-order",
+                "alice",
+                channel.kind(),
+                "s",
+                &channel.encode(),
+                b"ch-sealed",
+                Some("c1"),
+            )
+            .unwrap();
+        assert_eq!(store.cursor().unwrap().as_deref(), Some("c1"));
+
+        // The Host refuses the stored cursor, so the Package clears it and
+        // replays from the beginning.
+        let refused = crate::immutable_log::LogError::Transport("cursor_invalid".into());
+        assert!(matches!(
+            refused,
+            crate::immutable_log::LogError::Transport(ref code) if code == "cursor_invalid"
+        ));
+        store.reset_cursor().unwrap();
+        assert_eq!(store.cursor().unwrap(), None);
+
+        // A replayed record with a known identity does not duplicate.
+        let before = store.record_count().unwrap();
+        store
+            .ingest(
+                &hex_id(channel.id()),
+                "ch-order",
+                "alice",
+                channel.kind(),
+                "s",
+                &channel.encode(),
+                b"ch-sealed",
+                Some("c1"),
+            )
+            .unwrap();
+        assert_eq!(store.record_count().unwrap(), before);
     }
 }

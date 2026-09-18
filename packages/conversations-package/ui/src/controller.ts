@@ -60,8 +60,11 @@ function errorMessage(
     retryable: info.retryable,
   });
 
-  if (availability !== "current") {
+  if (availability === "catching_up" || availability === "waiting_for_history_access") {
     return "Conversations is catching up. Your message will be sent soon.";
+  }
+  if (availability === "offline" && info.retryable) {
+    return "You are offline. Your message is saved and will sync when a member is reachable.";
   }
   if (info.retryable) {
     return "Unable to complete the action. Please try again.";
@@ -145,7 +148,7 @@ export class ConversationsController {
       this._state = {
         ...this._state,
         loading: false,
-        availability: "degraded",
+        availability: "offline",
         warning: "Conversations is temporarily unavailable.",
       };
       this.notify();

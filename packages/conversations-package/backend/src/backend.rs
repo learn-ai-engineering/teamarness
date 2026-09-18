@@ -507,17 +507,17 @@ async fn run_session(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("conversations cursor read failure: {e:?}");
-                *active.sync_status.lock().await =
-                    SyncStatus::Degraded("cursor_read_failed".into());
+                *active.sync_status.lock().await = SyncStatus::Offline;
                 break;
             }
         };
 
+        let had_cursor = cursor.is_some();
         let mut sub = match log.subscribe(cursor).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("conversations subscribe failure: {e}");
-                *active.sync_status.lock().await = SyncStatus::Degraded("subscribe_failed".into());
+                *active.sync_status.lock().await = SyncStatus::Offline;
                 break;
             }
         };
@@ -528,6 +528,24 @@ async fn run_session(
 
         match outcome {
             ReceiveOutcome::Cancelled => break 'outer,
+            ReceiveOutcome::CursorInvalid => {
+                // A cursor the Host refuses is reset once, and the Package
+                // resubscribes from the beginning without waiting. A second
+                // refusal with no cursor is a real failure.
+                if !had_cursor {
+                    eprintln!("conversations cursor refused with no cursor set");
+                    *active.sync_status.lock().await = SyncStatus::Offline;
+                    tokio::select! {
+                        _ = cancelled.changed() => break 'outer,
+                        () = tokio::time::sleep(backoff) => {},
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                } else if let Err(error) = active.store.reset_cursor() {
+                    eprintln!("conversations cursor reset failure: {error:?}");
+                    *active.sync_status.lock().await = SyncStatus::Offline;
+                    break;
+                }
+            }
             ReceiveOutcome::StreamEnded | ReceiveOutcome::TransportError => {
                 // Transition to catching-up and reconnect after backoff.
                 *active.sync_status.lock().await = SyncStatus::CatchingUp;
@@ -546,6 +564,9 @@ enum ReceiveOutcome {
     Cancelled,
     StreamEnded,
     TransportError,
+    /// The Host refused the stored cursor. It is cleared once and the
+    /// subscription replays from the beginning.
+    CursorInvalid,
 }
 
 /// Inner loop: process events from one subscription until cancellation,
@@ -579,14 +600,9 @@ async fn receive_loop(
                         &canonical, &sealed_record, cursor.as_deref(),
                     ) {
                         Ok(_) => {
+                            // The Host reports availability explicitly, so
+                            // ingesting a record says nothing about it.
                             backend.changes.send_modify(|x| *x = x.saturating_add(1));
-                            // Quiescence fallback: first successful record
-                            // ingestion transitions to current when no explicit
-                            // state event arrived.
-                            let mut status = active.sync_status.lock().await;
-                            if *status == SyncStatus::CatchingUp {
-                                *status = SyncStatus::Current;
-                            }
                         }
                         Err(err) => {
                             eprintln!("conversations record ingestion failure: {err:?}");
@@ -594,20 +610,20 @@ async fn receive_loop(
                     }
                 }
                 Some(Ok(LogEvent::State { availability })) => {
-                    if let Some(avail) = availability {
-                        let mut status = active.sync_status.lock().await;
-                        match avail.as_str() {
-                            "current" => *status = SyncStatus::Current,
-                            "catching_up" => *status = SyncStatus::CatchingUp,
-                            _ => {}
-                        }
+                    if let Some(status) =
+                        availability.as_deref().and_then(SyncStatus::from_availability)
+                    {
+                        *active.sync_status.lock().await = status;
                     }
                 }
-                Some(Ok(LogEvent::Warning { code, message })) => {
-                    eprintln!(
-                        "conversations subscription warning: code={code} message={}",
-                        message.as_deref().unwrap_or("")
-                    );
+                Some(Ok(LogEvent::Warning { code, .. })) => {
+                    eprintln!("conversations subscription warning: code={code}");
+                }
+                // The cursor does not belong to this journal, or is beyond it.
+                // The Package resets it and replays; records deduplicate by
+                // their identity.
+                Some(Err(LogError::Transport(code))) if code == "cursor_invalid" => {
+                    return ReceiveOutcome::CursorInvalid;
                 }
                 Some(Err(err @ LogError::Transport(_))) => {
                     eprintln!("conversations subscription transport failure: {err}");

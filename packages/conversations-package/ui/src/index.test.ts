@@ -180,3 +180,54 @@ describe("package UI kit integration", () => {
     await unmount();
   });
 });
+describe("composer availability", () => {
+  async function mountWith(availability: string) {
+    const close = vi.fn(async () => undefined);
+    const request = vi.fn(async (operation: string): Promise<PackageValue> => {
+      if (operation === "conversations.snapshot") {
+        return { ...snapshot(), availability };
+      }
+      if (operation === "conversations.channel.open") return page("availability test");
+      throw new Error(`Unexpected operation: ${operation}`);
+    });
+    const client: PackageClient = {
+      request: async <TResponse extends PackageValue>(operation: string) => (
+        request(operation) as Promise<TResponse>
+      ),
+      subscribe: vi.fn(async () => ({ close })),
+    };
+    const host = document.createElement("div");
+    const root = host.attachShadow({ mode: "open" });
+    const context = {
+      root,
+      package: {
+        identity: "dev.teamarness.conversations",
+        version: "1.0.0",
+        displayName: "Conversations",
+        source: "bundled",
+        trust: "application_bundled",
+        lifecycle: "active",
+        processGeneration: 1,
+      },
+      workspace: { id: "workspace", name: "Workspace" },
+      uiHostVersion: 1,
+      themeTokens: [],
+      client,
+    } satisfies PackageMountContext;
+    const unmount = await mount(context);
+    const sendButton = root.querySelector<HTMLButtonElement>("button[type=submit]");
+    return { sendButton, unmount };
+  }
+
+  it("composer stays enabled while offline", async () => {
+    const { sendButton, unmount } = await mountWith("offline");
+    expect(sendButton?.disabled).toBe(false);
+    await unmount();
+  });
+
+  it("composer is disabled while waiting for history access", async () => {
+    const { sendButton, unmount } = await mountWith("waiting_for_history_access");
+    expect(sendButton?.disabled).toBe(true);
+    await unmount();
+  });
+});

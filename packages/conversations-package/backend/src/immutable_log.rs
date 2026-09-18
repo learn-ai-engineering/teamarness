@@ -121,23 +121,40 @@ pub enum LogEvent {
 /// The supported availability levels for the synchronisation session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncStatus {
-    /// The durable cursor is at the tip and live events are flowing.
-    Current,
+    /// No history can be read yet: the Package's record set has no key on this
+    /// Installation.
+    WaitingForHistoryAccess,
+    /// Nothing is reachable, or this Installation may no longer participate.
+    Offline,
     /// Records are being caught up; writes may be accepted but projection
     /// is not yet complete.
     CatchingUp,
-    /// The session cannot make progress. The inner string is a bounded
-    /// stable reason.
-    Degraded(String),
+    /// The durable cursor is at the tip and live events are flowing.
+    Current,
 }
 
 impl SyncStatus {
     /// Returns the exact availability string for the UI contract.
-    pub fn availability(&self) -> &str {
+    pub fn availability(&self) -> &'static str {
         match self {
-            Self::Current => "current",
+            Self::WaitingForHistoryAccess => "waiting_for_history_access",
+            Self::Offline => "offline",
             Self::CatchingUp => "catching_up",
-            Self::Degraded(_) => "degraded",
+            Self::Current => "current",
+        }
+    }
+
+    /// Reads one availability value reported by the Synchronization Capability.
+    ///
+    /// An unknown value is ignored rather than mapped, so a Host that learns a
+    /// new state never silently becomes something else here.
+    pub fn from_availability(value: &str) -> Option<Self> {
+        match value {
+            "waiting_for_history_access" => Some(Self::WaitingForHistoryAccess),
+            "offline" => Some(Self::Offline),
+            "catching_up" => Some(Self::CatchingUp),
+            "current" => Some(Self::Current),
+            _ => None,
         }
     }
 }
@@ -617,12 +634,26 @@ mod tests {
 
     #[test]
     fn sync_status_availability() {
-        assert_eq!(SyncStatus::Current.availability(), "current");
-        assert_eq!(SyncStatus::CatchingUp.availability(), "catching_up");
+        for status in [
+            SyncStatus::WaitingForHistoryAccess,
+            SyncStatus::Offline,
+            SyncStatus::CatchingUp,
+            SyncStatus::Current,
+        ] {
+            assert_eq!(
+                SyncStatus::from_availability(status.availability()),
+                Some(status.clone()),
+                "every reported value round trips"
+            );
+        }
         assert_eq!(
-            SyncStatus::Degraded("boom".into()).availability(),
-            "degraded"
+            SyncStatus::WaitingForHistoryAccess.availability(),
+            "waiting_for_history_access"
         );
+        assert_eq!(SyncStatus::Offline.availability(), "offline");
+        assert_eq!(SyncStatus::CatchingUp.availability(), "catching_up");
+        assert_eq!(SyncStatus::Current.availability(), "current");
+        assert_eq!(SyncStatus::from_availability("degraded"), None);
     }
 
     #[test]

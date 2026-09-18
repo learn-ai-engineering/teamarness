@@ -370,10 +370,12 @@ export class ConversationsView {
   }
 
   private patchComposer(state: ControllerState): void {
+    // Sending is local-first: a Message is committed and synchronized later,
+    // so only a Package that cannot read its own history yet may not send.
     const canSend =
       state.selectedChannelId !== null &&
       !state.loading &&
-      state.availability !== "offline";
+      state.availability !== "waiting_for_history_access";
     this.sendButton.disabled = !canSend;
     this.textarea.placeholder = state.selectedChannelId
       ? "Write a message…"

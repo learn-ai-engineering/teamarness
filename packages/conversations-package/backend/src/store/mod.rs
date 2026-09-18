@@ -122,6 +122,23 @@ impl ConversationStore {
             })
             .map_err(rerr)
     }
+    /// Clears the committed delivery cursor.
+    ///
+    /// The Host refuses a cursor that does not belong to this journal; the
+    /// Package then replays from the beginning, and ingestion deduplicates by
+    /// record identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the metadata row cannot be written.
+    pub fn reset_cursor(&self) -> Result<(), StoreError> {
+        let x = lock(&self.inner)?;
+        x.conn
+            .execute("UPDATE metadata SET cursor = NULL WHERE singleton = 1", [])
+            .map(|_| ())
+            .map_err(rerr)
+    }
+
     pub fn record_count(&self) -> Result<u64, StoreError> {
         let x = lock(&self.inner)?;
         x.conn
