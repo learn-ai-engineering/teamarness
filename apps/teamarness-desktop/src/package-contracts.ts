@@ -62,3 +62,38 @@ export type PackageBridgeError = Readonly<{
 }>;
 
 export type PackageResponse = PackageValue;
+
+export type HostUiEvent = Readonly<{
+  mount: string;
+  subscription: string;
+  sequence: string;
+  payload: PackageValue;
+}>;
+
+export type HostRequestInput = Readonly<{
+  mount: string;
+  request: string;
+  operation: string;
+  payload: PackageValue;
+}>;
+
+export type HostSubscriptionInput = Readonly<{
+  mount: string;
+  subscription: string;
+  operation: string;
+  payload: PackageValue;
+}>;
+
+/** The desktop-owned Tauri command surface the Package UI bridge calls on behalf of one mount. */
+export interface PackageHostTransport {
+  request(input: HostRequestInput): Promise<PackageValue>;
+  cancelRequest(input: Readonly<{ mount: string; request: string }>): Promise<void>;
+  openSubscription(
+    input: HostSubscriptionInput,
+    deliver: (event: HostUiEvent) => void,
+    terminate: () => void,
+  ): Promise<void>;
+  acknowledgeEvents(input: Readonly<{ mount: string; subscription: string; throughSequence: string }>): Promise<void>;
+  closeSubscription(input: Readonly<{ mount: string; subscription: string }>): Promise<void>;
+  reportUiFault(input: Readonly<{ mount: string; code: "ui_exception" }>): Promise<void>;
+}

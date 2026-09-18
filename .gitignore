@@ -2,6 +2,7 @@
 /target/
 node_modules/
 /apps/teamarness-desktop/dist/
+/apps/teamarness-desktop/frame-dist/
 /packages/reference-package/ui/dist/
 /packages/tutorial/ui/dist/
 /packages/conversations-package/ui/dist/

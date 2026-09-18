@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && npm run build:frame-runtime",
+    "build:frame-runtime": "vite build --config vite.frame.config.ts",
     "build:application-packages": "node ../../scripts/build-application-packages.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
