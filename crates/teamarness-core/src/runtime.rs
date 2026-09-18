@@ -592,6 +592,8 @@ pub struct CoreRuntime {
     membership_replica: Arc<dyn crate::membership_sync::MembershipReplica>,
     #[cfg(test)]
     membership_paused: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    recovery_report: crate::synchronization::RecoveryReport,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -647,6 +649,13 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         }
         let membership_version = *projection.snapshot().version().as_bytes();
         let scope = crate::synchronization::scope_digest(package, workspace);
+        // A scope isolated by a local integrity failure serves nothing and
+        // accepts nothing, but the Installation stays usable.
+        if crate::synchronization::quarantine::is_scope_quarantined(&state.connection, scope)
+            .map_err(|_| crate::synchronization::Refusal::Unavailable)?
+        {
+            return Err(crate::synchronization::Refusal::Unavailable);
+        }
         let content_key_id = state
             .connection
             .query_row(
@@ -1014,7 +1023,8 @@ impl CoreRuntime {
                 mut connection,
                 secret_key,
                 display_name,
-            } = crate::storage::open(&directory)?;
+                recovery,
+            } = crate::storage::open(&directory, opened_at_unix_ms)?;
             let memberships =
                 crate::membership::projection::recover(&mut connection, opened_at_unix_ms)?;
             // Parking is bounded in time as well as in size: a peer that went
@@ -1024,11 +1034,13 @@ impl CoreRuntime {
                 opened_at_unix_ms,
                 crate::synchronization::parking::ParkingLimits::CURRENT,
             );
-            Ok((connection, secret_key, display_name, memberships))
+            Ok((connection, secret_key, display_name, memberships, recovery))
         })
         .await
         .map_err(|_| CoreError::Storage(StorageError::Database))?;
-        let (connection, secret_key, display_name, memberships) = opened?;
+        let (connection, secret_key, display_name, memberships, recovery) = opened?;
+        #[cfg(not(test))]
+        let _ = recovery;
         let public_identity = PublicIdentity(secret_key.public());
         let peer_sessions = crate::synchronization::PeerSessions::new();
         let state = Arc::new(Mutex::new(RuntimeState {
@@ -1125,7 +1137,15 @@ impl CoreRuntime {
             membership_replica,
             #[cfg(test)]
             membership_paused,
+            #[cfg(test)]
+            recovery_report: recovery,
         })
+    }
+
+    /// What the restart that opened this runtime validated and isolated.
+    #[cfg(test)]
+    pub(crate) fn recovery_report_for_test(&self) -> crate::synchronization::RecoveryReport {
+        self.recovery_report
     }
 
     /// Returns this installation's validated public identity.
@@ -1784,11 +1804,13 @@ impl CoreRuntime {
         if state.poisoned {
             return Err(crate::SynchronizationError::RuntimeUnavailable);
         }
+        let now_unix_ms = state.clock.now_unix_ms();
         crate::synchronization::open_records(
             &state.connection,
             workspace_id,
             package_identity,
             sealed_records,
+            now_unix_ms,
         )
     }
 
@@ -1807,12 +1829,14 @@ impl CoreRuntime {
             return Err(crate::SynchronizationError::RuntimeUnavailable);
         }
         let (sender, receiver) = std::sync::mpsc::channel();
+        let now_unix_ms = state.clock.now_unix_ms();
         let subscription = crate::synchronization::subscribe(
             &state.connection,
             workspace_id,
             package_identity,
             after,
             receiver,
+            now_unix_ms,
         )?;
         state
             .record_subscribers

@@ -699,7 +699,7 @@ mod tests {
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&directory);
-            let runtime = crate::storage::open(&directory).unwrap();
+            let runtime = crate::storage::open(&directory, 0).unwrap();
             let mut connection = runtime.connection;
             let secret_key = runtime.secret_key;
             let result = create_with_test_fault(
@@ -731,7 +731,7 @@ mod tests {
                 .unwrap();
             drop(connection);
 
-            let reopened = crate::storage::open(&directory).unwrap();
+            let reopened = crate::storage::open(&directory, 0).unwrap();
             let workspace_count: i64 = reopened
                 .connection
                 .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
@@ -835,7 +835,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("teamarness-future-context-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
-        let runtime = crate::storage::open(&directory).unwrap();
+        let runtime = crate::storage::open(&directory, 0).unwrap();
         let mut connection = runtime.connection;
         let creator = runtime.secret_key;
         let request_summary = create(&mut connection, &creator, "Future", 1_000).unwrap();
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(counts, (1, 1, 0, 1));
         drop(connection);
 
-        let reopened = crate::storage::open(&directory).unwrap();
+        let reopened = crate::storage::open(&directory, 0).unwrap();
         let future_count: i64 = reopened
             .connection
             .query_row(

@@ -11,11 +11,13 @@ pub(crate) mod p2panda_adapter;
 pub(crate) mod parking;
 pub(crate) mod peer_sessions;
 mod protection_control;
+pub(crate) mod quarantine;
 mod scheduler;
 mod wakes;
 mod worker;
 
 pub(crate) use operation_store::log_id as operation_log_id;
+pub(crate) use quarantine::RecoveryReport;
 pub(crate) use worker::SyncWorker;
 
 pub(crate) use network_handler::{
@@ -821,6 +823,7 @@ pub enum SynchronizationError {
     ContentKeyUnavailable,
     KeyOriginRejected,
     CorruptRecord,
+    ScopeQuarantined,
     CursorScopeMismatch,
     CursorAhead,
     RuntimeUnavailable,
@@ -839,6 +842,9 @@ impl fmt::Display for SynchronizationError {
                 "protection grant does not trace to the workspace creator's key"
             }
             Self::CorruptRecord => "immutable record is corrupt",
+            Self::ScopeQuarantined => {
+                "the package record log is quarantined after a local integrity failure"
+            }
             Self::CursorScopeMismatch => "cursor belongs to another delivery journal",
             Self::CursorAhead => "cursor is ahead of the delivery journal",
             Self::RuntimeUnavailable => "synchronization runtime is unavailable",
@@ -1358,6 +1364,9 @@ pub(crate) fn append(
         MembershipStanding::Revoked => return Err(SynchronizationError::RevokedMember),
         MembershipStanding::None => return Err(SynchronizationError::NotCurrentMember),
     }
+    if quarantine::is_scope_quarantined(conn, scope_digest(package, workspace))? {
+        return Err(SynchronizationError::ScopeQuarantined);
+    }
     let signed = SignedRecordV1::sign(secret, package, workspace, purpose, canonical)
         .map_err(|_| SynchronizationError::InvalidInput)?;
     let scope_exists = conn
@@ -1494,6 +1503,7 @@ pub(crate) fn open_records(
     workspace: WorkspaceId,
     package: &str,
     envelopes: &[Vec<u8>],
+    now_unix_ms: i64,
 ) -> Result<Vec<OpenedRecord>, SynchronizationError> {
     validate_open_batch(envelopes).map_err(|_| SynchronizationError::InvalidInput)?;
     let scope = scope_digest(package, workspace);
@@ -1520,9 +1530,16 @@ pub(crate) fn open_records(
             if sealed.scope_digest != scope {
                 return Err(SynchronizationError::WrongScope);
             }
-            let record = protector
-                .open(&sealed)
-                .map_err(|error| map_open_error(&error))?;
+            let record = match protector.open(&sealed) {
+                Ok(record) => record,
+                Err(error) => {
+                    // An envelope that names a record this Installation stores
+                    // and no longer opens is a local integrity failure, so the
+                    // record is isolated before it is read again.
+                    note_unopenable_record(conn, scope, sealed.record_id, now_unix_ms)?;
+                    return Err(map_open_error(&error));
+                }
+            };
             Ok(OpenedRecord {
                 record_id: sealed.record_id,
                 order_key: sealed.order_key,
@@ -1535,12 +1552,44 @@ pub(crate) fn open_records(
         .collect()
 }
 
+/// Isolates a stored record that no longer opens under its scope's key.
+///
+/// An envelope that this Installation does not store is a caller's value, not a
+/// local fault, so nothing is recorded for it.
+fn note_unopenable_record(
+    conn: &rusqlite::Connection,
+    scope: [u8; 32],
+    record_id: RecordId,
+    now_unix_ms: i64,
+) -> Result<(), SynchronizationError> {
+    let stored = conn
+        .query_row(
+            "SELECT 1 FROM immutable_records WHERE record_id=?1 AND scope_id=?2",
+            rusqlite::params![record_id.as_bytes().as_slice(), scope.as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| storage_error())?
+        .is_some();
+    if stored {
+        quarantine::quarantine_record(
+            conn,
+            scope,
+            record_id.as_bytes(),
+            quarantine::RecordFault::Open,
+            now_unix_ms,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn subscribe(
     conn: &rusqlite::Connection,
     workspace: WorkspaceId,
     package: &str,
     after: Option<Cursor>,
     live: Receiver<RecordEvent>,
+    now_unix_ms: i64,
 ) -> Result<RecordSubscription, SynchronizationError> {
     let scope = scope_digest(package, workspace);
     let journal: Vec<u8> = conn
@@ -1566,7 +1615,7 @@ pub(crate) fn subscribe(
         }
         None => 0,
     };
-    let mut statement = conn.prepare("SELECT d.delivery_sequence,r.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM record_delivery d JOIN immutable_records r ON r.record_id=d.record_id JOIN immutable_operations o ON o.record_id=r.record_id WHERE d.scope_id=?1 AND d.delivery_sequence>?2 ORDER BY d.delivery_sequence").map_err(|_| storage_error())?;
+    let mut statement = conn.prepare("SELECT d.delivery_sequence,r.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM record_delivery d JOIN immutable_records r ON r.record_id=d.record_id JOIN immutable_operations o ON o.record_id=r.record_id LEFT JOIN quarantined_records q ON q.record_id=r.record_id WHERE d.scope_id=?1 AND d.delivery_sequence>?2 AND q.record_id IS NULL ORDER BY d.delivery_sequence").map_err(|_| storage_error())?;
     let rows = statement
         .query_map(rusqlite::params![scope.as_slice(), start], |r| {
             Ok((
@@ -1584,8 +1633,17 @@ pub(crate) fn subscribe(
     for row in rows {
         let (sequence, id, order, author, purpose, sig, sealed) =
             row.map_err(|_| storage_error())?;
-        let sealed_record =
-            SealedRecordV1::decode(&sealed).map_err(|_| SynchronizationError::CorruptRecord)?;
+        let record_id: [u8; 32] = fixed(id.clone())?;
+        let Ok(sealed_record) = SealedRecordV1::decode(&sealed) else {
+            quarantine::quarantine_record(
+                conn,
+                scope,
+                record_id,
+                quarantine::RecordFault::Decode,
+                now_unix_ms,
+            )?;
+            continue;
+        };
         let key: [u8; 32] = conn
             .query_row(
                 "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
@@ -1599,9 +1657,16 @@ pub(crate) fn subscribe(
             workspace_id: workspace,
             content_key: key,
         };
-        let opened = protection
-            .open(&sealed_record)
-            .map_err(|_| SynchronizationError::CorruptRecord)?;
+        let Ok(opened) = protection.open(&sealed_record) else {
+            quarantine::quarantine_record(
+                conn,
+                scope,
+                record_id,
+                quarantine::RecordFault::Open,
+                now_unix_ms,
+            )?;
+            continue;
+        };
         let record = record_from_row((
             &id,
             &order,
@@ -1984,6 +2049,15 @@ fn validate_protection_controls(
         if control.recipient != local {
             continue;
         }
+        let scope_id: [u8; 32] = scope
+            .clone()
+            .try_into()
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+        // A scope that restart already isolated is not held against the
+        // Installation a second time.
+        if quarantine::is_scope_quarantined(conn, scope_id).map_err(|_| StorageError::Database)? {
+            continue;
+        }
         let key = protection_control::open_control(
             &control,
             &bytes[..protection_control::AAD_END],
@@ -2010,7 +2084,8 @@ fn validate_protection_controls(
 pub(crate) fn recover(
     conn: &mut rusqlite::Connection,
     secret: &SecretKey,
-) -> Result<(), StorageError> {
+    now_unix_ms: i64,
+) -> Result<RecoveryReport, StorageError> {
     let scopes: Vec<ScopeRecoveryRow> = {
         let mut stmt = conn.prepare("SELECT scope_id,package_identity,workspace_id,content_key,content_key_id FROM sync_scopes").map_err(|_| StorageError::Database)?;
         let rows = stmt
@@ -2044,50 +2119,165 @@ pub(crate) fn recover(
         .collect::<Result<_, StorageError>>()?
     };
     operation_store::repair(conn, secret)?;
-    operation_store::validate(conn)?;
-    validate_protection_controls(conn, secret)?;
+    let mut report = RecoveryReport::default();
+    // Scope identity comes first: a scope whose binding or key identity is
+    // broken is isolated before anything that reads it runs.
+    let mut sound = Vec::with_capacity(scopes.len());
     for (scope, package, workspace, key, id) in scopes {
-        if scope_digest(&package, workspace) != scope || key_id(&key) != id {
-            return Err(StorageError::CorruptWorkspace);
+        report.scopes_checked += 1;
+        if quarantine::is_scope_quarantined(conn, scope).map_err(|_| StorageError::Database)? {
+            report.scopes_quarantined += 1;
+            continue;
         }
-        let protector = P2pandaRecordProtection {
-            package_identity: package,
-            workspace_id: workspace,
-            content_key: key,
+        let fault = if scope_digest(&package, workspace) != scope {
+            Some(quarantine::ScopeFault::ScopeBinding)
+        } else if key_id(&key) != id {
+            Some(quarantine::ScopeFault::ContentKeyId)
+        } else {
+            None
         };
+        if let Some(fault) = fault {
+            quarantine::quarantine_scope(conn, scope, fault, now_unix_ms)
+                .map_err(|_| StorageError::Database)?;
+            report.scopes_quarantined += 1;
+            continue;
+        }
+        sound.push((scope, package, workspace, key));
+    }
+    validate_protection_controls(conn, secret)?;
+    for (scope, package, workspace, key) in sound {
+        validate_scope_records(
+            conn,
+            scope,
+            &package,
+            workspace,
+            key,
+            now_unix_ms,
+            &mut report,
+        )?;
+    }
+    Ok(report)
+}
+
+/// Validates the records of one scope committed since its last validated start
+/// and moves the scope's validation mark forward.
+///
+/// A projection fault isolates the scope and stops it here; a decode, order-key
+/// or open fault isolates that one record and validation continues.
+fn validate_scope_records(
+    conn: &mut rusqlite::Connection,
+    scope: [u8; 32],
+    package: &str,
+    workspace: WorkspaceId,
+    key: [u8; 32],
+    now_unix_ms: i64,
+    report: &mut RecoveryReport,
+) -> Result<(), StorageError> {
+    let mark: i64 = conn
+        .query_row(
+            "SELECT validated_through_sequence FROM scope_validation WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::Database)?
+        .unwrap_or(0);
+    type PendingRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    let pending: Vec<PendingRow> = {
         let mut stmt = conn
             .prepare(
-                "SELECT r.record_id,o.order_key,r.sealed_record FROM immutable_records r JOIN immutable_operations o ON o.record_id=r.record_id WHERE r.scope_id=?1",
+                "SELECT d.delivery_sequence,r.record_id,o.order_key,r.sealed_record,o.operation_id
+                 FROM record_delivery d
+                 JOIN immutable_records r ON r.record_id=d.record_id
+                 JOIN immutable_operations o ON o.record_id=r.record_id
+                 WHERE d.scope_id=?1 AND d.delivery_sequence>?2
+                 ORDER BY d.delivery_sequence",
             )
             .map_err(|_| StorageError::Database)?;
         let rows = stmt
-            .query_map([scope.as_slice()], |r| {
+            .query_map(rusqlite::params![scope.as_slice(), mark], |r| {
                 Ok((
-                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
                     r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
                 ))
             })
             .map_err(|_| StorageError::Database)?;
-        for row in rows {
-            let (record_id, order, bytes) = row.map_err(|_| StorageError::CorruptWorkspace)?;
-            let sealed =
-                SealedRecordV1::decode(&bytes).map_err(|_| StorageError::CorruptWorkspace)?;
-            let expected_id: [u8; 32] = record_id
-                .try_into()
-                .map_err(|_| StorageError::CorruptWorkspace)?;
-            let expected_order: [u8; 41] = order
-                .try_into()
-                .map_err(|_| StorageError::CorruptWorkspace)?;
-            if sealed.scope_digest != scope
-                || sealed.record_id.as_bytes() != expected_id
-                || sealed.order_key.as_bytes() != expected_order
-                || protector.open(&sealed).is_err()
-            {
-                return Err(StorageError::CorruptWorkspace);
-            }
-        }
+        rows.collect::<Result<_, _>>()
+            .map_err(|_| StorageError::Database)?
+    };
+    if pending.is_empty() {
+        return Ok(());
     }
+    let protector = P2pandaRecordProtection {
+        package_identity: package.to_owned(),
+        workspace_id: workspace,
+        content_key: key,
+    };
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| StorageError::Database)?;
+    let mut scope_isolated = false;
+    let mut validated_through = mark;
+    for (sequence, record_id, order, bytes, operation_id) in pending {
+        if operation_store::validate_projection_row(&transaction, &operation_id).is_err() {
+            quarantine::quarantine_scope(
+                &transaction,
+                scope,
+                quarantine::ScopeFault::Projection,
+                now_unix_ms,
+            )
+            .map_err(|_| StorageError::Database)?;
+            report.scopes_quarantined += 1;
+            scope_isolated = true;
+            break;
+        }
+        let expected_id: [u8; 32] = record_id
+            .try_into()
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+        let expected_order: [u8; 41] = order
+            .try_into()
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+        let fault = match SealedRecordV1::decode(&bytes) {
+            Err(error) if error.value_name() == "order key binding" => {
+                Some(quarantine::RecordFault::OrderKey)
+            }
+            Err(_) => Some(quarantine::RecordFault::Decode),
+            Ok(sealed) => {
+                if sealed.scope_digest != scope
+                    || sealed.record_id.as_bytes() != expected_id
+                    || sealed.order_key.as_bytes() != expected_order
+                {
+                    Some(quarantine::RecordFault::Decode)
+                } else if protector.open(&sealed).is_err() {
+                    Some(quarantine::RecordFault::Open)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(fault) = fault {
+            quarantine::quarantine_record(&transaction, scope, expected_id, fault, now_unix_ms)
+                .map_err(|_| StorageError::Database)?;
+            report.records_quarantined += 1;
+        }
+        report.records_validated += 1;
+        validated_through = sequence;
+    }
+    if !scope_isolated {
+        transaction
+            .execute(
+                "INSERT INTO scope_validation(scope_id,validated_through_sequence) VALUES(?1,?2)
+                 ON CONFLICT(scope_id) DO UPDATE SET validated_through_sequence=excluded.validated_through_sequence",
+                rusqlite::params![scope.as_slice(), validated_through],
+            )
+            .map_err(|_| StorageError::Database)?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| StorageError::UncertainOutcome)?;
     Ok(())
 }
 

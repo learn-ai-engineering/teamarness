@@ -345,8 +345,15 @@ pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<
     Ok(())
 }
 
-/// Check every durable projection before the runtime accepts capability calls.
-pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
+/// Check one durable projection row, named by the Teamarness operation it
+/// projects.
+///
+/// Restart validation checks only the records committed since the last
+/// validated start, so this is per row rather than per table.
+pub(crate) fn validate_projection_row(
+    connection: &Connection,
+    teamarness_operation_id: &[u8],
+) -> Result<(), StorageError> {
     let mut statement = connection
         .prepare(
             "SELECT p.operation_id, p.teamarness_operation_id, p.scope_id, p.log_id,
@@ -357,12 +364,12 @@ pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
                     o.causal_height
              FROM p2panda_operations p
              JOIN immutable_operations o ON o.operation_id=p.teamarness_operation_id
-             WHERE p.status='accepted'
-             ORDER BY p.scope_id, p.author_public_identity, p.author_sequence",
+             WHERE p.status='accepted' AND p.teamarness_operation_id=?1",
         )
         .map_err(|_| StorageError::Database)?;
+    let mut seen = false;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([teamarness_operation_id], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -471,6 +478,12 @@ pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
         if expected_backlink != backlink {
             return Err(StorageError::CorruptWorkspace);
         }
+        seen = true;
+    }
+    // A committed record with no accepted projection row is as broken as a row
+    // that fails a check.
+    if !seen {
+        return Err(StorageError::CorruptWorkspace);
     }
     Ok(())
 }

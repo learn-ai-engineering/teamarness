@@ -38,8 +38,9 @@ fn directory() -> PathBuf {
     ))
 }
 
+// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test]
-async fn restart_authenticates_sealed_record_and_rejects_tampered_key_state() {
+async fn restart_quarantines_a_scope_with_tampered_key_state() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
     let runtime = CoreRuntime::open(config.clone()).await.unwrap();
@@ -47,26 +48,50 @@ async fn restart_authenticates_sealed_record_and_rejects_tampered_key_state() {
     runtime
         .append_record(workspace.id(), "teamarness.test", "message.post", b"secret")
         .unwrap();
+    runtime
+        .append_record(workspace.id(), "teamarness.other", "message.post", b"other")
+        .unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
     let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    let tampered = scope_of(&connection, "teamarness.test");
     connection
-        .execute("UPDATE sync_scopes SET content_key_id = zeroblob(32)", [])
+        .execute(
+            "UPDATE sync_scopes SET content_key_id = zeroblob(32) WHERE scope_id = ?1",
+            [tampered.as_slice()],
+        )
         .unwrap();
     drop(connection);
-    let reopened = CoreRuntime::open(config);
+
+    let reopened = CoreRuntime::open(config).await.unwrap();
     assert!(matches!(
-        reopened.await,
-        Err(teamarness_core::CoreError::Storage(
-            StorageError::CorruptWorkspace
-        ))
+        reopened.append_record(workspace.id(), "teamarness.test", "message.post", b"again"),
+        Err(teamarness_core::SynchronizationError::ScopeQuarantined)
     ));
+    reopened
+        .append_record(workspace.id(), "teamarness.other", "message.post", b"again")
+        .expect("an unrelated scope keeps working");
+    assert_eq!(reopened.list_workspaces().unwrap().len(), 1);
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    let reason: String = connection
+        .query_row(
+            "SELECT reason FROM quarantined_scopes WHERE scope_id = ?1",
+            [tampered.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "content_key_id");
+    drop(connection);
     fs::remove_dir_all(path).unwrap();
 }
 
+// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test]
-async fn restart_rejects_tampered_p2panda_projection() {
+async fn restart_quarantines_a_scope_with_a_tampered_projection() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
     let runtime = CoreRuntime::open(config.clone()).await.unwrap();
@@ -74,28 +99,152 @@ async fn restart_rejects_tampered_p2panda_projection() {
     runtime
         .append_record(workspace.id(), "teamarness.test", "message.post", b"sealed")
         .unwrap();
+    runtime
+        .append_record(workspace.id(), "teamarness.other", "message.post", b"other")
+        .unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
     let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    let tampered = scope_of(&connection, "teamarness.test");
     connection
         .execute("DROP TRIGGER p2panda_operations_no_update", [])
         .unwrap();
     connection
         .execute(
-            "UPDATE p2panda_operations SET payload_hash = zeroblob(32)",
-            [],
+            "UPDATE p2panda_operations SET payload_hash = zeroblob(32) WHERE scope_id = ?1",
+            [tampered.as_slice()],
         )
         .unwrap();
     drop(connection);
 
+    let reopened = CoreRuntime::open(config).await.unwrap();
     assert!(matches!(
-        CoreRuntime::open(config).await,
-        Err(teamarness_core::CoreError::Storage(
-            StorageError::CorruptWorkspace
-        ))
+        reopened.append_record(workspace.id(), "teamarness.test", "message.post", b"again"),
+        Err(teamarness_core::SynchronizationError::ScopeQuarantined)
     ));
+    reopened
+        .append_record(workspace.id(), "teamarness.other", "message.post", b"again")
+        .expect("an unrelated scope keeps working");
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    let reason: String = connection
+        .query_row(
+            "SELECT reason FROM quarantined_scopes WHERE scope_id = ?1",
+            [tampered.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "projection");
+    drop(connection);
     fs::remove_dir_all(path).unwrap();
+}
+
+/// A tampered record below the validation mark is never re-read at restart, so
+/// it is caught the next time a subscriber reads it, and skipped from then on.
+// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test]
+async fn tampered_record_below_the_validation_mark_is_quarantined_on_read() {
+    let path = directory();
+    let config = CoreRuntimeConfig::new(&path);
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let workspace = runtime.create_workspace("Late tamper").unwrap();
+    let mut appended = Vec::new();
+    for index in 0..3_u8 {
+        appended.push(
+            runtime
+                .append_record(
+                    workspace.id(),
+                    "teamarness.test",
+                    "message.post",
+                    &[index; 8],
+                )
+                .unwrap(),
+        );
+    }
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    // The first restart marks all three as validated.
+    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let second = appended[1].record_id().to_string();
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    connection
+        .execute("DROP TRIGGER immutable_records_no_update", [])
+        .unwrap();
+    let mut sealed: Vec<u8> = connection
+        .query_row(
+            "SELECT sealed_record FROM immutable_records WHERE record_id = ?1",
+            [hex_bytes(&second)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let last = sealed.len() - 1;
+    sealed[last] ^= 1;
+    connection
+        .execute(
+            "UPDATE immutable_records SET sealed_record = ?2 WHERE record_id = ?1",
+            rusqlite::params![hex_bytes(&second), sealed],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = CoreRuntime::open(config).await.unwrap();
+    let mut subscription = reopened
+        .subscribe_records(workspace.id(), "teamarness.test", None)
+        .unwrap();
+    let mut delivered = Vec::new();
+    while let Some(event) = subscription
+        .next_event_timeout(std::time::Duration::from_millis(50))
+        .unwrap()
+    {
+        delivered.push(event.record().record_id().to_string());
+    }
+    assert_eq!(
+        delivered,
+        vec![
+            appended[0].record_id().to_string(),
+            appended[2].record_id().to_string()
+        ],
+        "the tampered record is skipped, the others are delivered"
+    );
+    drop(subscription);
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+
+    let connection = Connection::open(path.join("core.sqlite3")).unwrap();
+    let quarantined: (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT record_id, reason FROM quarantined_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(quarantined.0, hex_bytes(&second));
+    assert_eq!(quarantined.1, "open");
+    drop(connection);
+    fs::remove_dir_all(path).unwrap();
+}
+
+fn scope_of(connection: &Connection, package: &str) -> Vec<u8> {
+    connection
+        .query_row(
+            "SELECT scope_id FROM sync_scopes WHERE package_identity = ?1",
+            [package],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn hex_bytes(value: &str) -> Vec<u8> {
+    (0..value.len() / 2)
+        .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
+        .collect()
 }
 
 #[tokio::test]

@@ -2141,7 +2141,7 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&directory);
-        let stored = crate::storage::open(&directory).unwrap();
+        let stored = crate::storage::open(&directory, 0).unwrap();
         let mut connection = stored.connection;
         let manager = stored.secret_key;
         let workspace =
@@ -2196,7 +2196,7 @@ mod tests {
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&directory);
-            let stored = crate::storage::open(&directory).unwrap();
+            let stored = crate::storage::open(&directory, 0).unwrap();
             let mut connection = stored.connection;
             let manager = stored.secret_key;
             let workspace =
@@ -2267,7 +2267,7 @@ mod tests {
                     .unwrap();
                 drop(connection);
 
-                let reopened = crate::storage::open(&directory).unwrap();
+                let reopened = crate::storage::open(&directory, 0).unwrap();
                 connection = reopened.connection;
                 projections = recover(&mut connection, 1_100).unwrap();
                 assert_eq!(

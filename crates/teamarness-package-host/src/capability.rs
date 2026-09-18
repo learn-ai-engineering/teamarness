@@ -823,7 +823,10 @@ fn sync_error(error: teamarness_core::SynchronizationError) -> PackageErrorCode 
         // The Package asked for something this Installation cannot serve yet,
         // not something malformed: the scope's content key has not arrived.
         | teamarness_core::SynchronizationError::ContentKeyUnavailable
-        | teamarness_core::SynchronizationError::KeyOriginRejected => {
+        | teamarness_core::SynchronizationError::KeyOriginRejected
+        // A scope isolated by a local integrity failure is unavailable until
+        // the Installation is reset; the request itself was well formed.
+        | teamarness_core::SynchronizationError::ScopeQuarantined => {
             PackageErrorCode::CapabilityUnavailable
         }
         teamarness_core::SynchronizationError::WorkspaceNotFound

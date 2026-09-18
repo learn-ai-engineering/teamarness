@@ -16,6 +16,8 @@ pub(crate) struct StoredRuntime {
     pub(crate) connection: Connection,
     pub(crate) secret_key: SecretKey,
     pub(crate) display_name: String,
+    /// What restart validation checked and isolated, for tests and diagnostics.
+    pub(crate) recovery: crate::synchronization::RecoveryReport,
 }
 
 #[derive(Clone, Copy)]
@@ -24,20 +26,25 @@ pub(crate) enum IdentityTransactionBoundary {
     AfterCommit,
 }
 
-pub(crate) fn open(private_data_directory: &Path) -> Result<StoredRuntime, StorageError> {
-    open_inner(private_data_directory, |_| Ok(()))
+pub(crate) fn open(
+    private_data_directory: &Path,
+    now_unix_ms: i64,
+) -> Result<StoredRuntime, StorageError> {
+    open_inner(private_data_directory, now_unix_ms, |_| Ok(()))
 }
 
 #[cfg(test)]
 pub(crate) fn open_with_fault(
     private_data_directory: &Path,
+    now_unix_ms: i64,
     fault: impl FnMut(IdentityTransactionBoundary) -> Result<(), StorageError>,
 ) -> Result<StoredRuntime, StorageError> {
-    open_inner(private_data_directory, fault)
+    open_inner(private_data_directory, now_unix_ms, fault)
 }
 
 fn open_inner(
     private_data_directory: &Path,
+    now_unix_ms: i64,
     mut fault: impl FnMut(IdentityTransactionBoundary) -> Result<(), StorageError>,
 ) -> Result<StoredRuntime, StorageError> {
     prepare_private_directory(private_data_directory)?;
@@ -58,12 +65,13 @@ fn open_inner(
     fault(IdentityTransactionBoundary::AfterCommit)?;
     authenticate_local_subject(&connection, &secret_key)?;
     crate::workspace::recover_pending(&mut connection)?;
-    crate::synchronization::recover(&mut connection, &secret_key)?;
+    let recovery = crate::synchronization::recover(&mut connection, &secret_key, now_unix_ms)?;
 
     Ok(StoredRuntime {
         connection,
         secret_key,
         display_name,
+        recovery,
     })
 }
 
@@ -247,7 +255,7 @@ mod tests {
     #[test]
     fn interruption_before_identity_transaction_leaves_no_identity() {
         let directory = test_directory("before-identity");
-        let result = open_with_fault(&directory, |boundary| match boundary {
+        let result = open_with_fault(&directory, 0, |boundary| match boundary {
             IdentityTransactionBoundary::Before => Err(StorageError::Database),
             IdentityTransactionBoundary::AfterCommit => Ok(()),
         });
@@ -262,7 +270,7 @@ mod tests {
         assert_eq!(count, 0);
         drop(connection);
 
-        let reopened = open(&directory).unwrap();
+        let reopened = open(&directory, 0).unwrap();
         authenticate_local_subject(&reopened.connection, &reopened.secret_key).unwrap();
         drop(reopened);
         fs::remove_dir_all(directory).unwrap();
@@ -271,16 +279,16 @@ mod tests {
     #[test]
     fn interruption_after_identity_commit_reloads_the_committed_identity() {
         let directory = test_directory("after-identity");
-        let result = open_with_fault(&directory, |boundary| match boundary {
+        let result = open_with_fault(&directory, 0, |boundary| match boundary {
             IdentityTransactionBoundary::Before => Ok(()),
             IdentityTransactionBoundary::AfterCommit => Err(StorageError::UncertainOutcome),
         });
         assert!(matches!(result, Err(StorageError::UncertainOutcome)));
 
-        let reopened = open(&directory).unwrap();
+        let reopened = open(&directory, 0).unwrap();
         let identity = reopened.secret_key.public();
         drop(reopened);
-        let reopened_again = open(&directory).unwrap();
+        let reopened_again = open(&directory, 0).unwrap();
         assert_eq!(reopened_again.secret_key.public(), identity);
         drop(reopened_again);
         fs::remove_dir_all(directory).unwrap();

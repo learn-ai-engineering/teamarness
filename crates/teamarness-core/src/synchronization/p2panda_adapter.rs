@@ -37,9 +37,17 @@ impl TeamarnessLogStore {
     ) -> Result<Self, TeamarnessLogStoreError> {
         let mut statement = connection
             .prepare(
-                "SELECT operation_bytes FROM p2panda_operations
-                 WHERE scope_id=?1 AND status='accepted'
-                 ORDER BY author_public_identity, author_sequence",
+                // A quarantined record ends the author's served log: a peer
+                // would refuse anything past a missing sequence anyway.
+                "SELECT p.operation_bytes FROM p2panda_operations p
+                 WHERE p.scope_id=?1 AND p.status='accepted'
+                   AND p.author_sequence < COALESCE(
+                       (SELECT MIN(o.author_sequence) FROM quarantined_records q
+                        JOIN immutable_operations o ON o.record_id=q.record_id
+                        WHERE o.scope_id=p.scope_id
+                          AND o.author_public_identity=p.author_public_identity),
+                       p.author_sequence + 1)
+                 ORDER BY p.author_public_identity, p.author_sequence",
             )
             .map_err(|error| TeamarnessLogStoreError(error.to_string()))?;
         let operations = statement

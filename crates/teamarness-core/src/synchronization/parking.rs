@@ -334,7 +334,7 @@ mod tests {
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&directory);
-            let stored = crate::storage::open(&directory).expect("a migrated test database");
+            let stored = crate::storage::open(&directory, 0).expect("a migrated test database");
             Self {
                 directory,
                 connection: stored.connection,
