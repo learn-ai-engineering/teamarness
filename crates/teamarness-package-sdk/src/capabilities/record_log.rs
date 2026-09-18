@@ -321,7 +321,13 @@ impl RecordLog {
         });
         let inner = self
             .client
-            .subscribe(&self.grant, object([("afterCursor", after)]))
+            .subscribe(
+                &self.grant,
+                object([
+                    ("method", JsonValue::String("subscribe".into())),
+                    ("afterCursor", after),
+                ]),
+            )
             .await?;
         Ok(RecordLogSubscription { inner })
     }

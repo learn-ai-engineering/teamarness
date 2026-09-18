@@ -840,3 +840,23 @@ async fn session_stops_on_cancellation_during_backoff() {
     );
     harness.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_names_the_method_the_host_requires() {
+    let directory = tempfile::tempdir().unwrap();
+    let sink = TestSink::open();
+    let scripted = ScriptedCapability::new();
+    let mut harness = start_session(
+        sink,
+        SessionOptions::default(),
+        scripted.clone(),
+        &directory,
+    )
+    .await;
+    wait_for_opens(&scripted, 1).await;
+
+    // The host reads `method` from a capability stream payload and refuses the frame without it.
+    assert_eq!(scripted.recorded_opens()[0]["method"], "subscribe");
+    harness.dispose().await.unwrap();
+    harness.shutdown().await.unwrap();
+}

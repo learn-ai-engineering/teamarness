@@ -1,21 +1,22 @@
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value as JsonValue};
+use teamarness_package_sdk::capabilities::record_log::{
+    Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
+    SyncState, SyncWarning, run_session,
+};
 use teamarness_package_sdk::{
-    Backend, BackendError, BackendRequest, CapabilityClient, EventSubscription, Package,
+    Backend, BackendError, BackendRequest, CancellationToken, EventSubscription, Package,
     event_channel,
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::domain::{DomainRecord, PAGE_SIZE, decode_id, hex_id};
-use crate::immutable_log::{
-    CapabilityLogAdapter, ImmutableRecordLog, LogError, LogEvent, LogSubscription,
-    OpenResultStatus, SyncStatus,
-};
 use crate::store::{ConversationStore, IngestResult};
+
+/// How many distinct synchronization warning codes are remembered at a time.
+const MAX_WARNINGS: usize = 8;
 
 fn object<const N: usize>(entries: [(&str, JsonValue); N]) -> JsonValue {
     let mut o = Map::new();
@@ -33,6 +34,9 @@ fn str_field(v: &JsonValue, k: &str) -> Result<String, BackendError> {
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, object([]))
 }
+fn storage_failed() -> BackendError {
+    error("conversations.storage_failed", true)
+}
 
 fn capability_error(operation: &str, cause: BackendError) -> BackendError {
     eprintln!(
@@ -46,31 +50,24 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
         object([("causeCode", JsonValue::String(cause.code().to_owned()))]),
     )
 }
-fn log_error(operation: &str, cause: LogError) -> BackendError {
-    let (code, retryable) = match &cause {
-        LogError::Transport(c) => (c.clone(), true),
-        LogError::InvalidResponse => ("conversations.invalid_record".into(), false),
-        LogError::StreamClosed => ("conversations.stream_closed".into(), true),
-    };
-    eprintln!("conversations log failure: operation={operation} code={code} retryable={retryable}");
-    BackendError::new(
-        "conversations.capability_unavailable",
-        retryable,
-        object([("causeCode", JsonValue::String(code))]),
-    )
+/// What the Package tells the UI about synchronization.
+///
+/// Availability changes only when the host sends a state event or the session reports a failure;
+/// ingesting a record never implies it.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncReport {
+    pub(crate) availability: Availability,
+    /// Distinct warning codes the host reported, bounded so a noisy session cannot grow it.
+    pub(crate) warnings: Vec<String>,
 }
-fn grant(init: &teamarness_package_sdk::Initialization, id: &str) -> Result<String, BackendError> {
-    init.capability(id)
-        .map(|grant| grant.grant.clone())
-        .ok_or_else(|| error("conversations.missing_capability", false))
-}
-fn b64(bytes: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-fn from_b64(v: &str) -> Result<Vec<u8>, BackendError> {
-    URL_SAFE_NO_PAD
-        .decode(v)
-        .map_err(|_| error("conversations.invalid_record", false))
+
+impl SyncReport {
+    fn catching_up() -> Self {
+        Self {
+            availability: Availability::CatchingUp,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -82,12 +79,12 @@ pub struct ConversationsBackend {
 #[derive(Clone)]
 pub(crate) struct Active {
     pub(crate) store: ConversationStore,
-    pub(crate) record_grant: String,
-    pub(crate) sync_status: Arc<AsyncMutex<SyncStatus>>,
+    pub(crate) log: RecordLog,
+    pub(crate) sync: Arc<Mutex<SyncReport>>,
 }
 pub(crate) struct Running {
     pub(crate) active: Active,
-    pub(crate) cancel: watch::Sender<bool>,
+    pub(crate) cancellation: CancellationToken,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 impl Default for ConversationsBackend {
@@ -116,7 +113,7 @@ impl ConversationsBackend {
 
     async fn stop_active(&self) {
         if let Some(running) = self.active.lock().await.take() {
-            let _ = running.cancel.send(true);
+            running.cancellation.cancel();
             let _ = running.task.await;
         }
     }
@@ -132,68 +129,61 @@ impl ConversationsBackend {
         self.stop_active().await;
         let data = r.initialization.data_directory().path();
         let store = ConversationStore::open(data.join("conversations.sqlite3"))
-            .map_err(|_| error("conversations.storage_failed", true))?;
-        let sync = grant(
-            &r.initialization,
-            "teamarness.synchronization.immutable-record-log",
-        )?;
-        let log = CapabilityLogAdapter::new(r.capabilities.clone(), sync.clone());
+            .map_err(|_| storage_failed())?;
+        let log = RecordLog::from_initialization(&r.initialization, r.capabilities.clone())
+            .map_err(|cause| capability_error("record-log", cause))?;
 
         // Open control records (channel creates / hides) to rehydrate display data.
-        let control_records = store
-            .control_records()
-            .map_err(|_| error("conversations.storage_failed", true))?;
+        let control_records = store.control_records().map_err(|_| storage_failed())?;
         for batch in control_records.chunks(32) {
             let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
             let results = log
-                .open(sealed)
+                .open(&sealed)
                 .await
-                .map_err(|cause| log_error("open-control-records", cause))?;
+                .map_err(|cause| capability_error("open-control-records", cause))?;
             for result in results {
-                if let OpenResultStatus::Ready { canonical } = &result.status {
-                    let _ = store.remember_opened(canonical);
+                if let OpenResult::Ready(record) = result {
+                    let _ = store.remember_opened(&record.canonical);
                 }
             }
         }
 
         // Open and retry deferred records (e.g. messages before their channel).
-        let deferred = store
-            .deferred_records()
-            .map_err(|_| error("conversations.storage_failed", true))?;
+        let deferred = store.deferred_records().map_err(|_| storage_failed())?;
         for batch in deferred.chunks(32) {
-            let records: Vec<_> = batch.to_vec();
-            let sealed: Vec<Vec<u8>> = records
-                .iter()
-                .map(|row| row.sealed_record.clone())
-                .collect();
+            let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
             let results = log
-                .open(sealed)
+                .open(&sealed)
                 .await
-                .map_err(|cause| log_error("open-deferred-records", cause))?;
-            for (row, result) in records.iter().zip(results.iter()) {
-                if let OpenResultStatus::Ready { canonical } = &result.status {
-                    let _ = store.retry_deferred(&row.record_id, canonical);
+                .map_err(|cause| capability_error("open-deferred-records", cause))?;
+            for (row, result) in batch.iter().zip(results.iter()) {
+                if let OpenResult::Ready(record) = result {
+                    let _ = store.retry_deferred(&row.record_id, &record.canonical);
                 }
             }
         }
 
-        let sync_status = Arc::new(AsyncMutex::new(SyncStatus::CatchingUp));
+        let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
         let active = Active {
             store: store.clone(),
-            record_grant: sync.clone(),
-            sync_status: sync_status.clone(),
+            log: log.clone(),
+            sync: sync.clone(),
         };
-
-        let backend = self.clone();
-        let capabilities = r.capabilities.clone();
-        let (cancel, cancelled) = watch::channel(false);
-        let active_clone = active.clone();
-        let task = tokio::spawn(async move {
-            run_session(backend, active_clone, capabilities, sync, cancelled).await;
+        let sink = Arc::new(ConversationsSink {
+            store,
+            changes: self.changes.clone(),
+            sync,
         });
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(run_session(
+            log,
+            sink,
+            cancellation.clone(),
+            SessionOptions::default(),
+        ));
         *self.active.lock().await = Some(Running {
             active,
-            cancel,
+            cancellation,
             task,
         });
         Ok(object([]))
@@ -201,11 +191,8 @@ impl ConversationsBackend {
 
     async fn snapshot(&self) -> Result<JsonValue, BackendError> {
         let a = self.active().await?;
-        let availability = a.sync_status.lock().await.availability().to_owned();
-        let channels = a
-            .store
-            .channels()
-            .map_err(|_| error("conversations.storage_failed", true))?;
+        let availability = a.report().availability;
+        let channels = a.store.channels().map_err(|_| storage_failed())?;
         let visible = channels
             .into_iter()
             .filter(|c| !c.hidden)
@@ -220,7 +207,7 @@ impl ConversationsBackend {
         let warnings = if a
             .store
             .has_projection_warnings()
-            .map_err(|_| error("conversations.storage_failed", true))?
+            .map_err(|_| storage_failed())?
         {
             vec![JsonValue::String(
                 "Some synchronized records could not be applied.".into(),
@@ -230,42 +217,35 @@ impl ConversationsBackend {
         };
         Ok(object([
             ("channels", JsonValue::Array(visible)),
-            ("availability", JsonValue::String(availability)),
+            (
+                "availability",
+                JsonValue::String(availability.as_str().to_owned()),
+            ),
             ("warnings", JsonValue::Array(warnings)),
         ]))
     }
 
-    async fn append(
-        &self,
-        r: &BackendRequest,
-        purpose: &str,
-        domain: DomainRecord,
-    ) -> Result<JsonValue, BackendError> {
+    async fn append(&self, purpose: &str, domain: DomainRecord) -> Result<JsonValue, BackendError> {
         let a = self.active().await?;
         let canonical = domain.encode();
-        let response = r
-            .capabilities
-            .call(
-                &a.record_grant,
-                "append",
-                object([
-                    ("purpose", JsonValue::String(purpose.into())),
-                    ("canonical", JsonValue::String(b64(&canonical))),
-                ]),
-            )
+        let appended = a
+            .log
+            .append(purpose, &canonical)
             .await
             .map_err(|cause| capability_error(purpose, cause))?;
-        let record_id = str_field(&response, "recordId")?;
-        let order = str_field(&response, "orderKey")?;
-        let author = str_field(&response, "author")?;
-        let signature = str_field(&response, "signature")?;
-        let sealed = from_b64(&str_field(&response, "sealedRecord")?)?;
         let outcome = a
             .store
             .ingest(
-                &record_id, &order, &author, purpose, &signature, &canonical, &sealed, None,
+                appended.record_id.as_str(),
+                appended.order_key.as_str(),
+                &appended.author,
+                purpose,
+                &appended.signature,
+                &canonical,
+                &appended.sealed_record,
+                None,
             )
-            .map_err(|_| error("conversations.storage_failed", true))?;
+            .map_err(|_| storage_failed())?;
         match outcome {
             IngestResult::Applied | IngestResult::Duplicate => {}
             IngestResult::Deferred(_) => {
@@ -294,36 +274,29 @@ impl ConversationsBackend {
         let rows = a
             .store
             .message_rows(channel, before, page_limit)
-            .map_err(|_| error("conversations.storage_failed", true))?;
+            .map_err(|_| storage_failed())?;
         if rows.is_empty() {
             return Ok(object([("messages", JsonValue::Array(Vec::new()))]));
         }
         let has_more = rows.len() == page_limit;
-        let sealed = rows.iter().map(|x| JsonValue::String(b64(&x.4))).collect();
-        let opened = r
-            .capabilities
-            .call(
-                &a.record_grant,
-                "open",
-                object([("sealedRecords", JsonValue::Array(sealed))]),
-            )
+        let sealed: Vec<Vec<u8>> = rows.iter().map(|x| x.4.clone()).collect();
+        let results = a
+            .log
+            .open(&sealed)
             .await
             .map_err(|cause| capability_error("open-message-page", cause))?;
-        let results = opened
-            .get("results")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| error("conversations.invalid_record", false))?;
         let local_identity = r.initialization.installation().identity.as_str();
         let last_order = rows.last().map(|r| r.1.clone());
         let mut messages = Vec::new();
-        for ((id, _order, author, _rid, _sealed, _ordinal), value) in rows.into_iter().zip(results)
+        for ((id, _order, author, _rid, _sealed, _ordinal), result) in
+            rows.into_iter().zip(results.iter())
         {
-            let canon = value
-                .get("canonical")
-                .and_then(JsonValue::as_str)
-                .and_then(|s| from_b64(s).ok())
-                .and_then(|b| DomainRecord::decode(&b).ok());
-            if let Some(DomainRecord::MessagePost { markdown, .. }) = canon {
+            let OpenResult::Ready(record) = result else {
+                continue;
+            };
+            if let Ok(DomainRecord::MessagePost { markdown, .. }) =
+                DomainRecord::decode(&record.canonical)
+            {
                 messages.push(object([
                     ("id", JsonValue::String(id)),
                     ("author", JsonValue::String(author.clone())),
@@ -342,6 +315,17 @@ impl ConversationsBackend {
         Ok(page)
     }
 }
+
+impl Active {
+    /// The synchronization report the UI is shown.
+    pub(crate) fn report(&self) -> SyncReport {
+        self.sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 impl Backend for ConversationsBackend {
     fn handle(
         &self,
@@ -358,7 +342,7 @@ impl Backend for ConversationsBackend {
                     let author = r.initialization.installation().identity.as_str();
                     let d = DomainRecord::channel_create(author, slug)
                         .map_err(|_| error("conversations.invalid_slug", false))?;
-                    self.append(&r, "channel.create", d).await
+                    self.append("channel.create", d).await
                 }
                 "conversations.channel.hide" => {
                     if r.payload.get("confirm").and_then(JsonValue::as_bool) != Some(true) {
@@ -369,7 +353,7 @@ impl Backend for ConversationsBackend {
                     let author = r.initialization.installation().identity.as_str();
                     let d = DomainRecord::channel_hide(cid, author)
                         .map_err(|_| error("conversations.invalid_request", false))?;
-                    self.append(&r, "channel.hide", d).await
+                    self.append("channel.hide", d).await
                 }
                 "conversations.message.post" => {
                     let cid = decode_id(&str_field(&r.payload, "channelId")?)
@@ -378,7 +362,7 @@ impl Backend for ConversationsBackend {
                     if !active
                         .store
                         .channel_is_active(&hex_id(cid))
-                        .map_err(|_| error("conversations.storage_failed", true))?
+                        .map_err(|_| storage_failed())?
                     {
                         return Err(error("conversations.channel_hidden", false));
                     }
@@ -386,7 +370,7 @@ impl Backend for ConversationsBackend {
                     let author = r.initialization.installation().identity.as_str();
                     let d = DomainRecord::message_post(cid, author, md)
                         .map_err(|_| error("conversations.invalid_markdown", false))?;
-                    self.append(&r, "message.post", d).await
+                    self.append("message.post", d).await
                 }
                 "conversations.channel.open" | "conversations.channel.page" => {
                     let cid = str_field(&r.payload, "channelId")?;
@@ -402,7 +386,7 @@ impl Backend for ConversationsBackend {
                             .await?
                             .store
                             .mark_read(&cid)
-                            .map_err(|_| error("conversations.storage_failed", true))?;
+                            .map_err(|_| storage_failed())?;
                     }
                     Ok(out)
                 }
@@ -443,169 +427,489 @@ impl Backend for ConversationsBackend {
 }
 
 // ---------------------------------------------------------------------------
-// session loop
+// record log sink
 // ---------------------------------------------------------------------------
 
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Where the SDK's record log session commits what it receives.
+///
+/// Every method runs on the blocking pool, and the session credits a delivery only after `ingest`
+/// has returned, so a record whose ingest fails is delivered again rather than skipped.
+pub(crate) struct ConversationsSink {
+    store: ConversationStore,
+    changes: watch::Sender<u64>,
+    sync: Arc<Mutex<SyncReport>>,
+}
 
-/// Run a cancellation-aware session loop that subscribes from the committed
-/// cursor, ingests events, and reconnects with exponential backoff on failure.
-async fn run_session(
-    backend: ConversationsBackend,
-    active: Active,
-    capabilities: CapabilityClient,
-    grant: String,
-    mut cancelled: watch::Receiver<bool>,
-) {
-    let log = CapabilityLogAdapter::new(capabilities, grant);
-    let mut backoff = INITIAL_BACKOFF;
-
-    // Start in catching-up; the first healthy record transitions to current.
-    *active.sync_status.lock().await = SyncStatus::CatchingUp;
-
-    'outer: loop {
-        // Check cancellation before expensive subscribe.
-        if *cancelled.borrow() {
-            break;
-        }
-
-        let cursor = match active.store.cursor() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("conversations cursor read failure: {e:?}");
-                *active.sync_status.lock().await = SyncStatus::Offline;
-                break;
-            }
-        };
-
-        let had_cursor = cursor.is_some();
-        let mut sub = match log.subscribe(cursor).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("conversations subscribe failure: {e}");
-                *active.sync_status.lock().await = SyncStatus::Offline;
-                break;
-            }
-        };
-
-        // Inner receive loop — processes events from one subscription.
-        let outcome = receive_loop(&backend, &active, &mut sub, &mut cancelled).await;
-        sub.close().await;
-
-        match outcome {
-            ReceiveOutcome::Cancelled => break 'outer,
-            ReceiveOutcome::CursorInvalid => {
-                // A cursor the Host refuses is reset once, and the Package
-                // resubscribes from the beginning without waiting. A second
-                // refusal with no cursor is a real failure.
-                if !had_cursor {
-                    eprintln!("conversations cursor refused with no cursor set");
-                    *active.sync_status.lock().await = SyncStatus::Offline;
-                    tokio::select! {
-                        _ = cancelled.changed() => break 'outer,
-                        () = tokio::time::sleep(backoff) => {},
-                    }
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                } else if let Err(error) = active.store.reset_cursor() {
-                    eprintln!("conversations cursor reset failure: {error:?}");
-                    *active.sync_status.lock().await = SyncStatus::Offline;
-                    break;
-                }
-            }
-            ReceiveOutcome::StreamEnded | ReceiveOutcome::TransportError => {
-                // Transition to catching-up and reconnect after backoff.
-                *active.sync_status.lock().await = SyncStatus::CatchingUp;
-
-                tokio::select! {
-                    _ = cancelled.changed() => break 'outer,
-                    _ = tokio::time::sleep(backoff) => {},
-                }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        }
+impl ConversationsSink {
+    fn with_report(&self, change: impl FnOnce(&mut SyncReport)) {
+        let mut report = self
+            .sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        change(&mut report);
     }
 }
 
-enum ReceiveOutcome {
-    Cancelled,
-    StreamEnded,
-    TransportError,
-    /// The Host refused the stored cursor. It is cleared once and the
-    /// subscription replays from the beginning.
-    CursorInvalid,
+impl RecordLogSink for ConversationsSink {
+    fn committed_cursor(&self) -> Result<Option<Cursor>, BackendError> {
+        let stored = self.store.cursor().map_err(|_| storage_failed())?;
+        // A stored value the contract's grammar refuses is treated as no cursor: the session
+        // replays from the beginning, which ingestion deduplicates by record identity.
+        Ok(stored.and_then(|value| Cursor::parse(value).ok()))
+    }
+
+    fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
+        self.store
+            .ingest(
+                record.record_id.as_str(),
+                record.order_key.as_str(),
+                &record.author,
+                &record.purpose,
+                &record.signature,
+                &record.canonical,
+                &record.sealed_record,
+                Some(record.cursor.as_str()),
+            )
+            .map_err(|_| storage_failed())?;
+        self.changes.send_modify(|x| *x = x.saturating_add(1));
+        Ok(())
+    }
+
+    fn reset_cursor(&self) -> Result<(), BackendError> {
+        self.store.reset_cursor().map_err(|_| storage_failed())
+    }
+
+    fn on_state(&self, state: &SyncState) {
+        self.with_report(|report| report.availability = state.availability);
+    }
+
+    fn on_warning(&self, warning: &SyncWarning) {
+        self.with_report(|report| {
+            if !report.warnings.iter().any(|code| code == &warning.code)
+                && report.warnings.len() < MAX_WARNINGS
+            {
+                report.warnings.push(warning.code.clone());
+            }
+        });
+    }
+
+    fn on_session_error(&self, error: &BackendError) {
+        eprintln!(
+            "conversations session failure: code={} retryable={}",
+            error.code(),
+            error.retryable()
+        );
+        if error.retryable() {
+            // The session is retrying; the host, not the Package, decides availability.
+            return;
+        }
+        let code = error.code().to_owned();
+        self.with_report(|report| {
+            report.availability = Availability::Offline;
+            if !report.warnings.iter().any(|entry| entry == &code)
+                && report.warnings.len() < MAX_WARNINGS
+            {
+                report.warnings.push(code);
+            }
+        });
+    }
 }
 
-/// Inner loop: process events from one subscription until cancellation,
-/// stream close, or a transport error.
-async fn receive_loop(
-    backend: &ConversationsBackend,
-    active: &Active,
-    sub: &mut LogSubscription,
-    cancelled: &mut watch::Receiver<bool>,
-) -> ReceiveOutcome {
-    loop {
-        tokio::select! {
-            result = cancelled.changed() => {
-                if result.is_err() || *cancelled.borrow() {
-                    return ReceiveOutcome::Cancelled;
-                }
+#[cfg(test)]
+mod session_tests {
+    use std::time::Duration;
+
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+    use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
+
+    use super::*;
+    use crate::domain::{GENERAL_ID, hex_id};
+
+    const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
+    const CHANNEL: [u8; 16] = [1; 16];
+
+    fn hex(length: usize, seed: u64) -> String {
+        format!("{:0width$x}", seed, width = length)
+    }
+
+    /// A capability that opens nothing and refuses anything it was not told about.
+    fn scripted_log() -> ScriptedCapability {
+        ScriptedCapability::new().calls(|method, payload| match method {
+            "open" => {
+                let count = payload
+                    .get("sealedRecords")
+                    .and_then(JsonValue::as_array)
+                    .map_or(0, Vec::len);
+                Ok(json!({
+                    "results": (0..count)
+                        .map(|_| json!({ "status": "waiting_for_history_access" }))
+                        .collect::<Vec<_>>(),
+                }))
             }
-            event = sub.recv() => match event {
-                Some(Ok(LogEvent::Record {
-                    record_id,
-                    order_key,
-                    author,
-                    purpose,
-                    signature,
-                    canonical,
-                    sealed_record,
-                    cursor,
-                })) => {
-                    match active.store.ingest(
-                        &record_id, &order_key, &author, &purpose, &signature,
-                        &canonical, &sealed_record, cursor.as_deref(),
-                    ) {
-                        Ok(_) => {
-                            // The Host reports availability explicitly, so
-                            // ingesting a record says nothing about it.
-                            backend.changes.send_modify(|x| *x = x.saturating_add(1));
-                        }
-                        Err(err) => {
-                            eprintln!("conversations record ingestion failure: {err:?}");
-                        }
-                    }
-                }
-                Some(Ok(LogEvent::State { availability })) => {
-                    if let Some(status) =
-                        availability.as_deref().and_then(SyncStatus::from_availability)
-                    {
-                        *active.sync_status.lock().await = status;
-                    }
-                }
-                Some(Ok(LogEvent::Warning { code, .. })) => {
-                    eprintln!("conversations subscription warning: code={code}");
-                }
-                // The cursor does not belong to this journal, or is beyond it.
-                // The Package resets it and replays; records deduplicate by
-                // their identity.
-                Some(Err(LogError::Transport(code))) if code == "cursor_invalid" => {
-                    return ReceiveOutcome::CursorInvalid;
-                }
-                Some(Err(err @ LogError::Transport(_))) => {
-                    eprintln!("conversations subscription transport failure: {err}");
-                    return ReceiveOutcome::TransportError;
-                }
-                Some(Err(err)) => {
-                    eprintln!("conversations event parse error: {err}");
-                    // Continue on parse errors — a single malformed event
-                    // does not tear down the subscription.
-                }
-                None => {
-                    eprintln!("conversations record subscription closed");
-                    return ReceiveOutcome::StreamEnded;
-                }
-            }
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        })
+    }
+
+    fn record_frame(seed: u64, purpose: &str, canonical: &[u8]) -> JsonValue {
+        json!({
+            "kind": "record",
+            "cursor": hex(50, seed),
+            "recordId": hex(64, seed),
+            "orderKey": hex(82, seed),
+            "author": "alice",
+            "purpose": purpose,
+            "signature": "c2ln",
+            "canonical": URL_SAFE_NO_PAD.encode(canonical),
+            "sealedRecord": "c2VhbGVk",
+        })
+    }
+
+    struct Session {
+        harness: Harness,
+        backend: ConversationsBackend,
+        scripted: ScriptedCapability,
+    }
+
+    async fn start(directory: &std::path::Path, scripted: ScriptedCapability) -> Session {
+        let backend = ConversationsBackend::default();
+        let mut harness = HarnessBuilder::new(Arc::new(backend.clone()) as Arc<dyn Backend>)
+            .package_identity("dev.teamarness.conversations")
+            .installation("alice", "Alice")
+            .data_directory(directory)
+            .capability(RECORD_LOG, scripted.clone())
+            .start()
+            .await;
+        harness.activate().await.unwrap();
+        Session {
+            harness,
+            backend,
+            scripted,
         }
+    }
+
+    impl Session {
+        async fn store(&self) -> ConversationStore {
+            self.backend.active().await.unwrap().store
+        }
+
+        async fn availability(&self) -> Availability {
+            self.backend.active().await.unwrap().report().availability
+        }
+
+        async fn warnings(&self) -> Vec<String> {
+            self.backend.active().await.unwrap().report().warnings
+        }
+    }
+
+    async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
+        for _ in 0..600 {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn wait_for_opens(scripted: &ScriptedCapability, count: usize) {
+        for _ in 0..600 {
+            if scripted.recorded_opens().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the Package opened {} streams, expected {count}",
+            scripted.recorded_opens().len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_ingest_is_redelivered_and_not_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        let store = session.store().await;
+        wait_for_opens(&session.scripted, 1).await;
+
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+        let first = DomainRecord::message_post(CHANNEL, "alice", "one").unwrap();
+        let second = DomainRecord::message_post(CHANNEL, "alice", "two").unwrap();
+        let sender = session.scripted.stream();
+        assert!(
+            sender
+                .send(record_frame(1, "channel.create", &channel.encode()))
+                .await
+        );
+        wait_until(
+            || store.record_count().unwrap_or(0) == 1,
+            "the channel record",
+        )
+        .await;
+
+        // The next ingest fails once; the session must deliver the same record again rather
+        // than crediting it away.
+        store.fail_next_ingest_for_test();
+        assert!(
+            sender
+                .send(record_frame(2, "message.post", &first.encode()))
+                .await
+        );
+        wait_for_opens(&session.scripted, 2).await;
+        let sender = session.scripted.stream();
+        assert!(
+            sender
+                .send(record_frame(2, "message.post", &first.encode()))
+                .await
+        );
+        assert!(
+            sender
+                .send(record_frame(3, "message.post", &second.encode()))
+                .await
+        );
+        wait_until(
+            || store.record_count().unwrap_or(0) == 3,
+            "both messages after the retry",
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .message_rows(&hex_id(CHANNEL), None, PAGE_SIZE)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(store.cursor().unwrap(), Some(hex(50, 3)));
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ingesting_a_record_does_not_mark_the_session_current() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        let store = session.store().await;
+        wait_for_opens(&session.scripted, 1).await;
+
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(1, "channel.create", &channel.encode()))
+                .await
+        );
+        wait_until(
+            || store.record_count().unwrap_or(0) == 1,
+            "the ingested record",
+        )
+        .await;
+
+        assert_eq!(
+            session.availability().await,
+            Availability::CatchingUp,
+            "ingesting a record does not mark the session current"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.CONV-R14
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn state_events_drive_sync_status_for_every_availability() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+        let sender = session.scripted.stream();
+
+        for expected in Availability::all() {
+            assert!(
+                sender
+                    .send(json!({
+                        "kind": "state",
+                        "availability": expected.as_str(),
+                        "pendingRecordCount": "0",
+                    }))
+                    .await
+            );
+            let reported = session.backend.clone();
+            wait_until(
+                || futures_now(&reported).is_some_and(|availability| availability == expected),
+                expected.as_str(),
+            )
+            .await;
+        }
+
+        // The retired value is refused by the typed decode rather than mapped to something
+        // else: the session reports an invalid capability response and the Package goes offline.
+        assert!(
+            sender
+                .send(json!({
+                    "kind": "state",
+                    "availability": "degraded",
+                    "pendingRecordCount": "0",
+                }))
+                .await
+        );
+        wait_until(
+            || futures_now(&session.backend) == Some(Availability::Offline),
+            "the refused state event",
+        )
+        .await;
+        assert!(
+            session
+                .warnings()
+                .await
+                .contains(&"package.invalid_capability_response".to_owned()),
+            "a retired availability is never mapped to a known one"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    /// Reads the availability without awaiting, for a polling predicate.
+    fn futures_now(backend: &ConversationsBackend) -> Option<Availability> {
+        let running = backend.active.try_lock().ok()?;
+        let active = running.as_ref()?;
+        Some(active.active.report().availability)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warnings_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+        let sender = session.scripted.stream();
+
+        for index in 0..12 {
+            assert!(
+                sender
+                    .send(json!({ "kind": "warning", "code": format!("warning_{index}") }))
+                    .await
+            );
+        }
+        wait_until(
+            || futures_warnings(&session.backend).is_some_and(|warnings| warnings.len() == 8),
+            "the bounded warning list",
+        )
+        .await;
+        assert_eq!(session.warnings().await.len(), 8);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    fn futures_warnings(backend: &ConversationsBackend) -> Option<Vec<String>> {
+        let running = backend.active.try_lock().ok()?;
+        let active = running.as_ref()?;
+        Some(active.active.report().warnings)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribe_failure_sets_offline_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+
+        session
+            .scripted
+            .stream()
+            .close("capability_unavailable")
+            .await;
+        wait_until(
+            || futures_now(&session.backend) == Some(Availability::Offline),
+            "the offline availability",
+        )
+        .await;
+        assert!(
+            session
+                .warnings()
+                .await
+                .contains(&"capability_unavailable".to_owned())
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cursor_invalid_close_resets_the_cursor_and_resubscribes_once() {
+        let directory = tempfile::tempdir().unwrap();
+        // Seed a committed cursor before the Package opens the same database.
+        {
+            let store =
+                ConversationStore::open(directory.path().join("conversations.sqlite3")).unwrap();
+            let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+            store
+                .ingest(
+                    &hex(64, 1),
+                    &hex(82, 1),
+                    "alice",
+                    "channel.create",
+                    "c2ln",
+                    &channel.encode(),
+                    b"sealed",
+                    Some(&hex(50, 1)),
+                )
+                .unwrap();
+            assert_eq!(store.cursor().unwrap(), Some(hex(50, 1)));
+        }
+
+        let session = start(directory.path(), scripted_log()).await;
+        let store = session.store().await;
+        wait_for_opens(&session.scripted, 1).await;
+        assert_eq!(
+            session.scripted.recorded_opens()[0]["afterCursor"].as_str(),
+            Some(hex(50, 1).as_str())
+        );
+
+        session.scripted.stream().close("cursor_invalid").await;
+        wait_for_opens(&session.scripted, 2).await;
+
+        assert_eq!(store.cursor().unwrap(), None);
+        assert_eq!(
+            session.scripted.recorded_opens()[1]["afterCursor"],
+            JsonValue::Null
+        );
+        // A replayed record with a known identity does not duplicate.
+        let before = store.record_count().unwrap();
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(1, "channel.create", &channel.encode()))
+                .await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(store.record_count().unwrap(), before);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deactivate_cancels_and_awaits_the_session_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+
+        session.harness.dispose().await.unwrap();
+        assert!(session.backend.active.lock().await.is_none());
+        // A second dispose is harmless.
+        session.harness.dispose().await.unwrap();
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn general_channel_is_visible_before_any_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot["availability"], "catching_up");
+        let channels = snapshot["channels"].as_array().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0]["id"], hex_id(GENERAL_ID));
+        session.harness.shutdown().await.unwrap();
     }
 }
