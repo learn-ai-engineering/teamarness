@@ -1,16 +1,24 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile, execFileSync } from "node:child_process";
+import { appendFile, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   createPackageProject,
+  FOUNDATION_TEMPLATE_VERSION,
   PACKAGE_IDENTITY_PATTERN,
   parseArgs,
   repositoryRoot,
   validateArguments,
+  vendorReport,
 } from "./create-package.mjs";
+import { VENDOR_TREES, vendorTreeDigest } from "./vendor-digest.mjs";
+
+const run = promisify(execFile);
+const templateRoot = join(repositoryRoot, "templates/package-foundation/v1");
 
 async function temporaryDirectory() {
   return mkdtemp(join(tmpdir(), "teamarness-create-package-test-"));
@@ -130,14 +138,23 @@ test("copies canonical SDK production trees and records exact provenance", async
     const output = join(parent, "package");
     await createPackageProject({ output, identity: "dev.teamarness.emojart", displayName: "Emojart" });
     const provenance = JSON.parse(await readFile(join(output, "teamarness-authoring.json"), "utf8"));
-    assert.deepEqual(provenance, {
-      templateVersion: 1,
-      packageProcessProtocol: "1.0",
-      uiHostVersion: 1,
-      sdkSource: "vendored-from-teamarness-checkout",
-      sdkUpgrade: "unsupported-in-place",
-      requestNamespace: "emojart",
-    });
+    assert.equal(provenance.templateVersion, FOUNDATION_TEMPLATE_VERSION);
+    assert.equal(provenance.templateVersion, 2);
+    assert.equal(provenance.packageProcessProtocol, "1.0");
+    assert.equal(provenance.uiHostVersion, 1);
+    assert.equal(provenance.sdkSource, "vendored-from-teamarness-checkout");
+    assert.equal(provenance.sdkUpgrade, "unsupported-in-place");
+    assert.equal(provenance.requestNamespace, "emojart");
+    assert.match(provenance.sdkRevision, /^([0-9a-f]{40}|unknown)$/);
+    assert.equal(typeof provenance.sdkRevisionDirty, "boolean");
+    assert.deepEqual(Object.keys(provenance.vendorDigests).sort(), [...VENDOR_TREES].sort());
+    for (const tree of VENDOR_TREES) {
+      assert.equal(
+        provenance.vendorDigests[tree],
+        await vendorTreeDigest(join(output, "vendor/teamarness", tree)),
+        `${tree} digest does not describe the vendored tree`,
+      );
+    }
     const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
     assert.equal(manifest.presentation.displayName, "Emojart");
     assert.equal(manifest.capabilities.length, 0);
@@ -165,12 +182,17 @@ test("copies canonical SDK production trees and records exact provenance", async
     for (const [canonical, generated] of [
       ["crates/teamarness-package-protocol/src", "vendor/teamarness/package-protocol/src"],
       ["crates/teamarness-package-sdk/src", "vendor/teamarness/package-sdk/src"],
+      ["crates/teamarness-package-contract/src", "vendor/teamarness/package-contract/src"],
       ["packages/teamarness-package-ui-sdk/src", "vendor/teamarness/package-ui-sdk/src"],
+      ["packages/teamarness-package-ui-sdk/bin", "vendor/teamarness/package-ui-sdk/bin"],
     ]) {
       const canonicalRoot = join(repositoryRoot, canonical);
       const generatedRoot = join(output, generated);
-      const canonicalFiles = await relativeFiles(canonicalRoot);
-      assert.deepEqual(await relativeFiles(generatedRoot), canonicalFiles, `${generated} file set drifted`);
+      const isTest = (path) => path.endsWith(".test.ts") || path.endsWith(".test.mjs");
+      const canonicalFiles = (await relativeFiles(canonicalRoot)).filter((path) => !isTest(path));
+      const generatedFiles = await relativeFiles(generatedRoot);
+      assert.deepEqual(generatedFiles, canonicalFiles, `${generated} file set drifted`);
+      assert.ok(!generatedFiles.some(isTest), `${generated} must not vendor SDK tests`);
       for (const relative of canonicalFiles) {
         assert.deepEqual(
           await readFile(join(generatedRoot, relative)),
@@ -191,6 +213,11 @@ test("copies canonical SDK production trees and records exact provenance", async
     const canonicalProtocol = await readFile(join(repositoryRoot, "crates/teamarness-package-protocol/Cargo.toml"), "utf8");
     const generatedProtocol = await readFile(join(output, "vendor/teamarness/package-protocol/Cargo.toml"), "utf8");
     assert.deepEqual(productionDependencyNames(generatedProtocol), productionDependencyNames(canonicalProtocol));
+    await stat(join(output, "vendor/teamarness/package-ui-sdk/bin/contract-types.mjs"));
+    const canonicalContract = await readFile(join(repositoryRoot, "crates/teamarness-package-contract/Cargo.toml"), "utf8");
+    const generatedContract = await readFile(join(output, "vendor/teamarness/package-contract/Cargo.toml"), "utf8");
+    assert.deepEqual(productionDependencyNames(generatedContract), productionDependencyNames(canonicalContract));
+    assert.match(generatedContract, /teamarness-package-protocol = \{ path = "\.\.\/package-protocol" \}/);
     const canonicalBackendSdk = await readFile(join(repositoryRoot, "crates/teamarness-package-sdk/Cargo.toml"), "utf8");
     const generatedBackendSdk = await readFile(join(output, "vendor/teamarness/package-sdk/Cargo.toml"), "utf8");
     assert.deepEqual(productionDependencyNames(generatedBackendSdk), productionDependencyNames(canonicalBackendSdk));
@@ -234,6 +261,86 @@ test("copies canonical SDK production trees and records exact provenance", async
       const text = await readFile(file, "utf8").catch(() => "");
       assert.equal(text.includes(repositoryRoot), false, `absolute checkout path leaked into ${file}`);
     }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("template tracks no vendored source trees", () => {
+  const tracked = execFileSync("git", ["-C", repositoryRoot, "ls-files", "templates/package-foundation/v1/vendor"], {
+    encoding: "utf8",
+  }).trim().split("\n").filter(Boolean);
+  assert.ok(tracked.length > 0, "the template must still track vendored manifests");
+  for (const path of tracked) {
+    assert.match(
+      path,
+      /\/(Cargo\.toml|package\.json|README\.md)$/,
+      `${path} must not be tracked: vendored sources are copied at generation`,
+    );
+  }
+});
+
+test("template workspace dependency pins equal the repository pins", async () => {
+  const pins = (manifest) => {
+    const section = manifest.match(/\[workspace\.dependencies\]\n([\s\S]*?)(?:\n\[|$)/);
+    assert.ok(section, "missing workspace dependencies section");
+    return new Map(section[1].split("\n").filter(Boolean).map((line) => [line.split(" = ")[0], line]));
+  };
+  const repository = pins(await readFile(join(repositoryRoot, "Cargo.toml"), "utf8"));
+  const template = pins(await readFile(join(templateRoot, "Cargo.toml"), "utf8"));
+  assert.ok(template.size >= 9, "the template must pin every dependency its vendored crates use");
+  for (const [name, line] of template) {
+    assert.ok(repository.has(name), `${name} is pinned by the template but not by the repository`);
+    assert.equal(line, repository.get(name), `${name} pin drifted from the repository`);
+  }
+});
+
+test("verify-vendor detects an edited vendored file", async () => {
+  const parent = await temporaryDirectory();
+  try {
+    const output = join(parent, "package");
+    await createPackageProject({ output, identity: "dev.teamarness.emojart", displayName: "Emojart" });
+    const verify = ["scripts/verify-vendor.mjs"];
+
+    const clean = await run(process.execPath, verify, { cwd: output });
+    assert.match(clean.stdout, /vendored SDK trees match provenance/);
+
+    await appendFile(join(output, "vendor/teamarness/package-sdk/src/lib.rs"), "\n// edited\n");
+    const edited = await run(process.execPath, verify, { cwd: output }).then(() => null, (error) => error);
+    assert.ok(edited !== null, "an edited vendored file must fail the check");
+    assert.equal(edited.code, 1);
+    assert.match(`${edited.stderr}`, /vendored package-sdk differs/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("vendor report compares a project with the current checkout without writing", async () => {
+  const parent = await temporaryDirectory();
+  try {
+    const output = join(parent, "package");
+    await createPackageProject({ output, identity: "dev.teamarness.emojart", displayName: "Emojart" });
+    const edited = join(output, "vendor/teamarness/package-sdk/src/lib.rs");
+    await appendFile(edited, "\n// edited\n");
+    const before = await Promise.all(VENDOR_TREES.map((tree) =>
+      stat(join(output, "vendor/teamarness", tree)).then((info) => info.mtimeMs)));
+
+    const report = await vendorReport(output);
+
+    assert.equal(report.trees["package-sdk"], "differs");
+    for (const tree of VENDOR_TREES.filter((name) => name !== "package-sdk")) {
+      assert.equal(report.trees[tree], "same", `${tree} must match the current checkout`);
+    }
+    assert.match(report.sdkRevision, /^([0-9a-f]{40}|unknown)$/);
+    const after = await Promise.all(VENDOR_TREES.map((tree) =>
+      stat(join(output, "vendor/teamarness", tree)).then((info) => info.mtimeMs)));
+    assert.deepEqual(after, before, "the report must not write to the project");
+    assert.match(await readFile(edited, "utf8"), /\/\/ edited/);
+    assert.deepEqual(
+      (await readdir(parent)).sort(),
+      ["package"],
+      "the report must remove its comparison project",
+    );
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

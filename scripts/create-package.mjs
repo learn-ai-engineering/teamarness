@@ -1,21 +1,48 @@
+import { execFileSync } from "node:child_process";
 import { cp, lstat, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const FOUNDATION_TEMPLATE_VERSION = 1;
+import { VENDOR_TREES, vendorTreeDigest } from "./vendor-digest.mjs";
+
+export const FOUNDATION_TEMPLATE_VERSION = 2;
 export const PACKAGE_IDENTITY_PATTERN = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 export const repositoryRoot = dirname(scriptDirectory);
 export const templateDirectory = join(repositoryRoot, "templates/package-foundation/v1");
-const canonicalSources = {
-  protocol: join(repositoryRoot, "crates/teamarness-package-protocol/src"),
-  backendSdk: join(repositoryRoot, "crates/teamarness-package-sdk/src"),
-  uiSdk: join(repositoryRoot, "packages/teamarness-package-ui-sdk/src"),
+/**
+ * What a generated project vendors, and where each tree comes from.
+ *
+ * Tests are not vendored: they exercise the SDK, not the project, and a generated project's own
+ * checks are about its own Package.
+ */
+export const canonicalSources = {
+  protocol: { from: "crates/teamarness-package-protocol/src", to: "package-protocol/src" },
+  backendSdk: { from: "crates/teamarness-package-sdk/src", to: "package-sdk/src" },
+  packageContract: { from: "crates/teamarness-package-contract/src", to: "package-contract/src" },
+  uiSdk: { from: "packages/teamarness-package-ui-sdk/src", to: "package-ui-sdk/src" },
+  uiSdkBin: { from: "packages/teamarness-package-ui-sdk/bin", to: "package-ui-sdk/bin" },
 };
+
+/** The checkout paths whose state decides whether a recorded revision is dirty. */
+const provenancePaths = Object.values(canonicalSources)
+  .map(({ from }) => dirname(from))
+  .filter((path, index, all) => all.indexOf(path) === index);
+
+function isTestFile(path) {
+  return path.endsWith(".test.ts") || path.endsWith(".test.mjs");
+}
 const textExtensions = new Set([".json", ".js", ".mjs", ".ts", ".tsx", ".rs", ".toml", ".md", ".html", ".css", ""]);
 
 export function parseArgs(argv) {
+  if (argv[0] === "--vendor-report") {
+    const project = argv[1];
+    if (argv.length !== 2 || !project || project.startsWith("--")) {
+      throw new Error("Missing value for --vendor-report");
+    }
+    return { vendorReport: resolve(project) };
+  }
   const values = {};
   const allowed = new Set(["--output", "--identity", "--display-name"]);
   for (let index = 0; index < argv.length; index += 1) {
@@ -79,6 +106,7 @@ export async function createPackageProject(options) {
   try {
     await copyTemplate(temporary, args);
     await copyCanonicalSdkSources(temporary);
+    await recordProvenance(temporary);
     if (destinationState === "empty") {
       const currentEntries = await readdir(args.output);
       if (currentEntries.length !== 0) throw new Error("output destination changed while generating");
@@ -107,12 +135,15 @@ async function copyTemplate(destination, args) {
 
 async function copyCanonicalSdkSources(destination) {
   const vendorRoot = join(destination, "vendor/teamarness");
-  for (const [name, source] of Object.entries(canonicalSources)) {
-    const targetName = name === "protocol" ? "package-protocol" : name === "backendSdk" ? "package-sdk" : "package-ui-sdk";
-    const target = join(vendorRoot, targetName, "src");
+  for (const { from, to } of Object.values(canonicalSources)) {
+    const target = join(vendorRoot, to);
     await rm(target, { recursive: true, force: true });
-    await cp(source, target, { recursive: true });
+    await cp(join(repositoryRoot, from), target, {
+      recursive: true,
+      filter: (source) => !isTestFile(source),
+    });
   }
+  await cp(join(scriptDirectory, "vendor-digest.mjs"), join(destination, "scripts/vendor-digest.mjs"));
 
   const generatedGuidePath = join(vendorRoot, "package-ui-sdk/README.md");
   const canonicalGuidePath = join(repositoryRoot, "packages/teamarness-package-ui-sdk/README.md");
@@ -122,6 +153,82 @@ async function copyCanonicalSdkSources(destination) {
   const noticeBody = generatedNotice.slice(generatedNotice.indexOf("\n") + 1).trim();
   const canonicalBody = canonicalGuide.slice(canonicalGuide.indexOf("\n") + 1).trimStart();
   await writeFile(generatedGuidePath, `${heading}\n\n${noticeBody}\n\n${canonicalBody}`);
+}
+
+/**
+ * Records which checkout the vendored trees came from, and what they contained.
+ *
+ * The revision names the source; the digests are what `npm run check:vendor` compares a project
+ * against, so an edited vendored file is reported rather than silently carried.
+ */
+async function recordProvenance(destination) {
+  const path = join(destination, "teamarness-authoring.json");
+  const provenance = JSON.parse(await readFile(path, "utf8"));
+  const { revision, dirty } = checkoutRevision();
+  provenance.templateVersion = FOUNDATION_TEMPLATE_VERSION;
+  provenance.sdkRevision = revision;
+  provenance.sdkRevisionDirty = dirty;
+  provenance.vendorDigests = await vendorDigests(destination);
+  await writeFile(path, `${JSON.stringify(provenance, null, 2)}\n`);
+}
+
+async function vendorDigests(project) {
+  const digests = {};
+  for (const tree of VENDOR_TREES) {
+    digests[tree] = await vendorTreeDigest(join(project, "vendor/teamarness", tree));
+  }
+  return digests;
+}
+
+function checkoutRevision() {
+  const git = (...args) => execFileSync("git", ["-C", repositoryRoot, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  try {
+    const revision = git("rev-parse", "HEAD").trim();
+    if (!/^[0-9a-f]{40}$/.test(revision)) return { revision: "unknown", dirty: true };
+    return { revision, dirty: git("status", "--porcelain", "--", ...provenancePaths).trim().length > 0 };
+  } catch {
+    return { revision: "unknown", dirty: true };
+  }
+}
+
+/**
+ * Compares a project's vendored trees with what this checkout would generate today.
+ *
+ * It is read-only, on purpose: ADR 0010 leaves a generated project without an SDK updater, so this
+ * reports a difference and leaves the decision to the author.
+ */
+export async function vendorReport(project) {
+  const projectRoot = resolve(project);
+  const provenance = JSON.parse(await readFile(join(projectRoot, "teamarness-authoring.json"), "utf8"));
+  const manifest = JSON.parse(await readFile(join(projectRoot, "teamarness.package.json"), "utf8"));
+  const parent = await mkdtemp(join(dirname(projectRoot), ".teamarness-vendor-report-"));
+  try {
+    const comparison = join(parent, basename(projectRoot));
+    await createPackageProject({
+      output: comparison,
+      identity: manifest.identity,
+      displayName: manifest.presentation.displayName,
+    });
+    const current = await vendorDigests(comparison);
+    const trees = {};
+    for (const tree of VENDOR_TREES) {
+      const held = await vendorTreeDigest(join(projectRoot, "vendor/teamarness", tree));
+      trees[tree] = held === current[tree] ? "same" : "differs";
+    }
+    const report = {
+      sdkRevision: provenance.sdkRevision,
+      sdkRevisionDirty: provenance.sdkRevisionDirty,
+      trees,
+    };
+    console.log(`sdkRevision: ${report.sdkRevision}${report.sdkRevisionDirty ? " (dirty)" : ""}`);
+    for (const tree of VENDOR_TREES) console.log(`${tree}: ${trees[tree]}`);
+    return report;
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 }
 
 async function replaceTokens(path, tokens) {
@@ -142,7 +249,9 @@ async function replaceTokens(path, tokens) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
-    await createPackageProject(parseArgs(process.argv.slice(2)));
+    const args = parseArgs(process.argv.slice(2));
+    if (args.vendorReport) await vendorReport(args.vendorReport);
+    else await createPackageProject(args);
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     process.exitCode = 1;

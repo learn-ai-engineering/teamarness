@@ -8,6 +8,7 @@
     "build": "cargo build --release --locked && npm --workspace generated-package-ui run build && node scripts/assemble-package.mjs",
     "typecheck": "cargo check --workspace --locked && npm --workspace generated-package-ui run typecheck",
     "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && npm --workspace generated-package-ui run lint",
-    "test": "cargo test --workspace --locked && npm --workspace generated-package-ui test && node --test scripts/assemble-package.test.mjs"
+    "check:vendor": "node scripts/verify-vendor.mjs",
+    "test": "npm run check:vendor && cargo test --workspace --locked && npm --workspace generated-package-ui test && node --test scripts/assemble-package.test.mjs"
   }
 }
