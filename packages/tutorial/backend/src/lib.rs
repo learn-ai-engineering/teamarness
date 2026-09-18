@@ -1,22 +1,18 @@
 #![forbid(unsafe_code)]
 
 use std::f64::consts::TAU;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use teamarness_package_protocol::JsonValue;
-use teamarness_package_sdk::{Backend, BackendError, BackendRequest, EventSubscription, Package};
-use tokio::sync::Mutex;
+use teamarness_package_sdk::{BackendError, Context, Empty, Router};
 
 pub const GENERATOR_VERSION: u32 = 1;
 pub const GRID_WIDTH: u32 = 16;
 pub const GRID_HEIGHT: u32 = 12;
 const STATE_SCHEMA_VERSION: u32 = 2;
 const STATE_FILE_NAME: &str = "tutorial.v1.json";
-const TEMP_FILE_NAME: &str = "tutorial.v1.json.tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -334,16 +330,14 @@ fn validate_state(state: &StateDocument) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Replaces the state document, leaving the previous one intact on any failure.
+///
+/// The SDK's helper flushes the bytes and the directory entry before the rename, so a crash
+/// never leaves a half-written document behind. Its temporary name is `tutorial.v1.json.tmp`.
 fn write_state(directory: &Path, state: &StateDocument) -> Result<(), std::io::Error> {
-    let temporary = directory.join(TEMP_FILE_NAME);
-    let destination = directory.join(STATE_FILE_NAME);
-    let bytes = serde_json::to_vec_pretty(state).map_err(invalid_data)?;
-    std::fs::write(&temporary, bytes)?;
-    if let Err(write_error) = std::fs::rename(&temporary, &destination) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(write_error);
-    }
-    Ok(())
+    let mut bytes = serde_json::to_vec_pretty(state).map_err(invalid_data)?;
+    bytes.push(b'\n');
+    teamarness_package_sdk::storage::write_atomic(&directory.join(STATE_FILE_NAME), &bytes)
 }
 
 fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
@@ -368,117 +362,95 @@ impl SeedSource for SystemSeed {
     }
 }
 
-pub struct TutorialBackend<S = SystemSeed> {
-    active: Arc<Mutex<Option<StateStore>>>,
-    seeds: S,
+/// Everything one activation of the Tutorial owns.
+///
+/// The store is a plain synchronous mutex: every handler touches it inside `Context::blocking`,
+/// so file work never holds an async worker.
+pub struct TutorialState {
+    store: Mutex<StateStore>,
+    seeds: Arc<dyn SeedSource>,
 }
 
-impl Default for TutorialBackend<SystemSeed> {
-    fn default() -> Self {
-        Self::with_seed_source(SystemSeed)
-    }
+/// The Tutorial Backend, with the platform's own source of randomness.
+#[must_use]
+pub fn router() -> Router<TutorialState> {
+    router_with_seed_source(SystemSeed)
 }
 
-impl<S: SeedSource> TutorialBackend<S> {
-    #[must_use]
-    pub fn with_seed_source(seeds: S) -> Self {
-        Self {
-            active: Arc::new(Mutex::new(None)),
-            seeds,
+/// The Tutorial Backend with a chosen source of seeds, which is what tests use.
+#[must_use]
+pub fn router_with_seed_source<S: SeedSource>(seeds: S) -> Router<TutorialState> {
+    let seeds: Arc<dyn SeedSource> = Arc::new(seeds);
+    Router::new(move |activation| {
+        let seeds = seeds.clone();
+        let directory = activation.data_directory().to_owned();
+        let cancellation = activation.cancellation().clone();
+        async move {
+            let store = teamarness_package_sdk::blocking(&cancellation, move |_| {
+                StateStore::open(&directory).map_err(|_| storage_failed())
+            })
+            .await?;
+            Ok(TutorialState {
+                store: Mutex::new(store),
+                seeds,
+            })
         }
-    }
-
-    pub async fn serve(self) -> Result<(), teamarness_package_sdk::SdkError> {
-        Package::builder(Arc::new(self)).serve().await
-    }
-
-    async fn activate(&self, request: &BackendRequest) -> Result<JsonValue, BackendError> {
-        let path = request.initialization.data_directory().path();
-        let store =
-            StateStore::open(path).map_err(|_| backend_error("tutorial.storage_failed", true))?;
-        *self.active.lock().await = Some(store);
-        Ok(empty_object())
-    }
-
-    async fn read(&self) -> Result<JsonValue, BackendError> {
-        let active = self.active.lock().await;
-        let store = active
-            .as_ref()
-            .ok_or_else(|| backend_error("tutorial.not_active", true))?;
-        serde_json::to_value(ReadResponse {
-            algorithms: &ALGORITHMS,
-            palettes: &PALETTES,
-            artworks: store.artworks(),
-        })
-        .map_err(|_| backend_error("tutorial.storage_failed", true))
-    }
-
-    async fn generate(&self, payload: JsonValue) -> Result<JsonValue, BackendError> {
-        if self.active.lock().await.is_none() {
-            return Err(backend_error("tutorial.not_active", true));
-        }
-        let request: GenerateRequest = serde_json::from_value(payload)
-            .map_err(|_| backend_error("tutorial.invalid_request", false))?;
-        let mut recipe = Recipe {
-            generator_version: GENERATOR_VERSION,
-            algorithm: request.algorithm,
-            palette: request.palette,
-            seed: 0,
-            width: GRID_WIDTH,
-            height: GRID_HEIGHT,
-        };
-        validate_recipe(&recipe).map_err(domain_backend_error)?;
-        recipe.seed = self
-            .seeds
-            .next_seed()
-            .map_err(|SeedError| backend_error("tutorial.random_failed", true))?;
-        let cells = render(&recipe).map_err(domain_backend_error)?;
-        serde_json::to_value(Draft { recipe, cells })
-            .map_err(|_| backend_error("tutorial.storage_failed", true))
-    }
-
-    async fn save(&self, payload: JsonValue) -> Result<JsonValue, BackendError> {
-        let request: SaveRequest = serde_json::from_value(payload)
-            .map_err(|_| backend_error("tutorial.invalid_request", false))?;
-        let mut active = self.active.lock().await;
-        let store = active
-            .as_mut()
-            .ok_or_else(|| backend_error("tutorial.not_active", true))?;
-        let artwork = store.save(request.recipe).map_err(store_backend_error)?;
-        serde_json::to_value(artwork).map_err(|_| backend_error("tutorial.storage_failed", true))
-    }
-}
-
-impl<S: SeedSource> Backend for TutorialBackend<S> {
-    fn handle(
-        &self,
-        request: BackendRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
-        Box::pin(async move {
-            match request.operation.as_str() {
-                "lifecycle.activate" | "lifecycle.recover" => self.activate(&request).await,
-                "lifecycle.suspend" => Ok(empty_object()),
-                "lifecycle.dispose" => {
-                    *self.active.lock().await = None;
-                    Ok(empty_object())
-                }
-                "tutorial.read" => {
-                    parse_empty(request.payload)?;
-                    self.read().await
-                }
-                "tutorial.generate" => self.generate(request.payload).await,
-                "tutorial.save" => self.save(request.payload).await,
-                _ => Err(backend_error("tutorial.unknown_operation", false)),
-            }
-        })
-    }
-
-    fn subscribe(
-        &self,
-        _request: BackendRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>> {
-        Box::pin(async { Err(backend_error("tutorial.unknown_subscription", false)) })
-    }
+    })
+    .request(
+        "tutorial.read",
+        |context: Context<TutorialState>, _: Empty| async move {
+            let state = context.state().clone();
+            context
+                .blocking(move |_| {
+                    let store = state.store.lock().map_err(|_| storage_failed())?;
+                    serde_json::to_value(ReadResponse {
+                        algorithms: &ALGORITHMS,
+                        palettes: &PALETTES,
+                        artworks: store.artworks(),
+                    })
+                    .map_err(|_| storage_failed())
+                })
+                .await
+        },
+    )
+    .request(
+        "tutorial.generate",
+        |context: Context<TutorialState>, request: GenerateRequest| async move {
+            let state = context.state().clone();
+            context
+                .blocking(move |_| {
+                    let mut recipe = Recipe {
+                        generator_version: GENERATOR_VERSION,
+                        algorithm: request.algorithm,
+                        palette: request.palette,
+                        seed: 0,
+                        width: GRID_WIDTH,
+                        height: GRID_HEIGHT,
+                    };
+                    validate_recipe(&recipe).map_err(domain_backend_error)?;
+                    recipe.seed = state
+                        .seeds
+                        .next_seed()
+                        .map_err(|SeedError| backend_error("tutorial.random_failed", true))?;
+                    let cells = render(&recipe).map_err(domain_backend_error)?;
+                    serde_json::to_value(Draft { recipe, cells }).map_err(|_| storage_failed())
+                })
+                .await
+        },
+    )
+    .request(
+        "tutorial.save",
+        |context: Context<TutorialState>, request: SaveRequest| async move {
+            let state = context.state().clone();
+            context
+                .blocking(move |_| {
+                    let mut store = state.store.lock().map_err(|_| storage_failed())?;
+                    let artwork = store.save(request.recipe).map_err(store_backend_error)?;
+                    serde_json::to_value(artwork).map_err(|_| storage_failed())
+                })
+                .await
+        },
+    )
 }
 
 #[derive(Serialize)]
@@ -502,17 +474,6 @@ struct SaveRequest {
     recipe: Recipe,
 }
 
-fn parse_empty(payload: JsonValue) -> Result<(), BackendError> {
-    let fields = payload
-        .as_object()
-        .ok_or_else(|| backend_error("tutorial.invalid_request", false))?;
-    if fields.is_empty() {
-        Ok(())
-    } else {
-        Err(backend_error("tutorial.invalid_request", false))
-    }
-}
-
 fn store_backend_error(error: StoreError) -> BackendError {
     match error {
         StoreError::Recipe(error) => domain_backend_error(error),
@@ -525,9 +486,10 @@ fn domain_backend_error(error: TutorialError) -> BackendError {
 }
 
 fn backend_error(code: &'static str, retryable: bool) -> BackendError {
-    BackendError::new(code, retryable, empty_object())
+    BackendError::new(code, retryable, JsonValue::Object(Default::default()))
 }
 
-fn empty_object() -> JsonValue {
-    JsonValue::Object(Default::default())
+/// A poisoned mutex or a failed write is the same thing to the UI: storage did not work.
+fn storage_failed() -> BackendError {
+    backend_error("tutorial.storage_failed", true)
 }

@@ -1,26 +1,54 @@
 #![forbid(unsafe_code)]
 
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::{Connection, params};
 use teamarness_package_protocol::JsonValue;
-use teamarness_package_sdk::{
-    Backend, BackendError, BackendRequest, EventSubscription, Package, event_channel,
-};
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use teamarness_package_sdk::capabilities::membership::Membership;
+use teamarness_package_sdk::capabilities::signing::Signing;
+use teamarness_package_sdk::capabilities::workspace_context::WorkspaceContext;
+use teamarness_package_sdk::{BackendError, Context, Empty, Router, event_channel};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(100);
-const SIGNING_PAYLOAD: &str = "cmVmZXJlbmNlLXBhY2thZ2UtYWN0aXZhdGlvbg";
+const SIGNING_PURPOSE: &str = "reference-activation";
+const SIGNING_PAYLOAD: &[u8] = b"reference-package-activation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateSnapshot {
     pub counter: i64,
     pub background_marker: i64,
+}
+
+/// Why the Reference state could not be read or written.
+///
+/// A poisoned connection is reported rather than panicked on: one failed request must not take
+/// the whole Package Instance down with it.
+#[derive(Debug)]
+pub enum StateError {
+    Database(rusqlite::Error),
+    /// A previous caller panicked while holding the connection.
+    Unavailable,
+}
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(formatter, "database: {error}"),
+            Self::Unavailable => formatter.write_str("state unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for StateError {}
+
+impl From<rusqlite::Error> for StateError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Database(value)
+    }
 }
 
 #[derive(Clone)]
@@ -29,7 +57,12 @@ pub struct ReferenceState {
 }
 
 impl ReferenceState {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
+    /// Opens or creates the Reference database.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database failure.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let connection = Connection::open(path)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -46,58 +79,60 @@ impl ReferenceState {
         })
     }
 
-    pub fn snapshot(&self) -> Result<StateSnapshot, rusqlite::Error> {
-        self.connection
-            .lock()
-            .expect("reference state mutex poisoned")
-            .query_row(
-                "SELECT counter, background_marker FROM reference_state WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok(StateSnapshot {
-                        counter: row.get(0)?,
-                        background_marker: row.get(1)?,
-                    })
-                },
-            )
+    fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StateError> {
+        self.connection.lock().map_err(|_| StateError::Unavailable)
     }
 
-    pub fn increment_counter(&self) -> Result<StateSnapshot, rusqlite::Error> {
-        self.connection
-            .lock()
-            .expect("reference state mutex poisoned")
-            .execute(
-                "UPDATE reference_state SET counter = counter + 1 WHERE singleton = ?1",
-                params![1],
-            )?;
+    /// Reads the counter and the background marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database failure, or `Unavailable` when the connection is poisoned.
+    pub fn snapshot(&self) -> Result<StateSnapshot, StateError> {
+        Ok(self.connection()?.query_row(
+            "SELECT counter, background_marker FROM reference_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(StateSnapshot {
+                    counter: row.get(0)?,
+                    background_marker: row.get(1)?,
+                })
+            },
+        )?)
+    }
+
+    /// Advances the counter the UI shows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database failure, or `Unavailable` when the connection is poisoned.
+    pub fn increment_counter(&self) -> Result<StateSnapshot, StateError> {
+        self.connection()?.execute(
+            "UPDATE reference_state SET counter = counter + 1 WHERE singleton = ?1",
+            params![1],
+        )?;
         self.snapshot()
     }
 
-    pub fn advance_background_marker(&self) -> Result<StateSnapshot, rusqlite::Error> {
-        self.connection
-            .lock()
-            .expect("reference state mutex poisoned")
-            .execute(
-                "UPDATE reference_state SET background_marker = background_marker + 1 WHERE singleton = ?1",
-                params![1],
-            )?;
+    /// Advances the marker that proves background work is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database failure, or `Unavailable` when the connection is poisoned.
+    pub fn advance_background_marker(&self) -> Result<StateSnapshot, StateError> {
+        self.connection()?.execute(
+            "UPDATE reference_state SET background_marker = background_marker + 1 WHERE singleton = ?1",
+            params![1],
+        )?;
         self.snapshot()
     }
 
+    /// Starts a timer that advances the background marker, for tests of the state alone.
     #[must_use]
     pub fn start_background_activity(&self, interval: Duration) -> BackgroundActivity {
-        let state = self.clone();
-        let task = tokio::spawn(async move {
-            let mut timer = tokio::time::interval(interval);
-            timer.tick().await;
-            loop {
-                timer.tick().await;
-                if state.advance_background_marker().is_err() {
-                    return;
-                }
-            }
-        });
-        BackgroundActivity { task }
+        BackgroundActivity {
+            task: spawn_activity(self.clone(), interval, None),
+        }
     }
 }
 
@@ -112,271 +147,238 @@ impl BackgroundActivity {
     }
 }
 
-#[derive(Clone)]
-pub struct ReferenceBackend {
-    active: Arc<AsyncMutex<Option<ActivePackage>>>,
-    activity: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
-    changes: watch::Sender<u64>,
+/// Advances the background marker on a timer, off the async runtime.
+///
+/// Each tick's database work runs on the blocking pool, so the Package's own workers stay free
+/// even while SQLite is busy.
+fn spawn_activity(
+    state: ReferenceState,
+    interval: Duration,
+    changes: Option<watch::Sender<u64>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            let worker = state.clone();
+            match tokio::task::spawn_blocking(move || worker.advance_background_marker()).await {
+                Ok(Ok(_)) => {}
+                _ => return,
+            }
+            if let Some(changes) = &changes {
+                changes.send_modify(|revision| *revision = revision.saturating_add(1));
+            }
+        }
+    })
 }
 
-#[derive(Clone)]
-struct ActivePackage {
+/// Everything one activation of the Reference Package owns.
+pub struct ReferenceActive {
     state: ReferenceState,
     package_version: String,
     process_generation: String,
     membership_version: String,
     signing_verified: bool,
+    activity: Mutex<Option<JoinHandle<()>>>,
+    changes: watch::Sender<u64>,
 }
 
-impl Default for ReferenceBackend {
-    fn default() -> Self {
-        let (changes, _) = watch::channel(0);
-        Self {
-            active: Arc::new(AsyncMutex::new(None)),
-            activity: Arc::new(AsyncMutex::new(None)),
-            changes,
-        }
-    }
-}
-
-impl ReferenceBackend {
-    pub async fn serve() -> Result<(), teamarness_package_sdk::SdkError> {
-        Package::builder(Arc::new(Self::default())).serve().await
+impl ReferenceActive {
+    /// Takes the running background task, if any, so the caller can stop it.
+    fn take_activity(&self) -> Option<JoinHandle<()>> {
+        self.activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
-    async fn activate(&self, request: &BackendRequest) -> Result<JsonValue, BackendError> {
-        self.stop_activity().await;
-        let workspace_grant = grant(&request.initialization, "teamarness.workspace-context")?;
-        let membership_grant = grant(&request.initialization, "teamarness.membership")?;
-        let signing_grant = grant(&request.initialization, "teamarness.signing")?;
-        let workspace = request
-            .capabilities
-            .call(&workspace_grant, "get", empty_object())
-            .await
-            .map_err(capability_error)?;
-        let membership = request
-            .capabilities
-            .call(&membership_grant, "current", empty_object())
-            .await
-            .map_err(capability_error)?;
-        let signed = request
-            .capabilities
-            .call(
-                &signing_grant,
-                "sign",
-                object([
-                    ("purpose", JsonValue::String("reference-activation".into())),
-                    ("payload", JsonValue::String(SIGNING_PAYLOAD.into())),
-                ]),
-            )
-            .await
-            .map_err(capability_error)?;
-        let signer = string_value(&signed, "signer")?;
-        let signature = string_value(&signed, "signature")?;
-        let verified = request
-            .capabilities
-            .call(
-                &signing_grant,
-                "verify",
-                object([
-                    ("signer", JsonValue::String(signer)),
-                    ("purpose", JsonValue::String("reference-activation".into())),
-                    ("payload", JsonValue::String(SIGNING_PAYLOAD.into())),
-                    ("signature", JsonValue::String(signature)),
-                ]),
-            )
-            .await
-            .map_err(capability_error)?;
-        let signing_verified = verified
-            .get("valid")
-            .and_then(JsonValue::as_bool)
-            .ok_or_else(invalid_capability_response)?;
-        let membership_version = string_value(&membership, "membershipVersion")?;
-        if workspace
-            .get("workspaceId")
-            .and_then(JsonValue::as_str)
-            .is_none()
-        {
-            return Err(invalid_capability_response());
-        }
-        let data_path = request.initialization.data_directory().path().to_owned();
-        let package_version = request.initialization.package().version.clone();
-        let state = ReferenceState::open(data_path.join("state.sqlite3")).map_err(storage_error)?;
-        *self.active.lock().await = Some(ActivePackage {
-            state: state.clone(),
-            package_version,
-            process_generation: request.initialization.process_generation().to_owned(),
-            membership_version,
-            signing_verified,
-        });
-        let changes = self.changes.clone();
-        *self.activity.lock().await = Some(tokio::spawn(async move {
-            let mut timer = tokio::time::interval(BACKGROUND_INTERVAL);
-            timer.tick().await;
-            loop {
-                timer.tick().await;
-                if state.advance_background_marker().is_err() {
-                    return;
-                }
-                changes.send_modify(|revision| *revision = revision.saturating_add(1));
-            }
-        }));
-        Ok(empty_object())
+    fn set_activity(&self, task: JoinHandle<()>) {
+        *self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
     }
 
-    async fn stop_activity(&self) {
-        if let Some(task) = self.activity.lock().await.take() {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-
-    async fn read(&self) -> Result<JsonValue, BackendError> {
-        let active = self.active.lock().await;
-        let active = active.as_ref().ok_or_else(not_active)?;
-        let state = active.state.snapshot().map_err(storage_error)?;
-        Ok(snapshot_value(active, state))
-    }
-
-    async fn increment(&self) -> Result<JsonValue, BackendError> {
-        let value = {
-            let active = self.active.lock().await;
-            let active = active.as_ref().ok_or_else(not_active)?;
-            let state = active.state.increment_counter().map_err(storage_error)?;
-            snapshot_value(active, state)
-        };
-        self.changes
-            .send_modify(|revision| *revision = revision.saturating_add(1));
-        Ok(value)
+    fn snapshot_value(&self) -> Result<JsonValue, BackendError> {
+        let state = self.state.snapshot().map_err(storage_error)?;
+        Ok(object([
+            ("counter", JsonValue::from(state.counter)),
+            ("backgroundMarker", JsonValue::from(state.background_marker)),
+            (
+                "membershipVersion",
+                JsonValue::String(self.membership_version.clone()),
+            ),
+            ("signingVerified", JsonValue::Bool(self.signing_verified)),
+            (
+                "processGeneration",
+                JsonValue::String(self.process_generation.clone()),
+            ),
+            (
+                "packageVersion",
+                JsonValue::String(self.package_version.clone()),
+            ),
+        ]))
     }
 }
 
-impl Backend for ReferenceBackend {
-    fn handle(
-        &self,
-        request: BackendRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
-        Box::pin(async move {
-            match request.operation.as_str() {
-                "lifecycle.activate" | "lifecycle.recover" => self.activate(&request).await,
-                "lifecycle.suspend" => {
-                    self.stop_activity().await;
-                    Ok(empty_object())
-                }
-                "lifecycle.dispose" => {
-                    self.stop_activity().await;
-                    *self.active.lock().await = None;
-                    Ok(empty_object())
-                }
-                "reference.read" => self.read().await,
-                "reference.increment" => self.increment().await,
-                // The live fixture for Package-owned error fidelity: the code, retryability and
-                // details reach the Reference UI unchanged.
-                "reference.fail" => Err(BackendError::new(
-                    "reference.requested_failure",
-                    false,
-                    object([("reason", JsonValue::String("requested".into()))]),
-                )),
-                _ => Err(BackendError::new(
-                    "reference.unknown_operation",
-                    false,
-                    empty_object(),
-                )),
-            }
-        })
+async fn stop_activity(state: &ReferenceActive) {
+    if let Some(task) = state.take_activity() {
+        task.abort();
+        let _ = task.await;
     }
+}
 
-    fn subscribe(
-        &self,
-        request: BackendRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>> {
-        Box::pin(async move {
-            if request.operation != "reference.changes" {
-                return Err(BackendError::new(
-                    "reference.unknown_subscription",
-                    false,
-                    empty_object(),
-                ));
+/// The Reference Package Backend.
+#[must_use]
+pub fn router() -> Router<ReferenceActive> {
+    Router::new(|activation| {
+        let initialization = activation.initialization().clone();
+        let capabilities = activation.capabilities().clone();
+        let cancellation = activation.cancellation().clone();
+        async move {
+            let workspace =
+                WorkspaceContext::from_initialization(&initialization, capabilities.clone())
+                    .map_err(initialization_error)?;
+            let membership = Membership::from_initialization(&initialization, capabilities.clone())
+                .map_err(initialization_error)?;
+            let signing = Signing::from_initialization(&initialization, capabilities)
+                .map_err(initialization_error)?;
+
+            let context = workspace.get().await.map_err(capability_error)?;
+            if context.workspace_id.is_empty() {
+                return Err(invalid_capability_response());
             }
+            let roster = membership.current().await.map_err(capability_error)?;
+            let signature = signing
+                .sign(SIGNING_PURPOSE, SIGNING_PAYLOAD)
+                .await
+                .map_err(capability_error)?;
+            let signing_verified = signing
+                .verify(
+                    &signature.signer,
+                    SIGNING_PURPOSE,
+                    SIGNING_PAYLOAD,
+                    &signature.signature,
+                )
+                .await
+                .map_err(capability_error)?;
+
+            let database = initialization.data_directory().path().join("state.sqlite3");
+            let state = teamarness_package_sdk::blocking(&cancellation, move |_| {
+                ReferenceState::open(database).map_err(storage_error)
+            })
+            .await?;
+
+            let (changes, _) = watch::channel(0);
+            let active = ReferenceActive {
+                state: state.clone(),
+                package_version: initialization.package().version.clone(),
+                process_generation: initialization.process_generation().to_owned(),
+                membership_version: roster.membership_version,
+                signing_verified,
+                activity: Mutex::new(None),
+                changes: changes.clone(),
+            };
+            active.set_activity(spawn_activity(state, BACKGROUND_INTERVAL, Some(changes)));
+            Ok(active)
+        }
+    })
+    .on_suspend(|state: Arc<ReferenceActive>| async move {
+        stop_activity(&state).await;
+        Ok(())
+    })
+    .on_resume(|state: Arc<ReferenceActive>| async move {
+        stop_activity(&state).await;
+        state.set_activity(spawn_activity(
+            state.state.clone(),
+            BACKGROUND_INTERVAL,
+            Some(state.changes.clone()),
+        ));
+        Ok(())
+    })
+    .on_dispose(|state: Arc<ReferenceActive>| async move {
+        stop_activity(&state).await;
+        Ok(())
+    })
+    .request(
+        "reference.read",
+        |context: Context<ReferenceActive>, _: Empty| async move {
+            let state = context.state().clone();
+            context.blocking(move |_| state.snapshot_value()).await
+        },
+    )
+    .request(
+        "reference.increment",
+        |context: Context<ReferenceActive>, _: Empty| async move {
+            let state = context.state().clone();
+            let value = context
+                .blocking(move |_| {
+                    state.state.increment_counter().map_err(storage_error)?;
+                    state.snapshot_value()
+                })
+                .await?;
+            context
+                .state()
+                .changes
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            Ok(value)
+        },
+    )
+    // The live fixture for Package-owned error fidelity: the code, retryability and details
+    // reach the Reference UI unchanged.
+    .request(
+        "reference.fail",
+        |_context: Context<ReferenceActive>, _: Empty| async move {
+            Err::<JsonValue, _>(BackendError::new(
+                "reference.requested_failure",
+                false,
+                object([("reason", JsonValue::String("requested".into()))]),
+            ))
+        },
+    )
+    .subscription(
+        "reference.changes",
+        |context: Context<ReferenceActive>, _: Empty| async move {
             let (sender, subscription) = event_channel(32);
-            let backend = self.clone();
-            let mut changes = self.changes.subscribe();
+            let mut changes = context.state().changes.subscribe();
             tokio::spawn(async move {
-                if let Ok(initial) = backend.read().await
-                    && sender.send(initial).await.is_err()
-                {
-                    return;
-                }
-                while changes.changed().await.is_ok() {
-                    let Ok(value) = backend.read().await else {
+                loop {
+                    let state = context.state().clone();
+                    let Ok(value) = context.blocking(move |_| state.snapshot_value()).await else {
                         return;
                     };
                     if sender.send(value).await.is_err() {
                         return;
                     }
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
                 }
             });
             Ok(subscription)
-        })
-    }
+        },
+    )
 }
 
-fn grant(
-    initialization: &teamarness_package_sdk::Initialization,
-    identity: &str,
-) -> Result<String, BackendError> {
-    initialization
-        .capability(identity)
-        .map(|grant| grant.grant.clone())
-        .ok_or_else(invalid_initialization)
-}
-
-fn snapshot_value(active: &ActivePackage, state: StateSnapshot) -> JsonValue {
-    object([
-        ("counter", JsonValue::from(state.counter)),
-        ("backgroundMarker", JsonValue::from(state.background_marker)),
-        (
-            "membershipVersion",
-            JsonValue::String(active.membership_version.clone()),
-        ),
-        ("signingVerified", JsonValue::Bool(active.signing_verified)),
-        (
-            "processGeneration",
-            JsonValue::String(active.process_generation.clone()),
-        ),
-        (
-            "packageVersion",
-            JsonValue::String(active.package_version.clone()),
-        ),
-    ])
-}
-
-fn string_value(value: &JsonValue, field: &str) -> Result<String, BackendError> {
-    value
-        .get(field)
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-        .ok_or_else(invalid_capability_response)
-}
-
-fn capability_error(_error: BackendError) -> BackendError {
-    BackendError::new("reference.capability_failed", true, empty_object())
+fn capability_error(error: BackendError) -> BackendError {
+    BackendError::new(
+        "reference.capability_failed",
+        true,
+        object([("capabilityCode", JsonValue::String(error.code().to_owned()))]),
+    )
 }
 
 fn invalid_capability_response() -> BackendError {
     BackendError::new("reference.capability_invalid", false, empty_object())
 }
 
-fn invalid_initialization() -> BackendError {
+fn initialization_error(_error: BackendError) -> BackendError {
     BackendError::new("reference.initialization_invalid", false, empty_object())
 }
 
-fn storage_error(_error: rusqlite::Error) -> BackendError {
+fn storage_error(_error: StateError) -> BackendError {
     BackendError::new("reference.storage_failed", true, empty_object())
-}
-
-fn not_active() -> BackendError {
-    BackendError::new("reference.not_active", true, empty_object())
 }
 
 fn empty_object() -> JsonValue {

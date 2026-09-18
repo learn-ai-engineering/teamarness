@@ -15,4 +15,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true
+teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk", features = ["testing"] }
 tempfile.workspace = true
