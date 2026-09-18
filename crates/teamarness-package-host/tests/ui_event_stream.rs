@@ -306,7 +306,7 @@ async fn request_contract_rejects_both_sides_and_backend_violation_fails_only_th
 }
 
 #[tokio::test]
-async fn stream_close_is_terminal_without_stopping_the_backend() {
+async fn package_closed_stream_completes_without_stopping_the_backend() {
     let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
@@ -314,13 +314,35 @@ async fn stream_close_is_terminal_without_stopping_the_backend() {
     let generation = host.snapshot().await.instances[0].process_generation;
     let mount = mount(&host, 0).await;
     let mut events = open(&host, &mount, "closed", "fixture.close").await;
-    assert_eq!(
-        events.changed().await.unwrap_err().code,
-        PackageErrorCode::BackendError
-    );
+    assert!(matches!(
+        events.changed().await.unwrap(),
+        PackageHostNotification::UiStreamCompleted(_)
+    ));
     assert_eq!(
         host.snapshot().await.instances[0].process_generation,
         generation
+    );
+}
+
+/// A Package that rejects a subscription reports its own code to its own UI, and the mount
+/// stays healthy: only a host-owned stream failure is a mount fault.
+#[tokio::test]
+async fn package_rejected_stream_carries_its_code_without_failing_the_mount() {
+    let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let mut events = open(&host, &mount, "rejected", "fixture.rejected_stream").await;
+    let error = events.changed().await.unwrap_err();
+    assert_eq!(error.code, PackageErrorCode::BackendError);
+    let package_error = error.package_error.as_ref().expect("Package-owned error");
+    assert_eq!(package_error.code, "fixture.stream_rejected");
+    assert!(!package_error.retryable);
+    assert!(package_error.details.is_empty());
+    assert_eq!(
+        host.snapshot().await.instances[0].mount_state,
+        Some(MountState::Mounted)
     );
 }
 

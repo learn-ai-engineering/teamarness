@@ -317,6 +317,11 @@ async fn forward_ui_events(
     loop {
         let message = match receiver.changed().await {
             Ok(PackageHostNotification::UiEvent(value)) => UiStreamMessageDto::Event(value.into()),
+            // The Package ended the stream; the Shell reports it and stops, without a fault.
+            Ok(PackageHostNotification::UiStreamCompleted(value)) => {
+                let _ = on_event.send(UiStreamMessageDto::Completed(value.into()));
+                return;
+            }
             Err(error) => {
                 let _ = on_event.send(UiStreamMessageDto::Failure(error.into()));
                 return;

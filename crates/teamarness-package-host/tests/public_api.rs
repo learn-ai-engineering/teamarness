@@ -374,3 +374,27 @@ fn public_source_does_not_export_dependency_types() {
     let token = UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
     assert_eq!(format!("{token:?}"), "UiResourceToken([redacted])");
 }
+
+#[test]
+fn package_error_envelope_version_two_serializes_package_error_in_camel_case() {
+    let mut envelope = PackageErrorEnvelope::new(
+        PackageErrorCode::BackendError,
+        PackageErrorStage::Ui,
+        false,
+        RecoveryAction::None,
+        teamarness_package_host::DiagnosticId::new("diag-fixture").unwrap(),
+    );
+    assert_eq!(
+        serde_json::to_value(&envelope).unwrap()["version"],
+        serde_json::json!(2)
+    );
+    envelope.package_error = Some(teamarness_package_host::PackageOwnedError {
+        code: "fixture.rejected".into(),
+        retryable: false,
+        details: serde_json::Map::new(),
+    });
+    let value = serde_json::to_value(&envelope).unwrap();
+    assert_eq!(value["packageError"]["code"], "fixture.rejected");
+    assert_eq!(value["packageError"]["retryable"], serde_json::json!(false));
+    assert!(value["packageError"]["details"].is_object());
+}

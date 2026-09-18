@@ -492,6 +492,23 @@ pub enum RecoveryAction {
     None,
 }
 
+/// A Package-owned terminal error, forwarded to the Package UI unchanged except for bounds.
+///
+/// The Host's own `code` stays authoritative; this is the Package's own vocabulary beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageOwnedError {
+    /// Frame-validated against `^[a-z][a-z0-9_.-]{0,127}$`.
+    pub code: String,
+    pub retryable: bool,
+    pub details: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The largest compact JSON encoding of Package error details the Host forwards.
+pub const MAX_PACKAGE_ERROR_DETAILS_BYTES: usize = 4096;
+/// The deepest Package error details the Host forwards.
+pub const MAX_PACKAGE_ERROR_DETAILS_DEPTH: usize = 8;
+
 /// Versioned, stable, payload-free Package Host error envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -505,6 +522,8 @@ pub struct PackageErrorEnvelope {
     pub retryable: bool,
     pub recovery: RecoveryAction,
     pub diagnostic_id: DiagnosticId,
+    /// The Package's own error, when the Package owns this failure.
+    pub package_error: Option<PackageOwnedError>,
 }
 
 impl PackageErrorEnvelope {
@@ -518,7 +537,7 @@ impl PackageErrorEnvelope {
         diagnostic_id: DiagnosticId,
     ) -> Self {
         Self {
-            version: 1,
+            version: 2,
             namespace: "teamarness.package-host".to_owned(),
             code,
             stage,
@@ -527,6 +546,7 @@ impl PackageErrorEnvelope {
             retryable,
             recovery,
             diagnostic_id,
+            package_error: None,
         }
     }
 }
@@ -755,6 +775,15 @@ pub struct UiEventNotification {
 pub enum PackageHostNotification {
     HostState(HostStateNotification),
     UiEvent(UiEventNotification),
+    UiStreamCompleted(UiStreamCompletedNotification),
+}
+
+/// A Package UI stream the Package ended normally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiStreamCompletedNotification {
+    pub mount: UiMountId,
+    pub subscription: UiSubscriptionId,
 }
 
 /// A bounded subscription to host revisions or one Package UI stream.
@@ -809,7 +838,21 @@ impl PackageHostSubscription {
                     sequence: event.sequence.to_string(),
                     payload: event.payload,
                 })),
-                Err(code) => {
+                Err(protocol::StreamEnd::Completed) => Ok(
+                    PackageHostNotification::UiStreamCompleted(UiStreamCompletedNotification {
+                        mount: mount.clone(),
+                        subscription: subscription.clone(),
+                    }),
+                ),
+                Err(protocol::StreamEnd::Package(package_error)) => {
+                    let mut error =
+                        host_error(PackageErrorCode::BackendError, PackageErrorStage::Ui);
+                    error.retryable = package_error.retryable;
+                    error.recovery = RecoveryAction::None;
+                    error.package_error = Some(package_error);
+                    Err(error)
+                }
+                Err(protocol::StreamEnd::Host(code)) => {
                     if matches!(
                         code,
                         PackageErrorCode::UiContractViolation
@@ -1285,7 +1328,7 @@ impl PackageHost {
                         input.payload,
                     )
                     .await
-                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Process))?;
+                    .map_err(|failure| wire_error(&failure, PackageErrorStage::Process))?;
                 if lease
                     .ui
                     .contract
@@ -1305,7 +1348,7 @@ impl PackageHost {
                 actor
                     .cancel(&input.mount, &input.request)
                     .await
-                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                    .map_err(|failure| wire_error(&failure, PackageErrorStage::Protocol))?;
                 Ok(PackageHostOutcome::UiRequestCancelled)
             }
             PackageHostCommand::OpenUiSubscription(input) => {
@@ -1326,7 +1369,7 @@ impl PackageHost {
                         lease.ui.clone(),
                     )
                     .await
-                    .map_err(|failure| host_error(failure.code, PackageErrorStage::Protocol))?;
+                    .map_err(|failure| wire_error(&failure, PackageErrorStage::Protocol))?;
                 let terminal = receiver.terminal();
                 self.inner
                     .data
@@ -1510,19 +1553,23 @@ impl PackageHost {
     fn monitor_ui_route(
         &self,
         mount: UiMountId,
-        mut terminal: watch::Receiver<Option<PackageErrorCode>>,
+        mut terminal: watch::Receiver<Option<protocol::StreamEnd>>,
     ) {
         let host = self.clone();
         tokio::spawn(async move {
             loop {
-                let current = *terminal.borrow();
-                if let Some(code) = current {
-                    if matches!(
-                        code,
-                        PackageErrorCode::UiContractViolation
-                            | PackageErrorCode::EventLagged
-                            | PackageErrorCode::ProtocolViolation
-                    ) {
+                let current = terminal.borrow().clone();
+                if let Some(end) = current {
+                    // Only a host-owned failure faults the mount; a Package-owned end is the
+                    // Package's own business and reaches its subscriber.
+                    if let protocol::StreamEnd::Host(code) = end
+                        && matches!(
+                            code,
+                            PackageErrorCode::UiContractViolation
+                                | PackageErrorCode::EventLagged
+                                | PackageErrorCode::ProtocolViolation
+                        )
+                    {
                         host.fail_mount(&mount).await;
                     }
                     return;
@@ -1637,6 +1684,17 @@ fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorE
     )
 }
 
+/// Builds the envelope for a Package → Host failure, carrying the Package's own error when the
+/// Package owns it.
+fn wire_error(failure: &protocol::WireFailure, stage: PackageErrorStage) -> PackageErrorEnvelope {
+    let mut error = host_error(failure.code, stage);
+    if let Some(package_error) = &failure.package_error {
+        error.retryable = package_error.retryable;
+        error.package_error = Some(package_error.clone());
+    }
+    error
+}
+
 fn activation_error(
     failure: &protocol::WireFailure,
     instance: &PackageInstanceKey,
@@ -1651,7 +1709,7 @@ fn activation_error(
     } else {
         PackageErrorStage::Process
     };
-    let mut error = host_error(failure.code, stage);
+    let mut error = wire_error(failure, stage);
     error.affected_instance = Some(instance.clone());
     error
 }
@@ -1660,7 +1718,7 @@ fn instance_error(
     failure: protocol::WireFailure,
     instance: &PackageInstanceKey,
 ) -> PackageErrorEnvelope {
-    let mut error = host_error(failure.code, PackageErrorStage::Lifecycle);
+    let mut error = wire_error(&failure, PackageErrorStage::Lifecycle);
     error.affected_instance = Some(instance.clone());
     error
 }

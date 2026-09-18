@@ -11,7 +11,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::ui::{AdmittedUi, MAX_UI_PAYLOAD_BYTES};
-use crate::{PackageErrorCode, PackageValue};
+use crate::{
+    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
+    PackageOwnedError, PackageValue,
+};
 
 type PendingRequests = Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<Value, WireFailure>>>>>;
 type UiEventRoutes = Arc<Mutex<BTreeMap<String, Arc<UiEventRoute>>>>;
@@ -27,13 +30,24 @@ pub(crate) struct UiEvent {
 
 pub(crate) struct UiEventReceiver {
     events: mpsc::Receiver<UiEvent>,
-    terminal: watch::Receiver<Option<PackageErrorCode>>,
+    terminal: watch::Receiver<Option<StreamEnd>>,
     route: Arc<UiEventRoute>,
+}
+
+/// How a Package UI event stream ended.
+///
+/// A Package-owned end is the Package's own terminal error and reaches its subscriber; only a
+/// host-owned end can fail the mount.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StreamEnd {
+    Completed,
+    Package(PackageOwnedError),
+    Host(PackageErrorCode),
 }
 
 pub(crate) struct UiEventRoute {
     events: mpsc::Sender<UiEvent>,
-    terminal: watch::Sender<Option<PackageErrorCode>>,
+    terminal: watch::Sender<Option<StreamEnd>>,
     bytes: Arc<Semaphore>,
     state: Mutex<UiEventRouteState>,
     contract: Arc<AdmittedUi>,
@@ -48,18 +62,22 @@ struct UiEventRouteState {
 }
 
 impl UiEventReceiver {
-    pub(crate) fn terminal(&self) -> watch::Receiver<Option<PackageErrorCode>> {
+    pub(crate) fn terminal(&self) -> watch::Receiver<Option<StreamEnd>> {
         self.terminal.clone()
     }
 
-    pub(crate) async fn changed(&mut self) -> Result<UiEvent, PackageErrorCode> {
+    pub(crate) async fn changed(&mut self) -> Result<UiEvent, StreamEnd> {
         loop {
-            let terminal_code = *self.terminal.borrow();
-            if let Some(code) = terminal_code {
-                if code == PackageErrorCode::BackendError {
+            let terminal = self.terminal.borrow().clone();
+            if let Some(end) = terminal {
+                // A Package-owned end, like a completion, drains what the Package already sent.
+                if matches!(end, StreamEnd::Completed | StreamEnd::Package(_)) {
                     match self.events.try_recv() {
                         Ok(event) => {
-                            self.route.mark_delivered(event.sequence).await?;
+                            self.route
+                                .mark_delivered(event.sequence)
+                                .await
+                                .map_err(StreamEnd::Host)?;
                             return Ok(event);
                         }
                         Err(
@@ -68,18 +86,21 @@ impl UiEventReceiver {
                         ) => {}
                     }
                 }
-                return Err(code);
+                return Err(end);
             }
             tokio::select! {
                 biased;
                 result = self.terminal.changed() => {
                     if result.is_err() {
-                        return Err(PackageErrorCode::ProcessExited);
+                        return Err(StreamEnd::Host(PackageErrorCode::ProcessExited));
                     }
                 }
                 event = self.events.recv() => {
-                    let event = event.ok_or(PackageErrorCode::ProcessExited)?;
-                    self.route.mark_delivered(event.sequence).await?;
+                    let event = event.ok_or(StreamEnd::Host(PackageErrorCode::ProcessExited))?;
+                    self.route
+                        .mark_delivered(event.sequence)
+                        .await
+                        .map_err(StreamEnd::Host)?;
                     return Ok(event);
                 }
             }
@@ -176,8 +197,8 @@ impl UiEventRoute {
         Ok(amount)
     }
 
-    fn terminate(&self, code: PackageErrorCode) {
-        self.terminal.send_replace(Some(code));
+    fn terminate(&self, end: StreamEnd) {
+        self.terminal.send_replace(Some(end));
     }
 }
 
@@ -185,6 +206,8 @@ impl UiEventRoute {
 pub(crate) struct WireFailure {
     pub(crate) code: PackageErrorCode,
     pub(crate) outcome_uncertain: bool,
+    /// The Package's own terminal error, when the Package owns the failure.
+    pub(crate) package_error: Option<PackageOwnedError>,
 }
 
 impl WireFailure {
@@ -192,7 +215,49 @@ impl WireFailure {
         Self {
             code,
             outcome_uncertain: false,
+            package_error: None,
         }
+    }
+}
+
+/// Rebuilds a Package-owned error from an `error` frame, within the host's bounds.
+///
+/// The code and `retryable` always survive; `details` become `{}` when they exceed either bound,
+/// which is lossy on purpose so one Package cannot push unbounded data at the Shell.
+fn package_owned_error(frame: &Frame) -> PackageOwnedError {
+    let code = frame
+        .field("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let retryable = frame
+        .field("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let details = frame
+        .field("details")
+        .and_then(Value::as_object)
+        .cloned()
+        .filter(|details| {
+            let value = Value::Object(details.clone());
+            serde_json::to_vec(&value).is_ok_and(|bytes| {
+                bytes.len() <= MAX_PACKAGE_ERROR_DETAILS_BYTES
+                    && value_depth(&value) <= MAX_PACKAGE_ERROR_DETAILS_DEPTH
+            })
+        })
+        .unwrap_or_default();
+    PackageOwnedError {
+        code,
+        retryable,
+        details,
+    }
+}
+
+fn value_depth(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => 1 + values.iter().map(value_depth).max().unwrap_or(0),
+        Value::Object(values) => 1 + values.values().map(value_depth).max().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -568,7 +633,7 @@ async fn reader_task<R>(
                     None => Err(PackageErrorCode::ProtocolViolation),
                 };
                 if let Err(code) = result {
-                    route.terminate(code);
+                    route.terminate(StreamEnd::Host(code));
                     ui_event_routes.lock().await.remove(stream_id);
                     closed_streams.lock().await.insert(stream_id.to_owned());
                     let _ = writer
@@ -621,12 +686,15 @@ async fn reader_task<R>(
                 let result = if frame.kind() == FrameKind::Response {
                     Ok(frame.field("payload").cloned().unwrap_or_else(empty_object))
                 } else {
-                    let code = match frame.field("code").and_then(Value::as_str) {
-                        Some("cancelled") => PackageErrorCode::Cancelled,
-                        Some("overloaded") => PackageErrorCode::Overloaded,
-                        _ => PackageErrorCode::BackendError,
+                    let mut failure = match frame.field("code").and_then(Value::as_str) {
+                        Some("cancelled") => WireFailure::new(PackageErrorCode::Cancelled),
+                        Some("overloaded") => WireFailure::new(PackageErrorCode::Overloaded),
+                        _ => {
+                            let mut failure = WireFailure::new(PackageErrorCode::BackendError);
+                            failure.package_error = Some(package_owned_error(&frame));
+                            failure
+                        }
                     };
-                    let mut failure = WireFailure::new(code);
                     failure.outcome_uncertain = frame
                         .field("outcomeUncertain")
                         .and_then(Value::as_bool)
@@ -756,7 +824,7 @@ async fn reader_task<R>(
                     return;
                 };
                 if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
-                    route.terminate(PackageErrorCode::BackendError);
+                    route.terminate(stream_end(&frame));
                     closed_streams.lock().await.insert(stream_id.to_owned());
                 } else {
                     capabilities.close_stream(stream_id).await;
@@ -781,10 +849,27 @@ async fn reader_task<R>(
     }
 }
 
+/// Classifies a Package `stream_close`.
+///
+/// No code, `completed` or `closed` is an ordinary completion; `cancelled` and `overloaded` stay
+/// host codes; every other code is the Package's own termination code.
+fn stream_end(frame: &Frame) -> StreamEnd {
+    match frame.field("code").and_then(Value::as_str) {
+        None | Some("completed") | Some("closed") => StreamEnd::Completed,
+        Some("cancelled") => StreamEnd::Host(PackageErrorCode::Cancelled),
+        Some("overloaded") => StreamEnd::Host(PackageErrorCode::Overloaded),
+        Some(code) => StreamEnd::Package(PackageOwnedError {
+            code: code.to_owned(),
+            retryable: false,
+            details: serde_json::Map::new(),
+        }),
+    }
+}
+
 async fn fail_ui_routes(routes: &UiEventRoutes, code: PackageErrorCode) {
     let mut routes = routes.lock().await;
     for (_, route) in std::mem::take(&mut *routes) {
-        route.terminate(code);
+        route.terminate(StreamEnd::Host(code));
     }
 }
 
@@ -960,7 +1045,7 @@ impl ProcessClient {
             .await
         {
             self.ui_event_routes.lock().await.remove(&id);
-            route.terminate(error.code);
+            route.terminate(StreamEnd::Host(error.code));
             return Err(error);
         }
         Ok((receiver, route))
@@ -982,7 +1067,7 @@ impl ProcessClient {
         }
         drop(closed);
         if let Some(route) = self.ui_event_routes.lock().await.remove(stream_id) {
-            route.terminate(PackageErrorCode::Cancelled);
+            route.terminate(StreamEnd::Host(PackageErrorCode::Cancelled));
         }
         self.writer
             .control(json!({"kind":"stream_close","streamId":stream_id,"code":"closed"}))
@@ -1054,4 +1139,75 @@ fn package_value_to_json(value: PackageValue) -> Value {
 
 fn empty_object() -> Value {
     Value::Object(Default::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StreamEnd, package_owned_error, stream_end};
+    use crate::PackageErrorCode;
+    use serde_json::{Value, json};
+    use teamarness_package_protocol::Frame;
+
+    fn frame(value: Value) -> Frame {
+        Frame::try_from(value).expect("valid frame")
+    }
+
+    fn error_frame(details: Value) -> Frame {
+        frame(json!({
+            "kind": "error",
+            "id": "h:error-1",
+            "code": "fixture.rejected",
+            "retryable": true,
+            "details": details,
+        }))
+    }
+
+    #[test]
+    fn package_error_details_over_bound_are_dropped() {
+        let error = package_owned_error(&error_frame(json!({"big": "x".repeat(5 * 1024)})));
+        assert_eq!(error.code, "fixture.rejected");
+        assert!(error.retryable);
+        assert!(error.details.is_empty());
+    }
+
+    #[test]
+    fn package_error_details_too_deep_are_dropped() {
+        let mut nested = json!("leaf");
+        for _ in 0..9 {
+            nested = json!({ "next": nested });
+        }
+        let error = package_owned_error(&error_frame(nested));
+        assert_eq!(error.code, "fixture.rejected");
+        assert!(error.details.is_empty());
+    }
+
+    #[test]
+    fn package_error_details_within_bounds_survive() {
+        let error = package_owned_error(&error_frame(json!({"field": "value"})));
+        assert_eq!(error.details["field"], json!("value"));
+    }
+
+    #[test]
+    fn cancelled_and_overloaded_stay_host_codes() {
+        for (code, expected) in [
+            ("cancelled", PackageErrorCode::Cancelled),
+            ("overloaded", PackageErrorCode::Overloaded),
+        ] {
+            let closed = frame(json!({"kind": "stream_close", "streamId": "h:s-1", "code": code}));
+            assert_eq!(stream_end(&closed), StreamEnd::Host(expected));
+        }
+        for code in ["completed", "closed"] {
+            let closed = frame(json!({"kind": "stream_close", "streamId": "h:s-1", "code": code}));
+            assert_eq!(stream_end(&closed), StreamEnd::Completed);
+        }
+        let closed = frame(json!({"kind": "stream_close", "streamId": "h:s-1"}));
+        assert_eq!(stream_end(&closed), StreamEnd::Completed);
+        let closed =
+            frame(json!({"kind": "stream_close", "streamId": "h:s-1", "code": "fixture.rejected"}));
+        let StreamEnd::Package(error) = stream_end(&closed) else {
+            panic!("a Package code is Package-owned");
+        };
+        assert_eq!(error.code, "fixture.rejected");
+        assert!(!error.retryable);
+    }
 }

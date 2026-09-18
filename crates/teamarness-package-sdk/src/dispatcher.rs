@@ -152,9 +152,14 @@ pub(crate) async fn run(
                         let credit = Arc::new(Semaphore::new(32));
                         let stream_credit = credit.clone();
                         let task = tokio::spawn(async move {
-                            let Ok(mut subscription) = backend.subscribe(request).await else {
-                                let _ = writer.data(stream_close(&stream_id, "backend_error")).await;
-                                return;
+                            // The Package's own code reaches the Host, and through it the UI.
+                            let mut subscription = match backend.subscribe(request).await {
+                                Ok(subscription) => subscription,
+                                Err(error) => {
+                                    let _ =
+                                        writer.data(stream_close(&stream_id, error.code())).await;
+                                    return;
+                                }
                             };
                             let mut sequence = 0_u64;
                             while let Some(event) = subscription.receiver.recv().await {

@@ -446,3 +446,57 @@ async fn pending_capability_calls_fail_when_the_session_ends() {
     assert_eq!(error.code(), "host_unavailable");
     let _ = service.await;
 }
+
+/// A Backend that refuses every subscription with its own code.
+struct RefusesSubscriptions;
+
+impl Backend for RefusesSubscriptions {
+    fn handle(
+        &self,
+        request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+        Box::pin(async move { Ok(request.payload) })
+    }
+
+    fn subscribe(
+        &self,
+        _request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>> {
+        Box::pin(async {
+            Err(BackendError::new(
+                "fixture.not_found",
+                false,
+                JsonValue::Object(Default::default()),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn sdk_forwards_the_package_code_when_subscribe_fails() {
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service = tokio::spawn(
+        Package::builder(Arc::new(RefusesSubscriptions)).serve_io(sdk_read, sdk_write),
+    );
+    write_json(&mut host_write, r#"{"kind":"initialize","nonce":"bm9uY2U","package":{"identity":"dev.teamarness.fixture","version":"1.0.0","manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","processGeneration":"1","workspace":{"id":"workspace1","name":"Workspace"},"installation":{"identity":"installation1","displayName":"Installation"},"dataDirectory":{"path":"/tmp/package","continuityId":"Y29udGludWl0eQ"},"protocol":{"major":1,"minor":0},"capabilities":[],"limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,"maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}}"#).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"stream_open","id":"h:stream-1","topic":"fixture.events","mountId":"bW91bnQx","initialCredit":32,"payload":{}}"#).await;
+    let closed = read_frame(&mut host_read).await;
+    assert_eq!(closed.kind(), FrameKind::StreamClose);
+    assert_eq!(closed.field("code").unwrap(), "fixture.not_found");
+    write_json(
+        &mut host_write,
+        r#"{"kind":"shutdown","reason":"application_shutdown"}"#,
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    drop(host_write);
+    service.await.unwrap().unwrap();
+}

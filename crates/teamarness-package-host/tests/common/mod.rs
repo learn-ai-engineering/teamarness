@@ -142,6 +142,7 @@ pub fn write_node_package_with_capabilities(
             "fixture.gap": {"request": {}, "event": {}},
             "fixture.invalid_event": {"request": {}, "event": {"type":"object","properties":{"order":{"type":"integer"}},"required":["order"],"additionalProperties":false}},
             "fixture.overflow": {"request": {}, "event": {}},
+            "fixture.rejected_stream": {"request": {}, "event": {}},
             "fixture.saturation": {"request": {}, "event": {}}
         }
     }))

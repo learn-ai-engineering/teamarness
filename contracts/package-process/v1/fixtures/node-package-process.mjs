@@ -282,6 +282,9 @@ async function serve() {
         if (frame.topic === "fixture.close") {
           send({ kind: "stream_close", streamId: frame.id, code: "closed" });
           uiStreams.delete(frame.id);
+        } else if (frame.topic === "fixture.rejected_stream") {
+          send({ kind: "stream_close", streamId: frame.id, code: "fixture.stream_rejected" });
+          uiStreams.delete(frame.id);
         } else if (frame.topic === "fixture.invalid_event") {
           send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: "invalid" } });
         } else if (frame.topic === "fixture.duplicate") {
@@ -392,7 +395,7 @@ async function serve() {
       } else if (frame.kind === "request" && frame.operation === "fixture.invalid_response") {
         send({ kind: "response", id: frame.id, payload: { value: false } });
       } else if (frame.kind === "request" && frame.operation === "fixture.error") {
-        send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: {} });
+        send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: { field: "value" } });
       } else if (frame.kind === "request" && frame.operation === "fixture.abort") {
         await import("node:fs/promises").then((fs) => fs.appendFile("mutation-attempts", "1\n"));
         process.abort();

@@ -15,7 +15,10 @@ use teamarness_package_host::{
     LifecycleState, OpenUiMount, PackageHost, PackageHostCommand, PackageHostOutcome,
     RecoverPackage, UiRequest, UiRequestId,
 };
-pub use teamarness_package_host::{PackageErrorCode, PackageIdentity, PackageValue};
+pub use teamarness_package_host::{
+    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
+    PackageIdentity, PackageOwnedError, PackageValue,
+};
 
 #[tokio::test]
 async fn package_error_preserves_generation_and_unrelated_instance() {
@@ -54,6 +57,20 @@ async fn package_error_preserves_generation_and_unrelated_instance() {
         .await
         .unwrap_err();
     assert_eq!(error.code, PackageErrorCode::BackendError);
+    // The Package's own code, retryability and bounded details reach the caller beside the
+    // host code.
+    assert!(!error.retryable);
+    assert_eq!(
+        error.package_error,
+        Some(teamarness_package_host::PackageOwnedError {
+            code: "fixture.error".into(),
+            retryable: false,
+            details: serde_json::Map::from_iter([(
+                "field".to_owned(),
+                serde_json::Value::String("value".to_owned())
+            )]),
+        })
+    );
     let after = host.snapshot().await;
     let target_after = after
         .instances
@@ -105,6 +122,10 @@ async fn lifecycle_error_fails_without_automatic_restarts_or_cross_instance_effe
         .await
         .unwrap_err();
     assert_eq!(error.code, PackageErrorCode::BackendError);
+    let package_error = error.package_error.as_ref().expect("Package-owned error");
+    assert_eq!(package_error.code, "fixture.lifecycle");
+    assert!(package_error.retryable);
+    assert!(error.retryable);
     let after_recovery = host.snapshot().await;
     let failing_after_recovery = after_recovery
         .instances

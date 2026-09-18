@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use teamarness_package_host::{
     HostStateNotification, PackageCatalogEntry, PackageHostSnapshot, PackageInstanceKey,
     PackageInstanceSnapshot, PackageValue, UiEventNotification, UiLoaderDescriptor,
+    UiStreamCompletedNotification,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +172,25 @@ impl From<UiEventNotification> for UiEventDto {
 pub enum UiStreamMessageDto {
     Event(UiEventDto),
     Failure(crate::package_error::PackageBridgeError),
+    /// The Package ended the stream normally; the mount stays healthy.
+    Completed(UiStreamCompletedDto),
+}
+
+/// A Package UI stream the Package ended normally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiStreamCompletedDto {
+    pub mount: String,
+    pub subscription: String,
+}
+
+impl From<UiStreamCompletedNotification> for UiStreamCompletedDto {
+    fn from(value: UiStreamCompletedNotification) -> Self {
+        Self {
+            mount: value.mount.into(),
+            subscription: value.subscription.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -269,5 +289,20 @@ mod tests {
         };
         assert_eq!(serde_json::to_value(event).unwrap(), fixture["event"]);
         assert_eq!(serde_json::to_value(state).unwrap(), fixture["hostState"]);
+    }
+
+    #[test]
+    fn stream_completed_matches_the_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../contracts/fixtures/package-bridge.json"))
+                .unwrap();
+        let completed = UiStreamMessageDto::Completed(UiStreamCompletedDto {
+            mount: "mount-1".into(),
+            subscription: "subscription-1".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(completed).unwrap(),
+            fixture["streamCompleted"]
+        );
     }
 }
