@@ -1,6 +1,9 @@
 use tauri::http::{
     Method, Request, Response, StatusCode, Uri,
-    header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, HeaderName},
+    header::{
+        ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+        HeaderName,
+    },
 };
 use teamarness_package_host::{
     PackageHostCommand, PackageHostOutcome, ReadUiResource, UiResourceToken,
@@ -9,6 +12,39 @@ use teamarness_package_host::{
 use crate::DesktopState;
 
 const NOSNIFF: HeaderName = HeaderName::from_static("x-content-type-options");
+
+/// Shell-owned frame resources answer before the Package Host is asked.
+const FRAME_PREFIX: &str = "__teamarness/";
+
+/// The Package UI Frame document. The same bytes for every mount, with no
+/// inline code, no inline style, and no Package-controlled text.
+const FRAME_DOCUMENT: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Package interface</title>
+<link rel="stylesheet" href="frame.css">
+<script type="module" src="frame-runtime.js"></script>
+</head>
+<body><div id="teamarness-package-host"></div></body>
+</html>
+"#;
+
+const FRAME_STYLESHEET: &str = r#"html, body { margin: 0; height: 100%; }
+body { background: var(--teamarness-color-background); color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); overflow: auto; }
+#teamarness-package-host { display: block; min-height: 100%; }
+"#;
+
+/// The frame runtime is produced by `npm --workspace teamarness-desktop run build:frame-runtime`.
+const FRAME_RUNTIME: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../frame-dist/package-frame-runtime.js"
+));
+
+/// Carried on every Package resource response, so a Package UI Frame can load
+/// only Shell-owned and Package-declared resources and can reach no network.
+const FRAME_DOCUMENT_CSP: &str = "default-src 'none'; script-src teamarness-package:; style-src teamarness-package:; img-src teamarness-package: data:; font-src teamarness-package:; media-src teamarness-package:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
 #[derive(Debug)]
 struct ResourceRequest {
@@ -29,6 +65,24 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
             Vec::new(),
         );
     };
+    if parsed.relative_path.starts_with(FRAME_PREFIX) {
+        return match reserved_frame_resource(&parsed.relative_path) {
+            Some((bytes, media_type)) => response(
+                StatusCode::OK,
+                media_type,
+                if parsed.head {
+                    Vec::new()
+                } else {
+                    bytes.to_vec()
+                },
+            ),
+            None => response(
+                StatusCode::NOT_FOUND,
+                "text/plain; charset=utf-8",
+                Vec::new(),
+            ),
+        };
+    }
     let token = match UiResourceToken::new(parsed.token) {
         Ok(value) => value,
         Err(_) => {
@@ -67,6 +121,15 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
             "text/plain; charset=utf-8",
             Vec::new(),
         ),
+    }
+}
+
+fn reserved_frame_resource(relative_path: &str) -> Option<(&'static [u8], &'static str)> {
+    match relative_path {
+        "__teamarness/frame.html" => Some((FRAME_DOCUMENT.as_bytes(), "text/html; charset=utf-8")),
+        "__teamarness/frame.css" => Some((FRAME_STYLESHEET.as_bytes(), "text/css; charset=utf-8")),
+        "__teamarness/frame-runtime.js" => Some((FRAME_RUNTIME, "text/javascript; charset=utf-8")),
+        _ => None,
     }
 }
 
@@ -135,6 +198,7 @@ fn response(status: StatusCode, media_type: &str, body: Vec<u8>) -> Response<Vec
         .header(NOSNIFF, "nosniff")
         .header(CACHE_CONTROL, "no-store")
         .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(CONTENT_SECURITY_POLICY, FRAME_DOCUMENT_CSP)
         .body(body)
         .expect("static protocol response is valid")
 }
@@ -182,12 +246,89 @@ mod tests {
     }
 
     #[test]
-    fn every_response_disables_sniffing_and_storage() {
+    fn every_response_carries_the_frame_document_policy() {
         let response = response(StatusCode::OK, "text/javascript", b"export {}".to_vec());
         assert_eq!(response.headers()[CONTENT_TYPE], "text/javascript");
         assert_eq!(response.headers()[NOSNIFF], "nosniff");
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
         assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            response.headers()[CONTENT_SECURITY_POLICY],
+            FRAME_DOCUMENT_CSP
+        );
+    }
+
+    #[test]
+    fn serves_shell_owned_frame_resources_only_under_the_reserved_prefix() {
+        assert_eq!(
+            reserved_frame_resource("__teamarness/frame.html").map(|(_, media)| media),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            reserved_frame_resource("__teamarness/frame.css").map(|(_, media)| media),
+            Some("text/css; charset=utf-8")
+        );
+        assert_eq!(
+            reserved_frame_resource("__teamarness/frame-runtime.js").map(|(_, media)| media),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert!(reserved_frame_resource("__teamarness/other.js").is_none());
+        assert!(reserved_frame_resource("ui/__teamarness/frame.html").is_none());
+        for value in [
+            format!("teamarness-package://localhost/{TOKEN}/__teamarness/"),
+            format!("teamarness-package://localhost/{TOKEN}/__teamarness/../ui/index.js"),
+        ] {
+            let uri: Uri = value.parse().unwrap();
+            assert!(parse_request(&Method::GET, &uri).is_err(), "{value}");
+        }
+        assert!(!"ui/__teamarness/frame.html".starts_with(FRAME_PREFIX));
+        assert!("__teamarness/frame.html".starts_with(FRAME_PREFIX));
+    }
+
+    #[test]
+    fn frame_document_loads_only_relative_shell_owned_resources() {
+        assert!(FRAME_DOCUMENT.contains(r#"src="frame-runtime.js""#));
+        assert!(FRAME_DOCUMENT.contains(r#"href="frame.css""#));
+        assert!(FRAME_DOCUMENT.contains(r#"id="teamarness-package-host""#));
+        assert!(!FRAME_DOCUMENT.contains("<style"));
+        assert!(!FRAME_DOCUMENT.contains("style="));
+        assert!(!FRAME_DOCUMENT.contains("<script>"));
+        assert_eq!(FRAME_DOCUMENT.matches("<script").count(), 1);
+    }
+
+    #[test]
+    fn frame_document_policy_denies_network_frames_forms_and_inline_code() {
+        for directive in [
+            "connect-src 'none'",
+            "frame-src 'none'",
+            "form-action 'none'",
+            "base-uri 'none'",
+            "object-src 'none'",
+            "worker-src 'none'",
+        ] {
+            assert!(FRAME_DOCUMENT_CSP.contains(directive), "{directive}");
+        }
+        for forbidden in [
+            "'unsafe-inline'",
+            "'unsafe-eval'",
+            "https:",
+            "http:",
+            "ipc:",
+        ] {
+            assert!(!FRAME_DOCUMENT_CSP.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn embedded_frame_runtime_has_no_tauri_surface() {
+        assert!(!FRAME_RUNTIME.is_empty());
+        let runtime = std::str::from_utf8(FRAME_RUNTIME).expect("the frame runtime is UTF-8");
+        for forbidden in ["__TAURI", "@tauri-apps", "ipc://", "plugin:", "invoke"] {
+            assert!(
+                !runtime.contains(forbidden),
+                "the embedded frame runtime contains {forbidden}"
+            );
+        }
     }
 
     #[test]
