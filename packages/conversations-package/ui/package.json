@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "typecheck": "tsc --noEmit",
+    "contract-types": "teamarness-contract-types --contract ../ui-contract.json --out src/contract.generated.ts --type-name ConversationsContract",
+    "typecheck": "teamarness-contract-types --contract ../ui-contract.json --out src/contract.generated.ts --type-name ConversationsContract --check && tsc --noEmit",
     "lint": "eslint src vite.config.ts",
     "test": "vitest run"
   },

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PackageMountContext, PackageSubscription } from "@teamarness/package-ui-sdk";
 import { TEAMARNESS_THEME_TOKENS } from "@teamarness/package-ui-sdk";
+import { createPackageRequestError } from "@teamarness/package-ui-sdk/testing";
 import { mount } from "./index";
 
 class FakeCSSStyleSheet {
@@ -176,20 +177,10 @@ describe("reference Package error fixture", () => {
     vi.stubGlobal("getComputedStyle", vi.fn(computedStyle));
     const root = { adoptedStyleSheets: [], append: vi.fn() } as unknown as ShadowRoot;
     const context = mountContext(root);
-    const rejected = Object.freeze({
-      kind: "teamarness.package-request-error",
-      version: 2,
-      namespace: "teamarness.package-host",
-      code: "backend_error",
+    const rejected = createPackageRequestError({
       stage: "ui",
-      retryable: false,
-      recovery: "none",
       diagnosticId: "diag-1",
-      packageError: Object.freeze({
-        code: "reference.requested_failure",
-        retryable: false,
-        details: Object.freeze({ reason: "requested" }),
-      }),
+      packageError: { code: "reference.requested_failure", details: { reason: "requested" } },
     });
     const failing = {
       ...context,

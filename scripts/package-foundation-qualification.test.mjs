@@ -132,7 +132,48 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
     assert.doesNotMatch(source, /\bstyle\.textContent\b/, `${path} must not write style text content`);
     assert.doesNotMatch(source, /setAttribute\(\s*["']style["']/, `${path} must not set style attributes`);
     assert.doesNotMatch(source, /\.style(?:\.|\[|\s*=)/, `${path} must not mutate style attributes`);
-    assert.match(source, /adoptedStyleSheets/, `${path} must use adopted stylesheets`);
+    assert.match(
+      source,
+      /adoptedStyleSheets|adoptPackageStyles\(/,
+      `${path} must use adopted stylesheets, directly or through adoptPackageStyles`,
+    );
+  }
+});
+
+const PACKAGE_UI_DIRECTORIES = [
+  ["packages/reference-package/ui", "ReferenceContract"],
+  ["packages/tutorial/ui", "TutorialContract"],
+  ["packages/conversations-package/ui", "ConversationsContract"],
+  ["packages/repo-aware/ui", "RepoAwareContract"],
+];
+
+test("Package UIs use contract-typed requests and shared style adoption", async () => {
+  for (const [directory, typeName] of PACKAGE_UI_DIRECTORIES) {
+    const sources = (await sourceFiles(`${directory}/src`)).filter(({ path }) =>
+      !path.endsWith(".test.ts") && !path.endsWith("/contract.generated.ts"));
+    assert.ok(sources.length > 0, `${directory} was not read`);
+    for (const { path, source } of sources) {
+      assert.doesNotMatch(
+        source,
+        /request(<[^>]*>)?\([^)]*\)\s*as\s/,
+        `${path} must not cast a request answer; the contract types it`,
+      );
+      assert.doesNotMatch(source, /\.request<\w/, `${path} must not name a response type by hand`);
+      for (const styling of ["new StyleSheet()", "globalThis.CSSStyleSheet", "adoptedStyleSheets ="]) {
+        assert.ok(!source.includes(styling), `${path} must adopt styles through adoptPackageStyles`);
+      }
+    }
+
+    const generated = await read(`${directory}/src/contract.generated.ts`);
+    assert.match(generated, /Generated from ui-contract\.json by teamarness-contract-types/);
+    assert.match(generated, new RegExp(`export type ${typeName} = \\{`));
+
+    const manifest = JSON.parse(await read(`${directory}/package.json`));
+    assert.match(
+      manifest.scripts.typecheck,
+      /teamarness-contract-types .*--check/,
+      `${directory} must check its generated contract types before tsc`,
+    );
   }
 });
 

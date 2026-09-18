@@ -7,9 +7,11 @@
 //
 // Node builtins only: this file is vendored into generated projects.
 
+import { realpathSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 const HEADER = "// Generated from ui-contract.json by teamarness-contract-types. Do not edit.";
 const INDENT = "  ";
@@ -119,10 +121,10 @@ function render(schema, context, indent) {
     const name = match ? context.names.get(decodePointer(match[1])) : undefined;
     return name ?? packageValue(context);
   }
-  if ("const" in schema) return literal(schema.const, context);
+  if ("const" in schema) return literal(schema.const, context, indent);
   if (Array.isArray(schema.enum)) {
     if (schema.enum.length === 0) return "never";
-    return schema.enum.map((value) => literal(value, context)).join(" | ");
+    return schema.enum.map((value) => literal(value, context, indent)).join(" | ");
   }
   for (const key of ["anyOf", "oneOf"]) {
     if (Array.isArray(schema[key])) {
@@ -187,10 +189,29 @@ function renderObject(schema, context, indent) {
   return `{\n${members.join("\n")}\n${indent}}`;
 }
 
-function literal(value, context) {
+/**
+ * Renders one fixed JSON value as the TypeScript type that accepts only it.
+ *
+ * A contract may fix a whole object or array — the Tutorial's choices are declared that way — and
+ * the type is then as exact as the value, so a UI reads its fields without a cast.
+ */
+function literal(value, context, indent = "") {
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (value === null) return "null";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "readonly []";
+    return `readonly [${value.map((entry) => literal(entry, context, indent)).join(", ")}]`;
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    if (keys.length === 0) return "Record<string, never>";
+    const inner = `${indent}${INDENT}`;
+    const members = keys.map(
+      (key) => `${inner}readonly ${JSON.stringify(key)}: ${literal(value[key], context, inner)};`,
+    );
+    return `{\n${members.join("\n")}\n${indent}}`;
+  }
   return packageValue(context);
 }
 
@@ -247,7 +268,23 @@ export async function run(argv) {
   return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Whether this module is the program being run.
+ *
+ * npm installs the command as a symbolic link, so the invoked path and this module's path only
+ * match once the link is resolved: comparing them unresolved makes `--check` silently do nothing.
+ */
+function invokedAsCommand() {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (invokedAsCommand()) {
   run(process.argv.slice(2))
     .then((code) => {
       process.exitCode = code;

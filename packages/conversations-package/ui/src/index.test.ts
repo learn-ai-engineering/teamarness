@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
 import { TEAMARNESS_THEME_TOKENS } from "@teamarness/package-ui-sdk";
+import { createFakePackageClient, createTestMountContext } from "@teamarness/package-ui-sdk/testing";
 import type {
   PackageClient,
   PackageMountContext,
@@ -18,19 +19,74 @@ function snapshot(): ConversationSnapshot {
       id: "00000000000000000000000000000000",
       slug: "general",
       canHide: false,
+      unreadCount: 0,
     }],
   };
 }
 
 function page(markdown: string): ConversationPage {
-  return {
-    messages: [{
-      id: markdown,
-      author: "bob",
-      markdown,
-    }],
-  };
+  return { messages: [message(markdown)] };
 }
+
+function message(markdown: string): ConversationPage["messages"][number] {
+  return { id: markdown, author: "bob", markdown, isLocal: false };
+}
+
+/** A page as the Backend returns one: newest Message first. */
+function newestFirstPage(): ConversationPage {
+  return { messages: [message("newest"), message("middle"), message("oldest")] };
+}
+
+function conversationsBackend() {
+  return createFakePackageClient({
+    requests: {
+      "conversations.snapshot": () => snapshot(),
+      "conversations.channel.open": () => newestFirstPage(),
+    },
+    subscriptions: { "conversations.changes": () => undefined },
+  });
+}
+
+function shadowRoot(): ShadowRoot {
+  return document.createElement("div").attachShadow({ mode: "open" });
+}
+
+describe("channel message order", () => {
+  // Verifies: TEAM.SYS.CONV-R08
+  it("renders the newest message at the bottom", async () => {
+    const root = shadowRoot();
+    const unmount = await mount(
+      createTestMountContext({ root, client: conversationsBackend().client }),
+    );
+
+    const rendered = [...root.querySelectorAll(".message .message-markdown")]
+      .map((element) => element.textContent?.trim());
+    expect(rendered).toEqual(["oldest", "middle", "newest"]);
+
+    await unmount();
+  });
+
+  // Verifies: TEAM.SYS.CONV-R08
+  it("opens a channel scrolled to the bottom", async () => {
+    // happy-dom performs no layout, so the test supplies the height the view scrolls to.
+    const original = Object.getOwnPropertyDescriptor(Element.prototype, "scrollHeight");
+    Object.defineProperty(Element.prototype, "scrollHeight", { configurable: true, get: () => 900 });
+    try {
+      const root = shadowRoot();
+      const unmount = await mount(
+        createTestMountContext({ root, client: conversationsBackend().client }),
+      );
+
+      const history = root.querySelector<HTMLElement>(".message-history");
+      expect(history?.scrollTop).toBe(900);
+
+      await unmount();
+    } finally {
+      if (original) Object.defineProperty(Element.prototype, "scrollHeight", original);
+      else delete (Element.prototype as unknown as Record<string, unknown>).scrollHeight;
+    }
+  });
+});
 
 describe("conversation change delivery", () => {
   it("reloads the selected channel and does not render unread counters", async () => {

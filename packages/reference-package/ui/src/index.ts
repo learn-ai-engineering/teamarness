@@ -1,11 +1,14 @@
 import {
+  adoptPackageStyles,
   describePackageError,
   installPackageUiKit,
   TEAMARNESS_THEME_TOKENS,
+  typedPackageClient,
   type PackageMountContext,
   type PackageSubscription,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
+import type { ReferenceContract, Snapshot } from "./contract.generated";
 import referenceAsset from "./probe.svg?no-inline";
 
 const REFERENCE_PACKAGE_CSS = `
@@ -16,50 +19,6 @@ const REFERENCE_PACKAGE_CSS = `
   .reference-details dt { font-weight: 700; }
   .reference-details dd { margin: 0; overflow-wrap: anywhere; }
 `;
-
-type ReferenceSnapshot = Readonly<{
-  counter: number;
-  backgroundMarker: number;
-  membershipVersion: string;
-  signingVerified: boolean;
-  processGeneration: string;
-  packageVersion: string;
-}>;
-
-function installPackageStyles(root: ShadowRoot): () => void {
-  const StyleSheet = globalThis.CSSStyleSheet;
-  if (typeof StyleSheet !== "function") {
-    throw new Error("The reference Package requires constructed CSSStyleSheet support");
-  }
-  if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
-    throw new Error("The reference Package requires ShadowRoot.adoptedStyleSheets support");
-  }
-  let sheet: CSSStyleSheet;
-  try {
-    sheet = new StyleSheet();
-  } catch (cause) {
-    throw new Error("The reference Package requires constructed CSSStyleSheet support", { cause });
-  }
-  if (typeof sheet.replaceSync !== "function") {
-    throw new Error("The reference Package requires CSSStyleSheet.replaceSync support");
-  }
-  sheet.replaceSync(REFERENCE_PACKAGE_CSS);
-  try {
-    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
-  } catch (cause) {
-    throw new Error("The reference Package requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
-  }
-  if (!root.adoptedStyleSheets.includes(sheet)) {
-    throw new Error("The reference Package requires mutable ShadowRoot.adoptedStyleSheets support");
-  }
-
-  let cleaned = false;
-  return () => {
-    if (cleaned) return;
-    cleaned = true;
-    root.adoptedStyleSheets = root.adoptedStyleSheets.filter((candidate) => candidate !== sheet);
-  };
-}
 
 function packageUiKitIsReady(article: HTMLElement, control: HTMLElement): boolean {
   const layout = getComputedStyle(article);
@@ -74,10 +33,11 @@ function packageUiKitIsReady(article: HTMLElement, control: HTMLElement): boolea
 }
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
+  const client = typedPackageClient<ReferenceContract>(context.client);
   const cleanupKit = installPackageUiKit(context.root);
   let cleanupPackageStyles: () => void;
   try {
-    cleanupPackageStyles = installPackageStyles(context.root);
+    cleanupPackageStyles = adoptPackageStyles(context.root, REFERENCE_PACKAGE_CSS);
   } catch (error) {
     cleanupKit();
     throw error;
@@ -133,7 +93,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   values.get("UI kit")!.textContent = uiKitStatus;
   values.get("UI kit")!.setAttribute("aria-label", `UI kit ${uiKitStatus}`);
 
-  const render = (snapshot: ReferenceSnapshot): void => {
+  const render = (snapshot: Snapshot): void => {
     values.get("Package Backend")!.textContent = "Ready";
     values.get("Membership access")!.textContent = "Ready";
     values.get("Counter")!.textContent = String(snapshot.counter);
@@ -141,21 +101,21 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     values.get("Signing round trip")!.textContent = snapshot.signingVerified ? "Verified" : "Failed";
   };
 
-  render(await context.client.request<ReferenceSnapshot>("reference.read", {}));
-  const subscription: PackageSubscription = await context.client.subscribe<ReferenceSnapshot>(
+  render(await client.request("reference.read", {}));
+  const subscription: PackageSubscription = await client.subscribe(
     "reference.changes",
     {},
     render,
   );
   const incrementCounter = async (): Promise<void> => {
-    render(await context.client.request<ReferenceSnapshot>("reference.increment", {}));
+    render(await client.request("reference.increment", {}));
   };
   const onIncrement = (): void => { void incrementCounter(); };
   increment.addEventListener("click", onIncrement);
 
   const triggerFailure = async (): Promise<void> => {
     try {
-      await context.client.request("reference.fail", {});
+      await client.request("reference.fail", {});
     } catch (error) {
       const text = `Package error: ${describePackageError(error)}`;
       const value = values.get("Last Package error")!;

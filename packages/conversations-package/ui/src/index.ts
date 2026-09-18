@@ -1,36 +1,30 @@
-import { installPackageUiKit } from "@teamarness/package-ui-sdk";
+import { installPackageUiKit, typedPackageClient } from "@teamarness/package-ui-sdk";
 import type { PackageMountContext, PackageUnmount } from "@teamarness/package-ui-sdk";
+import type {
+  Availability,
+  Channel,
+  ConversationsContract,
+  Message,
+  Page,
+  Snapshot,
+} from "./contract.generated";
 import { ConversationsController } from "./controller";
 import { ConversationsView } from "./view";
 
-export type ConversationChannel = Readonly<{
-  id: string;
-  slug: string;
-  canHide: boolean;
-}>;
-export type ConversationMessage = Readonly<{
-  id: string;
-  author: string;
-  markdown: string;
-  isLocal?: boolean;
-}>;
-export type ConversationSnapshot = Readonly<{
-  channels: readonly ConversationChannel[];
-  availability?: string;
-  warnings?: readonly string[];
-}>;
-export type ConversationPage = Readonly<{
-  messages: readonly ConversationMessage[];
-  nextBefore?: string;
-}>;
+export type { Availability, ConversationsContract };
+export type ConversationChannel = Channel;
+export type ConversationMessage = Message;
+export type ConversationSnapshot = Snapshot;
+export type ConversationPage = Page;
 
 export async function mount(
   context: PackageMountContext,
 ): Promise<PackageUnmount> {
+  const client = typedPackageClient<ConversationsContract>(context.client);
   const cleanupKit = installPackageUiKit(context.root);
   let disposed = false;
 
-  const controller = new ConversationsController(context.client, () => {
+  const controller = new ConversationsController(client, () => {
     if (!disposed) view.render();
   });
   const view = new ConversationsView(context.root, controller);
@@ -39,7 +33,7 @@ export async function mount(
   view.render();
 
   // Subscribe to live snapshot updates.
-  const subscription = await context.client.subscribe<ConversationSnapshot>(
+  const subscription = await client.subscribe(
     "conversations.changes",
     {},
     async (snapshot) => {

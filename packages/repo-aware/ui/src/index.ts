@@ -1,46 +1,19 @@
 import {
+  adoptPackageStyles,
   describePackageError,
+  typedPackageClient,
   type PackageClient,
   type PackageMountContext,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
+import type { Registration, RepoAwareContract, Snapshot } from "./contract.generated";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type Registration = Readonly<{
-  id: string;
-  path: string;
-  addedAt: string;
-}>;
+export type { Registration, Snapshot };
 
-export type Head = Readonly<
-  | { kind: "branch"; name: string }
-  | { kind: "detached"; commit: string }
->;
-
-export type Snapshot = Readonly<{
-  registrationId: string;
-  path: string;
-  originRemote: string | null;
-  githubUrl: string | null;
-  head: Head;
-  commit: string;
-  isClean: boolean;
-  fetchedAt: string;
-}>;
-
-type ListResponse = Readonly<{
-  registrations: readonly Registration[];
-}>;
-
-type RegisterResponse = Readonly<{
-  registration: Registration;
-}>;
-
-type SnapshotResponse = Readonly<{
-  registrationId: string;
-  snapshot: Snapshot;
-}>;
+/** Where the checkout's HEAD points, as the contract describes it. */
+export type Head = Snapshot["head"];
 
 type PendingOp = "none" | "register" | "snapshot" | "remove";
 
@@ -70,6 +43,7 @@ export function createRepoAwareController(
   client: PackageClient,
   present: (state: RepoAwareState) => void,
 ): RepoAwareController {
+  const typed = typedPackageClient<RepoAwareContract>(client);
   let disposed = false;
   let state: RepoAwareState = {
     registrations: [],
@@ -95,13 +69,13 @@ export function createRepoAwareController(
   };
 
   const loadList = async (): Promise<readonly Registration[]> => {
-    const result = await client.request("repo_aware.list", {}) as ListResponse;
+    const result = await typed.request("repo_aware.list", {});
     return result.registrations;
   };
 
   const loadSnapshot = async (id: string): Promise<Snapshot> => {
     update({ pending: "snapshot" });
-    const result = await client.request("repo_aware.snapshot", { registrationId: id }) as SnapshotResponse;
+    const result = await typed.request("repo_aware.snapshot", { registrationId: id });
     return result.snapshot;
   };
 
@@ -129,7 +103,7 @@ export function createRepoAwareController(
       if (disposed) return;
       update({ pending: "register", error: undefined });
       try {
-        await client.request("repo_aware.register", { path }) as RegisterResponse;
+        await typed.request("repo_aware.register", { path });
         const registrations = await loadList();
         let selectedRegistrationId: string | null = null;
         let snapshot: Snapshot | null = null;
@@ -176,7 +150,7 @@ export function createRepoAwareController(
       if (disposed || !state.selectedRegistrationId) return;
       update({ pending: "remove", showRemoveConfirm: false, error: undefined });
       try {
-        await client.request("repo_aware.remove", {
+        await typed.request("repo_aware.remove", {
           registrationId: state.selectedRegistrationId,
         });
         const registrations = await loadList();
@@ -233,41 +207,6 @@ const REPO_AWARE_CSS = `
   .link { color: var(--teamarness-color-accent); text-decoration: underline; }
 `;
 
-function installStyles(root: ShadowRoot): () => void {
-  const StyleSheet = globalThis.CSSStyleSheet;
-  if (typeof StyleSheet !== "function") {
-    throw new Error("The Repo-aware Package requires constructed CSSStyleSheet support");
-  }
-  if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
-    throw new Error("The Repo-aware Package requires ShadowRoot.adoptedStyleSheets support");
-  }
-  let sheet: CSSStyleSheet;
-  try {
-    sheet = new StyleSheet();
-  } catch (cause) {
-    throw new Error("The Repo-aware Package requires constructed CSSStyleSheet support", { cause });
-  }
-  if (typeof sheet.replaceSync !== "function") {
-    throw new Error("The Repo-aware Package requires CSSStyleSheet.replaceSync support");
-  }
-  sheet.replaceSync(REPO_AWARE_CSS);
-  try {
-    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
-  } catch (cause) {
-    throw new Error("The Repo-aware Package requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
-  }
-  if (!root.adoptedStyleSheets.includes(sheet)) {
-    throw new Error("The Repo-aware Package requires mutable ShadowRoot.adoptedStyleSheets support");
-  }
-
-  let cleaned = false;
-  return () => {
-    if (cleaned) return;
-    cleaned = true;
-    root.adoptedStyleSheets = root.adoptedStyleSheets.filter((candidate) => candidate !== sheet);
-  };
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function button(text: string): HTMLButtonElement {
@@ -286,7 +225,7 @@ function abbreviateCommit(hash: string): string {
 // ─── Mount ───────────────────────────────────────────────────────────────────
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const cleanupStyles = installStyles(context.root);
+  const cleanupStyles = adoptPackageStyles(context.root, REPO_AWARE_CSS);
   const article = document.createElement("article");
   const heading = document.createElement("h2");
   heading.textContent = context.package.displayName;

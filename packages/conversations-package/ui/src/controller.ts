@@ -1,10 +1,13 @@
-import { isPackageRequestError, packageErrorCode, type PackageClient } from "@teamarness/package-ui-sdk";
+import { isPackageRequestError, packageErrorCode, type TypedPackageClient } from "@teamarness/package-ui-sdk";
+import type { Availability, ConversationsContract } from "./contract.generated";
 import type {
   ConversationChannel,
   ConversationMessage,
-  ConversationPage,
   ConversationSnapshot,
 } from "./index";
+
+/** The client every Conversations request goes through: one contract, one set of shapes. */
+export type ConversationsClient = TypedPackageClient<ConversationsContract>;
 
 // ---------------------------------------------------------------------------
 // immutable presentable state
@@ -20,7 +23,7 @@ export interface ControllerState {
   readonly nextBefore: string | null;
   readonly loading: boolean;
   readonly loadingOlder: boolean;
-  readonly availability: string;
+  readonly availability: Availability;
   readonly warning: string | null;
   readonly warnings: readonly string[];
   readonly creating: boolean;
@@ -28,6 +31,18 @@ export interface ControllerState {
 }
 
 export const PAGE_SIZE = 32;
+
+/**
+ * The Backend pages a Channel newest Message first; the view reads top to bottom.
+ *
+ * Reversing here is what puts the newest Message at the bottom of the Channel, as
+ * `TEAM.SYS.CONV-R08` requires, and keeps every page the controller holds in one order.
+ */
+function oldestFirst(
+  messages: readonly ConversationMessage[],
+): readonly ConversationMessage[] {
+  return [...messages].reverse();
+}
 
 // ---------------------------------------------------------------------------
 // safe error classification — never exposes raw codes to the user
@@ -56,7 +71,7 @@ function classify(error: unknown): ErrorInfo {
 function errorMessage(
   operation: string,
   info: ErrorInfo,
-  availability: string,
+  availability: Availability,
 ): string {
   // Only log structured metadata — never raw errors or codes in user text.
   console.debug("Conversations operation failed", {
@@ -102,13 +117,13 @@ export class ConversationsController {
   private _state: ControllerState;
   private generation = 0;
   private disposed = false;
-  private readonly client: PackageClient;
+  private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
   /** Sticky draft value that survives re-renders. */
   draft = "";
 
-  constructor(client: PackageClient, onChange: () => void) {
+  constructor(client: ConversationsClient, onChange: () => void) {
     this.client = client;
     this.onChange = onChange;
     this._state = {
@@ -143,11 +158,7 @@ export class ConversationsController {
     if (this.disposed) return;
     // Fetch snapshot first, then load messages for the default channel.
     try {
-      const snapshot =
-        await this.client.request<ConversationSnapshot>(
-          "conversations.snapshot",
-          {},
-        );
+      const snapshot = await this.client.request("conversations.snapshot", {});
       this.applySnapshotSync(snapshot);
     } catch {
       this._state = {
@@ -163,14 +174,14 @@ export class ConversationsController {
     const selectedId = this._state.selectedChannelId;
     if (selectedId) {
       try {
-        const page = await this.client.request<ConversationPage>(
+        const page = await this.client.request(
           "conversations.channel.open",
           { channelId: selectedId, limit: PAGE_SIZE },
         );
         if (this.disposed) return;
         this._state = {
           ...this._state,
-          messages: page.messages,
+          messages: oldestFirst(page.messages),
           hasMore: page.nextBefore !== undefined,
           nextBefore: page.nextBefore ?? null,
           loading: false,
@@ -192,7 +203,7 @@ export class ConversationsController {
    *  live subscription updates; during initialization use initialize(). */
   private applySnapshotSync(snapshot: ConversationSnapshot): void {
     const channels = snapshot.channels;
-    const availability = snapshot.availability ?? "current";
+    const availability = snapshot.availability;
     const general = channels.find((c) => c.slug === "general");
     const selectedId =
       general?.id ?? channels[0]?.id ?? null;
@@ -239,14 +250,14 @@ export class ConversationsController {
     this.notify();
 
     try {
-      const page = await this.client.request<ConversationPage>(
+      const page = await this.client.request(
         "conversations.channel.open",
         { channelId, limit: PAGE_SIZE },
       );
       if (this.disposed || this.generation !== gen) return;
       this._state = {
         ...this._state,
-        messages: page.messages,
+        messages: oldestFirst(page.messages),
         hasMore: page.nextBefore !== undefined,
         nextBefore: page.nextBefore ?? null,
         loading: false,
@@ -275,17 +286,17 @@ export class ConversationsController {
     this.notify();
 
     try {
-      const page = await this.client.request<ConversationPage>(
+      const page = await this.client.request(
         "conversations.channel.page",
         { channelId: selectedChannelId, before: nextBefore, limit: PAGE_SIZE },
       );
       if (this.disposed) return;
-      // Deduplicate by message id.
+      // Deduplicate by message id. Older Messages belong above the ones already shown.
       const existing = new Set(this._state.messages.map((m) => m.id));
       const fresh = page.messages.filter((m) => !existing.has(m.id));
       this._state = {
         ...this._state,
-        messages: [...this._state.messages, ...fresh],
+        messages: [...oldestFirst(fresh), ...this._state.messages],
         hasMore: page.nextBefore !== undefined,
         nextBefore: page.nextBefore ?? null,
         loadingOlder: false,
@@ -311,11 +322,7 @@ export class ConversationsController {
     try {
       await this.client.request("conversations.channel.create", { slug });
       if (this.disposed) return;
-      const snapshot =
-        await this.client.request<ConversationSnapshot>(
-          "conversations.snapshot",
-          {},
-        );
+      const snapshot = await this.client.request("conversations.snapshot", {});
       if (this.disposed) return;
       this._state = { ...this._state, loading: false, creating: false };
       this.applySnapshot(snapshot);
@@ -345,11 +352,7 @@ export class ConversationsController {
         confirm: true,
       });
       if (this.disposed) return;
-      const snapshot =
-        await this.client.request<ConversationSnapshot>(
-          "conversations.snapshot",
-          {},
-        );
+      const snapshot = await this.client.request("conversations.snapshot", {});
       if (this.disposed) return;
       this._state = {
         ...this._state,
@@ -386,14 +389,14 @@ export class ConversationsController {
         markdown,
       });
       if (this.disposed) return;
-      const page = await this.client.request<ConversationPage>(
+      const page = await this.client.request(
         "conversations.channel.open",
         { channelId, limit: PAGE_SIZE },
       );
       if (this.disposed) return;
       this._state = {
         ...this._state,
-        messages: page.messages,
+        messages: oldestFirst(page.messages),
         hasMore: page.nextBefore !== undefined,
         nextBefore: page.nextBefore ?? null,
         loading: false,
@@ -423,7 +426,7 @@ export class ConversationsController {
   applySnapshot(snapshot: ConversationSnapshot): void | Promise<void> {
     if (this.disposed) return;
     const channels = snapshot.channels;
-    const availability = snapshot.availability ?? "current";
+    const availability = snapshot.availability;
     const general = channels.find((c) => c.slug === "general");
     const selectedExists =
       this._state.selectedChannelId !== null &&
@@ -467,14 +470,14 @@ export class ConversationsController {
     const channelId = this._state.selectedChannelId;
     if (!channelId) return;
     try {
-      const page = await this.client.request<ConversationPage>(
+      const page = await this.client.request(
         "conversations.channel.open",
         { channelId, limit: PAGE_SIZE },
       );
       if (this.disposed) return;
       this._state = {
         ...this._state,
-        messages: page.messages,
+        messages: oldestFirst(page.messages),
         hasMore: page.nextBefore !== undefined,
         nextBefore: page.nextBefore ?? null,
       };

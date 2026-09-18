@@ -30,6 +30,7 @@ export class ConversationsView {
   private readonly composer: HTMLFormElement;
   private readonly textarea: HTMLTextAreaElement;
   private readonly sendButton: HTMLButtonElement;
+  private renderedChannelId: string | null = null;
   private disposed = false;
 
   constructor(
@@ -331,11 +332,14 @@ export class ConversationsView {
   }
 
   private renderHistory(state: ControllerState): void {
-    // Preserve scrollTop if the user is not at the bottom.
+    // Messages read oldest at the top, newest at the bottom, and a Channel opens at the newest
+    // one (TEAM.SYS.CONV-R08). Once a Member scrolls up, their position is kept.
+    const openedChannel = state.selectedChannelId !== this.renderedChannelId;
+    this.renderedChannelId = state.selectedChannelId;
+    const previousTop = this.history.scrollTop;
+    const previousHeight = this.history.scrollHeight;
     const wasAtBottom =
-      this.history.scrollHeight - this.history.scrollTop -
-        this.history.clientHeight <
-      40;
+      previousHeight - previousTop - this.history.clientHeight < 40;
 
     this.history.replaceChildren();
     for (const message of state.messages) {
@@ -345,8 +349,7 @@ export class ConversationsView {
       const author = document.createElement("button");
       author.type = "button";
       author.className = "message-author";
-      const isLocal = (message as { isLocal?: boolean }).isLocal;
-      author.textContent = authorLabel(message.author, undefined, isLocal);
+      author.textContent = authorLabel(message.author, undefined, message.isLocal);
       author.title = message.author;
       author.setAttribute(
         "aria-label",
@@ -364,8 +367,11 @@ export class ConversationsView {
       this.history.append(row);
     }
 
-    if (wasAtBottom) {
+    if (openedChannel || wasAtBottom) {
       this.history.scrollTop = this.history.scrollHeight;
+    } else {
+      // Older Messages were added above: keep the Messages that were visible in place.
+      this.history.scrollTop = previousTop + (this.history.scrollHeight - previousHeight);
     }
   }
 

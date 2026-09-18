@@ -1,28 +1,25 @@
-import { PACKAGE_REQUEST_ERROR_KIND } from "@teamarness/package-ui-sdk";
+import { typedPackageClient } from "@teamarness/package-ui-sdk";
 import type { PackageClient, PackageValue } from "@teamarness/package-ui-sdk";
+import { createPackageRequestError } from "@teamarness/package-ui-sdk/testing";
 import { describe, expect, it } from "vitest";
-import { ConversationsController } from "./controller";
+import type { ConversationsContract } from "./contract.generated";
+import { ConversationsController, type ConversationsClient } from "./controller";
 
 /** A rejected Package request as the frame bridge brands it. */
 function packageRequestError(code: string, retryable: boolean): unknown {
-  return Object.freeze({
-    kind: PACKAGE_REQUEST_ERROR_KIND,
-    version: 2,
-    namespace: "teamarness.package-host",
-    code: "backend_error",
+  return createPackageRequestError({
     stage: "ui",
     retryable,
-    recovery: "none",
     diagnosticId: "diag-1",
-    packageError: Object.freeze({ code, retryable, details: Object.freeze({}) }),
+    packageError: { code, retryable },
   });
 }
 
 const CHANNEL = "00000000000000000000000000000000";
 const OTHER_CHANNEL = "11111111111111111111111111111111";
 
-function client(rejection: unknown): PackageClient {
-  return {
+function client(rejection: unknown): ConversationsClient {
+  const untyped: PackageClient = {
     request: async <TResponse extends PackageValue>(
       operation: string,
       payload: PackageValue,
@@ -34,11 +31,12 @@ function client(rejection: unknown): PackageClient {
       }
       return {
         availability: "current",
-        channels: [{ id: CHANNEL, slug: "general", canHide: false }],
+        channels: [{ id: CHANNEL, slug: "general", canHide: false, unreadCount: 0 }],
       } as unknown as TResponse;
     },
     subscribe: async () => ({ close: async () => undefined }),
   };
+  return typedPackageClient<ConversationsContract>(untyped);
 }
 
 /** Reaches an active, `current` session, then fails one channel open. */

@@ -1,4 +1,5 @@
-import { PACKAGE_REQUEST_ERROR_KIND, type PackageClient, type PackageValue } from "@teamarness/package-ui-sdk";
+import type { PackageClient, PackageValue } from "@teamarness/package-ui-sdk";
+import { createPackageRequestError } from "@teamarness/package-ui-sdk/testing";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -227,20 +228,10 @@ describe("Repo-aware Package UI", () => {
     const controller = createRepoAwareController(client, (next) => { state = next; });
     await controller.start();
 
-    client.rejectNextWith = Object.freeze({
-      kind: PACKAGE_REQUEST_ERROR_KIND,
-      version: 2,
-      namespace: "teamarness.package-host",
-      code: "backend_error",
+    client.rejectNextWith = createPackageRequestError({
       stage: "ui",
-      retryable: false,
-      recovery: "none",
       diagnosticId: "diag-1",
-      packageError: Object.freeze({
-        code: "repo_aware.not_git_repository",
-        retryable: false,
-        details: Object.freeze({}),
-      }),
+      packageError: { code: "repo_aware.not_git_repository" },
     });
     await controller.register("relative/path");
 

@@ -112,6 +112,33 @@ test("falls back to PackageValue for unsupported keywords and open objects", () 
   assert.match(generated, /readonly requests: Record<string, never>;/u);
 });
 
+test("renders a fixed object or array as the exact type that accepts it", () => {
+  const generated = generateContractTypes(
+    {
+      $defs: {
+        choice: {
+          oneOf: [
+            { const: { id: "waves", label: "Waves" } },
+            { const: { id: "spiral", label: "Spiral", values: ["a", "b"] } },
+          ],
+        },
+        nothing: { const: {} },
+        none: { const: [] },
+      },
+      requests: {},
+      subscriptions: {},
+    },
+    { typeName: "ConstContract" },
+  );
+  assert.match(
+    generated,
+    /export type Choice = \{\n {2}readonly "id": "waves";\n {2}readonly "label": "Waves";\n\} \| \{\n {2}readonly "id": "spiral";\n {2}readonly "label": "Spiral";\n {2}readonly "values": readonly \["a", "b"\];\n\};/u,
+  );
+  assert.match(generated, /export type Nothing = Record<string, never>;/u);
+  assert.match(generated, /export type None = readonly \[\];/u);
+  assert.doesNotMatch(generated, /PackageValue/u);
+});
+
 test("names collide deterministically and never start with a digit", () => {
   const generated = generateContractTypes(
     {
@@ -170,6 +197,31 @@ test("check mode reports stale output with exit code 1", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("the installed command checks and writes through its bin entry", async (t) => {
+  // npm installs the command as a symbolic link, so this is the only test that proves --check
+  // fails from a package script rather than silently doing nothing.
+  const command = join(repositoryRoot, "node_modules/.bin/teamarness-contract-types");
+  const directory = await mkdtemp(join(packageRoot, ".contract-types-check-"));
+  try {
+    const contract = join(directory, "ui-contract.json");
+    const out = join(directory, "contract.generated.ts");
+    await writeFile(contract, JSON.stringify(SMALL_CONTRACT));
+    const argv = ["--contract", contract, "--out", out, "--type-name", "DemoContract"];
+
+    const stale = await run_(command, [...argv, "--check"]).then(() => null, (error) => error);
+    assert.ok(stale !== null, "the command must fail on stale output");
+    assert.equal(stale.code, 1);
+    assert.match(`${stale.stderr ?? ""}`, /contract types are stale/u);
+
+    await run_(command, argv);
+    assert.equal(await readFile(out, "utf8"), SMALL_EXPECTED);
+    await run_(command, [...argv, "--check"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  t.diagnostic("ran the installed teamarness-contract-types command");
 });
 
 test("generated types typecheck against the SDK client", async (t) => {
