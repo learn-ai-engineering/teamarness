@@ -40,7 +40,7 @@ Exactly one `response` or `error` is terminal for a request. Responses may finis
 
 `cancel` names the original request ID. Cancellation is best effort. A request deadline causes cancellation; failure to stop within 500 milliseconds terminates the generation. A state-changing request can then report `outcome_uncertain` and is never replayed automatically.
 
-`error` contains a stable host or Package-owned code, retryability, an optional bounded details object, and an optional `outcomeUncertain` flag. Operating-system error text and stderr do not cross this frame.
+`error` contains a stable host or Package-owned code, retryability, an optional bounded details object, and an optional `outcomeUncertain` flag. Operating-system error text and stderr do not cross this frame. A Host capability error with code `overloaded` or `deadline_exceeded` is retryable. A state-changing capability call that exceeded its deadline after starting reports `outcomeUncertain`.
 
 ## Streams and credit
 

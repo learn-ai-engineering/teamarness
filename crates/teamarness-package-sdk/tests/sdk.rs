@@ -364,3 +364,85 @@ fn sdk_dependency_boundary_excludes_host_and_runtime_internals() {
         assert!(!source.contains(forbidden), "SDK source names {forbidden}");
     }
 }
+
+/// Calls a capability from Package-owned background work and reports what the
+/// call returned, so a test can observe a call that the Host never answers.
+struct ReportsCapabilityOutcome {
+    outcome: tokio::sync::mpsc::Sender<Result<JsonValue, BackendError>>,
+}
+
+impl Backend for ReportsCapabilityOutcome {
+    fn handle(
+        &self,
+        request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+        let outcome = self.outcome.clone();
+        Box::pin(async move {
+            let capabilities = request.capabilities;
+            tokio::spawn(async move {
+                let result = capabilities
+                    .call("Z3JhbnQx", "get", JsonValue::Object(Default::default()))
+                    .await;
+                let _ = outcome.send(result).await;
+            });
+            Ok(JsonValue::Object(Default::default()))
+        })
+    }
+}
+
+async fn start_reporting_session(
+    outcome: tokio::sync::mpsc::Sender<Result<JsonValue, BackendError>>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<(), teamarness_package_sdk::SdkError>>,
+) {
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service = tokio::spawn(
+        Package::builder(Arc::new(ReportsCapabilityOutcome { outcome }))
+            .serve_io(sdk_read, sdk_write),
+    );
+    write_json(&mut host_write, FIXTURE_INITIALIZE).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"request","id":"h:call","operation":"fixture.capability","deadlineUnixMs":"9999999999999","payload":{}}"#).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Response);
+    // The capability request reaches the host, which deliberately never answers.
+    let request = read_frame(&mut host_read).await;
+    assert_eq!(request.kind(), FrameKind::Request);
+    assert_eq!(request.field("operation").unwrap(), "capability.call");
+    (host_read, host_write, service)
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test(start_paused = true)]
+async fn capability_call_times_out_when_host_never_answers() {
+    let (outcome, mut outcomes) = tokio::sync::mpsc::channel(1);
+    let (_host_read, host_write, service) = start_reporting_session(outcome).await;
+    tokio::time::advance(std::time::Duration::from_millis(11_001)).await;
+    let result = outcomes.recv().await.expect("the call reported an outcome");
+    let error = result.expect_err("an unanswered call gives up");
+    assert_eq!(error.code(), "deadline_exceeded");
+    assert!(error.retryable(), "a call that timed out may be retried");
+    drop(host_write);
+    let _ = service.await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn pending_capability_calls_fail_when_the_session_ends() {
+    let (outcome, mut outcomes) = tokio::sync::mpsc::channel(1);
+    let (host_read, host_write, service) = start_reporting_session(outcome).await;
+    drop(host_write);
+    drop(host_read);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), outcomes.recv())
+        .await
+        .expect("the pending call was answered when the session ended")
+        .expect("the call reported an outcome");
+    let error = result.expect_err("nothing can answer the call now");
+    assert_eq!(error.code(), "host_unavailable");
+    let _ = service.await;
+}

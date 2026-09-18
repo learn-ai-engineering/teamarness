@@ -47,6 +47,10 @@ pub use error::{
 };
 pub use membership::MembershipOperationId;
 pub use onboarding::WorkspaceInvitation;
+/// Test observation hooks. See the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use runtime::RuntimeStateHold;
 pub use runtime::{
     CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipChange, MembershipEpoch,
     MembershipRole, MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription,

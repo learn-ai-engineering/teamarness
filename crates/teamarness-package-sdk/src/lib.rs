@@ -250,8 +250,22 @@ impl Package {
         let writer_task = tokio::spawn(priority_writer::run(output, control, data, writer_stopped));
         let (frames_tx, frames_rx) = mpsc::channel(64);
         let reader_task = tokio::spawn(reader::run(input, frames_tx));
-        let result = dispatcher::run(self.backend, writer.clone(), frames_rx).await;
+        let pending: capability::PendingCapabilities =
+            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let streams: capability::CapabilityStreams =
+            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let result = dispatcher::run(
+            self.backend,
+            writer.clone(),
+            frames_rx,
+            pending.clone(),
+            streams.clone(),
+        )
+        .await;
         reader_task.abort();
+        // Nothing will answer a pending capability call once the dispatcher has
+        // returned, so every caller is told so before the writer stops.
+        capability::fail_all(&pending, &streams).await;
         drop(writer);
         // Package-owned tasks may still hold `CapabilityClient` clones, which keep
         // writer senders alive. Stop the writer explicitly so the session always

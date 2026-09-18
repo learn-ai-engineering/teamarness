@@ -26,5 +26,6 @@ nix.workspace = true
 sysinfo.workspace = true
 
 [dev-dependencies]
+teamarness-core = { path = "../teamarness-core", features = ["test-hooks"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

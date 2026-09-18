@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use teamarness_package_protocol::JsonValue;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::priority_writer::PriorityWriter;
 use crate::{BackendError, object};
+
+/// How long a capability call waits for the Host's answer.
+///
+/// One second longer than the Host's own call deadline, so a Host that is
+/// answering slowly reports its own `deadline_exceeded` first.
+pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(11);
 
 pub(crate) type PendingCapabilities =
     Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<JsonValue, BackendError>>>>>;
@@ -243,7 +249,32 @@ impl CapabilityClient {
             self.pending.lock().await.remove(&id);
             return Err(unavailable());
         }
-        receiver.await.unwrap_or_else(|_| Err(unavailable()))
+        match tokio::time::timeout(CALL_DEADLINE, receiver).await {
+            Ok(answer) => answer.unwrap_or_else(|_| Err(unavailable())),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(BackendError::new(
+                    "deadline_exceeded",
+                    true,
+                    JsonValue::Object(Default::default()),
+                ))
+            }
+        }
+    }
+}
+
+/// Fails every capability call and stream that is still waiting.
+///
+/// Called once the dispatcher has returned: nothing will answer them now, and a
+/// Package task holding a client must not wait forever.
+pub(crate) async fn fail_all(pending: &PendingCapabilities, streams: &CapabilityStreams) {
+    let waiting = std::mem::take(&mut *pending.lock().await);
+    for (_, sender) in waiting {
+        let _ = sender.send(Err(unavailable()));
+    }
+    let routes = std::mem::take(&mut *streams.lock().await);
+    for (_, route) in routes {
+        let _ = route.sender.send(Err(unavailable())).await;
     }
 }
 

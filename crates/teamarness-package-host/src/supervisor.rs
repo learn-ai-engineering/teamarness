@@ -40,6 +40,14 @@ pub(crate) struct ProcessTemplate {
     pub(crate) capabilities: Vec<CapabilityRequirement>,
 }
 
+/// The Host-wide call environment every Package process shares: one blocking
+/// permit pool and one set of protocol bounds.
+#[derive(Clone)]
+pub(crate) struct CallEnvironment {
+    pub(crate) limiter: crate::capability::CoreCallLimiter,
+    pub(crate) limits: crate::protocol::ProtocolLimits,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProcessSpec {
     pub(crate) template: ProcessTemplate,
@@ -49,6 +57,7 @@ pub(crate) struct ProcessSpec {
     pub(crate) data_directory: PathBuf,
     pub(crate) continuity_id: String,
     pub(crate) core: Arc<teamarness_core::CoreRuntime>,
+    pub(crate) calls: CallEnvironment,
 }
 
 pub(crate) struct ProcessGeneration {
@@ -77,6 +86,7 @@ pub(crate) async fn spawn(
         },
         &spec.template.capabilities,
         generation,
+        spec.calls.limiter.clone(),
     )
     .map_err(WireFailure::new)?;
     let current = fs::read(&spec.template.backend_path)
@@ -164,7 +174,8 @@ pub(crate) async fn spawn(
         return Err(WireFailure::new(PackageErrorCode::DataDirectoryUnavailable));
     }
 
-    let client = protocol::start_with_capabilities(stdout, stdin, capabilities.clone());
+    let client =
+        protocol::start_with_capabilities(stdout, stdin, capabilities.clone(), spec.calls.limits);
     let initialize = initialize_frame(spec, generation, &launch_token, &capabilities);
     let initialized = match client.initialize(initialize).await {
         Ok(initialized) => initialized,
@@ -406,6 +417,10 @@ mod tests {
             data_directory: data.clone(),
             continuity_id: "continuity".into(),
             core,
+            calls: CallEnvironment {
+                limiter: crate::capability::CoreCallLimiter::new(),
+                limits: crate::protocol::ProtocolLimits::CURRENT,
+            },
         };
 
         let error = match spawn(&spec, 1, false).await {

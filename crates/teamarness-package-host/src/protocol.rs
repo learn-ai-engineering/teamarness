@@ -287,13 +287,42 @@ impl Writer {
     }
 }
 
+/// A failed capability call, and whether its state change may still land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapabilityFailure {
+    pub(crate) code: PackageErrorCode,
+    pub(crate) outcome_uncertain: bool,
+}
+
+impl CapabilityFailure {
+    pub(crate) const fn certain(code: PackageErrorCode) -> Self {
+        Self {
+            code,
+            outcome_uncertain: false,
+        }
+    }
+}
+
+/// Injectable protocol bounds. Production uses [`ProtocolLimits::CURRENT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtocolLimits {
+    pub(crate) capability_call: Duration,
+}
+
+impl ProtocolLimits {
+    pub(crate) const CURRENT: Self = Self {
+        capability_call: Duration::from_secs(10),
+    };
+}
+
 pub(crate) trait CapabilityHandler: Send + Sync {
     fn call<'a>(
         &'a self,
         grant: Option<&'a str>,
         payload: &'a Value,
+        started: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     >;
 
     fn open_stream<'a>(
@@ -329,10 +358,15 @@ impl CapabilityHandler for RejectCapabilities {
         &'a self,
         _grant: Option<&'a str>,
         _payload: &'a Value,
+        _started: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
-        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+        Box::pin(async {
+            Err(CapabilityFailure::certain(
+                PackageErrorCode::CapabilityRequestInvalid,
+            ))
+        })
     }
 
     fn open_stream<'a>(
@@ -372,13 +406,19 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    start_with_capabilities(reader, output, Arc::new(RejectCapabilities))
+    start_with_capabilities(
+        reader,
+        output,
+        Arc::new(RejectCapabilities),
+        ProtocolLimits::CURRENT,
+    )
 }
 
 pub(crate) fn start_with_capabilities<R, W>(
     reader: R,
     output: W,
     capabilities: Arc<dyn CapabilityHandler>,
+    limits: ProtocolLimits,
 ) -> ProcessClient
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -421,6 +461,7 @@ where
         pong_tx,
         failure_tx.clone(),
         capabilities,
+        limits,
     ));
     ProcessClient {
         writer,
@@ -491,6 +532,7 @@ async fn reader_task<R>(
     pongs: watch::Sender<Option<String>>,
     failure: watch::Sender<Option<PackageErrorCode>>,
     capabilities: Arc<dyn CapabilityHandler>,
+    limits: ProtocolLimits,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -610,20 +652,50 @@ async fn reader_task<R>(
                 let writer = writer.clone();
                 let capabilities = capabilities.clone();
                 let failure = failure.clone();
+                // The method is read before the call, so a call that never
+                // returns can still be classified.
+                let method = payload
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
                 tokio::spawn(async move {
+                    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let result = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        capabilities.call(grant.as_deref(), &payload),
+                        limits.capability_call,
+                        capabilities.call(grant.as_deref(), &payload, started.clone()),
                     )
                     .await
-                    .unwrap_or(Err(PackageErrorCode::DeadlineExceeded));
+                    .unwrap_or_else(|_| {
+                        Err(CapabilityFailure {
+                            code: PackageErrorCode::DeadlineExceeded,
+                            // A state-changing call whose Core work had already
+                            // begun may still commit. `append` is content
+                            // idempotent, so the Package can retry it.
+                            outcome_uncertain: method == "append"
+                                && started.load(std::sync::atomic::Ordering::Acquire),
+                        })
+                    });
                     let response = match result {
                         Ok(payload) => json!({"kind":"response","id":id,"payload":payload}),
-                        Err(code) => json!({
-                            "kind":"error", "id":id,
-                            "code":capability_code(code), "retryable":false,
-                            "details":{}
-                        }),
+                        Err(failure) => {
+                            let mut details = json!({
+                                "kind":"error", "id":id,
+                                "code":capability_code(failure.code),
+                                "retryable":matches!(
+                                    failure.code,
+                                    PackageErrorCode::Overloaded
+                                        | PackageErrorCode::DeadlineExceeded
+                                ),
+                                "details":{}
+                            });
+                            if failure.outcome_uncertain
+                                && let Some(object) = details.as_object_mut()
+                            {
+                                object.insert("outcomeUncertain".to_owned(), Value::Bool(true));
+                            }
+                            details
+                        }
                     };
                     if writer.control(response).await.is_err() {
                         let _ = failure.send(Some(PackageErrorCode::ProcessExited));

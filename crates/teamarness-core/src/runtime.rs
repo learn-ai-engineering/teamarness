@@ -2256,6 +2256,19 @@ impl CoreRuntime {
 
     #[cfg(test)]
     pub(crate) fn hold_runtime_state_for_test(&self) -> RuntimeStateHold {
+        self.hold_state_inner()
+    }
+
+    /// Holds the runtime state lock until the returned value is released, so a
+    /// test in another crate can observe the Host while Core is busy.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn hold_state_for_tests(&self) -> RuntimeStateHold {
+        self.hold_state_inner()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn hold_state_inner(&self) -> RuntimeStateHold {
         let state = Arc::clone(&self.state);
         let (acquired_sender, acquired_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
@@ -2927,21 +2940,26 @@ impl crate::synchronization::SyncReceiver for ProbeReceiver {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct RuntimeStateHold {
+/// Holds the runtime state lock on a separate thread until released.
+///
+/// A test uses this to make "Core is busy" observable; production never
+/// constructs one.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub struct RuntimeStateHold {
     release: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl RuntimeStateHold {
-    pub(crate) fn release(mut self) {
+    pub fn release(mut self) {
         self.release.take().unwrap().send(()).unwrap();
         self.thread.take().unwrap().join().unwrap();
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for RuntimeStateHold {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {

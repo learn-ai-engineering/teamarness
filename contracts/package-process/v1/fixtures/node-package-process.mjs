@@ -266,7 +266,7 @@ async function serve() {
       } else if ((frame.kind === "response" || frame.kind === "error") && pendingCapabilityCalls.has(frame.id)) {
         const requestId = pendingCapabilityCalls.get(frame.id);
         pendingCapabilityCalls.delete(frame.id);
-        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code } });
+        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code, retryable: frame.retryable ?? false, outcomeUncertain: frame.outcomeUncertain ?? false } });
       } else if (frame.kind === "event" && frame.streamId === membershipStream) {
         membershipEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === immutableStream) {

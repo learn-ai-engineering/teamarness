@@ -1,21 +1,76 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 use teamarness_core::{
     CoreRuntime, MembershipEpoch, MembershipRole, PublicIdentity, PublicSignature, SigningContext,
 };
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
-use crate::protocol::HostStreamSender;
+use crate::protocol::{CapabilityFailure, HostStreamSender};
 use crate::{InstallationPublicIdentity, PackageErrorCode, PackageIdentity, WorkspaceId};
 
 const SIGNING_CONTEXT: &str = "package-signing/v1";
 const MAX_PURPOSE_BYTES: usize = 64;
 const MAX_SIGNING_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_STREAM_CREDIT: u64 = 32;
+
+/// The Host-wide bound on concurrent blocking Core work for Package capability
+/// calls.
+///
+/// Core's state lock is synchronous, so a capability call does its Core work on
+/// a blocking thread. Without a bound, Packages could occupy the whole blocking
+/// pool and the call deadline would stop meaning anything.
+#[derive(Clone)]
+pub(crate) struct CoreCallLimiter {
+    permits: Arc<Semaphore>,
+}
+
+impl CoreCallLimiter {
+    pub(crate) const PERMITS: usize = 8;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(Self::PERMITS)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_permits(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+        }
+    }
+
+    /// Waits for a permit, then runs `f` on a blocking thread, holding the
+    /// permit until `f` returns.
+    ///
+    /// The permit moves into the closure, so a call that outlived its deadline
+    /// still releases its permit only when its Core work really ends. `started`
+    /// becomes true as the closure's first statement, which is what makes an
+    /// `append` outcome uncertain rather than failed.
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        started: Arc<AtomicBool>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, PackageErrorCode> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
+        tokio::task::spawn_blocking(move || {
+            started.store(true, Ordering::Release);
+            let value = f();
+            drop(permit);
+            value
+        })
+        .await
+        .map_err(|_| PackageErrorCode::CapabilityUnavailable)
+    }
+}
 
 #[derive(Clone)]
 struct Descriptor {
@@ -70,6 +125,7 @@ pub(crate) struct AdvertisedGrant {
 
 pub(crate) struct GenerationCapabilities {
     core: Arc<CoreRuntime>,
+    limiter: CoreCallLimiter,
     scope: CapabilityScope,
     generation: u64,
     grants: BTreeMap<String, BoundGrant>,
@@ -84,6 +140,7 @@ impl GenerationCapabilities {
         scope: CapabilityScope,
         requirements: &[CapabilityRequirement],
         generation: u64,
+        limiter: CoreCallLimiter,
     ) -> Result<Arc<Self>, PackageErrorCode> {
         let registry = Registry::production();
         let mut grants = BTreeMap::new();
@@ -113,6 +170,7 @@ impl GenerationCapabilities {
         let (cancelled, _) = watch::channel(false);
         Ok(Arc::new(Self {
             core,
+            limiter,
             scope,
             generation,
             grants,
@@ -126,10 +184,24 @@ impl GenerationCapabilities {
         &self.advertised
     }
 
+    /// Validates the request on the asynchronous task, then runs the Core work
+    /// on a blocking thread through the shared limiter.
     pub(crate) async fn call(
         &self,
         grant: Option<&str>,
         payload: &Value,
+        started: Arc<AtomicBool>,
+    ) -> Result<Value, CapabilityFailure> {
+        self.call_inner(grant, payload, started)
+            .await
+            .map_err(CapabilityFailure::certain)
+    }
+
+    async fn call_inner(
+        &self,
+        grant: Option<&str>,
+        payload: &Value,
+        started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
         let grant = self.bound_grant(grant)?;
         let object = payload
@@ -137,10 +209,14 @@ impl GenerationCapabilities {
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         let method = string_field(object, "method")?;
         match grant.descriptor.kind {
-            CapabilityKind::WorkspaceContext => self.workspace_context(method, object),
-            CapabilityKind::Membership => self.membership(method, object),
-            CapabilityKind::Signing => self.signing(method, object),
-            CapabilityKind::ImmutableRecordLog => self.immutable_record(method, object),
+            CapabilityKind::WorkspaceContext => {
+                self.workspace_context(method, object, started).await
+            }
+            CapabilityKind::Membership => self.membership(method, object, started).await,
+            CapabilityKind::Signing => self.signing(method, object, started).await,
+            CapabilityKind::ImmutableRecordLog => {
+                self.immutable_record(method, object, started).await
+            }
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
         }
@@ -269,100 +345,122 @@ impl GenerationCapabilities {
         Ok(grant)
     }
 
-    fn workspace_context(
+    async fn workspace_context(
         &self,
         method: &str,
         object: &Map<String, Value>,
+        started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
         if method != "get" {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
         exact_fields(object, &["method"])?;
-        Ok(json!({
-            "workspaceId": self.scope.workspace_id.as_str(),
-            "workspaceName": self.scope.workspace_name,
-            "installationIdentity": self.scope.installation.as_str(),
-            "installationDisplayName": self.core.display_name(),
-        }))
+        let core = Arc::clone(&self.core);
+        let workspace_id = self.scope.workspace_id.as_str().to_owned();
+        let workspace_name = self.scope.workspace_name.clone();
+        let installation = self.scope.installation.as_str().to_owned();
+        self.limiter
+            .run(started, move || {
+                Ok(json!({
+                    "workspaceId": workspace_id,
+                    "workspaceName": workspace_name,
+                    "installationIdentity": installation,
+                    "installationDisplayName": core.display_name(),
+                }))
+            })
+            .await?
     }
 
-    fn membership(
+    async fn membership(
         &self,
         method: &str,
         object: &Map<String, Value>,
+        started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
         let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
             .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+        let core = Arc::clone(&self.core);
         match method {
             "current" => {
                 exact_fields(object, &["method"])?;
-                let snapshot = self
-                    .core
-                    .membership_snapshot(workspace)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                let members = snapshot
-                    .members()
-                    .iter()
-                    .map(|member| {
-                        json!({
-                            "identity":member.identity().to_string(),
-                            "role":match member.role() {
-                                MembershipRole::Member => "member",
-                                MembershipRole::Manager => "manager",
-                            }
-                        })
+                self.limiter
+                    .run(started, move || {
+                        let snapshot = core
+                            .membership_snapshot(workspace)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                        let members = snapshot
+                            .members()
+                            .iter()
+                            .map(|member| {
+                                json!({
+                                    "identity":member.identity().to_string(),
+                                    "role":match member.role() {
+                                        MembershipRole::Member => "member",
+                                        MembershipRole::Manager => "manager",
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(json!({
+                            "workspaceId":snapshot.workspace_id().to_string(),
+                            "epoch":snapshot.epoch().value().to_string(),
+                            "membershipVersion":snapshot.version().to_string(),
+                            "members":members,
+                        }))
                     })
-                    .collect::<Vec<_>>();
-                Ok(json!({
-                    "workspaceId":snapshot.workspace_id().to_string(),
-                    "epoch":snapshot.epoch().value().to_string(),
-                    "membershipVersion":snapshot.version().to_string(),
-                    "members":members,
-                }))
+                    .await?
             }
             "was_member" => {
                 exact_fields(object, &["method", "identity", "atUnixMs"])?;
                 let identity = PublicIdentity::from_str(string_field(object, "identity")?)
                     .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
                 let at_unix_ms = signed_decimal_field(object, "atUnixMs")?;
-                let was_member = self
-                    .core
-                    .was_member(workspace, identity, at_unix_ms)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                Ok(json!({
-                    "wasMember":was_member,
-                    "warning":"informational_not_authorization",
-                }))
+                self.limiter
+                    .run(started, move || {
+                        let was_member = core
+                            .was_member(workspace, identity, at_unix_ms)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                        Ok(json!({
+                            "wasMember":was_member,
+                            "warning":"informational_not_authorization",
+                        }))
+                    })
+                    .await?
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
     }
 
-    fn immutable_record(
+    async fn immutable_record(
         &self,
         method: &str,
         object: &Map<String, Value>,
+        started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
         let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
             .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-        let package = self.scope.package_identity.as_str();
+        let package = self.scope.package_identity.as_str().to_owned();
+        let core = Arc::clone(&self.core);
         match method {
             "append" => {
                 exact_fields(object, &["method", "purpose", "canonical"])?;
-                let purpose = validated_purpose(string_field(object, "purpose")?)?;
+                let purpose = validated_purpose(string_field(object, "purpose")?)?.to_owned();
                 let canonical = decode_bounded(string_field(object, "canonical")?, 262_144)?;
-                let record = self
-                    .core
-                    .append_record(workspace, package, purpose, &canonical)
-                    .map_err(sync_error)?;
-                Ok(json!({
-                    "recordId": record.record_id().to_string(),
-                    "orderKey": record.order_key().to_string(),
-                    "author": record.author().to_string(),
-                    "signature": encode_signature(&record.signature())?,
-                    "sealedRecord": encode_base64(record.sealed_record()),
-                    "durability": record.durability(),
-                }))
+                self.limiter
+                    .run(started, move || {
+                        let record = core
+                            .append_record(workspace, &package, &purpose, &canonical)
+                            .map_err(sync_error)?;
+                        Ok(json!({
+                            "recordId": record.record_id().to_string(),
+                            "orderKey": record.order_key().to_string(),
+                            "author": record.author().to_string(),
+                            "signature": encode_signature(&record.signature())?,
+                            "sealedRecord": encode_base64(record.sealed_record()),
+                            "durability": record.durability(),
+                        }))
+                    })
+                    .await?
             }
             "open" => {
                 exact_fields(object, &["method", "sealedRecords"])?;
@@ -388,48 +486,62 @@ impl GenerationCapabilities {
                         .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
                     sealed.push(bytes);
                 }
-                let mut results = Vec::with_capacity(sealed.len());
-                for envelope in &sealed {
-                    match self
-                        .core
-                        .open_records(workspace, package, std::slice::from_ref(envelope))
-                    {
-                        Ok(records) => {
-                            let record = records
-                                .into_iter()
-                                .next()
-                                .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
-                            results.push(json!({
-                                "status":"ready",
-                                "recordId":record.record_id().to_string(),
-                                "orderKey":record.order_key().to_string(),
-                                "author":record.author().to_string(),
-                                "purpose":record.purpose(),
-                                "signature":encode_signature(&record.signature())?,
-                                "canonical":encode_base64(record.canonical()),
-                            }));
+                // Every envelope of one request is opened in one blocking
+                // closure, but still one `open_records` call each, so each
+                // result is classified independently.
+                self.limiter
+                    .run(started, move || {
+                        let mut results = Vec::with_capacity(sealed.len());
+                        for envelope in &sealed {
+                            match core.open_records(
+                                workspace,
+                                &package,
+                                std::slice::from_ref(envelope),
+                            ) {
+                                Ok(records) => {
+                                    let record = records
+                                        .into_iter()
+                                        .next()
+                                        .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+                                    results.push(json!({
+                                        "status":"ready",
+                                        "recordId":record.record_id().to_string(),
+                                        "orderKey":record.order_key().to_string(),
+                                        "author":record.author().to_string(),
+                                        "purpose":record.purpose(),
+                                        "signature":encode_signature(&record.signature())?,
+                                        "canonical":encode_base64(record.canonical()),
+                                    }));
+                                }
+                                Err(error) => {
+                                    let status = match error {
+                                        teamarness_core::SynchronizationError::WrongScope => {
+                                            "wrong_scope"
+                                        }
+                                        teamarness_core::SynchronizationError::CorruptRecord => {
+                                            "corrupt"
+                                        }
+                                        _ => "waiting_for_history_access",
+                                    };
+                                    results.push(json!({"status":status}));
+                                }
+                            }
                         }
-                        Err(error) => {
-                            let status = match error {
-                                teamarness_core::SynchronizationError::WrongScope => "wrong_scope",
-                                teamarness_core::SynchronizationError::CorruptRecord => "corrupt",
-                                _ => "waiting_for_history_access",
-                            };
-                            results.push(json!({"status":status}));
-                        }
-                    }
-                }
-                Ok(json!({"results":results}))
+                        Ok(json!({"results":results}))
+                    })
+                    .await?
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
     }
 
-    fn signing(
+    async fn signing(
         &self,
         method: &str,
         object: &Map<String, Value>,
+        started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
+        let core = Arc::clone(&self.core);
         match method {
             "sign" => {
                 exact_fields(object, &["method", "purpose", "payload"])?;
@@ -441,18 +553,21 @@ impl GenerationCapabilities {
                     purpose,
                     &payload,
                 )?;
-                let context = SigningContext::new(SIGNING_CONTEXT)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                let signature = self
-                    .core
-                    .sign(&context, &envelope)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                let signature_bytes = decode_hex::<64>(&signature.to_string())?;
-                Ok(json!({
-                    "signer":self.core.public_identity().to_string(),
-                    "envelopeVersion":1,
-                    "signature":URL_SAFE_NO_PAD.encode(signature_bytes),
-                }))
+                self.limiter
+                    .run(started, move || {
+                        let context = SigningContext::new(SIGNING_CONTEXT)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                        let signature = core
+                            .sign(&context, &envelope)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                        let signature_bytes = decode_hex::<64>(&signature.to_string())?;
+                        Ok(json!({
+                            "signer":core.public_identity().to_string(),
+                            "envelopeVersion":1,
+                            "signature":URL_SAFE_NO_PAD.encode(signature_bytes),
+                        }))
+                    })
+                    .await?
             }
             "verify" => {
                 exact_fields(
@@ -477,9 +592,15 @@ impl GenerationCapabilities {
                     purpose,
                     &payload,
                 )?;
-                let context = SigningContext::new(SIGNING_CONTEXT)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                Ok(json!({"valid":signer.verify(&context, &envelope, &signature).is_ok()}))
+                self.limiter
+                    .run(started, move || {
+                        let context = SigningContext::new(SIGNING_CONTEXT)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                        Ok(json!({
+                            "valid":signer.verify(&context, &envelope, &signature).is_ok()
+                        }))
+                    })
+                    .await?
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
@@ -497,10 +618,11 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
         &'a self,
         grant: Option<&'a str>,
         payload: &'a Value,
+        started: Arc<AtomicBool>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
-        Box::pin(GenerationCapabilities::call(self, grant, payload))
+        Box::pin(GenerationCapabilities::call(self, grant, payload, started))
     }
 
     fn open_stream<'a>(
@@ -987,6 +1109,138 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Condvar;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+
+    /// Binds the immutable-record capability against a real Core runtime with
+    /// one Workspace, and returns the generation and its grant.
+    async fn bound_immutable_record(
+        core: &Arc<CoreRuntime>,
+        limiter: CoreCallLimiter,
+    ) -> (Arc<GenerationCapabilities>, String) {
+        let workspace = core.create_workspace("Capability limiter").unwrap();
+        let capabilities = GenerationCapabilities::bind(
+            Arc::clone(core),
+            CapabilityScope {
+                package_identity: "dev.teamarness.fixture".parse().unwrap(),
+                workspace_id: crate::WorkspaceId::new(workspace.id().to_string()).unwrap(),
+                workspace_name: workspace.name().to_owned(),
+                installation: InstallationPublicIdentity::new(core.public_identity().to_string())
+                    .unwrap(),
+            },
+            &[CapabilityRequirement {
+                identity: "teamarness.synchronization.immutable-record-log".into(),
+                major: 1,
+                min_minor: 0,
+                max_minor: 0,
+            }],
+            1,
+            limiter,
+        )
+        .unwrap();
+        let grant = capabilities.advertised()[0].grant.clone();
+        (capabilities, grant)
+    }
+
+    fn append_request() -> Value {
+        json!({"method":"append","purpose":"message.post","canonical":"aGVsbG8"})
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_call_does_not_block_the_executor_while_core_is_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Arc::new(
+            CoreRuntime::open(CoreRuntimeConfig::new(directory.path().join("core")))
+                .await
+                .unwrap(),
+        );
+        let (capabilities, grant) = bound_immutable_record(&core, CoreCallLimiter::new()).await;
+
+        // Core is busy: the append cannot finish until the lock is released.
+        let hold = core.hold_state_for_tests();
+        let calling = Arc::clone(&capabilities);
+        let call = tokio::spawn(async move {
+            calling
+                .call(
+                    Some(&grant),
+                    &append_request(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+        });
+        let (finished, sibling) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = finished.send(());
+        });
+        let progressed = tokio::time::timeout(Duration::from_secs(5), sibling)
+            .await
+            .is_ok_and(|delivered| delivered.is_ok());
+        hold.release();
+        assert!(
+            progressed,
+            "the capability call held the executor while Core was locked"
+        );
+        let appended = call.await.unwrap().expect("the append completes");
+        assert_eq!(
+            appended.get("durability").and_then(Value::as_str),
+            Some("committed")
+        );
+        drop(capabilities);
+        core.shutdown().await.unwrap();
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn core_call_limiter_bounds_concurrent_blocking_work() {
+        let limiter = CoreCallLimiter::with_permits(2);
+        let started = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            let limiter = limiter.clone();
+            let started = Arc::clone(&started);
+            let gate = Arc::clone(&gate);
+            running.push(tokio::spawn(async move {
+                limiter
+                    .run(Arc::new(AtomicBool::new(false)), move || {
+                        started.fetch_add(1, Ordering::AcqRel);
+                        let (open, waiting) = &*gate;
+                        let mut open = open.lock().unwrap();
+                        while !*open {
+                            open = waiting.wait(open).unwrap();
+                        }
+                    })
+                    .await
+            }));
+        }
+        // Two permits, so exactly two closures can be inside the pool; the
+        // third cannot start until one of them returns, which needs the gate.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while started.load(Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "two closures never started"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(started.load(Ordering::Acquire), 2);
+
+        let (open, waiting) = &*gate;
+        *open.lock().unwrap() = true;
+        waiting.notify_all();
+        for handle in running {
+            handle.await.unwrap().unwrap();
+        }
+        assert_eq!(started.load(Ordering::Acquire), 3);
+    }
 
     #[test]
     fn canonical_signing_envelope_has_a_stable_golden() {

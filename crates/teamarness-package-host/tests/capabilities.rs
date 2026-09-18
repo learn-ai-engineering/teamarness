@@ -716,3 +716,70 @@ async fn rejects_capability_versions_before_process_activation() {
         assert!(snapshot.diagnostics.iter().any(|error| error.code == code));
     }
 }
+
+/// Verifies: TEAM.SYS.TRANS-R07, TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn capability_call_deadline_fires_while_core_is_busy() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let config = fixture
+        .config
+        .clone()
+        .with_capability_call_timeout_for_tests(std::time::Duration::from_millis(200));
+    let host = PackageHost::open(config, fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let append = capability(
+        "teamarness.synchronization.immutable-record-log",
+        "append",
+        object([
+            ("purpose", PackageValue::String("message.post".into())),
+            ("canonical", PackageValue::String("aGVsbG8".into())),
+        ]),
+    );
+
+    // Core is busy for longer than the call deadline, which must still fire.
+    let hold = fixture.core.hold_state_for_tests();
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        call(&host, mount.clone(), "deadline-append", append.clone()),
+    )
+    .await
+    .expect("the call deadline fired while Core was busy");
+    assert_eq!(
+        refused.get("error"),
+        Some(&PackageValue::String("deadline_exceeded".into()))
+    );
+    assert_eq!(refused.get("retryable"), Some(&PackageValue::Boolean(true)));
+    assert_eq!(
+        refused.get("outcomeUncertain"),
+        Some(&PackageValue::Boolean(true)),
+        "the append had already started, so its outcome is uncertain"
+    );
+    hold.release();
+
+    // The retry is content-idempotent: the Package sees one record, not two.
+    let retried = call(&host, mount, "retried-append", append).await;
+    assert_eq!(
+        retried.get("durability"),
+        Some(&PackageValue::String("committed".into()))
+    );
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    let mut records = fixture
+        .core
+        .subscribe_records(workspace.id(), "dev.teamarness.fixture", None)
+        .unwrap();
+    let mut committed = 0;
+    while let Ok(Some(_)) = records.next_event_timeout(std::time::Duration::ZERO) {
+        committed += 1;
+    }
+    assert_eq!(committed, 1, "the timed-out append committed nothing");
+}

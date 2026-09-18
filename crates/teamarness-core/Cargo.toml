@@ -7,6 +7,9 @@ license.workspace = true
 
 [features]
 p2panda-sync-adapter = []
+# Observation hooks for tests in other crates. Enabled only from a
+# `[dev-dependencies]` entry; it never re-exposes production API.
+test-hooks = []
 
 [dependencies]
 curve25519-dalek.workspace = true

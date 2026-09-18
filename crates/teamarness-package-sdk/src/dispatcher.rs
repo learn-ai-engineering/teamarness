@@ -13,6 +13,8 @@ pub(crate) async fn run(
     backend: Arc<dyn Backend>,
     writer: Arc<PriorityWriter>,
     mut frames: mpsc::Receiver<Frame>,
+    pending_capabilities: PendingCapabilities,
+    capability_streams: CapabilityStreams,
 ) -> Result<(), SdkError> {
     let initialize = frames.recv().await.ok_or(SdkError::ParentClosed)?;
     if initialize.kind() != FrameKind::Initialize {
@@ -21,8 +23,6 @@ pub(crate) async fn run(
     let initialization = Initialization::from_frame(&initialize)?;
     writer.control(initialized(&initialize)?).await?;
 
-    let pending_capabilities: PendingCapabilities = Arc::new(Mutex::new(BTreeMap::new()));
-    let capability_streams: CapabilityStreams = Arc::new(Mutex::new(BTreeMap::new()));
     let capabilities = CapabilityClient::new(
         writer.clone(),
         pending_capabilities.clone(),

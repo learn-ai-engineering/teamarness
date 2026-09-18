@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 teamarness-package-protocol = { path = "../teamarness-package-protocol" }
 tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

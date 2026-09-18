@@ -238,6 +238,7 @@ pub struct PackageHostConfig {
     private_data_directory: PathBuf,
     installation_public_identity: InstallationPublicIdentity,
     target: String,
+    capability_call_timeout: std::time::Duration,
 }
 
 impl PackageHostConfig {
@@ -255,7 +256,16 @@ impl PackageHostConfig {
             private_data_directory: private_data_directory.into(),
             installation_public_identity,
             target: "aarch64-apple-darwin".to_owned(),
+            capability_call_timeout: protocol::ProtocolLimits::CURRENT.capability_call,
         }
+    }
+
+    /// Shortens the Package capability-call deadline so a test can observe it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_capability_call_timeout_for_tests(mut self, timeout: std::time::Duration) -> Self {
+        self.capability_call_timeout = timeout;
+        self
     }
 
     /// Returns the application resource root.
@@ -835,6 +845,7 @@ pub struct PackageHost {
 }
 
 struct PackageHostInner {
+    calls: supervisor::CallEnvironment,
     data: Mutex<HostData>,
     revisions: watch::Sender<HostRevision>,
     config: PackageHostConfig,
@@ -939,6 +950,14 @@ impl PackageHost {
                     .collect(),
             });
         }
+        // One permit pool and one set of protocol bounds for every Package in
+        // this Host.
+        let calls = supervisor::CallEnvironment {
+            limiter: capability::CoreCallLimiter::new(),
+            limits: protocol::ProtocolLimits {
+                capability_call: config.capability_call_timeout,
+            },
+        };
         let mut instances = BTreeMap::new();
         for template in &templates {
             for workspace in &workspaces {
@@ -954,7 +973,8 @@ impl PackageHost {
                 )) {
                     continue;
                 }
-                let (key, actor) = prepare_instance(&config, &core, template, workspace).await?;
+                let (key, actor) =
+                    prepare_instance(&config, &core, &calls, template, workspace).await?;
                 if let Err(failure) = actor.activate().await {
                     report
                         .snapshot
@@ -968,6 +988,7 @@ impl PackageHost {
         let (revisions, _) = watch::channel(revision);
         let host = Self {
             inner: Arc::new(PackageHostInner {
+                calls,
                 data: Mutex::new(HostData {
                     state: PackageHostState::Running,
                     revision,
@@ -1091,6 +1112,7 @@ impl PackageHost {
                         let (key, actor) = prepare_instance(
                             &self.inner.config,
                             &self.inner.core,
+                            &self.inner.calls,
                             template,
                             workspace,
                         )
@@ -1495,6 +1517,7 @@ impl PackageHost {
 async fn prepare_instance(
     config: &PackageHostConfig,
     core: &Arc<teamarness_core::CoreRuntime>,
+    calls: &supervisor::CallEnvironment,
     template: &supervisor::ProcessTemplate,
     workspace: &teamarness_core::WorkspaceSummary,
 ) -> Result<(PackageInstanceKey, Arc<instance::InstanceActor>), PackageErrorEnvelope> {
@@ -1523,6 +1546,7 @@ async fn prepare_instance(
         data_directory: grant.path,
         continuity_id: grant.continuity_id,
         core: core.clone(),
+        calls: calls.clone(),
     };
     Ok((
         key.clone(),
