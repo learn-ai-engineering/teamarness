@@ -9,6 +9,8 @@ node_modules/
 /packages/repo-aware/ui/dist/
 /apps/teamarness-desktop/src-tauri/gen/
 /.teamarness-dev/
+# Temporary typecheck trees the contract-types generator test builds
+/packages/teamarness-package-ui-sdk/.contract-types-check-*/
 
 # Local MyFlow planning and implementation artifacts
 /.myflow/

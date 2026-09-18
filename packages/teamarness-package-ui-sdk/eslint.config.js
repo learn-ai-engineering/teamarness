@@ -6,6 +6,14 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   { ignores: ["dist/**"] },
   {
+    // The contract-types generator is a Node CLI: it uses Node globals and no DOM.
+    files: ["bin/**/*.mjs"],
+    languageOptions: {
+      globals: { console: "readonly", process: "readonly" },
+      sourceType: "module",
+    },
+  },
+  {
     files: ["src/**/*.ts"],
     rules: {
       "no-restricted-imports": ["error", {

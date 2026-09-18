@@ -8,5 +8,6 @@
     "noEmit": true,
     "lib": ["ESNext", "DOM"]
   },
+  "exclude": ["node_modules", ".contract-types-check-*"],
   "include": ["src"]
 }

@@ -2,11 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PACKAGE_REQUEST_ERROR_KIND,
   TEAMARNESS_THEME_TOKENS,
+  adoptPackageStyles,
   describePackageError,
   installPackageUiKit,
   isAbortError,
   isPackageRequestError,
   packageErrorCode,
+  typedPackageClient,
+  type PackageClient,
   type TeamarnessThemeToken,
 } from "./index";
 
@@ -104,17 +107,55 @@ describe("Package presentation contract", () => {
   });
 });
 
+describe("Package styles", () => {
+  it("adopts one Package stylesheet and removes only it on idempotent cleanup", () => {
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    const unrelated = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    const root = fakeShadowRoot([unrelated]);
+
+    const cleanup = adoptPackageStyles(root, ".package { color: red; }");
+    expect(root.adoptedStyleSheets).toHaveLength(2);
+    const adopted = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
+    expect(adopted.cssText).toBe(".package { color: red; }");
+
+    cleanup();
+    cleanup();
+    expect(root.adoptedStyleSheets).toEqual([unrelated]);
+  });
+
+  it("fails with a Package-neutral message when constructed stylesheets are unavailable", () => {
+    vi.stubGlobal("CSSStyleSheet", undefined);
+    expect(() => adoptPackageStyles(fakeShadowRoot(), "")).toThrow(
+      "Package styles require constructed CSSStyleSheet support",
+    );
+
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    expect(() => adoptPackageStyles({} as ShadowRoot, "")).toThrow(
+      "Package styles require ShadowRoot.adoptedStyleSheets support",
+    );
+  });
+});
+
+describe("typed client", () => {
+  it("typed client is the same object as the untyped client", () => {
+    const client = { request: async () => ({}), subscribe: async () => ({ close: async () => {} }) } as unknown as PackageClient;
+    expect(typedPackageClient(client)).toBe(client);
+  });
+});
+
 describe("author surface", () => {
   it("exports only the author contract and no transport or Tauri host pieces", async () => {
     const surface = await import("./index");
     expect(Object.keys(surface).sort()).toEqual([
       "PACKAGE_REQUEST_ERROR_KIND",
       "TEAMARNESS_THEME_TOKENS",
+      "adoptPackageStyles",
       "describePackageError",
       "installPackageUiKit",
       "isAbortError",
       "isPackageRequestError",
       "packageErrorCode",
+      "typedPackageClient",
     ]);
   });
 });

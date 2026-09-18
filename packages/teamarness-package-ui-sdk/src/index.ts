@@ -149,43 +149,72 @@ function installInputSuppressor(root: ShadowRoot): () => void {
   };
 }
 
-function currentAdoptedSheets(root: ShadowRoot): readonly CSSStyleSheet[] {
+/**
+ * The leading phrase of every stylesheet failure, so the message names what the caller asked for
+ * rather than the Package that asked for it.
+ */
+const KIT_NEEDS = "The Package UI kit requires";
+const STYLES_NEEDS = "Package styles require";
+
+function currentAdoptedSheets(root: ShadowRoot, needs = KIT_NEEDS): readonly CSSStyleSheet[] {
   if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
-    throw new Error("The Package UI kit requires ShadowRoot.adoptedStyleSheets support");
+    throw new Error(`${needs} ShadowRoot.adoptedStyleSheets support`);
   }
   return root.adoptedStyleSheets;
 }
 
-function createKitSheet(): CSSStyleSheet {
+function createSheet(css: string, needs = KIT_NEEDS): CSSStyleSheet {
   const StyleSheet = globalThis.CSSStyleSheet;
   if (typeof StyleSheet !== "function") {
-    throw new Error("The Package UI kit requires constructed CSSStyleSheet support");
+    throw new Error(`${needs} constructed CSSStyleSheet support`);
   }
   let sheet: CSSStyleSheet;
   try {
     sheet = new StyleSheet();
   } catch (cause) {
-    throw new Error("The Package UI kit requires constructed CSSStyleSheet support", { cause });
+    throw new Error(`${needs} constructed CSSStyleSheet support`, { cause });
   }
   if (typeof sheet.replaceSync !== "function") {
-    throw new Error("The Package UI kit requires CSSStyleSheet.replaceSync support");
+    throw new Error(`${needs} CSSStyleSheet.replaceSync support`);
   }
-  sheet.replaceSync(PACKAGE_UI_KIT_CSS);
+  sheet.replaceSync(css);
   return sheet;
 }
 
-function setAdoptedSheets(root: ShadowRoot, sheets: CSSStyleSheet[]): void {
+function setAdoptedSheets(root: ShadowRoot, sheets: CSSStyleSheet[], needs = KIT_NEEDS): void {
   try {
     root.adoptedStyleSheets = sheets;
   } catch (cause) {
-    throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
+    throw new Error(`${needs} mutable ShadowRoot.adoptedStyleSheets support`, { cause });
   }
+}
+
+/**
+ * Adopts one Package-owned stylesheet into a mount's shadow root.
+ *
+ * The Package keeps its CSS in its own bundle; this only puts it where the mount can use it. The
+ * returned cleanup is idempotent and removes exactly this sheet, never anything else the root has
+ * adopted.
+ */
+export function adoptPackageStyles(root: ShadowRoot, css: string): () => void {
+  const sheet = createSheet(css, STYLES_NEEDS);
+  setAdoptedSheets(root, [...currentAdoptedSheets(root, STYLES_NEEDS), sheet], STYLES_NEEDS);
+  if (!currentAdoptedSheets(root, STYLES_NEEDS).includes(sheet)) {
+    throw new Error(`${STYLES_NEEDS} mutable ShadowRoot.adoptedStyleSheets support`);
+  }
+  let cleaned = false;
+  return () => {
+    if (cleaned) return;
+    cleaned = true;
+    const remaining = currentAdoptedSheets(root, STYLES_NEEDS).filter((entry) => entry !== sheet);
+    setAdoptedSheets(root, remaining, STYLES_NEEDS);
+  };
 }
 
 export function installPackageUiKit(root: ShadowRoot): () => void {
   let installation = installedKits.get(root);
   if (installation === undefined) {
-    const sheet = createKitSheet();
+    const sheet = createSheet(PACKAGE_UI_KIT_CSS);
     setAdoptedSheets(root, [...currentAdoptedSheets(root), sheet]);
     if (!currentAdoptedSheets(root).includes(sheet)) {
       throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support");
@@ -349,3 +378,46 @@ export type PackageUnmount = () => void | Promise<void>;
 export type PackageUiModule = Readonly<{
   mount(context: PackageMountContext): PackageUnmount | Promise<PackageUnmount>;
 }>;
+
+/**
+ * The shape a generated contract type has: every operation with its request and answer.
+ *
+ * `teamarness-contract-types` writes one of these from `ui-contract.json`, so the types a UI
+ * programs against and the shapes the Host validates come from the same file.
+ */
+export type PackageContractShape = {
+  readonly requests: {
+    readonly [operation: string]: { readonly request: PackageValue; readonly response: PackageValue };
+  };
+  readonly subscriptions: {
+    readonly [operation: string]: { readonly request: PackageValue; readonly event: PackageValue };
+  };
+};
+
+/** A [`PackageClient`] whose operation names, payloads and answers come from one contract. */
+export interface TypedPackageClient<C extends PackageContractShape> {
+  request<K extends keyof C["requests"] & string>(
+    operation: K,
+    payload: C["requests"][K]["request"],
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<C["requests"][K]["response"]>;
+  subscribe<K extends keyof C["subscriptions"] & string>(
+    operation: K,
+    payload: C["subscriptions"][K]["request"],
+    listener: (event: C["subscriptions"][K]["event"]) => void | Promise<void>,
+    options?: PackageSubscribeOptions,
+  ): Promise<PackageSubscription>;
+}
+
+/**
+ * Views the mount's client through one contract's types.
+ *
+ * It is the same object: nothing is validated here, because the Host already validates every
+ * request, response and event against the contract it admitted. What this adds is that a UI
+ * cannot name an operation, or build a payload, the contract does not describe.
+ */
+export function typedPackageClient<C extends PackageContractShape>(
+  client: PackageClient,
+): TypedPackageClient<C> {
+  return client as TypedPackageClient<C>;
+}
