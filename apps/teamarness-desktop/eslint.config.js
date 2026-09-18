@@ -23,6 +23,24 @@ export default tseslint.config(
     },
   },
   {
+    // Package code never runs in the Shell realm and the Shell owns no global listeners.
+    files: ["src/**/*.ts"],
+    ignores: ["src/package-frame/**", "src/**/*.test.ts"],
+    rules: {
+      "no-restricted-syntax": ["error", {
+        selector: "ImportExpression",
+        message: "Package code runs only in sandboxed frames; the Shell must not load modules dynamically.",
+      }],
+      "no-restricted-imports": ["error", {
+        paths: [
+          { name: "./package-frame/runtime", message: "The frame runtime never loads in the Shell realm." },
+          { name: "./package-frame/runtime-entry", message: "The frame runtime never loads in the Shell realm." },
+          { name: "./package-frame/port-client", message: "The frame client never loads in the Shell realm." },
+        ],
+      }],
+    },
+  },
+  {
     // The frame runtime runs inside a Package UI Frame, never in the Shell realm.
     files: ["src/package-frame/**/*.ts"],
     ignores: ["src/package-frame/**/*.test.ts"],

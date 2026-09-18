@@ -332,13 +332,35 @@ mod tests {
     }
 
     #[test]
-    fn csp_allows_only_the_admitted_scheme_for_package_resources() {
+    fn shell_csp_frames_package_documents_without_loading_package_code() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let csp = config["app"]["security"]["csp"].as_str().unwrap();
-        assert!(csp.contains("script-src 'self' teamarness-package:"));
-        assert!(csp.contains("connect-src ipc: http://ipc.localhost teamarness-package:"));
-        assert!(!csp.contains("file:"));
-        assert!(!csp.contains("https:"));
+        let directives: Vec<Vec<&str>> = csp
+            .split(';')
+            .map(|directive| directive.split_whitespace().collect())
+            .collect();
+        let sources = |name: &str| -> Vec<&str> {
+            directives
+                .iter()
+                .find(|parts| parts.first() == Some(&name))
+                .map(|parts| parts[1..].to_vec())
+                .unwrap_or_default()
+        };
+        assert_eq!(sources("script-src"), vec!["'self'"]);
+        assert_eq!(sources("frame-src"), vec!["teamarness-package:"]);
+        assert_eq!(sources("connect-src"), vec!["ipc:", "http://ipc.localhost"]);
+        for parts in &directives {
+            if parts.first() == Some(&"frame-src") {
+                continue;
+            }
+            assert!(
+                !parts.contains(&"teamarness-package:"),
+                "the Shell realm must not load {parts:?} from Packages"
+            );
+        }
+        for forbidden in ["file:", "https:", "'unsafe-inline'", "'unsafe-eval'"] {
+            assert!(!csp.contains(forbidden), "{forbidden}");
+        }
     }
 }

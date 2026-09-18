@@ -171,6 +171,7 @@ function harness(
     theme: {
       getPreference: () => "system",
       selectPreference: (preference) => { calls.push(`theme:${preference}`); },
+      subscribe: () => () => undefined,
     },
     workspaceActions: {
       selectWorkspace: (workspaceId) => { calls.push(`workspace:${workspaceId}`); },

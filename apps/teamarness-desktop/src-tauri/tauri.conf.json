@@ -11,7 +11,7 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost teamarness-package:; img-src 'self' data: teamarness-package:; font-src 'self' teamarness-package:; style-src 'self' teamarness-package:; script-src 'self' teamarness-package:"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; font-src 'self'; style-src 'self'; script-src 'self'; frame-src teamarness-package:"
     },
     "windows": [
       {

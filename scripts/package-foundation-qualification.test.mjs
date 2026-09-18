@@ -8,6 +8,15 @@ import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
+async function sourceFiles(directory) {
+  const entries = await readdir(new URL(`${directory}/`, root), { withFileTypes: true, recursive: true });
+  const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".ts"));
+  return Promise.all(files.map(async (entry) => {
+    const path = `${entry.parentPath.slice(new URL(root).pathname.length)}/${entry.name}`;
+    return { path, source: await readFile(new URL(`${entry.parentPath}/${entry.name}`, "file://"), "utf8") };
+  }));
+}
+
 test("Package authoring guidance follows the local Package development path", async () => {
   const guide = await read("docs/build-your-first-package.md");
   const readme = await read("README.md");
@@ -110,12 +119,13 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
     .split(";")
     .map((directive) => directive.trim().split(/\s+/))
     .find(([name]) => name === "style-src");
-  assert.deepEqual(styleDirective, ["style-src", "'self'", "teamarness-package:"]);
+  assert.deepEqual(styleDirective, ["style-src", "'self'"]);
 
   for (const path of [
     "packages/teamarness-package-ui-sdk/src/index.ts",
     "packages/reference-package/ui/src/index.ts",
     "packages/tutorial/ui/src/index.ts",
+    "apps/teamarness-desktop/src/package-frame/runtime.ts",
   ]) {
     const source = await read(path);
     assert.doesNotMatch(source, /createElement\(\s*["']style["']/, `${path} must not create inline style elements`);
@@ -221,6 +231,34 @@ test("delivery configuration includes all bundled Package Directories and source
   assert.match(presentation, /catalog\.source === "local" \? "Personal" : "Team"/);
 });
 
+test("Package UIs run only in sandboxed frames and the Shell realm loads no Package code", async () => {
+  const mount = await read("apps/teamarness-desktop/src/package-mount.ts");
+  assert.match(mount, /"allow-scripts"/);
+
+  const desktopSources = await sourceFiles("apps/teamarness-desktop/src");
+  assert.ok(desktopSources.some(({ path }) => path.endsWith("/package-mount.ts")), "desktop sources were not read");
+  assert.ok(desktopSources.some(({ path }) => path.includes("/package-frame/")), "frame sources were not read");
+  assert.ok(desktopSources.length >= 10, "desktop source scan found too few files");
+  for (const { path, source } of desktopSources) {
+    for (const token of ["allow-same-origin", "allow-top-navigation", "allow-popups", "allow-forms"]) {
+      assert.ok(!source.includes(token), `${path} must not widen the Package UI Frame sandbox with ${token}`);
+    }
+  }
+  const shellRealm = desktopSources.filter(({ path }) =>
+    !path.includes("/package-frame/") && !path.endsWith(".test.ts"));
+  for (const { path, source } of shellRealm) {
+    assert.ok(!source.includes("import("), `${path} must not load modules into the Shell realm`);
+    for (const listener of ['addEventListener("error"', 'addEventListener("unhandledrejection"', 'addEventListener("message"']) {
+      assert.ok(!source.includes(listener), `${path} must not install the window listener ${listener}`);
+    }
+  }
+
+  const csp = JSON.parse(await read("apps/teamarness-desktop/src-tauri/tauri.conf.json")).app.security.csp;
+  const scriptDirective = csp.split(";").map((directive) => directive.trim()).find((directive) => directive.startsWith("script-src"));
+  assert.equal(scriptDirective, "script-src 'self'");
+  assert.ok(csp.includes("frame-src teamarness-package:"));
+});
+
 test("repository authoring records the temporary vendoring policy", async () => {
   const decision = await read("context/.decisions/0010-vendored-package-authoring.md");
   const roadmap = await read("context/roadmap.md");
@@ -270,6 +308,9 @@ test("delivery configuration has one local admitted loader and no deferred Packa
     "apps/teamarness-desktop/src/package-bridge.ts",
     "apps/teamarness-desktop/src/package-contracts.ts",
     "apps/teamarness-desktop/src/package-mount.ts",
+    "apps/teamarness-desktop/src/package-port-host.ts",
+    "apps/teamarness-desktop/src/package-frame/protocol.ts",
+    "apps/teamarness-desktop/src/package-frame/runtime.ts",
     "apps/teamarness-desktop/src-tauri/src/package_commands.rs",
     "apps/teamarness-desktop/src-tauri/src/package_dto.rs",
     "apps/teamarness-desktop/src-tauri/src/package_protocol.rs",
