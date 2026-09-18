@@ -12,42 +12,36 @@ use crate::synchronization::{LogSessionError, Refusal};
 
 const PACKAGE: &str = "teamarness.test";
 
-/// Verifies: TEAM.SYS.TRANS-R06
+/// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.MEM-R10
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn non_member_is_refused_on_package_sync() {
+async fn non_member_is_refused_on_every_sync_alpn() {
     let cluster = SyncCluster::start("non-member-refused", &["a", "x"]).await;
     let workspace = cluster.node("a").create_workspace("Gate").unwrap();
+    let id = workspace.id();
     let seed = cluster
         .node("a")
-        .append_record(workspace.id(), PACKAGE, "message.post", b"seed")
+        .append_record(id, PACKAGE, "message.post", b"seed")
         .unwrap();
 
+    // Package records.
     let outcome = cluster
         .node("x")
-        .probe_package_sync_for_test(
-            cluster.address("a"),
-            workspace.id(),
-            PACKAGE,
-            cluster.identity("a"),
-        )
+        .probe_package_sync_for_test(cluster.address("a"), id, PACKAGE, cluster.identity("a"))
         .await;
-
     assert_eq!(outcome, ProbeOutcome::Refused(Refusal::NotAuthorized));
-    assert_eq!(
-        cluster.record_ids("a", workspace.id(), PACKAGE),
-        BTreeSet::from([seed.record_id()]),
-        "a refused session must not change the serving installation's scope"
-    );
-    assert!(
-        cluster.record_ids("x", workspace.id(), PACKAGE).is_empty(),
-        "a non-member must receive nothing"
-    );
-    cluster.finish().await;
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batch_alpn_is_no_longer_offered() {
-    let cluster = SyncCluster::start("batch-alpn-gone", &["a", "x"]).await;
+    // Canonical membership.
+    let (operations, refused) = cluster
+        .node("x")
+        .probe_membership_sync_for_test(cluster.address("a"), id, Vec::new())
+        .await;
+    assert!(
+        operations.is_empty(),
+        "a non-member is served no membership"
+    );
+    assert!(refused, "a non-member is refused on membership sync");
+
+    // The retired batch ingest path.
     assert!(
         !cluster
             .node("x")
@@ -58,9 +52,23 @@ async fn batch_alpn_is_no_longer_offered() {
     assert!(
         cluster
             .node("x")
-            .can_connect_alpn_for_test(cluster.address("a"), b"teamarness/package-sync/2")
+            .can_connect_alpn_for_test(cluster.address("a"), b"teamarness/membership-sync/1")
             .await,
-        "the gated package sync ALPN is still offered"
+        "membership sync is offered; the refusal is inside the protocol"
+    );
+
+    assert_eq!(
+        cluster.record_ids("a", id, PACKAGE),
+        BTreeSet::from([seed.record_id()]),
+        "a refused session must not change the serving installation's scope"
+    );
+    assert!(
+        cluster.record_ids("x", id, PACKAGE).is_empty(),
+        "a non-member must receive nothing"
+    );
+    assert!(
+        cluster.members("x", id).is_empty(),
+        "a non-member must learn no roster"
     );
     cluster.finish().await;
 }
@@ -598,5 +606,155 @@ async fn forged_scope_record_is_rejected_without_ending_the_session() {
         "a record signed for another package never opens in this scope"
     );
     assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.MEM-R06, TEAM.SYS.TRANS-R06
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_member_cannot_pull_new_records_from_any_member() {
+    let cluster = SyncCluster::start("revoked-pulls-nothing", &["a", "b", "c"]).await;
+    let workspace = cluster.node("a").create_workspace("Revoked pull").unwrap();
+    let id = workspace.id();
+    let a0 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a0")
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster.admit("a", "c", id).await;
+    let everyone = BTreeSet::from([
+        cluster.identity("a"),
+        cluster.identity("b"),
+        cluster.identity("c"),
+    ]);
+    cluster
+        .wait_until(
+            "all three converge on the seed record",
+            DEFAULT_DEADLINE,
+            |c| {
+                c.members("b", id) == everyone
+                    && c.members("c", id) == everyone
+                    && c.record_ids("b", id, PACKAGE).contains(&a0.record_id())
+                    && c.record_ids("c", id, PACKAGE).contains(&a0.record_id())
+            },
+        )
+        .await;
+
+    // B is held at its pre-revocation view, so its own gate still lets it dial.
+    cluster
+        .node("b")
+        .pause_membership_replication_for_test(true);
+    cluster
+        .node("a")
+        .revoke_member(id, cluster.identity("b"))
+        .unwrap();
+    let without_bob = BTreeSet::from([cluster.identity("a"), cluster.identity("c")]);
+    cluster
+        .wait_until(
+            "the revocation reaches the third member",
+            DEFAULT_DEADLINE,
+            |c| c.members("c", id) == without_bob,
+        )
+        .await;
+
+    let a1 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a1")
+        .unwrap();
+    let c1 = cluster
+        .node("c")
+        .append_record(id, PACKAGE, "message.post", b"c1")
+        .unwrap();
+
+    for _ in 0..10 {
+        cluster.node("b").sync_now_for_test();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let seen = cluster.record_ids("b", id, PACKAGE);
+    assert!(!seen.contains(&a1.record_id()));
+    assert!(!seen.contains(&c1.record_id()));
+    for holder in ["a", "c"] {
+        assert_eq!(
+            cluster
+                .node("b")
+                .probe_package_sync_for_test(
+                    cluster.address(holder),
+                    id,
+                    PACKAGE,
+                    cluster.identity(holder),
+                )
+                .await,
+            ProbeOutcome::Refused(Refusal::NotAuthorized),
+            "every remaining member refuses the revoked installation"
+        );
+    }
+
+    // Once it can replicate again it learns its own revocation, and still gains
+    // nothing written after it.
+    cluster
+        .node("b")
+        .pause_membership_replication_for_test(false);
+    cluster
+        .wait_until(
+            "the revoked member learns its own revocation",
+            DEFAULT_DEADLINE,
+            |c| !c.members("b", id).contains(&c.identity("b")),
+        )
+        .await;
+    let seen = cluster.record_ids("b", id, PACKAGE);
+    assert!(seen.contains(&a0.record_id()), "past data is retained");
+    assert!(!seen.contains(&a1.record_id()));
+    assert!(!seen.contains(&c1.record_id()));
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.MEM-R06
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_cancels_inbound_sessions_on_the_responder() {
+    let cluster = SyncCluster::start("inbound-cancelled", &["a", "b", "x"]).await;
+    let workspace = cluster.node("a").create_workspace("Inbound").unwrap();
+    let id = workspace.id();
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"seed")
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster.admit("a", "x", id).await;
+    let everyone = BTreeSet::from([
+        cluster.identity("a"),
+        cluster.identity("b"),
+        cluster.identity("x"),
+    ]);
+    cluster
+        .wait_until("both joiners hold the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id) == everyone && c.members("x", id) == everyone
+        })
+        .await;
+
+    // X opens a session with B and then stops sending, so B is serving a live
+    // session that nothing else would end. The revoking Installation is A, and
+    // B learns of the revocation only through replication.
+    let address = cluster.address("b");
+    let revoked = cluster.identity("x");
+    let close_code = {
+        let stalled = cluster
+            .node("x")
+            .stalled_package_sync_close_code_for_test(address, DEFAULT_DEADLINE);
+        tokio::pin!(stalled);
+        let settled = tokio::select! {
+            result = &mut stalled => Some(result),
+            () = tokio::time::sleep(Duration::from_millis(300)) => None,
+        };
+        assert!(settled.is_none(), "the inbound session must still be open");
+
+        cluster.node("a").revoke_member(id, revoked).unwrap();
+        stalled.await
+    };
+
+    assert_eq!(
+        close_code,
+        Some(4),
+        "the responder closes the cancelled session with the invalid-or-cancelled code"
+    );
+    assert!(!cluster.members("b", id).contains(&cluster.identity("x")));
     cluster.finish().await;
 }

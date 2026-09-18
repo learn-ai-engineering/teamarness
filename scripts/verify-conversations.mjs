@@ -33,6 +33,22 @@ const checks = [
       "--nocapture",
     ],
   ],
+  [
+    "cargo",
+    [
+      "test",
+      "-p",
+      "teamarness-conversations-package",
+      "--test",
+      "three_profile_flow",
+      "--locked",
+      "three_profiles_converge_after_late_admission",
+      "--",
+      "--ignored",
+      "--exact",
+      "--nocapture",
+    ],
+  ],
   ["cargo", ["test", "-p", "teamarness-conversations-package", "--lib", "--locked"]],
   ["cargo", ["test", "-p", "teamarness-core", "--test", "immutable_record_recovery", "--locked"]],
   [

@@ -2203,6 +2203,36 @@ impl CoreRuntime {
         .await
     }
 
+    /// Opens a package synchronization session and then stops talking.
+    ///
+    /// The responder is left waiting for the rest of the first frame, which is
+    /// where a test can observe what ends an inbound session that is doing
+    /// nothing wrong. Returns the application close code the responder used.
+    #[cfg(test)]
+    pub(crate) async fn stalled_package_sync_close_code_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        wait: std::time::Duration,
+    ) -> Option<u64> {
+        let connection = self
+            .transport
+            .endpoint()
+            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .await
+            .ok()?;
+        let (mut send, _receive) = connection.open_bi().await.ok()?;
+        // A length header with no body: the stream exists, so the responder
+        // accepts it, and then waits for bytes that never arrive.
+        send.write_all(&64_u32.to_be_bytes()).await.ok()?;
+        let closed = tokio::time::timeout(wait, connection.closed()).await.ok()?;
+        match closed {
+            iroh::endpoint::ConnectionError::ApplicationClosed(close) => {
+                Some(u64::from(close.error_code))
+            }
+            _ => None,
+        }
+    }
+
     /// Reports whether a peer's Router still offers `alpn` at all.
     #[cfg(test)]
     pub(crate) async fn can_connect_alpn_for_test(
