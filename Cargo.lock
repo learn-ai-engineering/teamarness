@@ -7604,6 +7604,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "teamarness-package-protocol",
  "tempfile",
 ]
 
