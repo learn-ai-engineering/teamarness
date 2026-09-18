@@ -58,7 +58,7 @@ Each Installation SHALL keep a local, unsynchronized last-read position per Chan
 
 ## TEAM.SYS.CONV-R14 — Synchronization Availability
 
-The Package SHALL report Package-level availability of `catching_up`, `current`, or `offline`, and SHALL NOT claim per-peer delivery or read receipts.
+The Package SHALL report Package-level availability of `waiting_for_history_access`, `offline`, `catching_up`, or `current` as reported by the Synchronization Capability, and SHALL NOT claim per-peer delivery or read receipts.
 
 ## TEAM.SYS.CONV-R15 — Safe Message Rendering
 

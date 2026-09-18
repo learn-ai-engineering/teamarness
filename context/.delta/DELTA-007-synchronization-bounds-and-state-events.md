@@ -1,6 +1,8 @@
 # DELTA-007 — Synchronization bounds, backpressure, and state events are incomplete
 
-**Status:** open (2026-09-18)
+**Status:** closed (2026-09-18)
+
+Resolved by ADR 0014 (architecture-review workstream, remediation plan phase 4 — synchronization resource bounds and async correctness).
 
 ## Divergence
 
@@ -16,9 +18,11 @@
 
 Memory can grow without limit under load or from unauthenticated peers, and timeouts do not bound Package calls.
 
-## Resolution plan
+## Resolution
 
-The architecture-review workstream (see `roadmap.md` Current work), remediation plan phase 4 — synchronization resource bounds and async correctness.
+Core bounds every session and frame, reads outgoing operations lazily within a send budget, holds no per-subscriber queue, runs storage and cryptographic work on blocking threads, schedules per peer with durable progress, quarantines a corrupt record or scope instead of failing to open, and reports availability and warning events to Packages.
+
+The bounds live in `crates/teamarness-core/src/synchronization/limits.rs`. The session and delivery paths are `frames.rs`, `exchange.rs`, `log_view.rs`, and `record_subscription.rs`; availability is `health.rs`; scheduling is `scheduler.rs`; isolation is `quarantine.rs`; and the asynchronous boundary is `crates/teamarness-core/src/blocking.rs`.
 
 ## Tracking
 
