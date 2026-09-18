@@ -17,6 +17,8 @@ mod priority_writer;
 mod reader;
 mod router;
 pub mod storage;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 use std::error::Error;
 use std::fmt;
