@@ -68,24 +68,11 @@ impl FromStr for PackageIdentity {
     type Err = ValueParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if !(3..=128).contains(&value.len()) || !value.is_ascii() {
-            return Err(ValueParseError::new("package identity"));
+        if teamarness_package_contract::identity::is_valid_package_identity(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(ValueParseError::new("package identity"))
         }
-        let labels: Vec<_> = value.split('.').collect();
-        if labels.len() < 2
-            || labels.iter().any(|label| {
-                label.is_empty()
-                    || label.len() > 63
-                    || !label.as_bytes()[0].is_ascii_lowercase()
-                    || label.ends_with('-')
-                    || !label.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-            })
-        {
-            return Err(ValueParseError::new("package identity"));
-        }
-        Ok(Self(value.to_owned()))
     }
 }
 

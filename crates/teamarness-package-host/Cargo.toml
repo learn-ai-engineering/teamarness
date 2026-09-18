@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 teamarness-core = { path = "../teamarness-core" }
+teamarness-package-contract = { path = "../teamarness-package-contract" }
 teamarness-package-protocol = { path = "../teamarness-package-protocol" }
 tokio.workspace = true
 

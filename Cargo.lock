@@ -7595,6 +7595,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamarness-package-contract"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "mime",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+]
+
+[[package]]
 name = "teamarness-package-host"
 version = "0.1.0"
 dependencies = [
@@ -7610,6 +7623,7 @@ dependencies = [
  "sha2 0.11.0",
  "sysinfo",
  "teamarness-core",
+ "teamarness-package-contract",
  "teamarness-package-protocol",
  "tempfile",
  "tokio",

@@ -2,6 +2,7 @@
 members = [
     "apps/teamarness-desktop/src-tauri",
     "crates/teamarness-core",
+    "crates/teamarness-package-contract",
     "crates/teamarness-package-host",
     "crates/teamarness-package-protocol",
     "crates/teamarness-package-sdk",
