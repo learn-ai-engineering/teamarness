@@ -35,10 +35,12 @@ export function createTauriPackageHostTransport(
     openSubscription: async (input, deliver, terminate) => {
       type StreamMessage =
         | Readonly<{ kind: "event"; value: HostUiEvent }>
-        | Readonly<{ kind: "failure"; value: unknown }>;
+        | Readonly<{ kind: "failure"; value: unknown }>
+        | Readonly<{ kind: "completed"; value: Readonly<{ mount: string; subscription: string }> }>;
       const onEvent = makeChannel<StreamMessage>((message) => {
         if (message.kind === "event") deliver(message.value);
-        else terminate();
+        else if (message.kind === "completed") terminate({ error: null });
+        else terminate({ error: message.value });
       });
       await call("package_open_stream", { ...input, onEvent });
     },

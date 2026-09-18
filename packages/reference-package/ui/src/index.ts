@@ -1,4 +1,5 @@
 import {
+  describePackageError,
   installPackageUiKit,
   TEAMARNESS_THEME_TOKENS,
   type PackageMountContext,
@@ -106,6 +107,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     ["Counter", "0"],
     ["Background marker", "0"],
     ["Signing round trip", "Loading"],
+    ["Last Package error", "None"],
   ];
   for (const [label, value] of presentation) {
     const term = document.createElement("dt");
@@ -119,7 +121,13 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   increment.type = "button";
   increment.className = "reference-action teamarness-control teamarness-control--primary";
   increment.textContent = "Increment counter";
-  article.append(heading, logo, details, increment);
+  // The live fixture for Package-owned error fidelity: a declared request the Backend always
+  // rejects with its own code, so the whole path is demonstrable in the running application.
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "reference-action teamarness-control teamarness-control--secondary";
+  trigger.textContent = "Trigger Package error";
+  article.append(heading, logo, details, increment, trigger);
   context.root.append(article);
   const uiKitStatus = packageUiKitIsReady(article, increment) ? "Ready" : "Unavailable";
   values.get("UI kit")!.textContent = uiKitStatus;
@@ -145,11 +153,25 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const onIncrement = (): void => { void incrementCounter(); };
   increment.addEventListener("click", onIncrement);
 
+  const triggerFailure = async (): Promise<void> => {
+    try {
+      await context.client.request("reference.fail", {});
+    } catch (error) {
+      const text = `Package error: ${describePackageError(error)}`;
+      const value = values.get("Last Package error")!;
+      value.textContent = text;
+      value.setAttribute("aria-label", text);
+    }
+  };
+  const onTrigger = (): void => { void triggerFailure(); };
+  trigger.addEventListener("click", onTrigger);
+
   let unmounted = false;
   return async () => {
     if (unmounted) return;
     unmounted = true;
     increment.removeEventListener("click", onIncrement);
+    trigger.removeEventListener("click", onTrigger);
     await subscription.close();
     article.remove();
     cleanupPackageStyles();

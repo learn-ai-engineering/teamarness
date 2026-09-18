@@ -127,7 +127,7 @@ function mountMessage(entrypoint = "ui/index.js", theme = themeSnapshot()): unkn
       source: "bundled",
       trust: "application_bundled",
       lifecycle: "active",
-      processGeneration: 1,
+      processGeneration: "1",
     },
     workspace: { id: "ff".repeat(16), name: "Workspace" },
     uiHostVersion: 1,
@@ -141,8 +141,8 @@ describe("Package UI frame runtime", () => {
   it("accepts the connect message only from the parent, only once and only with one port", () => {
     const test = harness();
     test.connect({ source: { name: "other" } });
-    test.connect({ data: { kind: "teamarness.bridge.other", protocol: 1 } });
-    test.connect({ data: { kind: CONNECT_KIND, protocol: 2 } });
+    test.connect({ data: { kind: "teamarness.bridge.other", protocol: FRAME_BRIDGE_PROTOCOL } });
+    test.connect({ data: { kind: CONNECT_KIND, protocol: FRAME_BRIDGE_PROTOCOL + 1 } });
     test.connect({ ports: [] });
     expect(test.posted).toEqual([]);
 

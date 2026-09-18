@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isPackageRequestError, packageErrorCode, type PackageRequestError } from "@teamarness/package-ui-sdk";
 import { createPortPackageClient, type PortPackageClient } from "./port-client";
 import { parseShellMessage, type BridgeErrorEnvelope, type ShellToFrameMessage } from "./protocol";
 
@@ -12,6 +13,7 @@ const envelope: BridgeErrorEnvelope = Object.freeze({
   retryable: false,
   recovery: "none",
   diagnosticId: "desktop-ui-bridge",
+  packageError: null,
 });
 
 function harness(): {
@@ -50,14 +52,22 @@ describe("port-backed Package client", () => {
     expect(test.deliver({ kind: "response", id: 1, ok: true, value: null })).toBe(true);
   });
 
-  it("rejects with a frozen copy of the forwarded error envelope", async () => {
+  it("rejects with a frozen branded PackageRequestError carrying packageError", async () => {
     const test = harness();
     const answered = test.bridge.client.request("reference.read", {});
-    test.deliver({ kind: "response", id: 1, ok: false, error: envelope });
+    const packageError = { code: "fixture.rejected", retryable: false, details: { field: "value" } };
+    test.deliver({ kind: "response", id: 1, ok: false, error: { ...envelope, packageError } });
     const error = await answered.then(() => undefined, (reason: unknown) => reason);
-    expect(error).toEqual(envelope);
-    expect(Object.isFrozen(error)).toBe(true);
-    expect(error).not.toBe(envelope);
+    expect(isPackageRequestError(error)).toBe(true);
+    expect(packageErrorCode(error)).toBe("fixture.rejected");
+    const rejected = error as PackageRequestError;
+    expect(rejected.code).toBe(envelope.code);
+    expect(rejected.packageError?.details).toEqual({ field: "value" });
+    expect(Object.isFrozen(rejected)).toBe(true);
+    expect(Object.isFrozen(rejected.packageError)).toBe(true);
+    expect(Object.isFrozen(rejected.packageError?.details)).toBe(true);
+    // The identity fields the Shell keeps to itself never reach the frame.
+    expect(Object.keys(rejected)).not.toContain("affectedInstance");
   });
 
   it("cancels through the port and rejects with AbortError", async () => {
@@ -135,7 +145,7 @@ describe("port-backed Package client", () => {
     test.deliver({ kind: "subscribed", id: 1 });
     const subscription = await subscribing;
 
-    test.deliver({ kind: "stream_terminated", id: 1 });
+    test.deliver({ kind: "stream_terminated", id: 1, error: null });
     test.deliver({ kind: "event", id: 1, sequence: "0", payload: "a" });
     await settle();
 
@@ -144,6 +154,31 @@ describe("port-backed Package client", () => {
     expect(test.faults).toBe(0);
     await expect(subscription.close()).resolves.toBeUndefined();
     expect(test.posted.map((message) => message.kind)).toEqual(["subscribe"]);
+  });
+
+  it("calls onTerminated once with the error or null and stops delivery", async () => {
+    const packageError = { code: "fixture.stream_rejected", retryable: false, details: {} };
+    for (const failure of [null, { ...envelope, packageError }]) {
+      const test = harness();
+      const seen: (PackageRequestError | null)[] = [];
+      const subscribing = test.bridge.client.subscribe(
+        "reference.changes",
+        {},
+        () => undefined,
+        { onTerminated: (error) => { seen.push(error); } },
+      );
+      test.deliver({ kind: "subscribed", id: 1 });
+      await subscribing;
+
+      test.deliver({ kind: "stream_terminated", id: 1, error: failure });
+      test.deliver({ kind: "stream_terminated", id: 1, error: failure });
+      await settle();
+
+      expect(seen).toHaveLength(1);
+      if (failure === null) expect(seen[0]).toBeNull();
+      else expect(packageErrorCode(seen[0])).toBe("fixture.stream_rejected");
+      expect(test.faults).toBe(0);
+    }
   });
 
   it("makes subscription close and client dispose idempotent and rejects new work after dispose", async () => {

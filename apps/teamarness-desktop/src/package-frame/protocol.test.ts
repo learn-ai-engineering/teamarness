@@ -41,6 +41,7 @@ const envelope: BridgeErrorEnvelope = {
   retryable: false,
   recovery: "none",
   diagnosticId: "host-1",
+  packageError: null,
 };
 
 describe("Package UI bridge protocol", () => {
@@ -93,8 +94,8 @@ describe("Package UI bridge protocol", () => {
     ]);
 
     for (const message of [
-      { kind: CONNECT_KIND, protocol: 1 },
-      { kind: "hello", protocol: 2 },
+      { kind: CONNECT_KIND, protocol: FRAME_BRIDGE_PROTOCOL },
+      { kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL + 1 },
       { kind: "hello" },
       { kind: "mounted", extra: 1 },
       { kind: "request", id: 1.5, operation: "a", payload: {} },
@@ -126,7 +127,7 @@ describe("Package UI bridge protocol", () => {
       source: "bundled",
       trust: "application_bundled",
       lifecycle: "active",
-      processGeneration: 1,
+      processGeneration: "1",
     };
     const accepted: unknown[] = [
       {
@@ -144,12 +145,13 @@ describe("Package UI bridge protocol", () => {
       { kind: "subscribe_failed", id: 2, error: envelope },
       { kind: "unsubscribed", id: 2 },
       { kind: "event", id: 2, sequence: "0", payload: [] },
-      { kind: "stream_terminated", id: 2 },
+      { kind: "stream_terminated", id: 2, error: null },
+      { kind: "stream_terminated", id: 2, error: { ...envelope, packageError: { code: "fixture.rejected", retryable: false, details: { field: "value" } } } },
       { kind: "unmount" },
     ];
     expect(accepted.map((message) => parseShellMessage(message)?.kind)).toEqual([
       "mount", "theme", "response", "response", "subscribed", "subscribe_failed",
-      "unsubscribed", "event", "stream_terminated", "unmount",
+      "unsubscribed", "event", "stream_terminated", "stream_terminated", "unmount",
     ]);
 
     const extraToken = { ...themeSnapshot(), values: { ...themeSnapshot().values, "--rogue": "red" } };
@@ -181,7 +183,7 @@ describe("Package UI bridge protocol", () => {
     expect(rebuilt).not.toBeNull();
     expect(Object.keys(rebuilt ?? {}).sort()).toEqual([
       "affectedInstance", "affectedPackage", "code", "diagnosticId",
-      "namespace", "recovery", "retryable", "stage", "version",
+      "namespace", "packageError", "recovery", "retryable", "stage", "version",
     ]);
     expect(rebuilt).toEqual(envelope);
     expect(Object.isFrozen(rebuilt)).toBe(true);

@@ -299,7 +299,7 @@ export class PackagePortHost {
     void this.transport.openSubscription(
       { mount: this.mount, subscription: entry.subscription, operation, payload },
       (event) => { this.deliver(id, entry, event.mount, event.subscription, event.sequence, event.payload); },
-      () => { this.terminate(id, entry); },
+      (outcome) => { this.terminate(id, entry, outcome.error); },
     ).then(
       () => {
         if (this.disposed || this.subscriptions.get(id) !== entry) return;
@@ -333,14 +333,29 @@ export class PackagePortHost {
     this.post({ kind: "event", id, sequence, payload });
   }
 
-  private terminate(id: number, entry: OpenSubscription): void {
+  /**
+   * Ends one subscription.
+   *
+   * A completion and a Package-owned failure both reach the Package's own frame and leave the
+   * mount healthy; only a host-owned failure is still a mount fault (SHELL-R06 as amended).
+   */
+  private terminate(id: number, entry: OpenSubscription, failure: unknown): void {
     if (this.disposed || entry.closed || this.subscriptions.get(id) !== entry) return;
     entry.closed = true;
     this.subscriptions.delete(id);
     void this.transport
       .closeSubscription({ mount: this.mount, subscription: entry.subscription })
       .catch(() => undefined);
-    this.post({ kind: "stream_terminated", id });
+    if (failure === null) {
+      this.post({ kind: "stream_terminated", id, error: null });
+      return;
+    }
+    const error = parseBridgeErrorEnvelope(failure);
+    if (error !== null && error.packageError !== null) {
+      this.post({ kind: "stream_terminated", id, error });
+      return;
+    }
+    this.post({ kind: "stream_terminated", id, error: error ?? this.bridgeUnavailable() });
     this.fault("stream_terminated");
   }
 
@@ -383,7 +398,7 @@ export class PackagePortHost {
 
   private shellEnvelope(namespace: string, code: string, retryable: boolean): BridgeErrorEnvelope {
     return Object.freeze({
-      version: 1,
+      version: 2,
       namespace,
       code,
       stage: "ui",
@@ -395,6 +410,7 @@ export class PackagePortHost {
       retryable,
       recovery: "none",
       diagnosticId: DIAGNOSTIC_ID,
+      packageError: null,
     });
   }
 

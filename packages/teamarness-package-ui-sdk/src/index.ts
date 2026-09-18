@@ -223,13 +223,104 @@ export type PackagePresentation = Readonly<{
   source: "bundled" | "local";
   trust: "application_bundled" | "trusted_native_code_v1";
   lifecycle: "active";
-  processGeneration: number;
+  /** A decimal string, as the Package Process Protocol and the Rust SDK carry it. */
+  processGeneration: string;
 }>;
 export type WorkspacePresentation = Readonly<{ id: string; name: string }>;
+
+/**
+ * The brand on a rejected Package request.
+ *
+ * The Shell builds the frame runtime and each Package bundles its own copy of this module, so
+ * class identity differs between the two. A branded frozen plain object with a structural guard
+ * works across both copies and stays structured-clone safe.
+ */
+export const PACKAGE_REQUEST_ERROR_KIND = "teamarness.package-request-error";
+
+/** A Package Backend's own terminal error, forwarded unchanged within the host's bounds. */
+export type PackageOwnedError = Readonly<{
+  code: string;
+  retryable: boolean;
+  details: { readonly [key: string]: PackageValue };
+}>;
+
+/** What `PackageClient.request` rejects with when the Package Host answers with an error. */
+export type PackageRequestError = Readonly<{
+  kind: typeof PACKAGE_REQUEST_ERROR_KIND;
+  version: number;
+  namespace: string;
+  code: string;
+  stage: string;
+  retryable: boolean;
+  recovery: string;
+  diagnosticId: string;
+  /** The Package's own error, or `null` when the host owns the failure. */
+  packageError: PackageOwnedError | null;
+}>;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isPackageOwnedError(value: unknown): value is PackageOwnedError {
+  if (!isPlainRecord(value)) return false;
+  return typeof value.code === "string"
+    && typeof value.retryable === "boolean"
+    && isPlainRecord(value.details);
+}
+
+/** Whether `value` is a Package request error, whichever bundle built it. */
+export function isPackageRequestError(value: unknown): value is PackageRequestError {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind !== PACKAGE_REQUEST_ERROR_KIND) return false;
+  if (typeof candidate.version !== "number") return false;
+  if (typeof candidate.namespace !== "string" || typeof candidate.code !== "string") return false;
+  if (typeof candidate.stage !== "string" || typeof candidate.recovery !== "string") return false;
+  if (typeof candidate.diagnosticId !== "string" || typeof candidate.retryable !== "boolean") return false;
+  return candidate.packageError === null || isPackageOwnedError(candidate.packageError);
+}
+
+/** The Package Backend's own error code, or `null` when the host owns the failure. */
+export function packageErrorCode(error: unknown): string | null {
+  return isPackageRequestError(error) ? error.packageError?.code ?? null : null;
+}
+
+/** Whether `error` is the cancellation a Package request rejects with. */
+export function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null
+    && (error as { name?: unknown }).name === "AbortError";
+}
+
+/**
+ * A short, presentable description of a failed request.
+ *
+ * It never includes `details`: those are the Package's own data, not display text.
+ */
+export function describePackageError(error: unknown): string {
+  if (isPackageRequestError(error)) {
+    const packageCode = error.packageError?.code;
+    if (packageCode !== undefined) return packageCode;
+    return `${error.code} (${error.stage})`;
+  }
+  if (error instanceof Error && error.message.length > 0) return error.message;
+  return "Request failed";
+}
 
 export interface PackageSubscription {
   close(): Promise<void>;
 }
+
+/** Options for `PackageClient.subscribe`. */
+export type PackageSubscribeOptions = Readonly<{
+  /**
+   * Called once when the stream ends: with the Package's own terminal error, or `null` when the
+   * Package completed the stream normally.
+   */
+  onTerminated?: (error: PackageRequestError | null) => void;
+}>;
 
 export interface PackageClient {
   request<TResponse extends PackageValue = PackageValue>(
@@ -241,6 +332,7 @@ export interface PackageClient {
     operation: string,
     payload: PackageValue,
     listener: (event: TEvent) => void | Promise<void>,
+    options?: PackageSubscribeOptions,
   ): Promise<PackageSubscription>;
 }
 

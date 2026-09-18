@@ -1,5 +1,12 @@
-import type { PackageClient, PackageSubscription, PackageValue } from "@teamarness/package-ui-sdk";
-import type { ShellToFrameMessage } from "./protocol";
+import {
+  PACKAGE_REQUEST_ERROR_KIND,
+  type PackageClient,
+  type PackageRequestError,
+  type PackageSubscribeOptions,
+  type PackageSubscription,
+  type PackageValue,
+} from "@teamarness/package-ui-sdk";
+import type { BridgeErrorEnvelope, ShellToFrameMessage } from "./protocol";
 
 export type PortPackageClient = Readonly<{
   client: PackageClient;
@@ -12,13 +19,49 @@ type PortSink = Readonly<{ postMessage(message: unknown): void }>;
 type SubscriptionState = {
   closed: boolean;
   failed: boolean;
+  terminated: boolean;
   delivery: Promise<void>;
   listener(event: PackageValue): void | Promise<void>;
+  onTerminated: ((error: PackageRequestError | null) => void) | null;
   settleOpen: ((error?: unknown) => void) | null;
   settleClose: (() => void) | null;
 };
 
 const CLOSED_MESSAGE = "Package UI mount is closed";
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const entry of Object.values(value as Record<string, unknown>)) deepFreeze(entry);
+  return value;
+}
+
+/**
+ * Brands a host envelope as a `PackageRequestError` and freezes it.
+ *
+ * The frame runtime and each Package bundle their own copy of the SDK, so the guard is
+ * structural, not an `instanceof`; freezing keeps a Package from mutating what it is handed.
+ */
+function brand(envelope: BridgeErrorEnvelope): PackageRequestError {
+  const packageError = envelope.packageError === null
+    ? null
+    : Object.freeze({
+      code: envelope.packageError.code,
+      retryable: envelope.packageError.retryable,
+      details: deepFreeze({ ...envelope.packageError.details }),
+    });
+  return Object.freeze({
+    kind: PACKAGE_REQUEST_ERROR_KIND,
+    version: envelope.version,
+    namespace: envelope.namespace,
+    code: envelope.code,
+    stage: envelope.stage,
+    retryable: envelope.retryable,
+    recovery: envelope.recovery,
+    diagnosticId: envelope.diagnosticId,
+    packageError,
+  });
+}
 
 function cancelled(): DOMException {
   return new DOMException("The Package request was cancelled", "AbortError");
@@ -53,6 +96,23 @@ export function createPortPackageClient(
     state.settleClose?.();
     state.settleClose = null;
     hooks.onListenerFault();
+  };
+
+  const notifyTerminated = (
+    id: number,
+    state: SubscriptionState,
+    error: PackageRequestError | null,
+  ): void => {
+    if (state.terminated) return;
+    state.terminated = true;
+    const notify = state.onTerminated;
+    state.onTerminated = null;
+    if (notify === null) return;
+    try {
+      notify(error);
+    } catch {
+      hooks.onListenerFault();
+    }
   };
 
   const closeSubscription = async (id: number): Promise<void> => {
@@ -106,14 +166,17 @@ export function createPortPackageClient(
       operation: string,
       payload: PackageValue,
       listener: (event: TEvent) => void | Promise<void>,
+      options: PackageSubscribeOptions = {},
     ): Promise<PackageSubscription> {
       if (disposed) throw new Error(CLOSED_MESSAGE);
       const id = nextId++;
       const state: SubscriptionState = {
         closed: false,
         failed: false,
+        terminated: false,
         delivery: Promise.resolve(),
         listener: listener as (event: PackageValue) => void | Promise<void>,
+        onTerminated: options.onTerminated ?? null,
         settleOpen: null,
         settleClose: null,
       };
@@ -139,7 +202,7 @@ export function createPortPackageClient(
         if (entry === undefined) return true;
         pending.delete(message.id);
         if (message.ok) entry.resolve(message.value);
-        else entry.reject(message.error);
+        else entry.reject(brand(message.error));
         return true;
       }
       case "subscribed": {
@@ -150,7 +213,7 @@ export function createPortPackageClient(
       }
       case "subscribe_failed": {
         const state = subscriptions.get(message.id);
-        state?.settleOpen?.(message.error);
+        state?.settleOpen?.(brand(message.error));
         if (state !== undefined) state.settleOpen = null;
         return true;
       }
@@ -166,10 +229,12 @@ export function createPortPackageClient(
         if (state === undefined) return true;
         state.closed = true;
         subscriptions.delete(message.id);
-        state.settleOpen?.(new Error("Package event stream ended"));
+        const error = message.error === null ? null : brand(message.error);
+        state.settleOpen?.(error ?? new Error("Package event stream ended"));
         state.settleOpen = null;
         state.settleClose?.();
         state.settleClose = null;
+        notifyTerminated(message.id, state, error);
         return true;
       }
       case "event": {

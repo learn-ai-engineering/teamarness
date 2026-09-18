@@ -1,4 +1,4 @@
-import type { PackageClient, PackageValue } from "@teamarness/package-ui-sdk";
+import { PACKAGE_REQUEST_ERROR_KIND, type PackageClient, type PackageValue } from "@teamarness/package-ui-sdk";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -30,6 +30,7 @@ class FakeClient implements PackageClient {
   readonly requests: Array<{ operation: string; payload: PackageValue }> = [];
   private registrations: Registration[] = [];
   failNext = false;
+  rejectNextWith: unknown = null;
   snapshotOverride: Snapshot | null = null;
 
   constructor(registrations?: Registration[]) {
@@ -38,6 +39,11 @@ class FakeClient implements PackageClient {
 
   async request<TResponse extends PackageValue>(operation: string, payload: PackageValue): Promise<TResponse> {
     this.requests.push({ operation, payload });
+    if (this.rejectNextWith !== null) {
+      const rejection = this.rejectNextWith;
+      this.rejectNextWith = null;
+      throw rejection;
+    }
     if (this.failNext) {
       this.failNext = false;
       throw new Error("Backend unavailable");
@@ -212,6 +218,33 @@ describe("Repo-aware Package UI", () => {
     await controller.register("/Users/test/fail-repo");
 
     expect(state?.error).toBe("Backend unavailable");
+    expect(state?.pending).toBe("none");
+  });
+
+  it("shows the Package error code for a rejected registration", async () => {
+    const client = new FakeClient();
+    let state: RepoAwareState | undefined;
+    const controller = createRepoAwareController(client, (next) => { state = next; });
+    await controller.start();
+
+    client.rejectNextWith = Object.freeze({
+      kind: PACKAGE_REQUEST_ERROR_KIND,
+      version: 2,
+      namespace: "teamarness.package-host",
+      code: "backend_error",
+      stage: "ui",
+      retryable: false,
+      recovery: "none",
+      diagnosticId: "diag-1",
+      packageError: Object.freeze({
+        code: "repo_aware.not_git_repository",
+        retryable: false,
+        details: Object.freeze({}),
+      }),
+    });
+    await controller.register("relative/path");
+
+    expect(state?.error).toBe("repo_aware.not_git_repository");
     expect(state?.pending).toBe("none");
   });
 

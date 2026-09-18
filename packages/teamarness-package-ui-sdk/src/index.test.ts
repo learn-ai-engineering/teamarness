@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  installPackageUiKit,
+  PACKAGE_REQUEST_ERROR_KIND,
   TEAMARNESS_THEME_TOKENS,
+  describePackageError,
+  installPackageUiKit,
+  isAbortError,
+  isPackageRequestError,
+  packageErrorCode,
   type TeamarnessThemeToken,
 } from "./index";
 
@@ -102,6 +107,67 @@ describe("Package presentation contract", () => {
 describe("author surface", () => {
   it("exports only the author contract and no transport or Tauri host pieces", async () => {
     const surface = await import("./index");
-    expect(Object.keys(surface).sort()).toEqual(["TEAMARNESS_THEME_TOKENS", "installPackageUiKit"]);
+    expect(Object.keys(surface).sort()).toEqual([
+      "PACKAGE_REQUEST_ERROR_KIND",
+      "TEAMARNESS_THEME_TOKENS",
+      "describePackageError",
+      "installPackageUiKit",
+      "isAbortError",
+      "isPackageRequestError",
+      "packageErrorCode",
+    ]);
+  });
+});
+
+describe("Package request errors", () => {
+  const hostError = {
+    kind: PACKAGE_REQUEST_ERROR_KIND,
+    version: 2,
+    namespace: "teamarness.package-host",
+    code: "backend_error",
+    stage: "ui",
+    retryable: false,
+    recovery: "none",
+    diagnosticId: "diag-1",
+    packageError: null,
+  };
+  const packageError = {
+    ...hostError,
+    packageError: { code: "reference.requested_failure", retryable: false, details: { reason: "a private detail" } },
+  };
+
+  it("recognises only complete branded Package request errors", () => {
+    expect(isPackageRequestError(hostError)).toBe(true);
+    expect(isPackageRequestError(packageError)).toBe(true);
+    for (const invalid of [
+      { ...hostError, kind: "other" },
+      { ...hostError, retryable: "no" },
+      { ...hostError, version: "2" },
+      { ...hostError, packageError: { code: "a", retryable: false, details: [] } },
+      { ...hostError, packageError: { code: 1, retryable: false, details: {} } },
+      new Error("boom"),
+      null,
+      "backend_error",
+    ]) {
+      expect(isPackageRequestError(invalid)).toBe(false);
+    }
+  });
+
+  it("describes Package codes before host codes and never includes details", () => {
+    expect(describePackageError(packageError)).toBe("reference.requested_failure");
+    expect(describePackageError(hostError)).toBe("backend_error (ui)");
+    expect(describePackageError(new Error("the mount closed"))).toBe("the mount closed");
+    expect(describePackageError(undefined)).toBe("Request failed");
+    expect(describePackageError(packageError)).not.toContain("a private detail");
+    expect(packageErrorCode(packageError)).toBe("reference.requested_failure");
+    expect(packageErrorCode(hostError)).toBeNull();
+    expect(packageErrorCode(new Error("boom"))).toBeNull();
+  });
+
+  it("recognises abort errors by name", () => {
+    expect(isAbortError(new DOMException("cancelled", "AbortError"))).toBe(true);
+    expect(isAbortError({ name: "AbortError" })).toBe(true);
+    expect(isAbortError(new Error("boom"))).toBe(false);
+    expect(isAbortError(null)).toBe(false);
   });
 });

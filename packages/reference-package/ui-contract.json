@@ -35,6 +35,10 @@
     "reference.increment": {
       "request": { "$ref": "#/$defs/empty" },
       "response": { "$ref": "#/$defs/snapshot" }
+    },
+    "reference.fail": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/empty" }
     }
   },
   "subscriptions": {

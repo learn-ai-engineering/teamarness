@@ -15,6 +15,8 @@ class FakeCSSStyleSheet {
 type FakeElement = HTMLElement & {
   children: FakeElement[];
   removed: boolean;
+  listeners: Map<string, Set<() => void>>;
+  dispatch(type: string): void;
 };
 
 const createdElements: FakeElement[] = [];
@@ -31,8 +33,18 @@ function fakeElement(tagName: string): FakeElement {
     remove(this: FakeElement) { this.removed = true; },
     setAttribute(name: string, value: string) { attributes.set(name, value); },
     getAttribute(name: string) { return attributes.get(name) ?? null; },
-    addEventListener() {},
-    removeEventListener() {},
+    listeners: new Map<string, Set<() => void>>(),
+    addEventListener(this: FakeElement, type: string, handler: () => void) {
+      const existing = this.listeners.get(type) ?? new Set<() => void>();
+      existing.add(handler);
+      this.listeners.set(type, existing);
+    },
+    removeEventListener(this: FakeElement, type: string, handler: () => void) {
+      this.listeners.get(type)?.delete(handler);
+    },
+    dispatch(this: FakeElement, type: string) {
+      for (const handler of this.listeners.get(type) ?? []) handler();
+    },
   } as unknown as FakeElement;
   createdElements.push(element);
   return element;
@@ -61,7 +73,7 @@ function mountContext(root: ShadowRoot): PackageMountContext {
       source: "bundled",
       trust: "application_bundled",
       lifecycle: "active",
-      processGeneration: 1,
+      processGeneration: "1",
     },
     workspace: { id: "workspace", name: "Workspace" },
     uiHostVersion: 1,
@@ -154,5 +166,62 @@ describe("reference Package UI", () => {
     ]) {
       expect(source).not.toContain(diagnostic);
     }
+  });
+});
+
+describe("reference Package error fixture", () => {
+  it("shows the Package error code when the Backend rejects reference.fail", async () => {
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    vi.stubGlobal("document", { createElement: (tagName: string) => fakeElement(tagName) });
+    vi.stubGlobal("getComputedStyle", vi.fn(computedStyle));
+    const root = { adoptedStyleSheets: [], append: vi.fn() } as unknown as ShadowRoot;
+    const context = mountContext(root);
+    const rejected = Object.freeze({
+      kind: "teamarness.package-request-error",
+      version: 2,
+      namespace: "teamarness.package-host",
+      code: "backend_error",
+      stage: "ui",
+      retryable: false,
+      recovery: "none",
+      diagnosticId: "diag-1",
+      packageError: Object.freeze({
+        code: "reference.requested_failure",
+        retryable: false,
+        details: Object.freeze({ reason: "requested" }),
+      }),
+    });
+    const failing = {
+      ...context,
+      client: {
+        ...context.client,
+        request: async (operation: string) => {
+          if (operation === "reference.fail") throw rejected;
+          return {
+            counter: 0,
+            backgroundMarker: 0,
+            membershipVersion: "1",
+            signingVerified: true,
+            processGeneration: "1",
+            packageVersion: "1.0.0",
+          };
+        },
+      },
+    } as unknown as PackageMountContext;
+
+    const unmount = await mount(failing);
+    const trigger = createdElements.find((element) => element.textContent === "Trigger Package error");
+    expect(trigger).toBeDefined();
+    const terms = createdElements.filter((element) => element.tagName === "DT");
+    const index = terms.findIndex((element) => element.textContent === "Last Package error");
+    const value = createdElements.filter((element) => element.tagName === "DD")[index];
+    expect(value?.textContent).toBe("None");
+
+    trigger?.dispatch("click");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(value?.textContent).toBe("Package error: reference.requested_failure");
+    expect(value?.getAttribute("aria-label")).toBe("Package error: reference.requested_failure");
+    await unmount();
   });
 });

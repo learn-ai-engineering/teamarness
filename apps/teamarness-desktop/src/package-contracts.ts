@@ -59,9 +59,13 @@ export type PackageBridgeError = Readonly<{
   retryable: boolean;
   recovery: string;
   diagnosticId: string;
+  packageError: Readonly<{ code: string; retryable: boolean; details: PackageValue }> | null;
 }>;
 
 export type PackageResponse = PackageValue;
+
+/** How one Package UI stream ended: with the Package's own error, or normally. */
+export type HostStreamOutcome = Readonly<{ error: unknown | null }>;
 
 export type HostUiEvent = Readonly<{
   mount: string;
@@ -91,7 +95,7 @@ export interface PackageHostTransport {
   openSubscription(
     input: HostSubscriptionInput,
     deliver: (event: HostUiEvent) => void,
-    terminate: () => void,
+    terminate: (outcome: HostStreamOutcome) => void,
   ): Promise<void>;
   acknowledgeEvents(input: Readonly<{ mount: string; subscription: string; throughSequence: string }>): Promise<void>;
   closeSubscription(input: Readonly<{ mount: string; subscription: string }>): Promise<void>;

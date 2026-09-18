@@ -195,7 +195,9 @@ export class PackageMountController {
         if (hostDisposed) return;
         started.sendMount({
           entrypoint: loader.entrypoint,
-          package: loader.package,
+          // The protocol and the Rust SDK carry the generation as a decimal string; the Tauri
+          // DTO still reports a number.
+          package: { ...loader.package, processGeneration: String(loader.package.processGeneration) },
           workspace: loader.workspace,
           uiHostVersion: loader.uiHostVersion,
           theme: this.theme.current(),

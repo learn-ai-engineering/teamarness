@@ -7,7 +7,7 @@ import {
 } from "@teamarness/package-ui-sdk";
 
 /** The private Package UI bridge protocol. Both halves ship in one Shell build. */
-export const FRAME_BRIDGE_PROTOCOL = 1;
+export const FRAME_BRIDGE_PROTOCOL = 2;
 export const CONNECT_KIND = "teamarness.bridge.connect";
 
 /** Matches the Package Host bound `MAX_UI_PAYLOAD_BYTES`. */
@@ -19,6 +19,9 @@ export const MAX_PENDING_REQUESTS = 64;
 export const MAX_OPEN_SUBSCRIPTIONS = 32;
 
 const THEME_VALUE = /^[^;{}<>\\\r\n]{0,256}$/;
+const PACKAGE_ERROR_CODE = /^[a-z][a-z0-9_.-]{0,127}$/;
+/** Matches the Package Host bound `MAX_PACKAGE_ERROR_DETAILS_BYTES`. */
+export const MAX_PACKAGE_ERROR_DETAILS_BYTES = 4096;
 const DECIMAL_SEQUENCE = /^(?:0|[1-9][0-9]{0,38})$/;
 const FAULT_SOURCES = ["load", "mount", "unmount", "listener", "error", "unhandledrejection"] as const;
 
@@ -27,6 +30,12 @@ export type FrameFaultSource = (typeof FAULT_SOURCES)[number];
 export type ThemeSnapshot = Readonly<{
   colorScheme: "light" | "dark";
   values: Readonly<Record<TeamarnessThemeToken, string>>;
+}>;
+
+export type BridgePackageError = Readonly<{
+  code: string;
+  retryable: boolean;
+  details: { readonly [key: string]: PackageValue };
 }>;
 
 export type BridgeErrorEnvelope = Readonly<{
@@ -39,6 +48,8 @@ export type BridgeErrorEnvelope = Readonly<{
   retryable: boolean;
   recovery: string;
   diagnosticId: string;
+  /** The Package Backend's own error, or `null` when the host owns the failure. */
+  packageError: BridgePackageError | null;
 }>;
 
 export type FrameToShellMessage =
@@ -68,7 +79,7 @@ export type ShellToFrameMessage =
   | Readonly<{ kind: "subscribe_failed"; id: number; error: BridgeErrorEnvelope }>
   | Readonly<{ kind: "unsubscribed"; id: number }>
   | Readonly<{ kind: "event"; id: number; sequence: string; payload: PackageValue }>
-  | Readonly<{ kind: "stream_terminated"; id: number }>
+  | Readonly<{ kind: "stream_terminated"; id: number; error: BridgeErrorEnvelope | null }>
   | Readonly<{ kind: "unmount" }>;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -151,11 +162,25 @@ function parseThemeSnapshot(value: unknown): ThemeSnapshot | null {
   });
 }
 
+/** Rebuilds a Package-owned error within the host's bounds, or `null` when it is not one. */
+function parsePackageError(value: unknown): BridgePackageError | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { code, retryable, details } = value as Record<string, unknown>;
+  if (typeof code !== "string" || !PACKAGE_ERROR_CODE.test(code)) return null;
+  if (typeof retryable !== "boolean") return null;
+  if (!isPlainObject(details) || !isPackageValue(details)) return null;
+  if (packageValueByteLength(details) > MAX_PACKAGE_ERROR_DETAILS_BYTES) return null;
+  const rebuilt: Record<string, PackageValue> = {};
+  for (const [key, entry] of Object.entries(details)) rebuilt[key] = entry as PackageValue;
+  return Object.freeze({ code, retryable, details: Object.freeze(rebuilt) });
+}
+
 /** Rebuilds an error envelope field by field so no foreign prototype or extra field crosses. */
 export function parseBridgeErrorEnvelope(value: unknown): BridgeErrorEnvelope | null {
   if (typeof value !== "object" || value === null) return null;
   const {
-    version, namespace, code, stage, affectedPackage, affectedInstance, retryable, recovery, diagnosticId,
+    version, namespace, code, stage, affectedPackage, affectedInstance, retryable, recovery,
+    diagnosticId, packageError,
   } = value as Record<string, unknown>;
   if (typeof version !== "number" || !Number.isSafeInteger(version)) return null;
   if (typeof namespace !== "string" || typeof code !== "string" || typeof stage !== "string") return null;
@@ -168,6 +193,11 @@ export function parseBridgeErrorEnvelope(value: unknown): BridgeErrorEnvelope | 
     if (typeof packageIdentity !== "string" || typeof workspaceId !== "string") return null;
     instance = Object.freeze({ packageIdentity, workspaceId });
   }
+  let owned: BridgePackageError | null = null;
+  if (packageError !== null && packageError !== undefined) {
+    owned = parsePackageError(packageError);
+    if (owned === null) return null;
+  }
   return Object.freeze({
     version,
     namespace,
@@ -178,6 +208,7 @@ export function parseBridgeErrorEnvelope(value: unknown): BridgeErrorEnvelope | 
     retryable,
     recovery,
     diagnosticId,
+    packageError: owned,
   });
 }
 
@@ -234,7 +265,7 @@ function parsePresentation(value: unknown): PackagePresentation | null {
   if (source !== "bundled" && source !== "local") return null;
   if (trust !== "application_bundled" && trust !== "trusted_native_code_v1") return null;
   if (lifecycle !== "active") return null;
-  if (typeof processGeneration !== "number" || !Number.isSafeInteger(processGeneration)) return null;
+  if (typeof processGeneration !== "string" || !DECIMAL_SEQUENCE.test(processGeneration)) return null;
   return Object.freeze({ identity, version, displayName, source, trust, lifecycle, processGeneration });
 }
 
@@ -288,11 +319,18 @@ export function parseShellMessage(data: unknown): ShellToFrameMessage | null {
       return null;
     }
     case "subscribed":
-    case "unsubscribed":
-    case "stream_terminated": {
+    case "unsubscribed": {
       if (!hasExactKeys(data, ["kind", "id"])) return null;
       if (!isMessageId(data.id)) return null;
       return Object.freeze({ kind: data.kind, id: data.id });
+    }
+    case "stream_terminated": {
+      if (!hasExactKeys(data, ["kind", "id", "error"])) return null;
+      if (!isMessageId(data.id)) return null;
+      if (data.error === null) return Object.freeze({ kind: "stream_terminated", id: data.id, error: null });
+      const error = parseBridgeErrorEnvelope(data.error);
+      if (error === null) return null;
+      return Object.freeze({ kind: "stream_terminated", id: data.id, error });
     }
     case "subscribe_failed": {
       if (!hasExactKeys(data, ["kind", "id", "error"])) return null;

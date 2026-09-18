@@ -48,6 +48,7 @@ const packages: PackageHostSnapshot = {
     retryable: true,
     recovery: "secret-diagnostic-recovery",
     diagnosticId: "secret-diagnostic-id",
+    packageError: null,
   }],
 };
 

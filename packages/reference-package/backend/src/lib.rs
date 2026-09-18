@@ -282,6 +282,13 @@ impl Backend for ReferenceBackend {
                 }
                 "reference.read" => self.read().await,
                 "reference.increment" => self.increment().await,
+                // The live fixture for Package-owned error fidelity: the code, retryability and
+                // details reach the Reference UI unchanged.
+                "reference.fail" => Err(BackendError::new(
+                    "reference.requested_failure",
+                    false,
+                    object([("reason", JsonValue::String("requested".into()))]),
+                )),
                 _ => Err(BackendError::new(
                     "reference.unknown_operation",
                     false,

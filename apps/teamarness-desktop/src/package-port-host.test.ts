@@ -3,14 +3,35 @@ import type { PackageValue } from "@teamarness/package-ui-sdk";
 import type { HostUiEvent, PackageHostTransport, PackageInstanceKey } from "./package-contracts";
 import { PackagePortHost, type PackageUiFaultSource } from "./package-port-host";
 import {
+  FRAME_BRIDGE_PROTOCOL,
   MAX_OPEN_SUBSCRIPTIONS,
   MAX_PAYLOAD_BYTES,
   MAX_PENDING_REQUESTS,
   type BridgeErrorEnvelope,
 } from "./package-frame/protocol";
+import bridgeFixture from "../contracts/fixtures/package-bridge.json";
 
 const MOUNT = "mount-token-1";
+
+/** The `packageErrorEnvelope` example in the shared desktop bridge fixture. */
+const packageErrorEnvelope = bridgeFixture.packageErrorEnvelope as unknown as BridgeErrorEnvelope;
 const TOKEN = "T".repeat(32);
+
+/** A host envelope the Shell forwards unchanged, as the Tauri layer builds it. */
+function hostEnvelope(code: string): BridgeErrorEnvelope {
+  return {
+    version: 2,
+    namespace: "teamarness.package-host",
+    code,
+    stage: "ui",
+    affectedPackage: instance.packageIdentity,
+    affectedInstance: instance,
+    retryable: false,
+    recovery: "none",
+    diagnosticId: "host-9",
+    packageError: null,
+  };
+}
 const instance: PackageInstanceKey = {
   packageIdentity: "dev.teamarness.reference",
   workspaceId: "ff".repeat(16),
@@ -24,7 +45,7 @@ type Recorder = {
   answerRequest(request: string, value: PackageValue): void;
   failRequest(request: string, error: unknown): void;
   deliver(event: HostUiEvent): void;
-  terminate(subscription: string): void;
+  terminate(subscription: string, error?: unknown): void;
   failOpen(subscription: string, error: unknown): void;
   openFailures: Map<string, (error: unknown) => void>;
 };
@@ -32,7 +53,10 @@ type Recorder = {
 function recorder(): Recorder {
   const calls: TransportCall[] = [];
   const pending = new Map<string, Readonly<{ resolve(value: PackageValue): void; reject(error: unknown): void }>>();
-  const streams = new Map<string, Readonly<{ deliver(event: HostUiEvent): void; terminate(): void }>>();
+  const streams = new Map<
+    string,
+    Readonly<{ deliver(event: HostUiEvent): void; terminate(outcome: Readonly<{ error: unknown }>): void }>
+  >();
   const openFailures = new Map<string, (error: unknown) => void>();
   const record = (method: string, input: unknown): void => {
     calls.push({ method, input: input as Record<string, unknown> });
@@ -59,7 +83,7 @@ function recorder(): Recorder {
     answerRequest: (request, value) => { pending.get(request)?.resolve(value); },
     failRequest: (request, error) => { pending.get(request)?.reject(error); },
     deliver: (event) => { streams.get(event.subscription)?.deliver(event); },
-    terminate: (subscription) => { streams.get(subscription)?.terminate(); },
+    terminate: (subscription, error = null) => { streams.get(subscription)?.terminate({ error }); },
     failOpen: (subscription, error) => { openFailures.get(subscription)?.(error); },
     openFailures,
   };
@@ -100,7 +124,7 @@ function harness(mount = MOUNT): Harness {
     received,
     fromFrame: (message) => { channel.port2.postMessage(message); },
     async greet() {
-      channel.port2.postMessage({ kind: "hello", protocol: 1 });
+      channel.port2.postMessage({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
       await host.ready;
       await settle();
     },
@@ -181,6 +205,7 @@ describe("Shell-side Package UI port host", () => {
       retryable: false,
       recovery: "restart_package",
       diagnosticId: "host-7",
+      packageError: null,
     };
     test.fromFrame({ kind: "request", id: 1, operation: "reference.read", payload: {} });
     test.fromFrame({ kind: "request", id: 2, operation: "reference.read", payload: {} });
@@ -195,7 +220,7 @@ describe("Shell-side Package UI port host", () => {
       id: 2,
       ok: false,
       error: {
-        version: 1,
+        version: 2,
         namespace: "teamarness.desktop-ui-bridge",
         code: "ui_bridge_unavailable",
         stage: "ui",
@@ -204,6 +229,7 @@ describe("Shell-side Package UI port host", () => {
         retryable: true,
         recovery: "none",
         diagnosticId: "desktop-ui-bridge",
+        packageError: null,
       },
     });
     expect(JSON.stringify(test.received)).not.toContain("lost the command channel");
@@ -309,7 +335,28 @@ describe("Shell-side Package UI port host", () => {
     expect(test.transport.calls.filter(({ method }) => method === "acknowledgeEvents")).toHaveLength(1);
   });
 
-  it("on a terminal stream failure closes the host stream, notifies the frame and reports a fault", async () => {
+  it("still faults the mount for a host-owned stream failure", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
+    await settle();
+
+    test.transport.terminate("s1", hostEnvelope("event_lagged"));
+    await settle();
+
+    expect(test.transport.calls.at(-1)).toEqual({
+      method: "closeSubscription",
+      input: { mount: MOUNT, subscription: "s1" },
+    });
+    expect(test.received.at(-1)).toEqual({
+      kind: "stream_terminated",
+      id: 1,
+      error: hostEnvelope("event_lagged"),
+    });
+    expect(test.faults).toEqual(["stream_terminated"]);
+  });
+
+  it("ends a subscription gracefully on completion without a fault", async () => {
     const test = harness();
     await test.greet();
     test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
@@ -322,8 +369,43 @@ describe("Shell-side Package UI port host", () => {
       method: "closeSubscription",
       input: { mount: MOUNT, subscription: "s1" },
     });
-    expect(test.received.at(-1)).toEqual({ kind: "stream_terminated", id: 1 });
-    expect(test.faults).toEqual(["stream_terminated"]);
+    expect(test.received.at(-1)).toEqual({ kind: "stream_terminated", id: 1, error: null });
+    expect(test.faults).toEqual([]);
+  });
+
+  it("delivers a Package-owned stream failure to the frame without a fault and closes the host stream once", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
+    await settle();
+
+    const failure = {
+      ...hostEnvelope("backend_error"),
+      packageError: { code: "fixture.stream_rejected", retryable: false, details: {} },
+    };
+    test.transport.terminate("s1", failure);
+    await settle();
+
+    expect(test.transport.calls.filter(({ method }) => method === "closeSubscription")).toHaveLength(1);
+    expect(test.received.at(-1)).toEqual({ kind: "stream_terminated", id: 1, error: failure });
+    expect(test.faults).toEqual([]);
+  });
+
+  it("forwards the fixture Package error envelope to the frame unchanged", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "request", id: 1, operation: "reference.read", payload: {} });
+    await settle();
+    test.transport.failRequest("r1", packageErrorEnvelope);
+    await settle();
+
+    expect(test.received.at(-1)).toEqual({
+      kind: "response",
+      id: 1,
+      ok: false,
+      error: packageErrorEnvelope,
+    });
+    expect(test.faults).toEqual([]);
   });
 
   it("reports protocol faults for unknown kinds, duplicate ids, messages before hello and bad acknowledgements", async () => {
@@ -335,7 +417,7 @@ describe("Shell-side Package UI port host", () => {
 
     const unknown = harness();
     await unknown.greet();
-    unknown.fromFrame({ kind: "teamarness.bridge.connect", protocol: 1 });
+    unknown.fromFrame({ kind: "teamarness.bridge.connect", protocol: FRAME_BRIDGE_PROTOCOL });
     await settle();
     expect(unknown.faults).toEqual(["protocol"]);
 
@@ -356,7 +438,7 @@ describe("Shell-side Package UI port host", () => {
 
     const greetedTwice = harness();
     await greetedTwice.greet();
-    greetedTwice.fromFrame({ kind: "hello", protocol: 1 });
+    greetedTwice.fromFrame({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
     await settle();
     expect(greetedTwice.faults).toEqual(["protocol"]);
   });
@@ -396,7 +478,7 @@ describe("Shell-side Package UI port host", () => {
         source: "bundled",
         trust: "application_bundled",
         lifecycle: "active",
-        processGeneration: 1,
+        processGeneration: "1",
       },
       workspace: { id: instance.workspaceId, name: "Workspace" },
       uiHostVersion: 1,

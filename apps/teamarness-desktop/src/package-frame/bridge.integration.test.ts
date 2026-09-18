@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { TEAMARNESS_THEME_TOKENS, type PackageClient, type PackageValue } from "@teamarness/package-ui-sdk";
+import {
+  TEAMARNESS_THEME_TOKENS,
+  describePackageError,
+  isPackageRequestError,
+  packageErrorCode,
+  type PackageClient,
+  type PackageValue,
+} from "@teamarness/package-ui-sdk";
 import type { HostUiEvent, PackageHostTransport, PackageInstanceKey } from "../package-contracts";
 import { PackagePortHost, type PackageUiFaultSource } from "../package-port-host";
 import { PACKAGE_HOST_ELEMENT_ID, runPackageFrame, type FrameEnvironment } from "./runtime";
@@ -22,10 +29,12 @@ function sharedTransport(): {
   transport: PackageHostTransport;
   calls: HostCall[];
   answer(request: string, value: PackageValue): void;
+  reject(request: string, error: unknown): void;
   deliver(event: HostUiEvent): void;
 } {
   const calls: HostCall[] = [];
   const pending = new Map<string, (value: PackageValue) => void>();
+  const rejections = new Map<string, (error: unknown) => void>();
   const streams = new Map<string, (event: HostUiEvent) => void>();
   const record = (method: string, input: { mount: string }): void => {
     calls.push({ method, mount: input.mount, input: input as unknown as Record<string, unknown> });
@@ -33,11 +42,13 @@ function sharedTransport(): {
   return {
     calls,
     answer: (request, value) => { pending.get(request)?.(value); },
+    reject: (request, error) => { rejections.get(request)?.(error); },
     deliver: (event) => { streams.get(`${event.mount}/${event.subscription}`)?.(event); },
     transport: {
-      request: (input) => new Promise((resolve) => {
+      request: (input) => new Promise((resolve, rejectRequest) => {
         record("request", input);
         pending.set(input.request, resolve);
+        rejections.set(input.request, rejectRequest);
       }),
       cancelRequest: async (input) => { record("cancelRequest", input); },
       openSubscription: async (input, deliver) => {
@@ -141,7 +152,7 @@ async function sendMount(mount: Mount): Promise<void> {
       source: "bundled",
       trust: "application_bundled",
       lifecycle: "active",
-      processGeneration: 1,
+      processGeneration: "1",
     },
     workspace: { id: instance.workspaceId, name: "Workspace" },
     uiHostVersion: 1,
@@ -189,6 +200,34 @@ describe("Package UI frame and Shell host over a real channel", () => {
     await subscription.close();
     await settle();
     expect(host.calls.at(-1)?.method).toBe("closeSubscription");
+    expect(mount.faults).toEqual([]);
+  });
+
+  it("a Package error from the transport reaches the Package module as a typed error", async () => {
+    const host = sharedTransport();
+    const mount = mountFrame("mount-a", host.transport);
+    await sendMount(mount);
+    const client = await mount.client;
+
+    const answered = client.request("reference.read", {});
+    await settle();
+    host.reject("r1", {
+      version: 2,
+      namespace: "teamarness.package-host",
+      code: "backend_error",
+      stage: "ui",
+      affectedPackage: instance.packageIdentity,
+      affectedInstance: instance,
+      retryable: false,
+      recovery: "none",
+      diagnosticId: "diag-1",
+      packageError: { code: "fixture.rejected", retryable: false, details: { field: "value" } },
+    });
+
+    const error = await answered.then(() => undefined, (reason: unknown) => reason);
+    expect(isPackageRequestError(error)).toBe(true);
+    expect(packageErrorCode(error)).toBe("fixture.rejected");
+    expect(describePackageError(error)).toBe("fixture.rejected");
     expect(mount.faults).toEqual([]);
   });
 

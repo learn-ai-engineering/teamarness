@@ -1,7 +1,8 @@
-import type {
-  PackageClient,
-  PackageMountContext,
-  PackageUnmount,
+import {
+  describePackageError,
+  type PackageClient,
+  type PackageMountContext,
+  type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
 
 export type Choice = Readonly<{ id: string; label: string }>;
@@ -111,7 +112,7 @@ export function createTutorialController(
     present(state);
   };
   const fail = (error: unknown): void => {
-    update({ error: error instanceof Error ? error.message : "Tutorial request failed" });
+    update({ error: describePackageError(error) });
   };
   const generate = async (): Promise<void> => {
     if (disposed || !state.algorithm || !state.palette) return;

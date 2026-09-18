@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { TEAMARNESS_THEME_TOKENS } from "@teamarness/package-ui-sdk";
 import type { OpenPackageMount, PackageHostTransport, PackageInstanceKey } from "./package-contracts";
-import { CONNECT_KIND, type ThemeSnapshot } from "./package-frame/protocol";
+import { CONNECT_KIND, FRAME_BRIDGE_PROTOCOL, type ThemeSnapshot } from "./package-frame/protocol";
 import {
   browserFrameDom,
   FRAME_CONNECT_TIMEOUT_MS,
@@ -225,7 +225,7 @@ async function mountThrough(test: Harness, controller: PackageMountController, o
   if (frame === undefined) throw new Error("no frame was created");
   frame.load();
   const scripted = scriptFrame(frame);
-  scripted.send({ kind: "hello", protocol: 1 });
+  scripted.send({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
   await settle();
   scripted.send({ kind: "mounted" });
   await settle();
@@ -306,12 +306,12 @@ describe("generic Package UI mount", () => {
 
     frame.load();
     expect(frame.posted).toHaveLength(1);
-    expect(frame.posted[0]?.message).toEqual({ kind: CONNECT_KIND, protocol: 1 });
+    expect(frame.posted[0]?.message).toEqual({ kind: CONNECT_KIND, protocol: FRAME_BRIDGE_PROTOCOL });
     expect(frame.posted[0]?.targetOrigin).toBe("*");
     expect(frame.posted[0]?.transfer).toHaveLength(1);
 
     const scripted = scriptFrame(frame);
-    scripted.send({ kind: "hello", protocol: 1 });
+    scripted.send({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
     await settle();
     scripted.send({ kind: "mounted" });
     await mounting;
@@ -335,7 +335,7 @@ describe("generic Package UI mount", () => {
         source: "bundled",
         trust: "application_bundled",
         lifecycle: "active",
-        processGeneration: 1,
+        processGeneration: "1",
       },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
       uiHostVersion: 1,
@@ -490,7 +490,7 @@ describe("generic Package UI mount", () => {
     await settle();
     broken.frames[0]?.load();
     const brokenFrame = scriptFrame(broken.frames[0] as FakeFrame);
-    brokenFrame.send({ kind: "hello", protocol: 1 });
+    brokenFrame.send({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
     await settle();
     brokenFrame.send({ kind: "fault", source: "load" });
     await expect(mounting).rejects.toThrow("Package UI fault: load");
@@ -526,7 +526,7 @@ describe("generic Package UI mount", () => {
     if (second === undefined) throw new Error("the replacement frame was never created");
     second.load();
     const secondFrame = scriptFrame(second);
-    secondFrame.send({ kind: "hello", protocol: 1 });
+    secondFrame.send({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
     await settle();
     secondFrame.send({ kind: "mounted" });
     await replacing;

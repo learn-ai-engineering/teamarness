@@ -1,4 +1,4 @@
-import type { PackageClient } from "@teamarness/package-ui-sdk";
+import { isPackageRequestError, packageErrorCode, type PackageClient } from "@teamarness/package-ui-sdk";
 import type {
   ConversationChannel,
   ConversationMessage,
@@ -39,6 +39,11 @@ interface ErrorInfo {
 }
 
 function classify(error: unknown): ErrorInfo {
+  // The Package's own code, when it has one; otherwise the host's code and retryability.
+  const packageCode = packageErrorCode(error);
+  if (packageCode !== null) {
+    return { code: packageCode, retryable: isPackageRequestError(error) && error.retryable };
+  }
   if (typeof error === "object" && error !== null) {
     const e = error as Record<string, unknown>;
     if (typeof e.code === "string" && e.code.length > 0) {
