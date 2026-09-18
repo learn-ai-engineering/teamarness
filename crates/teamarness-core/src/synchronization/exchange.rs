@@ -102,6 +102,7 @@ where
         protocol,
         &mut protocol_sink,
         &mut messages,
+        limits.session_timeout,
     ));
 
     let mut outcomes = OutcomeCounts::default();
@@ -263,8 +264,8 @@ fn push_operation(
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::super::network_handler::tests::{ScriptedReceiver, signed_log, test_peer};
-    use super::super::p2panda_adapter::TeamarnessLogStore;
+    use super::super::network_handler::tests::{ScriptedReceiver, test_peer};
+    use super::super::test_io::{MemoryLogStore, signed_log};
     use super::*;
 
     const LOG: [u8; 32] = [4; 32];
@@ -301,8 +302,8 @@ mod tests {
             .collect::<BTreeMap<_, _>>()
     }
 
-    fn store(seed: u8, count: u32) -> TeamarnessLogStore {
-        TeamarnessLogStore::from_operations(
+    fn store(seed: u8, count: u32) -> MemoryLogStore {
+        MemoryLogStore::from_operations(
             signed_log(seed, count)
                 .into_iter()
                 .map(|operation| (LOG, operation)),
@@ -314,8 +315,8 @@ mod tests {
     /// The transport is real frame I/O over `duplex`, and the LogSync protocol
     /// is real; only the Core seam is scripted.
     async fn run_pair(
-        initiator: TeamarnessLogStore,
-        responder: TeamarnessLogStore,
+        initiator: MemoryLogStore,
+        responder: MemoryLogStore,
         authors: &[u8],
         limits: SessionLimits,
         buffer: usize,
@@ -390,7 +391,7 @@ mod tests {
     async fn applies_are_batched_by_at_most_sixteen() {
         let limits = limits(64, 16);
         let (initiator, _) = run_pair(
-            TeamarnessLogStore::from_operations(Vec::new()),
+            MemoryLogStore::from_operations(Vec::new()),
             store(2, 40),
             &[2],
             limits,
@@ -449,7 +450,7 @@ mod tests {
                 run_exchange(
                     &mut reader,
                     &mut sink,
-                    TeamarnessLogStore::from_operations(Vec::new()),
+                    MemoryLogStore::from_operations(Vec::new()),
                     logs,
                     receiver,
                     context(Role::Initiator),
@@ -467,7 +468,7 @@ mod tests {
                 run_exchange(
                     &mut reader,
                     &mut sink,
-                    TeamarnessLogStore::from_operations(served),
+                    MemoryLogStore::from_operations(served),
                     logs,
                     receiver,
                     context(Role::Responder),

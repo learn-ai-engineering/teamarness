@@ -68,6 +68,10 @@ struct WorkerContext {
     demand: Arc<MembershipDemand>,
     stopped: Arc<AtomicBool>,
     cancel: Arc<Notify>,
+    /// Lets a test observe one explicit session at a time, without the
+    /// scheduler's own sessions racing it.
+    #[cfg(test)]
+    records_paused: Arc<AtomicBool>,
 }
 
 /// Owns the background synchronization command loop for one Core runtime.
@@ -81,6 +85,8 @@ pub(crate) struct SyncWorker {
     membership_wake: Arc<Notify>,
     cancel: Arc<Notify>,
     join: Mutex<Vec<JoinHandle<()>>>,
+    #[cfg(test)]
+    records_paused: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SyncWorker {
@@ -102,6 +108,8 @@ impl SyncWorker {
         demand: Arc<MembershipDemand>,
     ) -> Arc<Self> {
         let (commands, command_rx) = mpsc::unbounded_channel();
+        #[cfg(test)]
+        let records_paused = Arc::new(AtomicBool::new(false));
         let worker = Arc::new(Self {
             stopped: Arc::new(AtomicBool::new(false)),
             commands,
@@ -109,6 +117,8 @@ impl SyncWorker {
             membership_wake: Arc::new(Notify::new()),
             cancel: Arc::new(Notify::new()),
             join: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            records_paused: Arc::clone(&records_paused),
         });
         let context = Arc::new(WorkerContext {
             state,
@@ -119,6 +129,8 @@ impl SyncWorker {
             demand,
             stopped: Arc::clone(&worker.stopped),
             cancel: Arc::clone(&worker.cancel),
+            #[cfg(test)]
+            records_paused,
         });
         let wake = Arc::clone(&worker.wake);
         let records = tokio::spawn({
@@ -144,6 +156,18 @@ impl SyncWorker {
             let _ = self.commands.send(WorkerCommand::Wake);
             self.wake.notify_one();
             self.membership_wake.notify_one();
+        }
+    }
+
+    /// Stops and resumes the record replication loop.
+    ///
+    /// A test that observes one explicit session at a time uses this so the
+    /// scheduler's own sessions do not race it.
+    #[cfg(test)]
+    pub(crate) fn pause_records_for_test(&self, paused: bool) {
+        self.records_paused.store(paused, Ordering::Release);
+        if !paused {
+            self.wake.notify_one();
         }
     }
 
@@ -197,6 +221,16 @@ async fn run_records(
     let mut retry = BTreeMap::new();
     let mut first = true;
     while !context.stopped.load(Ordering::Acquire) {
+        #[cfg(test)]
+        if context.records_paused.load(Ordering::Acquire) {
+            first = false;
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = idle.tick() => {}
+                _ = context.cancel.notified() => {}
+            }
+            continue;
+        }
         if first {
             first = false;
             if record_pass(context, &mut retry, true).await.is_err() {

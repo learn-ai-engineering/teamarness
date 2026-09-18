@@ -6,7 +6,7 @@
 pub(crate) mod exchange;
 pub(crate) mod frames;
 pub(crate) mod limits;
-mod log_sync;
+pub(crate) mod log_view;
 pub(crate) mod network_handler;
 mod operation_store;
 pub(crate) mod p2panda_adapter;
@@ -15,18 +15,38 @@ pub(crate) mod peer_sessions;
 mod protection_control;
 pub(crate) mod quarantine;
 mod scheduler;
+#[cfg(test)]
+pub(crate) mod test_io;
 mod wakes;
 mod worker;
 
+#[cfg(test)]
 pub(crate) use operation_store::log_id as operation_log_id;
 pub(crate) use quarantine::RecoveryReport;
 pub(crate) use worker::SyncWorker;
 
 pub(crate) use exchange::ExchangeReport;
 pub(crate) use network_handler::{
-    FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, ProtectionBundle, Refusal,
-    RejectReason, SessionGrant, SyncReceiver,
+    FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, ProtectionBundle,
+    RangeLoadError, Refusal, RejectReason, ReplicationEntry, SessionGrant, SessionSeed,
+    SyncReceiver,
 };
+
+/// How many stored operation rows sessions have read since the process began.
+///
+/// A session that serves a peer which is already up to date must read none.
+#[cfg(test)]
+static RECORDS_LOADED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn note_record_loaded_for_test() {
+    RECORDS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn records_loaded_for_test() -> usize {
+    RECORDS_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub(crate) use peer_sessions::PeerSessions;
 
 /// The Core services one bound Network needs to serve and run synchronization

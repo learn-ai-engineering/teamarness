@@ -35,7 +35,24 @@ const CLOSE_NOT_AUTHORIZED: u8 = 5;
 const CLOSE_KEY_MISMATCH: u8 = 6;
 const CLOSE_BUDGET_EXCEEDED: u8 = 7;
 
-type ReplicationOperation = ([u8; 32], Operation<()>);
+/// One operation as LogSync serves it: the operation and its header bytes.
+pub(crate) type ReplicationEntry = (Operation<()>, Vec<u8>);
+
+/// What one session advertises about the log it can serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionSeed {
+    pub(crate) authors: Vec<PublicIdentity>,
+    pub(crate) heights: std::collections::BTreeMap<PublicIdentity, u32>,
+}
+
+/// Why one page of a served log could not be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeLoadError {
+    Unavailable,
+    /// The stored projection no longer authenticates, so the scope is
+    /// quarantined and this session ends.
+    ScopeCorrupt,
+}
 
 /// Why a responder, or the local gate, refuses a package synchronization
 /// session. These are frame reasons, not QUIC close codes.
@@ -204,18 +221,45 @@ pub(crate) trait SyncReceiver: Send + Sync {
     /// the worker can run a membership session with it.
     fn note_membership_mismatch(&self, _workspace: WorkspaceId, _peer: PublicIdentity) {}
 
-    fn authors(
-        &self,
-        peer: PublicIdentity,
-        workspace: WorkspaceId,
-    ) -> Result<Vec<PublicIdentity>, ()>;
-
-    fn operations(
+    /// The author list and heights one session advertises, loaded once.
+    ///
+    /// This re-checks the membership gate, and reports an author's height as
+    /// one below its lowest quarantined sequence, so a peer is never offered a
+    /// log with a hole in it.
+    fn session_seed(
         &self,
         peer: PublicIdentity,
         workspace: WorkspaceId,
         package: &str,
-    ) -> Result<Vec<ReplicationOperation>, ()>;
+    ) -> Result<SessionSeed, Refusal>;
+
+    /// The sizes of one author's operations in sequence order, for planning
+    /// what fits in this session's send budget.
+    #[allow(clippy::too_many_arguments)]
+    fn range_sizes(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+        author: PublicIdentity,
+        after: Option<u32>,
+        until: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<(u32, usize)>, ()>;
+
+    /// One page of an author's operations, authenticated against the stored
+    /// projection as it is read.
+    #[allow(clippy::too_many_arguments)]
+    fn load_range_page(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+        author: PublicIdentity,
+        from: u32,
+        until: u32,
+        rows: usize,
+    ) -> Result<Vec<ReplicationEntry>, RangeLoadError>;
 
     fn receive_operation(
         &self,
@@ -310,44 +354,6 @@ fn parse_truncated_suffix(bytes: &[u8], prefix: &[u8]) -> Result<bool, LogSessio
     }
 }
 
-/// Builds the author-to-log map one session advertises.
-async fn session_logs(
-    receiver: &Arc<dyn SyncReceiver>,
-    peer: PublicIdentity,
-    workspace: WorkspaceId,
-    package: &str,
-    operations: &[ReplicationOperation],
-) -> Result<std::collections::BTreeMap<p2panda_core::VerifyingKey, Vec<[u8; 32]>>, LogSessionError>
-{
-    let package_log =
-        crate::synchronization::operation_store::log_id(scope_digest(package, workspace));
-    let authors =
-        crate::blocking::receiver_call(receiver, move |receiver| receiver.authors(peer, workspace))
-            .await
-            .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
-            .map_err(|()| {
-                LogSessionError::Transport("failed to load workspace authors".to_owned())
-            })?;
-    let mut logs = std::collections::BTreeMap::new();
-    for author in authors {
-        let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
-            .map_err(|error| LogSessionError::Protocol(error.to_string()))?;
-        logs.entry(author)
-            .or_insert_with(Vec::new)
-            .push(package_log);
-    }
-    for (log_id, operation) in operations {
-        logs.entry(operation.header.verifying_key)
-            .or_insert_with(Vec::new)
-            .push(*log_id);
-    }
-    for ids in logs.values_mut() {
-        ids.sort_unstable();
-        ids.dedup();
-    }
-    Ok(logs)
-}
-
 /// Loads what this side will offer and runs the exchange.
 async fn exchange_and_acknowledge(
     connection: &Connection,
@@ -360,29 +366,45 @@ async fn exchange_and_acknowledge(
     let peer = context.peer;
     let workspace = context.workspace;
     let scope = context.package.clone();
-    let operations = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.operations(peer, workspace, &scope)
+    // The author list and heights are read once; the operations themselves are
+    // read lazily, in pages, only for what fits this session's send budget.
+    let seed = crate::blocking::receiver_call(receiver, move |receiver| {
+        receiver.session_seed(peer, workspace, &scope)
     })
     .await
     .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
-    .map_err(|()| LogSessionError::Transport("failed to load local operations".to_owned()))?;
-    let logs = session_logs(receiver, peer, workspace, &context.package, &operations).await?;
-    let store =
-        crate::synchronization::p2panda_adapter::TeamarnessLogStore::from_operations(operations);
+    .map_err(LogSessionError::Refused)?;
+    let log_id =
+        crate::synchronization::operation_store::log_id(scope_digest(&context.package, workspace));
+    let mut logs = std::collections::BTreeMap::new();
+    for author in &seed.authors {
+        let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
+            .map_err(|error| LogSessionError::Protocol(error.to_string()))?;
+        logs.insert(author, vec![log_id]);
+    }
+    let view = crate::synchronization::log_view::SqliteLogView::new(
+        Arc::clone(receiver),
+        crate::synchronization::log_view::ViewContext {
+            peer,
+            workspace,
+            package: context.package.clone(),
+            log_id,
+        },
+        seed,
+        limits,
+    );
     let role = context.role;
     let outcomes = run_exchange(
         reader,
         sink,
-        store,
+        view.clone(),
         logs,
         Arc::clone(receiver),
         context,
         limits,
     )
     .await?;
-    // The lazy log view reports its own truncation; until then a session always
-    // offers everything it holds.
-    let sent_truncated = false;
+    let sent_truncated = view.truncated();
     let peer_truncated = match role {
         Role::Initiator => request_application_ack(connection, sent_truncated).await?,
         Role::Responder => acknowledge_application(connection, sent_truncated).await?,
@@ -910,20 +932,38 @@ pub(crate) mod tests {
             Ok(0)
         }
 
-        fn authors(
-            &self,
-            _peer: PublicIdentity,
-            _workspace: WorkspaceId,
-        ) -> Result<Vec<PublicIdentity>, ()> {
-            Ok(Vec::new())
-        }
-
-        fn operations(
+        fn session_seed(
             &self,
             _peer: PublicIdentity,
             _workspace: WorkspaceId,
             _package: &str,
-        ) -> Result<Vec<ReplicationOperation>, ()> {
+        ) -> Result<SessionSeed, Refusal> {
+            Ok(SessionSeed::default())
+        }
+
+        fn range_sizes(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+            _package: &str,
+            _author: PublicIdentity,
+            _after: Option<u32>,
+            _until: Option<u32>,
+            _limit: usize,
+        ) -> Result<Vec<(u32, usize)>, ()> {
+            Ok(Vec::new())
+        }
+
+        fn load_range_page(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+            _package: &str,
+            _author: PublicIdentity,
+            _from: u32,
+            _until: u32,
+            _rows: usize,
+        ) -> Result<Vec<ReplicationEntry>, RangeLoadError> {
             Ok(Vec::new())
         }
 
@@ -959,31 +999,6 @@ pub(crate) mod tests {
                 .map(|operation| self.receive_operation(peer, workspace, package, operation))
                 .collect()
         }
-    }
-
-    pub(crate) fn signed_operation(seed: u8, sequence: u32) -> Operation<()> {
-        signed_log(seed, sequence + 1).pop().expect("one operation")
-    }
-
-    /// A correctly backlinked log of `count` operations for one author.
-    pub(crate) fn signed_log(seed: u8, count: u32) -> Vec<Operation<()>> {
-        let key = p2panda_core::SigningKey::from_bytes(&[seed; 32]);
-        let mut backlink = None;
-        let mut log = Vec::with_capacity(count as usize);
-        for sequence in 0..count {
-            let payload = sequence.to_be_bytes().to_vec();
-            let header = p2panda_core::Header::<()>::builder()
-                .body(payload.as_slice())
-                .seq_num(sequence)
-                .backlink(backlink)
-                .build(&key, ());
-            backlink = Some(header.hash());
-            log.push(Operation::from_parts(
-                header,
-                Some(p2panda_core::Body::from_bytes(&payload)),
-            ));
-        }
-        log
     }
 
     pub(crate) fn received(operation: Operation<()>) -> LogSyncEvent<()> {

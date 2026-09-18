@@ -63,21 +63,40 @@ impl SyncReceiver for RejectingSyncReceiver {
         Err(())
     }
 
-    fn authors(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-    ) -> Result<Vec<crate::PublicIdentity>, ()> {
-        Err(())
-    }
-
-    fn operations(
+    fn session_seed(
         &self,
         _peer: crate::PublicIdentity,
         _workspace: crate::WorkspaceId,
         _package: &str,
-    ) -> Result<Vec<([u8; 32], p2panda_core::Operation<()>)>, ()> {
+    ) -> Result<crate::synchronization::SessionSeed, Refusal> {
+        Err(Refusal::NotAuthorized)
+    }
+
+    fn range_sizes(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+        _author: crate::PublicIdentity,
+        _after: Option<u32>,
+        _until: Option<u32>,
+        _limit: usize,
+    ) -> Result<Vec<(u32, usize)>, ()> {
         Err(())
+    }
+
+    fn load_range_page(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+        _author: crate::PublicIdentity,
+        _from: u32,
+        _until: u32,
+        _rows: usize,
+    ) -> Result<Vec<crate::synchronization::ReplicationEntry>, crate::synchronization::RangeLoadError>
+    {
+        Err(crate::synchronization::RangeLoadError::Unavailable)
     }
 
     fn receive_operation(

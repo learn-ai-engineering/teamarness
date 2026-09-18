@@ -119,6 +119,59 @@ impl ReceiveBudget {
     }
 }
 
+/// What one session may still send.
+///
+/// The budget reserves a prefix of a range at a time, so a sender stops at a
+/// record boundary and a later session continues from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SendBudget {
+    operations: usize,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl SendBudget {
+    pub(crate) const fn new(limits: &SessionLimits) -> Self {
+        Self {
+            operations: limits.operations,
+            bytes: limits.operation_bytes,
+            truncated: false,
+        }
+    }
+
+    pub(crate) const fn remaining_operations(&self) -> usize {
+        self.operations
+    }
+
+    pub(crate) const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Reserves the longest prefix of `sizes` that fits, in sequence order.
+    ///
+    /// Returns the sequence the reservation reaches, or `None` when nothing
+    /// fits. A prefix shorter than `sizes` marks the session as truncated.
+    pub(crate) fn reserve_range(&mut self, sizes: &[(u32, usize)]) -> Option<u32> {
+        let mut planned = None;
+        for (sequence, bytes) in sizes {
+            if self.operations == 0 || *bytes > self.bytes {
+                self.truncated = true;
+                return planned;
+            }
+            self.operations -= 1;
+            self.bytes -= *bytes;
+            planned = Some(*sequence);
+        }
+        planned
+    }
+
+    /// Records that a range was cut for a reason other than this budget, such
+    /// as a row limit that stopped short of the author's head.
+    pub(crate) const fn note_truncated(&mut self) {
+        self.truncated = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
