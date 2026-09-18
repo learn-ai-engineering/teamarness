@@ -804,6 +804,8 @@ pub enum SynchronizationError {
     RevokedMember,
     InvalidInput,
     WrongScope,
+    ContentKeyUnavailable,
+    KeyOriginRejected,
     CorruptRecord,
     CursorScopeMismatch,
     CursorAhead,
@@ -818,6 +820,10 @@ impl fmt::Display for SynchronizationError {
             Self::RevokedMember => "a revoked workspace member may not append",
             Self::InvalidInput => "invalid immutable record input",
             Self::WrongScope => "sealed record belongs to another scope",
+            Self::ContentKeyUnavailable => "the package content key has not been received yet",
+            Self::KeyOriginRejected => {
+                "protection grant does not trace to the workspace creator's key"
+            }
             Self::CorruptRecord => "immutable record is corrupt",
             Self::CursorScopeMismatch => "cursor belongs to another delivery journal",
             Self::CursorAhead => "cursor is ahead of the delivery journal",
@@ -1002,11 +1008,41 @@ pub(crate) fn protection_control_author(
         .map_err(|_| SynchronizationError::CorruptRecord)
 }
 
+/// Mints a self-authored origin and grant for a key this Installation invented.
+///
+/// This is the forgery a non-creator Member could attempt: every signature is
+/// genuine, so only the creator-origin rule refuses it.
+#[cfg(test)]
+pub(crate) fn forge_protection_bundle_for_test(
+    secret: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+    recipient: PublicIdentity,
+) -> (Vec<u8>, Vec<u8>) {
+    let scope = scope_digest(package, workspace);
+    let author = PublicIdentity::from_bytes(*secret.public().as_bytes()).expect("test identity");
+    let mut key = [0_u8; 32];
+    getrandom::fill(&mut key).expect("test randomness");
+    let origin = protection_control::create(secret, scope, workspace, author, [0; 32], key)
+        .expect("test origin");
+    let grant = protection_control::grant(secret, scope, workspace, recipient, [5; 32], key)
+        .expect("test grant");
+    (origin, grant)
+}
+
+/// Imports a content-key grant that traces to the Workspace creator's origin.
+///
+/// `origin` is the creator's own `create` control for the scope. Any current
+/// Member holding the key may author the grant, but a scope's first key is
+/// accepted only with the creator's signed origin (ADR 0008), and a `create`
+/// control is never accepted as a grant.
 pub(crate) fn import_protection_grant(
     conn: &mut rusqlite::Connection,
     local_secret: &SecretKey,
     workspace: WorkspaceId,
     package: &str,
+    creator: PublicIdentity,
+    origin_bytes: &[u8],
     bytes: &[u8],
 ) -> Result<usize, SynchronizationError> {
     let local_identity = PublicIdentity::from_bytes(*local_secret.public().as_bytes())
@@ -1016,13 +1052,13 @@ pub(crate) fn import_protection_grant(
     if control.scope != scope
         || control.workspace != workspace
         || control.recipient != local_identity
-        || !matches!(
-            control.kind,
-            protection_control::KIND_CREATE | protection_control::KIND_GRANT
-        )
+        || control.kind != protection_control::KIND_GRANT
     {
         return Err(SynchronizationError::WrongScope);
     }
+    let origin = protection_control::decode(origin_bytes).map_err(storage_or_corrupt)?;
+    protection_control::verify_origin(&origin, &control, creator)
+        .map_err(|_| SynchronizationError::KeyOriginRejected)?;
     let key = protection_control::open_control(
         &control,
         &bytes[..protection_control::AAD_END],
@@ -1063,15 +1099,35 @@ pub(crate) fn import_protection_grant(
         )
         .map_err(|_| storage_error())?;
     }
+    // The importer keeps the creator's origin so it can later prove the key's
+    // authority when it grants to someone else.
+    let stored_origin: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT control_bytes FROM protection_control_operations
+             WHERE scope_id=?1 AND operation_kind='create' LIMIT 1",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| storage_error())?;
+    match stored_origin {
+        Some(stored) if stored != origin_bytes => return Err(SynchronizationError::CorruptRecord),
+        Some(_) => {}
+        None => protection_control::insert(
+            &tx,
+            scope,
+            RecordId::digest(origin_bytes).as_bytes(),
+            "create",
+            &origin,
+            origin_bytes,
+        )
+        .map_err(|_| storage_error())?,
+    }
     protection_control::insert(
         &tx,
         scope,
         RecordId::digest(bytes).as_bytes(),
-        if control.kind == protection_control::KIND_CREATE {
-            "create"
-        } else {
-            "grant"
-        },
+        "grant",
         &control,
         bytes,
     )
@@ -1122,7 +1178,7 @@ pub(crate) fn append(
         .map_err(|_| storage_error())?
         .is_some();
     if !scope_exists && !is_creator {
-        return Err(SynchronizationError::NotCurrentMember);
+        return Err(SynchronizationError::ContentKeyUnavailable);
     }
     let canonical_signed = signed.canonical_bytes();
     let record_id = RecordId::digest(&canonical_signed);

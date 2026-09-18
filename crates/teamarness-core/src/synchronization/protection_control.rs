@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use hpke_rs::{Hpke, HpkePrivateKey, HpkePublicKey, Mode};
 use hpke_rs_crypto::types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
@@ -38,45 +36,6 @@ pub(crate) const CONTROL_LEN: usize = 354;
 
 const ENC_LEN: usize = 32;
 const CIPHERTEXT_LEN: usize = 48;
-
-/// Opaque protection welcome/grant metadata. Raw content keys never occur in
-/// this projection; the production protection adapter owns grant bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GrantSlot {
-    pub(crate) recipient: PublicIdentity,
-    pub(crate) admission: [u8; 32],
-    pub(crate) content_key_id: [u8; 32],
-    pub(crate) grant_bytes: Vec<u8>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct GrantProjection {
-    slots: BTreeMap<(PublicIdentity, [u8; 32]), GrantSlot>,
-    content_key_id: Option<[u8; 32]>,
-}
-
-impl GrantProjection {
-    pub(crate) fn apply(&mut self, slot: GrantSlot) -> Result<bool, ()> {
-        if let Some(existing) = self.content_key_id
-            && existing != slot.content_key_id
-        {
-            return Err(());
-        }
-        if self.content_key_id.is_none() {
-            self.content_key_id = Some(slot.content_key_id);
-        }
-        let key = (slot.recipient, slot.admission);
-        if self.slots.contains_key(&key) {
-            return Ok(false);
-        }
-        self.slots.insert(key, slot);
-        Ok(true)
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-}
 
 /// A decoded, signature-verified protection control. Decoding never decrypts:
 /// only [`open_control`], with the recipient's private key, recovers the key.
@@ -337,6 +296,41 @@ pub(crate) fn open_control(
     Ok(key)
 }
 
+/// Why a grant's claimed origin does not authorize a scope's first content key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginError {
+    NotCreate,
+    NotCreator,
+    ScopeMismatch,
+    KeyMismatch,
+}
+
+/// Checks that `grant` traces to the Workspace creator's own `create` control
+/// for the same scope and content key (ADR 0008 creator-only bootstrap).
+///
+/// Both controls are already signature-verified by [`decode`], so this decides
+/// authority alone: any current holder may grant, but only the creator may
+/// originate a scope's first key.
+pub(crate) fn verify_origin(
+    origin: &ProtectionControl,
+    grant: &ProtectionControl,
+    creator: PublicIdentity,
+) -> Result<(), OriginError> {
+    if origin.kind != KIND_CREATE {
+        return Err(OriginError::NotCreate);
+    }
+    if origin.author != creator || origin.recipient != creator {
+        return Err(OriginError::NotCreator);
+    }
+    if origin.scope != grant.scope || origin.workspace != grant.workspace {
+        return Err(OriginError::ScopeMismatch);
+    }
+    if origin.content_key_id != grant.content_key_id {
+        return Err(OriginError::KeyMismatch);
+    }
+    Ok(())
+}
+
 fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], StorageError> {
     let end = at.checked_add(N).ok_or(StorageError::CorruptWorkspace)?;
     let value = bytes.get(*at..end).ok_or(StorageError::CorruptWorkspace)?;
@@ -390,15 +384,6 @@ mod tests {
 
     fn identity(seed: u8) -> PublicIdentity {
         PublicIdentity::from_bytes(*secret(seed).public().as_bytes()).unwrap()
-    }
-
-    fn slot(key_id: [u8; 32], admission: u8) -> GrantSlot {
-        GrantSlot {
-            recipient: identity(9),
-            admission: [admission; 32],
-            content_key_id: key_id,
-            grant_bytes: vec![1, 2, 3],
-        }
     }
 
     fn sample_grant(author: &SecretKey, recipient: PublicIdentity, key: [u8; 32]) -> Vec<u8> {
@@ -605,12 +590,63 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_grants_are_idempotent_and_reject_key_split() {
-        let mut projection = GrantProjection::default();
-        assert!(projection.apply(slot([4; 32], 1)).unwrap());
-        assert!(!projection.apply(slot([4; 32], 1)).unwrap());
-        assert!(projection.apply(slot([4; 32], 2)).unwrap());
-        assert_eq!(projection.len(), 2);
-        assert!(projection.apply(slot([5; 32], 3)).is_err());
+    fn origin_must_be_authored_by_the_creator() {
+        let creator = secret(1);
+        let holder = secret(2);
+        let recipient = identity(3);
+        let scope = [7; 32];
+        let workspace = WorkspaceId::from_bytes([8; 16]);
+        let key = [9; 32];
+        let genuine =
+            decode(&create(&creator, scope, workspace, identity(1), [0; 32], key).unwrap())
+                .unwrap();
+        let granted =
+            decode(&grant(&holder, scope, workspace, recipient, [5; 32], key).unwrap()).unwrap();
+        assert_eq!(verify_origin(&genuine, &granted, identity(1)), Ok(()));
+
+        let minted =
+            decode(&create(&holder, scope, workspace, identity(2), [0; 32], key).unwrap()).unwrap();
+        assert_eq!(
+            verify_origin(&minted, &granted, identity(1)),
+            Err(OriginError::NotCreator)
+        );
+    }
+
+    #[test]
+    fn origin_must_name_the_same_scope_and_key() {
+        let creator = secret(1);
+        let recipient = identity(3);
+        let workspace = WorkspaceId::from_bytes([8; 16]);
+        let key = [9; 32];
+        let granted =
+            decode(&grant(&creator, [7; 32], workspace, recipient, [5; 32], key).unwrap()).unwrap();
+        let other_scope =
+            decode(&create(&creator, [6; 32], workspace, identity(1), [0; 32], key).unwrap())
+                .unwrap();
+        assert_eq!(
+            verify_origin(&other_scope, &granted, identity(1)),
+            Err(OriginError::ScopeMismatch)
+        );
+        let other_key =
+            decode(&create(&creator, [7; 32], workspace, identity(1), [0; 32], [1; 32]).unwrap())
+                .unwrap();
+        assert_eq!(
+            verify_origin(&other_key, &granted, identity(1)),
+            Err(OriginError::KeyMismatch)
+        );
+    }
+
+    #[test]
+    fn create_control_is_not_accepted_as_a_grant() {
+        let creator = secret(1);
+        let workspace = WorkspaceId::from_bytes([8; 16]);
+        let control =
+            decode(&create(&creator, [7; 32], workspace, identity(1), [0; 32], [9; 32]).unwrap())
+                .unwrap();
+        assert_eq!(control.kind, KIND_CREATE);
+        assert_eq!(
+            verify_origin(&control, &control, identity(2)),
+            Err(OriginError::NotCreator)
+        );
     }
 }

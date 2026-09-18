@@ -120,6 +120,15 @@ impl SyncCluster {
         self.exchange_addresses();
     }
 
+    /// Hands `to` every membership operation `from` has accepted.
+    ///
+    /// Plan phase 3 Step 8 replaces this with `teamarness/membership-sync/1`.
+    pub(super) fn copy_membership(&self, from: &str, to: &str, workspace: WorkspaceId) {
+        for envelope in self.node(from).canonical_envelopes_for_test(workspace) {
+            let _ = self.node(to).apply_membership_envelope(&envelope);
+        }
+    }
+
     pub(super) fn members(&self, name: &str, workspace: WorkspaceId) -> BTreeSet<PublicIdentity> {
         self.node(name)
             .membership_snapshot(workspace)

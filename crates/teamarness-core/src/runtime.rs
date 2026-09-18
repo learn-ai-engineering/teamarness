@@ -680,6 +680,11 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             )
             .optional()
             .map_err(|_| ())?;
+        // Without the creator's origin this Installation cannot prove the key's
+        // authority, so it offers nothing rather than an unusable grant.
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
         let secret_key = state.secret_key.clone();
         match crate::synchronization::export_protection_grant(
             &mut state.connection,
@@ -690,7 +695,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             admission,
         ) {
             Ok(grant) => Ok(Some(crate::synchronization::ProtectionBundle {
-                origin: origin.unwrap_or_default(),
+                origin,
                 grant,
             })),
             Err(crate::SynchronizationError::WorkspaceNotFound) => Ok(None),
@@ -715,12 +720,15 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         if !projection.contains_member(peer) {
             return Err(());
         }
+        let creator = projection.creator();
         let secret = state.secret_key.clone();
         crate::synchronization::import_protection_grant(
             &mut state.connection,
             &secret,
             workspace,
             package,
+            creator,
+            &bundle.origin,
             &bundle.grant,
         )
         .map_err(|_| ())
@@ -1554,17 +1562,18 @@ impl CoreRuntime {
         Ok(record)
     }
 
-    /// Creates an authenticated Core-held welcome grant for a current recipient.
+    /// Creates the welcome bundle a current recipient needs for one scope.
     ///
-    /// Creates a control that is HPKE-sealed to `recipient` and signed by this
-    /// Installation; only the recipient's private key can recover the content key.
+    /// The grant is HPKE-sealed to `recipient` and signed by this Installation,
+    /// so only the recipient's private key recovers the content key; the origin
+    /// is the Workspace creator's `create` control, which authorizes the key.
     #[cfg(test)]
-    pub(crate) fn export_protection_grant(
+    pub(crate) fn export_protection_bundle_for_test(
         &self,
         workspace_id: WorkspaceId,
         package_identity: &str,
         recipient: PublicIdentity,
-    ) -> Result<Vec<u8>, crate::SynchronizationError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), crate::SynchronizationError> {
         let mut state = self
             .state
             .lock()
@@ -1582,23 +1591,37 @@ impl CoreRuntime {
             return Err(crate::SynchronizationError::NotCurrentMember);
         }
         let admission = *projection.snapshot().version().as_bytes();
+        let scope = crate::synchronization::scope_digest(package_identity, workspace_id);
+        let origin: Vec<u8> = state
+            .connection
+            .query_row(
+                "SELECT control_bytes FROM protection_control_operations
+                 WHERE scope_id=?1 AND operation_kind='create' LIMIT 1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?
+            .ok_or(crate::SynchronizationError::ContentKeyUnavailable)?;
         let secret_key = state.secret_key.clone();
-        crate::synchronization::export_protection_grant(
+        let grant = crate::synchronization::export_protection_grant(
             &mut state.connection,
             &secret_key,
             workspace_id,
             package_identity,
             recipient,
             admission,
-        )
+        )?;
+        Ok((origin, grant))
     }
 
-    /// Imports an authenticated Core welcome and atomically promotes pending records.
+    /// Imports a welcome bundle that traces to the Workspace creator's origin.
     #[cfg(test)]
     pub(crate) fn import_protection_grant(
         &self,
         workspace_id: WorkspaceId,
         package_identity: &str,
+        origin: &[u8],
         grant: &[u8],
     ) -> Result<usize, crate::SynchronizationError> {
         let mut state = self
@@ -1616,12 +1639,15 @@ impl CoreRuntime {
         if !projection.contains_member(author) {
             return Err(crate::SynchronizationError::NotCurrentMember);
         }
+        let creator = projection.creator();
         let secret = state.secret_key.clone();
         crate::synchronization::import_protection_grant(
             &mut state.connection,
             &secret,
             workspace_id,
             package_identity,
+            creator,
+            origin,
             grant,
         )
     }
@@ -1870,6 +1896,30 @@ impl CoreRuntime {
     #[cfg(test)]
     pub(crate) fn remember_peer_address_for_test(&self, address: iroh_base::EndpointAddr) {
         self.transport.remember_peer_address(address);
+    }
+
+    /// Returns this Workspace's accepted membership envelopes in causal order.
+    ///
+    /// Plan phase 3 Step 8 replaces this with the membership replication
+    /// protocol; until then a test hands another Installation what a session
+    /// would have sent it.
+    #[cfg(test)]
+    pub(crate) fn canonical_envelopes_for_test(&self, workspace_id: WorkspaceId) -> Vec<Vec<u8>> {
+        let state = self.state.lock().expect("test runtime state");
+        let mut statement = state
+            .connection
+            .prepare(
+                "SELECT o.canonical_envelope FROM membership_transitions t
+                 JOIN membership_operations o ON o.operation_id = t.cause_operation_id
+                 WHERE t.workspace_id = ?1 ORDER BY t.epoch",
+            )
+            .expect("membership transition query");
+        let rows = statement
+            .query_map([workspace_id.as_bytes().as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .expect("membership transition rows");
+        rows.filter_map(Result::ok).collect()
     }
 
     /// Runs one synchronization pass now instead of waiting for the idle tick.
@@ -3012,10 +3062,10 @@ mod tests {
         alice
             .append_record(workspace.id(), package, "message.post", b"seed")
             .unwrap();
-        let bob_grant = alice
-            .export_protection_grant(workspace.id(), package, bob.public_identity())
+        let (bob_origin, bob_grant) = alice
+            .export_protection_bundle_for_test(workspace.id(), package, bob.public_identity())
             .unwrap();
-        bob.import_protection_grant(workspace.id(), package, &bob_grant)
+        bob.import_protection_grant(workspace.id(), package, &bob_origin, &bob_grant)
             .unwrap();
         let historical = bob
             .append_record(workspace.id(), package, "message.post", b"historical")
@@ -3054,11 +3104,11 @@ mod tests {
         .await
         .unwrap();
         carol.join_workspace(&carol_invitation).await.unwrap();
-        let carol_grant = alice
-            .export_protection_grant(workspace.id(), package, carol.public_identity())
+        let (carol_origin, carol_grant) = alice
+            .export_protection_bundle_for_test(workspace.id(), package, carol.public_identity())
             .unwrap();
         carol
-            .import_protection_grant(workspace.id(), package, &carol_grant)
+            .import_protection_grant(workspace.id(), package, &carol_origin, &carol_grant)
             .unwrap();
 
         let carol_receiver = RuntimeSyncReceiver {
@@ -3127,10 +3177,10 @@ mod tests {
         let package = "teamarness.test";
         a.append_record(workspace.id(), package, "message.post", b"seed")
             .unwrap();
-        let grant = a
-            .export_protection_grant(workspace.id(), package, b.public_identity())
+        let (origin, grant) = a
+            .export_protection_bundle_for_test(workspace.id(), package, b.public_identity())
             .unwrap();
-        b.import_protection_grant(workspace.id(), package, &grant)
+        b.import_protection_grant(workspace.id(), package, &origin, &grant)
             .unwrap();
         let record = b
             .append_record(workspace.id(), package, "message.post", b"remote")

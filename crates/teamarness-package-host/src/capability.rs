@@ -697,7 +697,11 @@ async fn run_membership_stream(
 fn sync_error(error: teamarness_core::SynchronizationError) -> PackageErrorCode {
     match error {
         teamarness_core::SynchronizationError::NotCurrentMember
-        | teamarness_core::SynchronizationError::RevokedMember => {
+        | teamarness_core::SynchronizationError::RevokedMember
+        // The Package asked for something this Installation cannot serve yet,
+        // not something malformed: the scope's content key has not arrived.
+        | teamarness_core::SynchronizationError::ContentKeyUnavailable
+        | teamarness_core::SynchronizationError::KeyOriginRejected => {
             PackageErrorCode::CapabilityUnavailable
         }
         teamarness_core::SynchronizationError::WorkspaceNotFound

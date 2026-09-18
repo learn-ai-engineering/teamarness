@@ -283,3 +283,130 @@ async fn the_worker_converges_two_members_and_catches_up_after_a_restart() {
         .await;
     cluster.finish().await;
 }
+
+/// Verifies: TEAM.SYS.TRANS-R06
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grant_with_a_member_minted_origin_is_rejected() {
+    let cluster = SyncCluster::start("minted-origin", &["a", "b", "c"]).await;
+    let workspace = cluster.node("a").create_workspace("Origin").unwrap();
+    let id = workspace.id();
+    let a1 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a1")
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster.admit("a", "c", id).await;
+
+    // B invents its own key and signs both halves of a bundle for C. Every
+    // signature is genuine; only the creator-origin rule refuses it.
+    let b_secret = cluster.node("b").state.lock().unwrap().secret_key.clone();
+    let (forged_origin, forged_grant) = crate::synchronization::forge_protection_bundle_for_test(
+        &b_secret,
+        id,
+        PACKAGE,
+        cluster.identity("c"),
+    );
+    assert_eq!(
+        cluster
+            .node("c")
+            .import_protection_grant(id, PACKAGE, &forged_origin, &forged_grant)
+            .unwrap_err(),
+        crate::SynchronizationError::KeyOriginRejected
+    );
+
+    let (origin, grant) = cluster
+        .node("a")
+        .export_protection_bundle_for_test(id, PACKAGE, cluster.identity("c"))
+        .unwrap();
+    cluster
+        .node("c")
+        .import_protection_grant(id, PACKAGE, &origin, &grant)
+        .unwrap();
+    cluster
+        .node("c")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cluster
+            .record_ids("c", id, PACKAGE)
+            .contains(&a1.record_id())
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_creator_holder_welcomes_a_new_member() {
+    let mut cluster = SyncCluster::start("non-creator-holder", &["a", "b", "c"]).await;
+    let workspace = cluster.node("a").create_workspace("Holder").unwrap();
+    let id = workspace.id();
+    let a1 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a1")
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .node("b")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
+    cluster.admit("a", "c", id).await;
+    cluster.copy_membership("a", "b", id);
+    cluster.stop("a").await;
+
+    cluster
+        .node("c")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("b"),
+            cluster.identity("b"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cluster
+            .record_ids("c", id, PACKAGE)
+            .contains(&a1.record_id())
+    );
+    let c1 = cluster
+        .node("c")
+        .append_record(id, PACKAGE, "message.post", b"c1")
+        .unwrap();
+    cluster
+        .wait_until(
+            "the holder receives the newcomer's record",
+            DEFAULT_DEADLINE,
+            |c| c.record_ids("b", id, PACKAGE).contains(&c1.record_id()),
+        )
+        .await;
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_without_key_gets_content_key_unavailable() {
+    let mut cluster = SyncCluster::start("no-key-yet", &["a", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("No key").unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster.stop("a").await;
+
+    assert_eq!(
+        cluster
+            .node("b")
+            .append_record(id, PACKAGE, "message.post", b"b1")
+            .unwrap_err(),
+        crate::SynchronizationError::ContentKeyUnavailable
+    );
+    cluster.finish().await;
+}
