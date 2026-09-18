@@ -584,6 +584,15 @@ pub(crate) fn import_bootstrap_with_fault(
         write_member_snapshot(&transaction, &imported_projection, deadline)?;
         import_boundary(&mut fault, ImportBoundary::MemberSnapshot, deadline)?;
     }
+    // A new joiner advertises itself to every Member it learned about, so the
+    // imported set is due for replication immediately.
+    transaction
+        .execute(
+            "INSERT INTO membership_sync_wakes(workspace_id, wake_generation) VALUES(?1, 1)
+             ON CONFLICT(workspace_id) DO UPDATE SET wake_generation = wake_generation + 1",
+            [response.workspace_id.as_bytes().as_slice()],
+        )
+        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
     import_boundary(&mut fault, ImportBoundary::BeforeCommit, deadline)?;
     // This is the last rollback-safe check. Never turn a completed commit into a timeout.
     ensure_import_deadline(deadline)?;
@@ -1678,6 +1687,15 @@ fn persist_candidate_rows(
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
+    // Every accepted membership operation bumps the Workspace's replication
+    // wake in the same transaction, so propagation cannot be lost on a crash.
+    transaction
+        .execute(
+            "INSERT INTO membership_sync_wakes(workspace_id, wake_generation) VALUES(?1, 1)
+             ON CONFLICT(workspace_id) DO UPDATE SET wake_generation = wake_generation + 1",
+            [envelope.workspace_id.as_bytes().as_slice()],
+        )
+        .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     write_derived(transaction, candidate)?;
     let epoch = i64::try_from(candidate.snapshot.epoch().value())
         .map_err(|_| MembershipError::Storage(StorageError::CorruptWorkspace))?;

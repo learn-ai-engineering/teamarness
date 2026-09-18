@@ -122,6 +122,12 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
         .unwrap();
     connection
         .execute(
+            "DELETE FROM membership_sync_wakes WHERE workspace_id = ?1",
+            [workspace.id().to_string_bytes()],
+        )
+        .unwrap();
+    connection
+        .execute(
             "DELETE FROM workspaces WHERE workspace_id = ?1",
             [workspace.id().to_string_bytes()],
         )

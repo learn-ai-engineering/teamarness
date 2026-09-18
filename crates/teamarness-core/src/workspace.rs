@@ -222,6 +222,12 @@ fn finish_request_with_fault(
                 ],
             )
             .map_err(|_| StorageError::CorruptWorkspace)?;
+        transaction
+            .execute(
+                "INSERT INTO membership_sync_wakes(workspace_id, wake_generation) VALUES(?1, 0)",
+                [request.workspace_id.as_bytes().as_slice()],
+            )
+            .map_err(|_| StorageError::CorruptWorkspace)?;
     }
 
     let existing_operation: Option<Vec<u8>> = transaction
