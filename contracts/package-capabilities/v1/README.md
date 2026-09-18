@@ -52,10 +52,36 @@ retry returns the original committed result.
 an Installation-local journal checkpoint. The stream is credit-controlled and
 at-least-once. Record events include both canonical bytes and the sealed
 Teamarness envelope so a Package can persist ciphertext and its own indexes.
-State events report `waiting_for_history_access`, `offline`, `catching_up`,
-`current`, or `degraded`; warning events contain only stable non-sensitive
-codes. Every event consumes credit. A Package commits the cursor with its
-projection and may safely deduplicate a replay by `recordId`.
+State events report availability and a pending record count; warning events
+contain only stable non-sensitive codes. Every event consumes credit. A Package
+commits the cursor with its projection and may safely deduplicate a replay by
+`recordId`.
+
+The first event of every stream is a `state` event. Afterwards one is sent when
+availability changes, when `pendingRecordCount` changes while not
+`catching_up`, and at most every 128 records while `catching_up`.
+
+| Availability | Meaning |
+|---|---|
+| `waiting_for_history_access` | No history can be read yet: the Package's record set has no key on this Installation. |
+| `offline` | Nothing is reachable, or this Installation may no longer participate. The warning code says which. |
+| `catching_up` | Records are known to be outstanding and peers are reachable. |
+| `current` | Everything known to this Installation has been delivered. |
+
+`pendingRecordCount` is the number of records this subscription still owes the
+Package: records already committed but not delivered, records held back waiting
+for their author or key, and records a running session has announced but not yet
+applied.
+
+Warning codes are `record_quarantined` (a record failed authentication and was
+skipped), `scope_quarantined` (the whole record set is isolated after a local
+integrity failure), and `membership_revoked` (this Installation is no longer a
+current Member). `record_quarantined` is sent once per page that skipped a
+record; the others are sent once per stream.
+
+A synchronization session exchanges at most 2,048 records or 8 MiB in each
+direction; larger backlogs continue in later sessions and are reported as
+`catching_up`.
 
 If `afterCursor` belongs to another delivery journal or is ahead of the journal,
 the Host closes the stream with code `cursor_invalid`. The Package must clear its

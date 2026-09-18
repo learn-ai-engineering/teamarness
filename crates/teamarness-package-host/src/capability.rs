@@ -922,7 +922,42 @@ fn optional_cursor(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the stream has already told the Package about its availability.
+struct StateTracking {
+    last: Option<(teamarness_core::SyncAvailability, u64)>,
+    /// Records sent since the last state event.
+    since_state: usize,
+    /// Codes already sent once on this stream.
+    sent: std::collections::BTreeSet<&'static str>,
+}
+
+impl StateTracking {
+    fn new() -> Self {
+        Self {
+            last: None,
+            since_state: 0,
+            sent: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Whether this availability is worth another state event.
+    fn should_emit(&self, reported: &teamarness_core::RecordAvailability) -> bool {
+        let catching_up = reported.availability == teamarness_core::SyncAvailability::CatchingUp;
+        match self.last {
+            None => true,
+            Some((availability, pending)) => {
+                availability != reported.availability
+                    || (!catching_up && pending != reported.pending_records)
+                    || (catching_up && self.since_state >= RECORDS_PER_STATE)
+            }
+        }
+    }
+}
+
+/// While catching up, a state event is sent at most every this many records.
+const RECORDS_PER_STATE: usize = 128;
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_record_stream(
     core: Arc<CoreRuntime>,
     workspace: teamarness_core::WorkspaceId,
@@ -967,6 +1002,10 @@ async fn run_record_stream(
         }
     };
     let mut sequence = 0_u64;
+    let mut tracking = StateTracking::new();
+    // The first event of every stream is a state event.
+    let mut need_state = true;
+    let mut refreshed_after_empty = false;
     loop {
         if *cancelled.borrow() {
             break;
@@ -976,6 +1015,63 @@ async fn run_record_stream(
         {
             streams.lock().await.remove(&stream_id);
             return;
+        }
+        if need_state {
+            let read = tokio::task::spawn_blocking(move || {
+                let reported = subscription.availability();
+                (subscription, reported)
+            })
+            .await;
+            let reported = match read {
+                Ok((returned, Ok(reported))) => {
+                    subscription = returned;
+                    reported
+                }
+                Ok((_returned, Err(error))) => {
+                    eprintln!("record stream availability failed: stream={stream_id} {error}");
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("record stream availability task failed: stream={stream_id} {error}");
+                    break;
+                }
+            };
+            let mut delivered = true;
+            for warning in &reported.warnings {
+                let code = warning.as_str();
+                // A record quarantine is reported once per page that skipped
+                // one; the other codes are reported once per stream.
+                let once_per_stream = *warning != teamarness_core::SyncWarning::RecordQuarantined;
+                if credit == 0 || (once_per_stream && !tracking.sent.insert(code)) {
+                    continue;
+                }
+                sequence = sequence.saturating_add(1);
+                let payload = json!({"kind":"warning","code":code});
+                if output.event(&stream_id, sequence, payload).await.is_err() {
+                    delivered = false;
+                    break;
+                }
+                credit -= 1;
+            }
+            if !delivered {
+                break;
+            }
+            if credit > 0 && tracking.should_emit(&reported) {
+                sequence = sequence.saturating_add(1);
+                let payload = json!({
+                    "kind":"state",
+                    "availability":reported.availability.as_str(),
+                    "pendingRecordCount":reported.pending_records.to_string(),
+                });
+                if output.event(&stream_id, sequence, payload).await.is_err() {
+                    break;
+                }
+                credit -= 1;
+                tracking.last = Some((reported.availability, reported.pending_records));
+                tracking.since_state = 0;
+            }
+            need_state = false;
+            continue;
         }
         let limit = usize::try_from(credit.min(RECORD_PAGE)).unwrap_or(1);
         let read = tokio::task::spawn_blocking(move || {
@@ -997,6 +1093,9 @@ async fn run_record_stream(
                 break;
             }
         };
+        if page.quarantined_skipped > 0 {
+            need_state = true;
+        }
         let mut delivered = true;
         for event in &page.events {
             let Ok(signature) = encode_signature(&event.record().signature()) else {
@@ -1026,15 +1125,28 @@ async fn run_record_stream(
             break;
         }
         if !page.events.is_empty() {
+            tracking.since_state = tracking.since_state.saturating_add(page.events.len());
+            if tracking.since_state >= RECORDS_PER_STATE {
+                need_state = true;
+            }
+            refreshed_after_empty = false;
             continue;
         }
-        // Nothing was ready. The subscription waits on the journal head rather
-        // than polling storage.
+        // Nothing was ready. The availability is re-read once, so a stream that
+        // has caught up says so, and then the subscription waits on the journal
+        // head rather than polling storage.
+        if !refreshed_after_empty {
+            refreshed_after_empty = true;
+            need_state = true;
+            continue;
+        }
         tokio::select! {
             changed = subscription.changed() => {
                 if changed.is_err() {
                     break;
                 }
+                need_state = true;
+                refreshed_after_empty = false;
             }
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => {

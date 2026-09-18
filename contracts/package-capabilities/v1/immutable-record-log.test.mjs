@@ -32,3 +32,19 @@ test('contract bounds are explicit even where decoded base64 size needs host val
   assert.equal(schema.$defs.open.properties.request.properties.sealedRecords.minItems, 1);
   assert.equal(schema.$defs.stateEvent.properties.pendingRecordCount.pattern, '^(0|[1-9][0-9]*)$');
 });
+
+test('state and warning events are closed and stable', () => {
+  const state = schema.$defs.stateEvent;
+  closed(state.properties, ['kind', 'availability', 'pendingRecordCount']);
+  assert.equal(state.additionalProperties, false);
+  assert.deepEqual(state.properties.availability.enum, ['waiting_for_history_access', 'offline', 'catching_up', 'current']);
+  assert.equal(state.properties.availability.enum.includes('degraded'), false);
+
+  const warning = schema.$defs.warningEvent;
+  closed(warning.properties, ['kind', 'code']);
+  assert.equal(warning.additionalProperties, false);
+  assert.equal(warning.properties.code.pattern, '^[a-z][a-z0-9_]{0,63}$');
+  for (const code of ['record_quarantined', 'scope_quarantined', 'membership_revoked']) {
+    assert.match(code, new RegExp(warning.properties.code.pattern));
+  }
+});

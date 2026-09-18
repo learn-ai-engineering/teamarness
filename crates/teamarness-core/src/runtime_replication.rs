@@ -107,6 +107,9 @@ pub(super) fn after_membership_accepted(
             );
         }
     }
+    // Who the peers are changed, so what every subscription of this
+    // Workspace's scopes reports may have changed with it.
+    crate::synchronization::record_subscription::bump_workspace_scopes(state, workspace);
     // A membership stream waits on this watch rather than polling.
     if let Some(sender) = state.membership_epochs.get(&workspace) {
         let epoch = transition.epoch().value();

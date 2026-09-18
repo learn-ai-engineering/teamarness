@@ -605,6 +605,8 @@ pub struct CoreRuntime {
     transport: Arc<crate::onboarding::transport::Transport>,
     sync_worker: Arc<crate::synchronization::SyncWorker>,
     membership_demand: Arc<crate::membership_sync::MembershipDemand>,
+    /// What recent sessions said about reaching each peer, per scope.
+    health: Arc<crate::synchronization::SyncHealthRegistry>,
     #[cfg(test)]
     membership_replica: Arc<dyn crate::membership_sync::MembershipReplica>,
     #[cfg(test)]
@@ -653,6 +655,9 @@ pub(crate) struct RuntimeSyncReceiver {
     pub(crate) state: Weak<Mutex<RuntimeState>>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) demand: Arc<crate::membership_sync::MembershipDemand>,
+    /// Isolating a scope changes what every subscriber of it reports, so the
+    /// registry is asked to wake them.
+    pub(crate) health: Arc<crate::synchronization::SyncHealthRegistry>,
 }
 
 impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
@@ -1008,6 +1013,8 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
                     crate::synchronization::quarantine::ScopeFault::Projection,
                     now,
                 );
+                drop(state);
+                self.health.scope_changed(scope);
                 return Err(RangeLoadError::ScopeCorrupt);
             };
             #[cfg(test)]
@@ -1341,6 +1348,11 @@ impl CoreRuntime {
         let public_identity = PublicIdentity(secret_key.public());
         let peer_sessions = crate::synchronization::PeerSessions::new();
         let sync_wake = Arc::new(tokio::sync::Notify::new());
+        // The head map is shared so session health and quarantine can wake a
+        // subscriber without taking the runtime state lock.
+        let record_heads: crate::synchronization::record_subscription::SharedRecordHeads =
+            Arc::default();
+        let health = crate::synchronization::SyncHealthRegistry::new(Arc::clone(&record_heads));
         let state = Arc::new(Mutex::new(RuntimeState {
             connection,
             clock: Arc::clone(&clock),
@@ -1350,7 +1362,7 @@ impl CoreRuntime {
             display_name,
             memberships,
             subscribers: BTreeMap::new(),
-            record_heads: Arc::default(),
+            record_heads,
             membership_epochs: BTreeMap::new(),
             next_subscriber_id: 0,
             poisoned: false,
@@ -1369,8 +1381,10 @@ impl CoreRuntime {
                 state: Arc::downgrade(&state),
                 clock: Arc::clone(&clock),
                 demand: Arc::clone(&demand),
+                health: Arc::clone(&health),
             }),
             sessions: Arc::clone(&peer_sessions),
+            health: Arc::clone(&health),
             limits: session_limits,
         };
         // The composition point owns the membership protocol: `network` keeps
@@ -1447,6 +1461,7 @@ impl CoreRuntime {
             transport,
             sync_worker,
             membership_demand: demand,
+            health,
             #[cfg(test)]
             membership_replica,
             #[cfg(test)]
@@ -2175,6 +2190,8 @@ impl CoreRuntime {
             journal,
             position,
             head,
+            self.public_identity,
+            Arc::clone(&self.health),
         ))
     }
 
@@ -2246,6 +2263,7 @@ impl CoreRuntime {
                 state: Arc::downgrade(&self.state),
                 clock: Arc::clone(&self.clock),
                 demand: Arc::clone(&self.membership_demand),
+                health: Arc::clone(&self.health),
             });
         let address = iroh_base::EndpointAddr::new(peer.as_public_key());
         let accepted = self
@@ -2326,6 +2344,7 @@ impl CoreRuntime {
                 state: Arc::downgrade(&self.state),
                 clock: Arc::clone(&self.clock),
                 demand: Arc::clone(&self.membership_demand),
+                health: Arc::clone(&self.health),
             });
         self.transport
             .send_log_sync(
@@ -2619,6 +2638,7 @@ impl CoreRuntime {
                 address,
                 receiver,
                 sessions,
+                Arc::clone(&self.health),
                 workspace_id,
                 package_identity.to_owned(),
                 peer,
@@ -2661,6 +2681,7 @@ impl CoreRuntime {
                 state: Arc::downgrade(&self.state),
                 clock: Arc::clone(&self.clock),
                 demand: Arc::clone(&self.membership_demand),
+                health: Arc::clone(&self.health),
             },
             extra: extra
                 .into_iter()
@@ -2672,6 +2693,7 @@ impl CoreRuntime {
             address,
             receiver,
             sessions,
+            Arc::clone(&self.health),
             workspace_id,
             package_identity.to_owned(),
             peer,
@@ -2823,6 +2845,94 @@ impl CoreRuntime {
         self.hold_state_inner()
     }
 
+    /// Stops and resumes synchronization scheduling from another crate.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn pause_sync_scheduler_for_tests(&self, paused: bool) {
+        self.sync_worker.pause_for_test(paused);
+    }
+
+    /// Admits a freshly generated Installation through the ordinary admission
+    /// path, without networking, so a test has a Member that is never reachable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Workspace is not one this Installation manages.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn admit_unreachable_member_for_tests(&self, workspace_id: WorkspaceId) -> PublicIdentity {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).expect("a test identity is generated");
+        let secret = SecretKey::from_bytes(&bytes);
+        let member = PublicIdentity::from_bytes(*secret.public().as_bytes())
+            .expect("a generated identity is valid");
+        let token = self
+            .issue_invitation(
+                workspace_id,
+                self.clock.now_unix_ms().saturating_add(600_000),
+            )
+            .expect("the local Installation manages the workspace");
+        let verified = token.verified().expect("a freshly issued token verifies");
+        let claim = crate::invitation::sign_claim(&secret, &verified)
+            .expect("the generated identity can claim");
+        self.admit_and_export_with_limits_for_test(
+            &InvitationClaim::from_verified(&claim),
+            member,
+            crate::membership::projection::BootstrapLimits::CURRENT,
+            None,
+        )
+        .expect("the admission commits");
+        member
+    }
+
+    /// Injects what the last session with `peer` saw, so a test can reach an
+    /// availability row without waiting for a real session to fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an outcome name that is not one of the four accepted values.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_peer_outcome_for_tests(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        peer: PublicIdentity,
+        outcome: &str,
+    ) {
+        let reported = match outcome {
+            "reachable" => Some(crate::synchronization::PeerOutcome::Reachable),
+            "unreachable" => Some(crate::synchronization::PeerOutcome::Unreachable),
+            "failed" => Some(crate::synchronization::PeerOutcome::Failed),
+            "clear" => None,
+            other => panic!("unknown peer outcome {other}"),
+        };
+        self.health.record_outcome(
+            crate::synchronization::scope_digest(package_identity, workspace_id),
+            peer,
+            reported,
+            None,
+        );
+    }
+
+    /// Isolates one scope, as a local integrity failure would.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn quarantine_scope_for_tests(&self, workspace_id: WorkspaceId, package_identity: &str) {
+        let scope = crate::synchronization::scope_digest(package_identity, workspace_id);
+        {
+            let state = self.state.lock().expect("test runtime state");
+            crate::synchronization::quarantine::quarantine_scope(
+                &state.connection,
+                scope,
+                crate::synchronization::quarantine::ScopeFault::Projection,
+                self.clock.now_unix_ms(),
+            )
+            .expect("the scope is isolated");
+        }
+        self.health.scope_changed(scope);
+    }
+
     /// Holds the runtime state lock until the returned value is released, so a
     /// test in another crate can observe the Host while Core is busy.
     #[cfg(feature = "test-hooks")]
@@ -2946,7 +3056,7 @@ impl CoreRuntime {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn admit_and_export_with_limits_for_test(
         &self,
         claim: &InvitationClaim,
@@ -4122,6 +4232,7 @@ mod tests {
             state: Arc::downgrade(&bob.state),
             clock: Arc::new(SystemClock),
             demand: Arc::clone(&bob.membership_demand),
+            health: Arc::clone(&bob.health),
         };
         let bob_identity = bob.public_identity();
         let seed = crate::synchronization::SyncReceiver::session_seed(
@@ -4177,6 +4288,7 @@ mod tests {
             state: Arc::downgrade(&carol.state),
             clock: Arc::new(SystemClock),
             demand: Arc::clone(&carol.membership_demand),
+            health: Arc::clone(&carol.health),
         };
         crate::synchronization::SyncReceiver::receive_operation(
             &carol_receiver,
@@ -4282,6 +4394,7 @@ mod tests {
             state: Arc::downgrade(&a.state),
             clock: Arc::new(SystemClock),
             demand: Arc::clone(&a.membership_demand),
+            health: Arc::clone(&a.health),
         };
         // One unacceptable operation is classified, not fatal: the session
         // continues and the author is skipped for the rest of it.

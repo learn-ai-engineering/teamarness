@@ -355,11 +355,13 @@ fn parse_truncated_suffix(bytes: &[u8], prefix: &[u8]) -> Result<bool, LogSessio
 }
 
 /// Loads what this side will offer and runs the exchange.
+#[allow(clippy::too_many_arguments)]
 async fn exchange_and_acknowledge(
     connection: &Connection,
     reader: &mut FrameReader,
     sink: &mut (impl futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin + Send),
     receiver: &Arc<dyn SyncReceiver>,
+    health: &Arc<crate::synchronization::SyncHealthRegistry>,
     context: ExchangeContext,
     limits: SessionLimits,
 ) -> Result<ExchangeReport, LogSessionError> {
@@ -394,6 +396,7 @@ async fn exchange_and_acknowledge(
         limits,
     );
     let role = context.role;
+    let scope = scope_digest(&context.package, workspace);
     let outcomes = run_exchange(
         reader,
         sink,
@@ -402,6 +405,7 @@ async fn exchange_and_acknowledge(
         Arc::clone(receiver),
         context,
         limits,
+        Some(health.session_incoming(scope)),
     )
     .await?;
     let sent_truncated = view.truncated();
@@ -426,6 +430,7 @@ pub(crate) async fn outbound_log_session(
     address: iroh_base::EndpointAddr,
     receiver: Arc<dyn SyncReceiver>,
     sessions: Arc<PeerSessions>,
+    health: Arc<crate::synchronization::SyncHealthRegistry>,
     workspace: WorkspaceId,
     package: String,
     peer: PublicIdentity,
@@ -441,7 +446,7 @@ pub(crate) async fn outbound_log_session(
     .map_err(|_| LogSessionError::LocalNotAuthorized)?;
     tokio::select! {
         result = outbound_session_body(
-            endpoint, address, &receiver, grant, workspace, &package, peer, limits,
+            endpoint, address, &receiver, &health, grant, workspace, &package, peer, limits,
         ) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
     }
@@ -452,6 +457,7 @@ async fn outbound_session_body(
     endpoint: &iroh::Endpoint,
     address: iroh_base::EndpointAddr,
     receiver: &Arc<dyn SyncReceiver>,
+    health: &Arc<crate::synchronization::SyncHealthRegistry>,
     grant: SessionGrant,
     workspace: WorkspaceId,
     package: &str,
@@ -547,6 +553,7 @@ async fn outbound_session_body(
         &mut reader,
         &mut sink,
         receiver,
+        health,
         ExchangeContext {
             peer,
             workspace,
@@ -722,17 +729,18 @@ async fn run_log_session(
 ) -> Result<(), LogSessionError> {
     let mut cancellation = services.sessions.subscribe(peer);
     tokio::select! {
-        result = run_log_session_body(&connection, &services.receiver, peer, limits) => result,
+        result = run_log_session_body(&connection, &services, peer, limits) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
     }
 }
 
 async fn run_log_session_body(
     connection: &Connection,
-    receiver: &Arc<dyn SyncReceiver>,
+    services: &SyncServices,
     peer: PublicIdentity,
     limits: SessionLimits,
 ) -> Result<(), LogSessionError> {
+    let receiver = &services.receiver;
     let (send, receive) = connection
         .accept_bi()
         .await
@@ -835,6 +843,7 @@ async fn run_log_session_body(
         &mut reader,
         &mut sink,
         receiver,
+        &services.health,
         ExchangeContext {
             peer,
             workspace,

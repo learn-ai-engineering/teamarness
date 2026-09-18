@@ -16,9 +16,10 @@ use tokio::sync::watch;
 use crate::WorkspaceId;
 use crate::runtime::RuntimeState;
 
+use super::health::{self, AvailabilityInputs, SyncHealthRegistry};
 use super::{
     Cursor, P2pandaRecordProtection, RecordEvent, RecordProtection, SealedRecordV1,
-    SynchronizationError, fixed, quarantine, record_from_row, scope_digest, storage_error,
+    SynchronizationError, fixed, parking, quarantine, record_from_row, scope_digest, storage_error,
 };
 
 /// A scope's delivery journal identity and content key.
@@ -229,6 +230,31 @@ pub(crate) fn publish_scope_exists(state: &RuntimeState, workspace: WorkspaceId,
     scope_head(state, scope).set_scope_exists();
 }
 
+/// Asks every subscriber of one Workspace's scopes to recompute what it
+/// reports, after a membership transition changed who the peers are.
+pub(crate) fn bump_workspace_scopes(state: &RuntimeState, workspace: WorkspaceId) {
+    let scopes: Vec<[u8; 32]> = {
+        let Ok(mut statement) = state
+            .connection
+            .prepare("SELECT scope_id FROM sync_scopes WHERE workspace_id=?1")
+        else {
+            return;
+        };
+        let Ok(rows) = statement.query_map([workspace.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        }) else {
+            return;
+        };
+        rows.filter_map(|row| row.ok().and_then(|id| id.try_into().ok()))
+            .collect()
+    };
+    for scope in scopes {
+        if let Some(head) = lookup_head(&state.record_heads, scope) {
+            head.bump_revision();
+        }
+    }
+}
+
 /// The map every runtime shares with the components that must wake subscribers
 /// without taking the runtime lock.
 pub(crate) type SharedRecordHeads = Arc<Mutex<BTreeMap<[u8; 32], Arc<ScopeHead>>>>;
@@ -372,6 +398,9 @@ pub struct RecordSubscription {
     /// Records skipped as quarantined since availability was last read.
     pub(crate) quarantined_seen: usize,
     pub(crate) last_seen: HeadState,
+    /// This Installation, so a revocation of it is visible to the Package.
+    pub(crate) local: crate::PublicIdentity,
+    pub(crate) health: Arc<SyncHealthRegistry>,
 }
 
 impl std::fmt::Debug for RecordSubscription {
@@ -383,6 +412,7 @@ impl std::fmt::Debug for RecordSubscription {
 }
 
 impl RecordSubscription {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: Weak<Mutex<RuntimeState>>,
         workspace: WorkspaceId,
@@ -391,6 +421,8 @@ impl RecordSubscription {
         journal: Option<[u8; 16]>,
         position: i64,
         scope_head: Arc<ScopeHead>,
+        local: crate::PublicIdentity,
+        health: Arc<SyncHealthRegistry>,
     ) -> Self {
         let head = scope_head.subscribe();
         let last_seen = *head.borrow();
@@ -406,6 +438,8 @@ impl RecordSubscription {
             buffer: VecDeque::new(),
             quarantined_seen: 0,
             last_seen,
+            local,
+            health,
         }
     }
 
@@ -540,15 +574,64 @@ impl RecordSubscription {
     /// gone, and a storage error when the counts cannot be read.
     #[doc(hidden)]
     pub fn availability(&mut self) -> Result<RecordAvailability, SynchronizationError> {
-        let mut warnings = Vec::new();
-        if std::mem::take(&mut self.quarantined_seen) > 0 {
-            warnings.push(SyncWarning::RecordQuarantined);
+        self.last_seen = *self.head.borrow_and_update();
+        let record_quarantined_seen = std::mem::take(&mut self.quarantined_seen) > 0;
+        let runtime = self
+            .state
+            .upgrade()
+            .ok_or(SynchronizationError::RuntimeUnavailable)?;
+        let state = runtime
+            .lock()
+            .map_err(|_| SynchronizationError::RuntimeUnavailable)?;
+        if state.poisoned {
+            return Err(SynchronizationError::RuntimeUnavailable);
         }
-        Ok(RecordAvailability {
-            availability: SyncAvailability::Current,
-            pending_records: 0,
-            warnings,
-        })
+        let connection = &state.connection;
+        let scope_quarantined = quarantine::is_scope_quarantined(connection, self.scope)?;
+        let scope_exists = connection
+            .query_row(
+                "SELECT 1 FROM sync_scopes WHERE scope_id=?1",
+                [self.scope.as_slice()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|_| storage_error())?
+            .unwrap_or(false);
+        let undelivered: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM record_delivery
+                 WHERE scope_id=?1 AND delivery_sequence>?2",
+                rusqlite::params![self.scope.as_slice(), self.position],
+                |row| row.get(0),
+            )
+            .map_err(|_| storage_error())?;
+        let parked = parking::parked_count(connection, self.workspace, &self.package)?;
+        let projection = state.memberships.get(&self.workspace);
+        let locally_revoked = projection.is_some_and(|projection| {
+            !projection.contains_member(self.local) && projection.has_membership_history(self.local)
+        });
+        let peers = projection
+            .map(|projection| {
+                projection
+                    .snapshot()
+                    .members()
+                    .iter()
+                    .map(crate::MemberSnapshot::identity)
+                    .filter(|member| *member != self.local)
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(state);
+        Ok(health::availability(&AvailabilityInputs {
+            scope_quarantined,
+            locally_revoked,
+            scope_exists,
+            undelivered: u64::try_from(undelivered).unwrap_or(0),
+            parked: parked as u64,
+            peers,
+            health: self.health.snapshot(self.scope),
+            record_quarantined_seen,
+        }))
     }
 
     /// The cursor this subscription would resume from.

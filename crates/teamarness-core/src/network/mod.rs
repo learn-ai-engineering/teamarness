@@ -170,6 +170,7 @@ impl Network {
         let services = services.unwrap_or_else(|| SyncServices {
             receiver: Arc::new(RejectingSyncReceiver),
             sessions: PeerSessions::new(),
+            health: crate::synchronization::SyncHealthRegistry::new(Arc::default()),
             limits: SessionLimits::CURRENT,
         });
         let log_sync = Arc::new(LogSyncHandler::new(services.clone(), services.limits));
@@ -261,6 +262,7 @@ impl Network {
                 address,
                 receiver,
                 Arc::clone(&self.services.sessions),
+                Arc::clone(&self.services.health),
                 workspace,
                 package,
                 peer,

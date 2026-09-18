@@ -404,3 +404,72 @@ async fn offline_peer_does_not_delay_other_peers() {
         .await;
     cluster.finish().await;
 }
+
+/// Verifies: TEAM.SYS.TRANS-R07, TEAM.SYS.PKG-R10
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catching_up_is_reported_between_truncated_sessions() {
+    let limits = SessionLimits {
+        operations: 100,
+        ..SessionLimits::CURRENT
+    };
+    let cluster =
+        SyncCluster::start_with_limits("catching-up-states", &["a", "b"], &[("a", limits)]).await;
+    let workspace = cluster.node("a").create_workspace("Catch up").unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 2
+        })
+        .await;
+    for index in 0..1_500_u16 {
+        cluster
+            .node("a")
+            .append_record(id, PACKAGE, "message.post", &index.to_be_bytes())
+            .unwrap();
+    }
+
+    let mut subscription = cluster
+        .node("b")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    let mut delivered = 0_usize;
+    let mut states: Vec<crate::SyncAvailability> = Vec::new();
+    let mut last = None;
+    // The deadline only bounds failure.
+    let expiry = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        delivered += subscription.next_page(32).unwrap().events.len();
+        let reported = subscription.availability().unwrap();
+        if last != Some(reported.availability) {
+            states.push(reported.availability);
+            last = Some(reported.availability);
+        }
+        if delivered == 1_500
+            && reported.availability == crate::SyncAvailability::Current
+            && reported.pending_records == 0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "b catches up with a: delivered {delivered}, states {states:?}"
+        );
+        // B's own sessions are what give it a view of reaching A; A's pushes
+        // are what fill the journal.
+        cluster.node("a").sync_now_for_test();
+        cluster.node("b").sync_now_for_test();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        states.contains(&crate::SyncAvailability::CatchingUp),
+        "truncated sessions leave more to send, which is reported: {states:?}"
+    );
+    assert_eq!(states.last(), Some(&crate::SyncAvailability::Current));
+    assert!(
+        !states.contains(&crate::SyncAvailability::Offline),
+        "the only peer answered every session: {states:?}"
+    );
+    cluster.finish().await;
+}

@@ -13,6 +13,7 @@ use p2panda_core::Operation;
 use p2panda_sync::protocols::{LogSync, LogSyncEvent};
 
 use super::frames::{FrameError, FrameReader, LogSyncWire};
+use super::health::HealthReporter;
 use super::limits::SessionLimits;
 use super::network_handler::{FatalSyncError, LogSessionError, OperationOutcome, SyncReceiver};
 use crate::{PublicIdentity, WorkspaceId};
@@ -69,6 +70,10 @@ type Logs = std::collections::BTreeMap<p2panda_core::VerifyingKey, Vec<[u8; 32]>
 ///
 /// Returns what was received. The caller exchanges the application
 /// acknowledgement afterwards, because only it owns the connection.
+///
+/// `health` reports what the peer announced and what has been applied, so a
+/// subscription can say how far behind it is while a session runs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_exchange<S, W>(
     reader: &mut FrameReader,
     sink: &mut W,
@@ -77,6 +82,7 @@ pub(crate) async fn run_exchange<S, W>(
     receiver: Arc<dyn SyncReceiver>,
     context: ExchangeContext,
     limits: SessionLimits,
+    health: Option<HealthReporter>,
 ) -> Result<OutcomeCounts, LogSessionError>
 where
     S: p2panda_store::logs::LogStore<
@@ -120,7 +126,7 @@ where
                         Ok(event) => {
                             let applied = apply_batch(
                                 &receiver, &context, limits, event, &mut event_rx,
-                                &mut skipped, &mut outcomes,
+                                &mut skipped, &mut outcomes, health.as_ref(),
                             ).await;
                             match applied {
                                 Ok(()) => {}
@@ -146,7 +152,7 @@ where
                 Ok(event) => {
                     apply_batch(
                         &receiver, &context, limits, event, &mut event_rx,
-                        &mut skipped, &mut outcomes,
+                        &mut skipped, &mut outcomes, health.as_ref(),
                     ).await?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -183,6 +189,7 @@ fn session_error(
 ///
 /// Events that are not operations are handled inline, so a batch is only ever
 /// operations.
+#[allow(clippy::too_many_arguments)]
 async fn apply_batch(
     receiver: &Arc<dyn SyncReceiver>,
     context: &ExchangeContext,
@@ -191,12 +198,13 @@ async fn apply_batch(
     events: &mut tokio::sync::broadcast::Receiver<LogSyncEvent<()>>,
     skipped: &mut BTreeSet<p2panda_core::VerifyingKey>,
     outcomes: &mut OutcomeCounts,
+    health: Option<&HealthReporter>,
 ) -> Result<(), LogSessionError> {
     let mut batch = Vec::with_capacity(limits.apply_batch);
-    push_operation(first, skipped, &mut batch);
+    push_operation(first, skipped, &mut batch, health);
     while batch.len() < limits.apply_batch {
         match events.try_recv() {
-            Ok(event) => push_operation(event, skipped, &mut batch),
+            Ok(event) => push_operation(event, skipped, &mut batch, health),
             Err(
                 tokio::sync::broadcast::error::TryRecvError::Empty
                 | tokio::sync::broadcast::error::TryRecvError::Closed,
@@ -214,6 +222,7 @@ async fn apply_batch(
         .iter()
         .map(|operation| operation.header.verifying_key)
         .collect::<Vec<_>>();
+    let applied_count = batch.len() as u64;
     let peer = context.peer;
     let workspace = context.workspace;
     let package = context.package.clone();
@@ -232,6 +241,9 @@ async fn apply_batch(
             LogSessionError::Transport("failed to store synchronized operation".to_owned())
         }
     })?;
+    if let Some(health) = health {
+        health.applied(applied_count);
+    }
     for (author, outcome) in authors.into_iter().zip(results) {
         outcomes.count(&outcome);
         if matches!(
@@ -250,7 +262,16 @@ fn push_operation(
     event: LogSyncEvent<()>,
     skipped: &BTreeSet<p2panda_core::VerifyingKey>,
     batch: &mut Vec<Operation<()>>,
+    health: Option<&HealthReporter>,
 ) {
+    // The peer announces what it intends to send before it sends anything, so
+    // a catching-up subscription can say how much is still coming.
+    if let LogSyncEvent::MetricsExchanged { metrics } = &event {
+        if let Some(health) = health {
+            health.announced(u64::from(metrics.inbound_operations));
+        }
+        return;
+    }
     let LogSyncEvent::OperationReceived { operation, .. } = event else {
         return;
     };
@@ -343,6 +364,7 @@ mod tests {
                     receiver,
                     context(Role::Initiator),
                     limits,
+                    None,
                 )
                 .await
             }
@@ -361,6 +383,7 @@ mod tests {
                     receiver,
                     context(Role::Responder),
                     limits,
+                    None,
                 )
                 .await
             }
@@ -455,6 +478,7 @@ mod tests {
                     receiver,
                     context(Role::Initiator),
                     limits,
+                    None,
                 )
                 .await
             }
@@ -473,6 +497,7 @@ mod tests {
                     receiver,
                     context(Role::Responder),
                     limits,
+                    None,
                 )
                 .await
             }

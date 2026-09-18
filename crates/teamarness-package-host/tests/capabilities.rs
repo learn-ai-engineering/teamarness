@@ -268,23 +268,18 @@ async fn immutable_record_stream_waits_for_a_new_scope() {
             b"hello",
         )
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let events = host
-        .execute(PackageHostCommand::UiRequest(UiRequest {
-            mount,
-            request: UiRequestId::new("immutable-events").unwrap(),
-            operation: "fixture.immutable_events".into(),
-            payload: object([]),
-        }))
-        .await
-        .unwrap();
-    let PackageHostOutcome::UiResponse {
-        payload: PackageValue::Object(value),
-    } = events
-    else {
-        panic!("unexpected immutable event response")
-    };
-    assert!(matches!(value.get("events"), Some(PackageValue::Array(events)) if events.len() == 1));
+    let value = poll_immutable(
+        &host,
+        &mount,
+        "the record reaches the package",
+        |response| record_events(response) == 1,
+    )
+    .await;
+    assert_eq!(
+        record_events(&value),
+        1,
+        "one record event, beside its state events"
+    );
 }
 
 #[tokio::test]
@@ -809,6 +804,8 @@ async fn fixture_request(
     }
 }
 
+static NEXT_POLL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Polls the fixture's recorded immutable-stream state until `ready` holds.
 ///
 /// The deadline only bounds failure; nothing here sleeps and then asserts.
@@ -819,9 +816,10 @@ async fn poll_immutable(
     mut ready: impl FnMut(&BTreeMap<String, PackageValue>) -> bool,
 ) -> BTreeMap<String, PackageValue> {
     let expiry = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let mut attempt = 0_u32;
     loop {
-        attempt += 1;
+        // A request identifier is used once per mount, so the counter spans
+        // every poll in the test rather than restarting with each call.
+        let attempt = NEXT_POLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let response = fixture_request(
             host,
             mount,
@@ -839,6 +837,18 @@ async fn poll_immutable(
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// How many of the recorded stream events are records rather than state or
+/// warning events.
+fn record_events(response: &BTreeMap<String, PackageValue>) -> usize {
+    events_of(response)
+        .iter()
+        .filter(|event| {
+            matches!(event, PackageValue::Object(event)
+                if event.get("kind") == Some(&PackageValue::String("record".into())))
+        })
+        .count()
 }
 
 fn events_of(response: &BTreeMap<String, PackageValue>) -> &[PackageValue] {
@@ -1059,5 +1069,296 @@ async fn membership_stream_does_not_poll() {
         after - idle,
         1,
         "one transition opens exactly one Core subscription"
+    );
+}
+
+/// Renders one recorded stream event as a compact, comparable string.
+fn describe(event: &PackageValue) -> String {
+    let PackageValue::Object(event) = event else {
+        return "<not an object>".to_owned();
+    };
+    let text = |key: &str| match event.get(key) {
+        Some(PackageValue::String(value)) => value.clone(),
+        _ => String::new(),
+    };
+    match text("kind").as_str() {
+        "record" => "record".to_owned(),
+        "state" => format!(
+            "state {} {}",
+            text("availability"),
+            text("pendingRecordCount")
+        ),
+        "warning" => format!("warning {}", text("code")),
+        other => format!("unknown {other}"),
+    }
+}
+
+fn described(response: &BTreeMap<String, PackageValue>) -> Vec<String> {
+    events_of(response).iter().map(describe).collect()
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn immutable_record_stream_reports_catching_up_then_current() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    for index in 0..3_u8 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                "dev.teamarness.fixture",
+                "fixture.record",
+                &[index; 4],
+            )
+            .unwrap();
+    }
+
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    // A solo Workspace with no concurrent appends produces exactly this.
+    let response = poll_immutable(&host, &mount, "the stream reports current", |response| {
+        events_of(response).len() >= 5
+    })
+    .await;
+    assert_eq!(
+        described(&response),
+        vec![
+            "state catching_up 3".to_owned(),
+            "record".to_owned(),
+            "record".to_owned(),
+            "record".to_owned(),
+            "state current 0".to_owned(),
+        ]
+    );
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn immutable_record_stream_waits_for_history_access_before_the_scope_exists() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    let first = poll_immutable(&host, &mount, "the first state event arrives", |response| {
+        !events_of(response).is_empty()
+    })
+    .await;
+    assert_eq!(described(&first)[0], "state waiting_for_history_access 0");
+
+    for index in 0..3_u8 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                "dev.teamarness.fixture",
+                "fixture.record",
+                &[index; 4],
+            )
+            .unwrap();
+    }
+    // Appends race the stream task, so the intermediate states are not fixed.
+    let response = poll_immutable(&host, &mount, "every record is delivered", |response| {
+        record_events(response) == 3
+            && described(response).last().map(String::as_str) == Some("state current 0")
+    })
+    .await;
+    let events = described(&response);
+    assert!(
+        events[1..]
+            .iter()
+            .filter(|event| event.starts_with("state "))
+            .all(|event| event.starts_with("state catching_up")
+                || event.starts_with("state current")),
+        "after history access the stream only reports catching up or current: {events:?}"
+    );
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn immutable_record_stream_reports_offline_from_unreachable_and_failed_peers() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    let package = "dev.teamarness.fixture";
+    // The scheduler must not overwrite the injected outcomes.
+    fixture.core.pause_sync_scheduler_for_tests(true);
+    let peer = fixture
+        .core
+        .admit_unreachable_member_for_tests(workspace.id());
+    fixture
+        .core
+        .append_record(workspace.id(), package, "fixture.record", b"one")
+        .unwrap();
+
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    // With no outcome for the new Member yet, row 8 keeps the stream catching
+    // up, so no further state event follows the record.
+    let response = poll_immutable(&host, &mount, "the record is delivered", |response| {
+        record_events(response) == 1
+    })
+    .await;
+    assert_eq!(
+        described(&response),
+        vec!["state catching_up 1".to_owned(), "record".to_owned()]
+    );
+
+    let mut before = events_of(&response).len();
+    for (injected, expected) in [
+        ("unreachable", "state offline 0"),
+        ("reachable", "state current 0"),
+        ("failed", "state offline 0"),
+    ] {
+        let seen = before;
+        fixture
+            .core
+            .set_peer_outcome_for_tests(workspace.id(), package, peer, injected);
+        let next = poll_immutable(
+            &host,
+            &mount,
+            "the injected outcome is reported",
+            |response| events_of(response).len() > seen,
+        )
+        .await;
+        assert_eq!(described(&next).last().map(String::as_str), Some(expected));
+        before = events_of(&next).len();
+    }
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn immutable_record_stream_warns_once_when_a_scope_is_quarantined() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    let package = "dev.teamarness.fixture";
+    fixture
+        .core
+        .append_record(workspace.id(), package, "fixture.record", b"one")
+        .unwrap();
+
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    let response = poll_immutable(&host, &mount, "the stream reports current", |response| {
+        described(response).last().map(String::as_str) == Some("state current 0")
+    })
+    .await;
+    let before = events_of(&response).len();
+
+    fixture
+        .core
+        .quarantine_scope_for_tests(workspace.id(), package);
+    let response = poll_immutable(&host, &mount, "the quarantine is reported", |response| {
+        events_of(response).len() >= before + 2
+    })
+    .await;
+    assert_eq!(
+        described(&response)[before..],
+        [
+            "warning scope_quarantined".to_owned(),
+            "state offline 0".to_owned()
+        ]
+    );
+    let after_warning = events_of(&response).len();
+
+    assert!(
+        fixture
+            .core
+            .append_record(workspace.id(), package, "fixture.record", b"two")
+            .is_err(),
+        "a quarantined scope refuses appends"
+    );
+    fixture_request(
+        &host,
+        &mount,
+        "immutable-credit-after-quarantine",
+        "fixture.immutable_credit",
+        object([("amount", PackageValue::Integer(1))]),
+    )
+    .await;
+    let response = fixture_request(
+        &host,
+        &mount,
+        "immutable-final-events",
+        "fixture.immutable_events",
+        object([]),
+    )
+    .await;
+    assert_eq!(
+        events_of(&response).len(),
+        after_warning,
+        "the warning is sent once per stream"
     );
 }

@@ -161,9 +161,48 @@ impl SessionRunner for NetworkSessionRunner {
             if matches!(outcome, SessionOutcome::RefusedNotAuthorized) {
                 runner.demand.note(workspace, peer);
             }
+            // Only record sessions say anything about a scope's availability;
+            // membership sessions belong to the Workspace, not to one scope.
+            if let JobKey::Records {
+                workspace, package, ..
+            } = &job.key
+            {
+                report_health(
+                    &runner.services.health,
+                    crate::synchronization::scope_digest(package, *workspace),
+                    peer,
+                    outcome,
+                );
+            }
             outcome
         })
     }
+}
+
+/// Tells the health registry what one record session saw of its peer.
+///
+/// A cancelled session, and one the local gate refused, say nothing about the
+/// peer, so they remove its entry rather than blaming it.
+fn report_health(
+    health: &Arc<crate::synchronization::SyncHealthRegistry>,
+    scope: [u8; 32],
+    peer: PublicIdentity,
+    outcome: SessionOutcome,
+) {
+    let (reported, truncated) = match outcome {
+        SessionOutcome::Completed { truncated } => (
+            Some(crate::synchronization::PeerOutcome::Reachable),
+            Some(truncated),
+        ),
+        SessionOutcome::Unreachable => {
+            (Some(crate::synchronization::PeerOutcome::Unreachable), None)
+        }
+        SessionOutcome::Failed | SessionOutcome::RefusedNotAuthorized => {
+            (Some(crate::synchronization::PeerOutcome::Failed), None)
+        }
+        SessionOutcome::LocalNotAuthorized | SessionOutcome::Cancelled => (None, None),
+    };
+    health.record_outcome(scope, peer, reported, truncated);
 }
 
 /// Classifies a record session, naming the failure kind once in the log.
@@ -323,7 +362,7 @@ impl SyncWorker {
     }
 
     /// Stops scheduling and dispatching. Durable loads still run.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn pause_for_test(&self, paused: bool) {
         self.paused.store(paused, Ordering::Release);
         if !paused {

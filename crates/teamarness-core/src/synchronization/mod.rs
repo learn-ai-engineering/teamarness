@@ -5,6 +5,7 @@
 
 pub(crate) mod exchange;
 pub(crate) mod frames;
+pub(crate) mod health;
 pub(crate) mod limits;
 pub(crate) mod log_view;
 pub(crate) mod network_handler;
@@ -20,6 +21,7 @@ pub(crate) mod scheduler;
 pub(crate) mod test_io;
 pub(crate) mod worker;
 
+pub(crate) use health::{PeerOutcome, SyncHealthRegistry};
 #[cfg(test)]
 pub(crate) use operation_store::log_id as operation_log_id;
 pub(crate) use quarantine::RecoveryReport;
@@ -58,6 +60,9 @@ pub(crate) use peer_sessions::PeerSessions;
 pub(crate) struct SyncServices {
     pub(crate) receiver: std::sync::Arc<dyn SyncReceiver>,
     pub(crate) sessions: std::sync::Arc<PeerSessions>,
+    /// Where every session reports what it saw of its peer, so subscriptions
+    /// can say whether this Installation is reaching anyone.
+    pub(crate) health: std::sync::Arc<SyncHealthRegistry>,
     /// Every bound one session obeys. Tests inject small values here, the same
     /// way they inject parking limits.
     pub(crate) limits: limits::SessionLimits,
