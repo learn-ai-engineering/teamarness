@@ -304,6 +304,29 @@ mod tests {
         }
     }
 
+    /// Verifies: TEAM.SYS.SHELL-R05
+    #[test]
+    fn shell_capability_targets_the_main_webview_not_windows() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(capability["webviews"], serde_json::json!(["main"]));
+        assert!(
+            capability.get("windows").is_none(),
+            "a window-scoped capability also reaches child webviews inside that window"
+        );
+        let permissions = capability["permissions"].as_array().unwrap();
+        assert!(permissions.iter().any(|value| value == "core:default"));
+        assert_eq!(
+            permissions
+                .iter()
+                .filter(|value| value
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("allow-")))
+                .count(),
+            19
+        );
+    }
+
     /// Verifies: TEAM.SYS-R01, TEAM.SYS.SHELL-R05
     #[test]
     fn bridge_and_registry_source_deny_internal_and_product_concepts() {
