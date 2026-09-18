@@ -1,12 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::process::ExitCode;
+
 #[tokio::main]
-async fn main() {
-    if let Err(error) = teamarness_repo_aware_package::RepoAwareBackend::default()
-        .serve()
-        .await
-    {
-        eprintln!("Repo-aware Package stopped: {error}");
-        std::process::exit(1);
-    }
+async fn main() -> ExitCode {
+    teamarness_repo_aware_package::router().run().await
 }

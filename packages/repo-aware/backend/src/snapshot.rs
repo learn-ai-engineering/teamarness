@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
@@ -63,20 +63,16 @@ pub fn normalize_github_url(origin: Option<&str>) -> Option<String> {
     None
 }
 
-struct SnapshotDropGuard {
-    cancelled: Arc<AtomicBool>,
-}
+/// How many snapshot walks have stopped because their request was cancelled.
+///
+/// A test reads it to prove that the interrupt flag reached the `gix` walk rather than the walk
+/// simply being abandoned while it kept a worker busy.
+pub static SNAPSHOT_INTERRUPTIONS: AtomicUsize = AtomicUsize::new(0);
 
-impl SnapshotDropGuard {
-    fn new(cancelled: Arc<AtomicBool>) -> Self {
-        Self { cancelled }
-    }
-}
-
-impl Drop for SnapshotDropGuard {
-    fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-    }
+/// Records one interrupted walk and names the error.
+fn interrupted() -> ErrorInfo {
+    SNAPSHOT_INTERRUPTIONS.fetch_add(1, Ordering::SeqCst);
+    error::SNAPSHOT_INTERRUPTED
 }
 
 pub fn compute_snapshot(
@@ -153,9 +149,8 @@ pub fn compute_snapshot_impl(
             )
         };
 
-    // Compute status with cooperative cancellation
-    let _guard = SnapshotDropGuard::new(cancel.clone());
-
+    // Compute status with cooperative cancellation. The flag belongs to the request's
+    // cancellation token, so the walk stops as soon as the host cancels.
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|_| error::NOT_GIT_REPOSITORY)?
@@ -170,7 +165,7 @@ pub fn compute_snapshot_impl(
             let mut count = 0;
             for item in iter {
                 if cancel.load(Ordering::SeqCst) {
-                    return Err(error::SNAPSHOT_INTERRUPTED);
+                    return Err(interrupted());
                 }
                 if item.is_ok() {
                     count += 1;
@@ -182,7 +177,7 @@ pub fn compute_snapshot_impl(
     };
 
     if cancel.load(Ordering::SeqCst) {
-        return Err(error::SNAPSHOT_INTERRUPTED);
+        return Err(interrupted());
     }
 
     let is_clean = status_count == 0;

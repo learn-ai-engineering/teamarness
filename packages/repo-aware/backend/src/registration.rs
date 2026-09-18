@@ -1,25 +1,55 @@
+use std::path::Path;
+
+use teamarness_package_sdk::CancellationToken;
+
 use crate::error::{self, ErrorInfo};
 
+/// Accepts one absolute path to an existing directory, and returns it canonicalized.
+///
+/// TEAM.SYS.REPO-R02: a relative path is refused **before** any filesystem call, so a relative
+/// name is never resolved against whatever working directory the Backend happens to have.
+///
+/// # Errors
+///
+/// Returns `path_missing`, `path_not_absolute`, `path_unavailable` or `not_directory`.
 pub fn validate_path(path: &str) -> Result<String, ErrorInfo> {
     if path.is_empty() {
         return Err(error::PATH_MISSING);
     }
+    if !Path::new(path).is_absolute() {
+        return Err(error::PATH_NOT_ABSOLUTE);
+    }
 
     let canonical = std::fs::canonicalize(path).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => error::PATH_MISSING,
-        std::io::ErrorKind::PermissionDenied => error::PATH_MISSING,
-        _ => error::PATH_MISSING,
+        _ => error::PATH_UNAVAILABLE,
     })?;
-
-    if !canonical.is_absolute() {
-        return Err(error::PATH_NOT_ABSOLUTE);
-    }
 
     if !canonical.is_dir() {
         return Err(error::NOT_DIRECTORY);
     }
 
     Ok(canonical.to_string_lossy().to_string())
+}
+
+/// Resolves one registration request to its checkout root, stopping if the request is cancelled.
+///
+/// Every step is a filesystem call, so the cancellation flag is checked between them: a Package UI
+/// that walks away never leaves a worker inspecting a repository nobody is waiting for.
+///
+/// # Errors
+///
+/// Returns the first validation failure, or `snapshot_interrupted` when the request was cancelled.
+pub fn resolve_registration(path: &str, cancel: &CancellationToken) -> Result<String, ErrorInfo> {
+    let canonical = validate_path(path)?;
+    if cancel.is_cancelled() {
+        return Err(error::SNAPSHOT_INTERRUPTED);
+    }
+    validate_git_checkout(&canonical)?;
+    if cancel.is_cancelled() {
+        return Err(error::SNAPSHOT_INTERRUPTED);
+    }
+    git_root(&canonical)
 }
 
 pub fn validate_git_checkout(path: &str) -> Result<(), ErrorInfo> {

@@ -74,9 +74,49 @@ fn normalize_subdirectory_to_root() {
 }
 
 #[test]
-fn reject_relative_path() {
-    let result = registration::validate_path("relative/path");
-    assert!(result.is_err());
+fn reject_relative_missing_path() {
+    assert_eq!(
+        registration::validate_path("relative/path"),
+        Err(error::PATH_NOT_ABSOLUTE)
+    );
+}
+
+// Verifies: TEAM.SYS.REPO-R02
+#[test]
+fn reject_existing_relative_path_without_resolving_it() {
+    // The test's working directory is the crate directory, where `src` exists. A relative path
+    // that happens to resolve is still refused, and it is refused before any filesystem call.
+    assert!(std::path::Path::new("src").is_dir());
+    assert_eq!(
+        registration::validate_path("src"),
+        Err(error::PATH_NOT_ABSOLUTE)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_denied_is_path_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc_geteuid() } == 0 {
+        return; // root reads everything, so the case cannot be produced
+    }
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("locked");
+    let child = parent.join("inside");
+    fs::create_dir_all(&child).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = registration::validate_path(child.to_string_lossy().as_ref());
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(result, Err(error::PATH_UNAVAILABLE));
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
 }
 
 #[test]
