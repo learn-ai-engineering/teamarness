@@ -98,7 +98,7 @@ Export `mount(context)` from the ESM entrypoint and return an idempotent unmount
 
 Use `context.root` for rendered content and `context.client` for Package requests. Clean up listeners, subscriptions, timers, and DOM nodes during unmount. Present loading and request failures explicitly.
 
-The UI should own interaction and presentation, not durable product authority. Do not calculate canonical records in the UI, use browser storage as Package persistence, call Tauri directly, or reach into Shell-owned DOM.
+The UI should own interaction and presentation, not durable product authority. Do not calculate canonical records in the UI. The UI runs in a sandboxed frame, so Tauri is unreachable, browser storage and the network are unavailable, and the Shell-owned DOM is out of reach; `context.client` is the only way out.
 
 Use semantic controls and accessible names. Mark purely decorative content outside the accessibility tree. Test behavior through user-visible state and PackageClient requests rather than internal function calls.
 
@@ -139,7 +139,7 @@ There is no supported in-place SDK upgrade yet. Teamarness SDK fixes do not arri
 
 A Package Backend runs with the current user's ambient filesystem, network, and process authority. Process supervision is a recovery boundary, not a sandbox. Avoid unnecessary dependencies and operating-system access. Validate paths and untrusted input.
 
-A Package UI runs in the Shell's main webview. A Shadow Root limits style collisions, but it is not a sandbox and does not remove DOM, JavaScript, network, or known Tauri-command authority. Treat the mount root and PackageClient as the supported interface.
+A Package UI runs in a sandboxed frame with an opaque origin. Tauri is unreachable, the Shell's DOM and storage are unreachable, and the frame's own policy denies network requests, nested frames, form navigation, and inline code. Treat the mount root and PackageClient as the supported interface. Frame isolation separates realms, not threads: a UI that blocks its thread freezes the Shell.
 
 Review both Backend and UI dependencies before shipping or registering the Package.
 

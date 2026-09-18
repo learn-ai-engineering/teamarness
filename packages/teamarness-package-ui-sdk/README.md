@@ -1,12 +1,12 @@
 # Teamarness Package UI SDK
 
-`@teamarness/package-ui-sdk` is the TypeScript contract for a Package UI mounted by the Teamarness Shell. It provides the mount-scoped Package client, the authoritative theme-token names, and an optional framework-neutral CSS kit.
+`@teamarness/package-ui-sdk` is the TypeScript contract for a Package UI mounted by the Teamarness Shell. It provides the mount, client, and presentation types, the authoritative theme-token names, and an optional framework-neutral CSS kit. The client implementation is Shell-owned and lives in the Package UI Frame; the SDK carries no Shell or Tauri code.
 
 A Package owns everything it renders inside its Shadow Root. The Shell supplies the mount and inherited semantic values; it does not own a Package-owned header, secondary navigation, content hierarchy, dialogs, tables, or domain patterns. The CSS kit styles only classes a Package explicitly applies.
 
 ## Theme tokens
 
-`TEAMARNESS_THEME_TOKENS` is the exact frozen token-name authority. `TeamarnessThemeToken` is derived from that constant, and `PackageMountContext.themeTokens` is typed with it. The Shell defines values on the Package mount ancestor, so changes inherit into the Shadow Root without a theme event.
+`TEAMARNESS_THEME_TOKENS` is the exact frozen token-name authority. `TeamarnessThemeToken` is derived from that constant, and `PackageMountContext.themeTokens` is typed with it. The Shell sends values across the frame bridge and the frame runtime defines them on the Package UI Frame's document root, so changes reach the Shadow Root without a theme event.
 
 | Token | Intended use |
 |---|---|
@@ -101,4 +101,4 @@ Build the Package's information architecture in Package markup. For example, thi
 </article>
 ```
 
-The Shell continues to own Workspace and Package selection, the right-pane mount, inherited token values, and generic mount recovery. Hiding or unmounting this UI does not suspend its Package Backend. A Shadow Root provides style locality, not a security boundary; Package UI code shares the webview's DOM and known Tauri-command authority.
+The Shell continues to own Workspace and Package selection, the right-pane mount, the Package UI Frame and its runtime, delivered token values, and generic mount recovery. Hiding or unmounting this UI does not suspend its Package Backend. Package UI code runs in a sandboxed frame with an opaque origin: the Shell's DOM, Tauri, browser storage, and the network are all unreachable, and `context.client` is the only way out. A Shadow Root still provides style locality, not a security boundary.

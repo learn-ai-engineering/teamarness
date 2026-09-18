@@ -125,7 +125,7 @@ The protocol and supported Rust tooling have separate contracts:
 - [`crates/teamarness-package-host/README.md`](crates/teamarness-package-host/README.md) describes the host facade and lifecycle.
 - [`crates/teamarness-package-sdk/README.md`](crates/teamarness-package-sdk/README.md) describes the Rust Backend SDK.
 
-Package trust is broad. Package Processes have the current user's ambient filesystem, network, and process authority. Process separation is a recovery boundary, not a sandbox. A same-webview Package UI shares DOM and known Tauri-command authority with the Shell. Its Shadow Root provides style locality, not a security boundary. Only install or bundle Package code you trust.
+Package trust is broad. Package Processes have the current user's ambient filesystem, network, and process authority. Process separation is a recovery boundary, not a sandbox. A Package UI runs in its own sandboxed frame with an opaque origin, so it reaches neither the Shell's DOM nor any Tauri command; it talks to Teamarness only through its mount-scoped bridge. Frame isolation separates realms, DOM, storage, and Tauri access, not threads: a Package UI that blocks its thread still freezes the Shell. Only install or bundle Package code you trust.
 
 ## Core Runtime behavior
 

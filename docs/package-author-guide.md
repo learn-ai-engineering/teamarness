@@ -70,17 +70,30 @@ The contract file may use at most 1 MiB. Each generic request, response, subscri
 
 Build one UTF-8 ESM entrypoint of at most 8 MiB. Declare at most 64 static assets, each at most 8 MiB. The entrypoint, assets, and contract may total at most 32 MiB. Do not emit undeclared chunks or remote imports.
 
-Export `mount(context)`. The context provides a fresh Shadow Root, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. Use `@teamarness/package-ui-sdk` for requests, cancellation, ordered subscriptions, and post-listener acknowledgement.
+Export `mount(context)`. The context provides a fresh Shadow Root inside the Package UI Frame, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. `context.client` gives requests, cancellation, ordered subscriptions, and post-listener acknowledgement; `@teamarness/package-ui-sdk` supplies the types and the optional CSS kit.
+
+### Package UI frame restrictions
+
+The Shell runs each Package UI Mount in its own sandboxed frame with an opaque origin. Inside it:
+
+- `localStorage`, `sessionStorage`, IndexedDB, and cookies are unavailable.
+- `fetch`, XHR, and WebSocket are denied by the frame's policy. All data goes through `context.client`.
+- Tauri commands, Tauri globals, the Shell's DOM, and other Packages are unreachable.
+- There are no popups, no `window.open`, and no `alert`, `confirm`, or `prompt`.
+- A `position: fixed` overlay covers the Package pane, not the window.
+- Navigating the frame away faults the mount.
+- Any uncaught error or unhandled rejection anywhere in the frame is a UI fault, not only one attributed to your module.
+- The `__teamarness/` path of the resource URL is reserved for the Shell-owned frame document, stylesheet, and runtime. A declared asset under that path is shadowed.
 
 ### Theme and Package-owned composition
 
-The UI SDK's [Package UI theme and CSS kit guide](../packages/teamarness-package-ui-sdk/README.md) is authoritative for the exact 12 semantic token names and the optional class-based kit. The Shell defines token values on the mount ancestor. Use the tokens inside your Shadow Root so System, Light, and Dark changes inherit without a Package event.
+The UI SDK's [Package UI theme and CSS kit guide](../packages/teamarness-package-ui-sdk/README.md) is authoritative for the exact 12 semantic token names and the optional class-based kit. The Shell sends token values across the frame bridge and the frame runtime defines them on the frame document root. Use the tokens inside your Shadow Root so System, Light, and Dark changes apply without a Package event.
 
 A Package owns its complete internal composition, including its Package-owned header, secondary navigation, forms, state feedback, and domain content. The Shell owns Workspace and Package selection, the mount, inherited token values, and generic recovery; do not copy Shell navigation into a Package. The optional `installPackageUiKit(root)` helper supplies only common controls, fields, validation, notices, panels, flow, and visible focus. It uses a constructed stylesheet in the Shadow Root's `adoptedStyleSheets`. Retain its cleanup callback and invoke it from your idempotent unmount function.
 
-The host's `style-src` rejects runtime inline `<style>` elements and `style` attributes. Package-owned styling must respect that policy too. Use a separate constructed `CSSStyleSheet` in the Package Shadow Root, and remove only that sheet during unmount. Do not fall back to inline styles, nonces, hashes, `data:` styles, or `blob:` styles if constructed stylesheets are unavailable.
+The frame document policy rejects runtime inline `<style>` elements and `style` attributes. Package-owned styling must respect that policy too. Use a separate constructed `CSSStyleSheet` in the Package Shadow Root, and remove only that sheet during unmount. Do not fall back to inline styles, nonces, hashes, `data:` styles, or `blob:` styles if constructed stylesheets are unavailable.
 
-The Shell loads admitted resources through `teamarness-package://`. The loader accepts only `GET` and `HEAD` for exact admitted paths. It rejects traversal, encoded separators, query selectors, stale tokens, undeclared files, changed cache bytes, and MIME changes. Responses disable sniffing and storage. Package code never receives the mount token or a source, cache, or data path.
+The Package UI Frame loads admitted resources through `teamarness-package://`. The loader accepts only `GET` and `HEAD` for exact admitted paths. It rejects traversal, encoded separators, query selectors, stale tokens, undeclared files, changed cache bytes, and MIME changes. Responses disable sniffing and storage. Package code never receives the mount token or a source, cache, or data path.
 
 ## Capabilities and local data
 
@@ -92,7 +105,7 @@ The initialization frame grants an absolute Package Data Directory. Your Backend
 
 A Package Backend is trusted native code. It has the current user's ambient filesystem, network, and process authority. Process supervision handles ordinary exits, deadlines, graceful shutdown, and conservative orphan cleanup. It is not a sandbox and does not contain hostile code or deliberately evasive descendants.
 
-A same-webview Package UI can access the Shell DOM and any Tauri command it knows. A Shadow Root limits style collisions only. It does not reduce DOM, JavaScript, network, or Tauri-command authority. Review both Backend and UI code before trusting a Package.
+A Package UI runs in a sandboxed frame with an opaque origin, so it reaches neither the Shell's DOM nor any Tauri command, and it has no storage and no network. Frame isolation separates realms, DOM, storage, and Tauri access; it does not separate threads, so a Package UI that blocks its thread freezes the Shell, and it places no limit on what the Package Backend can do. Review both Backend and UI code before trusting a Package.
 
 ## Bundled and local Package Source kinds
 

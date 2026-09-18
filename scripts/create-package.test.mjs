@@ -153,6 +153,7 @@ test("copies canonical SDK production trees and records exact provenance", async
       "Semantic Capabilities",
       "metadata changes while the meaningful output stays fixed",
       "not a sandbox",
+      "sandboxed frame",
       "npm run build",
     ]) assert.ok(agentGuide.includes(phrase), `AGENTS.md must include ${phrase}`);
     assert.equal(agentGuide.includes("__PACKAGE_"), false);

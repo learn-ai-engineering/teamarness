@@ -48,7 +48,7 @@ Replace `<app-data>` and the Package Directory below with absolute paths. Do not
 
 `expectedIdentity` must exactly match the Package Manifest. The complete `trusted_native_code_v1` evidence is explicit acknowledgement that the Backend can use the current user's ambient filesystem, network, and process authority. Process separation is not a sandbox.
 
-The Package UI runs in the Shell's main webview. Its Shadow Root limits styles, but the code retains DOM and known Tauri-command authority. It is not a UI sandbox. Register only code you trust.
+The Package UI runs in its own sandboxed frame inside the Shell webview. It cannot reach the Shell's DOM, browser storage, the network, or any Tauri command, and it talks to Teamarness only through its mount-scoped bridge. Frame isolation does not contain a UI that blocks its thread, and it does not limit what the Backend can do. Register only code you trust.
 
 ## Override a bundled Package
 

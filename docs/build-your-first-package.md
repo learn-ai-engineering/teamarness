@@ -246,7 +246,7 @@ The UI owns interaction and presentation. It keeps the selected controls, asks t
 >
 > Generate must preserve the selected controls and send only algorithm and palette IDs. Keep the complete draft returned by the Backend. Save must send that draft's canonical recipe, including its seed, so Save stores the artwork currently on screen. Selecting saved art must display it without generating a replacement. Expose the artwork as `role="img"`, give it a useful accessible label, and mark the 192 decorative cells `aria-hidden="true"`.
 >
-> Use only `context.client` for Package requests. Do not add direct Tauri commands, browser persistence, remote imports, networking, or rendering formulas. Add focused UI tests for dropdown order and accessible names, absence of visible dropdown labels, the initial read, generation, saving the visible recipe, saved-art selection, errors, and idempotent unmount. Run the UI typecheck, lint, and tests.
+> Use only `context.client` for Package requests. A sandboxed frame has no Tauri commands, no browser storage, and no network, so do not attempt them; do not add remote imports or rendering formulas. Add focused UI tests for dropdown order and accessible names, absence of visible dropdown labels, the initial read, generation, saving the visible recipe, saved-art selection, errors, and idempotent unmount. Run the UI typecheck, lint, and tests.
 
 ### Human checkpoint 3
 
@@ -295,7 +295,7 @@ This distinction matters. Your project is where you author Emojart. The Package 
 
 A local registration tells one Teamarness Installation where to find your built Package Directory. It does not add Emojart to the application bundle or make it available to anyone else.
 
-Review the code before registering it. A Package Backend runs as native code with the current user's filesystem, network, and process authority. It is not a sandbox. The Package UI runs in the same-webview UI host as the Shell. Its Shadow Root separates styles, not DOM or known Tauri-command authority.
+Review the code before registering it. A Package Backend runs as native code with the current user's filesystem, network, and process authority. It is not a sandbox. The Package UI runs in its own sandboxed frame inside the Shell webview, so it reaches neither the Shell's DOM nor any Tauri command; a sandboxed frame does not contain a UI that blocks its thread.
 
 ### Agent brief 5
 

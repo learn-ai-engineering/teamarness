@@ -63,7 +63,7 @@ test("Package authoring guidance follows the local Package development path", as
     "restart",
     "trusted_native_code_v1",
     "not a sandbox",
-    "same-webview",
+    "sandboxed frame",
     "There is no hot reload",
     "Workspace enablement",
     "synchronization",

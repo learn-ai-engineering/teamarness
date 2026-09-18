@@ -11,7 +11,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
 | **Package** | A vertical module that owns one product domain, including its model, records, schemas, projections, policy, UI, and Package-specific membership. A Package consumes Semantic Capabilities for Teamarness-owned authority and generic services |
 | **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and Teamarness implementations of Semantic Capabilities |
-| **Shell** | The Tauri desktop host that owns Package navigation and UI mounting, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
+| **Shell** | The Tauri desktop host that owns Package navigation and UI mounting in Package UI Frames, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
 
 ## Identity and Membership
 
@@ -49,6 +49,9 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Process** | One supervised operating-system process running a Package Backend for one Package Instance |
 | **Package Process Protocol** | The versioned, language-neutral executable contract between the Package Host and a Package Process |
 | **Package UI Mount** | The Shell-owned attachment of a Package UI to the visible Package pane for one Package Instance. Mounting and visibility do not define Backend lifetime |
+| **Package UI Frame** | The sandboxed frame, with an opaque origin, in which the Shell runs one Package UI Mount's code, separate from the Shell's JavaScript realm |
+| **Package UI Bridge** | The mount-scoped message channel between a Package UI Frame and the Shell. The Shell derives mount identity from the channel, never from message content |
+| **Frame Runtime** | The Shell-owned script inside a Package UI Frame that builds the mount context and client and calls the Package UI's `mount` |
 | **Package Data Directory** | The durable local directory assigned to one Package Identity, Workspace, and Installation. The Package owns its contents and local representation |
 | **Package Artifact** | A built Package file selected for a specific target and entrypoint |
 | **Package Directory** | A directory containing one Package Manifest and the Package Artifacts it identifies. A configured local Package path identifies this directory |
