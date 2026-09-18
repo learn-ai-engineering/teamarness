@@ -5,4 +5,12 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   { ignores: ["dist/**"] },
+  {
+    files: ["src/**/*.ts"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        patterns: [{ group: ["@tauri-apps/*"], message: "The author SDK carries no Shell or Tauri host code." }],
+      }],
+    },
+  },
 );

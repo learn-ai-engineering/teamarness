@@ -257,6 +257,25 @@ test("Package UIs run only in sandboxed frames and the Shell realm loads no Pack
   const scriptDirective = csp.split(";").map((directive) => directive.trim()).find((directive) => directive.startsWith("script-src"));
   assert.equal(scriptDirective, "script-src 'self'");
   assert.ok(csp.includes("frame-src teamarness-package:"));
+
+  const sdkManifest = JSON.parse(await read("packages/teamarness-package-ui-sdk/package.json"));
+  assert.equal(sdkManifest.dependencies?.["@tauri-apps/api"], undefined);
+  const authorTrees = [
+    "packages/teamarness-package-ui-sdk/src",
+    "packages/reference-package/ui/src",
+    "packages/tutorial/ui/src",
+    "packages/conversations-package/ui/src",
+    "packages/repo-aware/ui/src",
+    "templates/package-foundation/v1/ui/src",
+    "apps/teamarness-desktop/src/package-frame",
+  ];
+  for (const tree of authorTrees) {
+    const sources = await sourceFiles(tree);
+    assert.ok(sources.length > 0, `${tree} was not read`);
+    for (const { path, source } of sources) {
+      assert.ok(!source.includes("@tauri-apps"), `${path} must not reach Tauri`);
+    }
+  }
 });
 
 test("repository authoring records the temporary vendoring policy", async () => {

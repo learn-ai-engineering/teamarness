@@ -10,9 +10,6 @@
     "lint": "eslint src",
     "test": "vitest run"
   },
-  "dependencies": {
-    "@tauri-apps/api": "2.11.1"
-  },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "eslint": "10.10.0",
