@@ -8,6 +8,15 @@ import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
+async function rustFiles(directory) {
+  const entries = await readdir(new URL(`${directory}/`, root), { withFileTypes: true, recursive: true });
+  const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".rs"));
+  return Promise.all(files.map(async (entry) => {
+    const path = `${entry.parentPath.slice(new URL(root).pathname.length)}/${entry.name}`;
+    return { path, source: await readFile(new URL(`${entry.parentPath}/${entry.name}`, "file://"), "utf8") };
+  }));
+}
+
 async function sourceFiles(directory) {
   const entries = await readdir(new URL(`${directory}/`, root), { withFileTypes: true, recursive: true });
   const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".ts"));
@@ -174,6 +183,47 @@ test("Package UIs use contract-typed requests and shared style adoption", async 
       /teamarness-contract-types .*--check/,
       `${directory} must check its generated contract types before tsc`,
     );
+  }
+});
+
+const BACKEND_DIRECTORIES = [
+  "packages/reference-package/backend",
+  "packages/tutorial/backend",
+  "packages/conversations-package/backend",
+  "packages/repo-aware/backend",
+  "templates/package-foundation/v1/backend",
+];
+
+// This test drives the real Backend executable over its stdin lifeline, which is process
+// behaviour the harness cannot express, so it builds its own frames.
+const HAND_BUILT_FRAME_EXEMPTIONS = [
+  "packages/conversations-package/backend/tests/process_lifeline.rs",
+];
+
+test("Backends use the typed router and tests use the harness", async () => {
+  for (const directory of BACKEND_DIRECTORIES) {
+    const sources = await rustFiles(`${directory}/src`);
+    assert.ok(sources.length > 0, `${directory}/src was not read`);
+    for (const { path, source } of sources) {
+      assert.doesNotMatch(source, /fn object</, `${path} must not keep a private JSON helper`);
+      assert.doesNotMatch(source, /fn empty_object/, `${path} must not keep a private JSON helper`);
+      assert.ok(!source.includes("impl Backend for"), `${path} must route through Router`);
+      assert.ok(
+        !source.includes(".data_directory().get("),
+        `${path} must read typed initialization values`,
+      );
+    }
+
+    const tests = await rustFiles(`${directory}/tests`);
+    assert.ok(tests.length > 0, `${directory}/tests was not read`);
+    for (const { path, source } of tests) {
+      const normalized = path.replaceAll("//", "/");
+      if (HAND_BUILT_FRAME_EXEMPTIONS.some((exempt) => normalized.endsWith(exempt))) continue;
+      assert.ok(
+        !source.includes('"kind": "initialize"'),
+        `${path} must drive the Backend through the SDK harness, not hand-built frames`,
+      );
+    }
   }
 });
 

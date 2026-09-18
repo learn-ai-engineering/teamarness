@@ -43,10 +43,14 @@ The current foundation proves this path with `__REQUEST_NAMESPACE__.read`. It ha
 | `ui-contract.json` | Contains closed JSON schemas for every UI request, response, subscription request, and event. |
 | `backend/src/lib.rs` | Owns domain behavior, lifecycle handling, validation, and Package data. |
 | `backend/src/main.rs` | Starts the Backend through the vendored SDK. Keep it thin. |
-| `backend/tests/` | Exercises Backend behavior through stable public seams. |
+| `backend/tests/` | Exercises Backend behavior through the SDK test harness, with no protocol frames. |
 | `ui/src/index.ts` | Mounts the Package UI and communicates through the supplied `PackageClient`. |
-| `ui/src/index.test.ts` | Exercises UI behavior with a Package client test double. |
+| `ui/src/styles.ts` | Holds this Package's CSS, adopted into the mount and removed on unmount. |
+| `ui/src/contract.generated.ts` | Generated request and response types. Regenerate it; never edit it. |
+| `ui/src/index.test.ts` | Exercises UI behavior with the UI SDK's fake Package client. |
 | `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes into `dist/`. |
+| `scripts/validate-dist.mjs` | Applies Package Admission's rules to `dist/` and smoke-launches the Backend. |
+| `scripts/verify-vendor.mjs` | Fails when a vendored SDK file no longer matches recorded provenance. |
 | `vendor/teamarness/` | Contains the generated copies of the Package Process Protocol and SDK source used by this project. |
 | `teamarness-authoring.json` | Records template, protocol, UI host, SDK provenance, and request namespace information. |
 | `Cargo.lock` and `package-lock.json` | Lock this project's Rust and JavaScript dependency graphs. Commit both. |
@@ -86,11 +90,39 @@ Prefer deterministic pure functions for rules that can be expressed that way. Te
 When generated output includes a seed, revision, mode, or other value that is meant to affect the result, test the result itself. Use fixed inputs at the pure behavior seam and prove both directions: equal inputs produce equal output, and selected unequal inputs produce unequal output. A test is wrong if only metadata changes while the meaningful output stays fixed.
 
 
-The Backend receives its Package Data Directory during lifecycle activation. Use that supplied path. Do not hard-code an application-data path, inspect Teamarness databases, or store Package records in the project directory.
+The Backend receives its Package Data Directory at activation, as `Activation::data_directory()`. Use that supplied path. Do not hard-code an application-data path, inspect Teamarness databases, or store Package records in the project directory.
 
 A Package Data Directory belongs to one Package Identity, Workspace, and Installation. Data is not global across Workspaces. Teamarness does not inspect, migrate, back up, delete, synchronize, or share Package-owned files for you.
 
-Keep lifecycle operations bounded. The vendored SDK handles the Package Process Protocol and control-frame machinery. Use its public adapter rather than hand-writing protocol frames.
+Keep lifecycle operations bounded. The vendored SDK handles the Package Process Protocol and control-frame machinery: build a `Router`, register typed handlers, and let the activation hook produce the state those handlers share. Do not hand-write protocol frames.
+
+### Validate before you build
+
+`npm run validate` applies Package Admission's manifest and UI contract rules to this project and prints the host's verdict, with the rule that failed and where. Run it after every contract or manifest change, before building. `npm run build` assembles `dist/` and then runs the same rules against the assembled Package Directory, with a Backend smoke launch.
+
+### Blocking work and cancellation
+
+Backend handlers run on an async runtime. Anything that blocks — a file read or write, SQLite, hashing, a directory walk — goes inside `ctx.blocking(...)`, which moves it off that runtime and hands the closure a cancellation token.
+
+The host cancels a request, and the SDK cancels its token, when the caller cancels, when the request's deadline passes, and when the Package is suspended or disposed. Long work checks `cancel.is_cancelled()` and returns early. A handler that blocks the runtime freezes every other request, including the host's health checks.
+
+### Errors
+
+A Package error code is namespaced and stable: `__REQUEST_NAMESPACE__.storage_failed`, not "error" and not a sentence. It reaches the Package UI unchanged, with `retryable` and bounded `details`, so the UI can tell "try again" from "this cannot work".
+
+Mark an error `retryable` only when repeating the same request may succeed. Invalid input is not retryable; a failed write may be.
+
+The SDK owns the codes that are not about this product: `package.not_active`, `package.unknown_operation`, `package.unknown_subscription`, `package.invalid_payload`, `package.blocking_task_failed`, and `cancelled`. Do not redefine them.
+
+### Testing the Backend without frames
+
+`backend/tests/` drives the Backend through `teamarness_package_sdk::testing::{HarnessBuilder, Harness}`: activate, request, subscribe, suspend, recover, dispose, shutdown — with a real temporary Package Data Directory and no hand-built frames. `assert_router_matches_contract` proves the router and `ui-contract.json` declare the same operations, so a contract change without a handler fails the tests.
+
+### Typed UI requests
+
+The UI calls `typedPackageClient<PackageContract>(context.client)`, whose types come from `ui-contract.json` through `teamarness-contract-types`. Change the contract first, then run `npm run contract-types --workspace generated-package-ui` to regenerate `ui/src/contract.generated.ts` and commit it. `npm run typecheck` fails when the committed types are stale, and the UI cannot name an operation or build a payload the contract does not describe.
+
+Adopt Package CSS with `adoptPackageStyles(context.root, ...)` and drop it in the unmount. Present a failure with `describePackageError(error)`, and ignore an aborted request with `isAbortError(error)`.
 
 ### Keep the UI mount-scoped
 
@@ -133,6 +165,8 @@ The source under `vendor/teamarness/` was copied from the Teamarness checkout th
 
 Treat vendored SDK files as external infrastructure. Do not modify them to implement Package behavior or to work around a contract mistake. Change Package code first. If an SDK defect blocks correct implementation, report the exact defect and the smallest upstream change needed.
 
+`teamarness-authoring.json` records which checkout the copy came from — `sdkRevision`, `sdkRevisionDirty` — and a digest of every vendored tree. `npm run check:vendor` recomputes those digests as part of `npm test`, so a failure there means a vendored file was edited: restore it rather than weakening the check. From a Teamarness checkout, `npm run create:package -- --vendor-report <project>` reports which trees differ from that checkout, and changes nothing.
+
 There is no supported in-place SDK upgrade yet. Teamarness SDK fixes do not arrive in this repository automatically. Preserve source notices, license metadata, relative dependency paths, and `teamarness-authoring.json` provenance.
 
 ## Security model
@@ -165,13 +199,14 @@ While editing:
 Before reporting completion, run:
 
 ```sh
+npm run validate
 npm run typecheck
 npm run lint
 npm test
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 npm run build
 ```
+
+`npm run lint` already runs `cargo fmt --all --check` and `cargo clippy`.
 
 Then inspect `dist/__PACKAGE_IDENTITY__/` and report:
 

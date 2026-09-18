@@ -92,6 +92,7 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
     })).unwrap()).unwrap();
     fs::set_permissions(&registration, fs::Permissions::from_mode(0o600)).unwrap();
 
+    let installation_again = installation.clone();
     let host = PackageHost::open(
         PackageHostConfig::new(&application, &index, &private, installation),
         core.clone(),
@@ -135,10 +136,45 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
         object(&local_response).get("displayName"),
         Some(&PackageValue::String(local_display_name))
     );
+    // The generated Package counts reads in its own Package Data Directory.
+    assert_eq!(read_count(&local_response), 1);
+    let second_read = request(
+        &host,
+        instance_key("dev.teamarness.emojart", &workspace),
+        "emojart.read",
+    )
+    .await;
+    assert_eq!(read_count(&second_read), 2);
+    host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+
+    // A new Host, and so a new Backend process, reads the same persisted count.
+    let host = PackageHost::open(
+        PackageHostConfig::new(&application, &index, &private, installation_again),
+        core.clone(),
+    )
+    .await
+    .unwrap();
+    let after_restart = request(
+        &host,
+        instance_key("dev.teamarness.emojart", &workspace),
+        "emojart.read",
+    )
+    .await;
+    assert_eq!(read_count(&after_restart), 3);
     host.execute(PackageHostCommand::Shutdown(ShutdownHost))
         .await
         .unwrap();
     core.shutdown().await.unwrap();
+}
+
+fn read_count(response: &PackageValue) -> u64 {
+    match object(response).get("readCount") {
+        Some(PackageValue::Unsigned(count)) => *count,
+        Some(PackageValue::Integer(count)) => u64::try_from(*count).unwrap(),
+        other => panic!("readCount must be a non-negative integer, got {other:?}"),
+    }
 }
 
 async fn request(

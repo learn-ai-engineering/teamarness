@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::{Connection, params};
+use serde_json::json;
 use teamarness_package_protocol::JsonValue;
 use teamarness_package_sdk::capabilities::membership::Membership;
 use teamarness_package_sdk::capabilities::signing::Signing;
@@ -202,23 +203,14 @@ impl ReferenceActive {
 
     fn snapshot_value(&self) -> Result<JsonValue, BackendError> {
         let state = self.state.snapshot().map_err(storage_error)?;
-        Ok(object([
-            ("counter", JsonValue::from(state.counter)),
-            ("backgroundMarker", JsonValue::from(state.background_marker)),
-            (
-                "membershipVersion",
-                JsonValue::String(self.membership_version.clone()),
-            ),
-            ("signingVerified", JsonValue::Bool(self.signing_verified)),
-            (
-                "processGeneration",
-                JsonValue::String(self.process_generation.clone()),
-            ),
-            (
-                "packageVersion",
-                JsonValue::String(self.package_version.clone()),
-            ),
-        ]))
+        Ok(json!({
+            "counter": state.counter,
+            "backgroundMarker": state.background_marker,
+            "membershipVersion": self.membership_version,
+            "signingVerified": self.signing_verified,
+            "processGeneration": self.process_generation,
+            "packageVersion": self.package_version,
+        }))
     }
 }
 
@@ -333,7 +325,7 @@ pub fn router() -> Router<ReferenceActive> {
             Err::<JsonValue, _>(BackendError::new(
                 "reference.requested_failure",
                 false,
-                object([("reason", JsonValue::String("requested".into()))]),
+                json!({ "reason": "requested" }),
             ))
         },
     )
@@ -365,31 +357,18 @@ fn capability_error(error: BackendError) -> BackendError {
     BackendError::new(
         "reference.capability_failed",
         true,
-        object([("capabilityCode", JsonValue::String(error.code().to_owned()))]),
+        json!({ "capabilityCode": error.code() }),
     )
 }
 
 fn invalid_capability_response() -> BackendError {
-    BackendError::new("reference.capability_invalid", false, empty_object())
+    BackendError::new("reference.capability_invalid", false, json!({}))
 }
 
 fn initialization_error(_error: BackendError) -> BackendError {
-    BackendError::new("reference.initialization_invalid", false, empty_object())
+    BackendError::new("reference.initialization_invalid", false, json!({}))
 }
 
 fn storage_error(_error: StateError) -> BackendError {
-    BackendError::new("reference.storage_failed", true, empty_object())
-}
-
-fn empty_object() -> JsonValue {
-    JsonValue::Object(Default::default())
-}
-
-fn object<const N: usize>(entries: [(&str, JsonValue); N]) -> JsonValue {
-    let mut value = JsonValue::Object(Default::default());
-    let fields = value.as_object_mut().expect("new object");
-    for (name, entry) in entries {
-        fields.insert(name.to_owned(), entry);
-    }
-    value
+    BackendError::new("reference.storage_failed", true, json!({}))
 }

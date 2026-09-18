@@ -754,9 +754,10 @@ dependencies = [
 name = "teamarness-generated-package-backend"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
- "teamarness-package-protocol",
  "teamarness-package-sdk",
+ "tempfile",
  "tokio",
 ]
 

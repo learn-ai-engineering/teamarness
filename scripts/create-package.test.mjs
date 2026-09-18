@@ -172,6 +172,12 @@ test("copies canonical SDK production trees and records exact provenance", async
       "not a sandbox",
       "sandboxed frame",
       "npm run build",
+      "npm run validate",
+      "blocking",
+      "cancellation",
+      "package.unknown_operation",
+      "typedPackageClient",
+      "teamarness-authoring.json",
     ]) assert.ok(agentGuide.includes(phrase), `AGENTS.md must include ${phrase}`);
     assert.equal(agentGuide.includes("__PACKAGE_"), false);
     assert.equal(agentGuide.includes("__REQUEST_NAMESPACE__"), false);

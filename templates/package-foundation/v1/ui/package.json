@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "teamarness-contract-types --contract ../ui-contract.json --out src/contract.generated.ts --type-name PackageContract --check && tsc --noEmit",
     "lint": "eslint src vite.config.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "contract-types": "teamarness-contract-types --contract ../ui-contract.json --out src/contract.generated.ts --type-name PackageContract"
   },
   "dependencies": {
     "@teamarness/package-ui-sdk": "file:../../vendor/teamarness/package-ui-sdk"

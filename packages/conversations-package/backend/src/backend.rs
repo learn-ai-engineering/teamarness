@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
-use serde_json::{Map, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
@@ -17,15 +17,8 @@ use crate::store::{ConversationStore, IngestResult};
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
 
-fn object<const N: usize>(entries: [(&str, JsonValue); N]) -> JsonValue {
-    let mut o = Map::new();
-    for (k, v) in entries {
-        o.insert(k.into(), v);
-    }
-    JsonValue::Object(o)
-}
 fn error(code: &str, retryable: bool) -> BackendError {
-    BackendError::new(code, retryable, object([]))
+    BackendError::new(code, retryable, json!({}))
 }
 fn storage_failed() -> BackendError {
     error("conversations.storage_failed", true)
@@ -40,7 +33,7 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
     BackendError::new(
         "conversations.capability_unavailable",
         cause.retryable(),
-        object([("causeCode", JsonValue::String(cause.code().to_owned()))]),
+        json!({ "causeCode": cause.code() }),
     )
 }
 /// What the Package tells the UI about synchronization.
@@ -309,17 +302,17 @@ impl ConversationsActive {
     fn snapshot_value(&self) -> Result<JsonValue, BackendError> {
         let report = self.report();
         let channels = self.store.channels().map_err(|_| storage_failed())?;
-        let visible = channels
+        let visible: Vec<JsonValue> = channels
             .into_iter()
             .filter(|channel| !channel.hidden)
             .map(|channel| {
                 let can_hide = channel.creator == self.installation && channel.slug != "general";
-                object([
-                    ("id", JsonValue::String(channel.id)),
-                    ("slug", JsonValue::String(channel.slug)),
-                    ("canHide", JsonValue::Bool(can_hide)),
-                    ("unreadCount", JsonValue::from(channel.unread_count)),
-                ])
+                json!({
+                    "id": channel.id,
+                    "slug": channel.slug,
+                    "canHide": can_hide,
+                    "unreadCount": channel.unread_count,
+                })
             })
             .collect();
         let warnings = if self
@@ -333,14 +326,11 @@ impl ConversationsActive {
         } else {
             Vec::new()
         };
-        Ok(object([
-            ("channels", JsonValue::Array(visible)),
-            (
-                "availability",
-                JsonValue::String(report.availability.as_str().to_owned()),
-            ),
-            ("warnings", JsonValue::Array(warnings)),
-        ]))
+        Ok(json!({
+            "channels": visible,
+            "availability": report.availability.as_str(),
+            "warnings": warnings,
+        }))
     }
 }
 
@@ -384,7 +374,7 @@ async fn append(
         .state()
         .changes
         .send_modify(|revision| *revision = revision.saturating_add(1));
-    Ok(object([("ok", JsonValue::Bool(true))]))
+    Ok(json!({ "ok": true }))
 }
 
 /// Reads one page of a Channel's Messages, opening their sealed records through the capability.
@@ -410,7 +400,7 @@ async fn page(
         })
         .await?;
     if rows.is_empty() {
-        return Ok(object([("messages", JsonValue::Array(Vec::new()))]));
+        return Ok(json!({ "messages": [] }));
     }
     let has_more = rows.len() == limit;
     let sealed: Vec<Vec<u8>> = rows.iter().map(|row| row.4.clone()).collect();
@@ -432,15 +422,15 @@ async fn page(
         if let Ok(DomainRecord::MessagePost { markdown, .. }) =
             DomainRecord::decode(&opened.canonical)
         {
-            messages.push(object([
-                ("id", JsonValue::String(id)),
-                ("author", JsonValue::String(author.clone())),
-                ("isLocal", JsonValue::Bool(author == local_identity)),
-                ("markdown", JsonValue::String(markdown)),
-            ]));
+            messages.push(json!({
+                "id": id,
+                "author": author,
+                "isLocal": author == local_identity,
+                "markdown": markdown,
+            }));
         }
     }
-    let mut page = object([("messages", JsonValue::Array(messages))]);
+    let mut page = json!({ "messages": messages });
     if has_more
         && let Some(next) = last_order
         && let JsonValue::Object(ref mut fields) = page

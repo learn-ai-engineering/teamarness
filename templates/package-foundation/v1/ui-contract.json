@@ -3,13 +3,29 @@
   "$defs": {},
   "requests": {
     "__REQUEST_NAMESPACE__.read": {
-      "request": { "type": "object", "properties": {}, "additionalProperties": false },
+      "request": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
       "response": {
         "type": "object",
-        "required": ["message", "displayName"],
+        "required": [
+          "message",
+          "displayName",
+          "readCount"
+        ],
         "properties": {
-          "message": { "type": "string" },
-          "displayName": { "type": "string" }
+          "message": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "readCount": {
+            "type": "integer",
+            "minimum": 1
+          }
         },
         "additionalProperties": false
       }
