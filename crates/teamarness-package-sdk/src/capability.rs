@@ -59,6 +59,25 @@ impl CapabilitySubscription {
         event
     }
 
+    /// Receives one event and the credit it consumed, so the caller decides when to ask for more.
+    ///
+    /// The host sends no further event until the returned [`StreamCredit`] is released, which is
+    /// what lets a consumer commit an event before accepting the next one.
+    pub async fn recv_with_credit(
+        &mut self,
+    ) -> Option<Result<(JsonValue, StreamCredit), BackendError>> {
+        match self.receiver.recv().await? {
+            Ok(payload) => Some(Ok((
+                payload,
+                StreamCredit {
+                    id: self.id.clone(),
+                    writer: self.writer.clone(),
+                },
+            ))),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
     /// Closes the stream and releases its registry entry.
     pub async fn close(&mut self) {
         if self.closed {
@@ -72,6 +91,30 @@ impl CapabilitySubscription {
                 ("kind", JsonValue::String("stream_close".into())),
                 ("streamId", JsonValue::String(self.id.clone())),
                 ("code", JsonValue::String("closed".into())),
+            ]))
+            .await;
+    }
+}
+
+/// One event's worth of credit, still owed to the host.
+///
+/// Dropping it without releasing it keeps the window closed, which is how a consumer applies
+/// back pressure while it commits what it has already received.
+#[must_use = "the host sends no further event until this credit is released"]
+pub struct StreamCredit {
+    id: String,
+    writer: Arc<PriorityWriter>,
+}
+
+impl StreamCredit {
+    /// Returns the credit, allowing the host to send one more event.
+    pub async fn release(self) {
+        let _ = self
+            .writer
+            .control(object([
+                ("kind", JsonValue::String("credit".into())),
+                ("streamId", JsonValue::String(self.id)),
+                ("amount", JsonValue::from(1_u64)),
             ]))
             .await;
     }

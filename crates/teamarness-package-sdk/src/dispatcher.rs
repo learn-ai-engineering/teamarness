@@ -261,7 +261,13 @@ pub(crate) async fn run(
                             let code = frame.field("code").and_then(JsonValue::as_str);
                             let error = code
                                 .filter(|code| !matches!(*code, "completed" | "closed" | "dropped"))
-                                .map(|code| BackendError::new(code, true, empty_object()));
+                                .map(|code| {
+                                    BackendError::new(
+                                        code,
+                                        host_code_is_retryable(code),
+                                        empty_object(),
+                                    )
+                                });
                             crate::capability::CapabilityClient::close_stream(&capability_streams, &id, error).await;
                         }
                     }
@@ -277,6 +283,19 @@ pub(crate) async fn run(
             }
         }
     }
+}
+
+/// Whether a host code means "try again", on a stream close as on a call (register C-15).
+///
+/// A stream close carries no `retryable` field, so the SDK applies the same table the host
+/// applies to a capability call: the same code can never be retryable on one path and permanent
+/// on the other. `cursor_invalid` is not retryable here; the record log session answers it by
+/// code before it consults retryability.
+fn host_code_is_retryable(code: &str) -> bool {
+    matches!(
+        code,
+        "overloaded" | "deadline_exceeded" | "host_unavailable"
+    )
 }
 
 /// Cancels every in-flight request and stream, so blocking work stops before the aborts land.

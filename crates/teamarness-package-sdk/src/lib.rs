@@ -8,6 +8,7 @@
 
 mod blocking;
 mod cancellation;
+pub mod capabilities;
 mod capability;
 mod dispatcher;
 mod initialization;
@@ -29,7 +30,7 @@ use std::time::SystemTime;
 
 pub use blocking::blocking;
 pub use cancellation::CancellationToken;
-pub use capability::{CapabilityClient, CapabilitySubscription};
+pub use capability::{CapabilityClient, CapabilitySubscription, StreamCredit};
 pub use initialization::{
     CapabilityGrant, DataDirectory, Initialization, InstallationInfo, PackageInfo, WorkspaceInfo,
 };
