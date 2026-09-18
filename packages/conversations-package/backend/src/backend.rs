@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,15 +60,8 @@ fn log_error(operation: &str, cause: LogError) -> BackendError {
     )
 }
 fn grant(init: &teamarness_package_sdk::Initialization, id: &str) -> Result<String, BackendError> {
-    init.capabilities()
-        .as_array()
-        .and_then(|a| {
-            a.iter()
-                .find(|v| v.get("identity").and_then(JsonValue::as_str) == Some(id))
-                .and_then(|v| v.get("grant"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-        })
+    init.capability(id)
+        .map(|grant| grant.grant.clone())
         .ok_or_else(|| error("conversations.missing_capability", false))
 }
 fn b64(bytes: &[u8]) -> String {
@@ -138,13 +130,8 @@ impl ConversationsBackend {
     async fn activate(&self, r: &BackendRequest) -> Result<JsonValue, BackendError> {
         let _lifecycle = self.lifecycle.lock().await;
         self.stop_active().await;
-        let data = r
-            .initialization
-            .data_directory()
-            .get("path")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| error("conversations.invalid_initialization", false))?;
-        let store = ConversationStore::open(Path::new(data).join("conversations.sqlite3"))
+        let data = r.initialization.data_directory().path();
+        let store = ConversationStore::open(data.join("conversations.sqlite3"))
             .map_err(|_| error("conversations.storage_failed", true))?;
         let sync = grant(
             &r.initialization,
@@ -326,12 +313,7 @@ impl ConversationsBackend {
             .get("results")
             .and_then(JsonValue::as_array)
             .ok_or_else(|| error("conversations.invalid_record", false))?;
-        let local_identity = r
-            .initialization
-            .installation()
-            .get("identity")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("");
+        let local_identity = r.initialization.installation().identity.as_str();
         let last_order = rows.last().map(|r| r.1.clone());
         let mut messages = Vec::new();
         for ((id, _order, author, _rid, _sealed, _ordinal), value) in rows.into_iter().zip(results)
@@ -373,12 +355,7 @@ impl Backend for ConversationsBackend {
                 "conversations.snapshot" => self.snapshot().await,
                 "conversations.channel.create" => {
                     let slug = str_field(&r.payload, "slug")?;
-                    let author = r
-                        .initialization
-                        .installation()
-                        .get("identity")
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or("unknown");
+                    let author = r.initialization.installation().identity.as_str();
                     let d = DomainRecord::channel_create(author, slug)
                         .map_err(|_| error("conversations.invalid_slug", false))?;
                     self.append(&r, "channel.create", d).await
@@ -389,12 +366,7 @@ impl Backend for ConversationsBackend {
                     }
                     let cid = decode_id(&str_field(&r.payload, "channelId")?)
                         .ok_or_else(|| error("conversations.invalid_request", false))?;
-                    let author = r
-                        .initialization
-                        .installation()
-                        .get("identity")
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or("unknown");
+                    let author = r.initialization.installation().identity.as_str();
                     let d = DomainRecord::channel_hide(cid, author)
                         .map_err(|_| error("conversations.invalid_request", false))?;
                     self.append(&r, "channel.hide", d).await
@@ -411,12 +383,7 @@ impl Backend for ConversationsBackend {
                         return Err(error("conversations.channel_hidden", false));
                     }
                     let md = str_field(&r.payload, "markdown")?;
-                    let author = r
-                        .initialization
-                        .installation()
-                        .get("identity")
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or("unknown");
+                    let author = r.initialization.installation().identity.as_str();
                     let d = DomainRecord::message_post(cid, author, md)
                         .map_err(|_| error("conversations.invalid_markdown", false))?;
                     self.append(&r, "message.post", d).await

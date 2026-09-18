@@ -6,94 +6,34 @@
 
 #![forbid(unsafe_code)]
 
+mod blocking;
+mod cancellation;
 mod capability;
 mod dispatcher;
+mod initialization;
 mod lifecycle;
 mod parent_lifeline;
 mod priority_writer;
 mod reader;
+pub mod storage;
 
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::SystemTime;
 
+pub use blocking::blocking;
+pub use cancellation::CancellationToken;
 pub use capability::{CapabilityClient, CapabilitySubscription};
+pub use initialization::{
+    CapabilityGrant, DataDirectory, Initialization, InstallationInfo, PackageInfo, WorkspaceInfo,
+};
 pub use lifecycle::LifecycleOperation;
-use teamarness_package_protocol::{Frame, JsonValue};
+use teamarness_package_protocol::JsonValue;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
-
-/// Initialization values bound to the current process generation.
-#[derive(Debug, Clone)]
-pub struct Initialization {
-    package: JsonValue,
-    workspace: JsonValue,
-    installation: JsonValue,
-    data_directory: JsonValue,
-    process_generation: String,
-    capabilities: JsonValue,
-}
-
-impl Initialization {
-    fn from_frame(frame: &Frame) -> Result<Self, SdkError> {
-        let value = |name| {
-            frame
-                .field(name)
-                .cloned()
-                .ok_or(SdkError::Protocol("malformed_frame"))
-        };
-        Ok(Self {
-            package: value("package")?,
-            workspace: value("workspace")?,
-            installation: value("installation")?,
-            data_directory: value("dataDirectory")?,
-            process_generation: frame
-                .field("processGeneration")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-                .ok_or(SdkError::Protocol("malformed_frame"))?,
-            capabilities: value("capabilities")?,
-        })
-    }
-
-    /// Returns the Package descriptor from the initialize frame.
-    #[must_use]
-    pub const fn package(&self) -> &JsonValue {
-        &self.package
-    }
-
-    /// Returns the Workspace context bound by the host.
-    #[must_use]
-    pub const fn workspace(&self) -> &JsonValue {
-        &self.workspace
-    }
-
-    /// Returns the Installation context bound by the host.
-    #[must_use]
-    pub const fn installation(&self) -> &JsonValue {
-        &self.installation
-    }
-
-    /// Returns the direct Package Data Directory grant.
-    #[must_use]
-    pub const fn data_directory(&self) -> &JsonValue {
-        &self.data_directory
-    }
-
-    /// Returns the decimal process generation.
-    #[must_use]
-    pub fn process_generation(&self) -> &str {
-        &self.process_generation
-    }
-
-    /// Returns the negotiated opaque capability descriptors.
-    #[must_use]
-    pub const fn capabilities(&self) -> &JsonValue {
-        &self.capabilities
-    }
-}
 
 /// One host request delivered without framing details.
 #[derive(Debug, Clone)]
@@ -102,6 +42,22 @@ pub struct BackendRequest {
     pub payload: JsonValue,
     pub initialization: Initialization,
     pub capabilities: CapabilityClient,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) deadline: Option<SystemTime>,
+}
+
+impl BackendRequest {
+    /// The signal that fires when the host cancels this request or its deadline passes.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// The instant the host stops waiting for this request, when it named one.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<SystemTime> {
+        self.deadline
+    }
 }
 
 /// A bounded Package-owned terminal error.
@@ -147,6 +103,12 @@ impl BackendError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         self.retryable
+    }
+
+    /// The bounded object the Package attached to this error.
+    #[must_use]
+    pub const fn details(&self) -> &JsonValue {
+        &self.details
     }
 }
 
@@ -227,15 +189,7 @@ impl Package {
 
     /// Serves the protocol over process stdin and stdout.
     pub async fn serve(self) -> Result<(), SdkError> {
-        let input = tokio::fs::File::open("/dev/stdin")
-            .await
-            .map_err(|_| SdkError::ParentClosed)?;
-        let output = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/stdout")
-            .await
-            .map_err(|_| SdkError::ParentClosed)?;
-        self.serve_io(input, output).await
+        self.serve_source(InputSource::ProcessStdio).await
     }
 
     /// Serves the protocol over supplied I/O. This is useful for conformance tests.
@@ -244,37 +198,112 @@ impl Package {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (writer, control, data) = priority_writer::PriorityWriter::channels();
-        let writer = Arc::new(writer);
-        let (stop_writer, writer_stopped) = oneshot::channel();
-        let writer_task = tokio::spawn(priority_writer::run(output, control, data, writer_stopped));
-        let (frames_tx, frames_rx) = mpsc::channel(64);
-        let reader_task = tokio::spawn(reader::run(input, frames_tx));
-        let pending: capability::PendingCapabilities =
-            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
-        let streams: capability::CapabilityStreams =
-            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
-        let result = dispatcher::run(
-            self.backend,
-            writer.clone(),
-            frames_rx,
-            pending.clone(),
-            streams.clone(),
-        )
-        .await;
-        reader_task.abort();
-        // Nothing will answer a pending capability call once the dispatcher has
-        // returned, so every caller is told so before the writer stops.
-        capability::fail_all(&pending, &streams).await;
-        drop(writer);
-        // Package-owned tasks may still hold `CapabilityClient` clones, which keep
-        // writer senders alive. Stop the writer explicitly so the session always
-        // ends once the dispatcher has returned (shutdown frame or parent closure).
-        let _ = stop_writer.send(());
-        match writer_task.await {
-            Ok(Ok(())) | Err(_) => result,
-            Ok(Err(error)) => Err(error),
-        }
+        self.serve_source(InputSource::Supplied(Box::new(input), Box::new(output)))
+            .await
+    }
+
+    /// Runs the control plane on its own thread and runtime.
+    ///
+    /// Framing, dispatch and `ping` belong to a dedicated `current_thread` runtime on a named OS
+    /// thread, so a Package handler that blocks every worker of the Package's own runtime cannot
+    /// stop the host from getting a `pong`. Handler and subscription tasks are spawned back onto
+    /// the Package runtime this call was made from.
+    async fn serve_source(self, source: InputSource) -> Result<(), SdkError> {
+        let package_runtime = tokio::runtime::Handle::current();
+        let (result_tx, result_rx) = oneshot::channel();
+        let backend = self.backend;
+        let thread = std::thread::Builder::new()
+            .name("teamarness-package-control".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(_) => {
+                        let _ = result_tx.send(Err(SdkError::ParentClosed));
+                        return;
+                    }
+                };
+                let outcome = runtime.block_on(control_loop(backend, source, package_runtime));
+                let _ = result_tx.send(outcome);
+            })
+            .map_err(|_| SdkError::ParentClosed)?;
+        let result = result_rx.await.unwrap_or(Err(SdkError::ParentClosed));
+        // The thread is finished once it has sent its result; joining it off the async worker
+        // keeps the runtime free while the control runtime drops.
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        result
+    }
+}
+
+/// Where the control loop reads and writes frames.
+enum InputSource {
+    ProcessStdio,
+    Supplied(
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ),
+}
+
+async fn control_loop(
+    backend: Arc<dyn Backend>,
+    source: InputSource,
+    package_runtime: tokio::runtime::Handle,
+) -> Result<(), SdkError> {
+    // Opening the process files belongs to the control runtime, so their blocking I/O never lands
+    // on a Package worker.
+    let (input, output): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = match source {
+        InputSource::Supplied(input, output) => (input, output),
+        InputSource::ProcessStdio => (
+            Box::new(
+                tokio::fs::File::open("/dev/stdin")
+                    .await
+                    .map_err(|_| SdkError::ParentClosed)?,
+            ),
+            Box::new(
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/stdout")
+                    .await
+                    .map_err(|_| SdkError::ParentClosed)?,
+            ),
+        ),
+    };
+    let (writer, control, data) = priority_writer::PriorityWriter::channels();
+    let writer = Arc::new(writer);
+    let (stop_writer, writer_stopped) = oneshot::channel();
+    let writer_task = tokio::spawn(priority_writer::run(output, control, data, writer_stopped));
+    let (frames_tx, frames_rx) = mpsc::channel(64);
+    let reader_task = tokio::spawn(reader::run(input, frames_tx));
+    let pending: capability::PendingCapabilities =
+        Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let streams: capability::CapabilityStreams =
+        Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let result = dispatcher::run(
+        backend,
+        writer.clone(),
+        frames_rx,
+        pending.clone(),
+        streams.clone(),
+        package_runtime,
+    )
+    .await;
+    reader_task.abort();
+    // Nothing will answer a pending capability call once the dispatcher has
+    // returned, so every caller is told so before the writer stops.
+    capability::fail_all(&pending, &streams).await;
+    drop(writer);
+    // Package-owned tasks may still hold `CapabilityClient` clones, which keep
+    // writer senders alive. Stop the writer explicitly so the session always
+    // ends once the dispatcher has returned (shutdown frame or parent closure).
+    let _ = stop_writer.send(());
+    match writer_task.await {
+        Ok(Ok(())) | Err(_) => result,
+        Ok(Err(error)) => Err(error),
     }
 }
 

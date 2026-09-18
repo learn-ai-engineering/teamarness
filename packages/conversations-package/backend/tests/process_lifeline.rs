@@ -70,13 +70,15 @@ impl Backend {
             },
             "uiContractDigest": DIGEST,
             "processGeneration": "1",
-            "workspace": {"id": "workspace"},
-            "installation": {"identity": "installation"},
+            "workspace": {"id": "workspace", "name": "Workspace"},
+            "installation": {"identity": "installation", "displayName": "Installation"},
             "dataDirectory": {"path": path, "continuityId": "Y29udGludWl0eQ"},
             "protocol": {"major": 1, "minor": 0},
             "capabilities": [{
                 "identity": "teamarness.synchronization.immutable-record-log",
                 "grant": RECORD_GRANT,
+                "major": 1,
+                "minor": 0,
             }],
             "limits": {},
         }));

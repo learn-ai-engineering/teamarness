@@ -2,11 +2,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use teamarness_package_protocol::{Frame, FrameKind, JsonValue, decode_frame};
+use teamarness_package_protocol::{FrameKind, JsonValue};
 use teamarness_package_sdk::{
     Backend, BackendError, BackendRequest, EventSubscription, Package, event_channel,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+mod support;
+
+use support::{read_frame, write_json};
 
 struct Echo;
 
@@ -100,26 +103,6 @@ impl Backend for Echo {
             Ok(subscription)
         })
     }
-}
-
-async fn write_json(stream: &mut tokio::io::DuplexStream, value: &str) {
-    let payload = value.as_bytes();
-    stream
-        .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
-        .await
-        .unwrap();
-    stream.write_all(payload).await.unwrap();
-}
-
-async fn read_frame(stream: &mut tokio::io::DuplexStream) -> Frame {
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix).await.unwrap();
-    let length = u32::from_be_bytes(prefix) as usize;
-    let mut payload = vec![0; length];
-    stream.read_exact(&mut payload).await.unwrap();
-    let mut bytes = prefix.to_vec();
-    bytes.extend(payload);
-    decode_frame(&bytes).unwrap()
 }
 
 #[tokio::test]

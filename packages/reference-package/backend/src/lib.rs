@@ -199,21 +199,9 @@ impl ReferenceBackend {
         {
             return Err(invalid_capability_response());
         }
-        let data_path = request
-            .initialization
-            .data_directory()
-            .get("path")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(invalid_initialization)?;
-        let package_version = request
-            .initialization
-            .package()
-            .get("version")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(invalid_initialization)?
-            .to_owned();
-        let state = ReferenceState::open(Path::new(data_path).join("state.sqlite3"))
-            .map_err(storage_error)?;
+        let data_path = request.initialization.data_directory().path().to_owned();
+        let package_version = request.initialization.package().version.clone();
+        let state = ReferenceState::open(data_path.join("state.sqlite3")).map_err(storage_error)?;
         *self.active.lock().await = Some(ActivePackage {
             state: state.clone(),
             package_version,
@@ -338,20 +326,8 @@ fn grant(
     identity: &str,
 ) -> Result<String, BackendError> {
     initialization
-        .capabilities()
-        .as_array()
-        .and_then(|values| {
-            values.iter().find_map(|value| {
-                (value.get("identity").and_then(JsonValue::as_str) == Some(identity))
-                    .then(|| {
-                        value
-                            .get("grant")
-                            .and_then(JsonValue::as_str)
-                            .map(str::to_owned)
-                    })
-                    .flatten()
-            })
-        })
+        .capability(identity)
+        .map(|grant| grant.grant.clone())
         .ok_or_else(invalid_initialization)
 }
 

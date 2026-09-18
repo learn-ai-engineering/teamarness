@@ -1,13 +1,23 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use teamarness_package_protocol::{Frame, FrameKind, JsonValue, MAX_IN_FLIGHT_EACH_DIRECTION};
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::cancellation::CancellationToken;
 use crate::capability::{CapabilityClient, CapabilityStreams, PendingCapabilities};
 use crate::priority_writer::PriorityWriter;
 use crate::{Backend, BackendError, BackendRequest, Initialization, SdkError, object};
+
+/// One in-flight request: its task, its cancellation signal, and whether it is a lifecycle call.
+struct InFlight {
+    task: JoinHandle<()>,
+    cancellation: CancellationToken,
+    lifecycle: bool,
+}
 
 pub(crate) async fn run(
     backend: Arc<dyn Backend>,
@@ -15,6 +25,7 @@ pub(crate) async fn run(
     mut frames: mpsc::Receiver<Frame>,
     pending_capabilities: PendingCapabilities,
     capability_streams: CapabilityStreams,
+    package_runtime: Handle,
 ) -> Result<(), SdkError> {
     let initialize = frames.recv().await.ok_or(SdkError::ParentClosed)?;
     if initialize.kind() != FrameKind::Initialize {
@@ -30,8 +41,9 @@ pub(crate) async fn run(
     );
     let lifecycle = Arc::new(Mutex::new(()));
     let (done_tx, mut done_rx) = mpsc::channel::<String>(MAX_IN_FLIGHT_EACH_DIRECTION);
-    let mut tasks: BTreeMap<String, JoinHandle<()>> = BTreeMap::new();
-    let mut streams: BTreeMap<String, (JoinHandle<()>, Arc<Semaphore>)> = BTreeMap::new();
+    let mut tasks: BTreeMap<String, InFlight> = BTreeMap::new();
+    let mut streams: BTreeMap<String, (JoinHandle<()>, Arc<Semaphore>, CancellationToken)> =
+        BTreeMap::new();
 
     loop {
         tokio::select! {
@@ -40,7 +52,8 @@ pub(crate) async fn run(
             }
             frame = frames.recv() => {
                 let Some(frame) = frame else {
-                    crate::parent_lifeline::abort_all(tasks.into_values());
+                    cancel_all(&tasks, &streams);
+                    crate::parent_lifeline::abort_all(tasks.into_values().map(|entry| entry.task));
                     crate::parent_lifeline::abort_all(streams.into_values().map(|value| value.0));
                     return Err(SdkError::ParentClosed);
                 };
@@ -53,19 +66,51 @@ pub(crate) async fn run(
                         if tasks.contains_key(&id) {
                             return Err(SdkError::Protocol("duplicate_id"));
                         }
+                        let operation = string_field(&frame, "operation")?;
+                        let is_lifecycle = crate::LifecycleOperation::parse(&operation).is_some();
+                        let cancellation = CancellationToken::new();
+                        // PKG-R02: a suspend or dispose releases the work the previous state owns
+                        // before the lifecycle handler runs.
+                        if matches!(operation.as_str(), "lifecycle.suspend" | "lifecycle.dispose") {
+                            for entry in tasks.values() {
+                                if !entry.lifecycle {
+                                    entry.cancellation.cancel();
+                                }
+                            }
+                            for (_, _, token) in streams.values() {
+                                token.cancel();
+                            }
+                        }
+                        let deadline = deadline_of(&frame);
+                        if let Some(deadline) = deadline {
+                            match deadline.duration_since(SystemTime::now()) {
+                                Err(_) => cancellation.cancel(),
+                                Ok(remaining) => {
+                                    // The timer belongs to the control runtime, so a blocked
+                                    // Package worker cannot delay it.
+                                    let token = cancellation.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(remaining).await;
+                                        token.cancel();
+                                    });
+                                }
+                            }
+                        }
                         let request = BackendRequest {
-                            operation: string_field(&frame, "operation")?,
+                            operation,
                             payload: frame.field("payload").cloned().ok_or(SdkError::Protocol("malformed_frame"))?,
                             initialization: initialization.clone(),
                             capabilities: capabilities.clone(),
+                            cancellation: cancellation.clone(),
+                            deadline,
                         };
                         let backend = backend.clone();
                         let writer = writer.clone();
                         let done = done_tx.clone();
                         let lifecycle = lifecycle.clone();
                         let task_id = id.clone();
-                        let task = tokio::spawn(async move {
-                            let result = if crate::LifecycleOperation::parse(&request.operation).is_some() {
+                        let task = package_runtime.spawn(async move {
+                            let result = if is_lifecycle {
                                 let _barrier = lifecycle.lock().await;
                                 backend.handle(request).await
                             } else {
@@ -74,12 +119,14 @@ pub(crate) async fn run(
                             let _ = writer.control(terminal(&id, result)).await;
                             let _ = done.send(id).await;
                         });
-                        tasks.insert(task_id, task);
+                        tasks.insert(task_id, InFlight { task, cancellation, lifecycle: is_lifecycle });
                     }
                     FrameKind::Cancel => {
                         let target = string_field(&frame, "targetId")?;
-                        if let Some(task) = tasks.remove(&target) {
-                            task.abort();
+                        if let Some(entry) = tasks.remove(&target) {
+                            // Cancel first, so blocking work sees the signal before the abort.
+                            entry.cancellation.cancel();
+                            entry.task.abort();
                             writer.control(error_frame(
                                 &target,
                                 &BackendError::new("cancelled", true, empty_object()),
@@ -132,7 +179,7 @@ pub(crate) async fn run(
                         ])).await?;
                     }
                     FrameKind::StreamOpen => {
-                        streams.retain(|_, (task, _)| !task.is_finished());
+                        streams.retain(|_, (task, _, _)| !task.is_finished());
                         if streams.len() >= MAX_IN_FLIGHT_EACH_DIRECTION {
                             return Err(SdkError::Protocol("overloaded"));
                         }
@@ -140,18 +187,21 @@ pub(crate) async fn run(
                         if streams.contains_key(&id) {
                             return Err(SdkError::Protocol("duplicate_id"));
                         }
+                        let cancellation = CancellationToken::new();
                         let request = BackendRequest {
                             operation: string_field(&frame, "topic")?,
                             payload: frame.field("payload").cloned().ok_or(SdkError::Protocol("malformed_frame"))?,
                             initialization: initialization.clone(),
                             capabilities: capabilities.clone(),
+                            cancellation: cancellation.clone(),
+                            deadline: None,
                         };
                         let backend = backend.clone();
                         let writer = writer.clone();
                         let stream_id = id.clone();
                         let credit = Arc::new(Semaphore::new(32));
                         let stream_credit = credit.clone();
-                        let task = tokio::spawn(async move {
+                        let task = package_runtime.spawn(async move {
                             // The Package's own code reaches the Host, and through it the UI.
                             let mut subscription = match backend.subscribe(request).await {
                                 Ok(subscription) => subscription,
@@ -186,7 +236,7 @@ pub(crate) async fn run(
                             }
                             let _ = writer.data(stream_close(&stream_id, "completed")).await;
                         });
-                        streams.insert(id, (task, credit));
+                        streams.insert(id, (task, credit, cancellation));
                     }
                     FrameKind::Credit => {
                         let id = string_field(&frame, "streamId")?;
@@ -194,7 +244,7 @@ pub(crate) async fn run(
                             .and_then(|value| usize::try_from(value).ok())
                             .filter(|value| (1..=32).contains(value))
                             .ok_or(SdkError::Protocol("credit_violation"))?;
-                        let Some((_, credit)) = streams.get(&id) else {
+                        let Some((_, credit, _)) = streams.get(&id) else {
                             return Err(SdkError::Protocol("unknown_stream"));
                         };
                         if credit.available_permits().saturating_add(amount) > 32 {
@@ -204,7 +254,8 @@ pub(crate) async fn run(
                     }
                     FrameKind::StreamClose => {
                         let id = string_field(&frame, "streamId")?;
-                        if let Some((task, _)) = streams.remove(&id) {
+                        if let Some((task, _, cancellation)) = streams.remove(&id) {
+                            cancellation.cancel();
                             task.abort();
                         } else {
                             let code = frame.field("code").and_then(JsonValue::as_str);
@@ -215,7 +266,8 @@ pub(crate) async fn run(
                         }
                     }
                     FrameKind::Shutdown => {
-                        crate::parent_lifeline::abort_all(tasks.into_values());
+                        cancel_all(&tasks, &streams);
+                        crate::parent_lifeline::abort_all(tasks.into_values().map(|entry| entry.task));
                         crate::parent_lifeline::abort_all(streams.into_values().map(|value| value.0));
                         writer.control(object([("kind", JsonValue::String("shutdown_ack".into()))])).await?;
                         return Ok(());
@@ -225,6 +277,28 @@ pub(crate) async fn run(
             }
         }
     }
+}
+
+/// Cancels every in-flight request and stream, so blocking work stops before the aborts land.
+fn cancel_all(
+    tasks: &BTreeMap<String, InFlight>,
+    streams: &BTreeMap<String, (JoinHandle<()>, Arc<Semaphore>, CancellationToken)>,
+) {
+    for entry in tasks.values() {
+        entry.cancellation.cancel();
+    }
+    for (_, _, cancellation) in streams.values() {
+        cancellation.cancel();
+    }
+}
+
+/// Reads `deadlineUnixMs`, a decimal string of milliseconds since the Unix epoch.
+fn deadline_of(frame: &Frame) -> Option<SystemTime> {
+    let millis = frame
+        .field("deadlineUnixMs")
+        .and_then(JsonValue::as_str)
+        .and_then(|value| value.parse::<u64>().ok())?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(millis))
 }
 
 fn initialized(frame: &Frame) -> Result<JsonValue, SdkError> {

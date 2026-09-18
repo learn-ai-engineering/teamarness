@@ -42,12 +42,7 @@ impl RepoAwareBackend {
     }
 
     async fn activate(&self, request: &BackendRequest) -> Result<JsonValue, BackendError> {
-        let path = request
-            .initialization
-            .data_directory()
-            .get("path")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| Self::backend_error(error::INVALID_REQUEST))?;
+        let path = request.initialization.data_directory().path();
         let store = StateStore::open(path)?;
         *self.active.lock().await = Some(store);
         Ok(empty_object())

@@ -393,12 +393,7 @@ impl<S: SeedSource> TutorialBackend<S> {
     }
 
     async fn activate(&self, request: &BackendRequest) -> Result<JsonValue, BackendError> {
-        let path = request
-            .initialization
-            .data_directory()
-            .get("path")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| backend_error("tutorial.initialization_invalid", false))?;
+        let path = request.initialization.data_directory().path();
         let store =
             StateStore::open(path).map_err(|_| backend_error("tutorial.storage_failed", true))?;
         *self.active.lock().await = Some(store);
