@@ -34,7 +34,7 @@ The public API supports:
 
 Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. The returned `WorkspaceInvitation` is an opaque, sensitive bearer value: applications may parse, display, copy, and submit its text, but must not interpret its private wire representation.
 
-A successful onboarding response contains the issuer's complete accepted membership state at one consistency boundary. Version 1 limits that bootstrap to 8 MiB and 1,024 canonical operations. The same Installation can recover its one committed admission after interrupted response delivery, including after the invitation expires, provided it is still a current member. Another Installation cannot reuse the invitation. This is bounded one-shot onboarding, not continuous synchronization.
+A successful onboarding response contains the issuer's complete accepted membership state at one consistency boundary. Version 1 limits that bootstrap to 8 MiB and 1,024 canonical operations. The same Installation can recover its one committed admission after interrupted response delivery, including after the invitation expires, provided it is still a current member. Another Installation cannot reuse the invitation. Onboarding is bounded and one-shot; continuous membership replication is a separate protocol.
 
 Runtime shutdown rejects new onboarding transport work, leaves local identity, Workspace, and membership commands available, and must be awaited. `Drop` is an abnormal best-effort cleanup fallback only.
 
@@ -49,6 +49,8 @@ Low-level token issuance, claim creation, and redemption were intentionally remo
 The immutable-record capability is generic: Packages provide bounded canonical bytes and purposes, while Core owns signing, sealed persistence, membership gates, duplicate handling, ordering, cursors, peer reconciliation, and secret custody. Each accepted sealed record has a private authenticated P2Panda projection for production LogSync. Teamarness semantic rows and the projection commit together; an invalid or out-of-order remote operation is rejected before it can leave a partial journal row. Duplicate delivery is idempotent.
 
 Synchronization wakes are durable and coalesced. A private Core worker schedules at most four finite sessions, resumes work after restart, and is awaited before the shared Router and Endpoint shut down. No P2Panda, Iroh, SQLite, endpoint, or raw key type crosses the Package boundary.
+
+Canonical membership replicates over `teamarness/membership-sync/1`, independent of whether any Package has records to synchronize: one finite session per Workspace and peer reconciles sorted operation-ID sets and exchanges the canonical envelopes each side lacks, in causal order. Package synchronization uses `teamarness/package-sync/2` and serves nothing — not even the Workspace author list — until both this Installation and the authenticated remote peer are current Members, and accepting a revocation cancels live sessions with the revoked Installation. A received operation whose author is not yet known, or whose scope has no Content Key yet, is parked within fixed per-scope and per-peer bounds and applied when that state arrives. A scope's first Content Key is accepted only with the Workspace creator's signed origin. Protection controls are sealed to their recipient Installation and signed through the domain-separated signing interface.
 
 ## Database ownership and recovery
 
@@ -65,7 +67,7 @@ The Core Runtime does not provide:
 - a second-manager path, promotion, demotion, arbitrary access levels, nested groups, or re-admission after revocation;
 - multi-manager conflict fixtures (mutual manager removal and dependent transitive invalidation are deferred until a supported second-manager path exists);
 - human-scoped identity behavior;
-- package lifecycle, package storage, package transport, package keys, revocation-driven package-key rotation, or enforcement over future package content;
+- package lifecycle, package storage, package transport, package keys, revocation-driven package-key rotation, or cryptographic protection of future package content from revoked Installations (version 1 gates synchronization only);
 - a Tauri shell, package UI, or product-domain packages; or
 - authorization based on declared historical timestamps.
 

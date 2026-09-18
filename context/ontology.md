@@ -17,7 +17,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 
 | Term | Definition |
 |---|---|
-| **Installation Identity** | A permanent Ed25519 keypair generated on first launch. The `SecretKey` is the Iroh endpoint secret; the `PublicKey` is the Iroh `EndpointId`. This is the device's network identity |
+| **Installation Identity** | A permanent Ed25519 keypair generated on first launch. The `SecretKey` is the Iroh endpoint secret; the `PublicKey` is the Iroh `EndpointId`. This is the device's network identity. It is also converted to an X25519 key to open Protection Grants (ADR 0013) |
 | **Installation Display Name** | User-changeable, validated human-readable metadata for the local Installation. It does not replace the Public Identity and is not currently shared through canonical membership |
 | **Public Identity** | The public half of an installation identity (`EndpointId`), shared with workspaces as a member identifier |
 | **Member** | An installation identity admitted to a workspace. Membership is canonical and interval-based. A human may have multiple device identities; devices are first-class members |
@@ -26,10 +26,11 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Canonical Membership** | The signed, causally ordered, append-only membership operation DAG that is the sole authority for who is a workspace member. Built above Iroh's transport identity. Iroh connects peers; the membership DAG authorizes them |
 | **Invitation** | A single-use, cryptographically signed token that authorizes one Installation to join a Workspace. It carries the inviter identity, Workspace identity, and expiry. An exact retry by the already admitted Installation may recover the same committed admission; recovery is not a second use |
 | **Workspace Invitation** | The opaque, copied onboarding value that wraps a signed Invitation and the issuer's public Iroh endpoint ticket. It is sensitive bearer admission material |
-| **Revocation** | A signed membership operation that ends a member's current interval. The revoked member retains past data but cannot read or write future content. Triggers key rotation in affected packages |
-| **Epoch** | A workspace-local, monotonically increasing cursor for committed membership transitions. It orders local delivery but does not identify distributed membership state |
+| **Revocation** | A signed membership operation that ends a Member's current interval. It replicates to every Member; once an Installation accepts it, that Installation stops synchronizing with the revoked Installation. The revoked Installation keeps data and Content Keys it already received. Version 1 does not rotate Content Keys on revocation; rotation is roadmap Phase 5 work |
+| **Epoch** | A workspace-local, monotonically increasing cursor for committed membership transitions, including transitions received through Membership Replication. It orders local delivery but does not identify distributed membership state and is not a Content Key Generation |
 | **Membership Version** | A content-derived identifier for a workspace's accepted membership operation set. Peers with the same operation set have the same membership version |
 | **Membership Operation** | A signed `admit` or `revoke` entry in the canonical membership DAG. Its content-derived ID authenticates the canonical bytes, and its dependency links record causal history |
+| **Membership Replication** | Core-owned exchange of accepted Membership Operations between Installations of one Workspace, independent of Package records. It is idempotent, causal, and resumes after disconnection |
 
 ## Package Architecture
 
@@ -82,7 +83,10 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Cursor** | An Installation-local delivery position in a record subscription (`Cursor`). It is progress, not an order offset, and differs between Installations |
 | **Sealed Record** | The Teamarness-owned versioned binary envelope that carries an encrypted Immutable Record. Packages store and pass sealed records but open them only through the capability |
 | **Content Key** | The symmetric key that seals one Package-and-Workspace record log. Core holds it and never exposes it to Packages. Version 1 has one Content Key per scope and no rotation |
-| **Protection Grant** | Core-to-Core material that gives a current Member the Content Key for a scope. It is distinct from a Capability Grant |
+| **Protection Grant** | Core-to-Core material that gives one current Member the Content Key for a scope. It is sealed to its recipient Installation's key, so only that Installation can open it, and it is signed by its author through the domain-separated signing interface. It carries the Content Key Origin and is distinct from a Capability Grant |
+| **Content Key Generation** | The period during which one Content Key seals new records in a Package scope. Version 1 has exactly one generation per scope, started by the Workspace creator's first append. Roadmap Phase 5 starts a new generation on revocation so a revoked Member cannot open records sealed afterwards |
+| **Content Key Origin** | The Workspace creator's signed record naming a scope's first Content Key. A Protection Grant carries it, and an Installation accepts a first Content Key only with it |
+| **Parked Operation** | A received, authenticated synchronization operation that Core cannot apply yet because its author's admission or its scope's Content Key is not yet known locally. It is kept within fixed bounds and applied when that state arrives |
 
 ## Transport (Iroh)
 

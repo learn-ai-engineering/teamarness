@@ -20,7 +20,7 @@ Owned by `TEAM.SYS.MEM-R01` and `TEAM.SYS.MEM-R04`. This ID is retained and not 
 
 ## TEAM-R05 — Revocation and Epochs
 
-Revoking a member SHALL end their current membership interval. Every committed membership operation SHALL advance a workspace-local monotonic epoch and publish the resulting content-derived `MembershipVersion`. Package-specific keys and authorization SHALL rotate in response to versioned membership transitions, except where an accepted package capability explicitly freezes a version-1 one-key/no-rotation policy; that capability SHALL state its retained-key confidentiality limit. The revoked member SHALL retain past data but SHALL NOT read or write future content.
+Revoking a member SHALL end their current membership interval. Every committed membership operation SHALL advance a workspace-local monotonic epoch and publish the resulting content-derived `MembershipVersion`. Membership changes SHALL replicate to every Member, and synchronization SHALL follow current membership. The revoked member SHALL retain past data. In version 1 the synchronization gate is the only protection for future content; Content Key rotation on revocation is roadmap Phase 5 work. See `TEAM.SYS.MEM-R05`, `TEAM.SYS.MEM-R06`, `TEAM.SYS.MEM-R10`, and `TEAM.SYS.TRANS-R06`.
 
 ## TEAM-R06 — Package Model
 
