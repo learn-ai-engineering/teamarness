@@ -11,3 +11,4 @@ mod membership_replication;
 mod order_keys;
 mod recovery;
 mod sync_authorization;
+mod sync_bounds;

@@ -3,6 +3,8 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
+pub(crate) mod exchange;
+pub(crate) mod frames;
 pub(crate) mod limits;
 mod log_sync;
 pub(crate) mod network_handler;
@@ -20,6 +22,7 @@ pub(crate) use operation_store::log_id as operation_log_id;
 pub(crate) use quarantine::RecoveryReport;
 pub(crate) use worker::SyncWorker;
 
+pub(crate) use exchange::ExchangeReport;
 pub(crate) use network_handler::{
     FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, ProtectionBundle, Refusal,
     RejectReason, SessionGrant, SyncReceiver,
@@ -32,6 +35,9 @@ pub(crate) use peer_sessions::PeerSessions;
 pub(crate) struct SyncServices {
     pub(crate) receiver: std::sync::Arc<dyn SyncReceiver>,
     pub(crate) sessions: std::sync::Arc<PeerSessions>,
+    /// Every bound one session obeys. Tests inject small values here, the same
+    /// way they inject parking limits.
+    pub(crate) limits: limits::SessionLimits,
 }
 
 impl fmt::Debug for SyncServices {

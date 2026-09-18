@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::super::{CoreRuntime, CoreRuntimeConfig, PublicIdentity, SystemClock, WorkspaceId};
 use crate::RecordId;
+use crate::synchronization::limits::SessionLimits;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -32,15 +33,38 @@ pub(super) struct SyncCluster {
     /// An Installation keeps its identity across a restart, so a test can name
     /// a stopped node's identity while it is away.
     identities: Vec<PublicIdentity>,
+    /// A node keeps the bounds it was started with across a restart.
+    limits: Vec<SessionLimits>,
 }
 
 impl SyncCluster {
     pub(super) async fn start(test: &str, names: &[&'static str]) -> Self {
+        Self::start_with_limits(test, names, &[]).await
+    }
+
+    /// Starts a cluster where the named nodes run under injected bounds.
+    ///
+    /// Everything else is the real thing; only the numbers are smaller, so a
+    /// bound is reached in a few records instead of a few thousand.
+    pub(super) async fn start_with_limits(
+        test: &str,
+        names: &[&'static str],
+        overrides: &[(&str, SessionLimits)],
+    ) -> Self {
         let root = cluster_root(test);
         let _ = std::fs::remove_dir_all(&root);
+        let limits = names
+            .iter()
+            .map(|name| {
+                overrides
+                    .iter()
+                    .find(|(named, _)| named == name)
+                    .map_or(SessionLimits::CURRENT, |(_, limits)| *limits)
+            })
+            .collect::<Vec<_>>();
         let mut nodes = Vec::with_capacity(names.len());
-        for name in names {
-            nodes.push(Some(Self::open(&root, name).await));
+        for (name, limits) in names.iter().zip(&limits) {
+            nodes.push(Some(Self::open(&root, name, *limits).await));
         }
         let identities = nodes
             .iter()
@@ -52,14 +76,15 @@ impl SyncCluster {
             names: names.to_vec(),
             nodes,
             identities,
+            limits,
         };
         cluster.exchange_addresses();
         cluster
     }
 
-    async fn open(root: &std::path::Path, name: &str) -> CoreRuntime {
+    async fn open(root: &std::path::Path, name: &str, limits: SessionLimits) -> CoreRuntime {
         CoreRuntime::open_with_clock_and_readiness(
-            CoreRuntimeConfig::new(root.join(name)),
+            CoreRuntimeConfig::new(root.join(name)).with_session_limits_for_test(limits),
             Box::new(SystemClock),
             true,
         )
@@ -112,11 +137,17 @@ impl SyncCluster {
         }
     }
 
+    /// Changes the bounds a node runs under from its next start.
+    pub(super) fn set_limits_for_test(&mut self, name: &str, limits: SessionLimits) {
+        let index = self.index(name);
+        self.limits[index] = limits;
+    }
+
     /// Reopens a stopped node's data directory and re-exchanges addresses.
     pub(super) async fn restart(&mut self, name: &str) {
         let index = self.index(name);
         assert!(self.nodes[index].is_none(), "{name} is still running");
-        self.nodes[index] = Some(Self::open(&self.root, name).await);
+        self.nodes[index] = Some(Self::open(&self.root, name, self.limits[index]).await);
         self.exchange_addresses();
     }
 

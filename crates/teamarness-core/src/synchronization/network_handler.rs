@@ -1,42 +1,39 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::synchronization::exchange::{ExchangeContext, ExchangeReport, Role, run_exchange};
+use crate::synchronization::frames::{
+    FrameError, FramePhase, FrameReader, LogSyncWire, ProtectionBundleWire, frame_sink,
+};
+use crate::synchronization::limits::SessionLimits;
 use crate::synchronization::parking::ParkReason;
 use crate::synchronization::peer_sessions::{self, PeerSessions};
 use crate::synchronization::{SyncServices, scope_digest};
 use crate::{PublicIdentity, WorkspaceId};
-use futures_util::{Sink, Stream, StreamExt};
+use futures_util::SinkExt;
 use p2panda_core::Operation;
-use p2panda_sync::protocols::{LogSyncEvent, LogSyncMessage};
-use serde::{Deserialize, Serialize};
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-pub(crate) const MAX_SYNC_OPERATIONS: usize = 4_096;
-pub(crate) const MAX_SYNC_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const LOG_SYNC_ALPN: &[u8] = b"teamarness/package-sync/2";
 
-/// The first frame a responder reads, before any authorization, is a `Hello`.
-/// Nothing larger is read from an unauthorized peer.
-const MAX_HELLO_BYTES: usize = 1024;
-/// A version-2 protection control is exactly 354 bytes; the frame cap leaves
-/// room without admitting an unbounded handshake.
-const MAX_PROTECTION_CONTROL_BYTES: usize = 4096;
 const MAX_PACKAGE_IDENTITY: usize = 256;
-const APPLICATION_ACK_REQUEST: &[u8] = b"teamarness/log-sync/applied/1";
-const APPLICATION_ACK: &[u8] = b"teamarness/log-sync/applied/1/ok";
+const APPLICATION_ACK_REQUEST: &[u8] = b"teamarness/log-sync/applied/2";
+const APPLICATION_ACK: &[u8] = b"teamarness/log-sync/applied/2/ok";
 
-/// QUIC close codes for `teamarness/package-sync/2` (design §5.10). A `Refused`
+/// QUIC close codes for `teamarness/package-sync/2` (design §5.6). A `Refused`
 /// frame reason is a different value space and is never used as a close code.
 const CLOSE_UNAVAILABLE: u8 = 1;
+const CLOSE_OVERLOADED: u8 = 2;
+const CLOSE_PEER_BUSY: u8 = 3;
 const CLOSE_INVALID: u8 = 4;
 const CLOSE_NOT_AUTHORIZED: u8 = 5;
 const CLOSE_KEY_MISMATCH: u8 = 6;
+const CLOSE_BUDGET_EXCEEDED: u8 = 7;
 
 type ReplicationOperation = ([u8; 32], Operation<()>);
 
@@ -63,7 +60,7 @@ impl Refusal {
         }
     }
 
-    /// The design's close-code table (§5.10), read back. The `Refused` frame
+    /// The design's close-code table (§5.6), read back. The `Refused` frame
     /// reason is a different value space and never doubles as a close code.
     const fn from_close_code(code: u64) -> Option<Self> {
         match code {
@@ -124,7 +121,17 @@ pub(crate) struct ProtectionBundle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LogSessionError {
     Refused(Refusal),
+    /// The local gate refused before anything was dialled, so the peer was
+    /// never contacted.
+    LocalNotAuthorized,
     Cancelled,
+    /// The peer is already running as many sessions as it allows, globally or
+    /// with this Installation. Trying again later is the right response.
+    PeerBusy,
+    /// The peer sent more than its session budget allows.
+    BudgetExceeded,
+    /// The peer claimed a frame larger than the phase allows.
+    FrameTooLarge,
     Transport(String),
     Protocol(String),
 }
@@ -133,9 +140,33 @@ impl std::fmt::Display for LogSessionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(refusal) => write!(formatter, "package sync refused: {refusal:?}"),
+            Self::LocalNotAuthorized => {
+                formatter.write_str("package sync is not authorized locally")
+            }
             Self::Cancelled => formatter.write_str("package sync session cancelled"),
+            Self::PeerBusy => formatter.write_str("package sync peer is busy"),
+            Self::BudgetExceeded => formatter.write_str("package sync session budget exceeded"),
+            Self::FrameTooLarge => formatter.write_str("package sync frame exceeds its bound"),
             Self::Transport(error) => write!(formatter, "package sync transport: {error}"),
             Self::Protocol(error) => write!(formatter, "package sync protocol: {error}"),
+        }
+    }
+}
+
+impl LogSessionError {
+    /// The close code this failure ends the connection with.
+    const fn close_code(&self) -> u8 {
+        match self {
+            Self::BudgetExceeded => CLOSE_BUDGET_EXCEEDED,
+            _ => CLOSE_INVALID,
+        }
+    }
+
+    const fn close_reason(&self) -> &'static [u8] {
+        match self {
+            Self::BudgetExceeded => b"package sync session budget exceeded",
+            Self::Cancelled => b"session cancelled",
+            _ => b"log sync invalid or timed out",
         }
     }
 }
@@ -193,337 +224,114 @@ pub(crate) trait SyncReceiver: Send + Sync {
         package: &str,
         operation: Operation<()>,
     ) -> Result<OperationOutcome, FatalSyncError>;
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ProtectionBundleWire {
-    origin: Vec<u8>,
-    grant: Vec<u8>,
-}
-
-impl ProtectionBundleWire {
-    fn validated(self) -> Result<ProtectionBundle, String> {
-        if self.origin.len() > MAX_PROTECTION_CONTROL_BYTES
-            || self.grant.len() > MAX_PROTECTION_CONTROL_BYTES
-        {
-            return Err("protection bundle exceeds bound".to_owned());
-        }
-        Ok(ProtectionBundle {
-            origin: self.origin,
-            grant: self.grant,
-        })
-    }
-
-    fn from_bundle(bundle: ProtectionBundle) -> Self {
-        Self {
-            origin: bundle.origin,
-            grant: bundle.grant,
-        }
+    /// Applies a batch of operations in one lock hold, in order.
+    ///
+    /// The default is the per-operation path, so fakes stay small; the runtime
+    /// overrides it to take the state lock once per batch.
+    fn receive_operations(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+        operations: Vec<Operation<()>>,
+    ) -> Result<Vec<OperationOutcome>, FatalSyncError> {
+        operations
+            .into_iter()
+            .map(|operation| self.receive_operation(peer, workspace, package, operation))
+            .collect()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-enum LogSyncWire {
-    Hello {
-        workspace: [u8; 16],
-        package: String,
-        membership_version: [u8; 32],
-        content_key_id: Option<[u8; 32]>,
-    },
-    Welcome {
-        membership_version: [u8; 32],
-        content_key_id: Option<[u8; 32]>,
-        protection: Option<ProtectionBundleWire>,
-    },
-    Ready {
-        protection: Option<ProtectionBundleWire>,
-    },
-    Refused {
-        reason: u8,
-    },
-    Message(LogSyncMessage<[u8; 32]>),
-}
-
-/// Classifies one received operation and reports whether it was applied.
-///
-/// After an author's first rejection or refused park, later operations from
-/// that author are dropped for the rest of this session: they would fail the
-/// sequence check anyway, and LogSync redelivers them next time.
-async fn apply_log_sync_event(
-    receiver: &Arc<dyn SyncReceiver>,
-    peer: PublicIdentity,
-    workspace: WorkspaceId,
-    package: &str,
-    event: LogSyncEvent<()>,
-    skipped: &mut BTreeSet<p2panda_core::VerifyingKey>,
-) -> Result<bool, String> {
-    let LogSyncEvent::OperationReceived { operation, .. } = event else {
-        return Ok(false);
-    };
-    let author = operation.header.verifying_key;
-    if skipped.contains(&author) {
-        return Ok(false);
-    }
-    // Applying one operation is SQLite and signature work: it crosses to a
-    // blocking thread, so the session never holds the asynchronous executor.
-    let package = package.to_owned();
-    let outcome = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.receive_operation(peer, workspace, &package, *operation)
-    })
-    .await
-    .map_err(|_| "runtime state is unavailable".to_owned())?;
-    match outcome {
-        Ok(OperationOutcome::Applied) => Ok(true),
-        Ok(OperationOutcome::Duplicate | OperationOutcome::Parked(_)) => Ok(false),
-        Ok(OperationOutcome::Rejected(_) | OperationOutcome::ParkRefused) => {
-            skipped.insert(author);
-            Ok(false)
-        }
-        Err(FatalSyncError::PeerRevoked) => Err("peer was revoked mid-session".to_owned()),
-        Err(FatalSyncError::Storage) => Err("failed to store synchronized operation".to_owned()),
-    }
-}
-
-async fn request_application_ack(connection: &Connection) -> Result<(), String> {
+/// Requests the application acknowledgement and learns whether the peer had
+/// more to send than its own budget allowed.
+async fn request_application_ack(
+    connection: &Connection,
+    truncated: bool,
+) -> Result<bool, LogSessionError> {
     let (mut send, mut receive) = connection
         .open_bi()
         .await
-        .map_err(|error| error.to_string())?;
-    send.write_all(APPLICATION_ACK_REQUEST)
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    let mut request = APPLICATION_ACK_REQUEST.to_vec();
+    request.push(u8::from(truncated));
+    send.write_all(&request)
         .await
-        .map_err(|error| error.to_string())?;
-    send.finish().map_err(|error| error.to_string())?;
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    send.finish()
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
     let ack = receive
-        .read_to_end(APPLICATION_ACK.len())
+        .read_to_end(APPLICATION_ACK.len() + 1)
         .await
-        .map_err(|error| error.to_string())?;
-    if ack != APPLICATION_ACK {
-        return Err("missing log sync application acknowledgement".to_owned());
-    }
-    Ok(())
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    parse_truncated_suffix(&ack, APPLICATION_ACK)
 }
 
-async fn acknowledge_application(connection: &Connection) -> Result<(), String> {
+/// Answers the application acknowledgement and reports this side's own state.
+async fn acknowledge_application(
+    connection: &Connection,
+    truncated: bool,
+) -> Result<bool, LogSessionError> {
     let (mut send, mut receive) = connection
         .accept_bi()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
     let request = receive
-        .read_to_end(APPLICATION_ACK_REQUEST.len())
+        .read_to_end(APPLICATION_ACK_REQUEST.len() + 1)
         .await
-        .map_err(|error| error.to_string())?;
-    if request != APPLICATION_ACK_REQUEST {
-        return Err("invalid log sync application acknowledgement request".to_owned());
-    }
-    send.write_all(APPLICATION_ACK)
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    let peer_truncated = parse_truncated_suffix(&request, APPLICATION_ACK_REQUEST)?;
+    let mut reply = APPLICATION_ACK.to_vec();
+    reply.push(u8::from(truncated));
+    send.write_all(&reply)
         .await
-        .map_err(|error| error.to_string())?;
-    send.finish().map_err(|error| error.to_string())?;
-    send.stopped().await.map_err(|error| error.to_string())?;
-    Ok(())
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    send.finish()
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    send.stopped()
+        .await
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    Ok(peer_truncated)
 }
 
-#[derive(Default)]
-struct LogSyncWriterState {
-    pending: AtomicUsize,
-    failed: AtomicBool,
-    changed: tokio::sync::Notify,
-}
-
-impl LogSyncWriterState {
-    fn complete(&self, success: bool) {
-        if !success {
-            self.failed.store(true, Ordering::Release);
-        }
-        self.pending.fetch_sub(1, Ordering::AcqRel);
-        self.changed.notify_waiters();
+/// Parses an acknowledgement of exactly `prefix` followed by one boolean byte.
+fn parse_truncated_suffix(bytes: &[u8], prefix: &[u8]) -> Result<bool, LogSessionError> {
+    if bytes.len() != prefix.len() + 1 || &bytes[..prefix.len()] != prefix {
+        return Err(LogSessionError::Protocol(
+            "invalid log sync application acknowledgement".to_owned(),
+        ));
     }
-
-    async fn flushed(&self) -> Result<(), String> {
-        loop {
-            let changed = self.changed.notified();
-            if self.pending.load(Ordering::Acquire) == 0 {
-                return if self.failed.load(Ordering::Acquire) {
-                    Err("log sync writer failed".to_owned())
-                } else {
-                    Ok(())
-                };
-            }
-            changed.await;
-        }
+    match bytes[prefix.len()] {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(LogSessionError::Protocol(
+            "invalid log sync truncation flag".to_owned(),
+        )),
     }
 }
 
-struct LogSyncIo {
-    outbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    writer_state: Arc<LogSyncWriterState>,
-    inbound: tokio::sync::mpsc::UnboundedReceiver<Result<LogSyncWire, String>>,
-}
-
-impl LogSyncIo {
-    /// `first_frame_max` bounds the very first inbound frame. A responder caps
-    /// it at [`MAX_HELLO_BYTES`], so nothing larger is read before the gate.
-    fn new(
-        mut send: iroh::endpoint::SendStream,
-        mut receive: iroh::endpoint::RecvStream,
-        first_frame_max: usize,
-    ) -> Self {
-        let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let writer_state = Arc::new(LogSyncWriterState::default());
-        let writer_status = Arc::clone(&writer_state);
-        let (inbound_tx, inbound) =
-            tokio::sync::mpsc::unbounded_channel::<Result<LogSyncWire, String>>();
-        tokio::spawn(async move {
-            while let Some(bytes) = outbound_rx.recv().await {
-                let success = if let Ok(length) = u32::try_from(bytes.len()) {
-                    send.write_all(&length.to_be_bytes()).await.is_ok()
-                        && send.write_all(&bytes).await.is_ok()
-                } else {
-                    false
-                };
-                writer_status.complete(success);
-                if !success {
-                    while outbound_rx.try_recv().is_ok() {
-                        writer_status.complete(false);
-                    }
-                    break;
-                }
-            }
-            let _ = send.finish();
-        });
-        tokio::spawn(async move {
-            let mut limit = first_frame_max;
-            loop {
-                let mut length = [0; 4];
-                if receive.read_exact(&mut length).await.is_err() {
-                    break;
-                }
-                let length = u32::from_be_bytes(length) as usize;
-                if length > limit {
-                    let _ = inbound_tx.send(Err("log sync frame exceeds bound".to_owned()));
-                    break;
-                }
-                limit = MAX_SYNC_BYTES;
-                let mut bytes = vec![0; length];
-                if receive.read_exact(&mut bytes).await.is_err() {
-                    break;
-                }
-                let message = postcard::from_bytes(&bytes).map_err(|error| error.to_string());
-                if inbound_tx.send(message).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            outbound,
-            writer_state,
-            inbound,
-        }
-    }
-
-    fn send_wire(&mut self, wire: LogSyncWire) -> Result<(), String> {
-        let bytes = postcard::to_stdvec(&wire).map_err(|error| error.to_string())?;
-        if bytes.len() > MAX_SYNC_BYTES {
-            return Err("log sync frame exceeds bound".to_owned());
-        }
-        self.writer_state.pending.fetch_add(1, Ordering::AcqRel);
-        self.outbound.send(bytes).map_err(|_| {
-            self.writer_state.complete(false);
-            "log sync writer closed".to_owned()
-        })
-    }
-
-    async fn next_wire(&mut self) -> Result<LogSyncWire, String> {
-        match self.inbound.recv().await {
-            Some(Ok(wire)) => Ok(wire),
-            Some(Err(error)) => Err(error),
-            None => Err("log sync stream closed".to_owned()),
-        }
-    }
-}
-
-impl Sink<LogSyncMessage<[u8; 32]>> for LogSyncIo {
-    type Error = String;
-
-    fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: LogSyncMessage<[u8; 32]>,
-    ) -> Result<(), Self::Error> {
-        self.get_mut().send_wire(LogSyncWire::Message(item))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl Stream for LogSyncIo {
-    type Item = Result<LogSyncMessage<[u8; 32]>, String>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.get_mut().inbound.poll_recv(cx).map(|item| {
-            item.map(|wire| match wire {
-                Ok(LogSyncWire::Message(message)) => Ok(message),
-                Ok(_) => Err("unexpected log sync handshake frame".to_owned()),
-                Err(error) => Err(error),
-            })
-        })
-    }
-}
-
-/// Runs the p2panda LogSync exchange once both sides have been authorized.
-///
-/// Returns how many operations were applied locally.
-async fn run_log_exchange(
-    connection: &Connection,
-    io: LogSyncIo,
+/// Builds the author-to-log map one session advertises.
+async fn session_logs(
     receiver: &Arc<dyn SyncReceiver>,
     peer: PublicIdentity,
     workspace: WorkspaceId,
     package: &str,
-    initiator: bool,
-) -> Result<usize, String> {
-    let scope = package.to_owned();
-    let operations = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.operations(peer, workspace, &scope)
-    })
-    .await
-    .map_err(|_| "runtime state is unavailable".to_owned())?
-    .map_err(|()| "failed to load local operations".to_owned())?;
-    let store = crate::synchronization::p2panda_adapter::TeamarnessLogStore::from_operations(
-        operations.clone(),
-    );
-    let mut logs = std::collections::BTreeMap::new();
+    operations: &[ReplicationOperation],
+) -> Result<std::collections::BTreeMap<p2panda_core::VerifyingKey, Vec<[u8; 32]>>, LogSessionError>
+{
     let package_log =
         crate::synchronization::operation_store::log_id(scope_digest(package, workspace));
     let authors =
         crate::blocking::receiver_call(receiver, move |receiver| receiver.authors(peer, workspace))
             .await
-            .map_err(|_| "runtime state is unavailable".to_owned())?
-            .map_err(|()| "failed to load workspace authors".to_owned())?;
+            .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
+            .map_err(|()| {
+                LogSessionError::Transport("failed to load workspace authors".to_owned())
+            })?;
+    let mut logs = std::collections::BTreeMap::new();
     for author in authors {
         let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| LogSessionError::Protocol(error.to_string()))?;
         logs.entry(author)
             .or_insert_with(Vec::new)
             .push(package_log);
@@ -531,75 +339,66 @@ async fn run_log_exchange(
     for (log_id, operation) in operations {
         logs.entry(operation.header.verifying_key)
             .or_insert_with(Vec::new)
-            .push(log_id);
+            .push(*log_id);
     }
     for ids in logs.values_mut() {
-        ids.sort();
+        ids.sort_unstable();
         ids.dedup();
     }
-    let (events, mut event_rx) =
-        tokio::sync::broadcast::channel::<LogSyncEvent<()>>(MAX_SYNC_OPERATIONS + 1);
-    let protocol = p2panda_sync::protocols::LogSync::new(store, logs, events);
-    let writer_state = Arc::clone(&io.writer_state);
-    let (mut sink, mut stream) = io.split();
-    let mut running = Box::pin(crate::synchronization::p2panda_adapter::run_finite(
-        protocol,
-        &mut sink,
-        &mut stream,
-    ));
-    let mut accepted = 0;
-    // One skipped-author set per session, shared by both drain paths.
-    let mut skipped = BTreeSet::new();
-    loop {
-        tokio::select! {
-            result = &mut running => {
-                result.map_err(|error| error.to_string())?;
-                drop(running);
-                writer_state.flushed().await?;
-                loop {
-                    match event_rx.try_recv() {
-                        Ok(event) => {
-                            if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped).await? {
-                                accepted += 1;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::TryRecvError::Empty
-                            | tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                            return Err("log sync event delivery lagged".to_owned());
-                        }
-                    }
-                }
-                drop(sink);
-                drop(stream);
-                if initiator {
-                    request_application_ack(connection).await?;
-                } else {
-                    acknowledge_application(connection).await?;
-                }
-                return Ok(accepted);
-            }
-            event = event_rx.recv() => match event {
-                Ok(event) => {
-                    if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped).await? {
-                        accepted += 1;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    return Err("log sync event delivery lagged".to_owned());
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err("log sync event delivery closed".to_owned());
-                }
-            }
-        }
-    }
+    Ok(logs)
+}
+
+/// Loads what this side will offer and runs the exchange.
+async fn exchange_and_acknowledge(
+    connection: &Connection,
+    reader: &mut FrameReader,
+    sink: &mut (impl futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin + Send),
+    receiver: &Arc<dyn SyncReceiver>,
+    context: ExchangeContext,
+    limits: SessionLimits,
+) -> Result<ExchangeReport, LogSessionError> {
+    let peer = context.peer;
+    let workspace = context.workspace;
+    let scope = context.package.clone();
+    let operations = crate::blocking::receiver_call(receiver, move |receiver| {
+        receiver.operations(peer, workspace, &scope)
+    })
+    .await
+    .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
+    .map_err(|()| LogSessionError::Transport("failed to load local operations".to_owned()))?;
+    let logs = session_logs(receiver, peer, workspace, &context.package, &operations).await?;
+    let store =
+        crate::synchronization::p2panda_adapter::TeamarnessLogStore::from_operations(operations);
+    let role = context.role;
+    let outcomes = run_exchange(
+        reader,
+        sink,
+        store,
+        logs,
+        Arc::clone(receiver),
+        context,
+        limits,
+    )
+    .await?;
+    // The lazy log view reports its own truncation; until then a session always
+    // offers everything it holds.
+    let sent_truncated = false;
+    let peer_truncated = match role {
+        Role::Initiator => request_application_ack(connection, sent_truncated).await?,
+        Role::Responder => acknowledge_application(connection, sent_truncated).await?,
+    };
+    Ok(ExchangeReport {
+        outcomes,
+        sent_truncated,
+        peer_truncated,
+    })
 }
 
 /// The initiator half of `teamarness/package-sync/2`.
 ///
 /// The local gate runs before dialling, so an Installation never opens a
 /// session for a Workspace it or the peer has left.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn outbound_log_session(
     endpoint: &iroh::Endpoint,
     address: iroh_base::EndpointAddr,
@@ -608,7 +407,8 @@ pub(crate) async fn outbound_log_session(
     workspace: WorkspaceId,
     package: String,
     peer: PublicIdentity,
-) -> Result<usize, LogSessionError> {
+    limits: SessionLimits,
+) -> Result<ExchangeReport, LogSessionError> {
     let mut cancellation = sessions.subscribe(peer);
     let scope = package.clone();
     let grant = crate::blocking::receiver_call(&receiver, move |receiver| {
@@ -616,13 +416,16 @@ pub(crate) async fn outbound_log_session(
     })
     .await
     .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
-    .map_err(LogSessionError::Refused)?;
+    .map_err(|_| LogSessionError::LocalNotAuthorized)?;
     tokio::select! {
-        result = outbound_session_body(endpoint, address, &receiver, grant, workspace, &package, peer) => result,
+        result = outbound_session_body(
+            endpoint, address, &receiver, grant, workspace, &package, peer, limits,
+        ) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn outbound_session_body(
     endpoint: &iroh::Endpoint,
     address: iroh_base::EndpointAddr,
@@ -631,24 +434,34 @@ async fn outbound_session_body(
     workspace: WorkspaceId,
     package: &str,
     peer: PublicIdentity,
-) -> Result<usize, LogSessionError> {
-    let connection = endpoint
-        .connect(address, LOG_SYNC_ALPN)
-        .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    limits: SessionLimits,
+) -> Result<ExchangeReport, LogSessionError> {
+    // A peer that has gone away must be discovered well inside the session
+    // budget, so the dial has its own, shorter deadline.
+    let connection = timeout(
+        limits.connect_timeout,
+        endpoint.connect(address, LOG_SYNC_ALPN),
+    )
+    .await
+    .map_err(|_| LogSessionError::Transport("package sync dial timed out".to_owned()))?
+    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
     let (send, receive) = connection
         .open_bi()
         .await
         .map_err(|error| LogSessionError::Transport(error.to_string()))?;
-    let mut io = LogSyncIo::new(send, receive, MAX_SYNC_BYTES);
-    io.send_wire(LogSyncWire::Hello {
+    let mut reader = FrameReader::spawn(receive, limits);
+    // The initiator's next inbound frame is the `Welcome`.
+    reader.set_phase(FramePhase::Handshake);
+    let mut sink = frame_sink(send, limits);
+    sink.send(LogSyncWire::Hello {
         workspace: *workspace.as_bytes(),
         package: package.to_owned(),
         membership_version: grant.membership_version,
         content_key_id: grant.content_key_id,
     })
-    .map_err(LogSessionError::Transport)?;
-    let welcome = match io.next_wire().await {
+    .await
+    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    let welcome = match reader.next_wire().await {
         Ok(wire) => wire,
         Err(error) => return Err(refusal_from_close(&connection, error).await),
     };
@@ -668,10 +481,12 @@ async fn outbound_session_body(
     if let (Some(local_key), Some(remote_key)) = (grant.content_key_id, remote_key)
         && local_key != remote_key
     {
-        let _ = io.send_wire(LogSyncWire::Refused {
-            reason: Refusal::KeyMismatch.reason(),
-        });
-        connection.close(6_u8.into(), b"key mismatch");
+        let _ = sink
+            .send(LogSyncWire::Refused {
+                reason: Refusal::KeyMismatch.reason(),
+            })
+            .await;
+        connection.close(CLOSE_KEY_MISMATCH.into(), b"key mismatch");
         return Err(LogSessionError::Refused(Refusal::KeyMismatch));
     }
     if let Some(bundle) = welcome_bundle {
@@ -699,37 +514,102 @@ async fn outbound_session_body(
     } else {
         None
     };
-    io.send_wire(LogSyncWire::Ready {
+    sink.send(LogSyncWire::Ready {
         protection: offer.map(ProtectionBundleWire::from_bundle),
     })
-    .map_err(LogSessionError::Transport)?;
-    run_log_exchange(&connection, io, receiver, peer, workspace, package, true)
-        .await
-        .map_err(LogSessionError::Transport)
+    .await
+    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    reader.set_phase(FramePhase::Session);
+    let result = exchange_and_acknowledge(
+        &connection,
+        &mut reader,
+        &mut sink,
+        receiver,
+        ExchangeContext {
+            peer,
+            workspace,
+            package: package.to_owned(),
+            role: Role::Initiator,
+        },
+        limits,
+    )
+    .await;
+    match result {
+        Ok(report) => Ok(report),
+        // The peer's close code says why it stopped; the local stream error is
+        // only the symptom.
+        Err(error) => Err(peer_close_reason(&connection).unwrap_or(error)),
+    }
+}
+
+/// Reads the reason a peer gave for closing, when it gave one this side knows.
+fn peer_close_reason(connection: &Connection) -> Option<LogSessionError> {
+    let iroh::endpoint::ConnectionError::ApplicationClosed(close) = connection.close_reason()?
+    else {
+        return None;
+    };
+    close_code_reason(u64::from(close.error_code))
+}
+
+/// Names the failure a peer's close code stands for, when this side knows it.
+fn close_code_reason(code: u64) -> Option<LogSessionError> {
+    if let Some(refusal) = Refusal::from_close_code(code) {
+        return Some(LogSessionError::Refused(refusal));
+    }
+    match u8::try_from(code).ok()? {
+        CLOSE_OVERLOADED | CLOSE_PEER_BUSY => Some(LogSessionError::PeerBusy),
+        CLOSE_BUDGET_EXCEEDED => Some(LogSessionError::BudgetExceeded),
+        _ => None,
+    }
 }
 
 /// Maps a stream that ended before `Welcome` onto the responder's close code.
 ///
 /// A refusal is sent as a frame and as a close code; the close code is the
 /// reliable one, because closing may drop stream data the peer has not read.
-async fn refusal_from_close(connection: &Connection, error: String) -> LogSessionError {
+async fn refusal_from_close(connection: &Connection, error: FrameError) -> LogSessionError {
     let closed = match connection.close_reason() {
         Some(reason) => Some(reason),
-        None => timeout(Duration::from_secs(2), connection.closed())
+        None => timeout(std::time::Duration::from_secs(2), connection.closed())
             .await
             .ok(),
     };
     if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = closed
-        && let Some(refusal) = Refusal::from_close_code(u64::from(close.error_code))
+        && let Some(reason) = close_code_reason(u64::from(close.error_code))
     {
-        return LogSessionError::Refused(refusal);
+        return reason;
     }
-    LogSessionError::Transport(error)
+    LogSessionError::Transport(error.to_string())
+}
+
+/// Releases one inbound slot and one per-peer slot when a session ends.
+struct InboundSlot {
+    per_peer: Arc<Mutex<HashMap<PublicIdentity, usize>>>,
+    active: Arc<AtomicUsize>,
+    peer: PublicIdentity,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        let mut peers = self.per_peer.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = peers.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                peers.remove(&self.peer);
+            }
+        }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) struct LogSyncHandler {
     stopping: AtomicBool,
+    inbound: Arc<Semaphore>,
+    per_peer: Arc<Mutex<HashMap<PublicIdentity, usize>>>,
+    active: Arc<AtomicUsize>,
     services: SyncServices,
+    limits: SessionLimits,
 }
 
 impl std::fmt::Debug for LogSyncHandler {
@@ -741,15 +621,47 @@ impl std::fmt::Debug for LogSyncHandler {
 }
 
 impl LogSyncHandler {
-    pub(crate) fn new(services: SyncServices) -> Self {
+    pub(crate) fn new(services: SyncServices, limits: SessionLimits) -> Self {
         Self {
             stopping: AtomicBool::new(false),
+            inbound: Arc::new(Semaphore::new(limits.inbound_sessions)),
+            per_peer: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::new(AtomicUsize::new(0)),
             services,
+            limits,
         }
     }
 
     pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
+    }
+
+    /// How many inbound sessions hold a slot right now.
+    #[cfg(test)]
+    pub(crate) fn active_for_test(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Takes an inbound slot and a per-peer slot, or names which bound refused.
+    fn take_slot(&self, peer: PublicIdentity) -> Result<InboundSlot, (u8, &'static [u8])> {
+        let permit = Arc::clone(&self.inbound)
+            .try_acquire_owned()
+            .map_err(|_| (CLOSE_OVERLOADED, b"package sync overloaded".as_slice()))?;
+        {
+            let mut peers = self.per_peer.lock().unwrap_or_else(PoisonError::into_inner);
+            let count = peers.entry(peer).or_insert(0);
+            if *count >= self.limits.inbound_sessions_per_peer {
+                return Err((CLOSE_PEER_BUSY, b"package sync peer busy".as_slice()));
+            }
+            *count += 1;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Ok(InboundSlot {
+            per_peer: Arc::clone(&self.per_peer),
+            active: Arc::clone(&self.active),
+            peer,
+            _permit: permit,
+        })
     }
 }
 
@@ -761,10 +673,11 @@ async fn run_log_session(
     connection: Connection,
     services: SyncServices,
     peer: PublicIdentity,
+    limits: SessionLimits,
 ) -> Result<(), LogSessionError> {
     let mut cancellation = services.sessions.subscribe(peer);
     tokio::select! {
-        result = run_log_session_body(&connection, &services.receiver, peer) => result,
+        result = run_log_session_body(&connection, &services.receiver, peer, limits) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
     }
 }
@@ -773,35 +686,41 @@ async fn run_log_session_body(
     connection: &Connection,
     receiver: &Arc<dyn SyncReceiver>,
     peer: PublicIdentity,
+    limits: SessionLimits,
 ) -> Result<(), LogSessionError> {
     let (send, receive) = connection
         .accept_bi()
         .await
         .map_err(|error| LogSessionError::Transport(error.to_string()))?;
-    let mut io = LogSyncIo::new(send, receive, MAX_HELLO_BYTES);
-    let (workspace, package, remote_version, remote_key) =
-        match io.next_wire().await.map_err(LogSessionError::Transport)? {
-            LogSyncWire::Hello {
-                workspace,
+    let mut reader = FrameReader::spawn(receive, limits);
+    let mut sink = frame_sink(send, limits);
+    // A peer that says nothing must not hold an inbound slot for the whole
+    // session, so the opening frame has its own short deadline.
+    let hello = timeout(limits.hello_timeout, reader.next_wire())
+        .await
+        .map_err(|_| LogSessionError::Protocol("package sync hello timed out".to_owned()))?
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    let (workspace, package, remote_version, remote_key) = match hello {
+        LogSyncWire::Hello {
+            workspace,
+            package,
+            membership_version,
+            content_key_id,
+        } => {
+            if package.is_empty() || package.len() > MAX_PACKAGE_IDENTITY || !package.is_ascii() {
+                return Err(LogSessionError::Protocol(
+                    "invalid package identity".to_owned(),
+                ));
+            }
+            (
+                WorkspaceId::from_bytes(workspace),
                 package,
                 membership_version,
                 content_key_id,
-            } => {
-                if package.is_empty() || package.len() > MAX_PACKAGE_IDENTITY || !package.is_ascii()
-                {
-                    return Err(LogSessionError::Protocol(
-                        "invalid package identity".to_owned(),
-                    ));
-                }
-                (
-                    WorkspaceId::from_bytes(workspace),
-                    package,
-                    membership_version,
-                    content_key_id,
-                )
-            }
-            _ => return Err(LogSessionError::Protocol("missing hello".to_owned())),
-        };
+            )
+        }
+        _ => return Err(LogSessionError::Protocol("missing hello".to_owned())),
+    };
     let scope = package.clone();
     let authorized = crate::blocking::receiver_call(receiver, move |receiver| {
         receiver.authorize_session(peer, workspace, &scope)
@@ -810,12 +729,14 @@ async fn run_log_session_body(
     .unwrap_or(Err(Refusal::Unavailable));
     let grant = match authorized {
         Ok(grant) => grant,
-        Err(refusal) => return Err(refuse(&mut io, connection, refusal).await),
+        Err(refusal) => return Err(refuse(&mut sink, connection, refusal).await),
     };
+    // Past the gate the peer may send the larger handshake frames.
+    reader.set_phase(FramePhase::Handshake);
     if let (Some(remote_key), Some(local_key)) = (remote_key, grant.content_key_id)
         && remote_key != local_key
     {
-        return Err(refuse(&mut io, connection, Refusal::KeyMismatch).await);
+        return Err(refuse(&mut sink, connection, Refusal::KeyMismatch).await);
     }
     let bundle = if grant.content_key_id.is_some() && remote_key.is_none() {
         let scope = package.clone();
@@ -828,19 +749,24 @@ async fn run_log_session_body(
     } else {
         None
     };
-    io.send_wire(LogSyncWire::Welcome {
+    sink.send(LogSyncWire::Welcome {
         membership_version: grant.membership_version,
         content_key_id: grant.content_key_id,
         protection: bundle.map(ProtectionBundleWire::from_bundle),
     })
-    .map_err(LogSessionError::Transport)?;
+    .await
+    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
     if remote_version != grant.membership_version {
         let _ = crate::blocking::receiver_call(receiver, move |receiver| {
             receiver.note_membership_mismatch(workspace, peer);
         })
         .await;
     }
-    match io.next_wire().await.map_err(LogSessionError::Transport)? {
+    match reader
+        .next_wire()
+        .await
+        .map_err(|error| LogSessionError::Transport(error.to_string()))?
+    {
         LogSyncWire::Ready { protection } => {
             if let Some(bundle) = protection {
                 let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
@@ -858,22 +784,39 @@ async fn run_log_session_body(
         }
         _ => return Err(LogSessionError::Protocol("expected ready".to_owned())),
     }
-    run_log_exchange(connection, io, receiver, peer, workspace, &package, false)
-        .await
-        .map(|_| ())
-        .map_err(LogSessionError::Transport)
+    reader.set_phase(FramePhase::Session);
+    exchange_and_acknowledge(
+        connection,
+        &mut reader,
+        &mut sink,
+        receiver,
+        ExchangeContext {
+            peer,
+            workspace,
+            package,
+            role: Role::Responder,
+        },
+        limits,
+    )
+    .await
+    .map(|_| ())
 }
 
-/// Sends the refusal frame, flushes it, and closes with the matching code.
-async fn refuse(io: &mut LogSyncIo, connection: &Connection, refusal: Refusal) -> LogSessionError {
-    let _ = io.send_wire(LogSyncWire::Refused {
-        reason: refusal.reason(),
-    });
-    let _ = io.writer_state.flushed().await;
+/// Sends the refusal frame and closes with the matching code.
+async fn refuse(
+    sink: &mut (impl futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin),
+    connection: &Connection,
+    refusal: Refusal,
+) -> LogSessionError {
+    let _ = sink
+        .send(LogSyncWire::Refused {
+            reason: refusal.reason(),
+        })
+        .await;
     match refusal {
-        Refusal::NotAuthorized => connection.close(5_u8.into(), b"not authorized"),
-        Refusal::Unavailable => connection.close(1_u8.into(), b"unavailable"),
-        Refusal::KeyMismatch => connection.close(6_u8.into(), b"key mismatch"),
+        Refusal::NotAuthorized => connection.close(CLOSE_NOT_AUTHORIZED.into(), b"not authorized"),
+        Refusal::Unavailable => connection.close(CLOSE_UNAVAILABLE.into(), b"unavailable"),
+        Refusal::KeyMismatch => connection.close(CLOSE_KEY_MISMATCH.into(), b"key mismatch"),
     }
     LogSessionError::Refused(refusal)
 }
@@ -886,22 +829,31 @@ impl ProtocolHandler for LogSyncHandler {
         }
         let peer = PublicIdentity::from_bytes(*connection.remote_id().as_bytes())
             .map_err(|_| AcceptError::from(std::io::Error::other("invalid peer")))?;
+        // Concurrency is bounded before a single byte is read from the peer.
+        let slot = match self.take_slot(peer) {
+            Ok(slot) => slot,
+            Err((code, reason)) => {
+                connection.close(code.into(), reason);
+                return Ok(());
+            }
+        };
         let result = timeout(
-            SYNC_SESSION_TIMEOUT,
-            run_log_session(connection.clone(), self.services.clone(), peer),
+            self.limits.session_timeout,
+            run_log_session(connection.clone(), self.services.clone(), peer, self.limits),
         )
         .await;
         match result {
             Ok(Ok(())) => {}
             // A refusal has already closed the connection with its own code.
             Ok(Err(LogSessionError::Refused(_))) => {}
-            Ok(Err(LogSessionError::Cancelled)) => {
-                connection.close(CLOSE_INVALID.into(), b"session cancelled");
+            Ok(Err(error)) => {
+                connection.close(error.close_code().into(), error.close_reason());
             }
-            Ok(Err(_)) | Err(_) => {
+            Err(_) => {
                 connection.close(CLOSE_INVALID.into(), b"log sync invalid or timed out");
             }
         }
+        drop(slot);
         Ok(())
     }
 
@@ -911,17 +863,19 @@ impl ProtocolHandler for LogSyncHandler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    use std::sync::Mutex;
+    use p2panda_sync::protocols::LogSyncEvent;
+    use std::sync::Mutex as StdMutex;
 
     /// A scripted Core seam. It exists only to inject a rejection: everything
-    /// under test — the skipped-author set and the session loop — is real.
+    /// under test — the skipped-author set and the batching — is real.
     #[derive(Default)]
-    struct ScriptedReceiver {
-        rejected_author: Mutex<Option<p2panda_core::VerifyingKey>>,
-        seen: Mutex<Vec<p2panda_core::VerifyingKey>>,
+    pub(crate) struct ScriptedReceiver {
+        rejected_author: StdMutex<Option<p2panda_core::VerifyingKey>>,
+        seen: StdMutex<Vec<(p2panda_core::VerifyingKey, u32)>>,
+        batches: StdMutex<Vec<usize>>,
     }
 
     impl SyncReceiver for ScriptedReceiver {
@@ -981,78 +935,85 @@ mod tests {
             operation: Operation<()>,
         ) -> Result<OperationOutcome, FatalSyncError> {
             let author = operation.header.verifying_key;
-            self.seen.lock().unwrap().push(author);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((author, operation.header.seq_num));
             if *self.rejected_author.lock().unwrap() == Some(author) {
                 Ok(OperationOutcome::Rejected(RejectReason::Conflict))
             } else {
                 Ok(OperationOutcome::Applied)
             }
         }
+
+        fn receive_operations(
+            &self,
+            peer: PublicIdentity,
+            workspace: WorkspaceId,
+            package: &str,
+            operations: Vec<Operation<()>>,
+        ) -> Result<Vec<OperationOutcome>, FatalSyncError> {
+            self.batches.lock().unwrap().push(operations.len());
+            operations
+                .into_iter()
+                .map(|operation| self.receive_operation(peer, workspace, package, operation))
+                .collect()
+        }
     }
 
-    fn signed_operation(seed: u8, sequence: u32) -> Operation<()> {
+    pub(crate) fn signed_operation(seed: u8, sequence: u32) -> Operation<()> {
+        signed_log(seed, sequence + 1).pop().expect("one operation")
+    }
+
+    /// A correctly backlinked log of `count` operations for one author.
+    pub(crate) fn signed_log(seed: u8, count: u32) -> Vec<Operation<()>> {
         let key = p2panda_core::SigningKey::from_bytes(&[seed; 32]);
-        let payload = vec![seed, u8::try_from(sequence).unwrap()];
-        let header = p2panda_core::Header::<()>::builder()
-            .body(payload.as_slice())
-            .seq_num(sequence)
-            .build(&key, ());
-        Operation::from_parts(header, Some(p2panda_core::Body::from_bytes(&payload)))
+        let mut backlink = None;
+        let mut log = Vec::with_capacity(count as usize);
+        for sequence in 0..count {
+            let payload = sequence.to_be_bytes().to_vec();
+            let header = p2panda_core::Header::<()>::builder()
+                .body(payload.as_slice())
+                .seq_num(sequence)
+                .backlink(backlink)
+                .build(&key, ());
+            backlink = Some(header.hash());
+            log.push(Operation::from_parts(
+                header,
+                Some(p2panda_core::Body::from_bytes(&payload)),
+            ));
+        }
+        log
     }
 
-    fn received(operation: Operation<()>) -> LogSyncEvent<()> {
+    pub(crate) fn received(operation: Operation<()>) -> LogSyncEvent<()> {
         LogSyncEvent::OperationReceived {
             operation: Box::new(operation),
             metrics: p2panda_sync::protocols::LogSyncMetrics::default(),
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_skips_an_author_after_rejection_and_continues_with_others() {
-        let scripted = Arc::new(ScriptedReceiver::default());
-        let rejected = signed_operation(1, 0);
-        *scripted.rejected_author.lock().unwrap() = Some(rejected.header.verifying_key);
-        let receiver: Arc<dyn SyncReceiver> = scripted.clone();
-        let workspace = WorkspaceId::from_bytes([4; 16]);
-        let peer = PublicIdentity::from_bytes(
-            *iroh_base::SecretKey::from_bytes(&[9; 32])
+    pub(crate) fn test_peer(seed: u8) -> PublicIdentity {
+        PublicIdentity::from_bytes(
+            *iroh_base::SecretKey::from_bytes(&[seed; 32])
                 .public()
                 .as_bytes(),
         )
-        .unwrap();
-        let mut skipped = BTreeSet::new();
+        .unwrap()
+    }
 
-        let mut applied = 0;
-        for event in [
-            received(rejected.clone()),
-            received(signed_operation(1, 1)),
-            received(signed_operation(2, 0)),
-        ] {
-            if apply_log_sync_event(
-                &receiver,
-                peer,
-                workspace,
-                "teamarness.test",
-                event,
-                &mut skipped,
-            )
-            .await
-            .unwrap()
-            {
-                applied += 1;
-            }
+    impl ScriptedReceiver {
+        pub(crate) fn reject(&self, author: p2panda_core::VerifyingKey) {
+            *self.rejected_author.lock().unwrap() = Some(author);
         }
 
-        assert_eq!(applied, 1, "only the other author's operation applied");
-        let seen = scripted.seen.lock().unwrap().clone();
-        assert_eq!(
-            seen.iter()
-                .filter(|author| **author == rejected.header.verifying_key)
-                .count(),
-            1,
-            "the rejected author's later operation never reached the receiver"
-        );
-        assert_eq!(seen.len(), 2);
+        pub(crate) fn seen(&self) -> Vec<(p2panda_core::VerifyingKey, u32)> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        pub(crate) fn batches(&self) -> Vec<usize> {
+            self.batches.lock().unwrap().clone()
+        }
     }
 
     #[test]
@@ -1081,6 +1042,39 @@ mod tests {
         );
         assert_eq!(Refusal::from_reason(9), None);
         assert_eq!(Refusal::from_close_code(u64::from(CLOSE_INVALID)), None);
+        assert_eq!(
+            Refusal::from_close_code(u64::from(CLOSE_BUDGET_EXCEEDED)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_budget_refusal_closes_with_its_own_code() {
+        assert_eq!(
+            LogSessionError::BudgetExceeded.close_code(),
+            CLOSE_BUDGET_EXCEEDED
+        );
+        assert_eq!(
+            LogSessionError::Protocol("x".to_owned()).close_code(),
+            CLOSE_INVALID
+        );
+    }
+
+    #[test]
+    fn application_acknowledgements_carry_a_truncation_byte() {
+        let mut request = APPLICATION_ACK_REQUEST.to_vec();
+        request.push(1);
+        assert_eq!(
+            parse_truncated_suffix(&request, APPLICATION_ACK_REQUEST),
+            Ok(true)
+        );
+        let mut reply = APPLICATION_ACK.to_vec();
+        reply.push(0);
+        assert_eq!(parse_truncated_suffix(&reply, APPLICATION_ACK), Ok(false));
+        assert!(parse_truncated_suffix(APPLICATION_ACK, APPLICATION_ACK).is_err());
+        let mut invalid = APPLICATION_ACK.to_vec();
+        invalid.push(2);
+        assert!(parse_truncated_suffix(&invalid, APPLICATION_ACK).is_err());
     }
 
     #[test]
@@ -1092,46 +1086,10 @@ mod tests {
             content_key_id: Some([5; 32]),
         };
         let bytes = postcard::to_stdvec(&hello).unwrap();
-        assert!(bytes.len() <= MAX_HELLO_BYTES);
+        assert!(bytes.len() <= SessionLimits::CURRENT.hello_bytes);
         assert!(matches!(
             postcard::from_bytes::<LogSyncWire>(&bytes).unwrap(),
             LogSyncWire::Hello { package, .. } if package == "teamarness.test"
         ));
-        let welcome = LogSyncWire::Welcome {
-            membership_version: [6; 32],
-            content_key_id: None,
-            protection: Some(ProtectionBundleWire {
-                origin: vec![1; 354],
-                grant: vec![2; 354],
-            }),
-        };
-        let bytes = postcard::to_stdvec(&welcome).unwrap();
-        assert!(matches!(
-            postcard::from_bytes::<LogSyncWire>(&bytes).unwrap(),
-            LogSyncWire::Welcome {
-                protection: Some(_),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn oversized_protection_bundles_are_refused() {
-        assert!(
-            ProtectionBundleWire {
-                origin: vec![0; MAX_PROTECTION_CONTROL_BYTES + 1],
-                grant: Vec::new(),
-            }
-            .validated()
-            .is_err()
-        );
-        assert!(
-            ProtectionBundleWire {
-                origin: Vec::new(),
-                grant: vec![0; MAX_PROTECTION_CONTROL_BYTES],
-            }
-            .validated()
-            .is_ok()
-        );
     }
 }

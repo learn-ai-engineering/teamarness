@@ -137,6 +137,12 @@ impl Transport {
         }))
     }
 
+    /// How many inbound package synchronization sessions hold a slot.
+    #[cfg(test)]
+    pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
+        self.network.inbound_package_sessions_for_test()
+    }
+
     pub(crate) fn endpoint_id(&self) -> iroh_base::PublicKey {
         self.network.endpoint_id()
     }
@@ -223,7 +229,8 @@ impl Transport {
         workspace: crate::WorkspaceId,
         package: String,
         peer: crate::PublicIdentity,
-    ) -> Result<usize, crate::synchronization::LogSessionError> {
+    ) -> Result<crate::synchronization::ExchangeReport, crate::synchronization::LogSessionError>
+    {
         self.network
             .send_log_sync(address, receiver, workspace, package, peer)
             .await

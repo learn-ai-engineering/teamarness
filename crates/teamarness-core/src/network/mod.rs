@@ -15,9 +15,10 @@ use tokio::time::timeout;
 
 use crate::OnboardingError;
 use crate::onboarding::handler::OnboardingHandler;
+use crate::synchronization::limits::SessionLimits;
 use crate::synchronization::{
-    FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, PeerSessions, Refusal,
-    SessionGrant, SyncReceiver, SyncServices,
+    ExchangeReport, FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome,
+    PeerSessions, Refusal, SessionGrant, SyncReceiver, SyncServices,
 };
 
 pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = crate::synchronization::network_handler::LOG_SYNC_ALPN;
@@ -27,7 +28,6 @@ pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = crate::synchronization::network_hand
 /// Endpoint and Router while naming no protocol or synchronization type.
 pub(crate) type ProtocolRegistration = (Vec<u8>, Box<dyn iroh::protocol::DynProtocolHandler>);
 pub(crate) const MAX_OUTBOUND_PEERS: usize = 4;
-pub(crate) const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The receiver a Network bound without Core services uses. It authorizes
 /// nothing, so an unattached endpoint serves no Workspace.
@@ -103,6 +103,8 @@ pub(crate) struct Network {
     /// addresses here instead. Production binds with `loopback_only == false`.
     address_book: Option<iroh::address_lookup::memory::MemoryLookup>,
     #[cfg(test)]
+    log_sync: Arc<LogSyncHandler>,
+    #[cfg(test)]
     alpns: Vec<Vec<u8>>,
 }
 
@@ -149,17 +151,22 @@ impl Network {
         let services = services.unwrap_or_else(|| SyncServices {
             receiver: Arc::new(RejectingSyncReceiver),
             sessions: PeerSessions::new(),
+            limits: SessionLimits::CURRENT,
         });
-        let log_sync = Arc::new(LogSyncHandler::new(services.clone()));
+        let log_sync = Arc::new(LogSyncHandler::new(services.clone(), services.limits));
         let mut builder = Router::builder(endpoint.clone())
             .accept(crate::onboarding::transport::ONBOARDING_ALPN, onboarding);
         for (alpn, handler) in protocols {
             builder = builder.accept(alpn, handler);
         }
-        let router = builder.accept(PACKAGE_SYNC_ALPN, log_sync).spawn();
+        let router = builder
+            .accept(PACKAGE_SYNC_ALPN, Arc::clone(&log_sync))
+            .spawn();
         Ok(Arc::new(Self {
             endpoint,
             router,
+            #[cfg(test)]
+            log_sync,
             outbound: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
             outbound_extra: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
             services,
@@ -175,6 +182,12 @@ impl Network {
 
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// How many inbound package synchronization sessions hold a slot.
+    #[cfg(test)]
+    pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
+        self.log_sync.active_for_test()
     }
 
     #[cfg(test)]
@@ -197,14 +210,14 @@ impl Network {
         workspace: crate::WorkspaceId,
         package: String,
         peer: crate::PublicIdentity,
-    ) -> Result<usize, LogSessionError> {
+    ) -> Result<ExchangeReport, LogSessionError> {
         self.send_log_sync_with_timeout(
             address,
             receiver,
             workspace,
             package,
             peer,
-            crate::synchronization::network_handler::SYNC_SESSION_TIMEOUT,
+            self.services.limits.session_timeout,
         )
         .await
     }
@@ -217,7 +230,7 @@ impl Network {
         package: String,
         peer: crate::PublicIdentity,
         session_timeout: Duration,
-    ) -> Result<usize, LogSessionError> {
+    ) -> Result<ExchangeReport, LogSessionError> {
         timeout(session_timeout, async {
             let _permit = self
                 .outbound
@@ -232,6 +245,7 @@ impl Network {
                 workspace,
                 package,
                 peer,
+                self.services.limits,
             )
             .await
         })
@@ -355,10 +369,9 @@ mod tests {
                 crate::PublicIdentity::from_bytes(*server.endpoint_id().as_bytes()).unwrap(),
             )
             .await;
-        assert_eq!(
-            result.unwrap_err(),
-            LogSessionError::Refused(Refusal::NotAuthorized)
-        );
+        // The local gate refuses before anything is dialled, so the failure
+        // names this side rather than the peer's answer.
+        assert_eq!(result.unwrap_err(), LogSessionError::LocalNotAuthorized);
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
     }

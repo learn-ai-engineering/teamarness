@@ -594,7 +594,10 @@ async fn forged_scope_record_is_rejected_without_ending_the_session() {
         )
         .await
         .expect("one forged record must not end the session");
-    assert_eq!(applied, 0, "the forging peer had nothing new to receive");
+    assert_eq!(
+        applied.outcomes.applied, 0,
+        "the forging peer had nothing new to receive"
+    );
 
     let seen = cluster.record_ids("b", id, PACKAGE);
     assert!(

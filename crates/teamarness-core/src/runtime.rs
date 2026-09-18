@@ -22,6 +22,10 @@ use crate::invitation::{InvitationClaim, InvitationToken};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreRuntimeConfig {
     private_data_directory: PathBuf,
+    /// Tests bound a session far below production so a bound is reached in a
+    /// few records instead of a few thousand.
+    #[cfg(test)]
+    session_limits: crate::synchronization::limits::SessionLimits,
 }
 
 impl CoreRuntimeConfig {
@@ -30,7 +34,20 @@ impl CoreRuntimeConfig {
     pub fn new(private_data_directory: impl Into<PathBuf>) -> Self {
         Self {
             private_data_directory: private_data_directory.into(),
+            #[cfg(test)]
+            session_limits: crate::synchronization::limits::SessionLimits::CURRENT,
         }
+    }
+
+    /// Replaces the synchronization bounds this Installation runs sessions
+    /// under.
+    #[cfg(test)]
+    pub(crate) fn with_session_limits_for_test(
+        mut self,
+        limits: crate::synchronization::limits::SessionLimits,
+    ) -> Self {
+        self.session_limits = limits;
+        self
     }
 
     /// Returns the private data directory owned by the runtime.
@@ -594,6 +611,8 @@ pub struct CoreRuntime {
     membership_paused: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     recovery_report: crate::synchronization::RecoveryReport,
+    #[cfg(test)]
+    session_limits: crate::synchronization::limits::SessionLimits,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -820,11 +839,25 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         operation: p2panda_core::Operation<()>,
     ) -> Result<crate::synchronization::OperationOutcome, crate::synchronization::FatalSyncError>
     {
-        use crate::synchronization::{FatalSyncError, OperationOutcome, RejectReason};
-        let Ok(author) = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
-        else {
-            return Ok(OperationOutcome::Rejected(RejectReason::Invalid));
-        };
+        self.receive_operations(peer, workspace, package, vec![operation])?
+            .pop()
+            .ok_or(crate::synchronization::FatalSyncError::Storage)
+    }
+
+    /// Applies a batch of received operations in one lock hold.
+    ///
+    /// The peer's membership is re-checked once for the batch; each operation
+    /// is then classified and committed in its own transaction, so a rejection
+    /// isolates one operation rather than the batch.
+    fn receive_operations(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+        operations: Vec<p2panda_core::Operation<()>>,
+    ) -> Result<Vec<crate::synchronization::OperationOutcome>, crate::synchronization::FatalSyncError>
+    {
+        use crate::synchronization::FatalSyncError;
         let state = self.state.upgrade().ok_or(FatalSyncError::Storage)?;
         let mut state = state.lock().map_err(|_| FatalSyncError::Storage)?;
         let Some(projection) = state.memberships.get(&workspace) else {
@@ -833,76 +866,98 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         if !projection.contains_member(peer) {
             return Err(FatalSyncError::PeerRevoked);
         }
-        let known_author = projection.has_membership_history(author);
         let now = self.clock.now_unix_ms();
-        if !known_author {
-            return park_outcome(
-                &mut state,
-                workspace,
-                package,
-                peer,
-                crate::synchronization::parking::ParkReason::UnknownAuthor,
-                &operation,
-                now,
-            );
+        let mut outcomes = Vec::with_capacity(operations.len());
+        for operation in operations {
+            outcomes.push(classify_operation(
+                &mut state, peer, workspace, package, &operation, now,
+            )?);
         }
-        match crate::synchronization::insert_remote_operation(
-            &mut state.connection,
+        Ok(outcomes)
+    }
+}
+
+/// Classifies one received operation while the runtime state is already held.
+fn classify_operation(
+    state: &mut RuntimeState,
+    peer: PublicIdentity,
+    workspace: WorkspaceId,
+    package: &str,
+    operation: &p2panda_core::Operation<()>,
+    now: i64,
+) -> Result<crate::synchronization::OperationOutcome, crate::synchronization::FatalSyncError> {
+    use crate::synchronization::{FatalSyncError, OperationOutcome, RejectReason};
+    let Ok(author) = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes()) else {
+        return Ok(OperationOutcome::Rejected(RejectReason::Invalid));
+    };
+    let known_author = state
+        .memberships
+        .get(&workspace)
+        .ok_or(FatalSyncError::PeerRevoked)?
+        .has_membership_history(author);
+    if !known_author {
+        return park_outcome(
+            state,
             workspace,
             package,
-            &operation,
+            peer,
+            crate::synchronization::parking::ParkReason::UnknownAuthor,
+            operation,
             now,
-        ) {
-            Ok(crate::synchronization::RemoteInsert::Applied { record, .. }) => {
-                let record_id = record.record_id();
-                if let Some(event) = crate::synchronization::event_for_record(
-                    &state.connection,
-                    workspace,
-                    package,
-                    record,
-                ) {
-                    if let Some(listeners) = state
-                        .record_subscribers
-                        .get_mut(&(workspace, package.to_owned()))
-                    {
-                        listeners.retain(|sender| sender.send(event.clone()).is_ok());
-                    }
-                } else {
-                    eprintln!(
-                        "remote record event unavailable: package={package} record={record_id}"
-                    );
-                }
-                Ok(OperationOutcome::Applied)
-            }
-            Ok(crate::synchronization::RemoteInsert::Duplicate(_)) => {
-                Ok(OperationOutcome::Duplicate)
-            }
-            Err(crate::synchronization::RemoteInsertError::MissingScope) => park_outcome(
-                &mut state,
+        );
+    }
+    match crate::synchronization::insert_remote_operation(
+        &mut state.connection,
+        workspace,
+        package,
+        operation,
+        now,
+    ) {
+        Ok(crate::synchronization::RemoteInsert::Applied { record, .. }) => {
+            let record_id = record.record_id();
+            if let Some(event) = crate::synchronization::event_for_record(
+                &state.connection,
                 workspace,
                 package,
-                peer,
-                crate::synchronization::parking::ParkReason::MissingContentKey,
-                &operation,
-                now,
-            ),
-            Err(crate::synchronization::RemoteInsertError::KeyMismatch) => {
-                Ok(OperationOutcome::Rejected(RejectReason::KeyMismatch))
+                record,
+            ) {
+                if let Some(listeners) = state
+                    .record_subscribers
+                    .get_mut(&(workspace, package.to_owned()))
+                {
+                    listeners.retain(|sender| sender.send(event.clone()).is_ok());
+                }
+            } else {
+                eprintln!("remote record event unavailable: package={package} record={record_id}");
             }
-            Err(crate::synchronization::RemoteInsertError::WrongScope) => {
-                Ok(OperationOutcome::Rejected(RejectReason::WrongScope))
-            }
-            Err(crate::synchronization::RemoteInsertError::Conflict) => {
-                Ok(OperationOutcome::Rejected(RejectReason::Conflict))
-            }
-            Err(crate::synchronization::RemoteInsertError::Invalid) => {
-                Ok(OperationOutcome::Rejected(RejectReason::Invalid))
-            }
-            Err(crate::synchronization::RemoteInsertError::HeightOutOfRange) => {
-                Ok(OperationOutcome::Rejected(RejectReason::HeightOutOfRange))
-            }
-            Err(crate::synchronization::RemoteInsertError::Storage) => Err(FatalSyncError::Storage),
+            Ok(OperationOutcome::Applied)
         }
+        Ok(crate::synchronization::RemoteInsert::Duplicate(_)) => Ok(OperationOutcome::Duplicate),
+        Err(crate::synchronization::RemoteInsertError::MissingScope) => park_outcome(
+            state,
+            workspace,
+            package,
+            peer,
+            crate::synchronization::parking::ParkReason::MissingContentKey,
+            operation,
+            now,
+        ),
+        Err(crate::synchronization::RemoteInsertError::KeyMismatch) => {
+            Ok(OperationOutcome::Rejected(RejectReason::KeyMismatch))
+        }
+        Err(crate::synchronization::RemoteInsertError::WrongScope) => {
+            Ok(OperationOutcome::Rejected(RejectReason::WrongScope))
+        }
+        Err(crate::synchronization::RemoteInsertError::Conflict) => {
+            Ok(OperationOutcome::Rejected(RejectReason::Conflict))
+        }
+        Err(crate::synchronization::RemoteInsertError::Invalid) => {
+            Ok(OperationOutcome::Rejected(RejectReason::Invalid))
+        }
+        Err(crate::synchronization::RemoteInsertError::HeightOutOfRange) => {
+            Ok(OperationOutcome::Rejected(RejectReason::HeightOutOfRange))
+        }
+        Err(crate::synchronization::RemoteInsertError::Storage) => Err(FatalSyncError::Storage),
     }
 }
 
@@ -1060,6 +1115,10 @@ impl CoreRuntime {
             Arc::clone(&clock),
         );
         let demand = crate::membership_sync::MembershipDemand::new();
+        #[cfg(test)]
+        let session_limits = config.session_limits;
+        #[cfg(not(test))]
+        let session_limits = crate::synchronization::limits::SessionLimits::CURRENT;
         let services = crate::synchronization::SyncServices {
             receiver: Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&state),
@@ -1067,6 +1126,7 @@ impl CoreRuntime {
                 demand: Arc::clone(&demand),
             }),
             sessions: Arc::clone(&peer_sessions),
+            limits: session_limits,
         };
         // The composition point owns the membership protocol: `network` keeps
         // the Endpoint and Router and names no membership type.
@@ -1139,7 +1199,15 @@ impl CoreRuntime {
             membership_paused,
             #[cfg(test)]
             recovery_report: recovery,
+            #[cfg(test)]
+            session_limits,
         })
+    }
+
+    /// How many inbound package synchronization sessions hold a slot.
+    #[cfg(test)]
+    pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
+        self.transport.inbound_package_sessions_for_test()
     }
 
     /// What the restart that opened this runtime validated and isolated.
@@ -1891,9 +1959,14 @@ impl CoreRuntime {
             )
             .await
             .map_err(map_log_session_error)?;
-        Ok(accepted)
+        Ok(accepted.outcomes.applied)
     }
 
+    /// Runs one outbound session, retrying while the peer is already running
+    /// as many sessions with this Installation as it allows.
+    ///
+    /// The scheduler dials on its own, so an explicit session in a test can
+    /// cross one of its own; the deadline only bounds failure.
     #[cfg(test)]
     async fn replicate_records_to_address_for_test(
         &self,
@@ -1901,7 +1974,38 @@ impl CoreRuntime {
         package_identity: &str,
         address: iroh_base::EndpointAddr,
         peer: PublicIdentity,
-    ) -> Result<usize, crate::synchronization::LogSessionError> {
+    ) -> Result<crate::synchronization::ExchangeReport, crate::synchronization::LogSessionError>
+    {
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let result = self
+                .replicate_records_to_address_once_for_test(
+                    workspace_id,
+                    package_identity,
+                    address.clone(),
+                    peer,
+                )
+                .await;
+            if !matches!(
+                result,
+                Err(crate::synchronization::LogSessionError::PeerBusy)
+            ) || std::time::Instant::now() >= expiry
+            {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn replicate_records_to_address_once_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        address: iroh_base::EndpointAddr,
+        peer: PublicIdentity,
+    ) -> Result<crate::synchronization::ExchangeReport, crate::synchronization::LogSessionError>
+    {
         let local = self.public_identity;
         let state = Arc::downgrade(&self.state);
         let current = crate::blocking::run_with_state(&state, move |state| {
@@ -2145,12 +2249,13 @@ impl CoreRuntime {
                 workspace_id,
                 package_identity.to_owned(),
                 peer,
+                self.session_limits,
             ),
         )
         .await;
         match result {
-            Ok(Ok(operations_received)) => ProbeOutcome::Welcomed {
-                operations_received,
+            Ok(Ok(report)) => ProbeOutcome::Welcomed {
+                operations_received: report.outcomes.applied,
             },
             Ok(Err(crate::synchronization::LogSessionError::Refused(refusal))) => {
                 ProbeOutcome::Refused(refusal)
@@ -2172,7 +2277,8 @@ impl CoreRuntime {
         package_identity: &str,
         peer: PublicIdentity,
         extra: Vec<p2panda_core::Operation<()>>,
-    ) -> Result<usize, crate::synchronization::LogSessionError> {
+    ) -> Result<crate::synchronization::ExchangeReport, crate::synchronization::LogSessionError>
+    {
         let log_id = crate::synchronization::operation_log_id(
             crate::synchronization::scope_digest(package_identity, workspace_id),
         );
@@ -2196,6 +2302,7 @@ impl CoreRuntime {
             workspace_id,
             package_identity.to_owned(),
             peer,
+            self.session_limits,
         )
         .await
     }
@@ -2223,6 +2330,55 @@ impl CoreRuntime {
         send.write_all(&64_u32.to_be_bytes()).await.ok()?;
         let closed = tokio::time::timeout(wait, connection.closed()).await.ok()?;
         match closed {
+            iroh::endpoint::ConnectionError::ApplicationClosed(close) => {
+                Some(u64::from(close.error_code))
+            }
+            _ => None,
+        }
+    }
+
+    /// Opens a package synchronization stream and then waits, holding the
+    /// responder's inbound slot until the connection is dropped or its Hello
+    /// deadline passes.
+    #[cfg(test)]
+    pub(crate) async fn hold_package_sync_before_hello_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+    ) -> (iroh::endpoint::Connection, iroh::endpoint::SendStream) {
+        let connection = self
+            .transport
+            .endpoint()
+            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .await
+            .expect("the responder accepts the connection");
+        let (mut send, _receive) = connection
+            .open_bi()
+            .await
+            .expect("the responder accepts the stream");
+        // A length header with no body: the responder now waits for a Hello.
+        send.write_all(&64_u32.to_be_bytes())
+            .await
+            .expect("the header is written");
+        // The stream is returned with the connection: dropping it would reset
+        // the stream and release the responder's slot.
+        (connection, send)
+    }
+
+    /// Connects on the package synchronization ALPN and reports the close code
+    /// the responder used, without sending anything.
+    #[cfg(test)]
+    pub(crate) async fn package_sync_close_code_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        wait: std::time::Duration,
+    ) -> Option<u64> {
+        let connection = self
+            .transport
+            .endpoint()
+            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .await
+            .ok()?;
+        match tokio::time::timeout(wait, connection.closed()).await.ok()? {
             iroh::endpoint::ConnectionError::ApplicationClosed(close) => {
                 Some(u64::from(close.error_code))
             }
@@ -3162,7 +3318,10 @@ fn map_log_session_error(
     match error {
         crate::synchronization::LogSessionError::Refused(
             crate::synchronization::Refusal::NotAuthorized,
-        ) => crate::SynchronizationError::NotCurrentMember,
+        )
+        | crate::synchronization::LogSessionError::LocalNotAuthorized => {
+            crate::SynchronizationError::NotCurrentMember
+        }
         crate::synchronization::LogSessionError::Refused(
             crate::synchronization::Refusal::KeyMismatch,
         ) => crate::SynchronizationError::WrongScope,
