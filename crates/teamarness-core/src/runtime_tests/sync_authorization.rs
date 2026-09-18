@@ -361,7 +361,7 @@ async fn non_creator_holder_welcomes_a_new_member() {
         .await
         .unwrap();
     cluster.admit("a", "c", id).await;
-    cluster.copy_membership("a", "b", id);
+    cluster.replicate_membership("a", "b", id).await;
     cluster.stop("a").await;
 
     cluster
@@ -411,9 +411,9 @@ async fn member_without_key_gets_content_key_unavailable() {
     cluster.finish().await;
 }
 
-/// Verifies: TEAM.SYS.TRANS-R06
+/// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.MEM-R10
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn records_from_an_unknown_author_are_parked_then_applied_after_admission() {
+async fn records_from_an_unknown_author_are_applied_after_membership_replicates() {
     let mut cluster = SyncCluster::start("parked-author", &["a", "b", "c"]).await;
     let workspace = cluster.node("a").create_workspace("Parking").unwrap();
     let id = workspace.id();
@@ -466,6 +466,11 @@ async fn records_from_an_unknown_author_are_parked_then_applied_after_admission(
         .unwrap();
     cluster.stop("c").await;
     cluster.restart("b").await;
+    // Hold B's membership replication so the forwarded records arrive before
+    // the admission that makes them applicable.
+    cluster
+        .node("b")
+        .pause_membership_replication_for_test(true);
 
     cluster
         .node("a")
@@ -489,11 +494,21 @@ async fn records_from_an_unknown_author_are_parked_then_applied_after_admission(
     );
     assert!(!seen.contains(&c1.record_id()));
 
-    // Learning the admission promotes what was parked, in sequence order.
-    cluster.copy_membership("a", "b", id);
-    let seen = cluster.record_ids("b", id, PACKAGE);
-    assert!(seen.contains(&c1.record_id()));
-    assert!(seen.contains(&c2.record_id()));
+    // Replication delivers the admission, which promotes what was parked.
+    cluster
+        .node("b")
+        .pause_membership_replication_for_test(false);
+    cluster
+        .wait_until(
+            "the parked records are applied after membership replicates",
+            DEFAULT_DEADLINE,
+            |c| {
+                let seen = c.record_ids("b", id, PACKAGE);
+                seen.contains(&c1.record_id()) && seen.contains(&c2.record_id())
+            },
+        )
+        .await;
+    assert!(cluster.members("b", id).contains(&cluster.identity("c")));
     assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
     cluster.finish().await;
 }
@@ -515,10 +530,11 @@ async fn forged_scope_record_is_rejected_without_ending_the_session() {
         .unwrap();
     cluster.admit("a", "m", id).await;
     cluster.admit("a", "b", id).await;
-    // Each joiner learned the roster as it stood when it joined; give both the
-    // manager's current view so either may dial the other.
-    cluster.copy_membership("a", "m", id);
-    cluster.copy_membership("a", "b", id);
+    // Each joiner learned the roster as it stood when it joined; one membership
+    // session each gives both the manager's current view, so either may dial
+    // the other.
+    cluster.replicate_membership("a", "m", id).await;
+    cluster.replicate_membership("a", "b", id).await;
     for package in [OTHER, PACKAGE] {
         cluster
             .node("m")

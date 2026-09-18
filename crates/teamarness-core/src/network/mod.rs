@@ -21,6 +21,11 @@ use crate::synchronization::{
 };
 
 pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = crate::synchronization::network_handler::LOG_SYNC_ALPN;
+
+/// One extra Core protocol the runtime composition point registers with the
+/// shared Router. Keeping it opaque here is what lets this module own the
+/// Endpoint and Router while naming no protocol or synchronization type.
+pub(crate) type ProtocolRegistration = (Vec<u8>, Box<dyn iroh::protocol::DynProtocolHandler>);
 pub(crate) const MAX_OUTBOUND_PEERS: usize = 4;
 pub(crate) const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -90,6 +95,9 @@ pub(crate) struct Network {
     endpoint: Endpoint,
     router: Router,
     outbound: Arc<Semaphore>,
+    /// A second peer budget, for the Core protocols registered beside package
+    /// sync. A session stalled on one protocol cannot starve the other.
+    outbound_extra: Arc<Semaphore>,
     services: SyncServices,
     /// Loopback runtimes have no relay and no discovery, so tests register peer
     /// addresses here instead. Production binds with `loopback_only == false`.
@@ -114,11 +122,11 @@ impl Network {
         loopback_only: bool,
         onboarding: Arc<OnboardingHandler>,
         services: Option<SyncServices>,
+        protocols: Vec<ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
-        let configured_alpns = vec![
-            crate::onboarding::transport::ONBOARDING_ALPN.to_vec(),
-            PACKAGE_SYNC_ALPN.to_vec(),
-        ];
+        let mut configured_alpns = vec![crate::onboarding::transport::ONBOARDING_ALPN.to_vec()];
+        configured_alpns.extend(protocols.iter().map(|(alpn, _)| alpn.clone()));
+        configured_alpns.push(PACKAGE_SYNC_ALPN.to_vec());
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(configured_alpns.clone())
@@ -143,14 +151,17 @@ impl Network {
             sessions: PeerSessions::new(),
         });
         let log_sync = Arc::new(LogSyncHandler::new(services.clone()));
-        let router = Router::builder(endpoint.clone())
-            .accept(crate::onboarding::transport::ONBOARDING_ALPN, onboarding)
-            .accept(PACKAGE_SYNC_ALPN, log_sync)
-            .spawn();
+        let mut builder = Router::builder(endpoint.clone())
+            .accept(crate::onboarding::transport::ONBOARDING_ALPN, onboarding);
+        for (alpn, handler) in protocols {
+            builder = builder.accept(alpn, handler);
+        }
+        let router = builder.accept(PACKAGE_SYNC_ALPN, log_sync).spawn();
         Ok(Arc::new(Self {
             endpoint,
             router,
             outbound: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
+            outbound_extra: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
             services,
             address_book,
             #[cfg(test)]
@@ -228,6 +239,23 @@ impl Network {
         .map_err(|_| LogSessionError::Transport("package sync timed out".to_owned()))?
     }
 
+    /// Runs one outbound session on the shared endpoint within the outbound
+    /// peer budget. The session itself is supplied by the caller, so this
+    /// module never names the protocol it carries.
+    pub(crate) async fn run_outbound<T, E, Fut>(
+        &self,
+        overloaded: E,
+        session: impl FnOnce(Endpoint) -> Fut,
+    ) -> Result<T, E>
+    where
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let Ok(_permit) = self.outbound_extra.clone().try_acquire_owned() else {
+            return Err(overloaded);
+        };
+        session(self.endpoint.clone()).await
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
         self.router
             .shutdown()
@@ -248,17 +276,43 @@ mod tests {
         SecretKey::from_bytes(&[seed; 32])
     }
 
+    /// A protocol this module knows nothing about, which is the point: the
+    /// composition point supplies the handler and this module only routes it.
+    #[derive(Debug)]
+    struct OpaqueProtocol;
+
+    impl iroh::protocol::ProtocolHandler for OpaqueProtocol {
+        async fn accept(
+            &self,
+            connection: iroh::endpoint::Connection,
+        ) -> Result<(), iroh::protocol::AcceptError> {
+            connection.close(1_u8.into(), b"unavailable");
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn one_router_registers_onboarding_and_package_sync_alpns() {
+    async fn one_router_registers_onboarding_composed_protocols_and_package_sync() {
         let handler = Arc::new(OnboardingHandler::new(Duration::from_secs(1)));
-        let network = Network::bind(secret(1), RelayMode::Disabled, true, handler, None)
-            .await
-            .unwrap();
+        let network = Network::bind(
+            secret(1),
+            RelayMode::Disabled,
+            true,
+            handler,
+            None,
+            vec![(
+                b"teamarness/opaque-protocol/1".to_vec(),
+                Box::new(OpaqueProtocol) as Box<dyn iroh::protocol::DynProtocolHandler>,
+            )],
+        )
+        .await
+        .unwrap();
         assert_eq!(network.endpoint_id(), secret(1).public());
         assert_eq!(
             network.alpns(),
             vec![
                 crate::onboarding::transport::ONBOARDING_ALPN.to_vec(),
+                b"teamarness/opaque-protocol/1".to_vec(),
                 b"teamarness/package-sync/2".to_vec(),
             ]
         );
@@ -268,15 +322,23 @@ mod tests {
     #[tokio::test]
     async fn an_unattached_network_authorizes_no_session() {
         let handler = Arc::new(OnboardingHandler::new(Duration::from_secs(1)));
-        let server = Network::bind(secret(3), RelayMode::Disabled, true, handler, None)
-            .await
-            .unwrap();
+        let server = Network::bind(
+            secret(3),
+            RelayMode::Disabled,
+            true,
+            handler,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         let client = Network::bind(
             secret(4),
             RelayMode::Disabled,
             true,
             Arc::new(OnboardingHandler::new(Duration::from_secs(1))),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();

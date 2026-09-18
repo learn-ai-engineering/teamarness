@@ -28,8 +28,8 @@ mod identity;
 // redemption workflows in later phases.
 #[allow(dead_code)]
 mod invitation;
-#[allow(dead_code)]
 mod membership;
+mod membership_sync;
 #[allow(dead_code)]
 mod network;
 #[allow(dead_code)]

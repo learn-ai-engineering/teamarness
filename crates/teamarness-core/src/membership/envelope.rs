@@ -15,7 +15,7 @@ const DOMAIN: &str = "teamarness.membership-operation/v1";
 const MAX_DEPENDENCIES: usize = 64;
 const MAX_ADMISSION_PROOF_BYTES: usize = 1_024;
 const MAX_UNSIGNED_BYTES: usize = 64 * 1024;
-const MAX_ENVELOPE_BYTES: usize = 4 + MAX_UNSIGNED_BYTES + 32 + 64;
+pub(crate) const MAX_ENVELOPE_BYTES: usize = 4 + MAX_UNSIGNED_BYTES + 32 + 64;
 
 #[derive(Clone)]
 pub(crate) struct AdmissionProof {
@@ -43,6 +43,9 @@ pub(crate) struct MembershipEnvelope {
     pub(crate) dependencies: Vec<MembershipOperationId>,
     pub(crate) id: MembershipOperationId,
     pub(crate) signature: Signature,
+    /// The canonical unsigned encoding, which is the input to the operation
+    /// identifier. Only the envelope tests read it back.
+    #[cfg_attr(not(test), allow(dead_code))]
     unsigned_bytes: Vec<u8>,
     bytes: Vec<u8>,
 }
@@ -128,6 +131,7 @@ impl MembershipEnvelope {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn canonical_unsigned_bytes(&self) -> &[u8] {
         &self.unsigned_bytes
     }

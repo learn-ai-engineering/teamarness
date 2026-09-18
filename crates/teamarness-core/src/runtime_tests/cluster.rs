@@ -23,12 +23,15 @@ pub(super) fn cluster_root(test: &str) -> PathBuf {
     ))
 }
 
-pub(super) const DEFAULT_DEADLINE: Duration = Duration::from_secs(20);
+pub(super) const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub(super) struct SyncCluster {
     root: PathBuf,
     names: Vec<&'static str>,
     nodes: Vec<Option<CoreRuntime>>,
+    /// An Installation keeps its identity across a restart, so a test can name
+    /// a stopped node's identity while it is away.
+    identities: Vec<PublicIdentity>,
 }
 
 impl SyncCluster {
@@ -39,10 +42,16 @@ impl SyncCluster {
         for name in names {
             nodes.push(Some(Self::open(&root, name).await));
         }
+        let identities = nodes
+            .iter()
+            .flatten()
+            .map(CoreRuntime::public_identity)
+            .collect();
         let cluster = Self {
             root,
             names: names.to_vec(),
             nodes,
+            identities,
         };
         cluster.exchange_addresses();
         cluster
@@ -87,7 +96,12 @@ impl SyncCluster {
     }
 
     pub(super) fn identity(&self, name: &str) -> PublicIdentity {
-        self.node(name).public_identity()
+        self.identities[self.index(name)]
+    }
+
+    /// A stopped node holds no state, so it reports no members.
+    pub(super) fn is_running(&self, name: &str) -> bool {
+        self.nodes[self.index(name)].is_some()
     }
 
     /// Shuts a node down and drops it, keeping its data directory.
@@ -120,16 +134,30 @@ impl SyncCluster {
         self.exchange_addresses();
     }
 
-    /// Hands `to` every membership operation `from` has accepted.
+    /// Runs one real membership session from `from` to `to`.
     ///
-    /// Plan phase 3 Step 8 replaces this with `teamarness/membership-sync/1`.
-    pub(super) fn copy_membership(&self, from: &str, to: &str, workspace: WorkspaceId) {
-        for envelope in self.node(from).canonical_envelopes_for_test(workspace) {
-            let _ = self.node(to).apply_membership_envelope(&envelope);
-        }
+    /// This is the production protocol, not a shim: a test uses it when it
+    /// needs one specific exchange to have happened before it continues.
+    pub(super) async fn replicate_membership(&self, from: &str, to: &str, workspace: WorkspaceId) {
+        self.node(from)
+            .membership_session_for_test(self.address(to), workspace, self.identity(to))
+            .await
+            .expect("a membership session between two members completes");
+    }
+
+    /// Every accepted membership operation identifier one node holds.
+    pub(super) fn membership_operation_ids(
+        &self,
+        name: &str,
+        workspace: WorkspaceId,
+    ) -> BTreeSet<crate::MembershipOperationId> {
+        self.node(name).membership_operation_ids_for_test(workspace)
     }
 
     pub(super) fn members(&self, name: &str, workspace: WorkspaceId) -> BTreeSet<PublicIdentity> {
+        if !self.is_running(name) {
+            return BTreeSet::new();
+        }
         self.node(name)
             .membership_snapshot(workspace)
             .map(|snapshot| {
@@ -149,6 +177,9 @@ impl SyncCluster {
         package: &str,
     ) -> BTreeSet<RecordId> {
         let mut ids = BTreeSet::new();
+        if !self.is_running(name) {
+            return ids;
+        }
         let Ok(mut subscription) = self.node(name).subscribe_records(workspace, package, None)
         else {
             return ids;

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -585,6 +587,11 @@ pub struct CoreRuntime {
     clock: Arc<dyn Clock>,
     transport: Arc<crate::onboarding::transport::Transport>,
     sync_worker: Arc<crate::synchronization::SyncWorker>,
+    membership_demand: Arc<crate::membership_sync::MembershipDemand>,
+    #[cfg(test)]
+    membership_replica: Arc<dyn crate::membership_sync::MembershipReplica>,
+    #[cfg(test)]
+    membership_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -610,6 +617,7 @@ type RecordSubscriber = std::sync::mpsc::Sender<crate::RecordEvent>;
 pub(crate) struct RuntimeSyncReceiver {
     pub(crate) state: Weak<Mutex<RuntimeState>>,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) demand: Arc<crate::membership_sync::MembershipDemand>,
 }
 
 impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
@@ -734,6 +742,12 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         .map_err(|_| ())?;
         // Records that arrived before the key can now be applied.
         replication::promote_scope(&mut state, workspace, package).map_err(|_| ())
+    }
+
+    /// Two Installations that disagree about membership are exactly the case a
+    /// membership session resolves, so the worker is asked to run one.
+    fn note_membership_mismatch(&self, workspace: WorkspaceId, peer: PublicIdentity) {
+        self.demand.note(workspace, peer);
     }
 
     fn authors(
@@ -1017,13 +1031,32 @@ impl CoreRuntime {
             Arc::downgrade(&state),
             Arc::clone(&clock),
         );
+        let demand = crate::membership_sync::MembershipDemand::new();
         let services = crate::synchronization::SyncServices {
             receiver: Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&state),
                 clock: Arc::clone(&clock),
+                demand: Arc::clone(&demand),
             }),
             sessions: Arc::clone(&peer_sessions),
         };
+        // The composition point owns the membership protocol: `network` keeps
+        // the Endpoint and Router and names no membership type.
+        #[cfg(test)]
+        let membership_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let membership_replica: Arc<dyn crate::membership_sync::MembershipReplica> =
+            Arc::new(replication::RuntimeMembershipReplica::new(
+                Arc::downgrade(&state),
+                Arc::clone(&clock),
+                #[cfg(test)]
+                Arc::clone(&membership_paused),
+            ));
+        let protocols = vec![(
+            crate::membership_sync::MEMBERSHIP_SYNC_ALPN.to_vec(),
+            Box::new(crate::membership_sync::MembershipSyncHandler::new(
+                Arc::clone(&membership_replica),
+            )) as Box<dyn iroh::protocol::DynProtocolHandler>,
+        )];
         #[cfg(test)]
         let transport = if let Some(ready_immediately) = test_readiness {
             crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_services(
@@ -1032,6 +1065,7 @@ impl CoreRuntime {
                 ready_immediately,
                 issuer,
                 services,
+                protocols,
             )
             .await
         } else {
@@ -1039,6 +1073,7 @@ impl CoreRuntime {
                 secret_key.clone(),
                 issuer,
                 Some(services),
+                protocols,
             )
             .await
         };
@@ -1047,6 +1082,7 @@ impl CoreRuntime {
             secret_key.clone(),
             issuer,
             Some(services),
+            protocols,
         )
         .await;
         let transport = transport.map_err(CoreError::Onboarding)?;
@@ -1059,6 +1095,8 @@ impl CoreRuntime {
             Arc::clone(&transport),
             public_identity,
             Arc::clone(&peer_sessions),
+            Arc::clone(&membership_replica),
+            Arc::clone(&demand),
         );
         Ok(Self {
             public_identity,
@@ -1066,6 +1104,11 @@ impl CoreRuntime {
             clock,
             transport,
             sync_worker,
+            membership_demand: demand,
+            #[cfg(test)]
+            membership_replica,
+            #[cfg(test)]
+            membership_paused,
         })
     }
 
@@ -1835,6 +1878,7 @@ impl CoreRuntime {
             Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&self.state),
                 clock: Arc::clone(&self.clock),
+                demand: Arc::clone(&self.membership_demand),
             });
         let address = iroh_base::EndpointAddr::new(peer.as_public_key());
         let accepted = self
@@ -1880,6 +1924,7 @@ impl CoreRuntime {
             Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&self.state),
                 clock: Arc::clone(&self.clock),
+                demand: Arc::clone(&self.membership_demand),
             });
         self.transport
             .send_log_sync(
@@ -2000,28 +2045,71 @@ impl CoreRuntime {
         self.transport.remember_peer_address(address);
     }
 
-    /// Returns this Workspace's accepted membership envelopes in causal order.
-    ///
-    /// Plan phase 3 Step 8 replaces this with the membership replication
-    /// protocol; until then a test hands another Installation what a session
-    /// would have sent it.
+    /// Every accepted membership operation identifier this Installation holds.
     #[cfg(test)]
-    pub(crate) fn canonical_envelopes_for_test(&self, workspace_id: WorkspaceId) -> Vec<Vec<u8>> {
+    pub(crate) fn membership_operation_ids_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BTreeSet<MembershipOperationId> {
         let state = self.state.lock().expect("test runtime state");
-        let mut statement = state
-            .connection
-            .prepare(
-                "SELECT o.canonical_envelope FROM membership_transitions t
-                 JOIN membership_operations o ON o.operation_id = t.cause_operation_id
-                 WHERE t.workspace_id = ?1 ORDER BY t.epoch",
-            )
-            .expect("membership transition query");
-        let rows = statement
-            .query_map([workspace_id.as_bytes().as_slice()], |row| {
-                row.get::<_, Vec<u8>>(0)
+        state
+            .memberships
+            .get(&workspace_id)
+            .map(|projection| {
+                crate::membership::replication::operation_ids(projection)
+                    .into_iter()
+                    .collect()
             })
-            .expect("membership transition rows");
-        rows.filter_map(Result::ok).collect()
+            .unwrap_or_default()
+    }
+
+    /// Stops this Installation replicating membership in either direction.
+    ///
+    /// Every replica call reports the runtime as unavailable, which is what an
+    /// Installation that cannot currently answer looks like on the wire.
+    #[cfg(test)]
+    pub(crate) fn pause_membership_replication_for_test(&self, paused: bool) {
+        self.membership_paused
+            .store(paused, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Runs one real membership session against `address`, as the worker would.
+    #[cfg(test)]
+    pub(crate) async fn membership_session_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        workspace_id: WorkspaceId,
+        peer: PublicIdentity,
+    ) -> Result<
+        crate::membership_sync::MembershipSessionReport,
+        crate::membership_sync::MembershipSessionError,
+    > {
+        self.transport
+            .run_membership_session(
+                address,
+                Arc::clone(&self.membership_replica),
+                workspace_id,
+                peer,
+            )
+            .await
+    }
+
+    /// Dials the membership protocol pushing nothing, and reports what the
+    /// responder served and whether it refused.
+    #[cfg(test)]
+    pub(crate) async fn probe_membership_sync_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        workspace_id: WorkspaceId,
+        operation_ids: Vec<[u8; 32]>,
+    ) -> (Vec<Vec<u8>>, bool) {
+        crate::membership_sync::session::probe_membership_sync(
+            self.transport.endpoint(),
+            address,
+            workspace_id,
+            operation_ids,
+        )
+        .await
     }
 
     /// How many operations one scope currently holds parked.
@@ -2096,6 +2184,7 @@ impl CoreRuntime {
             inner: RuntimeSyncReceiver {
                 state: Arc::downgrade(&self.state),
                 clock: Arc::clone(&self.clock),
+                demand: Arc::clone(&self.membership_demand),
             },
             extra: extra
                 .into_iter()
@@ -2489,28 +2578,7 @@ impl CoreRuntime {
         state: &mut RuntimeState,
         now_unix_ms: i64,
     ) -> Result<(), MembershipError> {
-        let applied = match crate::membership::projection::maintain_quarantine(
-            &mut state.connection,
-            &mut state.memberships,
-            now_unix_ms,
-        ) {
-            Ok(applied) => applied,
-            Err(error) => {
-                if matches!(
-                    error,
-                    MembershipError::Storage(StorageError::UncertainOutcome)
-                ) {
-                    state.poisoned = true;
-                }
-                return Err(error);
-            }
-        };
-        for applied in applied {
-            if let Some(transition) = Self::transition_from_applied(applied) {
-                replication::after_membership_accepted(state, &transition);
-            }
-        }
-        Ok(())
+        replication::maintain_and_publish(state, now_unix_ms)
     }
 
     /// Returns `None` when the causing operation is a workspace `create`, which
@@ -3298,6 +3366,7 @@ mod tests {
         let bob_receiver = RuntimeSyncReceiver {
             state: Arc::downgrade(&bob.state),
             clock: Arc::new(SystemClock),
+            demand: Arc::clone(&bob.membership_demand),
         };
         let operation = crate::synchronization::SyncReceiver::operations(
             &bob_receiver,
@@ -3338,6 +3407,7 @@ mod tests {
         let carol_receiver = RuntimeSyncReceiver {
             state: Arc::downgrade(&carol.state),
             clock: Arc::new(SystemClock),
+            demand: Arc::clone(&carol.membership_demand),
         };
         crate::synchronization::SyncReceiver::receive_operation(
             &carol_receiver,
@@ -3442,6 +3512,7 @@ mod tests {
         let receiver = RuntimeSyncReceiver {
             state: Arc::downgrade(&a.state),
             clock: Arc::new(SystemClock),
+            demand: Arc::clone(&a.membership_demand),
         };
         // One unacceptable operation is classified, not fatal: the session
         // continues and the author is skipped for the rest of it.

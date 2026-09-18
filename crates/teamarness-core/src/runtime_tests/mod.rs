@@ -6,4 +6,5 @@
 //! SQLite. Fakes appear only to inject a fault or to drive a raw probe.
 
 mod cluster;
+mod membership_replication;
 mod sync_authorization;

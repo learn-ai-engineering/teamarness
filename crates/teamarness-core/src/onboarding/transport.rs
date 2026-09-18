@@ -68,6 +68,7 @@ impl Transport {
         secret_key: SecretKey,
         issuer: IssuerService,
         services: Option<crate::synchronization::SyncServices>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -80,6 +81,7 @@ impl Transport {
             },
             Some(issuer),
             services,
+            protocols,
         )
         .await
     }
@@ -89,6 +91,7 @@ impl Transport {
         options: BindOptions,
         issuer: Option<IssuerService>,
         services: Option<crate::synchronization::SyncServices>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         let handler = Arc::new(match issuer {
             Some(issuer) => OnboardingHandler::with_issuer(options.request_timeout, issuer),
@@ -100,6 +103,7 @@ impl Transport {
             options.loopback_only,
             Arc::clone(&handler),
             services,
+            protocols,
         )
         .await?;
         Ok(Arc::new(Self {
@@ -225,6 +229,37 @@ impl Transport {
             .await
     }
 
+    /// Reconciles one Workspace's canonical membership with one peer.
+    pub(crate) async fn run_membership_session(
+        &self,
+        address: EndpointAddr,
+        replica: Arc<dyn crate::membership_sync::MembershipReplica>,
+        workspace: crate::WorkspaceId,
+        peer: crate::PublicIdentity,
+    ) -> Result<
+        crate::membership_sync::MembershipSessionReport,
+        crate::membership_sync::MembershipSessionError,
+    > {
+        let overloaded = crate::membership_sync::MembershipSessionError::Transport(
+            "no outbound peer slot is free".to_owned(),
+        );
+        self.network
+            .run_outbound(overloaded, move |endpoint| async move {
+                match timeout(
+                    crate::membership_sync::MEMBERSHIP_SESSION_TIMEOUT,
+                    crate::membership_sync::run_membership_session(
+                        &endpoint, address, replica, workspace, peer,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(crate::membership_sync::MembershipSessionError::Timeout),
+                }
+            })
+            .await
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
         self.lifecycle.stop();
         self.handler.stop();
@@ -269,8 +304,15 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
     ) -> Result<Arc<Self>, OnboardingError> {
-        Self::bind_loopback_inner(secret_key, readiness_timeout, ready_immediately, None, None)
-            .await
+        Self::bind_loopback_inner(
+            secret_key,
+            readiness_timeout,
+            ready_immediately,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -286,6 +328,7 @@ impl Transport {
             ready_immediately,
             Some(issuer),
             None,
+            Vec::new(),
         )
         .await
     }
@@ -297,6 +340,7 @@ impl Transport {
         ready_immediately: bool,
         issuer: IssuerService,
         services: crate::synchronization::SyncServices,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind_loopback_inner(
             secret_key,
@@ -304,6 +348,7 @@ impl Transport {
             ready_immediately,
             Some(issuer),
             Some(services),
+            protocols,
         )
         .await
     }
@@ -315,6 +360,7 @@ impl Transport {
         ready_immediately: bool,
         issuer: Option<IssuerService>,
         services: Option<crate::synchronization::SyncServices>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -331,6 +377,7 @@ impl Transport {
             },
             issuer,
             services,
+            protocols,
         )
         .await
     }

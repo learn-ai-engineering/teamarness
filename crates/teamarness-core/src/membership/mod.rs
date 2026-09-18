@@ -1,9 +1,9 @@
 mod adapter;
-mod envelope;
+pub(crate) mod envelope;
 mod history;
 mod id;
 pub(crate) mod projection;
-pub(crate) mod sync;
+pub(crate) mod replication;
 mod validation;
 
 use serde::{Deserialize, Serialize};

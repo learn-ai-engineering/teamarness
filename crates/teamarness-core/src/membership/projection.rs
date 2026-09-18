@@ -70,6 +70,33 @@ impl WorkspaceProjection {
             })
     }
 
+    /// Builds a projection straight from envelopes, for the pure replication
+    /// tests that exercise export order and disclosure without storage.
+    #[cfg(test)]
+    pub(crate) fn for_replication_test(
+        workspace_id: WorkspaceId,
+        creator: PublicIdentity,
+        genesis_id: MembershipOperationId,
+        operations: BTreeMap<MembershipOperationId, MembershipEnvelope>,
+        members: Vec<PublicIdentity>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            creator,
+            genesis_id,
+            operations,
+            snapshot: MembershipSnapshot::new(
+                workspace_id,
+                MembershipEpoch::new(0),
+                MembershipVersion::from_bytes([0; 32]),
+                members
+                    .into_iter()
+                    .map(|identity| MemberSnapshot::new(identity, MembershipRole::Member))
+                    .collect(),
+            ),
+        }
+    }
+
     pub(crate) fn heads(&self) -> Vec<MembershipOperationId> {
         let dependencies = self
             .operations
