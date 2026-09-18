@@ -15,6 +15,7 @@ mod lifecycle;
 mod parent_lifeline;
 mod priority_writer;
 mod reader;
+mod router;
 pub mod storage;
 
 use std::error::Error;
@@ -31,6 +32,7 @@ pub use initialization::{
     CapabilityGrant, DataDirectory, Initialization, InstallationInfo, PackageInfo, WorkspaceInfo,
 };
 pub use lifecycle::LifecycleOperation;
+pub use router::{Activation, ActivationKind, Context, Empty, Router, RouterOperations};
 use teamarness_package_protocol::JsonValue;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -184,6 +186,15 @@ impl Package {
     where
         B: Backend,
     {
+        Self { backend }
+    }
+
+    /// Creates an SDK service around an already-erased Backend, as [`Router`] does.
+    ///
+    /// A Package that wants `serve_io` for its own tests can use this with
+    /// [`Router::into_backend`].
+    #[must_use]
+    pub fn from_backend(backend: Arc<dyn Backend>) -> Self {
         Self { backend }
     }
 
