@@ -585,6 +585,7 @@ pub struct CoreRuntime {
     clock: Arc<dyn Clock>,
     transport: Arc<crate::onboarding::transport::Transport>,
     sync_worker: Arc<crate::synchronization::SyncWorker>,
+    peer_sessions: Arc<crate::synchronization::PeerSessions>,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -603,18 +604,63 @@ struct MembershipSubscriber {
 
 type RecordSubscriber = std::sync::mpsc::Sender<crate::RecordEvent>;
 
+/// The Core side of every package synchronization session.
+///
+/// Every method re-checks current membership, so a revocation that lands while
+/// a session is running stops that session serving or accepting anything more.
 pub(crate) struct RuntimeSyncReceiver {
     pub(crate) state: Weak<Mutex<RuntimeState>>,
-    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
-    fn protection_grant(
+    fn authorize_session(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+    ) -> Result<crate::synchronization::SessionGrant, crate::synchronization::Refusal> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(crate::synchronization::Refusal::Unavailable)?;
+        let state = state
+            .lock()
+            .map_err(|_| crate::synchronization::Refusal::Unavailable)?;
+        if state.poisoned {
+            return Err(crate::synchronization::Refusal::Unavailable);
+        }
+        let local = PublicIdentity(state.secret_key.public());
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::synchronization::Refusal::NotAuthorized)?;
+        if !projection.contains_member(local) || !projection.contains_member(peer) {
+            return Err(crate::synchronization::Refusal::NotAuthorized);
+        }
+        let membership_version = *projection.snapshot().version().as_bytes();
+        let scope = crate::synchronization::scope_digest(package, workspace);
+        let content_key_id = state
+            .connection
+            .query_row(
+                "SELECT content_key_id FROM sync_scopes WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|_| crate::synchronization::Refusal::Unavailable)?
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+        Ok(crate::synchronization::SessionGrant {
+            membership_version,
+            content_key_id,
+        })
+    }
+
+    fn protection_bundle_for(
         &self,
         workspace: WorkspaceId,
         package: &str,
         recipient: PublicIdentity,
-    ) -> Result<Option<Vec<u8>>, ()> {
+    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
         let state = self.state.upgrade().ok_or(())?;
         let mut state = state.lock().map_err(|_| ())?;
         let projection = state.memberships.get(&workspace).ok_or(())?;
@@ -623,6 +669,17 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             return Err(());
         }
         let admission = *projection.snapshot().version().as_bytes();
+        let scope = crate::synchronization::scope_digest(package, workspace);
+        let origin: Option<Vec<u8>> = state
+            .connection
+            .query_row(
+                "SELECT control_bytes FROM protection_control_operations
+                 WHERE scope_id=?1 AND operation_kind='create' LIMIT 1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| ())?;
         let secret_key = state.secret_key.clone();
         match crate::synchronization::export_protection_grant(
             &mut state.connection,
@@ -632,16 +689,56 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             recipient,
             admission,
         ) {
-            Ok(grant) => Ok(Some(grant)),
+            Ok(grant) => Ok(Some(crate::synchronization::ProtectionBundle {
+                origin: origin.unwrap_or_default(),
+                grant,
+            })),
             Err(crate::SynchronizationError::WorkspaceNotFound) => Ok(None),
             Err(_) => Err(()),
         }
     }
 
-    fn authors(&self, workspace: WorkspaceId) -> Result<Vec<PublicIdentity>, ()> {
+    fn import_protection_bundle(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        package: &str,
+        bundle: crate::synchronization::ProtectionBundle,
+    ) -> Result<usize, ()> {
+        let state = self.state.upgrade().ok_or(())?;
+        let mut state = state.lock().map_err(|_| ())?;
+        if crate::synchronization::protection_control_author(&bundle.grant).map_err(|_| ())? != peer
+        {
+            return Err(());
+        }
+        let projection = state.memberships.get(&workspace).ok_or(())?;
+        if !projection.contains_member(peer) {
+            return Err(());
+        }
+        let secret = state.secret_key.clone();
+        crate::synchronization::import_protection_grant(
+            &mut state.connection,
+            &secret,
+            workspace,
+            package,
+            &bundle.grant,
+        )
+        .map_err(|_| ())
+    }
+
+    fn authors(
+        &self,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<PublicIdentity>, ()> {
         let state = self.state.upgrade().ok_or(())?;
         let state = state.lock().map_err(|_| ())?;
         let projection = state.memberships.get(&workspace).ok_or(())?;
+        if !projection.contains_member(peer)
+            || !projection.contains_member(PublicIdentity(state.secret_key.public()))
+        {
+            return Err(());
+        }
         Ok(projection
             .snapshot()
             .members()
@@ -650,85 +747,9 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             .collect())
     }
 
-    fn receive(
-        &self,
-        peer: PublicIdentity,
-        batch: crate::synchronization::SyncBatch,
-    ) -> Result<usize, ()> {
-        let state = self.state.upgrade().ok_or(())?;
-        let mut state = state.lock().map_err(|_| ())?;
-        let workspace = WorkspaceId::from_bytes(batch.workspace);
-        if !batch.membership.is_empty() {
-            let proof = crate::membership::sync::MembershipProof {
-                workspace_id: workspace,
-                operations: batch.membership,
-            };
-            if !state.memberships.contains_key(&workspace)
-                && !crate::membership::sync::admits_peer(&proof, peer).map_err(|_| ())?
-            {
-                return Err(());
-            }
-            let RuntimeState {
-                connection,
-                memberships,
-                ..
-            } = &mut *state;
-            crate::membership::sync::apply(
-                connection,
-                memberships,
-                &proof,
-                self.clock.now_unix_ms(),
-            )
-            .map_err(|_| ())?;
-        }
-        let local = PublicIdentity(state.secret_key.public());
-        let current = state.memberships.get(&workspace).is_some_and(|projection| {
-            projection.contains_member(local) && projection.contains_member(peer)
-        });
-        if !current {
-            return Err(());
-        }
-        if let Some(grant) = batch.protection_grant.as_deref() {
-            if crate::synchronization::protection_control_author(grant).map_err(|_| ())? != peer {
-                return Err(());
-            }
-            let secret = state.secret_key.clone();
-            crate::synchronization::import_protection_grant(
-                &mut state.connection,
-                &secret,
-                workspace,
-                &batch.package,
-                grant,
-            )
-            .map_err(|_| ())?;
-        }
-        let mut accepted = 0;
-        for sealed in batch.records {
-            let record = crate::synchronization::insert_remote(
-                &mut state.connection,
-                workspace,
-                &batch.package,
-                &sealed,
-            )
-            .map_err(|_| ())?;
-            if let Some(event) = crate::synchronization::event_for_record(
-                &state.connection,
-                workspace,
-                &batch.package,
-                record,
-            ) && let Some(listeners) = state
-                .record_subscribers
-                .get_mut(&(workspace, batch.package.clone()))
-            {
-                listeners.retain(|sender| sender.send(event.clone()).is_ok());
-            }
-            accepted += 1;
-        }
-        Ok(accepted)
-    }
-
     fn operations(
         &self,
+        peer: PublicIdentity,
         workspace: WorkspaceId,
         package: &str,
     ) -> Result<Vec<([u8; 32], p2panda_core::Operation<()>)>, ()> {
@@ -736,6 +757,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         let state = state.lock().map_err(|_| ())?;
         if !state.memberships.get(&workspace).is_some_and(|projection| {
             projection.contains_member(PublicIdentity(state.secret_key.public()))
+                && projection.contains_member(peer)
         }) {
             return Err(());
         }
@@ -886,26 +908,28 @@ impl CoreRuntime {
             Arc::downgrade(&state),
             Arc::clone(&clock),
         );
-        let sync_receiver: Arc<dyn crate::synchronization::SyncReceiver> =
-            Arc::new(RuntimeSyncReceiver {
+        let peer_sessions = crate::synchronization::PeerSessions::new();
+        let services = crate::synchronization::SyncServices {
+            receiver: Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&state),
-                clock: Arc::clone(&clock),
-            });
+            }),
+            sessions: Arc::clone(&peer_sessions),
+        };
         #[cfg(test)]
         let transport = if let Some(ready_immediately) = test_readiness {
-            crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_receiver(
+            crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_services(
                 secret_key.clone(),
                 std::time::Duration::from_millis(5),
                 ready_immediately,
                 issuer,
-                Arc::clone(&sync_receiver),
+                services,
             )
             .await
         } else {
             crate::onboarding::transport::Transport::bind_production(
                 secret_key.clone(),
                 issuer,
-                Some(Arc::clone(&sync_receiver)),
+                Some(services),
             )
             .await
         };
@@ -913,7 +937,7 @@ impl CoreRuntime {
         let transport = crate::onboarding::transport::Transport::bind_production(
             secret_key.clone(),
             issuer,
-            Some(sync_receiver),
+            Some(services),
         )
         .await;
         let transport = transport.map_err(CoreError::Onboarding)?;
@@ -925,6 +949,7 @@ impl CoreRuntime {
             Arc::downgrade(&state),
             Arc::clone(&transport),
             public_identity,
+            Arc::clone(&peer_sessions),
         );
         Ok(Self {
             public_identity,
@@ -932,6 +957,7 @@ impl CoreRuntime {
             clock,
             transport,
             sync_worker,
+            peer_sessions,
         })
     }
 
@@ -1528,48 +1554,12 @@ impl CoreRuntime {
         Ok(record)
     }
 
-    /// Inserts an authenticated sealed record received from another current peer.
-    ///
-    /// The record is committed exactly once and is safe to retry after an uncertain response.
-    pub fn insert_remote_record(
-        &self,
-        workspace_id: WorkspaceId,
-        package_identity: &str,
-        sealed_record: &[u8],
-    ) -> Result<crate::ImmutableRecord, crate::SynchronizationError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
-        if state.poisoned {
-            return Err(crate::SynchronizationError::RuntimeUnavailable);
-        }
-        let record = crate::synchronization::insert_remote(
-            &mut state.connection,
-            workspace_id,
-            package_identity,
-            sealed_record,
-        )?;
-        if let Some(event) = crate::synchronization::event_for_record(
-            &state.connection,
-            workspace_id,
-            package_identity,
-            record.clone(),
-        ) && let Some(listeners) = state
-            .record_subscribers
-            .get_mut(&(workspace_id, package_identity.to_owned()))
-        {
-            listeners.retain(|sender| sender.send(event.clone()).is_ok());
-        }
-        self.sync_worker.wake();
-        Ok(record)
-    }
-
     /// Creates an authenticated Core-held welcome grant for a current recipient.
     ///
     /// Creates a control that is HPKE-sealed to `recipient` and signed by this
     /// Installation; only the recipient's private key can recover the content key.
-    pub fn export_protection_grant(
+    #[cfg(test)]
+    pub(crate) fn export_protection_grant(
         &self,
         workspace_id: WorkspaceId,
         package_identity: &str,
@@ -1604,7 +1594,8 @@ impl CoreRuntime {
     }
 
     /// Imports an authenticated Core welcome and atomically promotes pending records.
-    pub fn import_protection_grant(
+    #[cfg(test)]
+    pub(crate) fn import_protection_grant(
         &self,
         workspace_id: WorkspaceId,
         package_identity: &str,
@@ -1717,7 +1708,6 @@ impl CoreRuntime {
         let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
             Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&self.state),
-                clock: Arc::clone(&self.clock),
             });
         let address = iroh_base::EndpointAddr::new(peer.as_public_key());
         let accepted = self
@@ -1730,7 +1720,7 @@ impl CoreRuntime {
                 peer,
             )
             .await
-            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+            .map_err(map_log_session_error)?;
         Ok(accepted)
     }
 
@@ -1741,25 +1731,27 @@ impl CoreRuntime {
         package_identity: &str,
         address: iroh_base::EndpointAddr,
         peer: PublicIdentity,
-    ) -> Result<usize, crate::SynchronizationError> {
+    ) -> Result<usize, crate::synchronization::LogSessionError> {
         {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
+            let state = self.state.lock().map_err(|_| {
+                crate::synchronization::LogSessionError::Refused(
+                    crate::synchronization::Refusal::Unavailable,
+                )
+            })?;
             if state.poisoned
                 || !state
                     .memberships
                     .get(&workspace_id)
                     .is_some_and(|projection| projection.contains_member(self.public_identity))
             {
-                return Err(crate::SynchronizationError::NotCurrentMember);
+                return Err(crate::synchronization::LogSessionError::Refused(
+                    crate::synchronization::Refusal::NotAuthorized,
+                ));
             }
         }
         let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
             Arc::new(RuntimeSyncReceiver {
                 state: Arc::downgrade(&self.state),
-                clock: Arc::clone(&self.clock),
             });
         self.transport
             .send_log_sync(
@@ -1770,7 +1762,6 @@ impl CoreRuntime {
                 peer,
             )
             .await
-            .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)
     }
 
     /// Stops accepting onboarding and synchronization work and awaits closure.
@@ -1873,6 +1864,69 @@ impl CoreRuntime {
     #[cfg(test)]
     pub(crate) fn endpoint_address_for_test(&self) -> iroh_base::EndpointAddr {
         self.transport.endpoint_address()
+    }
+
+    /// Teaches this loopback runtime how to reach a peer it has never dialled.
+    #[cfg(test)]
+    pub(crate) fn remember_peer_address_for_test(&self, address: iroh_base::EndpointAddr) {
+        self.transport.remember_peer_address(address);
+    }
+
+    /// Runs one synchronization pass now instead of waiting for the idle tick.
+    #[cfg(test)]
+    pub(crate) fn sync_now_for_test(&self) {
+        self.sync_worker.wake();
+    }
+
+    /// Dials a peer's package synchronization ALPN as this Installation and
+    /// reports whether the peer's gate served it anything.
+    #[cfg(test)]
+    pub(crate) async fn probe_package_sync_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        workspace_id: WorkspaceId,
+        package_identity: &str,
+        peer: PublicIdentity,
+    ) -> ProbeOutcome {
+        let receiver: Arc<dyn crate::synchronization::SyncReceiver> = Arc::new(ProbeReceiver);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::synchronization::network_handler::outbound_log_session(
+                self.transport.endpoint(),
+                address,
+                receiver,
+                Arc::clone(&self.peer_sessions),
+                workspace_id,
+                package_identity.to_owned(),
+                peer,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(operations_received)) => ProbeOutcome::Welcomed {
+                operations_received,
+            },
+            Ok(Err(crate::synchronization::LogSessionError::Refused(refusal))) => {
+                ProbeOutcome::Refused(refusal)
+            }
+            Ok(Err(error)) => ProbeOutcome::Failed(error.to_string()),
+            Err(_) => ProbeOutcome::Failed("probe timed out".to_owned()),
+        }
+    }
+
+    /// Reports whether a peer's Router still offers `alpn` at all.
+    #[cfg(test)]
+    pub(crate) async fn can_connect_alpn_for_test(
+        &self,
+        address: iroh_base::EndpointAddr,
+        alpn: &[u8],
+    ) -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.transport.endpoint().connect(address, alpn),
+        )
+        .await
+        .is_ok_and(|connection| connection.is_ok())
     }
 
     #[cfg(test)]
@@ -2197,7 +2251,10 @@ impl CoreRuntime {
                 let transition = Self::transition_from_applied(applied)
                     .ok_or(MembershipError::ConflictingGenesis)?;
                 Self::publish_transition(&mut state, transition.clone());
-                self.sync_worker.cancel_peer(member);
+                // A revoked Installation must stop being served immediately,
+                // not at the end of whatever session is already running.
+                self.peer_sessions.cancel(member);
+                self.sync_worker.wake();
                 Ok(transition)
             }
             Ok(_) => Err(MembershipError::AuthorizationRejected),
@@ -2461,6 +2518,81 @@ impl CoreRuntime {
     }
 }
 
+/// What a raw package-synchronization probe observed.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Refused(crate::synchronization::Refusal),
+    Welcomed { operations_received: usize },
+    Failed(String),
+}
+
+/// A probe's Core seam: it authorizes its own dial, offers nothing, and counts
+/// what the peer sent. It is a fake only for the probe's own side.
+#[cfg(test)]
+struct ProbeReceiver;
+
+#[cfg(test)]
+impl crate::synchronization::SyncReceiver for ProbeReceiver {
+    fn authorize_session(
+        &self,
+        _peer: PublicIdentity,
+        _workspace: WorkspaceId,
+        _package: &str,
+    ) -> Result<crate::synchronization::SessionGrant, crate::synchronization::Refusal> {
+        Ok(crate::synchronization::SessionGrant {
+            membership_version: [0; 32],
+            content_key_id: None,
+        })
+    }
+
+    fn protection_bundle_for(
+        &self,
+        _workspace: WorkspaceId,
+        _package: &str,
+        _recipient: PublicIdentity,
+    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
+        Ok(None)
+    }
+
+    fn import_protection_bundle(
+        &self,
+        _peer: PublicIdentity,
+        _workspace: WorkspaceId,
+        _package: &str,
+        _bundle: crate::synchronization::ProtectionBundle,
+    ) -> Result<usize, ()> {
+        Ok(0)
+    }
+
+    fn authors(
+        &self,
+        _peer: PublicIdentity,
+        _workspace: WorkspaceId,
+    ) -> Result<Vec<PublicIdentity>, ()> {
+        Ok(Vec::new())
+    }
+
+    fn operations(
+        &self,
+        _peer: PublicIdentity,
+        _workspace: WorkspaceId,
+        _package: &str,
+    ) -> Result<Vec<([u8; 32], p2panda_core::Operation<()>)>, ()> {
+        Ok(Vec::new())
+    }
+
+    fn receive_operation(
+        &self,
+        _peer: PublicIdentity,
+        _workspace: WorkspaceId,
+        _package: &str,
+        _operation: p2panda_core::Operation<()>,
+    ) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct RuntimeStateHold {
     release: Option<mpsc::Sender<()>>,
@@ -2561,6 +2693,22 @@ pub(crate) fn respond_to_join(
     }
 }
 
+/// Reports a refused package synchronization session as the capability error
+/// the caller can act on, instead of as a generic unavailability.
+fn map_log_session_error(
+    error: crate::synchronization::LogSessionError,
+) -> crate::SynchronizationError {
+    match error {
+        crate::synchronization::LogSessionError::Refused(
+            crate::synchronization::Refusal::NotAuthorized,
+        ) => crate::SynchronizationError::NotCurrentMember,
+        crate::synchronization::LogSessionError::Refused(
+            crate::synchronization::Refusal::KeyMismatch,
+        ) => crate::SynchronizationError::WrongScope,
+        _ => crate::SynchronizationError::RuntimeUnavailable,
+    }
+}
+
 pub(crate) fn map_invitation_onboarding_error(error: InvitationError) -> crate::OnboardingError {
     match error {
         InvitationError::Expired => crate::OnboardingError::Expired,
@@ -2590,6 +2738,10 @@ impl Drop for CoreRuntime {
         self.transport.start_abnormal_shutdown();
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_tests/mod.rs"]
+mod runtime_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2868,6 +3020,24 @@ mod tests {
         let historical = bob
             .append_record(workspace.id(), package, "message.post", b"historical")
             .unwrap();
+        // Bob's own operation is read while Bob is still a current Member: the
+        // gate now refuses a revoked Installation on its own sessions too.
+        let bob_receiver = RuntimeSyncReceiver {
+            state: Arc::downgrade(&bob.state),
+        };
+        let operation = crate::synchronization::SyncReceiver::operations(
+            &bob_receiver,
+            alice.public_identity(),
+            workspace.id(),
+            package,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, operation)| operation)
+        .find(|operation| {
+            operation.header.verifying_key.as_bytes() == bob.public_identity().as_bytes()
+        })
+        .unwrap();
         alice
             .revoke_member(workspace.id(), bob.public_identity())
             .unwrap();
@@ -2891,25 +3061,8 @@ mod tests {
             .import_protection_grant(workspace.id(), package, &carol_grant)
             .unwrap();
 
-        let bob_receiver = RuntimeSyncReceiver {
-            state: Arc::downgrade(&bob.state),
-            clock: Arc::new(SystemClock),
-        };
-        let operation = crate::synchronization::SyncReceiver::operations(
-            &bob_receiver,
-            workspace.id(),
-            package,
-        )
-        .unwrap()
-        .into_iter()
-        .map(|(_, operation)| operation)
-        .find(|operation| {
-            operation.header.verifying_key.as_bytes() == bob.public_identity().as_bytes()
-        })
-        .unwrap();
         let carol_receiver = RuntimeSyncReceiver {
             state: Arc::downgrade(&carol.state),
-            clock: Arc::new(SystemClock),
         };
         crate::synchronization::SyncReceiver::receive_operation(
             &carol_receiver,
@@ -3013,7 +3166,6 @@ mod tests {
         };
         let receiver = RuntimeSyncReceiver {
             state: Arc::downgrade(&a.state),
-            clock: Arc::new(SystemClock),
         };
         assert!(
             crate::synchronization::SyncReceiver::receive_operation(

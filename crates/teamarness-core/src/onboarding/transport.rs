@@ -67,7 +67,7 @@ impl Transport {
     pub(crate) async fn bind_production(
         secret_key: SecretKey,
         issuer: IssuerService,
-        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
+        services: Option<crate::synchronization::SyncServices>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -79,7 +79,7 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             Some(issuer),
-            receiver,
+            services,
         )
         .await
     }
@@ -88,7 +88,7 @@ impl Transport {
         secret_key: SecretKey,
         options: BindOptions,
         issuer: Option<IssuerService>,
-        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
+        services: Option<crate::synchronization::SyncServices>,
     ) -> Result<Arc<Self>, OnboardingError> {
         let handler = Arc::new(match issuer {
             Some(issuer) => OnboardingHandler::with_issuer(options.request_timeout, issuer),
@@ -99,7 +99,7 @@ impl Transport {
             options.relay_mode,
             options.loopback_only,
             Arc::clone(&handler),
-            receiver,
+            services,
         )
         .await?;
         Ok(Arc::new(Self {
@@ -212,14 +212,6 @@ impl Transport {
             .map_err(|_| OnboardingError::Timeout)?
     }
 
-    pub(crate) async fn send_sync_batch(
-        &self,
-        address: EndpointAddr,
-        batch: &crate::synchronization::SyncBatch,
-    ) -> Result<usize, OnboardingError> {
-        self.network.send_batch(address, batch).await
-    }
-
     pub(crate) async fn send_log_sync(
         &self,
         address: EndpointAddr,
@@ -227,7 +219,7 @@ impl Transport {
         workspace: crate::WorkspaceId,
         package: String,
         peer: crate::PublicIdentity,
-    ) -> Result<usize, OnboardingError> {
+    ) -> Result<usize, crate::synchronization::LogSessionError> {
         self.network
             .send_log_sync(address, receiver, workspace, package, peer)
             .await
@@ -299,19 +291,19 @@ impl Transport {
     }
 
     #[cfg(test)]
-    pub(crate) async fn bind_loopback_with_issuer_and_receiver(
+    pub(crate) async fn bind_loopback_with_issuer_and_services(
         secret_key: SecretKey,
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: IssuerService,
-        receiver: Arc<dyn crate::synchronization::SyncReceiver>,
+        services: crate::synchronization::SyncServices,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind_loopback_inner(
             secret_key,
             readiness_timeout,
             ready_immediately,
             Some(issuer),
-            Some(receiver),
+            Some(services),
         )
         .await
     }
@@ -322,7 +314,7 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: Option<IssuerService>,
-        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
+        services: Option<crate::synchronization::SyncServices>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -338,9 +330,20 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             issuer,
-            receiver,
+            services,
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn endpoint(&self) -> &iroh::Endpoint {
+        self.network.endpoint()
+    }
+
+    /// Teaches a loopback endpoint how to reach a peer it has never dialled.
+    #[cfg(test)]
+    pub(crate) fn remember_peer_address(&self, address: EndpointAddr) {
+        self.network.remember_peer_address(address);
     }
 
     #[cfg(test)]

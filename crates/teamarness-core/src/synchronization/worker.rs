@@ -14,7 +14,8 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::onboarding::transport::Transport;
-use crate::runtime::{RuntimeState, SystemClock};
+use crate::runtime::RuntimeState;
+use crate::synchronization::peer_sessions::{self, PeerSessions};
 use crate::synchronization::scheduler::RetryState;
 use crate::{PublicIdentity, SynchronizationError, WorkspaceId};
 
@@ -60,6 +61,7 @@ impl SyncWorker {
         state: Weak<Mutex<RuntimeState>>,
         network: Arc<Transport>,
         local: PublicIdentity,
+        sessions: Arc<PeerSessions>,
     ) -> Arc<Self> {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let worker = Arc::new(Self {
@@ -73,7 +75,10 @@ impl SyncWorker {
         let wake = Arc::clone(&worker.wake);
         let cancel = Arc::clone(&worker.cancel);
         let join = tokio::spawn(async move {
-            run(state, network, local, stopped, wake, cancel, command_rx).await;
+            run(
+                state, network, local, sessions, stopped, wake, cancel, command_rx,
+            )
+            .await;
         });
         *worker
             .join
@@ -88,16 +93,6 @@ impl SyncWorker {
             let _ = self.commands.send(WorkerCommand::Wake);
             self.wake.notify_one();
         }
-    }
-
-    /// Cancels sessions at the next cancellation point after membership loss.
-    ///
-    /// A session is finite and bounded; cancelling the shared in-flight set is
-    /// intentional. The next wake/idle pass rebuilds it from current membership.
-    pub(crate) fn cancel_peer(&self, _peer: PublicIdentity) {
-        let _ = self.commands.send(WorkerCommand::Cancel);
-        self.cancel.notify_waiters();
-        self.wake.notify_one();
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -134,10 +129,12 @@ impl Drop for SyncWorker {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     state: Weak<Mutex<RuntimeState>>,
     network: Arc<Transport>,
     local: PublicIdentity,
+    sessions: Arc<PeerSessions>,
     stopped: Arc<AtomicBool>,
     wake: Arc<Notify>,
     cancel: Arc<Notify>,
@@ -150,32 +147,37 @@ async fn run(
     while !stopped.load(Ordering::Acquire) {
         if first {
             first = false;
-            run_once(&state, &network, local, &stopped, &cancel, &mut retry, true).await;
+            run_once(
+                &state, &network, local, &sessions, &stopped, &cancel, &mut retry, true,
+            )
+            .await;
             continue;
         }
         tokio::select! {
             command = commands.recv() => {
                 match command {
-                    Some(WorkerCommand::Wake) => run_once(&state, &network, local, &stopped, &cancel, &mut retry, false).await,
+                    Some(WorkerCommand::Wake) => run_once(&state, &network, local, &sessions, &stopped, &cancel, &mut retry, false).await,
                     Some(WorkerCommand::Cancel) => cancel.notify_waiters(),
                     None => return,
                 }
             }
             _ = wake.notified() => {
-                run_once(&state, &network, local, &stopped, &cancel, &mut retry, false).await;
+                run_once(&state, &network, local, &sessions, &stopped, &cancel, &mut retry, false).await;
             }
             _ = idle.tick() => {
-                run_once(&state, &network, local, &stopped, &cancel, &mut retry, true).await;
+                run_once(&state, &network, local, &sessions, &stopped, &cancel, &mut retry, true).await;
             }
             _ = cancel.notified() => {}
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     state: &Weak<Mutex<RuntimeState>>,
     network: &Arc<Transport>,
     local: PublicIdentity,
+    sessions: &Arc<PeerSessions>,
     stopped: &Arc<AtomicBool>,
     cancel: &Arc<Notify>,
     retry: &mut BTreeMap<(WorkspaceId, String, PublicIdentity), RetryState>,
@@ -189,26 +191,31 @@ async fn run_once(
         if stopped.load(Ordering::Acquire) {
             return;
         }
-        let mut sessions = FuturesUnordered::new();
+        let mut running = FuturesUnordered::new();
         for job in chunk {
             let key = (job.workspace, job.package.clone(), job.peer);
             let state = Arc::clone(&state_arc);
             let network = Arc::clone(network);
             let cancel = cancel.clone();
+            // Subscribe before the retry sleep, so a revocation committed while
+            // this job waits is observed instead of being slept through.
+            let mut cancelled_peer = sessions.subscribe(job.peer);
             let delay = retry
                 .entry(key.clone())
                 .or_insert_with(RetryState::new)
                 .next_delay_jittered();
-            sessions.push(async move {
+            running.push(async move {
                 // The first retry is immediate; subsequent retries are capped
                 // and jittered to avoid synchronized member storms.
                 if delay > Duration::ZERO {
                     tokio::time::sleep(delay).await;
                 }
+                if !still_current(&state, local, job.peer, job.workspace) {
+                    return (job.clone(), false);
+                }
                 let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
                     Arc::new(crate::runtime::RuntimeSyncReceiver {
                         state: Arc::downgrade(&state),
-                        clock: Arc::new(SystemClock),
                     });
                 let session = network.send_log_sync(
                     iroh_base::EndpointAddr::new(job.peer.as_public_key()),
@@ -220,10 +227,11 @@ async fn run_once(
                 tokio::select! {
                     result = session => (job.clone(), result.is_ok()),
                     _ = cancel.notified() => (job.clone(), false),
+                    () = peer_sessions::cancelled(&mut cancelled_peer) => (job.clone(), false),
                 }
             });
         }
-        while let Some((job, success)) = sessions.next().await {
+        while let Some((job, success)) = running.next().await {
             let key = (job.workspace, job.package.clone(), job.peer);
             if success {
                 retry.entry(key).or_insert_with(RetryState::new).succeeded();
@@ -231,6 +239,23 @@ async fn run_once(
             }
         }
     }
+}
+
+/// Re-checks the gate after the retry sleep, so a job queued before a
+/// revocation never dials. A busy lock skips the job until the next pass.
+fn still_current(
+    state: &Arc<Mutex<RuntimeState>>,
+    local: PublicIdentity,
+    peer: PublicIdentity,
+    workspace: WorkspaceId,
+) -> bool {
+    let Ok(state) = state.try_lock() else {
+        return false;
+    };
+    !state.poisoned
+        && state.memberships.get(&workspace).is_some_and(|projection| {
+            projection.contains_member(local) && projection.contains_member(peer)
+        })
 }
 
 fn load_jobs(state: &Arc<Mutex<RuntimeState>>, local: PublicIdentity, idle: bool) -> Vec<Job> {

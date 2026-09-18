@@ -10,25 +10,78 @@ use std::time::Duration;
 use iroh::protocol::Router;
 use iroh::{Endpoint, RelayMode};
 use iroh_base::{EndpointAddr, PublicKey, SecretKey};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::OnboardingError;
 use crate::onboarding::handler::OnboardingHandler;
 use crate::synchronization::{
-    LogSyncHandler, PackageSyncHandler, SyncBatch, SyncReceiver, encode_batch,
+    LogSessionError, LogSyncHandler, PeerSessions, Refusal, SessionGrant, SyncReceiver,
+    SyncServices,
 };
 
-pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = b"teamarness/package-sync/1";
-const PACKAGE_BATCH_ALPN: &[u8] = b"teamarness/package-sync-batch/1";
+pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = crate::synchronization::network_handler::LOG_SYNC_ALPN;
 pub(crate) const MAX_OUTBOUND_PEERS: usize = 4;
 pub(crate) const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The receiver a Network bound without Core services uses. It authorizes
+/// nothing, so an unattached endpoint serves no Workspace.
 #[derive(Debug)]
 struct RejectingSyncReceiver;
 
 impl SyncReceiver for RejectingSyncReceiver {
-    fn receive(&self, _peer: crate::PublicIdentity, _batch: SyncBatch) -> Result<usize, ()> {
+    fn authorize_session(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+    ) -> Result<SessionGrant, Refusal> {
+        Err(Refusal::NotAuthorized)
+    }
+
+    fn protection_bundle_for(
+        &self,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+        _recipient: crate::PublicIdentity,
+    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
+        Ok(None)
+    }
+
+    fn import_protection_bundle(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+        _bundle: crate::synchronization::ProtectionBundle,
+    ) -> Result<usize, ()> {
+        Err(())
+    }
+
+    fn authors(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+    ) -> Result<Vec<crate::PublicIdentity>, ()> {
+        Err(())
+    }
+
+    fn operations(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+    ) -> Result<Vec<([u8; 32], p2panda_core::Operation<()>)>, ()> {
+        Err(())
+    }
+
+    fn receive_operation(
+        &self,
+        _peer: crate::PublicIdentity,
+        _workspace: crate::WorkspaceId,
+        _package: &str,
+        _operation: p2panda_core::Operation<()>,
+    ) -> Result<(), ()> {
         Err(())
     }
 }
@@ -37,6 +90,10 @@ pub(crate) struct Network {
     endpoint: Endpoint,
     router: Router,
     outbound: Arc<Semaphore>,
+    services: SyncServices,
+    /// Loopback runtimes have no relay and no discovery, so tests register peer
+    /// addresses here instead. Production binds with `loopback_only == false`.
+    address_book: Option<iroh::address_lookup::memory::MemoryLookup>,
     #[cfg(test)]
     alpns: Vec<Vec<u8>>,
 }
@@ -56,39 +113,46 @@ impl Network {
         relay_mode: RelayMode,
         loopback_only: bool,
         onboarding: Arc<OnboardingHandler>,
-        receiver: Option<Arc<dyn SyncReceiver>>,
+        services: Option<SyncServices>,
     ) -> Result<Arc<Self>, OnboardingError> {
         let configured_alpns = vec![
             crate::onboarding::transport::ONBOARDING_ALPN.to_vec(),
             PACKAGE_SYNC_ALPN.to_vec(),
-            PACKAGE_BATCH_ALPN.to_vec(),
         ];
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(configured_alpns.clone())
             .relay_mode(relay_mode);
-        if loopback_only {
+        let address_book = if loopback_only {
+            let lookup = iroh::address_lookup::memory::MemoryLookup::new();
             builder = builder
+                .address_lookup(lookup.clone())
                 .clear_ip_transports()
                 .bind_addr("127.0.0.1:0")
                 .map_err(|_| OnboardingError::Readiness)?;
-        }
+            Some(lookup)
+        } else {
+            None
+        };
         let endpoint = builder
             .bind()
             .await
             .map_err(|_| OnboardingError::Readiness)?;
-        let receiver = receiver.unwrap_or_else(|| Arc::new(RejectingSyncReceiver));
-        let synchronization = Arc::new(PackageSyncHandler::new(Arc::clone(&receiver)));
-        let log_sync = Arc::new(LogSyncHandler::new(receiver));
+        let services = services.unwrap_or_else(|| SyncServices {
+            receiver: Arc::new(RejectingSyncReceiver),
+            sessions: PeerSessions::new(),
+        });
+        let log_sync = Arc::new(LogSyncHandler::new(services.clone()));
         let router = Router::builder(endpoint.clone())
             .accept(crate::onboarding::transport::ONBOARDING_ALPN, onboarding)
-            .accept(PACKAGE_BATCH_ALPN, synchronization)
             .accept(PACKAGE_SYNC_ALPN, log_sync)
             .spawn();
         Ok(Arc::new(Self {
             endpoint,
             router,
             outbound: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
+            services,
+            address_book,
             #[cfg(test)]
             alpns: configured_alpns,
         }))
@@ -107,50 +171,12 @@ impl Network {
         &self.alpns
     }
 
-    pub(crate) async fn send_batch(
-        &self,
-        address: EndpointAddr,
-        batch: &SyncBatch,
-    ) -> Result<usize, OnboardingError> {
-        let permit = self
-            .outbound
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| OnboardingError::Overload)?;
-        self.send_batch_with_permit(address, batch, permit).await
-    }
-
-    async fn send_batch_with_permit(
-        &self,
-        address: EndpointAddr,
-        batch: &SyncBatch,
-        _permit: OwnedSemaphorePermit,
-    ) -> Result<usize, OnboardingError> {
-        let connection = timeout(
-            SYNC_CONNECT_TIMEOUT,
-            self.endpoint.connect(address, PACKAGE_BATCH_ALPN),
-        )
-        .await
-        .map_err(|_| OnboardingError::Timeout)?
-        .map_err(|_| OnboardingError::Authentication)?;
-        let (mut send, mut receive) = timeout(Duration::from_secs(30), connection.open_bi())
-            .await
-            .map_err(|_| OnboardingError::Timeout)?
-            .map_err(|_| OnboardingError::Authentication)?;
-        let frame = encode_batch(batch).map_err(|_| OnboardingError::Overload)?;
-        send.write_all(&frame)
-            .await
-            .map_err(|_| OnboardingError::Authentication)?;
-        send.finish().map_err(|_| OnboardingError::Authentication)?;
-        let mut ack = [0_u8; 8];
-        receive
-            .read_exact(&mut ack)
-            .await
-            .map_err(|_| OnboardingError::Authentication)?;
-        if ack[4] != 1 || ack[5] != 2 {
-            return Err(OnboardingError::InvalidInput);
+    /// Teaches a loopback endpoint how to reach a peer it has never dialled.
+    #[cfg(test)]
+    pub(crate) fn remember_peer_address(&self, address: EndpointAddr) {
+        if let Some(book) = &self.address_book {
+            book.add_endpoint_info(address);
         }
-        Ok(usize::from(u16::from_be_bytes([ack[6], ack[7]])))
     }
 
     pub(crate) async fn send_log_sync(
@@ -160,7 +186,7 @@ impl Network {
         workspace: crate::WorkspaceId,
         package: String,
         peer: crate::PublicIdentity,
-    ) -> Result<usize, OnboardingError> {
+    ) -> Result<usize, LogSessionError> {
         self.send_log_sync_with_timeout(
             address,
             receiver,
@@ -180,39 +206,26 @@ impl Network {
         package: String,
         peer: crate::PublicIdentity,
         session_timeout: Duration,
-    ) -> Result<usize, OnboardingError> {
+    ) -> Result<usize, LogSessionError> {
         timeout(session_timeout, async {
-            if let Some(protection_grant) = receiver
-                .protection_grant(workspace, &package, peer)
-                .map_err(|_| OnboardingError::InvalidInput)?
-            {
-                let control = SyncBatch {
-                    workspace: *workspace.as_bytes(),
-                    membership: Vec::new(),
-                    package: package.clone(),
-                    protection_grant: Some(protection_grant),
-                    records: Vec::new(),
-                };
-                self.send_batch(address.clone(), &control).await?;
-            }
             let _permit = self
                 .outbound
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| OnboardingError::Overload)?;
+                .map_err(|_| LogSessionError::Refused(Refusal::Unavailable))?;
             crate::synchronization::network_handler::outbound_log_session(
                 &self.endpoint,
                 address,
                 receiver,
+                Arc::clone(&self.services.sessions),
                 workspace,
                 package,
                 peer,
             )
             .await
-            .map_err(|_| OnboardingError::Authentication)
         })
         .await
-        .map_err(|_| OnboardingError::Timeout)?
+        .map_err(|_| LogSessionError::Transport("package sync timed out".to_owned()))?
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
@@ -225,55 +238,11 @@ impl Network {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::time::Duration;
 
-    use iroh_base::{EndpointAddr, SecretKey};
+    use iroh_base::SecretKey;
 
     use super::*;
-
-    #[derive(Debug, Default)]
-    struct RecordingReceiver(Mutex<Vec<SyncBatch>>);
-
-    #[derive(Debug)]
-    struct GrantReceiver;
-
-    impl SyncReceiver for GrantReceiver {
-        fn protection_grant(
-            &self,
-            _workspace: crate::WorkspaceId,
-            _package: &str,
-            _recipient: crate::PublicIdentity,
-        ) -> Result<Option<Vec<u8>>, ()> {
-            Ok(Some(vec![1]))
-        }
-
-        fn receive(&self, _peer: crate::PublicIdentity, _batch: SyncBatch) -> Result<usize, ()> {
-            Ok(0)
-        }
-    }
-
-    #[derive(Debug)]
-    struct StallingBatchHandler;
-
-    impl iroh::protocol::ProtocolHandler for StallingBatchHandler {
-        async fn accept(
-            &self,
-            connection: iroh::endpoint::Connection,
-        ) -> Result<(), iroh::protocol::AcceptError> {
-            let (_send, _receive) = connection.accept_bi().await?;
-            std::future::pending::<()>().await;
-            Ok(())
-        }
-    }
-
-    impl SyncReceiver for RecordingReceiver {
-        fn receive(&self, _peer: crate::PublicIdentity, batch: SyncBatch) -> Result<usize, ()> {
-            let count = batch.records.len();
-            self.0.lock().unwrap().push(batch);
-            Ok(count)
-        }
-    }
 
     fn secret(seed: u8) -> SecretKey {
         SecretKey::from_bytes(&[seed; 32])
@@ -290,71 +259,18 @@ mod tests {
             network.alpns(),
             vec![
                 crate::onboarding::transport::ONBOARDING_ALPN.to_vec(),
-                PACKAGE_SYNC_ALPN.to_vec(),
-                PACKAGE_BATCH_ALPN.to_vec(),
+                b"teamarness/package-sync/2".to_vec(),
             ]
         );
         network.shutdown().await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn grant_prelude_obeys_the_complete_session_deadline() {
-        let server_endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret(5))
-            .alpns(vec![PACKAGE_BATCH_ALPN.to_vec()])
-            .relay_mode(RelayMode::Disabled)
-            .clear_ip_transports()
-            .bind_addr("127.0.0.1:0")
-            .unwrap()
-            .bind()
+    #[tokio::test]
+    async fn an_unattached_network_authorizes_no_session() {
+        let handler = Arc::new(OnboardingHandler::new(Duration::from_secs(1)));
+        let server = Network::bind(secret(3), RelayMode::Disabled, true, handler, None)
             .await
             .unwrap();
-        let server_router = Router::builder(server_endpoint.clone())
-            .accept(PACKAGE_BATCH_ALPN, StallingBatchHandler)
-            .spawn();
-        let client = Network::bind(
-            secret(6),
-            RelayMode::Disabled,
-            true,
-            Arc::new(OnboardingHandler::new(Duration::from_secs(1))),
-            None,
-        )
-        .await
-        .unwrap();
-        let address = server_endpoint.bound_sockets().into_iter().fold(
-            EndpointAddr::new(server_endpoint.id()),
-            EndpointAddr::with_ip_addr,
-        );
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            client.send_log_sync_with_timeout(
-                address,
-                Arc::new(GrantReceiver),
-                crate::WorkspaceId::from_bytes([9; 16]),
-                "teamarness.test".to_owned(),
-                crate::PublicIdentity::from_bytes(*server_endpoint.id().as_bytes()).unwrap(),
-                Duration::from_millis(50),
-            ),
-        )
-        .await
-        .expect("the complete synchronization deadline must interrupt a stalled control ACK");
-        assert_eq!(result.unwrap_err(), OnboardingError::Timeout);
-        client.shutdown().await.unwrap();
-        server_router.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn bounded_sync_batch_is_delivered_through_the_shared_network() {
-        let receiver = Arc::new(RecordingReceiver::default());
-        let server = Network::bind(
-            secret(3),
-            RelayMode::Disabled,
-            true,
-            Arc::new(OnboardingHandler::new(Duration::from_secs(1))),
-            Some(receiver.clone()),
-        )
-        .await
-        .unwrap();
         let client = Network::bind(
             secret(4),
             RelayMode::Disabled,
@@ -368,15 +284,19 @@ mod tests {
             EndpointAddr::new(server.endpoint_id()),
             EndpointAddr::with_ip_addr,
         );
-        let batch = SyncBatch {
-            workspace: [8; 16],
-            membership: vec![],
-            package: "teamarness.test".to_owned(),
-            protection_grant: None,
-            records: vec![vec![1, 2, 3], vec![4]],
-        };
-        assert_eq!(client.send_batch(address, &batch).await.unwrap(), 2);
-        assert_eq!(receiver.0.lock().unwrap().as_slice(), &[batch]);
+        let result = client
+            .send_log_sync(
+                address,
+                Arc::new(RejectingSyncReceiver),
+                crate::WorkspaceId::from_bytes([8; 16]),
+                "teamarness.test".to_owned(),
+                crate::PublicIdentity::from_bytes(*server.endpoint_id().as_bytes()).unwrap(),
+            )
+            .await;
+        assert_eq!(
+            result.unwrap_err(),
+            LogSessionError::Refused(Refusal::NotAuthorized)
+        );
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
     }
