@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+mod blocking;
 mod error;
 mod runtime;
 

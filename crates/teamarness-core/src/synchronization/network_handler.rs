@@ -247,7 +247,7 @@ enum LogSyncWire {
 /// After an author's first rejection or refused park, later operations from
 /// that author are dropped for the rest of this session: they would fail the
 /// sequence check anyway, and LogSync redelivers them next time.
-fn apply_log_sync_event(
+async fn apply_log_sync_event(
     receiver: &Arc<dyn SyncReceiver>,
     peer: PublicIdentity,
     workspace: WorkspaceId,
@@ -262,7 +262,15 @@ fn apply_log_sync_event(
     if skipped.contains(&author) {
         return Ok(false);
     }
-    match receiver.receive_operation(peer, workspace, package, *operation) {
+    // Applying one operation is SQLite and signature work: it crosses to a
+    // blocking thread, so the session never holds the asynchronous executor.
+    let package = package.to_owned();
+    let outcome = crate::blocking::receiver_call(receiver, move |receiver| {
+        receiver.receive_operation(peer, workspace, &package, *operation)
+    })
+    .await
+    .map_err(|_| "runtime state is unavailable".to_owned())?;
+    match outcome {
         Ok(OperationOutcome::Applied) => Ok(true),
         Ok(OperationOutcome::Duplicate | OperationOutcome::Parked(_)) => Ok(false),
         Ok(OperationOutcome::Rejected(_) | OperationOutcome::ParkRefused) => {
@@ -493,19 +501,25 @@ async fn run_log_exchange(
     package: &str,
     initiator: bool,
 ) -> Result<usize, String> {
-    let operations = receiver
-        .operations(peer, workspace, package)
-        .map_err(|()| "failed to load local operations".to_owned())?;
+    let scope = package.to_owned();
+    let operations = crate::blocking::receiver_call(receiver, move |receiver| {
+        receiver.operations(peer, workspace, &scope)
+    })
+    .await
+    .map_err(|_| "runtime state is unavailable".to_owned())?
+    .map_err(|()| "failed to load local operations".to_owned())?;
     let store = crate::synchronization::p2panda_adapter::TeamarnessLogStore::from_operations(
         operations.clone(),
     );
     let mut logs = std::collections::BTreeMap::new();
     let package_log =
         crate::synchronization::operation_store::log_id(scope_digest(package, workspace));
-    for author in receiver
-        .authors(peer, workspace)
-        .map_err(|()| "failed to load workspace authors".to_owned())?
-    {
+    let authors =
+        crate::blocking::receiver_call(receiver, move |receiver| receiver.authors(peer, workspace))
+            .await
+            .map_err(|_| "runtime state is unavailable".to_owned())?
+            .map_err(|()| "failed to load workspace authors".to_owned())?;
+    for author in authors {
         let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
             .map_err(|error| error.to_string())?;
         logs.entry(author)
@@ -543,7 +557,7 @@ async fn run_log_exchange(
                 loop {
                     match event_rx.try_recv() {
                         Ok(event) => {
-                            if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped)? {
+                            if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped).await? {
                                 accepted += 1;
                             }
                         }
@@ -565,7 +579,7 @@ async fn run_log_exchange(
             }
             event = event_rx.recv() => match event {
                 Ok(event) => {
-                    if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped)? {
+                    if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped).await? {
                         accepted += 1;
                     }
                 }
@@ -594,9 +608,13 @@ pub(crate) async fn outbound_log_session(
     peer: PublicIdentity,
 ) -> Result<usize, LogSessionError> {
     let mut cancellation = sessions.subscribe(peer);
-    let grant = receiver
-        .authorize_session(peer, workspace, &package)
-        .map_err(LogSessionError::Refused)?;
+    let scope = package.clone();
+    let grant = crate::blocking::receiver_call(&receiver, move |receiver| {
+        receiver.authorize_session(peer, workspace, &scope)
+    })
+    .await
+    .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
+    .map_err(LogSessionError::Refused)?;
     tokio::select! {
         result = outbound_session_body(endpoint, address, &receiver, grant, workspace, &package, peer) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
@@ -656,15 +674,26 @@ async fn outbound_session_body(
     }
     if let Some(bundle) = welcome_bundle {
         let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
-        let _ = receiver.import_protection_bundle(peer, workspace, package, bundle);
+        let scope = package.to_owned();
+        let _ = crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.import_protection_bundle(peer, workspace, &scope, bundle)
+        })
+        .await;
     }
     if remote_version != grant.membership_version {
-        receiver.note_membership_mismatch(workspace, peer);
+        let _ = crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.note_membership_mismatch(workspace, peer);
+        })
+        .await;
     }
     let offer = if grant.content_key_id.is_some() && remote_key.is_none() {
-        receiver
-            .protection_bundle_for(workspace, package, peer)
-            .unwrap_or(None)
+        let scope = package.to_owned();
+        crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.protection_bundle_for(workspace, &scope, peer)
+        })
+        .await
+        .unwrap_or(Ok(None))
+        .unwrap_or(None)
     } else {
         None
     };
@@ -771,7 +800,13 @@ async fn run_log_session_body(
             }
             _ => return Err(LogSessionError::Protocol("missing hello".to_owned())),
         };
-    let grant = match receiver.authorize_session(peer, workspace, &package) {
+    let scope = package.clone();
+    let authorized = crate::blocking::receiver_call(receiver, move |receiver| {
+        receiver.authorize_session(peer, workspace, &scope)
+    })
+    .await
+    .unwrap_or(Err(Refusal::Unavailable));
+    let grant = match authorized {
         Ok(grant) => grant,
         Err(refusal) => return Err(refuse(&mut io, connection, refusal).await),
     };
@@ -781,9 +816,13 @@ async fn run_log_session_body(
         return Err(refuse(&mut io, connection, Refusal::KeyMismatch).await);
     }
     let bundle = if grant.content_key_id.is_some() && remote_key.is_none() {
-        receiver
-            .protection_bundle_for(workspace, &package, peer)
-            .unwrap_or(None)
+        let scope = package.clone();
+        crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.protection_bundle_for(workspace, &scope, peer)
+        })
+        .await
+        .unwrap_or(Ok(None))
+        .unwrap_or(None)
     } else {
         None
     };
@@ -794,13 +833,20 @@ async fn run_log_session_body(
     })
     .map_err(LogSessionError::Transport)?;
     if remote_version != grant.membership_version {
-        receiver.note_membership_mismatch(workspace, peer);
+        let _ = crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.note_membership_mismatch(workspace, peer);
+        })
+        .await;
     }
     match io.next_wire().await.map_err(LogSessionError::Transport)? {
         LogSyncWire::Ready { protection } => {
             if let Some(bundle) = protection {
                 let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
-                let _ = receiver.import_protection_bundle(peer, workspace, &package, bundle);
+                let scope = package.clone();
+                let _ = crate::blocking::receiver_call(receiver, move |receiver| {
+                    receiver.import_protection_bundle(peer, workspace, &scope, bundle)
+                })
+                .await;
             }
         }
         LogSyncWire::Refused { reason } => {
@@ -959,8 +1005,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_skips_an_author_after_rejection_and_continues_with_others() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_skips_an_author_after_rejection_and_continues_with_others() {
         let scripted = Arc::new(ScriptedReceiver::default());
         let rejected = signed_operation(1, 0);
         *scripted.rejected_author.lock().unwrap() = Some(rejected.header.verifying_key);
@@ -988,6 +1034,7 @@ mod tests {
                 event,
                 &mut skipped,
             )
+            .await
             .unwrap()
             {
                 applied += 1;

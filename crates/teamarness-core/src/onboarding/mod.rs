@@ -1,6 +1,6 @@
 pub(crate) mod client;
 pub(crate) mod handler;
-mod transfer;
+pub(crate) mod transfer;
 pub(crate) mod transport;
 pub(crate) mod wire;
 

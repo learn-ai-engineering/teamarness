@@ -5,6 +5,7 @@
 //! Iroh endpoints bound to loopback with an in-memory address book, and real
 //! SQLite. Fakes appear only to inject a fault or to drive a raw probe.
 
+mod async_boundary;
 mod cluster;
 mod membership_replication;
 mod sync_authorization;

@@ -19,6 +19,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::blocking::StateUnavailable;
 use crate::membership_sync::{MembershipDemand, MembershipReplica};
 use crate::onboarding::transport::Transport;
 use crate::runtime::{RuntimeState, SystemClock};
@@ -198,20 +199,30 @@ async fn run_records(
     while !context.stopped.load(Ordering::Acquire) {
         if first {
             first = false;
-            record_pass(context, &mut retry, true).await;
+            if record_pass(context, &mut retry, true).await.is_err() {
+                return;
+            }
             continue;
         }
-        tokio::select! {
+        let pass = tokio::select! {
             command = commands.recv() => {
                 match command {
                     Some(WorkerCommand::Wake) => record_pass(context, &mut retry, false).await,
-                    Some(WorkerCommand::Cancel) => context.cancel.notify_waiters(),
+                    Some(WorkerCommand::Cancel) => {
+                        context.cancel.notify_waiters();
+                        Ok(())
+                    }
                     None => return,
                 }
             }
             _ = wake.notified() => record_pass(context, &mut retry, false).await,
             _ = idle.tick() => record_pass(context, &mut retry, true).await,
-            _ = context.cancel.notified() => {}
+            _ = context.cancel.notified() => Ok(()),
+        };
+        // A dropped runtime has nothing left to schedule, and a poisoned one
+        // must not schedule anything more.
+        if pass.is_err() {
+            return;
         }
     }
 }
@@ -227,17 +238,22 @@ async fn run_membership(context: &WorkerContext, wake: Arc<Notify>) {
             first = false;
             // The first pass after start is a full sweep, so an Installation
             // that was offline catches up with every Member it knows.
-            membership_pass(context, &mut retry, true).await;
+            if membership_pass(context, &mut retry, true).await.is_err() {
+                return;
+            }
             continue;
         }
-        tokio::select! {
+        let pass = tokio::select! {
             _ = wake.notified() => membership_pass(context, &mut retry, false).await,
             () = context.demand.changed() => membership_pass(context, &mut retry, false).await,
             _ = idle.tick() => {
                 idle_ticks = idle_ticks.wrapping_add(1);
-                membership_pass(context, &mut retry, idle_ticks.is_multiple_of(MEMBERSHIP_IDLE_EVERY)).await;
+                membership_pass(context, &mut retry, idle_ticks.is_multiple_of(MEMBERSHIP_IDLE_EVERY)).await
             }
-            _ = context.cancel.notified() => {}
+            _ = context.cancel.notified() => Ok(()),
+        };
+        if pass.is_err() {
+            return;
         }
     }
 }
@@ -246,18 +262,18 @@ async fn record_pass(
     context: &WorkerContext,
     retry: &mut BTreeMap<(WorkspaceId, String, PublicIdentity), RetryState>,
     reconcile_idle: bool,
-) {
-    let Some(state_arc) = context.state.upgrade() else {
-        return;
-    };
-    run_record_pass(context, &state_arc, retry, reconcile_idle).await;
+) -> Result<(), StateUnavailable> {
+    let state_arc = context.state.upgrade().ok_or(StateUnavailable::Dropped)?;
+    run_record_pass(context, &state_arc, retry, reconcile_idle).await
 }
 
-async fn membership_pass(context: &WorkerContext, retry: &mut MembershipRetry, idle_due: bool) {
-    let Some(state_arc) = context.state.upgrade() else {
-        return;
-    };
-    run_membership_pass(context, &state_arc, retry, idle_due).await;
+async fn membership_pass(
+    context: &WorkerContext,
+    retry: &mut MembershipRetry,
+    idle_due: bool,
+) -> Result<(), StateUnavailable> {
+    let state_arc = context.state.upgrade().ok_or(StateUnavailable::Dropped)?;
+    run_membership_pass(context, &state_arc, retry, idle_due).await
 }
 
 /// One membership pass: reconcile every due Workspace with its Members.
@@ -266,7 +282,7 @@ async fn run_membership_pass(
     state_arc: &Arc<Mutex<RuntimeState>>,
     retry: &mut MembershipRetry,
     idle_due: bool,
-) {
+) -> Result<(), StateUnavailable> {
     let now = Instant::now();
     let due_now =
         |key: &(WorkspaceId, PublicIdentity)| retry.get(key).is_none_or(|(due, _)| *due <= now);
@@ -276,7 +292,7 @@ async fn run_membership_pass(
     // others, and a peer waiting out its backoff keeps the wake alive.
     let mut failed = BTreeSet::new();
     let mut jobs = Vec::new();
-    for job in load_membership_jobs(state_arc, context.local, idle_due, &forced) {
+    for job in load_membership_jobs(state_arc, context.local, idle_due, &forced).await? {
         // A peer that just failed is left alone until its backoff elapses, so
         // an Installation that has gone away is not dialled on every wake.
         if due_now(&(job.workspace, job.peer)) {
@@ -286,12 +302,12 @@ async fn run_membership_pass(
         }
     }
     if jobs.is_empty() {
-        return;
+        return Ok(());
     }
     let mut attempted = BTreeMap::<WorkspaceId, i64>::new();
     for chunk in jobs.chunks(MAX_DIALS) {
         if context.stopped.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         let mut running = FuturesUnordered::new();
         for job in chunk {
@@ -304,7 +320,7 @@ async fn run_membership_pass(
             running.push(async move {
                 // Re-check right before dialling: a revocation committed while
                 // this pass was queued must not produce a dial.
-                if !still_current(&state, local, job.peer, job.workspace) {
+                if !still_current(&state, local, job.peer, job.workspace).await {
                     return (job.clone(), false);
                 }
                 let session = network.run_membership_session(
@@ -340,9 +356,10 @@ async fn run_membership_pass(
     }
     for (workspace, generation) in attempted {
         if !failed.contains(&workspace) {
-            let _ = consume_membership_wake(state_arc, workspace, generation);
+            let _ = consume_membership_wake(state_arc, workspace, generation).await;
         }
     }
+    Ok(())
 }
 
 async fn run_record_pass(
@@ -350,11 +367,11 @@ async fn run_record_pass(
     state_arc: &Arc<Mutex<RuntimeState>>,
     retry: &mut BTreeMap<(WorkspaceId, String, PublicIdentity), RetryState>,
     reconcile_idle: bool,
-) {
-    let jobs = load_jobs(state_arc, context.local, reconcile_idle);
+) -> Result<(), StateUnavailable> {
+    let jobs = load_jobs(state_arc, context.local, reconcile_idle).await?;
     for chunk in jobs.chunks(MAX_DIALS) {
         if context.stopped.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         let mut running = FuturesUnordered::new();
         for job in chunk {
@@ -377,7 +394,7 @@ async fn run_record_pass(
                 if delay > Duration::ZERO {
                     tokio::time::sleep(delay).await;
                 }
-                if !still_current(&state, local, job.peer, job.workspace) {
+                if !still_current(&state, local, job.peer, job.workspace).await {
                     return (job.clone(), None);
                 }
                 let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
@@ -405,7 +422,7 @@ async fn run_record_pass(
             match result {
                 Some(Ok(_)) => {
                     retry.entry(key).or_insert_with(RetryState::new).succeeded();
-                    let _ = consume_wake(state_arc, &job);
+                    let _ = consume_wake(state_arc, &job).await;
                 }
                 // A peer that does not know this Installation as a Member is
                 // exactly the case a membership session resolves.
@@ -416,41 +433,53 @@ async fn run_record_pass(
             }
         }
     }
+    Ok(())
 }
 
 /// Re-checks the gate after the retry sleep, so a job queued before a
-/// revocation never dials. A busy lock skips the job until the next pass.
-fn still_current(
+/// revocation never dials. Unreachable or poisoned state means "do not dial".
+async fn still_current(
     state: &Arc<Mutex<RuntimeState>>,
     local: PublicIdentity,
     peer: PublicIdentity,
     workspace: WorkspaceId,
 ) -> bool {
-    let Ok(state) = state.try_lock() else {
-        return false;
-    };
-    !state.poisoned
-        && state.memberships.get(&workspace).is_some_and(|projection| {
+    let state = Arc::downgrade(state);
+    crate::blocking::run_with_state(&state, move |state| {
+        state.memberships.get(&workspace).is_some_and(|projection| {
             projection.contains_member(local) && projection.contains_member(peer)
         })
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Builds the membership jobs for this pass.
 ///
 /// An Installation that is no longer a current Member of a Workspace schedules
 /// nothing for it, in either pass.
-fn load_membership_jobs(
+async fn load_membership_jobs(
     state: &Arc<Mutex<RuntimeState>>,
     local: PublicIdentity,
     idle_due: bool,
     forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
+) -> Result<Vec<MembershipJob>, StateUnavailable> {
+    let forced = forced.clone();
+    let state = Arc::downgrade(state);
+    crate::blocking::run_with_state(&state, move |state| {
+        load_membership_jobs_locked(state, local, idle_due, &forced)
+    })
+    .await
+}
+
+/// The durable half of one membership pass, on a blocking thread: which
+/// Workspaces and peers are due.
+fn load_membership_jobs_locked(
+    state: &mut RuntimeState,
+    local: PublicIdentity,
+    idle_due: bool,
+    forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
 ) -> Vec<MembershipJob> {
-    let Ok(state) = state.try_lock() else {
-        return Vec::new();
-    };
-    if state.poisoned {
-        return Vec::new();
-    }
     let mut jobs = Vec::new();
     let Ok(mut statement) = state.connection.prepare(
         "SELECT workspace_id, wake_generation, consumed_generation
@@ -507,14 +536,17 @@ fn load_membership_jobs(
     jobs
 }
 
-fn load_jobs(state: &Arc<Mutex<RuntimeState>>, local: PublicIdentity, idle: bool) -> Vec<Job> {
-    let Ok(state) = state.try_lock() else {
-        // Never block the async executor behind a synchronous runtime mutex.
-        return Vec::new();
-    };
-    if state.poisoned {
-        return Vec::new();
-    }
+async fn load_jobs(
+    state: &Arc<Mutex<RuntimeState>>,
+    local: PublicIdentity,
+    idle: bool,
+) -> Result<Vec<Job>, StateUnavailable> {
+    let state = Arc::downgrade(state);
+    crate::blocking::run_with_state(&state, move |state| load_jobs_locked(state, local, idle)).await
+}
+
+/// The durable half of one record pass, on a blocking thread.
+fn load_jobs_locked(state: &mut RuntimeState, local: PublicIdentity, idle: bool) -> Vec<Job> {
     let mut jobs = Vec::new();
     let Ok(mut statement) = state.connection.prepare(
         "SELECT s.workspace_id,s.package_identity,w.wake_generation,w.consumed_generation
@@ -565,14 +597,24 @@ fn load_jobs(state: &Arc<Mutex<RuntimeState>>, local: PublicIdentity, idle: bool
     jobs
 }
 
-fn consume_membership_wake(
+async fn consume_membership_wake(
     state: &Arc<Mutex<RuntimeState>>,
     workspace: WorkspaceId,
     generation: i64,
 ) -> Result<(), SynchronizationError> {
-    let mut state = state
-        .try_lock()
-        .map_err(|_| SynchronizationError::RuntimeUnavailable)?;
+    let state = Arc::downgrade(state);
+    crate::blocking::run_with_state(&state, move |state| {
+        consume_membership_wake_locked(state, workspace, generation)
+    })
+    .await
+    .map_err(|_| SynchronizationError::RuntimeUnavailable)?
+}
+
+fn consume_membership_wake_locked(
+    state: &mut RuntimeState,
+    workspace: WorkspaceId,
+    generation: i64,
+) -> Result<(), SynchronizationError> {
     let tx = state
         .connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -588,10 +630,18 @@ fn consume_membership_wake(
         .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::UncertainOutcome))
 }
 
-fn consume_wake(state: &Arc<Mutex<RuntimeState>>, job: &Job) -> Result<(), SynchronizationError> {
-    let mut state = state
-        .try_lock()
-        .map_err(|_| SynchronizationError::RuntimeUnavailable)?;
+async fn consume_wake(
+    state: &Arc<Mutex<RuntimeState>>,
+    job: &Job,
+) -> Result<(), SynchronizationError> {
+    let job = job.clone();
+    let state = Arc::downgrade(state);
+    crate::blocking::run_with_state(&state, move |state| consume_wake_locked(state, &job))
+        .await
+        .map_err(|_| SynchronizationError::RuntimeUnavailable)?
+}
+
+fn consume_wake_locked(state: &mut RuntimeState, job: &Job) -> Result<(), SynchronizationError> {
     let tx = state
         .connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

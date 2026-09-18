@@ -999,22 +999,31 @@ impl CoreRuntime {
     ) -> Result<Self, CoreError> {
         let clock: Arc<dyn Clock> = Arc::from(clock);
         let opened_at_unix_ms = clock.now_unix_ms();
-        let stored = crate::storage::open(config.private_data_directory())?;
-        let crate::storage::StoredRuntime {
-            mut connection,
-            secret_key,
-            display_name,
-        } = stored;
+        // Opening storage and replaying the membership projection are both
+        // blocking SQLite and signature work, so they run together on a
+        // blocking thread and never on an asynchronous worker.
+        let directory = config.private_data_directory().to_path_buf();
+        let opened: Result<_, CoreError> = tokio::task::spawn_blocking(move || {
+            let crate::storage::StoredRuntime {
+                mut connection,
+                secret_key,
+                display_name,
+            } = crate::storage::open(&directory)?;
+            let memberships =
+                crate::membership::projection::recover(&mut connection, opened_at_unix_ms)?;
+            // Parking is bounded in time as well as in size: a peer that went
+            // away never leaves work here for longer than the time-to-live.
+            let _ = crate::synchronization::parking::purge_expired(
+                &connection,
+                opened_at_unix_ms,
+                crate::synchronization::parking::ParkingLimits::CURRENT,
+            );
+            Ok((connection, secret_key, display_name, memberships))
+        })
+        .await
+        .map_err(|_| CoreError::Storage(StorageError::Database))?;
+        let (connection, secret_key, display_name, memberships) = opened?;
         let public_identity = PublicIdentity(secret_key.public());
-        let memberships =
-            crate::membership::projection::recover(&mut connection, opened_at_unix_ms)?;
-        // Parking is bounded in time as well as in size: a peer that went away
-        // never leaves work here for longer than the time-to-live.
-        let _ = crate::synchronization::parking::purge_expired(
-            &connection,
-            opened_at_unix_ms,
-            crate::synchronization::parking::ParkingLimits::CURRENT,
-        );
         let peer_sessions = crate::synchronization::PeerSessions::new();
         let state = Arc::new(Mutex::new(RuntimeState {
             connection,
@@ -1323,42 +1332,112 @@ impl CoreRuntime {
             .checked_add(budget)
             .ok_or(crate::OnboardingError::Timeout)?;
         let permit = self.transport.begin_outbound().await?;
-        self.transport
+        let (verified, claim, response) = self
+            .transport
             .whole_join_until(
-                self.join_workspace_inner(invitation, deadline, &permit),
+                self.join_network_phase(invitation, deadline, &permit),
                 deadline,
             )
+            .await?;
+        // Validation commits nothing, so the whole-join timer still bounds it.
+        Self::ensure_join_deadline(deadline)?;
+        let local_identity = self.public_identity;
+        #[cfg(test)]
+        let transport = Arc::clone(&self.transport);
+        let validating = async move {
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                transport.block_after_response();
+                crate::membership::projection::validate_bootstrap(
+                    response,
+                    &verified.token,
+                    &claim,
+                    local_identity,
+                )
+            })
             .await
+            .map_err(|_| crate::OnboardingError::InvalidBootstrap)?
+        };
+        let bootstrap = self
+            .transport
+            .whole_join_until(validating, deadline)
+            .await?;
+        // The import runs outside the timer: a timer must never report
+        // `Timeout` for an import that then commits. The closure enforces the
+        // deadline itself, and the outbound permit is held until it finishes.
+        Self::ensure_join_deadline(deadline)?;
+        let state = Arc::clone(&self.state);
+        let imported = tokio::task::spawn_blocking(move || {
+            let state = match crate::blocking::lock_until(&state, deadline) {
+                Ok(state) => state,
+                Err(crate::blocking::LockUntilError::Timeout) => {
+                    return Err(crate::OnboardingError::Timeout);
+                }
+                Err(crate::blocking::LockUntilError::Poisoned) => {
+                    return Err(crate::OnboardingError::UncertainStorageOutcome);
+                }
+            };
+            import_validated_bootstrap_locked(state, &bootstrap, Some(deadline), |_| Ok(()))
+        })
+        .await
+        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        drop(permit);
+        imported
     }
 
-    async fn join_workspace_inner(
+    /// The network half of a join: the pre-network claim and the exchange.
+    ///
+    /// Everything here is bounded by the whole-join timer, because nothing here
+    /// commits.
+    async fn join_network_phase(
         &self,
         invitation: &crate::WorkspaceInvitation,
         deadline: std::time::Instant,
         permit: &crate::onboarding::transport::OutboundPermit,
-    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+    ) -> Result<
+        (
+            crate::onboarding::transfer::VerifiedWorkspaceInvitation,
+            crate::invitation::VerifiedInvitationClaim,
+            crate::onboarding::wire::SuccessResponse,
+        ),
+        crate::OnboardingError,
+    > {
         let verified = invitation
             .verified()
             .map_err(|_| crate::OnboardingError::InvalidInput)?;
         Self::ensure_join_deadline(deadline)?;
-        let claim = {
-            let state = self.lock_join_state_until(deadline).await?;
+        let state = Arc::clone(&self.state);
+        let token = verified.token.clone();
+        let claim = tokio::task::spawn_blocking(move || {
+            let state = match crate::blocking::lock_until(&state, deadline) {
+                Ok(state) => state,
+                Err(crate::blocking::LockUntilError::Timeout) => {
+                    return Err(crate::OnboardingError::Timeout);
+                }
+                Err(crate::blocking::LockUntilError::Poisoned) => {
+                    return Err(crate::OnboardingError::UncertainStorageOutcome);
+                }
+            };
+            if state.poisoned {
+                return Err(crate::OnboardingError::UncertainStorageOutcome);
+            }
             let local_creator: Option<Vec<u8>> = state
                 .connection
                 .query_row(
                     "SELECT creator_public_identity FROM workspaces WHERE workspace_id = ?1",
-                    [verified.token.workspace_id.as_bytes().as_slice()],
+                    [token.workspace_id.as_bytes().as_slice()],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(|_| crate::OnboardingError::LocalConflict)?;
-            if matches!(local_creator, Some(creator) if creator != verified.token.inviter.as_bytes())
-            {
+            if matches!(local_creator, Some(creator) if creator != token.inviter.as_bytes()) {
                 return Err(crate::OnboardingError::LocalConflict);
             }
-            crate::invitation::sign_claim(&state.secret_key, &verified.token)
-                .map_err(map_invitation_onboarding_error)?
-        };
+            crate::invitation::sign_claim(&state.secret_key, &token)
+                .map_err(map_invitation_onboarding_error)
+        })
+        .await
+        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)??;
         Self::ensure_join_deadline(deadline)?;
 
         let response = crate::onboarding::client::join(
@@ -1370,25 +1449,7 @@ impl CoreRuntime {
         .await?;
         #[cfg(test)]
         self.transport.pause_after_response().await;
-        Self::ensure_join_deadline(deadline)?;
-        let local_identity = self.public_identity;
-        #[cfg(test)]
-        let transport = Arc::clone(&self.transport);
-        let bootstrap = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            transport.block_after_response();
-            crate::membership::projection::validate_bootstrap(
-                response,
-                &verified.token,
-                &claim,
-                local_identity,
-            )
-        })
-        .await
-        .map_err(|_| crate::OnboardingError::InvalidBootstrap)??;
-        Self::ensure_join_deadline(deadline)?;
-        let state = self.lock_join_state_until(deadline).await?;
-        self.import_validated_bootstrap_after_lock(state, &bootstrap, Some(deadline), |_| Ok(()))
+        Ok((verified, claim, response))
     }
 
     fn ensure_join_deadline(deadline: std::time::Instant) -> Result<(), crate::OnboardingError> {
@@ -1396,32 +1457,6 @@ impl CoreRuntime {
             Ok(())
         } else {
             Err(crate::OnboardingError::Timeout)
-        }
-    }
-
-    async fn lock_join_state_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, crate::OnboardingError> {
-        loop {
-            Self::ensure_join_deadline(deadline)?;
-            if let Some(state) = self.try_lock_join_state()? {
-                return Ok(state);
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
-    fn try_lock_join_state(
-        &self,
-    ) -> Result<Option<std::sync::MutexGuard<'_, RuntimeState>>, crate::OnboardingError> {
-        match self.state.try_lock() {
-            Ok(state) if state.poisoned => Err(crate::OnboardingError::UncertainStorageOutcome),
-            Ok(state) => Ok(Some(state)),
-            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                Err(crate::OnboardingError::UncertainStorageOutcome)
-            }
         }
     }
 
@@ -1439,78 +1474,7 @@ impl CoreRuntime {
             .state
             .lock()
             .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
-        self.import_validated_bootstrap_after_lock(state, bootstrap, deadline, fault)
-    }
-
-    fn import_validated_bootstrap_after_lock(
-        &self,
-        mut state: std::sync::MutexGuard<'_, RuntimeState>,
-        bootstrap: &crate::membership::projection::ValidatedBootstrap,
-        deadline: Option<std::time::Instant>,
-        fault: impl FnMut(crate::membership::projection::ImportBoundary) -> Result<(), StorageError>,
-    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
-        if state.poisoned {
-            return Err(crate::OnboardingError::UncertainStorageOutcome);
-        }
-        if let Some(deadline) = deadline {
-            Self::ensure_join_deadline(deadline)?;
-        }
-        let prior_busy_timeout_ms = state
-            .connection
-            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
-            .map_err(|_| crate::OnboardingError::LocalConflict)?;
-        let prior_busy_timeout_ms = u64::try_from(prior_busy_timeout_ms)
-            .map_err(|_| crate::OnboardingError::LocalConflict)?;
-        if let Some(deadline) = deadline {
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .ok_or(crate::OnboardingError::Timeout)?;
-            state
-                .connection
-                .busy_timeout(remaining)
-                .map_err(|_| crate::OnboardingError::LocalConflict)?;
-        }
-        let result = crate::membership::projection::import_bootstrap_with_fault(
-            &mut state.connection,
-            bootstrap,
-            deadline,
-            fault,
-        );
-        if state
-            .connection
-            .busy_timeout(std::time::Duration::from_millis(prior_busy_timeout_ms))
-            .is_err()
-        {
-            state.poisoned = true;
-            return Err(crate::OnboardingError::UncertainStorageOutcome);
-        }
-        if !matches!(
-            &result,
-            Err(crate::OnboardingError::UncertainStorageOutcome)
-        ) && result.is_err()
-            && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err(crate::OnboardingError::Timeout);
-        }
-        match result {
-            Ok(imported) => {
-                let snapshot = imported.projection.snapshot();
-                state
-                    .memberships
-                    .insert(snapshot.workspace_id(), imported.projection);
-                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                    state.poisoned = true;
-                    return Err(crate::OnboardingError::UncertainStorageOutcome);
-                }
-                Ok((imported.summary, snapshot))
-            }
-            Err(error) => {
-                if error == crate::OnboardingError::UncertainStorageOutcome {
-                    state.poisoned = true;
-                }
-                Err(error)
-            }
-        }
+        import_validated_bootstrap_locked(state, bootstrap, deadline, fault)
     }
 
     #[cfg(test)]
@@ -1903,22 +1867,20 @@ impl CoreRuntime {
         address: iroh_base::EndpointAddr,
         peer: PublicIdentity,
     ) -> Result<usize, crate::synchronization::LogSessionError> {
-        {
-            let state = self.state.lock().map_err(|_| {
-                crate::synchronization::LogSessionError::Refused(
-                    crate::synchronization::Refusal::Unavailable,
-                )
-            })?;
-            if state.poisoned
-                || !state
-                    .memberships
-                    .get(&workspace_id)
-                    .is_some_and(|projection| projection.contains_member(self.public_identity))
-            {
-                return Err(crate::synchronization::LogSessionError::Refused(
-                    crate::synchronization::Refusal::NotAuthorized,
-                ));
-            }
+        let local = self.public_identity;
+        let state = Arc::downgrade(&self.state);
+        let current = crate::blocking::run_with_state(&state, move |state| {
+            state
+                .memberships
+                .get(&workspace_id)
+                .is_some_and(|projection| projection.contains_member(local))
+        })
+        .await
+        .unwrap_or(false);
+        if !current {
+            return Err(crate::synchronization::LogSessionError::Refused(
+                crate::synchronization::Refusal::NotAuthorized,
+            ));
         }
         let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
             Arc::new(RuntimeSyncReceiver {
@@ -2987,6 +2949,80 @@ impl Drop for RuntimeStateHold {
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+/// Imports a validated bootstrap with the state lock already held.
+///
+/// A free function so the whole import can run inside one blocking closure,
+/// without a `&CoreRuntime` reference crossing the thread boundary.
+fn import_validated_bootstrap_locked(
+    mut state: std::sync::MutexGuard<'_, RuntimeState>,
+    bootstrap: &crate::membership::projection::ValidatedBootstrap,
+    deadline: Option<std::time::Instant>,
+    fault: impl FnMut(crate::membership::projection::ImportBoundary) -> Result<(), StorageError>,
+) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+    if state.poisoned {
+        return Err(crate::OnboardingError::UncertainStorageOutcome);
+    }
+    if let Some(deadline) = deadline {
+        CoreRuntime::ensure_join_deadline(deadline)?;
+    }
+    let prior_busy_timeout_ms = state
+        .connection
+        .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+        .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    let prior_busy_timeout_ms =
+        u64::try_from(prior_busy_timeout_ms).map_err(|_| crate::OnboardingError::LocalConflict)?;
+    if let Some(deadline) = deadline {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or(crate::OnboardingError::Timeout)?;
+        state
+            .connection
+            .busy_timeout(remaining)
+            .map_err(|_| crate::OnboardingError::LocalConflict)?;
+    }
+    let result = crate::membership::projection::import_bootstrap_with_fault(
+        &mut state.connection,
+        bootstrap,
+        deadline,
+        fault,
+    );
+    if state
+        .connection
+        .busy_timeout(std::time::Duration::from_millis(prior_busy_timeout_ms))
+        .is_err()
+    {
+        state.poisoned = true;
+        return Err(crate::OnboardingError::UncertainStorageOutcome);
+    }
+    if !matches!(
+        &result,
+        Err(crate::OnboardingError::UncertainStorageOutcome)
+    ) && result.is_err()
+        && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
+        return Err(crate::OnboardingError::Timeout);
+    }
+    match result {
+        Ok(imported) => {
+            let snapshot = imported.projection.snapshot();
+            state
+                .memberships
+                .insert(snapshot.workspace_id(), imported.projection);
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                state.poisoned = true;
+                return Err(crate::OnboardingError::UncertainStorageOutcome);
+            }
+            Ok((imported.summary, snapshot))
+        }
+        Err(error) => {
+            if error == crate::OnboardingError::UncertainStorageOutcome {
+                state.poisoned = true;
+            }
+            Err(error)
         }
     }
 }
