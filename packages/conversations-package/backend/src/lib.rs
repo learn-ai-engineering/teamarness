@@ -7,7 +7,7 @@ mod backend;
 pub(crate) mod domain;
 pub(crate) mod store;
 
-pub use backend::ConversationsBackend;
+pub use backend::{ConversationsActive, router};
 pub use domain::{DomainError, DomainRecord, GENERAL_ID, PAGE_SIZE, decode_id};
 pub use store::{
     ChannelView, ConversationStore, IngestResult, MessageView, StoreError, StoredRecord,

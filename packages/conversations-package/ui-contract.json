@@ -8,11 +8,12 @@
     "channel": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "slug", "canHide"],
+      "required": ["id", "slug", "canHide", "unreadCount"],
       "properties": {
         "id": { "$ref": "#/$defs/channelId" },
         "slug": { "$ref": "#/$defs/slug" },
-        "canHide": { "type": "boolean" }
+        "canHide": { "type": "boolean" },
+        "unreadCount": { "type": "integer", "minimum": 0 }
       }
     },
     "message": {

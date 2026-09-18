@@ -155,7 +155,7 @@ async fn complete_two_profile_recovery_matrix() {
                 && alice_channels == bob_channels
                 && alice_channels
                     .iter()
-                    .filter(|(_, slug, _)| slug.starts_with("offline-team"))
+                    .filter(|(_, slug)| slug.starts_with("offline-team"))
                     .count()
                     == 2
         })

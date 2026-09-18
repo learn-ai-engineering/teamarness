@@ -1,16 +1,15 @@
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
 use serde_json::{Map, Value as JsonValue};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
 };
 use teamarness_package_sdk::{
-    Backend, BackendError, BackendRequest, CancellationToken, EventSubscription, Package,
-    event_channel,
+    BackendError, CancellationToken, Context, Empty, Router, event_channel,
 };
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::watch;
 
 use crate::domain::{DomainRecord, PAGE_SIZE, decode_id, hex_id};
 use crate::store::{ConversationStore, IngestResult};
@@ -24,12 +23,6 @@ fn object<const N: usize>(entries: [(&str, JsonValue); N]) -> JsonValue {
         o.insert(k.into(), v);
     }
     JsonValue::Object(o)
-}
-fn str_field(v: &JsonValue, k: &str) -> Result<String, BackendError> {
-    v.get(k)
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| error("conversations.invalid_request", false))
 }
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, object([]))
@@ -70,141 +63,266 @@ impl SyncReport {
     }
 }
 
-#[derive(Clone)]
-pub struct ConversationsBackend {
-    pub(crate) active: Arc<AsyncMutex<Option<Running>>>,
-    lifecycle: Arc<AsyncMutex<()>>,
-    changes: watch::Sender<u64>,
+/// The record log session one activation owns.
+struct Session {
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
+
+/// Everything one activation of Conversations owns.
+///
+/// Every store call runs inside `Context::blocking`, so SQLite never holds an async worker.
+pub struct ConversationsActive {
+    store: ConversationStore,
+    log: RecordLog,
+    sync: Arc<Mutex<SyncReport>>,
+    changes: watch::Sender<u64>,
+    /// The Installation this Package Instance belongs to, which decides who may hide a Channel.
+    installation: String,
+    session: Mutex<Option<Session>>,
+}
+
+/// What one activation built, for a test that must look inside.
+///
+/// The shipped router only publishes them; a test is what reads them.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
-pub(crate) struct Active {
+pub(crate) struct ActivationHandles {
     pub(crate) store: ConversationStore,
-    pub(crate) log: RecordLog,
     pub(crate) sync: Arc<Mutex<SyncReport>>,
 }
-pub(crate) struct Running {
-    pub(crate) active: Active,
-    pub(crate) cancellation: CancellationToken,
-    pub(crate) task: tokio::task::JoinHandle<()>,
-}
-impl Default for ConversationsBackend {
-    fn default() -> Self {
-        let (tx, _) = watch::channel(0);
-        Self {
-            active: Arc::new(AsyncMutex::new(None)),
-            lifecycle: Arc::new(AsyncMutex::new(())),
-            changes: tx,
-        }
-    }
-}
-impl ConversationsBackend {
-    pub async fn serve() -> Result<(), teamarness_package_sdk::SdkError> {
-        Package::builder(Arc::new(Self::default())).serve().await
-    }
 
-    async fn active(&self) -> Result<Active, BackendError> {
-        self.active
+pub(crate) type ActivationObserver = Arc<Mutex<Option<ActivationHandles>>>;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateRequest {
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HideRequest {
+    channel_id: String,
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PostRequest {
+    channel_id: String,
+    markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PageRequest {
+    channel_id: String,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// The Conversations Backend.
+#[must_use]
+pub fn router() -> Router<ConversationsActive> {
+    router_observing(None)
+}
+
+/// The Backend, publishing what each activation built.
+///
+/// Only a test passes an observer; the shipped router passes `None`.
+pub(crate) fn router_observing(
+    observer: Option<ActivationObserver>,
+) -> Router<ConversationsActive> {
+    Router::new(move |activation| {
+        let observer = observer.clone();
+        let initialization = activation.initialization().clone();
+        let capabilities = activation.capabilities().clone();
+        let cancellation = activation.cancellation().clone();
+        async move {
+            let directory = initialization.data_directory().path().to_owned();
+            let store = teamarness_package_sdk::blocking(&cancellation, move |_| {
+                ConversationStore::open(directory.join("conversations.sqlite3"))
+                    .map_err(|_| storage_failed())
+            })
+            .await?;
+            let log = RecordLog::from_initialization(&initialization, capabilities)
+                .map_err(|cause| capability_error("record-log", cause))?;
+            rehydrate(&store, &log, &cancellation).await?;
+
+            let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
+            let (changes, _) = watch::channel(0);
+            if let Some(observer) = observer {
+                *observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActivationHandles {
+                    store: store.clone(),
+                    sync: sync.clone(),
+                });
+            }
+            let session = start_session(&store, &log, &sync, &changes);
+            Ok(ConversationsActive {
+                store,
+                log,
+                sync,
+                changes,
+                installation: initialization.installation().identity.clone(),
+                session: Mutex::new(Some(session)),
+            })
+        }
+    })
+    .on_suspend(|state: Arc<ConversationsActive>| async move {
+        stop_session(&state).await;
+        Ok(())
+    })
+    .on_resume(|state: Arc<ConversationsActive>| async move {
+        // A suspended Instance stopped its session; recovering it starts a new one from the
+        // cursor the sink committed.
+        stop_session(&state).await;
+        let session = start_session(&state.store, &state.log, &state.sync, &state.changes);
+        *state
+            .session
             .lock()
-            .await
-            .as_ref()
-            .map(|running| running.active.clone())
-            .ok_or_else(|| error("conversations.not_active", true))
-    }
-
-    async fn stop_active(&self) {
-        if let Some(running) = self.active.lock().await.take() {
-            running.cancellation.cancel();
-            let _ = running.task.await;
-        }
-    }
-
-    pub(crate) async fn deactivate(&self) -> Result<JsonValue, BackendError> {
-        let _lifecycle = self.lifecycle.lock().await;
-        self.stop_active().await;
-        Ok(object([]))
-    }
-
-    async fn activate(&self, r: &BackendRequest) -> Result<JsonValue, BackendError> {
-        let _lifecycle = self.lifecycle.lock().await;
-        self.stop_active().await;
-        let data = r.initialization.data_directory().path();
-        let store = ConversationStore::open(data.join("conversations.sqlite3"))
-            .map_err(|_| storage_failed())?;
-        let log = RecordLog::from_initialization(&r.initialization, r.capabilities.clone())
-            .map_err(|cause| capability_error("record-log", cause))?;
-
-        // Open control records (channel creates / hides) to rehydrate display data.
-        let control_records = store.control_records().map_err(|_| storage_failed())?;
-        for batch in control_records.chunks(32) {
-            let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
-            let results = log
-                .open(&sealed)
-                .await
-                .map_err(|cause| capability_error("open-control-records", cause))?;
-            for result in results {
-                if let OpenResult::Ready(record) = result {
-                    let _ = store.remember_opened(&record.canonical);
-                }
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+        Ok(())
+    })
+    .on_dispose(|state: Arc<ConversationsActive>| async move {
+        stop_session(&state).await;
+        Ok(())
+    })
+    .request(
+        "conversations.snapshot",
+        |context: Context<ConversationsActive>, _: Empty| async move {
+            let state = context.state().clone();
+            context.blocking(move |_| state.snapshot_value()).await
+        },
+    )
+    .request(
+        "conversations.channel.create",
+        |context: Context<ConversationsActive>, request: CreateRequest| async move {
+            let author = context.state().installation.clone();
+            let record = DomainRecord::channel_create(&author, request.slug)
+                .map_err(|_| error("conversations.invalid_slug", false))?;
+            append(&context, "channel.create", record).await
+        },
+    )
+    .request(
+        "conversations.channel.hide",
+        |context: Context<ConversationsActive>, request: HideRequest| async move {
+            if !request.confirm {
+                return Err(error("conversations.confirmation_required", false));
             }
-        }
-
-        // Open and retry deferred records (e.g. messages before their channel).
-        let deferred = store.deferred_records().map_err(|_| storage_failed())?;
-        for batch in deferred.chunks(32) {
-            let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
-            let results = log
-                .open(&sealed)
-                .await
-                .map_err(|cause| capability_error("open-deferred-records", cause))?;
-            for (row, result) in batch.iter().zip(results.iter()) {
-                if let OpenResult::Ready(record) = result {
-                    let _ = store.retry_deferred(&row.record_id, &record.canonical);
-                }
+            let channel = decode_id(&request.channel_id)
+                .ok_or_else(|| error("conversations.invalid_request", false))?;
+            let author = context.state().installation.clone();
+            let record = DomainRecord::channel_hide(channel, &author)
+                .map_err(|_| error("conversations.invalid_request", false))?;
+            append(&context, "channel.hide", record).await
+        },
+    )
+    .request(
+        "conversations.message.post",
+        |context: Context<ConversationsActive>, request: PostRequest| async move {
+            let channel = decode_id(&request.channel_id)
+                .ok_or_else(|| error("conversations.invalid_request", false))?;
+            let state = context.state().clone();
+            let active = context
+                .blocking(move |_| {
+                    state
+                        .store
+                        .channel_is_active(&hex_id(channel))
+                        .map_err(|_| storage_failed())
+                })
+                .await?;
+            if !active {
+                return Err(error("conversations.channel_hidden", false));
             }
-        }
+            let author = context.state().installation.clone();
+            let record = DomainRecord::message_post(channel, &author, request.markdown)
+                .map_err(|_| error("conversations.invalid_markdown", false))?;
+            append(&context, "message.post", record).await
+        },
+    )
+    .request(
+        "conversations.channel.open",
+        |context: Context<ConversationsActive>, request: PageRequest| async move {
+            let channel = request.channel_id.clone();
+            let page = page(&context, request).await?;
+            let state = context.state().clone();
+            context
+                .blocking(move |_| {
+                    state
+                        .store
+                        .mark_read(&channel)
+                        .map_err(|_| storage_failed())
+                })
+                .await?;
+            Ok(page)
+        },
+    )
+    .request(
+        "conversations.channel.page",
+        |context: Context<ConversationsActive>, request: PageRequest| async move {
+            page(&context, request).await
+        },
+    )
+    .subscription(
+        "conversations.changes",
+        |context: Context<ConversationsActive>, _: Empty| async move {
+            let (sender, subscription) = event_channel(32);
+            let mut revisions = context.state().changes.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    let state = context.state().clone();
+                    let Ok(snapshot) = context.blocking(move |_| state.snapshot_value()).await
+                    else {
+                        return;
+                    };
+                    if sender.send(snapshot).await.is_err() {
+                        return;
+                    }
+                    if revisions.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(subscription)
+        },
+    )
+}
 
-        let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
-        let active = Active {
-            store: store.clone(),
-            log: log.clone(),
-            sync: sync.clone(),
-        };
-        let sink = Arc::new(ConversationsSink {
-            store,
-            changes: self.changes.clone(),
-            sync,
-        });
-        let cancellation = CancellationToken::new();
-        let task = tokio::spawn(run_session(
-            log,
-            sink,
-            cancellation.clone(),
-            SessionOptions::default(),
-        ));
-        *self.active.lock().await = Some(Running {
-            active,
-            cancellation,
-            task,
-        });
-        Ok(object([]))
+impl ConversationsActive {
+    /// The synchronization report the UI is shown.
+    pub(crate) fn report(&self) -> SyncReport {
+        self.sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    async fn snapshot(&self) -> Result<JsonValue, BackendError> {
-        let a = self.active().await?;
-        let availability = a.report().availability;
-        let channels = a.store.channels().map_err(|_| storage_failed())?;
+    /// The Channel list, availability and warnings the UI renders.
+    ///
+    /// TEAM.SYS.CONV-R06: Hide is offered only to the Installation that created the Channel, and
+    /// never for the general Channel. TEAM.SYS.CONV-R13: each Channel carries its unread count.
+    fn snapshot_value(&self) -> Result<JsonValue, BackendError> {
+        let report = self.report();
+        let channels = self.store.channels().map_err(|_| storage_failed())?;
         let visible = channels
             .into_iter()
-            .filter(|c| !c.hidden)
-            .map(|c| {
+            .filter(|channel| !channel.hidden)
+            .map(|channel| {
+                let can_hide = channel.creator == self.installation && channel.slug != "general";
                 object([
-                    ("id", JsonValue::String(c.id)),
-                    ("slug", JsonValue::String(c.slug)),
-                    ("canHide", JsonValue::Bool(c.creator != "system")),
+                    ("id", JsonValue::String(channel.id)),
+                    ("slug", JsonValue::String(channel.slug)),
+                    ("canHide", JsonValue::Bool(can_hide)),
+                    ("unreadCount", JsonValue::from(channel.unread_count)),
                 ])
             })
             .collect();
-        let warnings = if a
+        let warnings = if self
             .store
             .has_projection_warnings()
             .map_err(|_| storage_failed())?
@@ -219,210 +337,195 @@ impl ConversationsBackend {
             ("channels", JsonValue::Array(visible)),
             (
                 "availability",
-                JsonValue::String(availability.as_str().to_owned()),
+                JsonValue::String(report.availability.as_str().to_owned()),
             ),
             ("warnings", JsonValue::Array(warnings)),
         ]))
     }
+}
 
-    async fn append(&self, purpose: &str, domain: DomainRecord) -> Result<JsonValue, BackendError> {
-        let a = self.active().await?;
-        let canonical = domain.encode();
-        let appended = a
-            .log
-            .append(purpose, &canonical)
-            .await
-            .map_err(|cause| capability_error(purpose, cause))?;
-        let outcome = a
-            .store
-            .ingest(
-                appended.record_id.as_str(),
-                appended.order_key.as_str(),
-                &appended.author,
-                purpose,
-                &appended.signature,
-                &canonical,
-                &appended.sealed_record,
-                None,
-            )
-            .map_err(|_| storage_failed())?;
-        match outcome {
-            IngestResult::Applied | IngestResult::Duplicate => {}
-            IngestResult::Deferred(_) => {
-                return Err(error("conversations.deferred", true));
-            }
-            IngestResult::Quarantined(_) => {
-                return Err(error("conversations.rejected", false));
-            }
-        }
-        self.changes.send_modify(|x| *x = x.saturating_add(1));
-        Ok(object([("ok", JsonValue::Bool(true))]))
+/// Appends one domain record and projects it locally.
+async fn append(
+    context: &Context<ConversationsActive>,
+    purpose: &'static str,
+    record: DomainRecord,
+) -> Result<JsonValue, BackendError> {
+    let canonical = record.encode();
+    let appended = context
+        .state()
+        .log
+        .append(purpose, &canonical)
+        .await
+        .map_err(|cause| capability_error(purpose, cause))?;
+    let state = context.state().clone();
+    let outcome = context
+        .blocking(move |_| {
+            state
+                .store
+                .ingest(
+                    appended.record_id.as_str(),
+                    appended.order_key.as_str(),
+                    &appended.author,
+                    purpose,
+                    &appended.signature,
+                    &canonical,
+                    &appended.sealed_record,
+                    None,
+                )
+                .map_err(|_| storage_failed())
+        })
+        .await?;
+    match outcome {
+        IngestResult::Applied | IngestResult::Duplicate => {}
+        IngestResult::Deferred(_) => return Err(error("conversations.deferred", true)),
+        IngestResult::Quarantined(_) => return Err(error("conversations.rejected", false)),
     }
+    context
+        .state()
+        .changes
+        .send_modify(|revision| *revision = revision.saturating_add(1));
+    Ok(object([("ok", JsonValue::Bool(true))]))
+}
 
-    async fn page(
-        &self,
-        r: &BackendRequest,
-        channel: &str,
-        before: Option<&str>,
-        limit: usize,
-    ) -> Result<JsonValue, BackendError> {
-        let a = self.active().await?;
-        if decode_id(channel).is_none() {
-            return Err(error("conversations.invalid_request", false));
+/// Reads one page of a Channel's Messages, opening their sealed records through the capability.
+async fn page(
+    context: &Context<ConversationsActive>,
+    request: PageRequest,
+) -> Result<JsonValue, BackendError> {
+    if decode_id(&request.channel_id).is_none() {
+        return Err(error("conversations.invalid_request", false));
+    }
+    let limit = request
+        .limit
+        .map_or(PAGE_SIZE, |limit| (limit as usize).min(PAGE_SIZE));
+    let state = context.state().clone();
+    let channel = request.channel_id.clone();
+    let before = request.before.clone();
+    let rows = context
+        .blocking(move |_| {
+            state
+                .store
+                .message_rows(&channel, before.as_deref(), limit)
+                .map_err(|_| storage_failed())
+        })
+        .await?;
+    if rows.is_empty() {
+        return Ok(object([("messages", JsonValue::Array(Vec::new()))]));
+    }
+    let has_more = rows.len() == limit;
+    let sealed: Vec<Vec<u8>> = rows.iter().map(|row| row.4.clone()).collect();
+    let results = context
+        .state()
+        .log
+        .open(&sealed)
+        .await
+        .map_err(|cause| capability_error("open-message-page", cause))?;
+    let local_identity = context.state().installation.clone();
+    let last_order = rows.last().map(|row| row.1.clone());
+    let mut messages = Vec::new();
+    for ((id, _order, author, _record, _sealed, _ordinal), result) in
+        rows.into_iter().zip(results.iter())
+    {
+        let OpenResult::Ready(opened) = result else {
+            continue;
+        };
+        if let Ok(DomainRecord::MessagePost { markdown, .. }) =
+            DomainRecord::decode(&opened.canonical)
+        {
+            messages.push(object([
+                ("id", JsonValue::String(id)),
+                ("author", JsonValue::String(author.clone())),
+                ("isLocal", JsonValue::Bool(author == local_identity)),
+                ("markdown", JsonValue::String(markdown)),
+            ]));
         }
-        let page_limit = limit.min(PAGE_SIZE);
-        let rows = a
-            .store
-            .message_rows(channel, before, page_limit)
-            .map_err(|_| storage_failed())?;
-        if rows.is_empty() {
-            return Ok(object([("messages", JsonValue::Array(Vec::new()))]));
-        }
-        let has_more = rows.len() == page_limit;
-        let sealed: Vec<Vec<u8>> = rows.iter().map(|x| x.4.clone()).collect();
-        let results = a
-            .log
+    }
+    let mut page = object([("messages", JsonValue::Array(messages))]);
+    if has_more
+        && let Some(next) = last_order
+        && let JsonValue::Object(ref mut fields) = page
+    {
+        fields.insert("nextBefore".into(), JsonValue::String(next));
+    }
+    Ok(page)
+}
+
+/// Re-opens the sealed records the projection needs to render, and retries deferred ones.
+async fn rehydrate(
+    store: &ConversationStore,
+    log: &RecordLog,
+    cancellation: &CancellationToken,
+) -> Result<(), BackendError> {
+    let reader = store.clone();
+    let control = teamarness_package_sdk::blocking(cancellation, move |_| {
+        reader.control_records().map_err(|_| storage_failed())
+    })
+    .await?;
+    for batch in control.chunks(32) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+        let results = log
             .open(&sealed)
             .await
-            .map_err(|cause| capability_error("open-message-page", cause))?;
-        let local_identity = r.initialization.installation().identity.as_str();
-        let last_order = rows.last().map(|r| r.1.clone());
-        let mut messages = Vec::new();
-        for ((id, _order, author, _rid, _sealed, _ordinal), result) in
-            rows.into_iter().zip(results.iter())
-        {
-            let OpenResult::Ready(record) = result else {
-                continue;
-            };
-            if let Ok(DomainRecord::MessagePost { markdown, .. }) =
-                DomainRecord::decode(&record.canonical)
-            {
-                messages.push(object([
-                    ("id", JsonValue::String(id)),
-                    ("author", JsonValue::String(author.clone())),
-                    ("isLocal", JsonValue::Bool(author == local_identity)),
-                    ("markdown", JsonValue::String(markdown)),
-                ]));
+            .map_err(|cause| capability_error("open-control-records", cause))?;
+        for result in results {
+            if let OpenResult::Ready(record) = result {
+                let _ = store.remember_opened(&record.canonical);
             }
         }
-        let mut page = object([("messages", JsonValue::Array(messages))]);
-        if has_more
-            && let Some(next) = last_order
-            && let JsonValue::Object(ref mut o) = page
-        {
-            o.insert("nextBefore".into(), JsonValue::String(next));
+    }
+
+    let reader = store.clone();
+    let deferred = teamarness_package_sdk::blocking(cancellation, move |_| {
+        reader.deferred_records().map_err(|_| storage_failed())
+    })
+    .await?;
+    for batch in deferred.chunks(32) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+        let results = log
+            .open(&sealed)
+            .await
+            .map_err(|cause| capability_error("open-deferred-records", cause))?;
+        for (row, result) in batch.iter().zip(results.iter()) {
+            if let OpenResult::Ready(record) = result {
+                let _ = store.retry_deferred(&row.record_id, &record.canonical);
+            }
         }
-        Ok(page)
     }
+    Ok(())
 }
 
-impl Active {
-    /// The synchronization report the UI is shown.
-    pub(crate) fn report(&self) -> SyncReport {
-        self.sync
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
+/// Starts the record log session that ingests everything the host delivers.
+fn start_session(
+    store: &ConversationStore,
+    log: &RecordLog,
+    sync: &Arc<Mutex<SyncReport>>,
+    changes: &watch::Sender<u64>,
+) -> Session {
+    let sink = Arc::new(ConversationsSink {
+        store: store.clone(),
+        changes: changes.clone(),
+        sync: sync.clone(),
+    });
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(run_session(
+        log.clone(),
+        sink,
+        cancellation.clone(),
+        SessionOptions::default(),
+    ));
+    Session { cancellation, task }
 }
 
-impl Backend for ConversationsBackend {
-    fn handle(
-        &self,
-        r: BackendRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<JsonValue, BackendError>> + Send + '_>>
-    {
-        Box::pin(async move {
-            match r.operation.as_str() {
-                "lifecycle.activate" | "lifecycle.recover" => self.activate(&r).await,
-                "lifecycle.suspend" | "lifecycle.dispose" => self.deactivate().await,
-                "conversations.snapshot" => self.snapshot().await,
-                "conversations.channel.create" => {
-                    let slug = str_field(&r.payload, "slug")?;
-                    let author = r.initialization.installation().identity.as_str();
-                    let d = DomainRecord::channel_create(author, slug)
-                        .map_err(|_| error("conversations.invalid_slug", false))?;
-                    self.append("channel.create", d).await
-                }
-                "conversations.channel.hide" => {
-                    if r.payload.get("confirm").and_then(JsonValue::as_bool) != Some(true) {
-                        return Err(error("conversations.confirmation_required", false));
-                    }
-                    let cid = decode_id(&str_field(&r.payload, "channelId")?)
-                        .ok_or_else(|| error("conversations.invalid_request", false))?;
-                    let author = r.initialization.installation().identity.as_str();
-                    let d = DomainRecord::channel_hide(cid, author)
-                        .map_err(|_| error("conversations.invalid_request", false))?;
-                    self.append("channel.hide", d).await
-                }
-                "conversations.message.post" => {
-                    let cid = decode_id(&str_field(&r.payload, "channelId")?)
-                        .ok_or_else(|| error("conversations.invalid_request", false))?;
-                    let active = self.active().await?;
-                    if !active
-                        .store
-                        .channel_is_active(&hex_id(cid))
-                        .map_err(|_| storage_failed())?
-                    {
-                        return Err(error("conversations.channel_hidden", false));
-                    }
-                    let md = str_field(&r.payload, "markdown")?;
-                    let author = r.initialization.installation().identity.as_str();
-                    let d = DomainRecord::message_post(cid, author, md)
-                        .map_err(|_| error("conversations.invalid_markdown", false))?;
-                    self.append("message.post", d).await
-                }
-                "conversations.channel.open" | "conversations.channel.page" => {
-                    let cid = str_field(&r.payload, "channelId")?;
-                    let before = r.payload.get("before").and_then(JsonValue::as_str);
-                    let limit = r
-                        .payload
-                        .get("limit")
-                        .and_then(JsonValue::as_u64)
-                        .unwrap_or(PAGE_SIZE as u64) as usize;
-                    let out = self.page(&r, &cid, before, limit).await?;
-                    if r.operation.ends_with("open") {
-                        self.active()
-                            .await?
-                            .store
-                            .mark_read(&cid)
-                            .map_err(|_| storage_failed())?;
-                    }
-                    Ok(out)
-                }
-                _ => Err(error("conversations.unknown_operation", false)),
-            }
-        })
-    }
-    fn subscribe(
-        &self,
-        r: BackendRequest,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = Result<EventSubscription, BackendError>> + Send + '_>,
-    > {
-        Box::pin(async move {
-            if r.operation != "conversations.changes" {
-                return Err(error("conversations.unknown_subscription", false));
-            }
-            let (tx, sub) = event_channel(32);
-            let me = self.clone();
-            let mut rev = self.changes.subscribe();
-            tokio::spawn(async move {
-                if let Ok(v) = me.snapshot().await
-                    && tx.send(v).await.is_err()
-                {
-                    return;
-                }
-                while rev.changed().await.is_ok() {
-                    if let Ok(v) = me.snapshot().await
-                        && tx.send(v).await.is_err()
-                    {
-                        return;
-                    }
-                }
-            });
-            Ok(sub)
-        })
+/// Cancels the session and waits for it to finish, so no ingest outlives the activation.
+async fn stop_session(state: &ConversationsActive) {
+    let session = state
+        .session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(session) = session {
+        session.cancellation.cancel();
+        let _ = session.task.await;
     }
 }
 
@@ -521,21 +624,29 @@ mod session_tests {
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
-    use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
+    use teamarness_package_sdk::testing::{
+        Harness, HarnessBuilder, ScriptedCapability, assert_router_matches_contract,
+    };
 
     use super::*;
     use crate::domain::{GENERAL_ID, hex_id};
 
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
     const CHANNEL: [u8; 16] = [1; 16];
+    const ALICE: &str = "alice";
 
     fn hex(length: usize, seed: u64) -> String {
         format!("{:0width$x}", seed, width = length)
     }
 
-    /// A capability that opens nothing and refuses anything it was not told about.
+    fn empty_payload() -> JsonValue {
+        json!({})
+    }
+
+    /// A capability that opens nothing, appends deterministically, and refuses the rest.
     fn scripted_log() -> ScriptedCapability {
-        ScriptedCapability::new().calls(|method, payload| match method {
+        let appended = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        ScriptedCapability::new().calls(move |method, payload| match method {
             "open" => {
                 let count = payload
                     .get("sealedRecords")
@@ -547,6 +658,17 @@ mod session_tests {
                         .collect::<Vec<_>>(),
                 }))
             }
+            "append" => {
+                let seed = appended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({
+                    "recordId": hex(64, seed),
+                    "orderKey": hex(82, seed),
+                    "author": ALICE,
+                    "signature": "c2ln",
+                    "sealedRecord": "c2VhbGVk",
+                    "durability": "committed",
+                }))
+            }
             _ => Err(BackendError::new(
                 "capability_unavailable",
                 false,
@@ -555,13 +677,13 @@ mod session_tests {
         })
     }
 
-    fn record_frame(seed: u64, purpose: &str, canonical: &[u8]) -> JsonValue {
+    fn record_frame(seed: u64, author: &str, purpose: &str, canonical: &[u8]) -> JsonValue {
         json!({
             "kind": "record",
             "cursor": hex(50, seed),
             "recordId": hex(64, seed),
             "orderKey": hex(82, seed),
-            "author": "alice",
+            "author": author,
             "purpose": purpose,
             "signature": "c2ln",
             "canonical": URL_SAFE_NO_PAD.encode(canonical),
@@ -571,38 +693,44 @@ mod session_tests {
 
     struct Session {
         harness: Harness,
-        backend: ConversationsBackend,
+        handles: ActivationHandles,
         scripted: ScriptedCapability,
     }
 
     async fn start(directory: &std::path::Path, scripted: ScriptedCapability) -> Session {
-        let backend = ConversationsBackend::default();
-        let mut harness = HarnessBuilder::new(Arc::new(backend.clone()) as Arc<dyn Backend>)
-            .package_identity("dev.teamarness.conversations")
-            .installation("alice", "Alice")
-            .data_directory(directory)
-            .capability(RECORD_LOG, scripted.clone())
-            .start()
-            .await;
+        let observer: ActivationObserver = Arc::new(Mutex::new(None));
+        let mut harness =
+            HarnessBuilder::new(router_observing(Some(observer.clone())).into_backend())
+                .package_identity("dev.teamarness.conversations")
+                .installation(ALICE, "Alice")
+                .data_directory(directory)
+                .capability(RECORD_LOG, scripted.clone())
+                .start()
+                .await;
         harness.activate().await.unwrap();
+        let handles = observer
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the activation published its handles");
         Session {
             harness,
-            backend,
+            handles,
             scripted,
         }
     }
 
     impl Session {
-        async fn store(&self) -> ConversationStore {
-            self.backend.active().await.unwrap().store
+        fn store(&self) -> ConversationStore {
+            self.handles.store.clone()
         }
 
-        async fn availability(&self) -> Availability {
-            self.backend.active().await.unwrap().report().availability
-        }
-
-        async fn warnings(&self) -> Vec<String> {
-            self.backend.active().await.unwrap().report().warnings
+        fn report(&self) -> SyncReport {
+            self.handles
+                .sync
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
@@ -633,16 +761,16 @@ mod session_tests {
     async fn failed_ingest_is_redelivered_and_not_skipped() {
         let directory = tempfile::tempdir().unwrap();
         let session = start(directory.path(), scripted_log()).await;
-        let store = session.store().await;
+        let store = session.store();
         wait_for_opens(&session.scripted, 1).await;
 
-        let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
-        let first = DomainRecord::message_post(CHANNEL, "alice", "one").unwrap();
-        let second = DomainRecord::message_post(CHANNEL, "alice", "two").unwrap();
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, ALICE, "team").unwrap();
+        let first = DomainRecord::message_post(CHANNEL, ALICE, "one").unwrap();
+        let second = DomainRecord::message_post(CHANNEL, ALICE, "two").unwrap();
         let sender = session.scripted.stream();
         assert!(
             sender
-                .send(record_frame(1, "channel.create", &channel.encode()))
+                .send(record_frame(1, ALICE, "channel.create", &channel.encode()))
                 .await
         );
         wait_until(
@@ -656,19 +784,19 @@ mod session_tests {
         store.fail_next_ingest_for_test();
         assert!(
             sender
-                .send(record_frame(2, "message.post", &first.encode()))
+                .send(record_frame(2, ALICE, "message.post", &first.encode()))
                 .await
         );
         wait_for_opens(&session.scripted, 2).await;
         let sender = session.scripted.stream();
         assert!(
             sender
-                .send(record_frame(2, "message.post", &first.encode()))
+                .send(record_frame(2, ALICE, "message.post", &first.encode()))
                 .await
         );
         assert!(
             sender
-                .send(record_frame(3, "message.post", &second.encode()))
+                .send(record_frame(3, ALICE, "message.post", &second.encode()))
                 .await
         );
         wait_until(
@@ -692,15 +820,15 @@ mod session_tests {
     async fn ingesting_a_record_does_not_mark_the_session_current() {
         let directory = tempfile::tempdir().unwrap();
         let session = start(directory.path(), scripted_log()).await;
-        let store = session.store().await;
+        let store = session.store();
         wait_for_opens(&session.scripted, 1).await;
 
-        let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, ALICE, "team").unwrap();
         assert!(
             session
                 .scripted
                 .stream()
-                .send(record_frame(1, "channel.create", &channel.encode()))
+                .send(record_frame(1, ALICE, "channel.create", &channel.encode()))
                 .await
         );
         wait_until(
@@ -710,7 +838,7 @@ mod session_tests {
         .await;
 
         assert_eq!(
-            session.availability().await,
+            session.report().availability,
             Availability::CatchingUp,
             "ingesting a record does not mark the session current"
         );
@@ -735,9 +863,8 @@ mod session_tests {
                     }))
                     .await
             );
-            let reported = session.backend.clone();
             wait_until(
-                || futures_now(&reported).is_some_and(|availability| availability == expected),
+                || session.report().availability == expected,
                 expected.as_str(),
             )
             .await;
@@ -755,25 +882,18 @@ mod session_tests {
                 .await
         );
         wait_until(
-            || futures_now(&session.backend) == Some(Availability::Offline),
+            || session.report().availability == Availability::Offline,
             "the refused state event",
         )
         .await;
         assert!(
             session
-                .warnings()
-                .await
+                .report()
+                .warnings
                 .contains(&"package.invalid_capability_response".to_owned()),
             "a retired availability is never mapped to a known one"
         );
         session.harness.shutdown().await.unwrap();
-    }
-
-    /// Reads the availability without awaiting, for a polling predicate.
-    fn futures_now(backend: &ConversationsBackend) -> Option<Availability> {
-        let running = backend.active.try_lock().ok()?;
-        let active = running.as_ref()?;
-        Some(active.active.report().availability)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -791,18 +911,13 @@ mod session_tests {
             );
         }
         wait_until(
-            || futures_warnings(&session.backend).is_some_and(|warnings| warnings.len() == 8),
+            || session.report().warnings.len() == MAX_WARNINGS,
             "the bounded warning list",
         )
         .await;
-        assert_eq!(session.warnings().await.len(), 8);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.report().warnings.len(), MAX_WARNINGS);
         session.harness.shutdown().await.unwrap();
-    }
-
-    fn futures_warnings(backend: &ConversationsBackend) -> Option<Vec<String>> {
-        let running = backend.active.try_lock().ok()?;
-        let active = running.as_ref()?;
-        Some(active.active.report().warnings)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -817,14 +932,14 @@ mod session_tests {
             .close("capability_unavailable")
             .await;
         wait_until(
-            || futures_now(&session.backend) == Some(Availability::Offline),
+            || session.report().availability == Availability::Offline,
             "the offline availability",
         )
         .await;
         assert!(
             session
-                .warnings()
-                .await
+                .report()
+                .warnings
                 .contains(&"capability_unavailable".to_owned())
         );
         session.harness.shutdown().await.unwrap();
@@ -837,12 +952,12 @@ mod session_tests {
         {
             let store =
                 ConversationStore::open(directory.path().join("conversations.sqlite3")).unwrap();
-            let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+            let channel = DomainRecord::channel_create_with_id(CHANNEL, ALICE, "team").unwrap();
             store
                 .ingest(
                     &hex(64, 1),
                     &hex(82, 1),
-                    "alice",
+                    ALICE,
                     "channel.create",
                     "c2ln",
                     &channel.encode(),
@@ -854,7 +969,7 @@ mod session_tests {
         }
 
         let session = start(directory.path(), scripted_log()).await;
-        let store = session.store().await;
+        let store = session.store();
         wait_for_opens(&session.scripted, 1).await;
         assert_eq!(
             session.scripted.recorded_opens()[0]["afterCursor"].as_str(),
@@ -871,12 +986,12 @@ mod session_tests {
         );
         // A replayed record with a known identity does not duplicate.
         let before = store.record_count().unwrap();
-        let channel = DomainRecord::channel_create_with_id(CHANNEL, "alice", "team").unwrap();
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, ALICE, "team").unwrap();
         assert!(
             session
                 .scripted
                 .stream()
-                .send(record_frame(1, "channel.create", &channel.encode()))
+                .send(record_frame(1, ALICE, "channel.create", &channel.encode()))
                 .await
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -885,15 +1000,161 @@ mod session_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deactivate_cancels_and_awaits_the_session_task() {
+    async fn suspend_stops_the_session_and_recover_starts_a_new_one() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), scripted_log()).await;
         wait_for_opens(&session.scripted, 1).await;
 
+        session.harness.suspend().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.scripted.recorded_opens().len(), 1);
+
+        session.harness.recover().await.unwrap();
+        wait_for_opens(&session.scripted, 2).await;
         session.harness.dispose().await.unwrap();
-        assert!(session.backend.active.lock().await.is_none());
-        // A second dispose is harmless.
-        session.harness.dispose().await.unwrap();
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.CONV-R06
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_offers_hide_only_for_channels_created_by_this_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+
+        session
+            .harness
+            .request("conversations.channel.create", json!({ "slug": "mine" }))
+            .await
+            .unwrap();
+        let remote = DomainRecord::channel_create_with_id([2; 16], "bob", "theirs").unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(7, "bob", "channel.create", &remote.encode()))
+                .await
+        );
+        wait_until(
+            || session.store().record_count().unwrap_or(0) == 2,
+            "both Channels",
+        )
+        .await;
+
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", empty_payload())
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        for channel in snapshot["channels"].as_array().unwrap() {
+            seen.push((
+                channel["slug"].as_str().unwrap().to_owned(),
+                channel["canHide"].as_bool().unwrap(),
+            ));
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("general".to_owned(), false),
+                ("mine".to_owned(), true),
+                ("theirs".to_owned(), false),
+            ]
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.CONV-R13
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_reports_unread_count_per_channel() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+        let store = session.store();
+
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, "bob", "team").unwrap();
+        let sender = session.scripted.stream();
+        assert!(
+            sender
+                .send(record_frame(1, "bob", "channel.create", &channel.encode()))
+                .await
+        );
+        for (index, text) in ["one", "two", "three"].into_iter().enumerate() {
+            let message = DomainRecord::message_post(CHANNEL, "bob", text).unwrap();
+            assert!(
+                sender
+                    .send(record_frame(
+                        10 + index as u64,
+                        "bob",
+                        "message.post",
+                        &message.encode()
+                    ))
+                    .await
+            );
+        }
+        wait_until(|| store.record_count().unwrap_or(0) == 4, "every record").await;
+
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", empty_payload())
+            .await
+            .unwrap();
+        let counts = unread_counts(&snapshot);
+        assert_eq!(counts.get("team"), Some(&3));
+        assert_eq!(counts.get("general"), Some(&0));
+
+        session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({ "channelId": hex_id(CHANNEL) }),
+            )
+            .await
+            .unwrap();
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", empty_payload())
+            .await
+            .unwrap();
+        assert_eq!(unread_counts(&snapshot).get("team"), Some(&0));
+        session.harness.shutdown().await.unwrap();
+    }
+
+    fn unread_counts(snapshot: &JsonValue) -> std::collections::BTreeMap<String, u64> {
+        snapshot["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|channel| {
+                (
+                    channel["slug"].as_str().unwrap().to_owned(),
+                    channel["unreadCount"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalid_payload_uses_the_sdk_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let error = session
+            .harness
+            .request(
+                "conversations.channel.create",
+                json!({ "slug": "mine", "extra": 1 }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "package.invalid_payload");
+
+        let unknown = session
+            .harness
+            .request("conversations.delete", empty_payload())
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code(), "package.unknown_operation");
         session.harness.shutdown().await.unwrap();
     }
 
@@ -903,13 +1164,22 @@ mod session_tests {
         let mut session = start(directory.path(), scripted_log()).await;
         let snapshot = session
             .harness
-            .request("conversations.snapshot", json!({}))
+            .request("conversations.snapshot", empty_payload())
             .await
             .unwrap();
         assert_eq!(snapshot["availability"], "catching_up");
         let channels = snapshot["channels"].as_array().unwrap();
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0]["id"], hex_id(GENERAL_ID));
+        assert_eq!(channels[0]["canHide"], false);
         session.harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn router_matches_the_ui_contract() {
+        assert_router_matches_contract(
+            &router().operations(),
+            include_str!("../../ui-contract.json"),
+        );
     }
 }

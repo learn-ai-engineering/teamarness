@@ -323,7 +323,11 @@ pub fn assert_no_plaintext_sentinel(path: &Path) {
 // Extraction helpers for PackageValue snapshots/pages
 // ------------------------------------------------------------------
 
-pub fn channel_projection(value: &PackageValue) -> Vec<(String, String, bool)> {
+/// The Channels a snapshot shows, as identity and slug.
+///
+/// `canHide` is deliberately left out: TEAM.SYS.CONV-R06 makes it depend on which Installation
+/// is asking, so two profiles that have converged still disagree about it.
+pub fn channel_projection(value: &PackageValue) -> Vec<(String, String)> {
     let PackageValue::Object(fields) = value else {
         return Vec::new();
     };
@@ -342,10 +346,7 @@ pub fn channel_projection(value: &PackageValue) -> Vec<(String, String, bool)> {
             let PackageValue::String(slug) = fields.get("slug")? else {
                 return None;
             };
-            let PackageValue::Boolean(can_hide) = fields.get("canHide")? else {
-                return None;
-            };
-            Some((id.clone(), slug.clone(), !*can_hide))
+            Some((id.clone(), slug.clone()))
         })
         .collect::<Vec<_>>();
     projection.sort();
@@ -355,7 +356,7 @@ pub fn channel_projection(value: &PackageValue) -> Vec<(String, String, bool)> {
 pub fn channel_id(value: &PackageValue, slug: &str) -> Option<String> {
     channel_projection(value)
         .into_iter()
-        .find_map(|(id, candidate, _)| (candidate == slug).then_some(id))
+        .find_map(|(id, candidate)| (candidate == slug).then_some(id))
 }
 
 pub fn channel_is_hidden(value: &PackageValue, channel_id: &str) -> bool {
