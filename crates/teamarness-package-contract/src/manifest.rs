@@ -152,14 +152,31 @@ pub struct LoadedAsset {
     pub media_type: String,
 }
 
-/// One Semantic Capability the Package requests.
+/// One Semantic Capability family the Package requests, with the versions of it it accepts.
+///
+/// The declared `identity` **is** the family name: a family evolves by version within a major,
+/// and a different capability shape is a new family declared beside it. Naming it here is what
+/// lets an unknown capability be reported as an unknown family rather than a version error.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityRequirement {
-    pub identity: String,
+    #[serde(rename = "identity")]
+    pub family: String,
     pub major: u16,
     pub min_minor: u16,
     pub max_minor: u16,
+}
+
+impl CapabilityRequirement {
+    /// The versions of the family this Package accepts.
+    #[must_use]
+    pub const fn version(&self) -> VersionRange {
+        VersionRange {
+            major: self.major,
+            min_minor: self.min_minor,
+            max_minor: self.max_minor,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -482,20 +499,13 @@ fn validate_range(range: VersionRange, rule: &'static str) -> Result<(), Contrac
 fn validate_capabilities(values: &[CapabilityRequirement]) -> Result<(), ContractError> {
     let mut identities = BTreeSet::new();
     for (index, value) in values.iter().enumerate() {
-        if !is_valid_package_identity(&value.identity) {
+        if !is_valid_package_identity(&value.family) {
             return Err(malformed("manifest.capability_identity")
                 .at(format!("/capabilities/{index}/identity")));
         }
-        validate_range(
-            VersionRange {
-                major: value.major,
-                min_minor: value.min_minor,
-                max_minor: value.max_minor,
-            },
-            "manifest.capability_range",
-        )
-        .map_err(|error| error.at(format!("/capabilities/{index}")))?;
-        if !identities.insert(&value.identity) {
+        validate_range(value.version(), "manifest.capability_range")
+            .map_err(|error| error.at(format!("/capabilities/{index}")))?;
+        if !identities.insert(&value.family) {
             return Err(
                 malformed("manifest.capability_duplicate").at(format!("/capabilities/{index}"))
             );

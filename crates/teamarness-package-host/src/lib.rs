@@ -995,7 +995,7 @@ impl PackageHost {
                     .capabilities
                     .iter()
                     .map(|requirement| capability::CapabilityRequirement {
-                        identity: requirement.identity.clone(),
+                        family: requirement.family.clone(),
                         major: requirement.major,
                         min_minor: requirement.min_minor,
                         max_minor: requirement.max_minor,

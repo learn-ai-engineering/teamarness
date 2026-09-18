@@ -2,6 +2,16 @@
 
 The Package Host negotiates each required capability before process spawn and sends an opaque grant in `initialize`. A grant is valid for one Package Identity, Workspace, Installation, selected capability version, and process generation. Calls carry the grant and method. They do not carry scope selectors.
 
+## Families and versions
+
+A capability identity names a **family**: one contract shape, such as the immutable record log. A family evolves by minor version within a major, and a minor may only add — new optional request fields, new event kinds a Package may ignore, wider bounds. Nothing is removed or narrowed within a major.
+
+The Package declares a family and the versions of it it accepts; the Host offers a major and a range of minors and grants the highest minor both accept. A family the Host does not provide is an unavailable capability, not a version error.
+
+A different shape is a **new family**, declared and negotiated beside the existing ones — document-oriented synchronization would be one — never a new version of an existing family. Adding a family changes no lifecycle operation, no Package Process Protocol version, and no Package UI contract, and a Package that does not declare it is unaffected.
+
+See ADR 0018, Package seam versioning, for the policy, including the deprecation window intended for the first breaking change.
+
 ## `teamarness.workspace-context` 1.0
 
 `get` takes no arguments. It returns `workspaceId`, `workspaceName`, `installationIdentity`, and `installationDisplayName`.

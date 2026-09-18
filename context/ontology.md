@@ -10,7 +10,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Installation** | One running instance of Teamarness on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
 | **Package** | A vertical module that owns one product domain, including its model, records, schemas, projections, policy, UI, and Package-specific membership. A Package consumes Semantic Capabilities for Teamarness-owned authority and generic services |
-| **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and Teamarness implementations of Semantic Capabilities |
+| **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and the authority and state behind Semantic Capabilities |
 | **Shell** | The Tauri desktop host that owns Package navigation and UI mounting in Package UI Frames, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
 
 ## Identity and Membership
@@ -36,8 +36,9 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 
 | Term | Definition |
 |---|---|
-| **Package Host** | The Teamarness boundary that operates Package Instances and routes Package Process, data-directory, Semantic Capability, and UI contracts without product-specific branches |
+| **Package Host** | The Teamarness boundary that operates Package Instances and routes Package Process, data-directory, Semantic Capability, and UI contracts without product-specific branches. It owns each Semantic Capability's wire contract, limits, and version negotiation |
 | **Semantic Capability** | A versioned, typed interface through which a Package uses Teamarness-owned authority or generic behavior without receiving host secrets or resources |
+| **Semantic Capability Family** | The stable name of one Semantic Capability contract shape, such as the immutable record log. A family evolves by version; a different shape is a new family, declared and negotiated beside the existing ones |
 | **Synchronization Capability** | A Package-scoped Semantic Capability that uses Core Runtime-owned replication and transport machinery for Package-defined records. The Package still owns its schemas, projections, and domain policy |
 | **Synchronization Projection** | Core's private authenticated P2Panda operation view of a Teamarness semantic record. It supplies bounded LogSync ranges without replacing `RecordId`, `OrderKey`, or the Installation-local `Cursor` |
 | **Durable Wake** | A coalesced Core persistence marker that records synchronization work needing a later bounded session, including after restart |

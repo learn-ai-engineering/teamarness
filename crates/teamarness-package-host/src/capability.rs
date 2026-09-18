@@ -14,8 +14,16 @@ use crate::protocol::{CapabilityFailure, HostStreamSender};
 use crate::{InstallationPublicIdentity, PackageErrorCode, PackageIdentity, WorkspaceId};
 
 const SIGNING_CONTEXT: &str = "package-signing/v1";
-const MAX_PURPOSE_BYTES: usize = 64;
-const MAX_SIGNING_PAYLOAD_BYTES: usize = 256 * 1024;
+// Every bound below is the Host's half of one capability schema. `capability_limits_match_contract_schemas`
+// reads the schema files and fails when the two drift.
+pub(crate) const MAX_PURPOSE_BYTES: usize = 64;
+pub(crate) const MAX_SIGNING_PAYLOAD_BYTES: usize = 256 * 1024;
+/// The largest batch of sealed records one `open` call may carry.
+pub(crate) const MAX_OPEN_RECORDS: usize = 32;
+/// The largest total decoded size of one `open` call's sealed records.
+pub(crate) const MAX_OPEN_DECODED_BYTES: usize = 512 * 1024;
+/// The largest canonical payload one `append` call may carry.
+pub(crate) const MAX_CANONICAL_DECODED_BYTES: usize = 262_144;
 const MAX_STREAM_CREDIT: u64 = 32;
 /// The largest record page one blocking read may return, matching Core's bound.
 const RECORD_PAGE: u64 = 32;
@@ -74,15 +82,36 @@ impl CoreCallLimiter {
     }
 }
 
-#[derive(Clone)]
+/// The stable name of one Semantic Capability contract shape.
+///
+/// A family evolves by version within a major. A different shape — document-oriented
+/// synchronization, say — is a new family declared beside the existing ones, never a new version
+/// of one, so adding it changes no lifecycle operation, no Package Process Protocol version and no
+/// UI contract.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct CapabilityFamily(&'static str);
+
+impl CapabilityFamily {
+    pub(crate) const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        self.0
+    }
+}
+
+/// What the Host provides for one capability family: a major, and the minors it can speak.
+#[derive(Clone, Copy, Debug)]
 struct Descriptor {
-    identity: &'static str,
+    family: CapabilityFamily,
     major: u16,
-    minor: u16,
+    min_minor: u16,
+    max_minor: u16,
     kind: CapabilityKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CapabilityKind {
     WorkspaceContext,
     Membership,
@@ -92,9 +121,10 @@ enum CapabilityKind {
     Neutral,
 }
 
+/// What a Package declares: one capability family, and the versions of it the Package accepts.
 #[derive(Clone)]
 pub(crate) struct CapabilityRequirement {
-    pub(crate) identity: String,
+    pub(crate) family: String,
     pub(crate) major: u16,
     pub(crate) min_minor: u16,
     pub(crate) max_minor: u16,
@@ -148,14 +178,14 @@ impl GenerationCapabilities {
         let mut grants = BTreeMap::new();
         let mut advertised = Vec::with_capacity(requirements.len());
         for requirement in requirements {
-            let descriptor = registry.negotiate(requirement)?;
+            let (descriptor, minor) = registry.negotiate(requirement)?;
             let mut random = [0_u8; 32];
             getrandom::fill(&mut random).map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
             let grant = URL_SAFE_NO_PAD.encode(random);
             grants.insert(
                 grant.clone(),
                 BoundGrant {
-                    descriptor: descriptor.clone(),
+                    descriptor,
                     package_identity: scope.package_identity.clone(),
                     workspace_id: scope.workspace_id.clone(),
                     installation: scope.installation.clone(),
@@ -164,9 +194,9 @@ impl GenerationCapabilities {
             );
             advertised.push(AdvertisedGrant {
                 grant,
-                identity: descriptor.identity,
+                identity: descriptor.family.name(),
                 major: descriptor.major,
-                minor: descriptor.minor,
+                minor,
             });
         }
         let (cancelled, _) = watch::channel(false);
@@ -447,7 +477,10 @@ impl GenerationCapabilities {
             "append" => {
                 exact_fields(object, &["method", "purpose", "canonical"])?;
                 let purpose = validated_purpose(string_field(object, "purpose")?)?.to_owned();
-                let canonical = decode_bounded(string_field(object, "canonical")?, 262_144)?;
+                let canonical = decode_bounded(
+                    string_field(object, "canonical")?,
+                    MAX_CANONICAL_DECODED_BYTES,
+                )?;
                 self.limiter
                     .run(started, move || {
                         let record = core
@@ -470,7 +503,7 @@ impl GenerationCapabilities {
                     .get("sealedRecords")
                     .and_then(Value::as_array)
                     .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
-                if !(1..=32).contains(&values.len()) {
+                if !(1..=MAX_OPEN_RECORDS).contains(&values.len()) {
                     return Err(PackageErrorCode::CapabilityRequestInvalid);
                 }
                 let mut sealed = Vec::with_capacity(values.len());
@@ -480,11 +513,11 @@ impl GenerationCapabilities {
                         value
                             .as_str()
                             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?,
-                        512 * 1024,
+                        MAX_OPEN_DECODED_BYTES,
                     )?;
                     total = total
                         .checked_add(bytes.len())
-                        .filter(|total| *total <= 512 * 1024)
+                        .filter(|total| *total <= MAX_OPEN_DECODED_BYTES)
                         .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
                     sealed.push(bytes);
                 }
@@ -675,50 +708,64 @@ impl Registry {
             descriptors: BTreeMap::new(),
         };
         registry.register(Descriptor {
-            identity: "teamarness.workspace-context",
+            family: CapabilityFamily::new("teamarness.workspace-context"),
             major: 1,
-            minor: 0,
+            min_minor: 0,
+            max_minor: 0,
             kind: CapabilityKind::WorkspaceContext,
         });
         registry.register(Descriptor {
-            identity: "teamarness.membership",
+            family: CapabilityFamily::new("teamarness.membership"),
             major: 1,
-            minor: 0,
+            min_minor: 0,
+            max_minor: 0,
             kind: CapabilityKind::Membership,
         });
         registry.register(Descriptor {
-            identity: "teamarness.signing",
+            family: CapabilityFamily::new("teamarness.signing"),
             major: 1,
-            minor: 0,
+            min_minor: 0,
+            max_minor: 0,
             kind: CapabilityKind::Signing,
         });
         registry.register(Descriptor {
-            identity: "teamarness.synchronization.immutable-record-log",
+            family: CapabilityFamily::new("teamarness.synchronization.immutable-record-log"),
             major: 1,
-            minor: 0,
+            min_minor: 0,
+            max_minor: 0,
             kind: CapabilityKind::ImmutableRecordLog,
         });
         registry
     }
 
     fn register(&mut self, descriptor: Descriptor) {
-        self.descriptors.insert(descriptor.identity, descriptor);
+        self.descriptors
+            .insert(descriptor.family.name(), descriptor);
     }
 
+    /// Selects one version of the requested family, or says why it cannot.
+    ///
+    /// The family is matched first: a family the Host does not provide is an unavailable
+    /// capability, not a version error, so an author who asks for a capability that does not exist
+    /// is not told their versions are wrong. Within a family, the highest minor both sides accept
+    /// is selected, because a minor may only add.
     fn negotiate(
         &self,
         requirement: &CapabilityRequirement,
-    ) -> Result<Descriptor, PackageErrorCode> {
-        let descriptor = self
+    ) -> Result<(Descriptor, u16), PackageErrorCode> {
+        let descriptor = *self
             .descriptors
-            .get(requirement.identity.as_str())
+            .get(requirement.family.as_str())
             .ok_or(PackageErrorCode::CapabilityUnavailable)?;
-        if descriptor.major != requirement.major
-            || !(requirement.min_minor..=requirement.max_minor).contains(&descriptor.minor)
-        {
+        if descriptor.major != requirement.major {
             return Err(PackageErrorCode::CapabilityVersionUnsupported);
         }
-        Ok(descriptor.clone())
+        let low = descriptor.min_minor.max(requirement.min_minor);
+        let high = descriptor.max_minor.min(requirement.max_minor);
+        if low > high {
+            return Err(PackageErrorCode::CapabilityVersionUnsupported);
+        }
+        Ok((descriptor, high))
     }
 }
 
@@ -1308,7 +1355,7 @@ mod tests {
                     .unwrap(),
             },
             &[CapabilityRequirement {
-                identity: "teamarness.synchronization.immutable-record-log".into(),
+                family: "teamarness.synchronization.immutable-record-log".into(),
                 major: 1,
                 min_minor: 0,
                 max_minor: 0,
@@ -1436,23 +1483,200 @@ mod tests {
         );
     }
 
-    #[test]
-    fn registry_accepts_a_neutral_test_only_extension() {
+    /// A second family, provided only to tests, standing in for a later capability shape such as
+    /// document-oriented synchronization.
+    fn with_second_family(min_minor: u16, max_minor: u16) -> Registry {
         let mut registry = Registry::production();
         registry.register(Descriptor {
-            identity: "example.neutral",
+            family: CapabilityFamily::new("example.neutral"),
             major: 1,
-            minor: 0,
+            min_minor,
+            max_minor,
             kind: CapabilityKind::Neutral,
         });
-        let selected = registry
-            .negotiate(&CapabilityRequirement {
-                identity: "example.neutral".into(),
-                major: 1,
-                min_minor: 0,
-                max_minor: 0,
-            })
+        registry
+    }
+
+    fn requirement(
+        family: &str,
+        major: u16,
+        min_minor: u16,
+        max_minor: u16,
+    ) -> CapabilityRequirement {
+        CapabilityRequirement {
+            family: family.into(),
+            major,
+            min_minor,
+            max_minor,
+        }
+    }
+
+    #[test]
+    fn registry_accepts_a_neutral_test_only_extension() {
+        let (descriptor, minor) = with_second_family(0, 0)
+            .negotiate(&requirement("example.neutral", 1, 0, 0))
             .unwrap();
-        assert_eq!(selected.identity, "example.neutral");
+        assert_eq!(descriptor.family.name(), "example.neutral");
+        assert_eq!(minor, 0);
+    }
+
+    #[test]
+    fn negotiates_the_highest_common_minor() {
+        let registry = with_second_family(0, 2);
+        assert_eq!(
+            registry
+                .negotiate(&requirement("example.neutral", 1, 1, 3))
+                .unwrap()
+                .1,
+            2
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement("example.neutral", 1, 0, 0))
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement("example.neutral", 1, 3, 4))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityVersionUnsupported
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement("example.neutral", 2, 0, 2))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityVersionUnsupported
+        );
+    }
+
+    #[test]
+    fn unknown_capability_family_is_not_a_version_error() {
+        // A family the Host does not provide, asked for with versions the Host would otherwise
+        // accept: the answer names the missing capability, not the versions.
+        assert_eq!(
+            Registry::production()
+                .negotiate(&requirement("teamarness.synchronization.document", 1, 0, 0))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityUnavailable
+        );
+        assert_eq!(
+            Registry::production()
+                .negotiate(&requirement(
+                    "teamarness.synchronization.immutable-record-log",
+                    1,
+                    0,
+                    0
+                ))
+                .unwrap()
+                .1,
+            0
+        );
+    }
+
+    #[test]
+    fn adding_a_capability_family_does_not_change_lifecycle_or_ui_contracts() {
+        let production = Registry::production();
+        let extended = with_second_family(0, 0);
+
+        // Every family the Host already provides negotiates to exactly what it did before.
+        for family in [
+            "teamarness.workspace-context",
+            "teamarness.membership",
+            "teamarness.signing",
+            "teamarness.synchronization.immutable-record-log",
+        ] {
+            let before = production.negotiate(&requirement(family, 1, 0, 0)).unwrap();
+            let after = extended.negotiate(&requirement(family, 1, 0, 0)).unwrap();
+            assert_eq!(before.0.family, after.0.family);
+            assert_eq!(before.0.major, after.0.major);
+            assert_eq!(before.1, after.1);
+        }
+        // The new family is granted, and nothing the Package Process Protocol, the lifecycle
+        // contract or the UI bridge declares moves with it.
+        assert_eq!(
+            extended
+                .negotiate(&requirement("example.neutral", 1, 0, 0))
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(
+            teamarness_package_contract::manifest::SUPPORTED_PROTOCOL,
+            (1, 0),
+            "adding a capability family must not move the Package Process Protocol version"
+        );
+        // The lifecycle contract and the UI bridge are declared elsewhere and unchanged: a UI
+        // contract compiles to the same verdicts with the extra family registered.
+        let contract = crate::ui::compile_contract(
+            br#"{"schemaVersion":1,"$defs":{},"requests":{"fixture.read":{"request":{"type":"object","additionalProperties":false},"response":{"type":"object","additionalProperties":false}}},"subscriptions":{}}"#,
+        )
+        .unwrap();
+        assert!(
+            contract
+                .validate_request(
+                    "fixture.read",
+                    &crate::PackageValue::Object(Default::default())
+                )
+                .is_ok()
+        );
+        assert!(
+            contract
+                .validate_request(
+                    "fixture.missing",
+                    &crate::PackageValue::Object(Default::default())
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capability_limits_match_contract_schemas() {
+        // The Host owns these bounds; the schemas publish them. Both are read here so neither can
+        // move alone.
+        let record_log: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/immutable-record-log.schema.json"
+        ))
+        .unwrap();
+        let signing: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/signing.schema.json"
+        ))
+        .unwrap();
+        // base64url without padding, which is how every byte string crosses the capability wire.
+        let encoded = |bytes: usize| (bytes * 4).div_ceil(3);
+
+        assert_eq!(
+            record_log["$defs"]["purpose"]["maxLength"]
+                .as_u64()
+                .unwrap() as usize,
+            MAX_PURPOSE_BYTES
+        );
+        assert_eq!(
+            signing["$defs"]["purpose"]["maxLength"].as_u64().unwrap() as usize,
+            MAX_PURPOSE_BYTES
+        );
+        assert_eq!(
+            record_log["$defs"]["open"]["properties"]["request"]["properties"]["sealedRecords"]
+                ["maxItems"]
+                .as_u64()
+                .unwrap() as usize,
+            MAX_OPEN_RECORDS
+        );
+        assert_eq!(
+            record_log["$defs"]["append"]["properties"]["request"]["properties"]["canonical"]
+                ["maxLength"]
+                .as_u64()
+                .unwrap() as usize,
+            encoded(MAX_CANONICAL_DECODED_BYTES)
+        );
+        assert_eq!(
+            record_log["$defs"]["sealed"]["maxLength"].as_u64().unwrap() as usize,
+            encoded(MAX_OPEN_DECODED_BYTES)
+        );
+        assert_eq!(
+            signing["$defs"]["bytes"]["maxLength"].as_u64().unwrap() as usize,
+            encoded(MAX_SIGNING_PAYLOAD_BYTES)
+        );
     }
 }
