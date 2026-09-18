@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::synchronization::parking::ParkReason;
 use crate::synchronization::peer_sessions::{self, PeerSessions};
 use crate::synchronization::{SyncServices, scope_digest};
 use crate::{PublicIdentity, WorkspaceId};
@@ -71,6 +73,35 @@ impl Refusal {
             _ => None,
         }
     }
+}
+
+/// Why one received operation was refused outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectReason {
+    Invalid,
+    KeyMismatch,
+    Conflict,
+    WrongScope,
+}
+
+/// What happened to one operation received in a session.
+///
+/// Only [`FatalSyncError`] ends a session: a rejected or unparkable operation
+/// skips its author for the rest of this session and is redelivered later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OperationOutcome {
+    Applied,
+    Duplicate,
+    Parked(ParkReason),
+    ParkRefused,
+    Rejected(RejectReason),
+}
+
+/// The only two conditions that end a session instead of skipping an author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FatalSyncError {
+    PeerRevoked,
+    Storage,
 }
 
 /// What the membership gate grants one authorized session.
@@ -159,7 +190,7 @@ pub(crate) trait SyncReceiver: Send + Sync {
         workspace: WorkspaceId,
         package: &str,
         operation: Operation<()>,
-    ) -> Result<(), ()>;
+    ) -> Result<OperationOutcome, FatalSyncError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,20 +242,35 @@ enum LogSyncWire {
     Message(LogSyncMessage<[u8; 32]>),
 }
 
+/// Classifies one received operation and reports whether it was applied.
+///
+/// After an author's first rejection or refused park, later operations from
+/// that author are dropped for the rest of this session: they would fail the
+/// sequence check anyway, and LogSync redelivers them next time.
 fn apply_log_sync_event(
     receiver: &Arc<dyn SyncReceiver>,
     peer: PublicIdentity,
     workspace: WorkspaceId,
     package: &str,
     event: LogSyncEvent<()>,
+    skipped: &mut BTreeSet<p2panda_core::VerifyingKey>,
 ) -> Result<bool, String> {
-    if let LogSyncEvent::OperationReceived { operation, .. } = event {
-        receiver
-            .receive_operation(peer, workspace, package, *operation)
-            .map_err(|()| "failed to apply synchronized operation".to_owned())?;
-        Ok(true)
-    } else {
-        Ok(false)
+    let LogSyncEvent::OperationReceived { operation, .. } = event else {
+        return Ok(false);
+    };
+    let author = operation.header.verifying_key;
+    if skipped.contains(&author) {
+        return Ok(false);
+    }
+    match receiver.receive_operation(peer, workspace, package, *operation) {
+        Ok(OperationOutcome::Applied) => Ok(true),
+        Ok(OperationOutcome::Duplicate | OperationOutcome::Parked(_)) => Ok(false),
+        Ok(OperationOutcome::Rejected(_) | OperationOutcome::ParkRefused) => {
+            skipped.insert(author);
+            Ok(false)
+        }
+        Err(FatalSyncError::PeerRevoked) => Err("peer was revoked mid-session".to_owned()),
+        Err(FatalSyncError::Storage) => Err("failed to store synchronized operation".to_owned()),
     }
 }
 
@@ -486,6 +532,8 @@ async fn run_log_exchange(
         &mut stream,
     ));
     let mut accepted = 0;
+    // One skipped-author set per session, shared by both drain paths.
+    let mut skipped = BTreeSet::new();
     loop {
         tokio::select! {
             result = &mut running => {
@@ -495,7 +543,7 @@ async fn run_log_exchange(
                 loop {
                     match event_rx.try_recv() {
                         Ok(event) => {
-                            if apply_log_sync_event(receiver, peer, workspace, package, event)? {
+                            if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped)? {
                                 accepted += 1;
                             }
                         }
@@ -517,7 +565,7 @@ async fn run_log_exchange(
             }
             event = event_rx.recv() => match event {
                 Ok(event) => {
-                    if apply_log_sync_event(receiver, peer, workspace, package, event)? {
+                    if apply_log_sync_event(receiver, peer, workspace, package, event, &mut skipped)? {
                         accepted += 1;
                     }
                 }
@@ -817,6 +865,146 @@ impl ProtocolHandler for LogSyncHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Mutex;
+
+    /// A scripted Core seam. It exists only to inject a rejection: everything
+    /// under test — the skipped-author set and the session loop — is real.
+    #[derive(Default)]
+    struct ScriptedReceiver {
+        rejected_author: Mutex<Option<p2panda_core::VerifyingKey>>,
+        seen: Mutex<Vec<p2panda_core::VerifyingKey>>,
+    }
+
+    impl SyncReceiver for ScriptedReceiver {
+        fn authorize_session(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+            _package: &str,
+        ) -> Result<SessionGrant, Refusal> {
+            Ok(SessionGrant {
+                membership_version: [0; 32],
+                content_key_id: None,
+            })
+        }
+
+        fn protection_bundle_for(
+            &self,
+            _workspace: WorkspaceId,
+            _package: &str,
+            _recipient: PublicIdentity,
+        ) -> Result<Option<ProtectionBundle>, ()> {
+            Ok(None)
+        }
+
+        fn import_protection_bundle(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+            _package: &str,
+            _bundle: ProtectionBundle,
+        ) -> Result<usize, ()> {
+            Ok(0)
+        }
+
+        fn authors(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+        ) -> Result<Vec<PublicIdentity>, ()> {
+            Ok(Vec::new())
+        }
+
+        fn operations(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+            _package: &str,
+        ) -> Result<Vec<ReplicationOperation>, ()> {
+            Ok(Vec::new())
+        }
+
+        fn receive_operation(
+            &self,
+            _peer: PublicIdentity,
+            _workspace: WorkspaceId,
+            _package: &str,
+            operation: Operation<()>,
+        ) -> Result<OperationOutcome, FatalSyncError> {
+            let author = operation.header.verifying_key;
+            self.seen.lock().unwrap().push(author);
+            if *self.rejected_author.lock().unwrap() == Some(author) {
+                Ok(OperationOutcome::Rejected(RejectReason::Conflict))
+            } else {
+                Ok(OperationOutcome::Applied)
+            }
+        }
+    }
+
+    fn signed_operation(seed: u8, sequence: u32) -> Operation<()> {
+        let key = p2panda_core::SigningKey::from_bytes(&[seed; 32]);
+        let payload = vec![seed, u8::try_from(sequence).unwrap()];
+        let header = p2panda_core::Header::<()>::builder()
+            .body(payload.as_slice())
+            .seq_num(sequence)
+            .build(&key, ());
+        Operation::from_parts(header, Some(p2panda_core::Body::from_bytes(&payload)))
+    }
+
+    fn received(operation: Operation<()>) -> LogSyncEvent<()> {
+        LogSyncEvent::OperationReceived {
+            operation: Box::new(operation),
+            metrics: p2panda_sync::protocols::LogSyncMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn session_skips_an_author_after_rejection_and_continues_with_others() {
+        let scripted = Arc::new(ScriptedReceiver::default());
+        let rejected = signed_operation(1, 0);
+        *scripted.rejected_author.lock().unwrap() = Some(rejected.header.verifying_key);
+        let receiver: Arc<dyn SyncReceiver> = scripted.clone();
+        let workspace = WorkspaceId::from_bytes([4; 16]);
+        let peer = PublicIdentity::from_bytes(
+            *iroh_base::SecretKey::from_bytes(&[9; 32])
+                .public()
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut skipped = BTreeSet::new();
+
+        let mut applied = 0;
+        for event in [
+            received(rejected.clone()),
+            received(signed_operation(1, 1)),
+            received(signed_operation(2, 0)),
+        ] {
+            if apply_log_sync_event(
+                &receiver,
+                peer,
+                workspace,
+                "teamarness.test",
+                event,
+                &mut skipped,
+            )
+            .unwrap()
+            {
+                applied += 1;
+            }
+        }
+
+        assert_eq!(applied, 1, "only the other author's operation applied");
+        let seen = scripted.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .filter(|author| **author == rejected.header.verifying_key)
+                .count(),
+            1,
+            "the rejected author's later operation never reached the receiver"
+        );
+        assert_eq!(seen.len(), 2);
+    }
 
     #[test]
     fn refusal_reasons_and_close_codes_are_distinct_value_spaces() {

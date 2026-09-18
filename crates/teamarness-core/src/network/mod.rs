@@ -16,8 +16,8 @@ use tokio::time::timeout;
 use crate::OnboardingError;
 use crate::onboarding::handler::OnboardingHandler;
 use crate::synchronization::{
-    LogSessionError, LogSyncHandler, PeerSessions, Refusal, SessionGrant, SyncReceiver,
-    SyncServices,
+    FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, PeerSessions, Refusal,
+    SessionGrant, SyncReceiver, SyncServices,
 };
 
 pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = crate::synchronization::network_handler::LOG_SYNC_ALPN;
@@ -81,8 +81,8 @@ impl SyncReceiver for RejectingSyncReceiver {
         _workspace: crate::WorkspaceId,
         _package: &str,
         _operation: p2panda_core::Operation<()>,
-    ) -> Result<(), ()> {
-        Err(())
+    ) -> Result<OperationOutcome, FatalSyncError> {
+        Err(FatalSyncError::PeerRevoked)
     }
 }
 

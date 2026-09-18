@@ -34,7 +34,7 @@ pub(crate) fn log_id(scope_id: [u8; 32]) -> [u8; 32] {
     *Hash::digest(input).as_bytes()
 }
 
-fn encode_operation(header: &Header<()>, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_operation(header: &Header<()>, payload: &[u8]) -> Vec<u8> {
     let header = header.encode();
     let mut bytes = Vec::with_capacity(1 + 4 + header.len() + payload.len());
     bytes.push(OPERATION_VERSION);

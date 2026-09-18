@@ -410,3 +410,177 @@ async fn member_without_key_gets_content_key_unavailable() {
     );
     cluster.finish().await;
 }
+
+/// Verifies: TEAM.SYS.TRANS-R06
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn records_from_an_unknown_author_are_parked_then_applied_after_admission() {
+    let mut cluster = SyncCluster::start("parked-author", &["a", "b", "c"]).await;
+    let workspace = cluster.node("a").create_workspace("Parking").unwrap();
+    let id = workspace.id();
+    let a1 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a1")
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .node("b")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
+    cluster.stop("b").await;
+
+    // C is admitted while B is away, so B has never heard of C.
+    cluster.admit("a", "c", id).await;
+    cluster
+        .node("c")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
+    let c1 = cluster
+        .node("c")
+        .append_record(id, PACKAGE, "message.post", b"c1")
+        .unwrap();
+    let c2 = cluster
+        .node("c")
+        .append_record(id, PACKAGE, "message.post", b"c2")
+        .unwrap();
+    cluster
+        .node("c")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
+    cluster.stop("c").await;
+    cluster.restart("b").await;
+
+    cluster
+        .node("a")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("b"),
+            cluster.identity("b"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster.node("b").parked_count_for_test(id, PACKAGE),
+        2,
+        "both of the unknown author's records wait instead of aborting the session"
+    );
+    let seen = cluster.record_ids("b", id, PACKAGE);
+    assert!(
+        seen.contains(&a1.record_id()),
+        "the known author still applies"
+    );
+    assert!(!seen.contains(&c1.record_id()));
+
+    // Learning the admission promotes what was parked, in sequence order.
+    cluster.copy_membership("a", "b", id);
+    let seen = cluster.record_ids("b", id, PACKAGE);
+    assert!(seen.contains(&c1.record_id()));
+    assert!(seen.contains(&c2.record_id()));
+    assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R06
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_scope_record_is_rejected_without_ending_the_session() {
+    const OTHER: &str = "teamarness.other";
+    let cluster = SyncCluster::start("forged-scope", &["a", "m", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("Forgery").unwrap();
+    let id = workspace.id();
+    cluster
+        .node("a")
+        .append_record(id, OTHER, "message.post", b"a-other")
+        .unwrap();
+    let a1 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a1")
+        .unwrap();
+    cluster.admit("a", "m", id).await;
+    cluster.admit("a", "b", id).await;
+    // Each joiner learned the roster as it stood when it joined; give both the
+    // manager's current view so either may dial the other.
+    cluster.copy_membership("a", "m", id);
+    cluster.copy_membership("a", "b", id);
+    for package in [OTHER, PACKAGE] {
+        cluster
+            .node("m")
+            .replicate_records_to_address_for_test(
+                id,
+                package,
+                cluster.address("a"),
+                cluster.identity("a"),
+            )
+            .await
+            .unwrap();
+    }
+    cluster
+        .node("b")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
+
+    // M writes to one scope and re-seals that record into another it also holds.
+    let m_other = cluster
+        .node("m")
+        .append_record(id, OTHER, "message.post", b"m-other")
+        .unwrap();
+    let forged = {
+        let state = cluster.node("m").state.lock().unwrap();
+        crate::synchronization::forge_cross_scope_operation_for_test(
+            &state.connection,
+            &state.secret_key,
+            id,
+            OTHER,
+            PACKAGE,
+            m_other.record_id(),
+        )
+    };
+
+    let applied = cluster
+        .node("m")
+        .deliver_operations_for_test(
+            cluster.address("b"),
+            id,
+            PACKAGE,
+            cluster.identity("b"),
+            vec![forged],
+        )
+        .await
+        .expect("one forged record must not end the session");
+    assert_eq!(applied, 0, "the forging peer had nothing new to receive");
+
+    let seen = cluster.record_ids("b", id, PACKAGE);
+    assert!(
+        seen.contains(&a1.record_id()),
+        "the genuine record in the same session still applies"
+    );
+    assert!(
+        !seen.contains(&m_other.record_id()),
+        "a record signed for another package never opens in this scope"
+    );
+    assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
+    cluster.finish().await;
+}

@@ -14,7 +14,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::onboarding::transport::Transport;
-use crate::runtime::RuntimeState;
+use crate::runtime::{RuntimeState, SystemClock};
 use crate::synchronization::peer_sessions::{self, PeerSessions};
 use crate::synchronization::scheduler::RetryState;
 use crate::{PublicIdentity, SynchronizationError, WorkspaceId};
@@ -216,6 +216,7 @@ async fn run_once(
                 let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
                     Arc::new(crate::runtime::RuntimeSyncReceiver {
                         state: Arc::downgrade(&state),
+                        clock: Arc::new(SystemClock),
                     });
                 let session = network.send_log_sync(
                     iroh_base::EndpointAddr::new(job.peer.as_public_key()),
