@@ -11,7 +11,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::capability::{CapabilityRequirement, CapabilityScope, GenerationCapabilities};
-use crate::host_store::{HostStore, ProcessLease};
+use crate::host_store::{HostStore, HostStoreHandle, ProcessLease};
 use crate::manifest::sha256;
 use crate::protocol::{self, ProcessClient, WireFailure};
 use crate::{
@@ -58,6 +58,7 @@ pub(crate) struct ProcessSpec {
     pub(crate) continuity_id: String,
     pub(crate) core: Arc<teamarness_core::CoreRuntime>,
     pub(crate) calls: CallEnvironment,
+    pub(crate) store: HostStoreHandle,
 }
 
 pub(crate) struct ProcessGeneration {
@@ -67,7 +68,7 @@ pub(crate) struct ProcessGeneration {
     process_group: i32,
     package: PackageIdentity,
     workspace: WorkspaceId,
-    private_data_directory: PathBuf,
+    store: HostStoreHandle,
     health: tokio::task::JoinHandle<()>,
 }
 
@@ -89,13 +90,19 @@ pub(crate) async fn spawn(
         spec.calls.limiter.clone(),
     )
     .map_err(WireFailure::new)?;
-    let current = fs::read(&spec.template.backend_path)
-        .map_err(|_| WireFailure::new(PackageErrorCode::ArtifactChanged))?;
-    if sha256(&current) != spec.template.backend_digest {
-        return Err(WireFailure::new(PackageErrorCode::ArtifactChanged));
-    }
-    let executable = fs::canonicalize(&spec.template.backend_path)
-        .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?;
+    // Reading and hashing the Backend executable is blocking file work.
+    let backend_path = spec.template.backend_path.clone();
+    let expected_digest = spec.template.backend_digest.clone();
+    let executable = tokio::task::spawn_blocking(move || {
+        let current = fs::read(&backend_path)
+            .map_err(|_| WireFailure::new(PackageErrorCode::ArtifactChanged))?;
+        if sha256(&current) != expected_digest {
+            return Err(WireFailure::new(PackageErrorCode::ArtifactChanged));
+        }
+        fs::canonicalize(&backend_path).map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))
+    })
+    .await
+    .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))??;
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?;
     let launch_token = URL_SAFE_NO_PAD.encode(random);
@@ -166,10 +173,12 @@ pub(crate) async fn spawn(
         executable_digest: spec.template.backend_digest.clone(),
         launch_token: launch_token.clone(),
     };
-    if HostStore::open(&spec.template.private_data_directory)
-        .and_then(|store| store.record_process_lease(&lease))
-        .is_err()
-    {
+    let recorded = lease.clone();
+    let stored = spec
+        .store
+        .run(move |store| store.record_process_lease(&recorded))
+        .await;
+    if !matches!(stored, Ok(Ok(()))) {
         cleanup_failed_spawn(&child, spec, process_group, None).await;
         return Err(WireFailure::new(PackageErrorCode::DataDirectoryUnavailable));
     }
@@ -225,7 +234,7 @@ pub(crate) async fn spawn(
         process_group,
         package: spec.template.package_identity.clone(),
         workspace: spec.workspace_id.clone(),
-        private_data_directory: spec.template.private_data_directory.clone(),
+        store: spec.store.clone(),
         health,
     })
 }
@@ -299,19 +308,22 @@ impl ProcessGeneration {
         self.health.abort();
         self.client.shutdown().await;
         stop_process_group(&self.child, self.process_group).await;
-        self.remove_lease();
+        self.remove_lease().await;
     }
 
     pub(crate) async fn terminate(&self) {
         self.health.abort();
         stop_process_group(&self.child, self.process_group).await;
-        self.remove_lease();
+        self.remove_lease().await;
     }
 
-    fn remove_lease(&self) {
-        if let Ok(store) = HostStore::open(&self.private_data_directory) {
-            let _ = store.delete_process_lease(self.package.as_str(), self.workspace.as_str());
-        }
+    async fn remove_lease(&self) {
+        let package = self.package.to_string();
+        let workspace = self.workspace.to_string();
+        let _ = self
+            .store
+            .run(move |store| store.delete_process_lease(&package, &workspace))
+            .await;
     }
 }
 
@@ -349,10 +361,13 @@ async fn cleanup_failed_spawn(
     lease: Option<&ProcessLease>,
 ) {
     stop_process_group(child, process_group).await;
-    if let Some(lease) = lease
-        && let Ok(store) = HostStore::open(&spec.template.private_data_directory)
-    {
-        let _ = store.delete_process_lease(&lease.package_identity, &lease.workspace_id);
+    if let Some(lease) = lease {
+        let package = lease.package_identity.clone();
+        let workspace = lease.workspace_id.clone();
+        let _ = spec
+            .store
+            .run(move |store| store.delete_process_lease(&package, &workspace))
+            .await;
     }
 }
 
@@ -421,6 +436,7 @@ mod tests {
                 limiter: crate::capability::CoreCallLimiter::new(),
                 limits: crate::protocol::ProtocolLimits::CURRENT,
             },
+            store: HostStoreHandle::open(private.clone()).await.unwrap(),
         };
 
         let error = match spawn(&spec, 1, false).await {
@@ -545,8 +561,7 @@ async fn observed_start_time(_pid: u32) -> Option<String> {
     Some("unsupported-target".into())
 }
 
-pub(crate) fn reconcile_orphans(private: &Path) -> Result<Vec<ProcessLease>, PackageErrorCode> {
-    let store = HostStore::open(private).map_err(|_| PackageErrorCode::DataDirectoryUnavailable)?;
+pub(crate) fn reconcile_orphans(store: &HostStore) -> Result<Vec<ProcessLease>, PackageErrorCode> {
     let leases = store
         .process_leases()
         .map_err(|_| PackageErrorCode::DataDirectoryUnavailable)?;

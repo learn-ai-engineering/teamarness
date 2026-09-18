@@ -846,6 +846,7 @@ pub struct PackageHost {
 
 struct PackageHostInner {
     calls: supervisor::CallEnvironment,
+    store: host_store::HostStoreHandle,
     data: Mutex<HostData>,
     revisions: watch::Sender<HostRevision>,
     config: PackageHostConfig,
@@ -882,9 +883,22 @@ impl PackageHost {
         config: PackageHostConfig,
         core: Arc<teamarness_core::CoreRuntime>,
     ) -> Result<Self, PackageErrorEnvelope> {
-        let mut report = admission::admit(&config)
+        // One store for the whole Host: opening runs directory checks and the
+        // migration batch, and every use after this crosses to a blocking
+        // thread.
+        let store = host_store::HostStoreHandle::open(config.private_data_directory().to_owned())
+            .await
+            .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
+        let admitting = config.clone();
+        let mut report = store
+            .run(move |store| admission::admit(&admitting, store))
+            .await
+            .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?
             .map_err(|failure| host_error(failure.code, PackageErrorStage::Admission))?;
-        let unresolved = supervisor::reconcile_orphans(config.private_data_directory())
+        let unresolved = store
+            .run(supervisor::reconcile_orphans)
+            .await
+            .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?
             .map_err(|code| host_error(code, PackageErrorStage::Process))?;
         for lease in &unresolved {
             let package = lease.package_identity.parse().ok();
@@ -899,12 +913,21 @@ impl PackageHost {
             .iter()
             .map(|lease| (lease.package_identity.clone(), lease.workspace_id.clone()))
             .collect();
-        let workspaces = core.list_workspaces().map_err(|_| {
-            host_error(
-                PackageErrorCode::DataDirectoryUnavailable,
-                PackageErrorStage::Storage,
-            )
-        })?;
+        let listing = core.clone();
+        let workspaces = tokio::task::spawn_blocking(move || listing.list_workspaces())
+            .await
+            .map_err(|_| {
+                host_error(
+                    PackageErrorCode::DataDirectoryUnavailable,
+                    PackageErrorStage::Storage,
+                )
+            })?
+            .map_err(|_| {
+                host_error(
+                    PackageErrorCode::DataDirectoryUnavailable,
+                    PackageErrorStage::Storage,
+                )
+            })?;
         let mut templates = Vec::new();
         let mut admitted_ui = BTreeMap::new();
         for admission in report.admissions {
@@ -974,7 +997,7 @@ impl PackageHost {
                     continue;
                 }
                 let (key, actor) =
-                    prepare_instance(&config, &core, &calls, template, workspace).await?;
+                    prepare_instance(&config, &core, &calls, &store, template, workspace).await?;
                 if let Err(failure) = actor.activate().await {
                     report
                         .snapshot
@@ -989,6 +1012,7 @@ impl PackageHost {
         let host = Self {
             inner: Arc::new(PackageHostInner {
                 calls,
+                store: store.clone(),
                 data: Mutex::new(HostData {
                     state: PackageHostState::Running,
                     revision,
@@ -1087,12 +1111,21 @@ impl PackageHost {
         match command {
             PackageHostCommand::ReconcileWorkspaces(_) => {
                 let _gate = self.inner.reconciliation.lock().await;
-                let workspaces = self.inner.core.list_workspaces().map_err(|_| {
-                    host_error(
-                        PackageErrorCode::DataDirectoryUnavailable,
-                        PackageErrorStage::Storage,
-                    )
-                })?;
+                let listing = self.inner.core.clone();
+                let workspaces = tokio::task::spawn_blocking(move || listing.list_workspaces())
+                    .await
+                    .map_err(|_| {
+                        host_error(
+                            PackageErrorCode::DataDirectoryUnavailable,
+                            PackageErrorStage::Storage,
+                        )
+                    })?
+                    .map_err(|_| {
+                        host_error(
+                            PackageErrorCode::DataDirectoryUnavailable,
+                            PackageErrorStage::Storage,
+                        )
+                    })?;
                 for template in &self.inner.templates {
                     for workspace in &workspaces {
                         let workspace_id =
@@ -1113,6 +1146,7 @@ impl PackageHost {
                             &self.inner.config,
                             &self.inner.core,
                             &self.inner.calls,
+                            &self.inner.store,
                             template,
                             workspace,
                         )
@@ -1352,9 +1386,18 @@ impl PackageHost {
                         PackageErrorStage::Ui,
                     ));
                 }
-                let resource = lease.ui.cache.resolve(&input.relative_path).map_err(|_| {
-                    host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
-                })?;
+                // Reading and hashing a UI resource is blocking file work.
+                let ui = Arc::clone(&lease.ui);
+                let relative_path = input.relative_path.clone();
+                let resource =
+                    tokio::task::spawn_blocking(move || ui.cache.resolve(&relative_path))
+                        .await
+                        .map_err(|_| {
+                            host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
+                        })?
+                        .map_err(|_| {
+                            host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui)
+                        })?;
                 Ok(PackageHostOutcome::UiResource {
                     bytes: resource.bytes,
                     media_type: resource.media_type,
@@ -1518,6 +1561,7 @@ async fn prepare_instance(
     config: &PackageHostConfig,
     core: &Arc<teamarness_core::CoreRuntime>,
     calls: &supervisor::CallEnvironment,
+    store: &host_store::HostStoreHandle,
     template: &supervisor::ProcessTemplate,
     workspace: &teamarness_core::WorkspaceSummary,
 ) -> Result<(PackageInstanceKey, Arc<instance::InstanceActor>), PackageErrorEnvelope> {
@@ -1528,16 +1572,23 @@ async fn prepare_instance(
         )
     })?;
     let key = PackageInstanceKey::new(template.package_identity.clone(), workspace_id.clone());
-    let store = host_store::HostStore::open(config.private_data_directory())
+    let private = config.private_data_directory().to_owned();
+    let installation = config.installation_public_identity().clone();
+    let allocating_workspace = workspace_id.clone();
+    let allocating_package = template.package_identity.clone();
+    let grant = store
+        .run(move |store| {
+            data_directory::allocate(
+                store,
+                &private,
+                &installation,
+                &allocating_workspace,
+                &allocating_package,
+            )
+        })
+        .await
+        .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?
         .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
-    let grant = data_directory::allocate(
-        &store,
-        config.private_data_directory(),
-        config.installation_public_identity(),
-        &workspace_id,
-        &template.package_identity,
-    )
-    .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
     let spec = supervisor::ProcessSpec {
         template: template.clone(),
         workspace_id,
@@ -1547,6 +1598,7 @@ async fn prepare_instance(
         continuity_id: grant.continuity_id,
         core: core.clone(),
         calls: calls.clone(),
+        store: store.clone(),
     };
     Ok((
         key.clone(),
@@ -1633,3 +1685,47 @@ impl fmt::Display for PackageErrorEnvelope {
 }
 
 impl std::error::Error for PackageErrorEnvelope {}
+
+#[cfg(test)]
+extern crate self as teamarness_package_host;
+
+/// The Package fixtures the integration tests use, so a crate-internal test can
+/// open a real Host without a second copy of the fixture writer.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod host_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test]
+    async fn host_store_is_opened_once_across_spawn_and_shutdown() {
+        let fixture = host_fixture::Fixture::node(&[
+            ("one", "dev.teamarness.one"),
+            ("two", "dev.teamarness.two"),
+        ])
+        .await;
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let instances = host.snapshot().await.instances;
+        assert_eq!(instances.len(), 2, "both Packages activated");
+        for instance in instances {
+            host.execute(PackageHostCommand::OpenUiMount(OpenUiMount {
+                instance: instance.key,
+            }))
+            .await
+            .unwrap();
+        }
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+        assert_eq!(
+            host.inner.store.opens(),
+            1,
+            "the Host opened its store once, and every later use shares it"
+        );
+    }
+}

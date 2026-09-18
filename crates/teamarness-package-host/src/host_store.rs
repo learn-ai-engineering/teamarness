@@ -1,6 +1,7 @@
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -13,6 +14,50 @@ pub(crate) struct HostStoreFailure {
 
 pub(crate) struct HostStore {
     connection: Connection,
+}
+
+/// The one Package Host store, shared by every Package in a Host.
+///
+/// Opening runs directory checks, permission changes and the migration batch,
+/// so it happens once per Host. Every later use crosses to a blocking thread:
+/// SQLite is synchronous and must not run on an asynchronous worker.
+#[derive(Clone)]
+pub(crate) struct HostStoreHandle {
+    store: Arc<std::sync::Mutex<HostStore>>,
+    #[cfg(test)]
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HostStoreHandle {
+    pub(crate) async fn open(private_data_directory: PathBuf) -> Result<Self, HostStoreFailure> {
+        let store = tokio::task::spawn_blocking(move || HostStore::open(&private_data_directory))
+            .await
+            .map_err(|_| storage_failure())??;
+        Ok(Self {
+            store: Arc::new(std::sync::Mutex::new(store)),
+            #[cfg(test)]
+            opens: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        })
+    }
+
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&HostStore) -> T + Send + 'static,
+    ) -> Result<T, HostStoreFailure> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| storage_failure())?;
+            Ok(f(&store))
+        })
+        .await
+        .map_err(|_| storage_failure())?
+    }
+
+    /// How many times this Host opened its store. Always one.
+    #[cfg(test)]
+    pub(crate) fn opens(&self) -> usize {
+        self.opens.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
