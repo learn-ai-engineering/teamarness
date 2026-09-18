@@ -255,7 +255,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     for column in [
         "scope_id",
         "log_id",
@@ -328,7 +328,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -459,7 +459,12 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE membership_sync_wakes;
+            "DROP TABLE sync_peer_progress;
+             DROP TABLE membership_peer_progress;
+             DROP TABLE scope_validation;
+             DROP TABLE quarantined_scopes;
+             DROP TABLE quarantined_records;
+             DROP TABLE membership_sync_wakes;
              DROP TABLE parked_operations;
              CREATE TABLE pending_protection_records (pending_id INTEGER PRIMARY KEY);
              PRAGMA user_version = 9;",
@@ -479,6 +484,49 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
         )
         .unwrap();
     assert_eq!(seeded, (1, 1), "an existing workspace is seeded as due");
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn migration_0011_adds_progress_and_quarantine_tables() {
+    let directory = private_data_directory("migration-sync-bounds");
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Bounds").unwrap();
+    runtime
+        .append_record(workspace.id(), "teamarness.test", "message.post", b"sealed")
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+
+    for table in [
+        "sync_peer_progress",
+        "membership_peer_progress",
+        "scope_validation",
+        "quarantined_scopes",
+        "quarantined_records",
+    ] {
+        let rows: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|error| panic!("missing migration table {table}: {error}"));
+        assert_eq!(rows, 0, "{table} starts empty");
+    }
+
+    let scope: Vec<u8> = connection
+        .query_row("SELECT scope_id FROM sync_scopes", [], |row| row.get(0))
+        .unwrap();
+    let rejected = connection.execute(
+        "INSERT INTO quarantined_records(record_id, scope_id, reason, detected_at_unix_ms)
+         VALUES (?1, ?2, 'not_a_reason', 1)",
+        params![[9_u8; 32].as_slice(), scope.as_slice()],
+    );
+    assert!(rejected.is_err(), "an unknown quarantine reason is refused");
+
     drop(connection);
     fs::remove_dir_all(directory).unwrap();
 }
