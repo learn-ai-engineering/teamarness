@@ -119,6 +119,9 @@ pub(super) fn after_membership_accepted(
             );
         }
     }
+    // The peer set changed, so what is due changed; the scheduler reloads
+    // rather than waiting for its idle tick.
+    state.sync_wake.notify_one();
 }
 
 /// Applies quarantined operations that have become applicable and publishes

@@ -169,11 +169,27 @@ impl SyncCluster {
     ///
     /// This is the production protocol, not a shim: a test uses it when it
     /// needs one specific exchange to have happened before it continues.
+    /// The responder allows one inbound membership session per peer, and the
+    /// scheduler dials on its own, so an explicit session can cross one of its
+    /// own. The deadline only bounds failure.
     pub(super) async fn replicate_membership(&self, from: &str, to: &str, workspace: WorkspaceId) {
-        self.node(from)
-            .membership_session_for_test(self.address(to), workspace, self.identity(to))
-            .await
-            .expect("a membership session between two members completes");
+        let expiry = Instant::now() + DEFAULT_DEADLINE;
+        loop {
+            let result = self
+                .node(from)
+                .membership_session_for_test(self.address(to), workspace, self.identity(to))
+                .await;
+            match result {
+                Ok(_) => return,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < expiry,
+                        "a membership session between two members completes: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 
     /// Every accepted membership operation identifier one node holds.

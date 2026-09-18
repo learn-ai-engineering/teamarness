@@ -6,6 +6,27 @@ use teamarness_core::{
     MembershipOperationId, MembershipVersion, OnboardingError, SigningContext, WorkspaceId,
 };
 
+/// Issues an invitation, waiting out the endpoint readiness this machine needs
+/// under load.
+///
+/// Readiness is a real-network condition, not the behaviour under test, and the
+/// deadline only bounds failure.
+async fn invite(
+    runtime: &CoreRuntime,
+    workspace: WorkspaceId,
+) -> teamarness_core::WorkspaceInvitation {
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match runtime.create_workspace_invitation(workspace).await {
+            Ok(invitation) => return invitation,
+            Err(OnboardingError::Readiness) if std::time::Instant::now() < expiry => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("the invitation could not be issued: {error}"),
+        }
+    }
+}
+
 #[test]
 fn runtime_config_preserves_the_private_data_directory() {
     let data_directory = PathBuf::from("/tmp/teamarness-contract");
@@ -95,18 +116,12 @@ async fn durable_and_live_transitions_report_the_same_change_and_author() {
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
         .unwrap();
 
-    let bob_invitation = alice
-        .create_workspace_invitation(workspace.id())
-        .await
-        .unwrap();
+    let bob_invitation = invite(&alice, workspace.id()).await;
     let bob = CoreRuntime::open(CoreRuntimeConfig::new(root.join("bob")))
         .await
         .unwrap();
     bob.join_workspace(&bob_invitation).await.unwrap();
-    let carol_invitation = alice
-        .create_workspace_invitation(workspace.id())
-        .await
-        .unwrap();
+    let carol_invitation = invite(&alice, workspace.id()).await;
     let carol = CoreRuntime::open(CoreRuntimeConfig::new(root.join("carol")))
         .await
         .unwrap();

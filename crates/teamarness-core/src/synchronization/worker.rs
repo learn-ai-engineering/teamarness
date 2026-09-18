@@ -1,717 +1,1108 @@
-//! Serialized ownership of synchronization scheduling and lifecycle.
+//! The asynchronous driver around the synchronization scheduler.
 //!
-//! The worker only holds the runtime state lock while reading or committing a
-//! small SQLite transaction. Network sessions always run after that guard has
-//! been dropped, and are cancelled before the shared Network is shut down.
+//! The driver owns no policy: it loads what is durably due, asks
+//! [`SchedulerCore`] what to run next, runs it, and applies the actions the
+//! scheduler returns. Everything it does with the runtime state crosses to a
+//! blocking thread, so nothing is silently skipped because a lock was busy.
 //!
-//! Membership replication and record replication run as two independent loops
-//! over the one shared Endpoint. They are separate because a record session
-//! with an unreachable peer occupies its whole session budget, and canonical
-//! membership must keep moving while that happens: an Installation that cannot
-//! learn who is a Member cannot decide who to serve.
+//! Membership and record replication share one schedule, and stay independent
+//! where it matters: at most one session per peer, with that peer's membership
+//! job dispatched before its record jobs, and backoff that belongs to the peer
+//! rather than to the protocol. A peer that has gone away therefore never
+//! delays another peer's membership convergence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{Notify, mpsc};
-use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use tokio::sync::{Notify, watch};
+use tokio::task::JoinSet;
 
 use crate::blocking::StateUnavailable;
-use crate::membership_sync::{MembershipDemand, MembershipReplica};
+use crate::membership_sync::{MembershipDemand, MembershipReplica, MembershipSessionError};
 use crate::onboarding::transport::Transport;
-use crate::runtime::{RuntimeState, SystemClock};
-use crate::synchronization::peer_sessions::{self, PeerSessions};
-use crate::synchronization::scheduler::RetryState;
-use crate::synchronization::{LogSessionError, Refusal};
-use crate::{PublicIdentity, SynchronizationError, WorkspaceId};
+use crate::runtime::RuntimeState;
+use crate::synchronization::limits::SchedulerLimits;
+use crate::synchronization::scheduler::{
+    DueJob, JobKey, SchedulerAction, SchedulerCore, SessionOutcome,
+};
+use crate::synchronization::{LogSessionError, Refusal, SyncServices};
+use crate::{PublicIdentity, WorkspaceId};
 
-const IDLE_RECONCILIATION: Duration = Duration::from_secs(5);
-const MAX_DIALS: usize = 4;
-/// A full membership sweep every sixth idle tick, so offline peers and missed
-/// wakes converge in about thirty seconds without a dial every five.
-const MEMBERSHIP_IDLE_EVERY: u32 = 6;
-/// A membership session is small, so an unreachable peer is retried sooner than
-/// a record session would be. This is the ceiling on that backoff.
-const MEMBERSHIP_RETRY_CEILING: Duration = Duration::from_secs(5);
-
-enum WorkerCommand {
+/// Why the driver reloaded the durable job set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadKind {
+    /// Something committed, or a peer asked for a membership session.
     Wake,
-    Cancel,
+    /// Record scopes that have gone quiet are reconciled anyway.
+    RecordIdle,
+    /// The same, for canonical membership.
+    MembershipIdle,
+    /// Everything, whether or not it has gone quiet. A test asks for this
+    /// instead of waiting out an idle interval.
+    #[cfg(test)]
+    FullSweep,
 }
 
-#[derive(Debug, Clone)]
-struct Job {
-    workspace: WorkspaceId,
-    package: String,
-    peer: PublicIdentity,
-    generation: i64,
+/// Runs one scheduled session. Production dials; tests script the outcome.
+pub(crate) trait SessionRunner: Send + Sync + 'static {
+    fn run(
+        &self,
+        job: DueJob,
+        stop: watch::Receiver<bool>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SessionOutcome> + Send>>;
 }
 
-#[derive(Debug, Clone)]
-struct MembershipJob {
-    workspace: WorkspaceId,
-    peer: PublicIdentity,
-    generation: i64,
-}
-
-/// Everything one worker pass needs. Bundled so the pass functions stay
-/// readable as the worker grows a second protocol.
-struct WorkerContext {
-    state: Weak<Mutex<RuntimeState>>,
+/// The production runner: real sessions over the shared Endpoint.
+pub(crate) struct NetworkSessionRunner {
     network: Arc<Transport>,
-    local: PublicIdentity,
-    sessions: Arc<PeerSessions>,
+    services: SyncServices,
     replica: Arc<dyn MembershipReplica>,
     demand: Arc<MembershipDemand>,
-    stopped: Arc<AtomicBool>,
-    cancel: Arc<Notify>,
-    /// Lets a test observe one explicit session at a time, without the
-    /// scheduler's own sessions racing it.
-    #[cfg(test)]
-    records_paused: Arc<AtomicBool>,
+    state: Weak<Mutex<RuntimeState>>,
+    local: PublicIdentity,
 }
 
-/// Owns the background synchronization command loop for one Core runtime.
-///
-/// A worker is started only after storage and projection recovery have
-/// completed. Its join handle is awaited by [`CoreRuntime::shutdown`].
+impl NetworkSessionRunner {
+    pub(crate) fn new(
+        network: Arc<Transport>,
+        services: SyncServices,
+        replica: Arc<dyn MembershipReplica>,
+        demand: Arc<MembershipDemand>,
+        state: Weak<Mutex<RuntimeState>>,
+        local: PublicIdentity,
+    ) -> Self {
+        Self {
+            network,
+            services,
+            replica,
+            demand,
+            state,
+            local,
+        }
+    }
+
+    /// Re-checks the gate before dialling, so a job queued before a revocation
+    /// never reaches the network.
+    async fn still_current(&self, peer: PublicIdentity, workspace: WorkspaceId) -> bool {
+        let local = self.local;
+        crate::blocking::run_with_state(&self.state, move |state| {
+            state.memberships.get(&workspace).is_some_and(|projection| {
+                projection.contains_member(local) && projection.contains_member(peer)
+            })
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+impl SessionRunner for NetworkSessionRunner {
+    fn run(
+        &self,
+        job: DueJob,
+        mut stop: watch::Receiver<bool>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SessionOutcome> + Send>> {
+        let network = Arc::clone(&self.network);
+        let services = self.services.clone();
+        let replica = Arc::clone(&self.replica);
+        let demand = Arc::clone(&self.demand);
+        let state = Weak::clone(&self.state);
+        let local = self.local;
+        Box::pin(async move {
+            let runner = Self {
+                network,
+                services,
+                replica,
+                demand,
+                state,
+                local,
+            };
+            let peer = job.key.peer();
+            let workspace = job.key.workspace();
+            if !runner.still_current(peer, workspace).await {
+                return SessionOutcome::LocalNotAuthorized;
+            }
+            let address = iroh_base::EndpointAddr::new(peer.as_public_key());
+            let outcome = match &job.key {
+                JobKey::Membership { workspace, peer } => {
+                    let session = runner.network.run_membership_session(
+                        address,
+                        Arc::clone(&runner.replica),
+                        *workspace,
+                        *peer,
+                    );
+                    tokio::select! {
+                        result = session => membership_outcome(&job.key, result),
+                        _ = stop.changed() => SessionOutcome::Cancelled,
+                    }
+                }
+                JobKey::Records {
+                    workspace,
+                    package,
+                    peer,
+                    ..
+                } => {
+                    let session = runner.network.send_log_sync(
+                        address,
+                        Arc::clone(&runner.services.receiver),
+                        *workspace,
+                        package.clone(),
+                        *peer,
+                    );
+                    tokio::select! {
+                        result = session => record_outcome(&job.key, result),
+                        _ = stop.changed() => SessionOutcome::Cancelled,
+                    }
+                }
+            };
+            if matches!(outcome, SessionOutcome::RefusedNotAuthorized) {
+                runner.demand.note(workspace, peer);
+            }
+            outcome
+        })
+    }
+}
+
+/// Classifies a record session, naming the failure kind once in the log.
+fn record_outcome(
+    key: &JobKey,
+    result: Result<crate::synchronization::ExchangeReport, LogSessionError>,
+) -> SessionOutcome {
+    let error = match result {
+        Ok(report) => {
+            return SessionOutcome::Completed {
+                truncated: report.sent_truncated || report.peer_truncated,
+            };
+        }
+        Err(error) => error,
+    };
+    let outcome = match &error {
+        LogSessionError::Refused(Refusal::NotAuthorized) => SessionOutcome::RefusedNotAuthorized,
+        LogSessionError::LocalNotAuthorized => SessionOutcome::LocalNotAuthorized,
+        LogSessionError::Cancelled => SessionOutcome::Cancelled,
+        // A peer that could not be reached at all is a different thing from one
+        // that answered and then failed.
+        LogSessionError::Transport(_) => SessionOutcome::Unreachable,
+        _ => SessionOutcome::Failed,
+    };
+    if !matches!(
+        outcome,
+        SessionOutcome::Cancelled | SessionOutcome::LocalNotAuthorized
+    ) {
+        report_failure(key, &error.to_string());
+    }
+    outcome
+}
+
+fn membership_outcome(
+    key: &JobKey,
+    result: Result<crate::membership_sync::MembershipSessionReport, MembershipSessionError>,
+) -> SessionOutcome {
+    let error = match result {
+        Ok(_) => return SessionOutcome::Completed { truncated: false },
+        Err(error) => error,
+    };
+    let outcome = match &error {
+        MembershipSessionError::Transport(_) => SessionOutcome::Unreachable,
+        MembershipSessionError::Protocol(_)
+        | MembershipSessionError::Invalid
+        | MembershipSessionError::Timeout => SessionOutcome::Failed,
+    };
+    report_failure(key, &error.to_string());
+    outcome
+}
+
+/// Names a failure once, with no peer identity and no payload.
+fn report_failure(key: &JobKey, error: &str) {
+    eprintln!("sync session {} failed: {error}", key.kind());
+}
+
+/// Owns the background synchronization schedule for one Core runtime.
 pub(crate) struct SyncWorker {
-    stopped: Arc<AtomicBool>,
-    commands: mpsc::UnboundedSender<WorkerCommand>,
     wake: Arc<Notify>,
-    membership_wake: Arc<Notify>,
-    cancel: Arc<Notify>,
-    join: Mutex<Vec<JoinHandle<()>>>,
+    stop: watch::Sender<bool>,
+    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    paused: Arc<AtomicBool>,
+    /// Asks the next reload to be a full sweep.
     #[cfg(test)]
-    records_paused: Arc<AtomicBool>,
+    sweep: Arc<AtomicBool>,
+    /// How many durable loads this driver has run. A burst of wakes must cost
+    /// one follow-up load, not one per wake.
+    #[cfg(test)]
+    loads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    snapshot: Arc<Mutex<Vec<crate::synchronization::scheduler::PeerSnapshot>>>,
 }
 
 impl std::fmt::Debug for SyncWorker {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SyncWorker")
-            .field("stopped", &self.stopped.load(Ordering::Acquire))
+            .field("stopped", &*self.stop.borrow())
             .finish_non_exhaustive()
     }
 }
 
 impl SyncWorker {
     pub(crate) fn start(
+        wake: Arc<Notify>,
         state: Weak<Mutex<RuntimeState>>,
-        network: Arc<Transport>,
         local: PublicIdentity,
-        sessions: Arc<PeerSessions>,
-        replica: Arc<dyn MembershipReplica>,
+        runner: Arc<dyn SessionRunner>,
         demand: Arc<MembershipDemand>,
+        limits: SchedulerLimits,
+        jitter: fn(Duration) -> Duration,
     ) -> Arc<Self> {
-        let (commands, command_rx) = mpsc::unbounded_channel();
-        #[cfg(test)]
-        let records_paused = Arc::new(AtomicBool::new(false));
+        let (stop, stop_rx) = watch::channel(false);
         let worker = Arc::new(Self {
-            stopped: Arc::new(AtomicBool::new(false)),
-            commands,
-            wake: Arc::new(Notify::new()),
-            membership_wake: Arc::new(Notify::new()),
-            cancel: Arc::new(Notify::new()),
-            join: Mutex::new(Vec::new()),
+            wake,
+            stop,
+            join: Mutex::new(None),
+            paused: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            records_paused: Arc::clone(&records_paused),
+            sweep: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            snapshot: Arc::new(Mutex::new(Vec::new())),
         });
-        let context = Arc::new(WorkerContext {
+        let driver = Driver {
             state,
-            network,
             local,
-            sessions,
-            replica,
+            runner,
             demand,
-            stopped: Arc::clone(&worker.stopped),
-            cancel: Arc::clone(&worker.cancel),
+            limits,
+            wake: Arc::clone(&worker.wake),
+            paused: Arc::clone(&worker.paused),
+            stop: stop_rx,
             #[cfg(test)]
-            records_paused,
-        });
-        let wake = Arc::clone(&worker.wake);
-        let records = tokio::spawn({
-            let context = Arc::clone(&context);
-            async move {
-                run_records(&context, wake, command_rx).await;
-            }
-        });
-        let membership_wake = Arc::clone(&worker.membership_wake);
-        let membership = tokio::spawn(async move {
-            run_membership(&context, membership_wake).await;
-        });
+            sweep: Arc::clone(&worker.sweep),
+            #[cfg(test)]
+            loads: Arc::clone(&worker.loads),
+            #[cfg(test)]
+            snapshot: Arc::clone(&worker.snapshot),
+        };
+        let join = tokio::spawn(async move { driver.run(jitter).await });
         *worker
             .join
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![records, membership];
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(join);
         worker
     }
 
-    /// Requests reconciliation after a committed local or remote write.
+    /// Requests a reload. Any number of wakes leave exactly one stored permit,
+    /// so a burst costs one follow-up load, not one per wake.
     pub(crate) fn wake(&self) {
-        if !self.stopped.load(Ordering::Acquire) {
-            let _ = self.commands.send(WorkerCommand::Wake);
-            self.wake.notify_one();
-            self.membership_wake.notify_one();
-        }
+        self.wake.notify_one();
     }
 
-    /// Stops and resumes the record replication loop.
-    ///
-    /// A test that observes one explicit session at a time uses this so the
-    /// scheduler's own sessions do not race it.
+    /// Requests the reconciliation the idle intervals would eventually do,
+    /// without waiting one out.
     #[cfg(test)]
-    pub(crate) fn pause_records_for_test(&self, paused: bool) {
-        self.records_paused.store(paused, Ordering::Release);
+    pub(crate) fn sweep_for_test(&self) {
+        self.sweep.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// How many durable loads this driver has run.
+    #[cfg(test)]
+    pub(crate) fn loads_for_test(&self) -> usize {
+        self.loads.load(Ordering::Relaxed)
+    }
+
+    /// What the scheduler currently knows about each peer.
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(&self) -> Vec<crate::synchronization::scheduler::PeerSnapshot> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stops scheduling and dispatching. Durable loads still run.
+    #[cfg(test)]
+    pub(crate) fn pause_for_test(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
         if !paused {
             self.wake.notify_one();
         }
     }
 
     pub(crate) async fn shutdown(&self) {
-        if self.stopped.swap(true, Ordering::AcqRel) {
+        if self.stop.send_replace(true) {
             return;
         }
-        let _ = self.commands.send(WorkerCommand::Cancel);
-        self.cancel.notify_waiters();
         self.wake.notify_waiters();
-        self.membership_wake.notify_waiters();
-        let join = std::mem::take(
-            &mut *self
-                .join
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for handle in join {
-            let _ = handle.await;
+        let join = self
+            .join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(join) = join {
+            let _ = join.await;
         }
     }
 }
 
 impl Drop for SyncWorker {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
-        self.cancel.notify_waiters();
+        let _ = self.stop.send_replace(true);
         self.wake.notify_waiters();
-        self.membership_wake.notify_waiters();
-        for handle in std::mem::take(
-            self.join
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ) {
-            handle.abort();
+        if let Some(join) = self
+            .join
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            join.abort();
         }
     }
 }
 
-/// Per-peer membership backoff: when a peer's next attempt is due, and how far
-/// its retry delay has grown.
-type MembershipRetry = BTreeMap<(WorkspaceId, PublicIdentity), (Instant, RetryState)>;
-
-async fn run_records(
-    context: &WorkerContext,
+struct Driver {
+    state: Weak<Mutex<RuntimeState>>,
+    local: PublicIdentity,
+    runner: Arc<dyn SessionRunner>,
+    demand: Arc<MembershipDemand>,
+    limits: SchedulerLimits,
     wake: Arc<Notify>,
-    mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
-) {
-    let mut idle = tokio::time::interval(IDLE_RECONCILIATION);
-    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut retry = BTreeMap::new();
-    let mut first = true;
-    while !context.stopped.load(Ordering::Acquire) {
-        #[cfg(test)]
-        if context.records_paused.load(Ordering::Acquire) {
-            first = false;
-            tokio::select! {
-                _ = wake.notified() => {}
-                _ = idle.tick() => {}
-                _ = context.cancel.notified() => {}
-            }
-            continue;
-        }
-        if first {
-            first = false;
-            if record_pass(context, &mut retry, true).await.is_err() {
-                return;
-            }
-            continue;
-        }
-        let pass = tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(WorkerCommand::Wake) => record_pass(context, &mut retry, false).await,
-                    Some(WorkerCommand::Cancel) => {
-                        context.cancel.notify_waiters();
-                        Ok(())
+    paused: Arc<AtomicBool>,
+    stop: watch::Receiver<bool>,
+    #[cfg(test)]
+    sweep: Arc<AtomicBool>,
+    #[cfg(test)]
+    loads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    snapshot: Arc<Mutex<Vec<crate::synchronization::scheduler::PeerSnapshot>>>,
+}
+
+impl Driver {
+    async fn run(mut self, jitter: fn(Duration) -> Duration) {
+        let mut core = SchedulerCore::new(self.limits, jitter);
+        let mut sessions: JoinSet<(JobKey, SessionOutcome)> = JoinSet::new();
+        // The first tick is one period away: the sweep below already covers
+        // the start, and an immediate tick would be a second load for nothing.
+        let mut record_idle = tokio::time::interval_at(
+            Instant::now() + self.limits.record_idle,
+            self.limits.record_idle,
+        );
+        record_idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut membership_idle = tokio::time::interval_at(
+            Instant::now() + self.limits.membership_idle,
+            self.limits.membership_idle,
+        );
+        membership_idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first pass after start is a full sweep, so an Installation that
+        // was away catches up with every peer it knows.
+        let mut reload = Some(ReloadKind::RecordIdle);
+
+        loop {
+            if reload.is_none() {
+                let deadline = core.next_deadline();
+                tokio::select! {
+                    biased;
+                    changed = self.stop.changed() => {
+                        if changed.is_err() || *self.stop.borrow() {
+                            break;
+                        }
                     }
-                    None => return,
+                    Some(finished) = sessions.join_next(), if !sessions.is_empty() => {
+                        if let Ok((key, outcome)) = finished {
+                            let actions = core.complete(&key, outcome, Instant::now());
+                            if self.apply(&mut core, actions).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    () = self.wake.notified() => reload = Some(ReloadKind::Wake),
+                    () = self.demand.changed() => reload = Some(ReloadKind::Wake),
+                    _ = record_idle.tick() => reload = Some(ReloadKind::RecordIdle),
+                    _ = membership_idle.tick() => reload = Some(ReloadKind::MembershipIdle),
+                    () = sleep_until(deadline) => {}
                 }
             }
-            _ = wake.notified() => record_pass(context, &mut retry, false).await,
-            _ = idle.tick() => record_pass(context, &mut retry, true).await,
-            _ = context.cancel.notified() => Ok(()),
-        };
-        // A dropped runtime has nothing left to schedule, and a poisoned one
-        // must not schedule anything more.
-        if pass.is_err() {
+            if *self.stop.borrow() {
+                break;
+            }
+            #[cfg(test)]
+            if self.sweep.swap(false, Ordering::AcqRel) {
+                reload = Some(ReloadKind::FullSweep);
+            }
+            if let Some(kind) = reload.take() {
+                let attempts = core.last_attempts();
+                match self.load(kind, attempts).await {
+                    Ok(due) => {
+                        #[cfg(test)]
+                        self.loads.fetch_add(1, Ordering::Relaxed);
+                        core.replace_due(due, Instant::now());
+                    }
+                    // A dropped runtime has nothing left to schedule, and a
+                    // poisoned one must not schedule anything more.
+                    Err(_) => return,
+                }
+            }
+            if self.paused.load(Ordering::Acquire) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                *self
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = core.snapshot();
+            }
+            let now = Instant::now();
+            while let Some(job) = core.next_dispatch(now) {
+                let runner = Arc::clone(&self.runner);
+                let stop = self.stop.clone();
+                let key = job.key.clone();
+                sessions.spawn(async move {
+                    let outcome = runner.run(job, stop).await;
+                    (key, outcome)
+                });
+            }
+        }
+        self.drain(sessions).await;
+    }
+
+    /// Waits at most the shutdown grace for sessions, then abandons them.
+    async fn drain(&self, mut sessions: JoinSet<(JobKey, SessionOutcome)>) {
+        if sessions.is_empty() {
             return;
         }
-    }
-}
-
-async fn run_membership(context: &WorkerContext, wake: Arc<Notify>) {
-    let mut idle = tokio::time::interval(IDLE_RECONCILIATION);
-    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut retry = MembershipRetry::new();
-    let mut idle_ticks: u32 = 0;
-    let mut first = true;
-    while !context.stopped.load(Ordering::Acquire) {
-        if first {
-            first = false;
-            // The first pass after start is a full sweep, so an Installation
-            // that was offline catches up with every Member it knows.
-            if membership_pass(context, &mut retry, true).await.is_err() {
-                return;
-            }
-            continue;
-        }
-        let pass = tokio::select! {
-            _ = wake.notified() => membership_pass(context, &mut retry, false).await,
-            () = context.demand.changed() => membership_pass(context, &mut retry, false).await,
-            _ = idle.tick() => {
-                idle_ticks = idle_ticks.wrapping_add(1);
-                membership_pass(context, &mut retry, idle_ticks.is_multiple_of(MEMBERSHIP_IDLE_EVERY)).await
-            }
-            _ = context.cancel.notified() => Ok(()),
-        };
-        if pass.is_err() {
-            return;
-        }
-    }
-}
-
-async fn record_pass(
-    context: &WorkerContext,
-    retry: &mut BTreeMap<(WorkspaceId, String, PublicIdentity), RetryState>,
-    reconcile_idle: bool,
-) -> Result<(), StateUnavailable> {
-    let state_arc = context.state.upgrade().ok_or(StateUnavailable::Dropped)?;
-    run_record_pass(context, &state_arc, retry, reconcile_idle).await
-}
-
-async fn membership_pass(
-    context: &WorkerContext,
-    retry: &mut MembershipRetry,
-    idle_due: bool,
-) -> Result<(), StateUnavailable> {
-    let state_arc = context.state.upgrade().ok_or(StateUnavailable::Dropped)?;
-    run_membership_pass(context, &state_arc, retry, idle_due).await
-}
-
-/// One membership pass: reconcile every due Workspace with its Members.
-async fn run_membership_pass(
-    context: &WorkerContext,
-    state_arc: &Arc<Mutex<RuntimeState>>,
-    retry: &mut MembershipRetry,
-    idle_due: bool,
-) -> Result<(), StateUnavailable> {
-    let now = Instant::now();
-    let due_now =
-        |key: &(WorkspaceId, PublicIdentity)| retry.get(key).is_none_or(|(due, _)| *due <= now);
-    let forced = context.demand.take_ready(due_now);
-    // A Workspace's wake is consumed only when every current Member was dialled
-    // and answered, so one unreachable Member never hides the work from the
-    // others, and a peer waiting out its backoff keeps the wake alive.
-    let mut failed = BTreeSet::new();
-    let mut jobs = Vec::new();
-    for job in load_membership_jobs(state_arc, context.local, idle_due, &forced).await? {
-        // A peer that just failed is left alone until its backoff elapses, so
-        // an Installation that has gone away is not dialled on every wake.
-        if due_now(&(job.workspace, job.peer)) {
-            jobs.push(job);
-        } else {
-            failed.insert(job.workspace);
-        }
-    }
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    let mut attempted = BTreeMap::<WorkspaceId, i64>::new();
-    for chunk in jobs.chunks(MAX_DIALS) {
-        if context.stopped.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut running = FuturesUnordered::new();
-        for job in chunk {
-            attempted.insert(job.workspace, job.generation);
-            let state = Arc::clone(state_arc);
-            let network = Arc::clone(&context.network);
-            let replica = Arc::clone(&context.replica);
-            let cancel = context.cancel.clone();
-            let local = context.local;
-            running.push(async move {
-                // Re-check right before dialling: a revocation committed while
-                // this pass was queued must not produce a dial.
-                if !still_current(&state, local, job.peer, job.workspace).await {
-                    return (job.clone(), false);
-                }
-                let session = network.run_membership_session(
-                    iroh_base::EndpointAddr::new(job.peer.as_public_key()),
-                    replica,
-                    job.workspace,
-                    job.peer,
-                );
-                tokio::select! {
-                    result = session => (job.clone(), result.is_ok()),
-                    _ = cancel.notified() => (job.clone(), false),
-                }
-            });
-        }
-        while let Some((job, success)) = running.next().await {
-            let key = (job.workspace, job.peer);
-            if success {
-                if let Some((due, state)) = retry.get_mut(&key) {
-                    state.succeeded();
-                    *due = Instant::now();
-                }
-            } else {
-                // The Workspace wake stays unconsumed, so a later pass retries.
-                // Re-recording the demand here would spin this loop instead.
-                failed.insert(job.workspace);
-                let entry = retry
-                    .entry(key)
-                    .or_insert((Instant::now(), RetryState::new()));
-                let delay = entry.1.next_delay_jittered().min(MEMBERSHIP_RETRY_CEILING);
-                entry.0 = Instant::now() + delay;
-            }
-        }
-    }
-    for (workspace, generation) in attempted {
-        if !failed.contains(&workspace) {
-            let _ = consume_membership_wake(state_arc, workspace, generation).await;
-        }
-    }
-    Ok(())
-}
-
-async fn run_record_pass(
-    context: &WorkerContext,
-    state_arc: &Arc<Mutex<RuntimeState>>,
-    retry: &mut BTreeMap<(WorkspaceId, String, PublicIdentity), RetryState>,
-    reconcile_idle: bool,
-) -> Result<(), StateUnavailable> {
-    let jobs = load_jobs(state_arc, context.local, reconcile_idle).await?;
-    for chunk in jobs.chunks(MAX_DIALS) {
-        if context.stopped.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut running = FuturesUnordered::new();
-        for job in chunk {
-            let key = (job.workspace, job.package.clone(), job.peer);
-            let state = Arc::clone(state_arc);
-            let network = Arc::clone(&context.network);
-            let cancel = context.cancel.clone();
-            let local = context.local;
-            let demand = Arc::clone(&context.demand);
-            // Subscribe before the retry sleep, so a revocation committed while
-            // this job waits is observed instead of being slept through.
-            let mut cancelled_peer = context.sessions.subscribe(job.peer);
-            let delay = retry
-                .entry(key.clone())
-                .or_insert_with(RetryState::new)
-                .next_delay_jittered();
-            running.push(async move {
-                // The first retry is immediate; subsequent retries are capped
-                // and jittered to avoid synchronized member storms.
-                if delay > Duration::ZERO {
-                    tokio::time::sleep(delay).await;
-                }
-                if !still_current(&state, local, job.peer, job.workspace).await {
-                    return (job.clone(), None);
-                }
-                let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
-                    Arc::new(crate::runtime::RuntimeSyncReceiver {
-                        state: Arc::downgrade(&state),
-                        clock: Arc::new(SystemClock),
-                        demand,
-                    });
-                let session = network.send_log_sync(
-                    iroh_base::EndpointAddr::new(job.peer.as_public_key()),
-                    receiver,
-                    job.workspace,
-                    job.package.clone(),
-                    job.peer,
-                );
-                tokio::select! {
-                    result = session => (job.clone(), Some(result)),
-                    _ = cancel.notified() => (job.clone(), None),
-                    () = peer_sessions::cancelled(&mut cancelled_peer) => (job.clone(), None),
-                }
-            });
-        }
-        while let Some((job, result)) = running.next().await {
-            let key = (job.workspace, job.package.clone(), job.peer);
-            match result {
-                Some(Ok(_)) => {
-                    retry.entry(key).or_insert_with(RetryState::new).succeeded();
-                    let _ = consume_wake(state_arc, &job).await;
-                }
-                // A peer that does not know this Installation as a Member is
-                // exactly the case a membership session resolves.
-                Some(Err(LogSessionError::Refused(Refusal::NotAuthorized))) => {
-                    context.demand.note(job.workspace, job.peer);
-                }
-                Some(Err(_)) | None => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Re-checks the gate after the retry sleep, so a job queued before a
-/// revocation never dials. Unreachable or poisoned state means "do not dial".
-async fn still_current(
-    state: &Arc<Mutex<RuntimeState>>,
-    local: PublicIdentity,
-    peer: PublicIdentity,
-    workspace: WorkspaceId,
-) -> bool {
-    let state = Arc::downgrade(state);
-    crate::blocking::run_with_state(&state, move |state| {
-        state.memberships.get(&workspace).is_some_and(|projection| {
-            projection.contains_member(local) && projection.contains_member(peer)
+        let _ = tokio::time::timeout(self.limits.shutdown_grace, async {
+            while sessions.join_next().await.is_some() {}
         })
-    })
-    .await
-    .unwrap_or(false)
+        .await;
+        sessions.abort_all();
+    }
+
+    async fn apply(
+        &self,
+        core: &mut SchedulerCore,
+        actions: Vec<SchedulerAction>,
+    ) -> Result<(), StateUnavailable> {
+        for action in actions {
+            match action {
+                SchedulerAction::Consume { key, generation } => {
+                    consume(&self.state, &key, generation).await?;
+                }
+                SchedulerAction::ForceMembership { workspace, peer } => {
+                    core.force_membership(workspace, peer);
+                }
+                // Session health is reported to subscriptions by the health
+                // registry; the scheduler only says what it saw.
+                SchedulerAction::Health { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn load(
+        &self,
+        kind: ReloadKind,
+        attempts: BTreeMap<JobKey, Instant>,
+    ) -> Result<Vec<DueJob>, StateUnavailable> {
+        let local = self.local;
+        let limits = self.limits;
+        let now = Instant::now();
+        let forced = self.demand.take_ready(|_| true);
+        crate::blocking::run_with_state(&self.state, move |state| {
+            load_due_jobs(state, local, kind, limits, &attempts, now, &forced)
+        })
+        .await
+    }
 }
 
-/// Builds the membership jobs for this pass.
-///
-/// An Installation that is no longer a current Member of a Workspace schedules
-/// nothing for it, in either pass.
-async fn load_membership_jobs(
-    state: &Arc<Mutex<RuntimeState>>,
-    local: PublicIdentity,
-    idle_due: bool,
-    forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
-) -> Result<Vec<MembershipJob>, StateUnavailable> {
-    let forced = forced.clone();
-    let state = Arc::downgrade(state);
-    crate::blocking::run_with_state(&state, move |state| {
-        load_membership_jobs_locked(state, local, idle_due, &forced)
-    })
-    .await
+/// Completes when `deadline` passes, and otherwise never.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
-/// The durable half of one membership pass, on a blocking thread: which
-/// Workspaces and peers are due.
-fn load_membership_jobs_locked(
+/// Everything that is durably due right now, for every peer this Installation
+/// shares a Workspace with.
+fn load_due_jobs(
     state: &mut RuntimeState,
     local: PublicIdentity,
-    idle_due: bool,
+    kind: ReloadKind,
+    limits: SchedulerLimits,
+    attempts: &BTreeMap<JobKey, Instant>,
+    now: Instant,
     forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
-) -> Vec<MembershipJob> {
+) -> Vec<DueJob> {
     let mut jobs = Vec::new();
-    let Ok(mut statement) = state.connection.prepare(
-        "SELECT workspace_id, wake_generation, consumed_generation
-         FROM membership_sync_wakes ORDER BY workspace_id",
-    ) else {
-        return jobs;
+    #[cfg(test)]
+    let sweeping = kind == ReloadKind::FullSweep;
+    #[cfg(not(test))]
+    let sweeping = false;
+    let idle_due = |key: &JobKey, interval: Duration| {
+        sweeping
+            || attempts
+                .get(key)
+                .is_none_or(|attempt| now.duration_since(*attempt) >= interval)
     };
-    let rows = statement.query_map([], |row| {
-        let workspace: Vec<u8> = row.get(0)?;
-        Ok((
-            WorkspaceId::from_bytes(
-                workspace
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-            ),
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    });
-    let Ok(rows) = rows else {
-        return jobs;
-    };
-    for (workspace, generation, consumed) in rows.flatten() {
-        let Some(projection) = state.memberships.get(&workspace) else {
-            continue;
-        };
-        if !projection.contains_member(local) {
-            continue;
+    for (workspace, peer) in forced {
+        jobs.push(DueJob {
+            key: JobKey::Membership {
+                workspace: *workspace,
+                peer: *peer,
+            },
+            generation: 0,
+        });
+    }
+    let membership_progress = peer_progress(
+        state,
+        "SELECT workspace_id, peer_public_identity, consumed_generation
+         FROM membership_peer_progress",
+    );
+    for (workspace, generation) in membership_wakes(state) {
+        for peer in peers_of(state, local, workspace) {
+            let key = JobKey::Membership { workspace, peer };
+            let consumed = membership_progress
+                .get(&(workspace.as_bytes().to_vec(), peer))
+                .copied()
+                .unwrap_or(0);
+            if generation > consumed
+                || (kind == ReloadKind::MembershipIdle && idle_due(&key, limits.membership_idle))
+            {
+                jobs.push(DueJob { key, generation });
+            }
         }
-        let mut peers = forced
-            .iter()
-            .filter(|(candidate, _)| *candidate == workspace)
-            .map(|(_, peer)| *peer)
-            .collect::<BTreeSet<_>>();
-        if generation > consumed || idle_due {
-            peers.extend(
-                projection
-                    .snapshot()
-                    .members()
-                    .iter()
-                    .map(crate::MemberSnapshot::identity),
-            );
-        }
-        for peer in peers {
-            if peer != local && projection.contains_member(peer) {
-                jobs.push(MembershipJob {
-                    workspace,
-                    peer,
-                    generation,
-                });
+    }
+    let record_progress = peer_progress(
+        state,
+        "SELECT scope_id, peer_public_identity, consumed_generation FROM sync_peer_progress",
+    );
+    for (scope, workspace, package, generation) in record_wakes(state) {
+        for peer in peers_of(state, local, workspace) {
+            let key = JobKey::Records {
+                scope,
+                workspace,
+                package: package.clone(),
+                peer,
+            };
+            let consumed = record_progress
+                .get(&(scope.to_vec(), peer))
+                .copied()
+                .unwrap_or(0);
+            if generation > consumed
+                || ((sweeping || kind == ReloadKind::RecordIdle)
+                    && idle_due(&key, limits.record_idle))
+            {
+                jobs.push(DueJob { key, generation });
+            }
+            if jobs.len() >= limits.max_scheduled_jobs {
+                return jobs;
             }
         }
     }
     jobs
 }
 
-async fn load_jobs(
-    state: &Arc<Mutex<RuntimeState>>,
-    local: PublicIdentity,
-    idle: bool,
-) -> Result<Vec<Job>, StateUnavailable> {
-    let state = Arc::downgrade(state);
-    crate::blocking::run_with_state(&state, move |state| load_jobs_locked(state, local, idle)).await
+type ProgressKey = (Vec<u8>, PublicIdentity);
+
+fn peer_progress(state: &RuntimeState, query: &str) -> BTreeMap<ProgressKey, i64> {
+    let mut progress = BTreeMap::new();
+    let Ok(mut statement) = state.connection.prepare(query) else {
+        return progress;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    }) else {
+        return progress;
+    };
+    for (owner, peer, consumed) in rows.flatten() {
+        let Ok(peer) = <[u8; 32]>::try_from(peer).map(PublicIdentity::from_bytes) else {
+            continue;
+        };
+        let Ok(peer) = peer else { continue };
+        progress.insert((owner, peer), consumed);
+    }
+    progress
 }
 
-/// The durable half of one record pass, on a blocking thread.
-fn load_jobs_locked(state: &mut RuntimeState, local: PublicIdentity, idle: bool) -> Vec<Job> {
-    let mut jobs = Vec::new();
+fn membership_wakes(state: &RuntimeState) -> Vec<(WorkspaceId, i64)> {
     let Ok(mut statement) = state.connection.prepare(
-        "SELECT s.workspace_id,s.package_identity,w.wake_generation,w.consumed_generation
-         FROM sync_scopes s JOIN durable_wakes w USING(scope_id)
-         ORDER BY s.workspace_id,s.package_identity",
+        "SELECT workspace_id, wake_generation FROM membership_sync_wakes ORDER BY workspace_id",
     ) else {
-        return jobs;
+        return Vec::new();
     };
-    let rows = statement.query_map([], |row| {
-        let workspace: Vec<u8> = row.get(0)?;
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|(workspace, generation)| {
+            <[u8; 16]>::try_from(workspace)
+                .ok()
+                .map(|bytes| (WorkspaceId::from_bytes(bytes), generation))
+        })
+        .collect()
+}
+
+type RecordWake = ([u8; 32], WorkspaceId, String, i64);
+
+fn record_wakes(state: &RuntimeState) -> Vec<RecordWake> {
+    // A scope isolated by a local integrity failure is never scheduled.
+    let Ok(mut statement) = state.connection.prepare(
+        "SELECT s.scope_id, s.workspace_id, s.package_identity, w.wake_generation
+         FROM sync_scopes s JOIN durable_wakes w USING(scope_id)
+         LEFT JOIN quarantined_scopes q USING(scope_id)
+         WHERE q.scope_id IS NULL
+         ORDER BY s.workspace_id, s.package_identity",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
         Ok((
-            WorkspaceId::from_bytes(
-                workspace
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-            ),
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
         ))
-    });
-    let Ok(rows) = rows else {
-        return jobs;
+    }) else {
+        return Vec::new();
     };
-    for row in rows.flatten() {
-        let (workspace, package, generation, consumed) = row;
-        if !idle && generation <= consumed {
-            continue;
-        }
-        let Some(projection) = state.memberships.get(&workspace) else {
-            continue;
-        };
-        if !projection.contains_member(local) {
-            continue;
-        }
-        for member in projection.snapshot().members() {
-            let peer = member.identity();
-            if peer != local {
-                jobs.push(Job {
-                    workspace,
-                    package: package.clone(),
-                    peer,
-                    generation,
-                });
-            }
-        }
-    }
-    jobs
+    rows.flatten()
+        .filter_map(|(scope, workspace, package, generation)| {
+            let scope = <[u8; 32]>::try_from(scope).ok()?;
+            let workspace = <[u8; 16]>::try_from(workspace).ok()?;
+            Some((
+                scope,
+                WorkspaceId::from_bytes(workspace),
+                package,
+                generation,
+            ))
+        })
+        .collect()
 }
 
-async fn consume_membership_wake(
-    state: &Arc<Mutex<RuntimeState>>,
+/// The current Members of a Workspace this Installation is still a Member of.
+fn peers_of(
+    state: &RuntimeState,
+    local: PublicIdentity,
     workspace: WorkspaceId,
+) -> Vec<PublicIdentity> {
+    let Some(projection) = state.memberships.get(&workspace) else {
+        return Vec::new();
+    };
+    if !projection.contains_member(local) {
+        return Vec::new();
+    }
+    projection
+        .snapshot()
+        .members()
+        .iter()
+        .map(crate::MemberSnapshot::identity)
+        .filter(|peer| *peer != local)
+        .collect()
+}
+
+async fn consume(
+    state: &Weak<Mutex<RuntimeState>>,
+    key: &JobKey,
     generation: i64,
-) -> Result<(), SynchronizationError> {
-    let state = Arc::downgrade(state);
-    crate::blocking::run_with_state(&state, move |state| {
-        consume_membership_wake_locked(state, workspace, generation)
+) -> Result<(), StateUnavailable> {
+    let key = key.clone();
+    crate::blocking::run_with_state(state, move |state| {
+        consume_locked(state, &key, generation);
     })
     .await
-    .map_err(|_| SynchronizationError::RuntimeUnavailable)?
 }
 
-fn consume_membership_wake_locked(
-    state: &mut RuntimeState,
-    workspace: WorkspaceId,
-    generation: i64,
-) -> Result<(), SynchronizationError> {
-    let tx = state
-        .connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::Database))?;
-    tx.execute(
-        "UPDATE membership_sync_wakes SET consumed_generation=CASE
-             WHEN consumed_generation < ?2 THEN ?2 ELSE consumed_generation END
-         WHERE workspace_id=?1",
-        rusqlite::params![workspace.as_bytes().as_slice(), generation],
-    )
-    .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::Database))?;
-    tx.commit()
-        .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::UncertainOutcome))
-}
-
-async fn consume_wake(
-    state: &Arc<Mutex<RuntimeState>>,
-    job: &Job,
-) -> Result<(), SynchronizationError> {
-    let job = job.clone();
-    let state = Arc::downgrade(state);
-    crate::blocking::run_with_state(&state, move |state| consume_wake_locked(state, &job))
-        .await
-        .map_err(|_| SynchronizationError::RuntimeUnavailable)?
-}
-
-fn consume_wake_locked(state: &mut RuntimeState, job: &Job) -> Result<(), SynchronizationError> {
-    let tx = state
-        .connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::Database))?;
-    tx.execute(
-        "UPDATE durable_wakes SET consumed_generation=CASE
-             WHEN consumed_generation < ?2 THEN ?2 ELSE consumed_generation END
-         WHERE scope_id=(SELECT scope_id FROM sync_scopes
-                         WHERE workspace_id=?1 AND package_identity=?3)",
-        rusqlite::params![
-            job.workspace.as_bytes().as_slice(),
-            job.generation,
-            job.package
-        ],
-    )
-    .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::Database))?;
-    tx.commit()
-        .map_err(|_| SynchronizationError::Storage(crate::error::StorageError::UncertainOutcome))
+fn consume_locked(state: &mut RuntimeState, key: &JobKey, generation: i64) {
+    let result = match key {
+        JobKey::Membership { workspace, peer } => state.connection.execute(
+            "INSERT INTO membership_peer_progress
+                 (workspace_id, peer_public_identity, consumed_generation)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT DO UPDATE SET
+                 consumed_generation = MAX(consumed_generation, excluded.consumed_generation)",
+            rusqlite::params![
+                workspace.as_bytes().as_slice(),
+                peer.as_bytes().as_slice(),
+                generation
+            ],
+        ),
+        JobKey::Records { scope, peer, .. } => state.connection.execute(
+            "INSERT INTO sync_peer_progress
+                 (scope_id, peer_public_identity, consumed_generation)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT DO UPDATE SET
+                 consumed_generation = MAX(consumed_generation, excluded.consumed_generation)",
+            rusqlite::params![scope.as_slice(), peer.as_bytes().as_slice(), generation],
+        ),
+    };
+    if result.is_err() {
+        // Progress that cannot be recorded only means the job is due again.
+        eprintln!("sync progress for a {} job was not recorded", key.kind());
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::atomic::AtomicUsize;
 
-    #[test]
-    fn worker_bounds_dial_batch() {
-        assert_eq!(MAX_DIALS, 4);
-        assert_eq!(MAX_DIALS, crate::network::MAX_OUTBOUND_PEERS);
-        assert!(IDLE_RECONCILIATION > Duration::from_secs(1));
+    use super::*;
+    use crate::synchronization::scheduler::no_jitter;
+
+    const PACKAGE: &str = "teamarness.test";
+
+    /// A scripted runner. Only the session is scripted: the scheduler, the
+    /// driver, the durable loads and the real storage under them are real.
+    struct FakeRunner {
+        dispatches: Mutex<Vec<(JobKey, Instant)>>,
+        outcome: SessionOutcome,
+        /// When set, a session waits for this before returning.
+        release: Arc<Notify>,
+        hold: AtomicBool,
+        /// When set, a session never returns and ignores the stop signal.
+        wedge: AtomicBool,
+        started: Arc<Notify>,
+        running: AtomicUsize,
     }
 
-    #[test]
-    fn a_full_membership_sweep_runs_about_every_thirty_seconds() {
-        assert_eq!(
-            IDLE_RECONCILIATION * MEMBERSHIP_IDLE_EVERY,
-            Duration::from_secs(30)
+    impl FakeRunner {
+        fn new(outcome: SessionOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                dispatches: Mutex::new(Vec::new()),
+                outcome,
+                release: Arc::new(Notify::new()),
+                hold: AtomicBool::new(false),
+                wedge: AtomicBool::new(false),
+                started: Arc::new(Notify::new()),
+                running: AtomicUsize::new(0),
+            })
+        }
+
+        fn dispatches(&self) -> Vec<(JobKey, Instant)> {
+            self.dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn dispatches_for(&self, peer: PublicIdentity) -> usize {
+            self.dispatches()
+                .iter()
+                .filter(|(key, _)| key.peer() == peer)
+                .count()
+        }
+    }
+
+    impl SessionRunner for FakeRunner {
+        fn run(
+            &self,
+            job: DueJob,
+            _stop: watch::Receiver<bool>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SessionOutcome> + Send>> {
+            self.dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((job.key, Instant::now()));
+            let outcome = self.outcome;
+            let release = Arc::clone(&self.release);
+            let started = Arc::clone(&self.started);
+            let hold = self.hold.load(Ordering::Acquire);
+            let wedge = self.wedge.load(Ordering::Acquire);
+            self.running.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                started.notify_waiters();
+                if wedge {
+                    std::future::pending::<()>().await;
+                }
+                if hold {
+                    release.notified().await;
+                }
+                outcome
+            })
+        }
+    }
+
+    /// A Workspace with one record scope and one other Member, in real storage.
+    ///
+    /// Storage, the durable wakes and the record scope are the real ones; the
+    /// second Member's projection is built directly, because this fixture has
+    /// no networking to admit one through.
+    struct Fixture {
+        state: Arc<Mutex<RuntimeState>>,
+        local: PublicIdentity,
+        peer: PublicIdentity,
+        workspace: WorkspaceId,
+        root: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn open(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "teamarness-scheduler-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("the test root is created");
+            let stored = crate::storage::open(&root, 0).expect("a migrated database");
+            let mut connection = stored.connection;
+            let secret = stored.secret_key;
+            let local = PublicIdentity::from_bytes(*secret.public().as_bytes())
+                .expect("the local identity is valid");
+            let summary = crate::workspace::create(&mut connection, &secret, "Scheduling", 0)
+                .expect("the Workspace is created");
+            let workspace = summary.id();
+            crate::synchronization::append(
+                &mut connection,
+                &secret,
+                workspace,
+                PACKAGE,
+                "message.post",
+                b"seed",
+                crate::synchronization::MembershipStanding::Current,
+                true,
+                0,
+            )
+            .expect("the scope exists");
+            let peer = PublicIdentity::from_bytes(
+                *iroh_base::SecretKey::from_bytes(&[9; 32])
+                    .public()
+                    .as_bytes(),
+            )
+            .expect("the peer identity is valid");
+            let projection = crate::membership::WorkspaceProjection::for_replication_test(
+                workspace,
+                local,
+                crate::MembershipOperationId::digest([1]),
+                std::collections::BTreeMap::new(),
+                vec![local, peer],
+            );
+            let memberships = BTreeMap::from([(workspace, projection)]);
+            let state = Arc::new(Mutex::new(RuntimeState::for_scheduler_tests(
+                connection,
+                secret,
+                memberships,
+            )));
+            Self {
+                state,
+                local,
+                peer,
+                workspace,
+                root,
+            }
+        }
+
+        fn finish(self) {
+            drop(self.state);
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn start(
+        fixture: &Fixture,
+        runner: Arc<FakeRunner>,
+        limits: SchedulerLimits,
+    ) -> Arc<SyncWorker> {
+        SyncWorker::start(
+            Arc::clone(
+                &fixture
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .sync_wake,
+            ),
+            Arc::downgrade(&fixture.state),
+            fixture.local,
+            runner,
+            MembershipDemand::new(),
+            limits,
+            no_jitter,
+        )
+    }
+
+    /// Waits for `check` on paused time, letting the driver run between polls.
+    async fn until(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if check() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wake_burst_during_a_session_causes_one_follow_up_reload() {
+        let fixture = Fixture::open("wake-burst");
+        let runner = FakeRunner::new(SessionOutcome::Completed { truncated: false });
+        runner.hold.store(true, Ordering::Release);
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+
+        until("the first session is dispatched", || {
+            !runner.dispatches().is_empty()
+        })
+        .await;
+        let after_first = worker.loads_for_test();
+        for _ in 0..1_000 {
+            worker.wake();
+        }
+        runner.hold.store(false, Ordering::Release);
+        runner.release.notify_waiters();
+        until("the follow-up load has run", || {
+            worker.loads_for_test() > after_first
+        })
+        .await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        // A thousand wakes cost at most two follow-up loads: one for the
+        // waiter that was already parked, and one stored permit. Without
+        // coalescing this would be a thousand.
+        let follow_ups = worker.loads_for_test() - after_first;
+        assert!(
+            (1..=2).contains(&follow_ups),
+            "a thousand wakes coalesced into {follow_ups} follow-up loads"
         );
+        assert_eq!(
+            runner.dispatches_for(fixture.peer),
+            1,
+            "the wakes carried no new work, so nothing is dialled again"
+        );
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_during_backoff_returns_without_advancing_time() {
+        let fixture = Fixture::open("shutdown-backoff");
+        let runner = FakeRunner::new(SessionOutcome::Unreachable);
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        for expected in 1..=3 {
+            until("the peer has failed again", || {
+                runner.dispatches_for(fixture.peer) >= expected
+            })
+            .await;
+            // Step past the backoff this failure created, so the next attempt
+            // is due. Shutdown must not do the same.
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+
+        let before = Instant::now();
+        worker.shutdown().await;
+        assert!(
+            Instant::now().duration_since(before) < Duration::from_secs(1),
+            "shutdown does not wait out a backoff"
+        );
+        drop(worker);
+        fixture.finish();
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_waits_at_most_the_grace_for_sessions_that_ignore_stop() {
+        let fixture = Fixture::open("shutdown-grace");
+        let runner = FakeRunner::new(SessionOutcome::Completed { truncated: false });
+        runner.wedge.store(true, Ordering::Release);
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        until("a session is running", || !runner.dispatches().is_empty()).await;
+
+        let before = Instant::now();
+        worker.shutdown().await;
+        assert_eq!(
+            Instant::now().duration_since(before),
+            SchedulerLimits::CURRENT.shutdown_grace,
+            "shutdown waits exactly the grace for a session that ignores it"
+        );
+        drop(worker);
+        fixture.finish();
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn revoked_peer_in_backoff_is_never_dialled() {
+        let fixture = Fixture::open("revoked-backoff");
+        let runner = FakeRunner::new(SessionOutcome::Unreachable);
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        until("the peer has failed once", || {
+            runner.dispatches_for(fixture.peer) >= 1
+        })
+        .await;
+        let dispatched = runner.dispatches_for(fixture.peer);
+
+        // The peer leaves the Workspace while it is waiting out its backoff.
+        fixture
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_membership_for_test(fixture.workspace, None);
+        worker.wake();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            runner.dispatches_for(fixture.peer),
+            dispatched,
+            "a peer that is no longer a Member is never dialled again"
+        );
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn busy_runtime_lock_delays_but_does_not_drop_a_wake() {
+        let fixture = Fixture::open("busy-lock");
+        let runner = FakeRunner::new(SessionOutcome::Completed { truncated: false });
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        until("the first pass has run", || worker.loads_for_test() >= 1).await;
+        let before = worker.loads_for_test();
+
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(&fixture.state);
+        let holding = std::thread::spawn(move || {
+            let _guard = held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = released.recv();
+        });
+        // Let the holding thread take the lock before the wake lands.
+        while fixture.state.try_lock().is_ok() {
+            std::thread::yield_now();
+        }
+
+        worker.wake();
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            worker.loads_for_test(),
+            before,
+            "a busy lock delays the load instead of skipping it"
+        );
+
+        let _ = release.send(());
+        holding.join().expect("the holding thread finishes");
+        until("the delayed wake is loaded", || {
+            worker.loads_for_test() > before
+        })
+        .await;
+
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
     }
 }

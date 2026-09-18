@@ -1178,6 +1178,9 @@ pub(crate) struct RuntimeState {
     /// The one clock every commit time is read from, injectable in tests.
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) peer_sessions: Arc<crate::synchronization::PeerSessions>,
+    /// Asks the synchronization scheduler to reload what is due. Every commit
+    /// path can reach it, so nothing waits for an idle tick to be noticed.
+    pub(crate) sync_wake: Arc<tokio::sync::Notify>,
     secret_key: iroh_base::SecretKey,
     display_name: String,
     pub(crate) memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
@@ -1185,6 +1188,50 @@ pub(crate) struct RuntimeState {
     record_subscribers: BTreeMap<(WorkspaceId, String), Vec<RecordSubscriber>>,
     next_subscriber_id: u64,
     pub(crate) poisoned: bool,
+}
+
+#[cfg(test)]
+impl RuntimeState {
+    /// Builds a runtime state with no networking, for scheduler driver tests.
+    ///
+    /// Storage and the membership projection are the real ones; only the
+    /// Endpoint and the session runner are absent.
+    pub(crate) fn for_scheduler_tests(
+        connection: rusqlite::Connection,
+        secret_key: iroh_base::SecretKey,
+        memberships: BTreeMap<WorkspaceId, crate::membership::WorkspaceProjection>,
+    ) -> Self {
+        Self {
+            connection,
+            clock: Arc::new(SystemClock),
+            peer_sessions: crate::synchronization::PeerSessions::new(),
+            sync_wake: Arc::new(tokio::sync::Notify::new()),
+            secret_key,
+            display_name: crate::identity::DEFAULT_DISPLAY_NAME.to_owned(),
+            memberships,
+            subscribers: BTreeMap::new(),
+            record_subscribers: BTreeMap::new(),
+            next_subscriber_id: 0,
+            poisoned: false,
+        }
+    }
+
+    /// Replaces the membership projection of one Workspace, as a revocation
+    /// that arrived from elsewhere would.
+    pub(crate) fn replace_membership_for_test(
+        &mut self,
+        workspace: WorkspaceId,
+        projection: Option<crate::membership::WorkspaceProjection>,
+    ) {
+        match projection {
+            Some(projection) => {
+                self.memberships.insert(workspace, projection);
+            }
+            None => {
+                self.memberships.remove(&workspace);
+            }
+        }
+    }
 }
 
 pub(crate) trait Clock: Send + Sync {
@@ -1275,10 +1322,12 @@ impl CoreRuntime {
         let _ = recovery;
         let public_identity = PublicIdentity(secret_key.public());
         let peer_sessions = crate::synchronization::PeerSessions::new();
+        let sync_wake = Arc::new(tokio::sync::Notify::new());
         let state = Arc::new(Mutex::new(RuntimeState {
             connection,
             clock: Arc::clone(&clock),
             peer_sessions: Arc::clone(&peer_sessions),
+            sync_wake: Arc::clone(&sync_wake),
             secret_key: secret_key.clone(),
             display_name,
             memberships,
@@ -1329,7 +1378,7 @@ impl CoreRuntime {
                 std::time::Duration::from_millis(5),
                 ready_immediately,
                 issuer,
-                services,
+                services.clone(),
                 protocols,
             )
             .await
@@ -1337,7 +1386,7 @@ impl CoreRuntime {
             crate::onboarding::transport::Transport::bind_production(
                 secret_key.clone(),
                 issuer,
-                Some(services),
+                Some(services.clone()),
                 protocols,
             )
             .await
@@ -1346,7 +1395,7 @@ impl CoreRuntime {
         let transport = crate::onboarding::transport::Transport::bind_production(
             secret_key.clone(),
             issuer,
-            Some(services),
+            Some(services.clone()),
             protocols,
         )
         .await;
@@ -1355,13 +1404,22 @@ impl CoreRuntime {
         // Recovery has completed before the worker is started. The worker owns
         // wake consumption and scheduling, while all network awaits happen
         // outside the runtime state mutex.
-        let sync_worker = crate::synchronization::SyncWorker::start(
-            Arc::downgrade(&state),
+        let runner = crate::synchronization::worker::NetworkSessionRunner::new(
             Arc::clone(&transport),
-            public_identity,
-            Arc::clone(&peer_sessions),
+            services,
             Arc::clone(&membership_replica),
             Arc::clone(&demand),
+            Arc::downgrade(&state),
+            public_identity,
+        );
+        let sync_worker = crate::synchronization::SyncWorker::start(
+            sync_wake,
+            Arc::downgrade(&state),
+            public_identity,
+            Arc::new(runner),
+            Arc::clone(&demand),
+            crate::synchronization::limits::SchedulerLimits::CURRENT,
+            crate::synchronization::scheduler::production_jitter,
         );
         Ok(Self {
             public_identity,
@@ -2351,10 +2409,18 @@ impl CoreRuntime {
             .store(paused, std::sync::atomic::Ordering::Release);
     }
 
-    /// Stops and resumes record replication scheduling.
+    /// What the scheduler currently knows about each peer.
     #[cfg(test)]
-    pub(crate) fn pause_record_replication_for_test(&self, paused: bool) {
-        self.sync_worker.pause_records_for_test(paused);
+    pub(crate) fn scheduler_snapshot_for_test(
+        &self,
+    ) -> Vec<crate::synchronization::scheduler::PeerSnapshot> {
+        self.sync_worker.snapshot_for_test()
+    }
+
+    /// Stops and resumes synchronization scheduling.
+    #[cfg(test)]
+    pub(crate) fn pause_sync_scheduler_for_test(&self, paused: bool) {
+        self.sync_worker.pause_for_test(paused);
     }
 
     /// Isolates one stored record, as a failed read would.
@@ -2466,7 +2532,7 @@ impl CoreRuntime {
     /// Runs one synchronization pass now instead of waiting for the idle tick.
     #[cfg(test)]
     pub(crate) fn sync_now_for_test(&self) {
-        self.sync_worker.wake();
+        self.sync_worker.sweep_for_test();
     }
 
     /// Dials a peer's package synchronization ALPN as this Installation and

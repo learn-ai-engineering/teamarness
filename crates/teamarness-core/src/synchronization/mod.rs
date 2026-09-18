@@ -14,11 +14,10 @@ pub(crate) mod parking;
 pub(crate) mod peer_sessions;
 mod protection_control;
 pub(crate) mod quarantine;
-mod scheduler;
+pub(crate) mod scheduler;
 #[cfg(test)]
 pub(crate) mod test_io;
-mod wakes;
-mod worker;
+pub(crate) mod worker;
 
 #[cfg(test)]
 pub(crate) use operation_store::log_id as operation_log_id;
@@ -678,39 +677,6 @@ fn write_hex(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{byte:02x}")?;
     }
     Ok(())
-}
-
-// These private seams are intentionally named and kept independent so production and
-// deterministic adapters can be tested through identical semantic behavior.
-trait ReplicatedRecordStore {
-    fn put(&mut self, record: SealedRecordV1) -> Result<(), ValueParseError>;
-}
-trait ReplicaEngine {
-    fn record_id(&self, operation: &[u8]) -> RecordId;
-}
-trait PeerSessionTransport {
-    fn bounds(&self) -> (usize, usize);
-}
-struct DeterministicStore(Vec<SealedRecordV1>);
-impl ReplicatedRecordStore for DeterministicStore {
-    fn put(&mut self, record: SealedRecordV1) -> Result<(), ValueParseError> {
-        if !self.0.iter().any(|old| old.record_id == record.record_id) {
-            self.0.push(record);
-        }
-        Ok(())
-    }
-}
-struct DeterministicReplica;
-impl ReplicaEngine for DeterministicReplica {
-    fn record_id(&self, operation: &[u8]) -> RecordId {
-        RecordId::digest(operation)
-    }
-}
-struct DeterministicTransport;
-impl PeerSessionTransport for DeterministicTransport {
-    fn bounds(&self) -> (usize, usize) {
-        (4_096, 64 * 1024 * 1024)
-    }
 }
 
 /// A committed immutable record returned by local append.
@@ -2410,31 +2376,6 @@ mod tests {
             assert!(validate_open_batch(&[]).is_err());
             assert!(validate_open_batch(&[vec![0; MAX_OPEN_BYTES + 1]]).is_err());
             assert!(validate_frontier(MAX_PARENTS + 1).is_err());
-        }
-    }
-
-    pub(crate) mod replica_compatibility {
-        use super::*;
-        #[test]
-        fn deterministic_replica_and_store_deduplicate_operations() {
-            let replica = DeterministicReplica;
-            let operation = b"operation";
-            assert_eq!(replica.record_id(operation), replica.record_id(operation));
-            let record = signed();
-            let id = RecordId::digest(&record.canonical_bytes());
-            let sealed = SealedRecordV1 {
-                scope_digest: [1; 32],
-                record_id: id,
-                order_key: OrderKey::from_height_and_id(0, id),
-                content_key_id: [2; 32],
-                nonce: [3; 24],
-                ciphertext: vec![4],
-            };
-            let mut store = DeterministicStore(Vec::new());
-            store.put(sealed.clone()).unwrap();
-            store.put(sealed).unwrap();
-            assert_eq!(store.0.len(), 1);
-            assert_eq!(DeterministicTransport.bounds(), (4_096, 64 * 1024 * 1024));
         }
     }
 

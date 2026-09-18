@@ -80,6 +80,43 @@ impl SessionLimits {
     }
 }
 
+/// Every bound the synchronization scheduler obeys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SchedulerLimits {
+    /// Sessions in flight across all peers.
+    pub(crate) outbound_sessions: usize,
+    /// How many of those slots peers that keep failing may occupy.
+    pub(crate) failing_peer_slots: usize,
+    /// Consecutive failures after which a peer counts as failing.
+    pub(crate) failing_threshold: u32,
+    pub(crate) retry_base: Duration,
+    pub(crate) retry_cap: Duration,
+    pub(crate) jitter_ratio_percent: u32,
+    /// How long a (scope, peer) pair may go unattempted before it is due again.
+    pub(crate) record_idle: Duration,
+    /// The same, for canonical membership.
+    pub(crate) membership_idle: Duration,
+    /// The in-memory job set; the rest are picked up by the next durable load.
+    pub(crate) max_scheduled_jobs: usize,
+    /// How long shutdown waits for sessions before abandoning them.
+    pub(crate) shutdown_grace: Duration,
+}
+
+impl SchedulerLimits {
+    pub(crate) const CURRENT: Self = Self {
+        outbound_sessions: 4,
+        failing_peer_slots: 2,
+        failing_threshold: 2,
+        retry_base: Duration::from_millis(500),
+        retry_cap: Duration::from_secs(60),
+        jitter_ratio_percent: 20,
+        record_idle: Duration::from_secs(60),
+        membership_idle: Duration::from_secs(30),
+        max_scheduled_jobs: 4_096,
+        shutdown_grace: Duration::from_secs(2),
+    };
+}
+
 /// A peer asked for more than its session budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BudgetExceeded;

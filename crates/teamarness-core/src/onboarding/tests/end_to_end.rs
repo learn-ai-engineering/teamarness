@@ -68,7 +68,22 @@ async fn open(name: &str) -> (std::path::PathBuf, CoreRuntime) {
 async fn close(runtime: CoreRuntime, path: &std::path::Path) {
     runtime.shutdown().await.unwrap();
     drop(runtime);
-    fs::remove_dir_all(path).unwrap();
+    remove_directory(path);
+}
+
+/// Removes a test directory, tolerating the readdir and rmdir race this
+/// platform shows when a directory is being torn down under load.
+///
+/// The failure it retries is the operating system's, not the product's.
+fn remove_directory(path: &std::path::Path) {
+    for attempt in 0..50 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt == 49 => panic!("{}: {error}", path.display()),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 #[tokio::test]
@@ -372,6 +387,6 @@ async fn malformed_frame_and_shutdown_during_active_work_fail_without_admission(
     drop(issuer);
     let client = Arc::try_unwrap(client).expect("shutdown task released runtime");
     drop(client);
-    fs::remove_dir_all(issuer_directory).unwrap();
-    fs::remove_dir_all(client_directory).unwrap();
+    remove_directory(&issuer_directory);
+    remove_directory(&client_directory);
 }

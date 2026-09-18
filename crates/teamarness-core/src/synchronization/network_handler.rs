@@ -296,18 +296,18 @@ async fn request_application_ack(
     let (mut send, mut receive) = connection
         .open_bi()
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     let mut request = APPLICATION_ACK_REQUEST.to_vec();
     request.push(u8::from(truncated));
     send.write_all(&request)
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     send.finish()
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     let ack = receive
         .read_to_end(APPLICATION_ACK.len() + 1)
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     parse_truncated_suffix(&ack, APPLICATION_ACK)
 }
 
@@ -319,22 +319,22 @@ async fn acknowledge_application(
     let (mut send, mut receive) = connection
         .accept_bi()
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     let request = receive
         .read_to_end(APPLICATION_ACK_REQUEST.len() + 1)
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     let peer_truncated = parse_truncated_suffix(&request, APPLICATION_ACK_REQUEST)?;
     let mut reply = APPLICATION_ACK.to_vec();
     reply.push(u8::from(truncated));
     send.write_all(&reply)
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     send.finish()
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     send.stopped()
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     Ok(peer_truncated)
 }
 
@@ -466,11 +466,11 @@ async fn outbound_session_body(
     )
     .await
     .map_err(|_| LogSessionError::Transport("package sync dial timed out".to_owned()))?
-    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    .map_err(connect_error)?;
     let (send, receive) = connection
         .open_bi()
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(&connection, &error))?;
     let mut reader = FrameReader::spawn(receive, limits);
     // The initiator's next inbound frame is the `Welcome`.
     reader.set_phase(FramePhase::Handshake);
@@ -482,7 +482,7 @@ async fn outbound_session_body(
         content_key_id: grant.content_key_id,
     })
     .await
-    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    .map_err(|error| transport_error(&connection, &error))?;
     let welcome = match reader.next_wire().await {
         Ok(wire) => wire,
         Err(error) => return Err(refusal_from_close(&connection, error).await),
@@ -540,7 +540,7 @@ async fn outbound_session_body(
         protection: offer.map(ProtectionBundleWire::from_bundle),
     })
     .await
-    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    .map_err(|error| transport_error(&connection, &error))?;
     reader.set_phase(FramePhase::Session);
     let result = exchange_and_acknowledge(
         &connection,
@@ -571,6 +571,29 @@ fn peer_close_reason(connection: &Connection) -> Option<LogSessionError> {
         return None;
     };
     close_code_reason(u64::from(close.error_code))
+}
+
+/// Maps a stream failure onto the reason the peer gave for closing, when it
+/// gave one. A write or read that fails because the peer closed the connection
+/// says nothing useful on its own.
+fn transport_error(connection: &Connection, error: &impl std::fmt::Display) -> LogSessionError {
+    peer_close_reason(connection).unwrap_or_else(|| LogSessionError::Transport(error.to_string()))
+}
+
+/// Maps a dial that the responder refused onto the reason it gave.
+///
+/// A responder that is at its concurrency bound closes the connection during
+/// the dial, so the reason arrives as a connect failure rather than as a frame.
+fn connect_error(error: iroh::endpoint::ConnectError) -> LogSessionError {
+    if let iroh::endpoint::ConnectError::Connection {
+        source: iroh::endpoint::ConnectionError::ApplicationClosed(close),
+        ..
+    } = &error
+        && let Some(reason) = close_code_reason(u64::from(close.error_code))
+    {
+        return reason;
+    }
+    LogSessionError::Transport(error.to_string())
 }
 
 /// Names the failure a peer's close code stands for, when this side knows it.
@@ -713,7 +736,7 @@ async fn run_log_session_body(
     let (send, receive) = connection
         .accept_bi()
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     let mut reader = FrameReader::spawn(receive, limits);
     let mut sink = frame_sink(send, limits);
     // A peer that says nothing must not hold an inbound slot for the whole
@@ -721,7 +744,7 @@ async fn run_log_session_body(
     let hello = timeout(limits.hello_timeout, reader.next_wire())
         .await
         .map_err(|_| LogSessionError::Protocol("package sync hello timed out".to_owned()))?
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+        .map_err(|error| transport_error(connection, &error))?;
     let (workspace, package, remote_version, remote_key) = match hello {
         LogSyncWire::Hello {
             workspace,
@@ -777,7 +800,7 @@ async fn run_log_session_body(
         protection: bundle.map(ProtectionBundleWire::from_bundle),
     })
     .await
-    .map_err(|error| LogSessionError::Transport(error.to_string()))?;
+    .map_err(|error| transport_error(connection, &error))?;
     if remote_version != grant.membership_version {
         let _ = crate::blocking::receiver_call(receiver, move |receiver| {
             receiver.note_membership_mismatch(workspace, peer);
@@ -787,7 +810,7 @@ async fn run_log_session_body(
     match reader
         .next_wire()
         .await
-        .map_err(|error| LogSessionError::Transport(error.to_string()))?
+        .map_err(|error| transport_error(connection, &error))?
     {
         LogSyncWire::Ready { protection } => {
             if let Some(bundle) = protection {

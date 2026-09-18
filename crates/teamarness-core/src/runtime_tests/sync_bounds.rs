@@ -156,25 +156,23 @@ async fn session_stops_at_the_send_budget_and_reports_truncation() {
     };
     let cluster =
         SyncCluster::start_with_limits("send-budget", &["a", "b"], &[("a", limits)]).await;
-    // Only the explicit sessions below move records, so each report is about a
-    // session this test ran.
-    cluster.node("a").pause_record_replication_for_test(true);
-    cluster.node("b").pause_record_replication_for_test(true);
     let workspace = cluster.node("a").create_workspace("Send budget").unwrap();
     let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 2
+        })
+        .await;
+    // From here only the explicit sessions below move records, so each report
+    // is about a session this test ran.
+    pause_scheduling(&cluster, &["a", "b"]);
     for index in 0..25_u8 {
         cluster
             .node("a")
             .append_record(id, PACKAGE, "message.post", &[index; 8])
             .unwrap();
     }
-    cluster.admit("a", "b", id).await;
-    cluster.replicate_membership("a", "b", id).await;
-    cluster
-        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
-            c.members("b", id).len() == 2
-        })
-        .await;
 
     let first = replicate(&cluster, id).await;
     assert!(first.sent_truncated, "the first session stops at its bound");
@@ -197,23 +195,21 @@ async fn session_stops_at_the_send_budget_and_reports_truncation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_does_not_load_the_whole_scope() {
     let cluster = SyncCluster::start("no-whole-scope-load", &["a", "b"]).await;
-    cluster.node("a").pause_record_replication_for_test(true);
-    cluster.node("b").pause_record_replication_for_test(true);
     let workspace = cluster.node("a").create_workspace("Lazy").unwrap();
     let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 2
+        })
+        .await;
+    pause_scheduling(&cluster, &["a", "b"]);
     for index in 0..300_u16 {
         cluster
             .node("a")
             .append_record(id, PACKAGE, "message.post", &index.to_be_bytes())
             .unwrap();
     }
-    cluster.admit("a", "b", id).await;
-    cluster.replicate_membership("a", "b", id).await;
-    cluster
-        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
-            c.members("b", id).len() == 2
-        })
-        .await;
     replicate(&cluster, id).await;
     assert_eq!(cluster.record_ids("b", id, PACKAGE).len(), 300);
 
@@ -234,11 +230,17 @@ async fn session_does_not_load_the_whole_scope() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn served_log_stops_before_a_quarantined_record() {
     let cluster = SyncCluster::start("quarantined-served-log", &["a", "b", "c"]).await;
-    cluster.node("a").pause_record_replication_for_test(true);
-    cluster.node("b").pause_record_replication_for_test(true);
-    cluster.node("c").pause_record_replication_for_test(true);
     let workspace = cluster.node("a").create_workspace("Gap").unwrap();
     let id = workspace.id();
+    for joiner in ["b", "c"] {
+        cluster.admit("a", joiner, id).await;
+    }
+    cluster
+        .wait_until("both joiners hold the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 3 && c.members("c", id).len() == 3
+        })
+        .await;
+    pause_scheduling(&cluster, &["a", "b", "c"]);
     let mut appended = Vec::new();
     for index in 0..6_u8 {
         appended.push(
@@ -248,15 +250,6 @@ async fn served_log_stops_before_a_quarantined_record() {
                 .unwrap(),
         );
     }
-    for joiner in ["b", "c"] {
-        cluster.admit("a", joiner, id).await;
-        cluster.replicate_membership("a", joiner, id).await;
-    }
-    cluster
-        .wait_until("both joiners hold the roster", DEFAULT_DEADLINE, |c| {
-            c.members("b", id).len() == 3 && c.members("c", id).len() == 3
-        })
-        .await;
 
     // C takes the whole log first, then A isolates its own fourth record.
     cluster
@@ -309,23 +302,21 @@ async fn served_log_stops_before_a_quarantined_record() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corrupt_projection_row_fails_the_range_and_quarantines_the_scope() {
     let cluster = SyncCluster::start("corrupt-served-row", &["a", "b"]).await;
-    cluster.node("a").pause_record_replication_for_test(true);
-    cluster.node("b").pause_record_replication_for_test(true);
     let workspace = cluster.node("a").create_workspace("Corrupt").unwrap();
     let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster
+        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 2
+        })
+        .await;
+    pause_scheduling(&cluster, &["a", "b"]);
     for index in 0..3_u8 {
         cluster
             .node("a")
             .append_record(id, PACKAGE, "message.post", &[index; 8])
             .unwrap();
     }
-    cluster.admit("a", "b", id).await;
-    cluster.replicate_membership("a", "b", id).await;
-    cluster
-        .wait_until("b holds the roster", DEFAULT_DEADLINE, |c| {
-            c.members("b", id).len() == 2
-        })
-        .await;
 
     cluster.node("a").tamper_payload_hash_for_test(id, PACKAGE);
     let result = cluster
@@ -351,6 +342,13 @@ async fn corrupt_projection_row_fails_the_range_and_quarantines_the_scope() {
     cluster.finish().await;
 }
 
+/// Stops scheduling on the named nodes, so only explicit sessions run.
+fn pause_scheduling(cluster: &SyncCluster, names: &[&str]) {
+    for name in names {
+        cluster.node(name).pause_sync_scheduler_for_test(true);
+    }
+}
+
 /// Runs one explicit session from A to B and returns its report.
 async fn replicate(
     cluster: &SyncCluster,
@@ -366,4 +364,43 @@ async fn replicate(
         )
         .await
         .expect("the session completes")
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_peer_does_not_delay_other_peers() {
+    let mut cluster = SyncCluster::start("offline-peer", &["a", "b", "c"]).await;
+    let workspace = cluster.node("a").create_workspace("Offline").unwrap();
+    let id = workspace.id();
+    for joiner in ["b", "c"] {
+        cluster.admit("a", joiner, id).await;
+    }
+    cluster
+        .wait_until("both joiners hold the roster", DEFAULT_DEADLINE, |c| {
+            c.members("b", id).len() == 3 && c.members("c", id).len() == 3
+        })
+        .await;
+
+    // C goes away; A keeps its own schedule for B.
+    let absent = cluster.identity("c");
+    cluster.stop("c").await;
+    let record = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"while c is away")
+        .unwrap();
+
+    cluster
+        .wait_until("b receives the record", DEFAULT_DEADLINE, |c| {
+            c.record_ids("b", id, PACKAGE).contains(&record.record_id())
+        })
+        .await;
+    cluster
+        .wait_until("a records c as failing", DEFAULT_DEADLINE, |c| {
+            c.node("a")
+                .scheduler_snapshot_for_test()
+                .iter()
+                .any(|peer| peer.peer == absent && peer.failures >= 1)
+        })
+        .await;
+    cluster.finish().await;
 }
