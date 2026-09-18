@@ -82,6 +82,8 @@ pub(crate) enum RejectReason {
     KeyMismatch,
     Conflict,
     WrongScope,
+    /// The order key claimed a causal height far beyond this scope's own.
+    HeightOutOfRange,
 }
 
 /// What happened to one operation received in a session.

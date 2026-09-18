@@ -758,3 +758,88 @@ async fn revocation_cancels_inbound_sessions_on_the_responder() {
     assert!(!cluster.members("b", id).contains(&cluster.identity("x")));
     cluster.finish().await;
 }
+
+/// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R07
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_order_key_does_not_end_the_session() {
+    let cluster = SyncCluster::start("forged-order-key", &["a", "m", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("Order keys").unwrap();
+    let id = workspace.id();
+    let a1 = cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"a1")
+        .unwrap();
+    cluster.admit("a", "m", id).await;
+    cluster.admit("a", "b", id).await;
+    cluster.replicate_membership("a", "m", id).await;
+    cluster.replicate_membership("a", "b", id).await;
+    for node in ["m", "b"] {
+        cluster
+            .node(node)
+            .replicate_records_to_address_for_test(
+                id,
+                PACKAGE,
+                cluster.address("a"),
+                cluster.identity("a"),
+            )
+            .await
+            .unwrap();
+    }
+
+    // M mints two operations whose order keys it has no right to: one naming
+    // another record, one claiming a height far beyond B's own.
+    let forged = {
+        let state = cluster.node("m").state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        let misbound = crate::synchronization::forge_order_key_operation_for_test(
+            &state.connection,
+            &secret,
+            id,
+            PACKAGE,
+            b"m-misbound",
+            |_| {
+                crate::synchronization::OrderKey::from_height_and_id(
+                    1,
+                    crate::synchronization::RecordId::from_bytes_for_test([9; 32]),
+                )
+                .as_bytes()
+            },
+        );
+        let too_high = crate::synchronization::forge_order_key_operation_for_test(
+            &state.connection,
+            &secret,
+            id,
+            PACKAGE,
+            b"m-too-high",
+            |record| {
+                crate::synchronization::OrderKey::from_height_and_id(
+                    crate::synchronization::limits::MAX_HEIGHT_ADVANCE + 2,
+                    record,
+                )
+                .as_bytes()
+            },
+        );
+        vec![misbound, too_high]
+    };
+
+    cluster
+        .node("m")
+        .deliver_operations_for_test(
+            cluster.address("b"),
+            id,
+            PACKAGE,
+            cluster.identity("b"),
+            forged,
+        )
+        .await
+        .expect("two forged order keys must not end the session");
+
+    let seen = cluster.record_ids("b", id, PACKAGE);
+    assert!(
+        seen.contains(&a1.record_id()),
+        "the genuine record still applies"
+    );
+    assert_eq!(seen.len(), 1, "neither forged record entered the journal");
+    assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
+    cluster.finish().await;
+}

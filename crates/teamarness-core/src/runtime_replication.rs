@@ -20,7 +20,8 @@ pub(super) fn promote_author(
     author: PublicIdentity,
 ) -> Result<usize, SynchronizationError> {
     let parked = parking::parked_for_author(&state.connection, workspace, author)?;
-    promote(state, workspace, parked)
+    let now = state.clock.now_unix_ms();
+    promote(state, workspace, parked, now)
 }
 
 /// Applies everything parked for one scope now that its content key is held.
@@ -30,7 +31,8 @@ pub(super) fn promote_scope(
     package: &str,
 ) -> Result<usize, SynchronizationError> {
     let parked = parking::parked_for_scope(&state.connection, workspace, package)?;
-    promote(state, workspace, parked)
+    let now = state.clock.now_unix_ms();
+    promote(state, workspace, parked, now)
 }
 
 /// Each promotion is its own transaction, so a crash between the insert and the
@@ -40,6 +42,7 @@ fn promote(
     state: &mut RuntimeState,
     workspace: WorkspaceId,
     parked: Vec<ParkedOperation>,
+    now_unix_ms: i64,
 ) -> Result<usize, SynchronizationError> {
     let mut applied = 0;
     for item in parked {
@@ -48,8 +51,9 @@ fn promote(
             workspace,
             &item.package,
             &item.operation,
+            now_unix_ms,
         ) {
-            Ok(RemoteInsert::Applied(record)) => {
+            Ok(RemoteInsert::Applied { record, .. }) => {
                 parking::remove(&state.connection, item.operation_hash)?;
                 publish_record(state, workspace, &item.package, record);
                 applied += 1;
@@ -59,6 +63,9 @@ fn promote(
             }
             // Still unapplicable: the scope's key has not arrived yet.
             Err(RemoteInsertError::MissingScope) => {}
+            // The window may open as this scope's own heights grow, so the
+            // operation is kept until its time-to-live expires.
+            Err(RemoteInsertError::HeightOutOfRange) => {}
             Err(RemoteInsertError::Storage) => {
                 return Err(SynchronizationError::Storage(StorageError::Database));
             }

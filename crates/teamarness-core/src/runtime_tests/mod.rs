@@ -8,4 +8,5 @@
 mod async_boundary;
 mod cluster;
 mod membership_replication;
+mod order_keys;
 mod sync_authorization;

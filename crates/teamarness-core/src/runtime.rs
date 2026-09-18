@@ -842,8 +842,9 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             workspace,
             package,
             &operation,
+            now,
         ) {
-            Ok(crate::synchronization::RemoteInsert::Applied(record)) => {
+            Ok(crate::synchronization::RemoteInsert::Applied { record, .. }) => {
                 let record_id = record.record_id();
                 if let Some(event) = crate::synchronization::event_for_record(
                     &state.connection,
@@ -888,6 +889,9 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             Err(crate::synchronization::RemoteInsertError::Invalid) => {
                 Ok(OperationOutcome::Rejected(RejectReason::Invalid))
             }
+            Err(crate::synchronization::RemoteInsertError::HeightOutOfRange) => {
+                Ok(OperationOutcome::Rejected(RejectReason::HeightOutOfRange))
+            }
             Err(crate::synchronization::RemoteInsertError::Storage) => Err(FatalSyncError::Storage),
         }
     }
@@ -930,6 +934,8 @@ fn park_outcome(
 
 pub(crate) struct RuntimeState {
     pub(crate) connection: rusqlite::Connection,
+    /// The one clock every commit time is read from, injectable in tests.
+    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) peer_sessions: Arc<crate::synchronization::PeerSessions>,
     secret_key: iroh_base::SecretKey,
     display_name: String,
@@ -1027,6 +1033,7 @@ impl CoreRuntime {
         let peer_sessions = crate::synchronization::PeerSessions::new();
         let state = Arc::new(Mutex::new(RuntimeState {
             connection,
+            clock: Arc::clone(&clock),
             peer_sessions: Arc::clone(&peer_sessions),
             secret_key: secret_key.clone(),
             display_name,
@@ -1629,30 +1636,34 @@ impl CoreRuntime {
         if state.poisoned {
             return Err(crate::SynchronizationError::RuntimeUnavailable);
         }
-        let is_member = state
-            .memberships
-            .get(&workspace_id)
-            .is_some_and(|projection| {
-                projection
-                    .snapshot()
-                    .members()
-                    .iter()
-                    .any(|member| member.identity() == self.public_identity)
-            });
+        let standing = state.memberships.get(&workspace_id).map_or(
+            crate::synchronization::MembershipStanding::None,
+            |projection| {
+                if projection.contains_member(self.public_identity) {
+                    crate::synchronization::MembershipStanding::Current
+                } else if projection.has_membership_history(self.public_identity) {
+                    crate::synchronization::MembershipStanding::Revoked
+                } else {
+                    crate::synchronization::MembershipStanding::None
+                }
+            },
+        );
         let is_creator = state
             .memberships
             .get(&workspace_id)
             .is_some_and(|projection| projection.creator() == self.public_identity);
         let secret_key = state.secret_key.clone();
-        let record = crate::synchronization::append(
+        let now = self.clock.now_unix_ms();
+        let (record, _delivery_sequence) = crate::synchronization::append(
             &mut state.connection,
             &secret_key,
             workspace_id,
             package_identity,
             purpose,
             canonical,
-            is_member,
+            standing,
             is_creator,
+            now,
         )?;
         if let Some(event) = crate::synchronization::event_for_record(
             &state.connection,

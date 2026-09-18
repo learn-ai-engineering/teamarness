@@ -3,6 +3,7 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
+pub(crate) mod limits;
 mod log_sync;
 pub(crate) mod network_handler;
 mod operation_store;
@@ -109,6 +110,12 @@ impl RecordId {
     pub(crate) const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    /// Names a record identity that belongs to no record, for forgery tests.
+    #[cfg(test)]
+    pub(crate) const fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Display for RecordId {
@@ -149,7 +156,7 @@ impl<'de> Deserialize<'de> for OrderKey {
 }
 
 impl OrderKey {
-    fn from_height_and_id(height: u64, record_id: RecordId) -> Self {
+    pub(crate) fn from_height_and_id(height: u64, record_id: RecordId) -> Self {
         let mut bytes = [0; 41];
         bytes[0] = VERSION;
         bytes[1..9].copy_from_slice(&height.to_be_bytes());
@@ -416,6 +423,11 @@ impl SealedRecordV1 {
         let scope_digest = take_array::<32>(bytes, &mut at)?;
         let record_id = RecordId(take_array::<32>(bytes, &mut at)?);
         let order_key = OrderKey(take_array::<41>(bytes, &mut at)?);
+        // An order key is part of the sealed bytes, so a peer cannot move a
+        // record in the order without breaking this binding.
+        if order_key.0[0] != VERSION || order_key.0[9..41] != record_id.0 {
+            return Err(ValueParseError::new("order key binding"));
+        }
         let content_key_id = take_array::<32>(bytes, &mut at)?;
         let nonce = take_array::<24>(bytes, &mut at)?;
         Ok(Self {
@@ -1102,6 +1114,78 @@ pub(crate) fn forge_cross_scope_operation_for_test(
     Operation::from_parts(header, Some(p2panda_core::Body::from_bytes(&payload)))
 }
 
+/// Seals a new record for this Installation under an order key the test picks.
+///
+/// Every signature is genuine and the P2Panda sequence and backlink are
+/// correct, so only the order key's own rules refuse it. `order_key` receives
+/// the record's identity, so a test can bind the key correctly and still choose
+/// an impossible height.
+#[cfg(test)]
+pub(crate) fn forge_order_key_operation_for_test(
+    conn: &rusqlite::Connection,
+    secret: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+    canonical: &[u8],
+    order_key: impl FnOnce(RecordId) -> [u8; 41],
+) -> Operation<()> {
+    let scope = scope_digest(package, workspace);
+    let signed = SignedRecordV1::sign(secret, package, workspace, "message.post", canonical)
+        .expect("a signable test record");
+    let record_id = RecordId::digest(&signed.canonical_bytes());
+    let content_key: [u8; 32] = conn
+        .query_row(
+            "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .expect("a held content key");
+    let sequence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(author_sequence),-1)+1 FROM p2panda_operations
+             WHERE scope_id=?1 AND author_public_identity=?2",
+            rusqlite::params![scope.as_slice(), secret.public().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("an author sequence");
+    let backlink: Option<Vec<u8>> = if sequence == 0 {
+        None
+    } else {
+        conn.query_row(
+            "SELECT operation_id FROM p2panda_operations
+             WHERE scope_id=?1 AND author_public_identity=?2 AND author_sequence=?3",
+            rusqlite::params![
+                scope.as_slice(),
+                secret.public().as_bytes().as_slice(),
+                sequence - 1
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+    };
+    let payload = P2pandaRecordProtection {
+        package_identity: package.to_owned(),
+        workspace_id: workspace,
+        content_key,
+    }
+    .seal(&signed, OrderKey(order_key(record_id)))
+    .expect("the record seals under its own scope")
+    .encode();
+    let header = p2panda_core::Header::<()>::builder()
+        .body(payload.as_slice())
+        .seq_num(u32::try_from(sequence).expect("a p2panda sequence"))
+        .backlink(backlink.map(|bytes| {
+            Hash::from_bytes(bytes.try_into().expect("a stored operation identifier"))
+        }))
+        .build(
+            &p2panda_core::SigningKey::from_bytes(&secret.to_bytes()),
+            (),
+        );
+    Operation::from_parts(header, Some(p2panda_core::Body::from_bytes(&payload)))
+}
+
 /// Mints a self-authored origin and grant for a key this Installation invented.
 ///
 /// This is the forgery a non-creator Member could attempt: every signature is
@@ -1246,6 +1330,15 @@ fn record_from_row(row: RecordFields<'_>) -> Result<ImmutableRecord, Synchroniza
     })
 }
 
+/// What the local Installation's membership says about an append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipStanding {
+    Current,
+    /// Known to this Workspace's membership history, but not a current Member.
+    Revoked,
+    None,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append(
     conn: &mut rusqlite::Connection,
@@ -1254,11 +1347,16 @@ pub(crate) fn append(
     package: &str,
     purpose: &str,
     canonical: &[u8],
-    is_member: bool,
+    standing: MembershipStanding,
     is_creator: bool,
-) -> Result<ImmutableRecord, SynchronizationError> {
-    if !is_member {
-        return Err(SynchronizationError::NotCurrentMember);
+    now_unix_ms: i64,
+) -> Result<(ImmutableRecord, i64), SynchronizationError> {
+    match standing {
+        MembershipStanding::Current => {}
+        // An Installation that was a Member and is not one now was revoked;
+        // one that was never a Member is simply not in this Workspace.
+        MembershipStanding::Revoked => return Err(SynchronizationError::RevokedMember),
+        MembershipStanding::None => return Err(SynchronizationError::NotCurrentMember),
     }
     let signed = SignedRecordV1::sign(secret, package, workspace, purpose, canonical)
         .map_err(|_| SynchronizationError::InvalidInput)?;
@@ -1293,11 +1391,24 @@ pub(crate) fn append(
                     .map_err(|_| SynchronizationError::CorruptRecord)?,
             )
             .map_err(|_| SynchronizationError::CorruptRecord)?;
-        return record_from_row((&id, &order, &author, &p, &sig, &opened.canonical, &sealed));
+        let delivery: i64 = tx
+            .query_row(
+                "SELECT delivery_sequence FROM record_delivery WHERE record_id=?1",
+                [id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|_| storage_error())?;
+        let record = record_from_row((&id, &order, &author, &p, &sig, &opened.canonical, &sealed))?;
+        return Ok((record, delivery));
     }
     let max_height: Option<i64> = tx.query_row("SELECT MAX(causal_height) FROM immutable_operations WHERE scope_id=?1 AND status='accepted'", [scope.as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
-    let height = u64::try_from(max_height.unwrap_or(-1).saturating_add(1))
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let height = match max_height {
+        Some(max) => u64::try_from(max)
+            .ok()
+            .and_then(|max| max.checked_add(1))
+            .ok_or(SynchronizationError::CorruptRecord)?,
+        None => 0,
+    };
     let order = OrderKey::from_height_and_id(height, record_id);
     let sealed = protection
         .seal(&signed, order)
@@ -1357,7 +1468,8 @@ pub(crate) fn append(
     .map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),record_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
     tx.execute("INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id) VALUES(?1,?2,?3) ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),operation_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice(),0_i64]).map_err(|_| storage_error())?;
+    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice(),now_unix_ms]).map_err(|_| storage_error())?;
+    let delivery_sequence = tx.last_insert_rowid();
     tx.execute(
         "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
         [scope.as_slice()],
@@ -1365,7 +1477,7 @@ pub(crate) fn append(
     .map_err(|_| storage_error())?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-    record_from_row((
+    let record = record_from_row((
         record_id.as_bytes().as_slice(),
         order.as_bytes().as_slice(),
         signed.author.as_bytes(),
@@ -1373,7 +1485,8 @@ pub(crate) fn append(
         signed.signature.to_bytes().as_slice(),
         canonical,
         sealed_bytes.as_slice(),
-    ))
+    ))?;
+    Ok((record, delivery_sequence))
 }
 
 pub(crate) fn open_records(
@@ -1525,7 +1638,10 @@ fn insert_error(error: rusqlite::Error) -> RemoteInsertError {
 /// Whether a remote operation was newly applied or already stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteInsert {
-    Applied(ImmutableRecord),
+    Applied {
+        record: ImmutableRecord,
+        delivery_sequence: i64,
+    },
     Duplicate(ImmutableRecord),
 }
 
@@ -1537,6 +1653,8 @@ pub(crate) enum RemoteInsertError {
     WrongScope,
     Invalid,
     Conflict,
+    /// The order key claims a causal height too far beyond this scope's own.
+    HeightOutOfRange,
     Storage,
 }
 
@@ -1550,6 +1668,7 @@ pub(crate) fn insert_remote_operation(
     workspace: WorkspaceId,
     package: &str,
     operation: &Operation<()>,
+    now_unix_ms: i64,
 ) -> Result<RemoteInsert, RemoteInsertError> {
     // Validate the complete P2Panda operation before touching the Teamarness
     // journal. In particular, an occupied sequence or backlink conflict must
@@ -1676,6 +1795,23 @@ pub(crate) fn insert_remote_operation(
     if expected_backlink != actual_backlink {
         return Err(RemoteInsertError::Conflict);
     }
+    // A height far beyond this scope's own is a claim nothing local can check,
+    // and it would push every later record behind it.
+    let local_max: Option<i64> = transaction
+        .query_row(
+            "SELECT MAX(causal_height) FROM immutable_operations
+             WHERE scope_id=?1 AND status='accepted'",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| RemoteInsertError::Storage)?;
+    let ceiling = local_max
+        .and_then(|height| u64::try_from(height).ok())
+        .unwrap_or(0)
+        .saturating_add(limits::MAX_HEIGHT_ADVANCE);
+    if sealed.order_key.height() > ceiling {
+        return Err(RemoteInsertError::HeightOutOfRange);
+    }
     // All Teamarness rows and the P2Panda projection share this transaction.
     // An invalid projection therefore rolls back the accepted record too.
     transaction
@@ -1754,14 +1890,16 @@ pub(crate) fn insert_remote_operation(
     transaction
         .execute(
             "INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms)
-             VALUES(?1,?2,?3,0)",
+             VALUES(?1,?2,?3,?4)",
             rusqlite::params![
                 scope.as_slice(),
                 journal.as_slice(),
-                record_id.as_bytes().as_slice()
+                record_id.as_bytes().as_slice(),
+                now_unix_ms
             ],
         )
         .map_err(insert_error)?;
+    let delivery_sequence = transaction.last_insert_rowid();
     transaction
         .execute(
             "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
@@ -1771,8 +1909,8 @@ pub(crate) fn insert_remote_operation(
     transaction
         .commit()
         .map_err(|_| RemoteInsertError::Storage)?;
-    Ok(RemoteInsert::Applied(
-        record_from_row((
+    Ok(RemoteInsert::Applied {
+        record: record_from_row((
             record_id.as_bytes().as_slice(),
             sealed.order_key.as_bytes().as_slice(),
             signed.author.as_bytes(),
@@ -1782,7 +1920,8 @@ pub(crate) fn insert_remote_operation(
             &payload,
         ))
         .map_err(|_| RemoteInsertError::Invalid)?,
-    ))
+        delivery_sequence,
+    })
 }
 
 pub(crate) fn event_for_record(
@@ -1985,6 +2124,46 @@ mod tests {
             assert_eq!(id, id.to_string().parse().unwrap());
             assert_eq!(key, key.to_string().parse().unwrap());
             assert_eq!(cursor, cursor.to_string().parse().unwrap());
+        }
+
+        #[test]
+        fn decode_rejects_order_key_with_wrong_version() {
+            let record = signed();
+            let id = RecordId::digest(&record.canonical_bytes());
+            let mut order = OrderKey::from_height_and_id(3, id).as_bytes();
+            order[0] = 2;
+            let sealed = SealedRecordV1 {
+                scope_digest: [1; 32],
+                record_id: id,
+                order_key: OrderKey(order),
+                content_key_id: [2; 32],
+                nonce: [3; 24],
+                ciphertext: vec![4],
+            };
+
+            let error = SealedRecordV1::decode(&sealed.encode())
+                .expect_err("an order key of another version must not decode");
+
+            assert_eq!(error.to_string(), "invalid order key binding");
+        }
+
+        #[test]
+        fn decode_rejects_order_key_embedding_another_record_id() {
+            let record = signed();
+            let id = RecordId::digest(&record.canonical_bytes());
+            let sealed = SealedRecordV1 {
+                scope_digest: [1; 32],
+                record_id: id,
+                order_key: OrderKey::from_height_and_id(3, RecordId([9; 32])),
+                content_key_id: [2; 32],
+                nonce: [3; 24],
+                ciphertext: vec![4],
+            };
+
+            let error = SealedRecordV1::decode(&sealed.encode())
+                .expect_err("an order key naming another record must not decode");
+
+            assert_eq!(error.to_string(), "invalid order key binding");
         }
 
         #[test]
