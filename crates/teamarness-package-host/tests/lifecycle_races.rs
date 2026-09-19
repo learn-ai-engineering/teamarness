@@ -163,6 +163,107 @@ impl host_protocol::CapabilityHandler for ClosingStream {
     }
 }
 
+/// CR-003: a page of events larger than the writer's data budget is
+/// backpressure, not a capability failure.
+///
+/// `run_record_stream`'s tail is modelled exactly: a failed `event` ends the
+/// stream with `capability_unavailable`, which the SDK's own table calls
+/// permanent. A contract-maximum record carries two base64 copies, so a page of
+/// them is far more than the data lane holds at once, and the events must wait
+/// for capacity rather than tear the stream down.
+struct LargePage;
+
+/// Events per page, and the payload size that overruns the data budget together.
+const PAGE_EVENTS: u64 = 16;
+const PAGE_EVENT_BYTES: usize = 512 * 1024;
+
+impl host_protocol::CapabilityHandler for LargePage {
+    fn call<'a>(
+        &'a self,
+        _grant: Option<&'a str>,
+        _payload: &'a Value,
+        _started: Arc<AtomicBool>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(json!({})) })
+    }
+
+    fn open_stream<'a>(
+        &'a self,
+        stream_id: String,
+        _topic: &'a str,
+        _initial_credit: u64,
+        _payload: &'a Value,
+        output: HostStreamSender,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let record = "A".repeat(PAGE_EVENT_BYTES);
+                for sequence in 1..=PAGE_EVENTS {
+                    let payload = json!({"kind":"record","canonical":record});
+                    if output.event(&stream_id, sequence, payload).await.is_err() {
+                        output.retire(&stream_id).await;
+                        let _ = output.close(&stream_id, "capability_unavailable").await;
+                        return;
+                    }
+                }
+                output.retire(&stream_id).await;
+                let _ = output.close(&stream_id, "completed").await;
+            });
+            Ok(())
+        })
+    }
+
+    fn add_credit<'a>(
+        &'a self,
+        _stream_id: &'a str,
+        _amount: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn close_stream<'a>(
+        &'a self,
+        _stream_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
+/// CR-003: the whole page reaches the Package behind a pipe it drains slowly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_page_larger_than_the_data_budget_is_backpressure() {
+    // A realistic 64 KiB pipe, far smaller than one event of this page.
+    let (client, mut package) = connect(Arc::new(LargePage), 64 * 1024);
+    package
+        .send(json!({
+            "kind":"stream_open", "id":"p:big-1", "topic":"capability.stream",
+            "initialCredit":32, "payload":{"grant":"Z3JhbnQx"}
+        }))
+        .await;
+    let mut delivered = 0_u64;
+    loop {
+        let frame = package.next_frame().await;
+        match frame.kind() {
+            FrameKind::Event => delivered += 1,
+            FrameKind::StreamClose => {
+                assert_eq!(
+                    frame.field("code").and_then(Value::as_str),
+                    Some("completed"),
+                    "a slow reader is backpressure, not a capability outage"
+                );
+                break;
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    assert_eq!(delivered, PAGE_EVENTS, "every event of the page arrives");
+    assert_eq!(client.failure(), None);
+}
+
 /// CR-002: credit the Package released for events it had already accepted
 /// arrives after the Host's own `stream_close`.
 #[tokio::test]
