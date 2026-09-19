@@ -52,8 +52,10 @@ async fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
     let issuer_directory = private_data_directory("invitation-issuer");
     let invitee_directory = private_data_directory("invitation-invitee");
     let issuer_config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(issuer_config.clone()).await.unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let issuer = CoreRuntime::open_loopback_for_tests(issuer_config.clone())
+        .await
+        .unwrap();
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let workspace = issuer.create_workspace("Invitations").unwrap();
@@ -94,7 +96,9 @@ async fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
     issuer.shutdown().await.unwrap();
     drop(issuer);
 
-    let reopened = CoreRuntime::open(issuer_config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(issuer_config)
+        .await
+        .unwrap();
     assert_eq!(
         reopened.membership_snapshot(workspace.id()).unwrap(),
         snapshot
@@ -117,7 +121,9 @@ async fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_re
     let issuer_copy_directory = private_data_directory("invitation-validation-copy");
     let invitee_directory = private_data_directory("invitation-validation-invitee");
     let issuer_config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(issuer_config.clone()).await.unwrap();
+    let issuer = CoreRuntime::open_loopback_for_tests(issuer_config.clone())
+        .await
+        .unwrap();
     fs::create_dir_all(&issuer_copy_directory).unwrap();
     fs::copy(
         issuer_directory.join("core.sqlite3"),
@@ -143,7 +149,7 @@ async fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_re
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let claim = invitee.create_invitation_claim(&token).unwrap();
@@ -153,7 +159,7 @@ async fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_re
         InvitationError::WrongIssuer
     );
     let issuer_without_workspace =
-        CoreRuntime::open(CoreRuntimeConfig::new(&issuer_copy_directory))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&issuer_copy_directory))
             .await
             .unwrap();
     assert_eq!(
@@ -186,10 +192,10 @@ async fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_re
 async fn an_expired_token_is_not_consumed() {
     let issuer_directory = private_data_directory("invitation-expired-issuer");
     let invitee_directory = private_data_directory("invitation-expired-invitee");
-    let issuer = CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory))
+    let issuer = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&issuer_directory))
         .await
         .unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let workspace = issuer.create_workspace("Expiry").unwrap();
@@ -231,8 +237,10 @@ async fn an_admitted_non_manager_cannot_issue_an_invitation() {
     let issuer_directory = private_data_directory("invitation-non-manager-issuer");
     let invitee_directory = private_data_directory("invitation-non-manager-invitee");
     let issuer_config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(issuer_config.clone()).await.unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let issuer = CoreRuntime::open_loopback_for_tests(issuer_config.clone())
+        .await
+        .unwrap();
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let workspace = issuer.create_workspace("Manager only").unwrap();
@@ -264,7 +272,9 @@ async fn an_admitted_non_manager_cannot_issue_an_invitation() {
         .unwrap();
     drop(connection);
 
-    let member_runtime = CoreRuntime::open(issuer_config).await.unwrap();
+    let member_runtime = CoreRuntime::open_loopback_for_tests(issuer_config)
+        .await
+        .unwrap();
     assert_eq!(
         member_runtime
             .issue_invitation(workspace.id(), now_unix_ms() + 60_000)

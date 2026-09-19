@@ -72,6 +72,15 @@ impl Network {
         let address_book = if loopback_only {
             let lookup = iroh::address_lookup::memory::MemoryLookup::new();
             builder = builder
+                // The preset installs three address-lookup services that reach
+                // the public internet: a pkarr publisher and resolver against
+                // n0's relay, and n0's DNS. `address_lookup` pushes onto that
+                // list rather than replacing it, and `clear_ip_transports`
+                // clears IP transports, not lookup services — so a loopback
+                // Installation still published its identity and addresses to a
+                // third party over HTTPS. Clearing the list first is what makes
+                // "loopback" mean nothing off this machine is contacted.
+                .clear_address_lookup()
                 .address_lookup(lookup.clone())
                 .clear_ip_transports()
                 .bind_addr("127.0.0.1:0")
@@ -215,6 +224,25 @@ mod tests {
                 b"teamarness/first-protocol/1".to_vec(),
                 b"teamarness/second-protocol/1".to_vec(),
             ]
+        );
+        network.shutdown().await.unwrap();
+    }
+
+    /// A loopback Installation contacts nothing off this machine.
+    ///
+    /// The preset's pkarr publisher, pkarr resolver and n0 DNS lookup each
+    /// reach the public internet, and `address_lookup` adds to that list rather
+    /// than replacing it. Counting the services is the cheap guard: one is the
+    /// in-memory address book and nothing else.
+    #[tokio::test]
+    async fn a_loopback_endpoint_carries_only_its_in_memory_address_book() {
+        let network = Network::bind(secret(3), RelayMode::Disabled, true, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            network.endpoint.address_lookup().unwrap().len(),
+            1,
+            "a loopback endpoint keeps only the in-memory address book"
         );
         network.shutdown().await.unwrap();
     }

@@ -48,7 +48,7 @@ async fn host_shutdown_reaps_active_backend() {
     let core_path = application.root.path().join("core");
     let private = application.root.path().join("private");
     let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&core_path))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&core_path))
             .await
             .unwrap(),
     );

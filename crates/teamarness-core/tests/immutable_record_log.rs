@@ -17,7 +17,9 @@ fn directory() -> PathBuf {
 async fn append_replay_and_open_are_durable_and_content_idempotent() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Journal").unwrap();
 
     let first = runtime
@@ -71,7 +73,7 @@ async fn append_replay_and_open_are_durable_and_content_idempotent() {
 
     runtime.shutdown().await.unwrap();
     drop(runtime);
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     let mut replay = reopened
         .subscribe_records(workspace.id(), "teamarness.test", None)
         .unwrap();

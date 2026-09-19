@@ -414,9 +414,9 @@ mod tests {
         std::fs::set_permissions(&backend_path, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let core = std::sync::Arc::new(
-            teamarness_core::CoreRuntime::open(teamarness_core::CoreRuntimeConfig::new(
-                root.path().join("core"),
-            ))
+            teamarness_core::CoreRuntime::open_loopback_for_tests(
+                teamarness_core::CoreRuntimeConfig::new(root.path().join("core")),
+            )
             .await
             .unwrap(),
         );

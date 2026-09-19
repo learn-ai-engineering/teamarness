@@ -13,8 +13,10 @@ async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen(
     let _ = fs::remove_dir_all(&issuer_directory);
     let _ = fs::remove_dir_all(&invitee_directory);
     let config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(config.clone()).await.unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let issuer = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let workspace = issuer.create_workspace("Uncertain invitation").unwrap();
@@ -47,7 +49,7 @@ async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen(
     issuer.shutdown().await.unwrap();
     drop(issuer);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     let snapshot = reopened.membership_snapshot(workspace.id()).unwrap();
     assert_eq!(snapshot.epoch(), MembershipEpoch::new(1));
     assert_eq!(snapshot.members().len(), 2);
@@ -69,7 +71,7 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&directory);
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Membership validation").unwrap();
@@ -211,7 +213,7 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&baseline);
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&baseline))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&baseline))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Reachable convergence").unwrap();
@@ -284,7 +286,7 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
             directory.join(crate::storage::DATABASE_FILE_NAME),
         )
         .unwrap();
-        let branch = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        let branch = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
             .await
             .unwrap();
         for operation in order {

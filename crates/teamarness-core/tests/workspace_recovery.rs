@@ -27,7 +27,9 @@ fn database(directory: &Path) -> Connection {
 async fn create_workspace_persists_one_immutable_manager_genesis() {
     let directory = private_data_directory("workspace-create");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let creator = runtime.public_identity();
 
     let created = runtime.create_workspace("Field Notes").unwrap();
@@ -38,7 +40,7 @@ async fn create_workspace_persists_one_immutable_manager_genesis() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert_eq!(reopened.list_workspaces().unwrap(), vec![created.clone()]);
 
     let connection = database(&directory);
@@ -83,7 +85,9 @@ async fn create_workspace_persists_one_immutable_manager_genesis() {
 async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
     let directory = private_data_directory("workspace-pending-recovery");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Recovered").unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
@@ -140,7 +144,7 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
         .unwrap();
     drop(connection);
 
-    let recovered = CoreRuntime::open(config).await.unwrap();
+    let recovered = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert_eq!(
         recovered.list_workspaces().unwrap(),
         vec![workspace.clone()]
@@ -176,7 +180,7 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
 #[tokio::test]
 async fn workspace_names_are_validated_before_any_request_is_written() {
     let directory = private_data_directory("workspace-name");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
 

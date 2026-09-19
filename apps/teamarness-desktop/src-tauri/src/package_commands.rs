@@ -649,7 +649,7 @@ mod tests {
         )
         .unwrap();
         let core = Arc::new(
-            CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("core")))
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
                 .await
                 .unwrap(),
         );

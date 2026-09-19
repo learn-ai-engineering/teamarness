@@ -68,7 +68,7 @@ async fn public_identity_has_a_stable_validated_string_serde_contract() {
     assert_serde_traits::<PublicIdentity>();
 
     let directory = temporary_directory();
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let identity = runtime.public_identity();

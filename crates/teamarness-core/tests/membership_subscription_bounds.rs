@@ -12,7 +12,7 @@ async fn bounded_membership_subscription_releases_an_idle_receiver_after_timeout
             .unwrap()
             .as_nanos()
     ));
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&root))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&root))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Bounded receiver").unwrap();

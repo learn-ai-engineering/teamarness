@@ -22,4 +22,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
+# Every test Installation binds loopback with no address lookup, so no test
+# here reaches the public internet. `check-core-module-graph.mjs` holds the
+# feature to this table.
+teamarness-core = { path = "../../../crates/teamarness-core", features = ["test-hooks"] }
 tempfile.workspace = true

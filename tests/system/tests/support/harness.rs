@@ -442,6 +442,8 @@ pub async fn open_core(addressing: Addressing, path: &Path) -> Arc<CoreRuntime> 
     let config = teamarness_core::CoreRuntimeConfig::new(path);
     let core = match addressing {
         Addressing::Loopback => CoreRuntime::open_loopback_for_tests(config).await,
+        // production-addressing: the one seam that binds public relays, for
+        // the `#[ignore]`d scenarios that qualify relay-mediated addressing.
         Addressing::ProductionRelay => CoreRuntime::open(config).await,
     };
     Arc::new(core.expect("an Installation opens on its private data directory"))

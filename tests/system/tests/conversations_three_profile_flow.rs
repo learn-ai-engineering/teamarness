@@ -33,7 +33,7 @@ async fn three_profiles_converge_after_late_admission() {
     let root = application.root.path().to_owned();
 
     let alice_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.join("alice-core")))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.join("alice-core")))
             .await
             .unwrap(),
     );
@@ -218,9 +218,11 @@ async fn join_profile(
 ) -> Profile {
     let invitation = create_invitation(manager, workspace).await;
     let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.join(format!("{name}-core"))))
-            .await
-            .unwrap(),
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(
+            root.join(format!("{name}-core")),
+        ))
+        .await
+        .unwrap(),
     );
     core.join_workspace(&invitation).await.unwrap();
     drop(invitation);

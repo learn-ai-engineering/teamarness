@@ -27,7 +27,9 @@ fn database(directory: &Path) -> Connection {
 async fn workspace_snapshot_is_available_through_core_runtime_and_survives_reopen() {
     let directory = private_data_directory("membership-snapshot");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let creator = runtime.public_identity();
     let workspace = runtime.create_workspace("Projected").unwrap();
 
@@ -40,7 +42,7 @@ async fn workspace_snapshot_is_available_through_core_runtime_and_survives_reope
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert_eq!(
         reopened.membership_snapshot(workspace.id()).unwrap(),
         before
@@ -54,7 +56,7 @@ async fn workspace_snapshot_is_available_through_core_runtime_and_survives_reope
 #[tokio::test]
 async fn invalid_public_membership_commands_leave_the_projection_unchanged() {
     let directory = private_data_directory("membership-invalid");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Guarded membership").unwrap();
@@ -83,7 +85,9 @@ async fn invalid_public_membership_commands_leave_the_projection_unchanged() {
 async fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
     let directory = private_data_directory("membership-rebuild");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Repairable").unwrap();
     let expected = runtime.membership_snapshot(workspace.id()).unwrap();
     runtime.shutdown().await.unwrap();
@@ -98,7 +102,9 @@ async fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
         .unwrap();
     drop(connection);
 
-    let reopened = CoreRuntime::open(config.clone()).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     assert_eq!(
         reopened.membership_snapshot(workspace.id()).unwrap(),
         expected
@@ -119,7 +125,7 @@ async fn derived_rows_are_rebuilt_but_corrupt_canonical_bytes_refuse_open() {
     drop(connection);
 
     assert!(matches!(
-        CoreRuntime::open(config).await,
+        CoreRuntime::open_loopback_for_tests(config).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 

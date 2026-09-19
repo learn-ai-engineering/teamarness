@@ -18,7 +18,7 @@ fn private_data_directory(test_name: &str) -> PathBuf {
 #[tokio::test]
 async fn migration_0001_reserves_nullable_human_identity_subjects() {
     let directory = private_data_directory("migration-human-identity");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.shutdown().await.unwrap();
@@ -71,7 +71,7 @@ async fn migration_0001_reserves_nullable_human_identity_subjects() {
 #[tokio::test]
 async fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
     let directory = private_data_directory("migration-workspaces");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.create_workspace("Migration").unwrap();
@@ -119,7 +119,7 @@ async fn migration_0002_adds_workspace_membership_state_and_append_only_guards()
 #[tokio::test]
 async fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
     let directory = private_data_directory("migration-invitations");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.shutdown().await.unwrap();
@@ -151,7 +151,7 @@ async fn migration_0003_adds_the_unique_invitation_nonce_ledger() {
 #[tokio::test]
 async fn migration_0004_adds_the_append_only_transition_ledger() {
     let directory = private_data_directory("migration-transitions");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.shutdown().await.unwrap();
@@ -183,7 +183,7 @@ async fn migration_0004_adds_the_append_only_transition_ledger() {
 #[tokio::test]
 async fn migration_0006_adds_strict_immutable_journal_and_append_only_guards() {
     let directory = private_data_directory("migration-immutable-record-log");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.create_workspace("Journal").unwrap();
@@ -234,7 +234,7 @@ async fn migration_0006_adds_strict_immutable_journal_and_append_only_guards() {
 #[tokio::test]
 async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let directory = private_data_directory("migration-p2panda-projection");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Projection").unwrap();
@@ -312,10 +312,12 @@ async fn ordered_migration_is_idempotent_on_reopen() {
     let directory = private_data_directory("migration-reopen");
     let config = CoreRuntimeConfig::new(&directory);
 
-    let first = CoreRuntime::open(config.clone()).await.unwrap();
+    let first = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     first.shutdown().await.unwrap();
     drop(first);
-    let second = CoreRuntime::open(config).await.unwrap();
+    let second = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     second.shutdown().await.unwrap();
     drop(second);
 
@@ -338,7 +340,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
 #[tokio::test]
 async fn migration_0010_adds_membership_wakes_and_parking_and_drops_pending_records() {
     let directory = private_data_directory("migration-membership-replication");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Replication").unwrap();
@@ -452,7 +454,9 @@ async fn accepted_membership_operations_bump_the_membership_wake() {
 async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     let directory = private_data_directory("migration-membership-wake-seed");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     runtime.create_workspace("Seeded").unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
@@ -478,7 +482,7 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
         .unwrap();
     drop(connection);
 
-    let runtime = CoreRuntime::open(config).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
@@ -497,7 +501,7 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
 #[tokio::test]
 async fn migration_0011_adds_progress_and_quarantine_tables() {
     let directory = private_data_directory("migration-sync-bounds");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Bounds").unwrap();
@@ -547,7 +551,7 @@ fn hex_bytes(value: &str) -> Vec<u8> {
 // Verifies: TEAM.SYS.ID-R07
 async fn migration_0012_removes_duplicate_content_key_copy() {
     let directory = private_data_directory("migration-single-content-key");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.shutdown().await.unwrap();

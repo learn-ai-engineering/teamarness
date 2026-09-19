@@ -26,7 +26,7 @@ fn database(directory: &Path) -> Connection {
 #[tokio::test]
 async fn append_only_guards_reject_canonical_and_trust_anchor_changes() {
     let directory = private_data_directory("append-only");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     runtime.create_workspace("Guarded").unwrap();
@@ -62,7 +62,9 @@ async fn append_only_guards_reject_canonical_and_trust_anchor_changes() {
 async fn trust_anchor_mismatch_refuses_reopen() {
     let directory = private_data_directory("trust-anchor-corrupt");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     runtime.create_workspace("Authentic").unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
@@ -76,7 +78,7 @@ async fn trust_anchor_mismatch_refuses_reopen() {
     drop(connection);
 
     assert!(matches!(
-        CoreRuntime::open(config).await,
+        CoreRuntime::open_loopback_for_tests(config).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 
@@ -88,7 +90,9 @@ async fn forged_or_wrong_workspace_genesis_refuses_reopen() {
     for (suffix, corruption) in ["forged-bytes", "wrong-workspace"].into_iter().enumerate() {
         let directory = private_data_directory(&format!("genesis-{suffix}"));
         let config = CoreRuntimeConfig::new(&directory);
-        let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+        let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+            .await
+            .unwrap();
         let first = runtime.create_workspace("First").unwrap();
         let second = runtime.create_workspace("Second").unwrap();
         runtime.shutdown().await.unwrap();
@@ -124,7 +128,7 @@ async fn forged_or_wrong_workspace_genesis_refuses_reopen() {
         drop(connection);
 
         assert!(matches!(
-            CoreRuntime::open(config).await,
+            CoreRuntime::open_loopback_for_tests(config).await,
             Err(CoreError::Storage(StorageError::CorruptWorkspace))
         ));
         fs::remove_dir_all(directory).unwrap();
@@ -134,7 +138,7 @@ async fn forged_or_wrong_workspace_genesis_refuses_reopen() {
 #[tokio::test]
 async fn duplicate_or_conflicting_workspace_and_genesis_ids_are_rejected() {
     let directory = private_data_directory("duplicate-ids");
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Unique").unwrap();
@@ -187,7 +191,9 @@ async fn duplicate_or_conflicting_workspace_and_genesis_ids_are_rejected() {
 async fn durable_future_quarantine_is_inert_across_reopen() {
     let directory = private_data_directory("future-inert");
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Future").unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
@@ -227,7 +233,7 @@ async fn durable_future_quarantine_is_inert_across_reopen() {
         .unwrap();
     drop(connection);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert_eq!(reopened.list_workspaces().unwrap(), vec![workspace]);
     let connection = database(&directory);
     let after: (i64, i64, i64, i64) = connection

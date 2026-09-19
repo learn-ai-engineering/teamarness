@@ -1408,9 +1408,11 @@ mod tests {
     async fn capability_call_does_not_block_the_executor_while_core_is_locked() {
         let directory = tempfile::tempdir().unwrap();
         let core = Arc::new(
-            CoreRuntime::open(CoreRuntimeConfig::new(directory.path().join("core")))
-                .await
-                .unwrap(),
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(
+                directory.path().join("core"),
+            ))
+            .await
+            .unwrap(),
         );
         let (capabilities, grant) = bound_immutable_record(&core, CoreCallLimiter::new()).await;
 

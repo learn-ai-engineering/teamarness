@@ -43,7 +43,9 @@ fn directory() -> PathBuf {
 async fn restart_quarantines_a_scope_with_tampered_key_state() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Recovery").unwrap();
     runtime
         .append_record(workspace.id(), "teamarness.test", "message.post", b"secret")
@@ -64,7 +66,7 @@ async fn restart_quarantines_a_scope_with_tampered_key_state() {
         .unwrap();
     drop(connection);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert!(matches!(
         reopened.append_record(workspace.id(), "teamarness.test", "message.post", b"again"),
         Err(teamarness_core::SynchronizationError::ScopeQuarantined)
@@ -94,7 +96,9 @@ async fn restart_quarantines_a_scope_with_tampered_key_state() {
 async fn restart_quarantines_a_scope_with_a_tampered_projection() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Projection tamper").unwrap();
     runtime
         .append_record(workspace.id(), "teamarness.test", "message.post", b"sealed")
@@ -118,7 +122,7 @@ async fn restart_quarantines_a_scope_with_a_tampered_projection() {
         .unwrap();
     drop(connection);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert!(matches!(
         reopened.append_record(workspace.id(), "teamarness.test", "message.post", b"again"),
         Err(teamarness_core::SynchronizationError::ScopeQuarantined)
@@ -149,7 +153,9 @@ async fn restart_quarantines_a_scope_with_a_tampered_projection() {
 async fn tampered_record_below_the_validation_mark_is_quarantined_on_read() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Late tamper").unwrap();
     let mut appended = Vec::new();
     for index in 0..3_u8 {
@@ -168,7 +174,9 @@ async fn tampered_record_below_the_validation_mark_is_quarantined_on_read() {
     drop(runtime);
 
     // The first restart marks all three as validated.
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
@@ -194,7 +202,7 @@ async fn tampered_record_below_the_validation_mark_is_quarantined_on_read() {
         .unwrap();
     drop(connection);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     let mut subscription = reopened
         .subscribe_records(workspace.id(), "teamarness.test", None)
         .unwrap();
@@ -250,7 +258,7 @@ fn hex_bytes(value: &str) -> Vec<u8> {
 #[tokio::test]
 async fn creator_bootstrap_is_recorded_as_authenticated_control() {
     let path = directory();
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&path))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&path))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Protection bootstrap").unwrap();
@@ -283,7 +291,9 @@ async fn creator_bootstrap_is_recorded_as_authenticated_control() {
 async fn restart_refuses_legacy_version_1_protection_controls() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Legacy controls").unwrap();
     runtime
         .append_record(workspace.id(), "teamarness.test", "message.post", b"legacy")
@@ -301,7 +311,7 @@ async fn restart_refuses_legacy_version_1_protection_controls() {
     drop(connection);
 
     assert!(matches!(
-        CoreRuntime::open(config).await,
+        CoreRuntime::open_loopback_for_tests(config).await,
         Err(teamarness_core::CoreError::Storage(
             StorageError::LegacyProtectionState
         ))
@@ -315,7 +325,9 @@ async fn restart_refuses_legacy_version_1_protection_controls() {
 async fn restart_rejects_tampered_protection_control() {
     let path = directory();
     let config = CoreRuntimeConfig::new(&path);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = runtime.create_workspace("Tampered control").unwrap();
     runtime
         .append_record(workspace.id(), "teamarness.test", "message.post", b"tamper")
@@ -332,7 +344,7 @@ async fn restart_rejects_tampered_protection_control() {
     drop(connection);
 
     assert!(matches!(
-        CoreRuntime::open(config).await,
+        CoreRuntime::open_loopback_for_tests(config).await,
         Err(teamarness_core::CoreError::Storage(
             StorageError::CorruptWorkspace
         ))
@@ -343,7 +355,7 @@ async fn restart_rejects_tampered_protection_control() {
 #[tokio::test]
 async fn core_database_contains_sealed_payload_not_canonical_record_bytes() {
     let path = directory();
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&path))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&path))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("At Rest").unwrap();
@@ -435,7 +447,7 @@ fn blob_occurrences(connection: &Connection, needle: &[u8]) -> usize {
 #[tokio::test]
 async fn content_key_is_stored_exactly_once() {
     let path = directory();
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&path))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&path))
         .await
         .unwrap();
     let workspace = runtime.create_workspace("Custody").unwrap();

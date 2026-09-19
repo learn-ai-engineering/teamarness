@@ -1117,8 +1117,14 @@ impl CoreRuntime {
     }
 
     /// Opens an Installation whose Iroh endpoint is bound to loopback with no
-    /// relay and no discovery, so a multi-Installation test in another crate
-    /// needs nothing off this machine.
+    /// relay and no address-lookup service but an in-memory address book, so a
+    /// test needs nothing off this machine.
+    ///
+    /// Every test opens its Installation this way. `CoreRuntime::open` binds
+    /// the production way in a test build too — the loopback branch is gated on
+    /// the readiness hook, not on `cfg(test)` — so a test that called it
+    /// published its identity and addresses to a third party and waited on a
+    /// public relay. `scripts/check-loopback-tests.mjs` holds the rule.
     ///
     /// Only the addressing changes. Storage, the Endpoint and Router, the
     /// onboarding transport and the synchronization worker are the production
@@ -1128,7 +1134,7 @@ impl CoreRuntime {
     /// [`Self::remember_loopback_peer_for_tests`]; an Installation that is
     /// reopened binds a fresh loopback port, so the introduction is repeated
     /// after every restart.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub async fn open_loopback_for_tests(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
         Self::open_inner(config, Box::new(SystemClock), Some(true)).await
