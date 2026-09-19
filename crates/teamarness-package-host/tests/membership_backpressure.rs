@@ -100,6 +100,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
             {
                 break response;
             }
+            // poll-interval: the interval of this loop, which is bounded by its own timeout.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -151,6 +152,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
             {
                 break response;
             }
+            // poll-interval: the interval of this loop, which is bounded by its own timeout.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -176,6 +178,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         object([("afterEpoch", PackageValue::String("33".into()))]),
     )
     .await;
+    // settle: lets the reopened subscription deliver before its events are read.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let resumed = request(
         &host,

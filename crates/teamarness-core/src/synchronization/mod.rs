@@ -42,20 +42,36 @@ pub(crate) use network_handler::{
     SyncReceiver, SyncRejection,
 };
 
-/// How many stored operation rows sessions have read since the process began.
+/// How many stored operation rows sessions have read, per scope.
 ///
 /// A session that serves a peer which is already up to date must read none.
+/// The count is per scope because every test in this binary runs in one
+/// process: a single global counter measures every concurrent test's reads as
+/// well as the caller's, which is what made
+/// `session_does_not_load_the_whole_scope` flake. A scope digest is derived
+/// from a Package identity and a Workspace identity, and a test's Workspace is
+/// its own.
 #[cfg(test)]
-static RECORDS_LOADED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDS_LOADED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
-pub(crate) fn note_record_loaded_for_test() {
-    RECORDS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn note_record_loaded_for_test(scope: [u8; 32]) {
+    *RECORDS_LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(scope)
+        .or_default() += 1;
 }
 
 #[cfg(test)]
-pub(crate) fn records_loaded_for_test() -> usize {
-    RECORDS_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+pub(crate) fn records_loaded_for_test(scope: [u8; 32]) -> usize {
+    RECORDS_LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&scope)
+        .copied()
+        .unwrap_or(0)
 }
 use crate::diag::fault;
 use crate::encoding::ByteReader;

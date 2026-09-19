@@ -256,6 +256,14 @@ async fn quarantined_record_is_skipped_and_position_advances() {
 #[tokio::test]
 async fn commits_from_every_path_wake_a_waiting_subscriber() {
     let mut cluster = SyncCluster::start("wake-every-path", &["a", "b", "c"]).await;
+    // Every session in parts (a) and (b) is driven explicitly, so the schedulers
+    // must not run one of their own with the same peer at the same time: the
+    // loser of that race is cancelled, and it would be this test's session.
+    // Part (c) resumes b's scheduler, which is what triggers the promotion it
+    // waits for.
+    for name in ["a", "b", "c"] {
+        cluster.node(name).pause_sync_scheduler_for_test(true);
+    }
     let workspace = cluster.node("a").create_workspace("Wakes").unwrap();
     let id = workspace.id();
     cluster

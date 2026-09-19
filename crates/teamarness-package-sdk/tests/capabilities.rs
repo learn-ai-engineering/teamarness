@@ -470,6 +470,7 @@ impl RecordLogSink for TestSink {
 
     fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
         while !self.gate.load(Ordering::SeqCst) {
+            // simulated-delay: the fixture's own gate, which the test opens when it is ready.
             std::thread::sleep(Duration::from_millis(5));
         }
         if self.fail_next_ingest.swap(false, Ordering::SeqCst) {
@@ -642,6 +643,7 @@ async fn session_credits_only_after_ingest_returns() {
         "the credit window to fill",
     )
     .await;
+    // negative-wait: a bounded window proving the 33rd event cannot leave.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(sent.load(Ordering::SeqCst), 32);
     assert!(sink.ingested.lock().unwrap().is_empty());
@@ -832,6 +834,7 @@ async fn session_stops_on_cancellation_during_backoff() {
     let disposed = Instant::now();
     harness.dispose().await.unwrap();
     assert!(disposed.elapsed() < Duration::from_secs(5));
+    // negative-wait: a bounded window proving a cancelled session never resubscribes.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         scripted.recorded_opens().len(),

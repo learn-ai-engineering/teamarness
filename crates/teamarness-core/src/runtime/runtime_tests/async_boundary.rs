@@ -37,6 +37,7 @@ where
     let (finished, sibling) = tokio::sync::oneshot::channel();
     executor.spawn(async move {
         for _ in 0..10 {
+            // simulated-delay: the sibling task's own work, which is what the executor must keep running.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = finished.send(());

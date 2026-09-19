@@ -88,6 +88,7 @@ async fn exact_lease_evidence_terminates_the_process_group_and_removes_the_lease
             break process.start_time().to_string();
         }
         assert!(Instant::now() < deadline);
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         std::thread::sleep(Duration::from_millis(10));
     };
     insert_lease(
@@ -122,6 +123,7 @@ async fn exact_lease_evidence_terminates_the_process_group_and_removes_the_lease
             let _ = child.kill();
             break child.wait().unwrap();
         }
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(!status.success());

@@ -94,6 +94,7 @@ async fn declared_history_uses_inclusive_admission_and_exclusive_revocation_boun
     );
 
     while now_unix_ms() <= admitted_at {
+        // negative-wait: waits for the wall clock to leave the admission's millisecond.
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     issuer

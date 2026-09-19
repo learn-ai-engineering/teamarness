@@ -384,7 +384,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
                 return Err(RangeLoadError::ScopeCorrupt);
             };
             #[cfg(test)]
-            crate::synchronization::note_record_loaded_for_test();
+            crate::synchronization::note_record_loaded_for_test(scope);
             entries.push((
                 p2panda_core::Operation::from_parts(
                     header,

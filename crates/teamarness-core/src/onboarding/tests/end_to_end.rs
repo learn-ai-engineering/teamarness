@@ -81,6 +81,7 @@ fn remove_directory(path: &std::path::Path) {
             Ok(()) => return,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) if attempt == 49 => panic!("{}: {error}", path.display()),
+            // negative-wait: backoff between retries of the platform's own readdir and rmdir race.
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     }
@@ -182,6 +183,7 @@ async fn retry_after_expiry_imports_later_current_state_but_refuses_a_revoked_in
         .await
         .unwrap();
     second.join_workspace(&second_invitation).await.unwrap();
+    // negative-wait: waits past the first invitation's wall-clock expiry.
     std::thread::sleep(Duration::from_millis(35));
 
     let (_, first_snapshot) = first.join_workspace(&first_invitation).await.unwrap();

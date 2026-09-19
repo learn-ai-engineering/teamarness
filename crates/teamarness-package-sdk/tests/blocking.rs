@@ -30,12 +30,14 @@ async fn blocking_returns_cancelled_immediately_while_the_closure_observes_the_t
     let flag = observed.clone();
     let work = blocking(&token, move |cancellation| {
         while !cancellation.is_cancelled() {
+            // simulated-delay: the fixture's own polling of the cancellation token.
             std::thread::sleep(Duration::from_millis(5));
         }
         flag.store(true, Ordering::SeqCst);
         Ok(())
     });
     let started = Instant::now();
+    // settle: lets the blocking closure start before the token is cancelled.
     tokio::time::sleep(Duration::from_millis(30)).await;
     token.cancel();
     let error = work.await.unwrap_err();
@@ -45,6 +47,7 @@ async fn blocking_returns_cancelled_immediately_while_the_closure_observes_the_t
 
     let deadline = Instant::now() + Duration::from_secs(1);
     while !observed.load(Ordering::SeqCst) && Instant::now() < deadline {
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(observed.load(Ordering::SeqCst), "the closure saw the token");

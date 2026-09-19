@@ -186,6 +186,7 @@ async fn cancelling_a_snapshot_interrupts_the_blocking_walk() {
             serde_json::json!({ "registrationId": id }),
         )
         .await;
+    // settle: lets the snapshot start walking before it is cancelled.
     tokio::time::sleep(Duration::from_millis(20)).await;
     pending.cancel().await;
     let error = pending.result().await.unwrap_err();
@@ -199,6 +200,7 @@ async fn cancelling_a_snapshot_interrupts_the_blocking_walk() {
     // The walk itself observed the interrupt flag rather than running to completion unread.
     let deadline = Instant::now() + Duration::from_secs(2);
     while SNAPSHOT_INTERRUPTIONS.load(Ordering::SeqCst) == before && Instant::now() < deadline {
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
@@ -221,6 +223,7 @@ async fn suspend_interrupts_an_in_flight_snapshot() {
             serde_json::json!({ "registrationId": id }),
         )
         .await;
+    // settle: lets the snapshot start walking before suspension cancels it.
     tokio::time::sleep(Duration::from_millis(20)).await;
     harness.suspend().await.unwrap();
 

@@ -643,6 +643,11 @@ impl CoreRuntime {
                     peer,
                 )
                 .await;
+            // An explicit session competes with the responder's two inbound
+            // slots per peer. Losing that race is not the behaviour any caller
+            // is testing, so retry until the deadline. `Cancelled` is NOT
+            // retried: `local_revocation_cancels_a_live_session` asserts it, and
+            // a caller that must not race the scheduler pauses it instead.
             if !matches!(
                 result,
                 Err(crate::synchronization::LogSessionError::PeerBusy)
@@ -650,6 +655,8 @@ impl CoreRuntime {
             {
                 return result;
             }
+            // negative-wait: backoff between retries; the peer offers no event
+            // saying it has freed a slot.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }

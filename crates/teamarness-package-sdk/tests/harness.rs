@@ -237,9 +237,11 @@ async fn scripted_capability_answers_calls_and_streams_with_credit() {
         if sent.load(Ordering::SeqCst) == 32 {
             break;
         }
+        // poll-interval: the interval of this loop, which is bounded by its own count.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(sent.load(Ordering::SeqCst), 32);
+    // negative-wait: a bounded window proving the 33rd event waits for credit.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         sent.load(Ordering::SeqCst),

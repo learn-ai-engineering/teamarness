@@ -430,6 +430,7 @@ pub async fn create_invitation(
         match core.create_workspace_invitation(workspace).await {
             Ok(invitation) => return invitation,
             Err(OnboardingError::Readiness) if Instant::now() < deadline => {
+                // negative-wait: backoff between retries; the endpoint offers no readiness event.
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(error) => panic!("workspace invitation failed during qualification: {error}"),

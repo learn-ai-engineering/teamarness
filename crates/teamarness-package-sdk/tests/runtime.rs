@@ -50,6 +50,7 @@ impl Backend for Fixture {
                     let token = request.cancellation().clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         while !token.is_cancelled() {
+                            // simulated-delay: the fixture's own polling of the cancellation token.
                             std::thread::sleep(Duration::from_millis(5));
                         }
                         flag.store(true, Ordering::SeqCst);
@@ -83,6 +84,7 @@ impl Backend for Fixture {
                     Ok(empty())
                 }
                 "fixture.block" => {
+                    // simulated-delay: the fixture's blocking work, which is what the test is about.
                     std::thread::sleep(Duration::from_secs(3));
                     Ok(empty())
                 }
@@ -183,6 +185,7 @@ async fn cancel_frame_cancels_the_request_token_before_aborting() {
         r#"{{"kind":"request","id":"h:poll","operation":"fixture.poll_cancellation","deadlineUnixMs":"{}","payload":{{}}}}"#,
         deadline_in(Duration::from_secs(60)),
     )).await;
+    // settle: lets the request reach the Backend before it is cancelled.
     tokio::time::sleep(Duration::from_millis(50)).await;
     write_json(
         &mut session.host_write,
@@ -195,6 +198,7 @@ async fn cancel_frame_cancels_the_request_token_before_aborting() {
 
     let deadline = Instant::now() + Duration::from_secs(1);
     while !backend.cancellation_observed.load(Ordering::SeqCst) && Instant::now() < deadline {
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(
@@ -231,6 +235,7 @@ async fn suspend_cancels_in_flight_request_tokens_first() {
         r#"{{"kind":"request","id":"h:long","operation":"fixture.long","deadlineUnixMs":"{}","payload":{{}}}}"#,
         deadline_in(Duration::from_secs(60)),
     )).await;
+    // settle: lets the long request start before suspension is asked for.
     tokio::time::sleep(Duration::from_millis(50)).await;
     write_json(&mut session.host_write, &format!(
         r#"{{"kind":"request","id":"h:suspend","operation":"lifecycle.suspend","deadlineUnixMs":"{}","payload":{{}}}}"#,
@@ -277,6 +282,7 @@ async fn ping_is_answered_while_every_package_worker_is_blocked() {
         r#"{{"kind":"request","id":"h:block","operation":"fixture.block","deadlineUnixMs":"{}","payload":{{}}}}"#,
         deadline_in(Duration::from_secs(60)),
     )).await;
+    // settle: lets the blocking request start before the control plane is pinged.
     tokio::time::sleep(Duration::from_millis(100)).await;
     write_json(&mut host_write, r#"{"kind":"ping","nonce":"cGluZw"}"#).await;
     let pong = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut host_read))

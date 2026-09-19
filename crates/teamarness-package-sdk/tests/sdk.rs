@@ -66,6 +66,7 @@ impl Backend for Echo {
                 return Ok(event);
             }
             if request.operation == "fixture.slow" {
+                // simulated-delay: the fixture's own slow operation, which is what the test is about.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             if request.operation == "fixture.error" {

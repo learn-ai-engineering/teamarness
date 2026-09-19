@@ -180,6 +180,7 @@ async fn exit_invalidates_generation_without_replaying_the_request_and_explicit_
             if snapshot.lifecycle == LifecycleState::Active {
                 break snapshot;
             }
+            // poll-interval: the interval of this loop, which is bounded by its own timeout.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })

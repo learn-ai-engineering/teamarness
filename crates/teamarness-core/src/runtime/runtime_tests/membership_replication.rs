@@ -277,6 +277,7 @@ async fn revoked_member_learns_only_its_revocation_closure() {
 
     // Ten further seconds of replication do not widen what it learned.
     let settled = cluster.members("b", id);
+    // negative-wait: a bounded window proving no further operation is disclosed.
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(cluster.members("b", id), settled);
     assert_eq!(cluster.membership_operation_ids("b", id), learned);
@@ -328,6 +329,7 @@ async fn membership_replication_is_idempotent() {
         for name in ["a", "b", "c"] {
             cluster.node(name).sync_now_for_test();
         }
+        // negative-wait: bounded rounds proving a repeated session applies nothing twice.
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 

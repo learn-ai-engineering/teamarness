@@ -184,6 +184,7 @@ async fn local_revocation_cancels_a_live_session() {
         tokio::pin!(session);
         let settled = tokio::select! {
             result = &mut session => Some(result),
+            // negative-wait: a bounded window proving the session has not finished.
             () = tokio::time::sleep(Duration::from_millis(300)) => None,
         };
         assert!(settled.is_none(), "the session must still be running");
@@ -670,6 +671,7 @@ async fn revoked_member_cannot_pull_new_records_from_any_member() {
 
     for _ in 0..10 {
         cluster.node("b").sync_now_for_test();
+        // negative-wait: bounded rounds proving a revoked peer is served nothing.
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let seen = cluster.record_ids("b", id, PACKAGE);
@@ -745,6 +747,7 @@ async fn revocation_cancels_inbound_sessions_on_the_responder() {
         tokio::pin!(stalled);
         let settled = tokio::select! {
             result = &mut stalled => Some(result),
+            // negative-wait: a bounded window proving the inbound session is still open.
             () = tokio::time::sleep(Duration::from_millis(300)) => None,
         };
         assert!(settled.is_none(), "the inbound session must still be open");

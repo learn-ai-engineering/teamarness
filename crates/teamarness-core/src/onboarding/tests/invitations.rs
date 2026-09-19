@@ -197,6 +197,7 @@ async fn an_expired_token_is_not_consumed() {
         .issue_invitation(workspace.id(), now_unix_ms() + 5)
         .unwrap();
     let claim = invitee.create_invitation_claim(&token).unwrap();
+    // negative-wait: waits past the invitation's wall-clock expiry.
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     assert_eq!(

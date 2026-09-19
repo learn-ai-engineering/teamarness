@@ -184,9 +184,33 @@ pub async fn invite(
             Err(teamarness_core::OnboardingError::Readiness)
                 if std::time::Instant::now() < expiry =>
             {
+                // negative-wait: backoff between retries; the endpoint offers
+                // no readiness event to await.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(error) => panic!("the invitation could not be issued: {error}"),
         }
+    }
+}
+
+/// Waits for a condition instead of guessing how long it takes.
+///
+/// Polls every 10 ms and panics with `what` on timeout, so a failure names the
+/// condition that never held rather than an assertion about a marker.
+pub async fn eventually<F, Fut>(timeout: std::time::Duration, what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let expiry = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

@@ -345,6 +345,7 @@ async fn synchronous_post_response_validation_respects_the_deadline() {
         elapsed < Duration::from_millis(1_500),
         "synchronous validation prevented deadline enforcement: {elapsed:?}"
     );
+    // negative-wait: gives the abandoned join longer than its budget to prove it writes nothing.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert_eq!(workspace_rows(&joiner_directory), 0);
 

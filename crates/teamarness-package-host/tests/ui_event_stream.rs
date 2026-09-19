@@ -436,6 +436,7 @@ async fn mount_scoped_client_ids_do_not_collide_or_cross_cancel() {
             }))
             .await
     });
+    // settle: lets both requests reach the Backend before one is cancelled.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     host.execute(PackageHostCommand::CancelUiRequest(CancelUiRequest {
         mount: first.clone(),

@@ -151,32 +151,54 @@ async fn a_capability_failure_keeps_the_underlying_code_in_details() {
     harness.shutdown().await.unwrap();
 }
 
+/// The Backend's background marker, read through a request.
+async fn marker(harness: &mut Harness) -> i64 {
+    harness.request("reference.read", empty()).await.unwrap()["backgroundMarker"]
+        .as_i64()
+        .unwrap()
+}
+
+/// Waits until the background marker reaches `at_least`, and returns it.
+async fn wait_for_marker(harness: &mut Harness, at_least: i64, what: &str) -> i64 {
+    let expiry = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let value = marker(harness).await;
+        if value >= at_least {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_stops_background_activity_and_resume_restarts_it() {
     let root = tempfile::tempdir().unwrap();
     let mut harness = start(root.path()).await;
     harness.activate().await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_marker(&mut harness, 1, "background activity advances the marker").await;
     harness.suspend().await.unwrap();
     // The marker is read through a request, so recover first, read, then suspend again.
     harness.recover().await.unwrap();
-    let running = harness.request("reference.read", empty()).await.unwrap()["backgroundMarker"]
-        .as_i64()
-        .unwrap();
+    let running = marker(&mut harness).await;
     assert!(running >= 1, "background activity advanced the marker");
 
     harness.suspend().await.unwrap();
+    // negative-wait: a bounded window proving a suspended Backend's marker stays put.
     tokio::time::sleep(Duration::from_millis(300)).await;
     harness.recover().await.unwrap();
-    let stopped = harness.request("reference.read", empty()).await.unwrap()["backgroundMarker"]
-        .as_i64()
-        .unwrap();
+    let stopped = marker(&mut harness).await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let resumed = harness.request("reference.read", empty()).await.unwrap()["backgroundMarker"]
-        .as_i64()
-        .unwrap();
+    let resumed = wait_for_marker(
+        &mut harness,
+        stopped + 1,
+        "a recovered Backend advances its marker again",
+    )
+    .await;
     assert!(
         resumed > stopped,
         "recover restarts the background activity: {stopped} then {resumed}"

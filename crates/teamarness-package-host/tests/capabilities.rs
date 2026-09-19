@@ -241,6 +241,7 @@ async fn immutable_record_stream_waits_for_a_new_scope() {
         .unwrap();
     assert!(matches!(opened, PackageHostOutcome::UiResponse { .. }));
 
+    // negative-wait: a bounded window proving the subscription does not fail the instance.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
         host.snapshot().await.instances[0].lifecycle,
@@ -1062,6 +1063,7 @@ async fn membership_stream_does_not_poll() {
             std::time::Instant::now() < expiry,
             "the admitted transition reaches the Package"
         );
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     let after = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());

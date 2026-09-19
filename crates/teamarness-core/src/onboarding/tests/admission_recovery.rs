@@ -62,6 +62,7 @@ async fn exact_retry_recovers_after_expiry_without_a_duplicate_admission() {
         .admit_and_export_for_test(&claim, invitee.public_identity(), None)
         .unwrap();
     let first_response = decode_success(&first).unwrap();
+    // negative-wait: the invitation's expiry is a wall-clock timestamp, not an event.
     std::thread::sleep(Duration::from_millis(75));
     let recovered = issuer
         .admit_and_export_for_test(&claim, invitee.public_identity(), None)

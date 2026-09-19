@@ -17,6 +17,25 @@ use teamarness_package_host::{
     UiRequestId, UiSubscriptionId, WorkspaceId,
 };
 
+/// Waits for a condition instead of guessing how long it takes.
+async fn eventually<F, Fut>(timeout: Duration, what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let expiry = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bundled_local_and_version_restarts_preserve_reference_state_and_processes() {
     let root = tempfile::tempdir().unwrap();
@@ -126,15 +145,22 @@ async fn bundled_local_and_version_restarts_preserve_reference_state_and_process
     .await
     .unwrap();
     assert_eq!(instance_generation(&host, &key).await, generation);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let baseline = integer(&first, "backgroundMarker");
+    eventually(
+        Duration::from_secs(5),
+        "background activity advances",
+        || async { integer(&read_reference(&host, &key).await, "backgroundMarker") > baseline },
+    )
+    .await;
     let active_marker = integer(&read_reference(&host, &key).await, "backgroundMarker");
-    assert!(active_marker > integer(&first, "backgroundMarker"));
+    assert!(active_marker > baseline);
 
     host.execute(PackageHostCommand::Suspend(SuspendPackage {
         instance: key.clone(),
     }))
     .await
     .unwrap();
+    // negative-wait: a bounded window proving a suspended Backend's marker stays put.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(persisted_marker(&private, &key), active_marker);
     host.execute(PackageHostCommand::Recover(RecoverPackage {
@@ -143,8 +169,14 @@ async fn bundled_local_and_version_restarts_preserve_reference_state_and_process
     .await
     .unwrap();
     assert_eq!(instance_generation(&host, &key).await, generation);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(integer(&read_reference(&host, &key).await, "backgroundMarker") > active_marker);
+    eventually(
+        Duration::from_secs(5),
+        "a recovered Backend advances its marker again",
+        || async {
+            integer(&read_reference(&host, &key).await, "backgroundMarker") > active_marker
+        },
+    )
+    .await;
     host.execute(PackageHostCommand::Dispose(DisposePackage {
         instance: other_key.clone(),
     }))

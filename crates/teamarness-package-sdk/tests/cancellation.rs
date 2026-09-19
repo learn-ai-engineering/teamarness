@@ -14,6 +14,7 @@ async fn cancelled_future_completes_for_cancel_before_and_after_await() {
     let after = CancellationToken::new();
     let waiting = after.clone();
     let task = tokio::spawn(async move { waiting.cancelled().await });
+    // negative-wait: a bounded window proving an uncancelled token stays uncancelled.
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(!after.is_cancelled());
     after.cancel();

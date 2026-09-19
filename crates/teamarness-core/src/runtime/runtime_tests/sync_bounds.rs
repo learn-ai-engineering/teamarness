@@ -214,12 +214,14 @@ async fn session_does_not_load_the_whole_scope() {
     assert_eq!(cluster.record_ids("b", id, PACKAGE).len(), 300);
 
     // A second session with a peer that already holds everything reads no row
-    // of the journal at all.
-    let before = crate::synchronization::records_loaded_for_test();
+    // of the journal at all. The count is scoped to this test's Workspace, so a
+    // test running beside it in the same process cannot move it.
+    let scope = crate::synchronization::scope_digest(PACKAGE, id);
+    let before = crate::synchronization::records_loaded_for_test(scope);
     let report = replicate(&cluster, id).await;
     assert_eq!(report.outcomes.applied, 0);
     assert_eq!(
-        crate::synchronization::records_loaded_for_test(),
+        crate::synchronization::records_loaded_for_test(scope),
         before,
         "a peer that is already up to date costs no reads"
     );
@@ -468,6 +470,7 @@ async fn catching_up_is_reported_between_truncated_sessions() {
         // are what fill the journal.
         cluster.node("a").sync_now_for_test();
         cluster.node("b").sync_now_for_test();
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -634,6 +637,7 @@ async fn non_member_connection_flood_is_refused_without_reading() {
             std::time::Instant::now() < expiry,
             "a silent peer holds a slot for at most the hello timeout"
         );
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     drop(held);
@@ -698,6 +702,7 @@ async fn revocation_during_backoff_prevents_redial() {
             before,
             "a revoked peer is never dialled out of backoff"
         );
+        // negative-wait: a bounded window proving a revoked peer is never dialled.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     cluster.finish().await;

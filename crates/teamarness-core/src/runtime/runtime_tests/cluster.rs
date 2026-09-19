@@ -186,6 +186,7 @@ impl SyncCluster {
                         Instant::now() < expiry,
                         "a membership session between two members completes: {error}"
                     );
+                    // negative-wait: backoff between retries; the peer offers no event saying it has a slot.
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }

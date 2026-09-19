@@ -20,6 +20,7 @@ async fn invite(
         match runtime.create_workspace_invitation(workspace).await {
             Ok(invitation) => return invitation,
             Err(OnboardingError::Readiness) if std::time::Instant::now() < expiry => {
+                // negative-wait: backoff between retries; the endpoint offers no readiness event.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(error) => panic!("the invitation could not be issued: {error}"),

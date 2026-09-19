@@ -94,6 +94,7 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
         let result = context
             .blocking(move |cancellation| {
                 while !cancellation.is_cancelled() {
+                    // simulated-delay: the fixture's own polling of the cancellation token.
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 flag.store(true, Ordering::SeqCst);
@@ -396,6 +397,7 @@ async fn context_blocking_observes_request_cancellation() {
         .request("h:activate", "lifecycle.activate", "{}")
         .await;
     write_json(&mut session.host_write, r#"{"kind":"request","id":"h:blocking","operation":"fixture.blocking","deadlineUnixMs":"99999999999999","payload":{}}"#).await;
+    // settle: lets the request reach the router before it is cancelled.
     tokio::time::sleep(Duration::from_millis(50)).await;
     write_json(
         &mut session.host_write,
