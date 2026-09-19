@@ -345,6 +345,10 @@ async function serve() {
   // `fixture.membership_credit` may put on the wire.
   let membershipCredited = 0;
   const immutableEvents = [];
+  /** Events recorded before the open immutable stream, which it never credits. */
+  let immutableCreditBase = 0;
+  /** Events of the open immutable stream this fixture has already credited. */
+  let immutableCredited = 0;
   let immutableStream;
   let immutableCloseCode = null;
   const uiStreams = new Map();
@@ -490,6 +494,8 @@ async function serve() {
       } else if (frame.kind === "request" && ["fixture.immutable_subscribe", "fixture.record_subscribe"].includes(frame.operation)) {
         capabilitySequence += 1;
         immutableStream = `p:immutable-${capabilitySequence}`;
+        immutableCreditBase = immutableEvents.length;
+        immutableCredited = 0;
         send({
           kind: "stream_open", id: immutableStream, topic: "capability.stream", initialCredit: 32,
           payload: {
@@ -503,11 +509,23 @@ async function serve() {
       } else if (frame.kind === "request" && ["fixture.immutable_credit", "fixture.record_credit"].includes(frame.operation)) {
         // `frames` returns the window one event at a time, the way a consumer
         // that commits before crediting does; the default is a single frame.
+        //
+        // What crosses the wire is what this stream has consumed and not yet
+        // credited, never what the request asked for. The 32 events are a
+        // ceiling on the window, so a grant that would carry the stream past
+        // it is `credit_violation` and fatal to the generation — two frames of
+        // one is enough on an empty scope, which emits a single state event.
         const frames = frame.payload.frames ?? 1;
+        let credited = 0;
         for (let index = 0; index < frames; index += 1) {
-          send({ kind: "credit", streamId: immutableStream, amount: frame.payload.amount });
+          const consumed = immutableEvents.length - immutableCreditBase - immutableCredited;
+          const amount = Math.min(frame.payload.amount, consumed);
+          if (amount <= 0) break;
+          immutableCredited += amount;
+          credited += amount;
+          send({ kind: "credit", streamId: immutableStream, amount });
         }
-        send({ kind: "response", id: frame.id, payload: { credited: true } });
+        send({ kind: "response", id: frame.id, payload: { credited } });
       } else if (frame.kind === "request" && ["fixture.immutable_close", "fixture.record_close"].includes(frame.operation)) {
         if (immutableStream) send({ kind: "stream_close", streamId: immutableStream, code: "closed" });
         immutableStream = undefined;

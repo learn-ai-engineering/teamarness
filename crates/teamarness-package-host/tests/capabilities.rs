@@ -241,8 +241,13 @@ async fn immutable_record_stream_waits_for_a_new_scope() {
         .unwrap();
     assert!(matches!(opened, PackageHostOutcome::UiResponse { .. }));
 
-    // negative-wait: a bounded window proving the subscription does not fail the instance.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // The empty scope's one state event, waited for rather than slept past:
+    // the acknowledgement below credits exactly what arrived, so a late event
+    // used to mean the credit was for work that never happened.
+    poll_immutable(&host, &mount, "the empty scope reports its state", |response| {
+        !events_of(response).is_empty()
+    })
+    .await;
     assert_eq!(
         host.snapshot().await.instances[0].lifecycle,
         teamarness_package_host::LifecycleState::Active
@@ -280,6 +285,67 @@ async fn immutable_record_stream_waits_for_a_new_scope() {
         record_events(&value),
         1,
         "one record event, beside its state events"
+    );
+}
+
+/// The language-neutral reference implementation cannot emit credit for work
+/// it never accepted.
+///
+/// `fixture.immutable_credit` put every frame the request asked for on the
+/// wire with nothing bounding it by what the stream had delivered. Since the
+/// window became a ceiling, two frames of one credit on an empty scope — which
+/// emits a single state event — carry the stream to 33 against 32 and are
+/// `credit_violation`: fatal, and the instance goes `Failed` with its mount
+/// cleared. The contract's own reference implementation is the last place that
+/// should be able to do it.
+#[tokio::test]
+async fn crediting_more_than_the_stream_delivered_keeps_the_generation() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    fixture_request(
+        &host,
+        &mount,
+        "over-credit-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    poll_immutable(&host, &mount, "the empty scope reports its state", |response| {
+        !events_of(response).is_empty()
+    })
+    .await;
+
+    let credited = fixture_request(
+        &host,
+        &mount,
+        "over-credit",
+        "fixture.immutable_credit",
+        object([
+            ("amount", PackageValue::Integer(1)),
+            ("frames", PackageValue::Integer(2)),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        credited.get("credited"),
+        Some(&PackageValue::Integer(1)),
+        "only the one event the stream accepted is credited"
+    );
+    assert_eq!(
+        host.snapshot().await.instances[0].lifecycle,
+        teamarness_package_host::LifecycleState::Active,
+        "an over-window grant would be `credit_violation` and fail the generation"
     );
 }
 
