@@ -114,7 +114,10 @@ async fn external_consumers_cannot_cross_the_runtime_boundary() {
         ("redeem_invitation.rs", "redeem_invitation"),
         ("configuration_error.rs", "unresolved import"),
         ("replicate_records_to.rs", "replicate_records_to"),
-        ("authenticate_membership_operation.rs", "authenticate_membership_operation"),
+        (
+            "authenticate_membership_operation.rs",
+            "authenticate_membership_operation",
+        ),
     ];
 
     for (fixture, marker) in cases {
