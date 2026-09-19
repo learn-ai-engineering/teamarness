@@ -10,6 +10,7 @@ members = [
     "packages/tutorial/backend",
     "packages/conversations-package/backend",
     "packages/repo-aware/backend",
+    "tests/system",
 ]
 resolver = "3"
 

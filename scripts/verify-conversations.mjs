@@ -2,14 +2,16 @@ import { availableParallelism } from "node:os";
 import { spawnSync } from "node:child_process";
 
 const checks = [
+  // The system tests read the Backend `npm run build` stages, so stage it first.
+  ["npm", ["run", "build:conversations"]],
   [
     "cargo",
     [
       "test",
       "-p",
-      "teamarness-conversations-package",
+      "teamarness-system-tests",
       "--test",
-      "two_profile_flow",
+      "conversations_two_profile_flow",
       "--locked",
       "complete_two_profile_recovery_matrix",
       "--",
@@ -22,9 +24,9 @@ const checks = [
     [
       "test",
       "-p",
-      "teamarness-conversations-package",
+      "teamarness-system-tests",
       "--test",
-      "two_profile_flow",
+      "conversations_two_profile_flow",
       "--locked",
       "ordinary_machine_qualification_meets_delivery_and_catch_up_targets",
       "--",
@@ -38,9 +40,9 @@ const checks = [
     [
       "test",
       "-p",
-      "teamarness-conversations-package",
+      "teamarness-system-tests",
       "--test",
-      "three_profile_flow",
+      "conversations_three_profile_flow",
       "--locked",
       "three_profiles_converge_after_late_admission",
       "--",

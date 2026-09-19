@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   checkCoreModuleGraph,
+  findPackageHostDependencies,
   findDemotedBehindTestHooks,
   findModuleGraphBreaks,
   findTestHooksMisuse,
@@ -101,4 +102,26 @@ mod tests {
     findModuleGraphBreaks("network", "network/mod.rs", source, ["crate::onboarding"]),
     [],
   );
+});
+
+test("a Package manifest may not depend on Core or the Package Host", () => {
+  const manifest = `[dependencies]
+teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
+
+[dev-dependencies]
+teamarness-core = { path = "../../../crates/teamarness-core" }
+teamarness-package-host = { path = "../../../crates/teamarness-package-host" }
+`;
+  const problems = findPackageHostDependencies("packages/x/backend/Cargo.toml", manifest);
+  assert.equal(problems.length, 2);
+  assert.match(problems[0], /Cargo\.toml:5 .*teamarness-core/);
+  assert.match(problems[1], /Cargo\.toml:6 .*teamarness-package-host/);
+});
+
+test("the SDK and the protocol are not the forbidden crates", () => {
+  const manifest = `[dependencies]
+teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
+teamarness-package-protocol = { path = "../../../crates/teamarness-package-protocol" }
+`;
+  assert.deepEqual(findPackageHostDependencies("packages/x/backend/Cargo.toml", manifest), []);
 });

@@ -1,0 +1,16 @@
+[package]
+name = "teamarness-system-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+teamarness-core = { path = "../../crates/teamarness-core" }
+teamarness-package-host = { path = "../../crates/teamarness-package-host" }
+teamarness-package-protocol = { path = "../../crates/teamarness-package-protocol" }
+tempfile.workspace = true
+tokio.workspace = true

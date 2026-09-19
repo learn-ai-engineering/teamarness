@@ -4,7 +4,7 @@
 
 ## Divergence
 
-`TEAM.SYS.CONV-R16` requires a new Message within 5 seconds for a reachable peer, catch-up on 1,000 queued records within 30 seconds, and those targets in a Workspace of 25 Members. The shipped qualification (`packages/conversations-package/backend/tests/two_profile_flow.rs`) proves 10 seconds, 100 queued records, and two or three Members; nothing measures 25 Members.
+`TEAM.SYS.CONV-R16` requires a new Message within 5 seconds for a reachable peer, catch-up on 1,000 queued records within 30 seconds, and those targets in a Workspace of 25 Members. The shipped qualification (`tests/system/tests/conversations_two_profile_flow.rs`) proves 10 seconds, 100 queued records, and two or three Members; nothing measures 25 Members.
 
 ## Impact
 

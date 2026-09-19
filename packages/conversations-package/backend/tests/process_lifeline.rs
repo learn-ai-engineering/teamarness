@@ -7,30 +7,22 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
-mod support;
-
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
-use teamarness_package_host::{PackageIdentity, PackageInstanceKey, WorkspaceId};
 use teamarness_package_protocol::{Frame, FrameKind, decode_frame, encode_frame};
 
 const EXIT_DEADLINE: Duration = Duration::from_secs(5);
 const DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const RECORD_GRANT: &str = "cmVjb3JkLWdyYW50";
 
-// Every test here spawns Conversations Backends as children of this test process,
-// and `host_shutdown_reaps_active_backend` counts those children. Serialize the
-// tests so a sibling test's child is never mistaken for a leaked Backend.
-static CHILD_PROCESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Every test here spawns a Conversations Backend as a child of this test
+// process. Serialize them so one test's child is never mistaken for another's.
+static CHILD_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Backend {
     child: Child,
@@ -210,7 +202,9 @@ fn read_frames(mut stdout: ChildStdout, sender: &mpsc::Sender<Frame>) {
 
 #[test]
 fn backend_exits_when_host_dies_before_activation() {
-    let _serial = CHILD_PROCESS_LOCK.blocking_lock();
+    let _serial = CHILD_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut backend = Backend::launch();
     backend.close_stdin();
     assert!(
@@ -221,7 +215,9 @@ fn backend_exits_when_host_dies_before_activation() {
 
 #[test]
 fn backend_exits_when_host_dies_with_active_synchronization_session() {
-    let _serial = CHILD_PROCESS_LOCK.blocking_lock();
+    let _serial = CHILD_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut backend = Backend::launch();
     backend.activate_with_open_capability_stream();
     backend.open_changes_stream();
@@ -234,7 +230,9 @@ fn backend_exits_when_host_dies_with_active_synchronization_session() {
 
 #[test]
 fn backend_exits_after_shutdown_frame_with_active_synchronization_session() {
-    let _serial = CHILD_PROCESS_LOCK.blocking_lock();
+    let _serial = CHILD_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut backend = Backend::launch();
     backend.activate_with_open_capability_stream();
     backend.open_changes_stream();
@@ -249,65 +247,5 @@ fn backend_exits_after_shutdown_frame_with_active_synchronization_session() {
     assert!(
         backend.exits_within(EXIT_DEADLINE),
         "Conversations Backend acknowledged shutdown but did not exit"
-    );
-}
-
-fn conversations_children() -> Vec<u32> {
-    let parent = std::process::id();
-    let output = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat=,command="])
-        .output()
-        .expect("ps");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let ppid = fields.next()?.parse::<u32>().ok()?;
-            let stat = fields.next()?;
-            let command = fields.collect::<Vec<_>>().join(" ");
-            (ppid == parent
-                && !stat.starts_with('Z')
-                && command.contains("teamarness-conversations-package"))
-            .then_some(pid)
-        })
-        .collect()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn host_shutdown_reaps_active_backend() {
-    let _serial = CHILD_PROCESS_LOCK.lock().await;
-    let application = support::harness::StagedApplication::new();
-    let core_path = application.root.path().join("core");
-    let private = application.root.path().join("private");
-    let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&core_path))
-            .await
-            .unwrap(),
-    );
-    let workspace = core.create_workspace("Lifeline").unwrap();
-    let key = PackageInstanceKey::new(
-        PackageIdentity::from_str(support::harness::PACKAGE_ID).unwrap(),
-        WorkspaceId::new(workspace.id().to_string()).unwrap(),
-    );
-    let host =
-        support::harness::open_host(&application.application_path, private, core.clone()).await;
-    let _mount = support::harness::open_mount(&host, &key).await;
-    let children = conversations_children();
-    assert_eq!(
-        children.len(),
-        1,
-        "expected one Conversations Backend child"
-    );
-
-    support::harness::shutdown(host).await;
-    let reaped = support::harness::poll_until(EXIT_DEADLINE, || async {
-        conversations_children().is_empty()
-    })
-    .await;
-    core.shutdown().await.unwrap();
-    assert!(
-        reaped,
-        "host shutdown left the Conversations Backend running"
     );
 }

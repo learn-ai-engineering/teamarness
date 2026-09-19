@@ -22,6 +22,11 @@ export const MODULE_RULES = [
 ];
 export const TEST_HOOKS_ATTRIBUTE = '#[cfg(feature = "test-hooks")]';
 
+// ARC-10: a Package depends on what a Package an author writes can depend on —
+// the SDK and the protocol. Multi-profile tests that need a real Core Runtime
+// and Package Host live in `tests/system`, outside every Package crate.
+export const PACKAGE_FORBIDDEN_CRATES = ["teamarness-core", "teamarness-package-host"];
+
 // Production escape hatches that plan phase 8 removed from the supported API.
 // The `test-hooks` feature exists so Host integration tests can observe Core,
 // not so a demoted method can come back through a side door.
@@ -32,6 +37,23 @@ export const DEMOTED_METHODS = [
   "import_protection_grant",
   "authenticate_membership_operation",
 ];
+
+// A bundled Package's manifest must not name Core or the Package Host, in any
+// dependency table.
+export function findPackageHostDependencies(file, text) {
+  const problems = [];
+  for (const [index, raw] of text.split("\n").entries()) {
+    const line = stripComment(raw).trim();
+    for (const crateName of PACKAGE_FORBIDDEN_CRATES) {
+      if (new RegExp(`(^|[^-\\w])${crateName}([^-\\w]|$)`).test(line)) {
+        problems.push(
+          `${file}:${index + 1} a Package must not depend on \`${crateName}\`; a test that needs it belongs in tests/system`,
+        );
+      }
+    }
+  }
+  return problems;
+}
 
 function stripComment(line) {
   let quote = null;
@@ -154,6 +176,9 @@ export async function checkCoreModuleGraph(root = repositoryRoot) {
   const problems = [];
   for (const file of await trackedFiles(root, "*Cargo.toml")) {
     problems.push(...findTestHooksMisuse(file, await readFile(join(root, file), "utf8")));
+  }
+  for (const file of await trackedFiles(root, "packages/*/backend/Cargo.toml")) {
+    problems.push(...findPackageHostDependencies(file, await readFile(join(root, file), "utf8")));
   }
   for (const file of await trackedFiles(root, `${CORE_SOURCE}/*.rs`)) {
     problems.push(...findDemotedBehindTestHooks(file, await readFile(join(root, file), "utf8")));

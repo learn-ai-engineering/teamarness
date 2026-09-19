@@ -16,8 +16,5 @@ teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
 tokio.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk", features = ["testing"] }
-teamarness-core = { path = "../../../crates/teamarness-core" }
-teamarness-package-host = { path = "../../../crates/teamarness-package-host" }
 tempfile.workspace = true

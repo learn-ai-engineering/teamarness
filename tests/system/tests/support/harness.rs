@@ -469,13 +469,53 @@ pub async fn open_mount(
     }
 }
 
+/// The repository root. `CARGO_MANIFEST_DIR` is `<root>/tests/system`.
+pub fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the workspace root exists")
+}
+
+/// The Backend executable `npm run build` stages for one Package.
+///
+/// `CARGO_BIN_EXE_*` only exists inside the crate that declares the binary, and
+/// these tests deliberately live outside every Package crate (ARC-10). The
+/// staged application directory is what the desktop application reads too, so
+/// these tests exercise the same artifact.
+pub fn staged_backend(identity: &str) -> PathBuf {
+    let directory = workspace_root()
+        .join("target/teamarness-packages")
+        .join(identity);
+    let manifest = directory.join("teamarness.package.json");
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap_or_else(|error| {
+        panic!(
+            "cannot read the staged Package manifest at {}: {error}\n\
+             hint: the bundled Application Packages under target/teamarness-packages are staged by npm. \
+             Run `npm ci && npm run build` from the repository root before `cargo test -p teamarness-system-tests`.",
+            manifest.display(),
+        )
+    }))
+    .expect("the staged Package manifest is JSON");
+    let relative = manifest["backends"]
+        .as_array()
+        .and_then(|backends| {
+            backends
+                .iter()
+                .find(|backend| backend["target"] == "aarch64-apple-darwin")
+        })
+        .and_then(|backend| backend["path"].as_str())
+        .expect("the staged manifest names an aarch64-apple-darwin Backend");
+    directory.join(relative)
+}
+
 pub fn stage_package(root: &Path) -> PathBuf {
     let application = root.join("application");
     let package = application.join(PACKAGE_ID);
     fs::create_dir_all(package.join("backend")).unwrap();
     fs::create_dir_all(package.join("ui")).unwrap();
 
-    let backend = fs::read(env!("CARGO_BIN_EXE_teamarness-conversations-package")).unwrap();
+    let backend = fs::read(staged_backend(PACKAGE_ID)).unwrap();
     let backend_path =
         package.join("backend/teamarness-conversations-package-aarch64-apple-darwin");
     fs::write(&backend_path, &backend).unwrap();
@@ -483,7 +523,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
     let ui = b"export function mount() { return async () => {}; }";
     let css = b"";
     let contract =
-        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui-contract.json")).unwrap();
+        fs::read(workspace_root().join("packages/conversations-package/ui-contract.json")).unwrap();
     fs::write(package.join("ui/index.js"), ui).unwrap();
     fs::write(package.join("ui/style.css"), css).unwrap();
     fs::write(package.join("ui-contract.json"), &contract).unwrap();

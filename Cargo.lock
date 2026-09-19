@@ -7544,9 +7544,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.11.0",
- "teamarness-core",
- "teamarness-package-host",
  "teamarness-package-protocol",
  "teamarness-package-sdk",
  "tempfile",
@@ -7679,6 +7676,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "teamarness-system-tests"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.0",
+ "teamarness-core",
+ "teamarness-package-host",
+ "teamarness-package-protocol",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
