@@ -7,6 +7,7 @@ mod content_key;
 pub(crate) mod exchange;
 pub(crate) mod frames;
 pub(crate) mod health;
+pub(crate) mod key_bridge;
 pub(crate) mod limits;
 pub(crate) mod log_view;
 pub(crate) mod network_handler;

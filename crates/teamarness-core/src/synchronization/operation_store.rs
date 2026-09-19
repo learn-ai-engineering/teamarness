@@ -170,8 +170,8 @@ pub(crate) fn insert_remote(
         .as_ref()
         .ok_or(StorageError::CorruptWorkspace)?
         .to_bytes();
-    let author = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
-        .map_err(|_| StorageError::CorruptWorkspace)?;
+    let author = super::key_bridge::identity(&operation.header.verifying_key)
+        .ok_or(StorageError::CorruptWorkspace)?;
     let operation_id = operation.hash.as_bytes();
     let backlink = operation
         .header

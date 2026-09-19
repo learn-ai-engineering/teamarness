@@ -380,8 +380,8 @@ async fn exchange_and_acknowledge(
         crate::synchronization::operation_store::log_id(scope_digest(&context.package, workspace));
     let mut logs = std::collections::BTreeMap::new();
     for author in &seed.authors {
-        let author = p2panda_core::VerifyingKey::from_bytes(author.as_bytes())
-            .map_err(|error| LogSessionError::Protocol(error.to_string()))?;
+        let author = crate::synchronization::key_bridge::p2panda_verifying_key(*author)
+            .ok_or_else(|| LogSessionError::Protocol("invalid author key".to_owned()))?;
         logs.insert(author, vec![log_id]);
     }
     let view = crate::synchronization::log_view::SqliteLogView::new(

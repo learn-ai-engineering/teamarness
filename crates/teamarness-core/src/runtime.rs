@@ -1092,7 +1092,9 @@ fn classify_operation(
     now: i64,
 ) -> Result<crate::synchronization::OperationOutcome, crate::synchronization::FatalSyncError> {
     use crate::synchronization::{FatalSyncError, OperationOutcome, RejectReason};
-    let Ok(author) = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes()) else {
+    let Some(author) =
+        crate::synchronization::key_bridge::identity(&operation.header.verifying_key)
+    else {
         return Ok(OperationOutcome::Rejected(RejectReason::Invalid));
     };
     let known_author = state
@@ -3618,7 +3620,8 @@ impl crate::synchronization::SyncReceiver for InjectingReceiver {
     ) -> Result<crate::synchronization::SessionSeed, crate::synchronization::Refusal> {
         let mut seed = self.inner.session_seed(peer, workspace, package)?;
         for operation in self.extra_operations() {
-            let Ok(author) = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
+            let Some(author) =
+                crate::synchronization::key_bridge::identity(&operation.header.verifying_key)
             else {
                 continue;
             };

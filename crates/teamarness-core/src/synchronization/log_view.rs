@@ -90,7 +90,7 @@ impl SqliteLogView {
     }
 
     fn identity(author: &VerifyingKey) -> Option<PublicIdentity> {
-        PublicIdentity::from_bytes(*author.as_bytes()).ok()
+        crate::synchronization::key_bridge::identity(author)
     }
 
     fn serves(&self, log_id: &[u8; 32]) -> bool {

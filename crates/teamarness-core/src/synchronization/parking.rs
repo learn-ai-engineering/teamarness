@@ -89,8 +89,8 @@ pub(crate) fn park(
     if sealed.scope_digest != scope {
         return Err(SynchronizationError::WrongScope);
     }
-    let author = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
-        .map_err(|_| SynchronizationError::InvalidInput)?;
+    let author = super::key_bridge::identity(&operation.header.verifying_key)
+        .ok_or(SynchronizationError::InvalidInput)?;
     let bytes = super::operation_store::encode_operation(&operation.header, &payload);
     let hash = *operation.hash.as_bytes();
 
