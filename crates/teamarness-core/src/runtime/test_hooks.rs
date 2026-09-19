@@ -290,6 +290,19 @@ impl Drop for RuntimeStateHold {
 }
 
 #[cfg(test)]
+impl CoreRuntimeConfig {
+    /// Replaces the synchronization bounds this Installation runs sessions
+    /// under.
+    pub(crate) fn with_session_limits_for_test(
+        mut self,
+        limits: crate::synchronization::limits::SessionLimits,
+    ) -> Self {
+        self.session_limits = limits;
+        self
+    }
+}
+
+#[cfg(test)]
 impl RuntimeState {
     /// Builds a runtime state with no networking, for scheduler driver tests.
     ///

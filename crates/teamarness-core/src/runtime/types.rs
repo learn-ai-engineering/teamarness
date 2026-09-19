@@ -35,17 +35,6 @@ impl CoreRuntimeConfig {
         }
     }
 
-    /// Replaces the synchronization bounds this Installation runs sessions
-    /// under.
-    #[cfg(test)]
-    pub(crate) fn with_session_limits_for_test(
-        mut self,
-        limits: crate::synchronization::limits::SessionLimits,
-    ) -> Self {
-        self.session_limits = limits;
-        self
-    }
-
     /// Returns the private data directory owned by the runtime.
     #[must_use]
     pub fn private_data_directory(&self) -> &Path {
