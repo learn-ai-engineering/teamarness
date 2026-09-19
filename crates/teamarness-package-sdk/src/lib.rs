@@ -289,9 +289,21 @@ async fn control_loop(
     };
     let (writer, control, data) = priority_writer::PriorityWriter::channels();
     let writer = Arc::new(writer);
+    // One classifier for this Package's whole session: the reader, the writer
+    // and every capability client share it, so neither direction can hold its
+    // own idea of which lifecycle races are tolerable.
+    let state: priority_writer::SharedState = Arc::new(tokio::sync::Mutex::new(
+        teamarness_package_protocol::ContractState::default(),
+    ));
     let (stop_writer, writer_stopped) = oneshot::channel();
-    let writer_task = tokio::spawn(priority_writer::run(output, control, data, writer_stopped));
-    let (frames_tx, frames_rx) = mpsc::channel(64);
+    let writer_task = tokio::spawn(priority_writer::run(
+        output,
+        control,
+        data,
+        writer_stopped,
+        state.clone(),
+    ));
+    let (frames_tx, frames_rx) = mpsc::channel(teamarness_package_protocol::MAX_WRITER_FRAMES);
     let reader_task = tokio::spawn(reader::run(input, frames_tx));
     let pending: capability::PendingCapabilities =
         Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -304,6 +316,7 @@ async fn control_loop(
         pending.clone(),
         streams.clone(),
         package_runtime,
+        state,
     )
     .await;
     reader_task.abort();

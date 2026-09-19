@@ -1,15 +1,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use teamarness_package_protocol::{Frame, FrameKind, JsonValue, MAX_IN_FLIGHT_EACH_DIRECTION};
+use teamarness_package_protocol::{
+    Direction, Frame, FrameKind, INITIAL_STREAM_CREDIT, JsonValue, MAX_IN_FLIGHT_EACH_DIRECTION,
+    Verdict,
+};
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::cancellation::CancellationToken;
 use crate::capability::{CapabilityClient, CapabilityStreams, PendingCapabilities};
-use crate::priority_writer::PriorityWriter;
+use crate::priority_writer::{PriorityWriter, SharedState};
 use crate::{Backend, BackendError, BackendRequest, Initialization, SdkError, object};
 
 /// One in-flight request: its task, its cancellation signal, and whether it is a lifecycle call.
@@ -17,6 +21,10 @@ struct InFlight {
     task: JoinHandle<()>,
     cancellation: CancellationToken,
     lifecycle: bool,
+    /// Set by whichever of the handler task and the cancel path gets there
+    /// first. Exactly one `response` or `error` is terminal for a request, and
+    /// a cancel that races a finishing handler must not emit the second.
+    answered: Arc<AtomicBool>,
 }
 
 pub(crate) async fn run(
@@ -26,11 +34,17 @@ pub(crate) async fn run(
     pending_capabilities: PendingCapabilities,
     capability_streams: CapabilityStreams,
     package_runtime: Handle,
+    state: SharedState,
 ) -> Result<(), SdkError> {
     let initialize = frames.recv().await.ok_or(SdkError::ParentClosed)?;
     if initialize.kind() != FrameKind::Initialize {
         return Err(SdkError::Protocol("handshake_order"));
     }
+    state
+        .lock()
+        .await
+        .observe(Direction::HostToPackage, &initialize)
+        .map_err(SdkError::protocol)?;
     let initialization = Initialization::from_frame(&initialize)?;
     writer.control(initialized(&initialize)?).await?;
 
@@ -38,6 +52,7 @@ pub(crate) async fn run(
         writer.clone(),
         pending_capabilities.clone(),
         capability_streams.clone(),
+        state.clone(),
     );
     let lifecycle = Arc::new(Mutex::new(()));
     let (done_tx, mut done_rx) = mpsc::channel::<String>(MAX_IN_FLIGHT_EACH_DIRECTION);
@@ -57,15 +72,20 @@ pub(crate) async fn run(
                     crate::parent_lifeline::abort_all(streams.into_values().map(|value| value.0));
                     return Err(SdkError::ParentClosed);
                 };
+                // One classifier, shared with the Host and with this side's own
+                // writer. A frame it ignores names state this side has already
+                // retired, and never reaches a handler.
+                let verdict = state
+                    .lock()
+                    .await
+                    .observe(Direction::HostToPackage, &frame)
+                    .map_err(SdkError::protocol)?;
+                if verdict == Verdict::Ignore {
+                    continue;
+                }
                 match frame.kind() {
                     FrameKind::Request => {
-                        if tasks.len() >= MAX_IN_FLIGHT_EACH_DIRECTION {
-                            return Err(SdkError::Protocol("overloaded"));
-                        }
                         let id = string_field(&frame, "id")?;
-                        if tasks.contains_key(&id) {
-                            return Err(SdkError::Protocol("duplicate_id"));
-                        }
                         let operation = string_field(&frame, "operation")?;
                         let is_lifecycle = crate::LifecycleOperation::parse(&operation).is_some();
                         let cancellation = CancellationToken::new();
@@ -109,6 +129,8 @@ pub(crate) async fn run(
                         let done = done_tx.clone();
                         let lifecycle = lifecycle.clone();
                         let task_id = id.clone();
+                        let answered = Arc::new(AtomicBool::new(false));
+                        let task_answered = answered.clone();
                         let task = package_runtime.spawn(async move {
                             let result = if is_lifecycle {
                                 let _barrier = lifecycle.lock().await;
@@ -116,10 +138,15 @@ pub(crate) async fn run(
                             } else {
                                 backend.handle(request).await
                             };
-                            let _ = writer.control(terminal(&id, result)).await;
+                            // Claim the one terminal frame before writing it,
+                            // so a cancel that reaches the dispatcher while
+                            // this task is finishing cannot write a second.
+                            if !task_answered.swap(true, Ordering::AcqRel) {
+                                let _ = writer.control(terminal(&id, result)).await;
+                            }
                             let _ = done.send(id).await;
                         });
-                        tasks.insert(task_id, InFlight { task, cancellation, lifecycle: is_lifecycle });
+                        tasks.insert(task_id, InFlight { task, cancellation, lifecycle: is_lifecycle, answered });
                     }
                     FrameKind::Cancel => {
                         let target = string_field(&frame, "targetId")?;
@@ -127,19 +154,16 @@ pub(crate) async fn run(
                             // Cancel first, so blocking work sees the signal before the abort.
                             entry.cancellation.cancel();
                             entry.task.abort();
-                            writer.control(error_frame(
-                                &target,
-                                &BackendError::new("cancelled", true, empty_object()),
-                            )).await?;
+                            if !entry.answered.swap(true, Ordering::AcqRel) {
+                                writer.control(error_frame(
+                                    &target,
+                                    &BackendError::new("cancelled", true, empty_object()),
+                                )).await?;
+                            }
                         }
                     }
                     FrameKind::Event => {
                         let id = string_field(&frame, "streamId")?;
-                        let sequence = frame
-                            .field("sequence")
-                            .and_then(JsonValue::as_str)
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .ok_or(SdkError::Protocol("event_sequence"))?;
                         let payload = frame
                             .field("payload")
                             .cloned()
@@ -147,19 +171,21 @@ pub(crate) async fn run(
                         if crate::capability::CapabilityClient::event(
                             &capability_streams,
                             &id,
-                            sequence,
                             payload,
                         )
                         .await
                         .is_err()
                         {
-                            return Err(SdkError::Protocol("event_sequence"));
+                            return Err(SdkError::Protocol("event_lagged"));
                         }
                     }
                     FrameKind::Response | FrameKind::Error => {
                         let id = string_field(&frame, "id")?;
+                        // The classifier has already decided this frame. A call
+                        // whose caller stopped waiting has no correlation entry
+                        // left, and the answer is simply dropped.
                         let Some(sender) = pending_capabilities.lock().await.remove(&id) else {
-                            return Err(SdkError::Protocol("unknown_response"));
+                            continue;
                         };
                         let result = if frame.kind() == FrameKind::Response {
                             Ok(frame.field("payload").cloned().unwrap_or_else(empty_object))
@@ -184,9 +210,6 @@ pub(crate) async fn run(
                             return Err(SdkError::Protocol("overloaded"));
                         }
                         let id = string_field(&frame, "id")?;
-                        if streams.contains_key(&id) {
-                            return Err(SdkError::Protocol("duplicate_id"));
-                        }
                         let cancellation = CancellationToken::new();
                         let request = BackendRequest {
                             operation: string_field(&frame, "topic")?,
@@ -199,7 +222,7 @@ pub(crate) async fn run(
                         let backend = backend.clone();
                         let writer = writer.clone();
                         let stream_id = id.clone();
-                        let credit = Arc::new(Semaphore::new(32));
+                        let credit = Arc::new(Semaphore::new(INITIAL_STREAM_CREDIT));
                         let stream_credit = credit.clone();
                         let task = package_runtime.spawn(async move {
                             // The Package's own code reaches the Host, and through it the UI.
@@ -240,17 +263,14 @@ pub(crate) async fn run(
                     }
                     FrameKind::Credit => {
                         let id = string_field(&frame, "streamId")?;
+                        // The amount and the window are the classifier's; what
+                        // is left is handing the permits to the stream's task.
                         let amount = frame.field("amount").and_then(JsonValue::as_u64)
                             .and_then(|value| usize::try_from(value).ok())
-                            .filter(|value| (1..=32).contains(value))
                             .ok_or(SdkError::Protocol("credit_violation"))?;
-                        let Some((_, credit, _)) = streams.get(&id) else {
-                            return Err(SdkError::Protocol("unknown_stream"));
-                        };
-                        if credit.available_permits().saturating_add(amount) > 32 {
-                            return Err(SdkError::Protocol("credit_violation"));
+                        if let Some((_, credit, _)) = streams.get(&id) {
+                            credit.add_permits(amount);
                         }
-                        credit.add_permits(amount);
                     }
                     FrameKind::StreamClose => {
                         let id = string_field(&frame, "streamId")?;

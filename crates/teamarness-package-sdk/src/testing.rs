@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use teamarness_package_protocol::{
-    Frame, FrameKind, JsonValue, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES,
-    MAX_WRITER_FRAMES, decode_frame,
+    Frame, FrameKind, INITIAL_STREAM_CREDIT, JsonValue, MAX_FRAME_BYTES,
+    MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES, decode_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -29,7 +29,7 @@ use crate::{Backend, BackendError, Package, SdkError, object};
 /// How long a harness request waits before the Host would give up, unless a test names its own.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The credit window the Host opens on a Package subscription.
-const INITIAL_CREDIT: u64 = 32;
+const INITIAL_CREDIT: u64 = INITIAL_STREAM_CREDIT as u64;
 
 /// Builds a [`Harness`] around a Package's own [`Backend`].
 pub struct HarnessBuilder {
