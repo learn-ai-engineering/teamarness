@@ -341,6 +341,8 @@ pub(crate) use test_hooks::ProbeOutcome;
 pub use test_hooks::RuntimeStateHold;
 pub use types::*;
 
+// `test_hooks` reaches this through `use super::*`; nothing else in `runtime` needs it.
+#[cfg(any(test, feature = "test-hooks"))]
 use onboarding::map_invitation_onboarding_error;
 pub(crate) use onboarding::respond_to_join;
 #[cfg(feature = "test-hooks")]
