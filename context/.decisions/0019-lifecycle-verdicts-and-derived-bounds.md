@@ -31,7 +31,9 @@ A peer enters the tombstone at the moment it stops being willing to serve the re
 
 A queue, buffer, page or channel that carries contract-governed traffic is declared as a named constant over the protocol constant it serves, with a comment naming the worst case it must admit. Exhausting it is backpressure or `overloaded`, never a fatal or permanent code.
 
-Three mechanisms hold it: a floor test per crate asserting each bound meets its floor, a test that parses the limits table out of the contract README and asserts every constant matches it, and `scripts/check-protocol-bounds.mjs`, which refuses a bare numeric literal in a channel or semaphore constructor and reads the one subscription bound the Shell and the Host both publish.
+A floor is written from the traffic, independently of the bound it guards. A floor that restates the expression defining its own bound cannot fail on a change to any input: the control lane was sized for one `credit` frame per subscription while the Shell acknowledged one event at a time, and the floor re-read the same wrong worst case and agreed with it. Where the traffic is produced in another language, that language publishes a constant for it and the Rust side mirrors it.
+
+Four mechanisms hold it: `const` floors beside each bound, so a bound that stops admitting its worst case fails the build; a test that parses the limits table out of the contract README and asserts every constant matches it; `scripts/check-protocol-bounds.mjs`, which refuses a bare numeric literal in a channel or semaphore constructor and reads the two bounds the Shell and the Host both publish — the subscriptions one mount may hold and the events one `ack` acknowledges; and a behaviour test for each bound whose worst case cannot fit, proving the send waits rather than refusing.
 
 ### 4. The contract states the rule
 
@@ -52,7 +54,8 @@ Under ADR 0018 this adds no frame kind, no field and no vocabulary value, so the
 - `observe` returns a verdict, so the compiler enumerates every place this class of defect can live: an adapter that reaches the classifier must say what it does with each of the three answers.
 - A congested writer answers `overloaded` for the one request it cannot serve, and that answer is owed: it travels a reserve the answer it replaces cannot consume. The code is retryable by the contract's own table and by the SDK's, so a Package retries rather than restarts.
 - Malformed and out-of-contract traffic stays fatal. The state-machine fixtures in `contracts/package-process/v1/invalid/` pin where the tolerance stops: an answer for a request that never existed, a second terminal frame, a second terminal frame after one late one has been tolerated, an event past the credit window, credit outside `1..=32` on a live stream or on a closed one, and credit that would carry a stream past the window it was opened with.
-- Nothing enforces the "comment naming the worst case" half of the bounds rule mechanically. The guard catches a bare literal; only review catches a derived bound whose derivation is wrong.
+- Nothing enforces the "comment naming the worst case" half of the bounds rule mechanically. The guard catches a bare literal; only review catches a derived bound whose derivation is wrong. What is mechanical is narrower and stated as such: a floor can only fail when its left-hand side is written from the traffic, and the traffic that crosses a language boundary is only held by the two constants `check-protocol-bounds.mjs` reads.
+- Two bounds have a worst case no split of the published writer budget admits: the Host's control lane against a whole credit window of `credit` frames, and the SDK's against 32 terminal answers beside its three lifecycle frames. Both are met by waiting for a slot rather than refusing, so their floors read `>= worst case || waits for a slot` and the behaviour tests are what make the second half true rather than asserted.
 
 ## Evidence
 
