@@ -74,8 +74,18 @@ const PACKAGE_UI_KIT_CSS = `
   }
 `;
 
-const installedKits = new WeakMap<ShadowRoot, { readonly sheet: CSSStyleSheet; users: number }>();
-const installedSuppressors = new WeakMap<ShadowRoot, { readonly observer: MutationObserver }>();
+/**
+ * One record per shadow root, owning everything that root's kit installation holds: the adopted
+ * sheet, the input suppressor's teardown, and the number of live installers.
+ *
+ * The suppressor's teardown belongs here rather than to the caller that happened to create it.
+ * Overlapping mounts share one root, so the cleanup that takes `users` to zero is not necessarily
+ * the one that installed the suppressor, and it must still be able to stop it.
+ */
+const installedKits = new WeakMap<
+  ShadowRoot,
+  { readonly sheet: CSSStyleSheet; readonly stopSuppressor: () => void; users: number }
+>();
 
 /**
  * Attributes that suppress WebKit autocorrection / autocapitalisation /
@@ -116,13 +126,14 @@ function suppressInputs(node: Node): void {
 /**
  * Start a MutationObserver that suppresses autocorrect on any
  * input/textarea/contenteditable added to or within this shadow root.
+ *
+ * Returns the idempotent teardown, which the caller is responsible for storing somewhere the last
+ * cleanup of this root can reach.
  */
 function installInputSuppressor(root: ShadowRoot): () => void {
-  if (installedSuppressors.has(root)) return () => undefined;
   if (typeof MutationObserver !== "function") {
-    // Environment (e.g. test runner) lacks MutationObserver.
-    // Suppress any elements already present and bail.
-    suppressInputs(root);
+    // Environment (e.g. test runner) lacks MutationObserver: the per-install sweep below is all
+    // the suppression this root gets, and there is nothing to disconnect.
     return () => undefined;
   }
 
@@ -135,17 +146,11 @@ function installInputSuppressor(root: ShadowRoot): () => void {
   });
   observer.observe(root, { childList: true, subtree: true });
 
-  // Suppress any elements already in the root.
-  suppressInputs(root);
-
-  installedSuppressors.set(root, { observer });
-
   let disconnected = false;
   return () => {
     if (disconnected) return;
     disconnected = true;
     observer.disconnect();
-    installedSuppressors.delete(root);
   };
 }
 
@@ -219,14 +224,15 @@ export function installPackageUiKit(root: ShadowRoot): () => void {
     if (!currentAdoptedSheets(root).includes(sheet)) {
       throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support");
     }
-    installation = { sheet, users: 0 };
+    // The suppressor starts alongside the kit and is torn down by whichever cleanup takes the
+    // last user away, so its teardown is stored on the installation, not captured per caller.
+    installation = { sheet, stopSuppressor: installInputSuppressor(root), users: 0 };
     installedKits.set(root, installation);
   }
   installation.users += 1;
-
-  // Start the input suppressor alongside the kit.  It is torn down when
-  // the last kit user calls their cleanup function.
-  const uninstallSuppressor = installInputSuppressor(root);
+  // Suppress the elements this installer's mount has already put in the root; the observer only
+  // sees what arrives after it starts.
+  suppressInputs(root);
 
   let cleaned = false;
   return () => {
@@ -236,9 +242,11 @@ export function installPackageUiKit(root: ShadowRoot): () => void {
     if (current !== installation) return;
     current.users -= 1;
     if (current.users === 0) {
-      uninstallSuppressor();
-      setAdoptedSheets(root, currentAdoptedSheets(root).filter((sheet) => sheet !== current.sheet));
+      // Release the root before removing the sheet: an environment that refuses the write must
+      // not be able to strand the observer or leave a spent record behind.
       installedKits.delete(root);
+      current.stopSuppressor();
+      setAdoptedSheets(root, currentAdoptedSheets(root).filter((sheet) => sheet !== current.sheet));
     }
   };
 }

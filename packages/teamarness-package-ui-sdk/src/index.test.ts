@@ -107,6 +107,109 @@ describe("Package presentation contract", () => {
   });
 });
 
+/**
+ * The input suppressor's MutationObserver holds the mount's shadow root, so a cleanup that does
+ * not disconnect it leaks for as long as the Shell lives. The default `node` environment has no
+ * `MutationObserver`, so these tests install a counting stub: without it the suppressor bails out
+ * and every assertion below is vacuous.
+ */
+describe("Package UI kit input suppressor", () => {
+  function stubObservers(): { constructed: number; live: number; disconnected: number } {
+    const tally = { constructed: 0, live: 0, disconnected: 0 };
+    class CountingMutationObserver {
+      private connected = false;
+      constructor() {
+        tally.constructed += 1;
+      }
+      observe(): void {
+        if (this.connected) return;
+        this.connected = true;
+        tally.live += 1;
+      }
+      disconnect(): void {
+        tally.disconnected += 1;
+        if (!this.connected) return;
+        this.connected = false;
+        tally.live -= 1;
+      }
+      takeRecords(): readonly never[] {
+        return [];
+      }
+    }
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    vi.stubGlobal("MutationObserver", CountingMutationObserver);
+    return tally;
+  }
+
+  it("leaves no live observer once the single installer cleans up", () => {
+    const tally = stubObservers();
+    const root = fakeShadowRoot();
+
+    const cleanup = installPackageUiKit(root);
+    expect(tally.live).toBe(1);
+
+    cleanup();
+    cleanup();
+    expect(tally.live).toBe(0);
+    expect(tally.disconnected).toBe(1);
+  });
+
+  it("leaves no live observer when overlapping mounts clean up in either order", () => {
+    for (const order of ["first-then-second", "second-then-first"] as const) {
+      const tally = stubObservers();
+      const root = fakeShadowRoot();
+
+      const cleanupFirst = installPackageUiKit(root);
+      const cleanupSecond = installPackageUiKit(root);
+      expect(tally.constructed, `${order}: one root needs one observer`).toBe(1);
+      expect(tally.live).toBe(1);
+
+      const [earlier, later] =
+        order === "first-then-second" ? [cleanupFirst, cleanupSecond] : [cleanupSecond, cleanupFirst];
+      earlier();
+      expect(tally.live, `${order}: the surviving mount still needs the suppressor`).toBe(1);
+      later();
+      later();
+      expect(tally.live, `${order}: the last cleanup must disconnect the observer`).toBe(0);
+
+      // A leaked observer also poisons the root: the record that stops it is never removed, so a
+      // later mount silently gets no suppressor at all.
+      const cleanupThird = installPackageUiKit(root);
+      expect(tally.constructed, `${order}: a fresh mount gets a fresh observer`).toBe(2);
+      expect(tally.live).toBe(1);
+      cleanupThird();
+      expect(tally.live).toBe(0);
+    }
+  });
+
+  it("leaves no live observer when the last cleanup cannot restore the stylesheets", () => {
+    const tally = stubObservers();
+    let sheets: readonly CSSStyleSheet[] = [];
+    let sealed = false;
+    const root = Object.defineProperty({}, "adoptedStyleSheets", {
+      get: () => sheets,
+      set: (next: readonly CSSStyleSheet[]) => {
+        if (sealed) throw new Error("read only");
+        sheets = next;
+      },
+    }) as ShadowRoot;
+
+    const cleanup = installPackageUiKit(root);
+    expect(tally.live).toBe(1);
+
+    sealed = true;
+    expect(cleanup).toThrow(/mutable ShadowRoot\.adoptedStyleSheets support/);
+    expect(tally.live, "a failed sheet removal must not strand the observer").toBe(0);
+
+    // And the root is still installable, rather than stuck on a spent installation record.
+    sealed = false;
+    const reinstalled = installPackageUiKit(root);
+    expect(tally.constructed).toBe(2);
+    reinstalled();
+    expect(tally.live).toBe(0);
+  });
+});
+
 describe("Package styles", () => {
   it("adopts one Package stylesheet and removes only it on idempotent cleanup", () => {
     vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
