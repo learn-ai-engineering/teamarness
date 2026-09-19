@@ -166,7 +166,7 @@ test("the Node constants match the contract's own limits table", async () => {
 
 test("Node consumes every malformed fixture with its stable error", async () => {
   const paths = await files("invalid", ".json");
-  assert.equal(paths.length, 17);
+  assert.equal(paths.length, 18);
   for (const path of paths) {
     const fixture = JSON.parse(await readFile(path, "utf8"));
     const actual = errorCode(() => {

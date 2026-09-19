@@ -241,6 +241,12 @@ export class ContractState {
       const stream = this.#streams.get(frame.streamId);
       if (!stream || stream.sender === direction) throw new ProtocolFailure("unknown_stream");
       if (stream.retired) return IGNORE;
+      // The window is a ceiling, not a starting balance: credit pays for
+      // events the receiving adapter has already accepted, so a grant past the
+      // window the stream was opened with pays for work that never happened.
+      if (stream.credit + frame.amount > INITIAL_STREAM_CREDIT) {
+        throw new ProtocolFailure("credit_violation");
+      }
       stream.credit += frame.amount;
     } else if (frame.kind === "stream_close") {
       if (this.#streams.delete(frame.streamId)) {

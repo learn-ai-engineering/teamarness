@@ -406,10 +406,15 @@ impl ContractState {
         if stream.retired {
             return Ok(self.ignore_stream_frame());
         }
-        stream.credit = stream
-            .credit
-            .checked_add(amount)
-            .ok_or_else(|| ProtocolError::new("credit_violation"))?;
+        // The window is a ceiling, not a starting balance. `credit` pays for
+        // events the receiving adapter has already accepted, so a grant that
+        // would carry the stream past the window it was opened with pays for
+        // work that never happened, and the events it would admit are events
+        // beyond the window.
+        if stream.credit.saturating_add(amount) > INITIAL_STREAM_CREDIT {
+            return Err(ProtocolError::new("credit_violation"));
+        }
+        stream.credit += amount;
         Ok(Verdict::Deliver)
     }
 
@@ -653,6 +658,48 @@ mod tests {
                 .code(),
             "unknown_stream"
         );
+    }
+
+    /// The window is a ceiling: credit buys back only what was spent.
+    #[test]
+    fn credit_cannot_carry_a_stream_past_the_window_it_was_opened_with() {
+        let mut state = ContractState::default();
+        state
+            .observe(Direction::HostToPackage, &stream_open("h:stream-1"))
+            .expect("open");
+        // Nothing has been consumed, so the window is already full.
+        assert_eq!(
+            state
+                .observe(Direction::HostToPackage, &credit("h:stream-1", 1))
+                .unwrap_err()
+                .code(),
+            "credit_violation"
+        );
+        for sequence in 1..=4 {
+            state
+                .observe(Direction::PackageToHost, &event("h:stream-1", sequence))
+                .expect("event within the window");
+        }
+        state
+            .observe(Direction::HostToPackage, &credit("h:stream-1", 4))
+            .expect("credit for the four events accepted");
+        assert_eq!(
+            state
+                .observe(Direction::HostToPackage, &credit("h:stream-1", 1))
+                .unwrap_err()
+                .code(),
+            "credit_violation"
+        );
+        // A peer that repeats a full grant cannot inflate the window either.
+        for _ in 0..1000 {
+            assert_eq!(
+                state
+                    .observe(Direction::HostToPackage, &credit("h:stream-1", 32))
+                    .unwrap_err()
+                    .code(),
+                "credit_violation"
+            );
+        }
     }
 
     #[test]
