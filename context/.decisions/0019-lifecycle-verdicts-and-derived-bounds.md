@@ -51,7 +51,7 @@ Under ADR 0018 this adds no frame kind, no field and no vocabulary value, so the
 
 - `observe` returns a verdict, so the compiler enumerates every place this class of defect can live: an adapter that reaches the classifier must say what it does with each of the three answers.
 - A congested writer answers `overloaded` for the one request it cannot serve, and that answer is owed: it travels a reserve the answer it replaces cannot consume. The code is retryable by the contract's own table and by the SDK's, so a Package retries rather than restarts.
-- Malformed and out-of-contract traffic stays fatal. The state-machine fixtures in `contracts/package-process/v1/invalid/` pin where the tolerance stops: an answer for a request that never existed, a second terminal frame, a second terminal frame after one late one has been tolerated, an event past the credit window, and credit outside `1..=32` on a live stream or on a closed one.
+- Malformed and out-of-contract traffic stays fatal. The state-machine fixtures in `contracts/package-process/v1/invalid/` pin where the tolerance stops: an answer for a request that never existed, a second terminal frame, a second terminal frame after one late one has been tolerated, an event past the credit window, credit outside `1..=32` on a live stream or on a closed one, and credit that would carry a stream past the window it was opened with.
 - Nothing enforces the "comment naming the worst case" half of the bounds rule mechanically. The guard catches a bare literal; only review catches a derived bound whose derivation is wrong.
 
 ## Evidence

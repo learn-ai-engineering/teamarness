@@ -46,7 +46,7 @@ A receiver retires a request or a stream at the moment it stops being willing to
 
 A sender never withholds a frame it owes. Exactly one `response` or `error` still reaches the wire for every request, even one the peer cancelled, and the peer applies these verdicts to what arrives.
 
-Ignore never widens a budget. Events beyond the credit window, a sequence gap on a live stream, credit outside `1..=32`, a 33rd in-flight request, a second terminal frame, and anything naming state that never existed are all fatal.
+Ignore never widens a budget. Events beyond the credit window, a sequence gap on a live stream, credit outside `1..=32` or above the window a stream was opened with, a 33rd in-flight request, a second terminal frame, and anything naming state that never existed are all fatal.
 
 ## Requests, terminal frames, and cancellation
 
@@ -62,7 +62,7 @@ A Package's `error` answer to a host request is forwarded, not replaced. The hos
 
 ## Streams and credit
 
-`stream_open` creates one origin-scoped stream and grants 32 events initially. `event` carries that stream ID, an increasing decimal-string sequence, and an object payload. The sender must not send without credit. `credit` adds a positive bounded amount only after the receiving adapter has accepted preceding work. `stream_close` closes either direction and can include a stable reason code.
+`stream_open` creates one origin-scoped stream and grants 32 events initially. `event` carries that stream ID, an increasing decimal-string sequence, and an object payload. The sender must not send without credit. `credit` adds a positive bounded amount only after the receiving adapter has accepted preceding work, and never more than that adapter has accepted: the 32 events are a ceiling on the window, not a starting balance, so a grant that would carry a stream past it is `credit_violation`. `stream_close` closes either direction and can include a stable reason code.
 
 The reason code on a Package's `stream_close` says who owns the ending. No code, `completed` or `closed` is an ordinary completion. `cancelled` and `overloaded` are host codes. Every other code is the Package's own termination code and is forwarded to the subscriber as a Package-owned error, with `retryable` false and no details, because `stream_close` carries neither. A completion and a Package-owned termination both end that one stream and nothing else; only a Teamarness-owned terminal stream error causes Package UI Mount recovery.
 
