@@ -3,6 +3,7 @@ import type { PackageHostTransport, PackageInstanceKey } from "./package-contrac
 import {
   MAX_OPEN_SUBSCRIPTIONS,
   MAX_OPERATION_LENGTH,
+  MAX_RETIRED_SUBSCRIPTIONS,
   MAX_PAYLOAD_BYTES,
   MAX_PENDING_REQUESTS,
   isPackageValue,
@@ -71,6 +72,8 @@ export class PackagePortHost {
 
   private readonly pending = new Map<number, PendingRequest>();
   private readonly subscriptions = new Map<number, OpenSubscription>();
+  /** Bounded, insertion-ordered tombstones for subscriptions this host retired. */
+  private readonly retiredSubscriptions = new Set<number>();
 
   private resolveReady: (() => void) | null = null;
   private settleMounted: ((error?: unknown) => void) | null = null;
@@ -296,6 +299,7 @@ export class PackagePortHost {
       closed: false,
     };
     this.subscriptions.set(id, entry);
+    this.retiredSubscriptions.delete(id);
     void this.transport.openSubscription(
       { mount: this.mount, subscription: entry.subscription, operation, payload },
       (event) => { this.deliver(id, entry, event.mount, event.subscription, event.sequence, event.payload); },
@@ -307,7 +311,7 @@ export class PackagePortHost {
       },
       (error: unknown) => {
         if (this.disposed || this.subscriptions.get(id) !== entry) return;
-        this.subscriptions.delete(id);
+        this.retire(id);
         this.post({ kind: "subscribe_failed", id, error: this.envelope(error) });
       },
     );
@@ -342,7 +346,7 @@ export class PackagePortHost {
   private terminate(id: number, entry: OpenSubscription, failure: unknown): void {
     if (this.disposed || entry.closed || this.subscriptions.get(id) !== entry) return;
     entry.closed = true;
-    this.subscriptions.delete(id);
+    this.retire(id);
     void this.transport
       .closeSubscription({ mount: this.mount, subscription: entry.subscription })
       .catch(() => undefined);
@@ -359,10 +363,18 @@ export class PackagePortHost {
     this.fault("stream_terminated");
   }
 
+  /**
+   * Releases credit for events the Package UI has consumed.
+   *
+   * An acknowledgement for a subscription this host has retired is the normal
+   * ordering for a synchronous listener: the ack for the last delivered event
+   * is already queued when the stream ends. It is dropped. An id that was
+   * never issued names nothing this host ever had, and stays a fault.
+   */
   private acknowledge(id: number, sequence: string): void {
     const entry = this.subscriptions.get(id);
     if (entry === undefined || entry.closed) {
-      this.fault("protocol");
+      if (!this.retiredSubscriptions.has(id)) this.fault("protocol");
       return;
     }
     let value: bigint;
@@ -389,11 +401,23 @@ export class PackagePortHost {
       return;
     }
     entry.closed = true;
-    this.subscriptions.delete(id);
+    this.retire(id);
     void this.transport
       .closeSubscription({ mount: this.mount, subscription: entry.subscription })
       .catch(() => undefined)
       .finally(() => { this.post({ kind: "unsubscribed", id }); });
+  }
+
+  /** Drops one subscription and remembers its id, within a bounded window. */
+  private retire(id: number): void {
+    this.subscriptions.delete(id);
+    this.retiredSubscriptions.delete(id);
+    this.retiredSubscriptions.add(id);
+    while (this.retiredSubscriptions.size > MAX_RETIRED_SUBSCRIPTIONS) {
+      const oldest = this.retiredSubscriptions.values().next();
+      if (oldest.done === true) break;
+      this.retiredSubscriptions.delete(oldest.value);
+    }
   }
 
   private shellEnvelope(namespace: string, code: string, retryable: boolean): BridgeErrorEnvelope {

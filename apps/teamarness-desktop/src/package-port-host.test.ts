@@ -335,6 +335,30 @@ describe("Shell-side Package UI port host", () => {
     expect(test.transport.calls.filter(({ method }) => method === "acknowledgeEvents")).toHaveLength(1);
   });
 
+  it("drops the in-flight acknowledgement for a stream that has already completed", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
+    await settle();
+    test.transport.deliver({ mount: MOUNT, subscription: "s1", sequence: "0", payload: { a: 1 } });
+    await settle();
+    // An ordinary completion. The frame's acknowledgement for the last event
+    // it received is already queued and arrives after the entry is gone.
+    test.transport.terminate("s1");
+    await settle();
+    expect(test.received.at(-1)).toEqual({ kind: "stream_terminated", id: 1, error: null });
+
+    test.fromFrame({ kind: "ack", id: 1, sequence: "0" });
+    await settle();
+    expect(test.faults).toEqual([]);
+    expect(test.transport.calls.filter(({ method }) => method === "acknowledgeEvents")).toEqual([]);
+  });
+
+  it("caps open subscriptions at the bound the Package Host enforces per mount", () => {
+    // The Host refuses the ninth subscription on one mount as `overloaded`.
+    expect(MAX_OPEN_SUBSCRIPTIONS).toBe(8);
+  });
+
   it("still faults the mount for a host-owned stream failure", async () => {
     const test = harness();
     await test.greet();

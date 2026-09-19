@@ -16,7 +16,23 @@ export const MAX_PAYLOAD_BYTES = 256 * 1024;
 export const MAX_VALUE_DEPTH = 64;
 export const MAX_OPERATION_LENGTH = 256;
 export const MAX_PENDING_REQUESTS = 64;
-export const MAX_OPEN_SUBSCRIPTIONS = 32;
+/**
+ * Matches the Package Host bound `MAX_UI_SUBSCRIPTIONS_PER_MOUNT`.
+ *
+ * The Host refuses the ninth open subscription on one mount as `overloaded`,
+ * so a Shell that admitted more would accept subscriptions the Host then
+ * rejects. `check-protocol-bounds.mjs` reads both so neither can move alone.
+ */
+export const MAX_OPEN_SUBSCRIPTIONS = 8;
+
+/**
+ * Subscription ids the Shell keeps after it stops serving them.
+ *
+ * A stream ends while the acknowledgement for its last delivered event is
+ * still queued, so that acknowledgement names an entry this side has already
+ * released. An id that was never issued has no tombstone and stays a fault.
+ */
+export const MAX_RETIRED_SUBSCRIPTIONS = 64;
 
 const THEME_VALUE = /^[^;{}<>\\\r\n]{0,256}$/;
 const PACKAGE_ERROR_CODE = /^[a-z][a-z0-9_.-]{0,127}$/;
