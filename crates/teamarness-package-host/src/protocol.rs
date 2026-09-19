@@ -813,6 +813,9 @@ async fn reader_task<R>(
                     .field("amount")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
+                // What is left after the handler has absorbed the races it owns
+                // is the Package crediting outside the window the contract
+                // grants it, which ends the connection.
                 if capabilities.add_credit(stream_id, amount).await.is_err() {
                     let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                     return;

@@ -347,6 +347,14 @@ impl GenerationCapabilities {
         Ok(())
     }
 
+    /// Applies one `credit` frame.
+    ///
+    /// Credit for a stream this generation no longer has is dropped rather than
+    /// refused: the stream task removes its own entry before the `stream_close`
+    /// reaches the Package, so credit the Package released for events it had
+    /// already accepted is still in flight and arrives afterwards. That race is
+    /// ordinary, and the same tolerance `stream_close` for an unknown stream
+    /// already gets.
     pub(crate) async fn add_credit(
         &self,
         stream_id: &str,
@@ -355,13 +363,9 @@ impl GenerationCapabilities {
         if amount == 0 || amount > MAX_STREAM_CREDIT {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
-        let sender = self
-            .streams
-            .lock()
-            .await
-            .get(stream_id)
-            .cloned()
-            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        let Some(sender) = self.streams.lock().await.get(stream_id).cloned() else {
+            return Ok(());
+        };
         sender
             .try_send(StreamCommand::Credit(amount))
             .map_err(|_| PackageErrorCode::Overloaded)
