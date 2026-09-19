@@ -358,13 +358,20 @@ pub(crate) struct PendingAcknowledgement<'route> {
 }
 
 impl PendingAcknowledgement<'_> {
-    pub(crate) const fn amount(&self) -> u64 {
-        self.amount
-    }
-
-    /// Records the acknowledgement, now that its `credit` frame is queued.
-    pub(crate) fn commit(mut self) {
+    /// Queues this acknowledgement's `credit` frame, then records it.
+    ///
+    /// The send is taken rather than the amount handed out, so the order
+    /// cannot be got wrong at a call site: there is no way to reach the amount
+    /// without giving this method the send it accounts for, and the record
+    /// moves only after that send has returned `Ok`.
+    pub(crate) async fn commit<Send, Sent>(mut self, send: Send) -> Result<(), WireFailure>
+    where
+        Send: FnOnce(u64) -> Sent,
+        Sent: Future<Output = Result<(), WireFailure>>,
+    {
+        send(self.amount).await?;
         self.state.highest_acknowledged = self.through;
+        Ok(())
     }
 }
 
@@ -1476,10 +1483,10 @@ fn empty_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, MAX_ID_BYTES, MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES,
+        Duration, MAX_ID_BYTES, MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES, WireFailure,
         package_owned_error, start, stream_end,
     };
-    use crate::PackageErrorCode;
+    use crate::{MAX_UI_SUBSCRIPTIONS_PER_MOUNT, PackageErrorCode};
     use serde_json::{Value, json};
     use teamarness_package_protocol::{Direction, Frame, INITIAL_STREAM_CREDIT};
     use tokio::io::AsyncReadExt;
@@ -1512,22 +1519,35 @@ mod tests {
     ///
     /// The route advanced first and the Host had no way back: `acknowledge`'s
     /// own first guard refuses a repeat, and this path is the only producer of
-    /// `credit` there is.
+    /// `credit` there is. `commit` takes the send rather than handing out the
+    /// amount, so a call site cannot put the record first.
     #[tokio::test]
     async fn an_uncommitted_acknowledgement_leaves_its_credit_to_claim_again() {
         let (route, _receiver) = super::UiEventRoute::new(ui_contract(), "fixture.events".into());
         route.mark_delivered(2).await;
-        {
-            let pending = route.acknowledge(2).await.expect("two events to credit");
-            assert_eq!(pending.amount(), 2);
-            // Dropped without `commit`: the frame never reached the writer.
-        }
-        let again = route
+        let refused = route
             .acknowledge(2)
             .await
-            .expect("the same two events are still owed credit");
-        assert_eq!(again.amount(), 2);
-        again.commit();
+            .expect("two events to credit")
+            .commit(|amount| {
+                assert_eq!(amount, 2);
+                std::future::ready(Err(WireFailure::new(PackageErrorCode::ProcessExited)))
+            })
+            .await;
+        assert!(refused.is_err(), "the frame never reached the writer");
+
+        let mut credited = None;
+        route
+            .acknowledge(2)
+            .await
+            .expect("the same two events are still owed credit")
+            .commit(|amount| {
+                credited = Some(amount);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .expect("the second attempt is queued");
+        assert_eq!(credited, Some(2));
         assert!(
             route.acknowledge(2).await.is_err(),
             "a committed acknowledgement is not owed twice"
@@ -1549,42 +1569,49 @@ mod tests {
         })
     }
 
-    /// One subscription's legal acknowledgement traffic never loses a `credit`
-    /// frame, however full the control lane is.
+    /// A mount's legal acknowledgement traffic never loses a `credit` frame,
+    /// however full the control lane is.
     ///
-    /// The Shell acknowledges one event at a time, so a subscription at a full
-    /// window owes `INITIAL_STREAM_CREDIT` `credit` frames at once — more than
-    /// any split of the 64 frames the contract publishes can hold. A refusing
-    /// send destroys the ones that do not fit, and the Host has no second
-    /// producer of `credit`: the window stays shut, a conforming Package stops
-    /// sending, and the instance is still reported `Active`.
+    /// The Shell acknowledges one event at a time, so the eight subscriptions
+    /// one mount may hold, each at a full window, owe
+    /// `MAX_UI_SUBSCRIPTIONS_PER_MOUNT * INITIAL_STREAM_CREDIT` = 256 `credit`
+    /// frames at once — more than any split of the 64 frames the contract
+    /// publishes for the whole writer can hold. A refusing send destroys the
+    /// ones that do not fit, and the Host has no second producer of `credit`:
+    /// the window stays shut, a conforming Package stops sending, and the
+    /// instance is still reported `Active`.
     #[tokio::test]
     async fn a_full_control_lane_never_destroys_acknowledged_credit() {
         // A child that has taken the pipe and stopped reading, which is the
         // congestion the lane exists to absorb.
         let (child, mut pipe) = tokio::io::duplex(1);
         let client = start(tokio::io::empty(), child);
+        let streams = (1..=MAX_UI_SUBSCRIPTIONS_PER_MOUNT)
+            .map(|index| format!("h:ui-{index}"))
+            .collect::<Vec<_>>();
         {
             let mut state = client.state.lock().await;
-            state
-                .observe(
-                    Direction::HostToPackage,
-                    &frame(json!({
-                        "kind":"stream_open", "id":"h:ui-1", "topic":"t", "mountId":"bW91bnQ",
-                        "initialCredit":INITIAL_STREAM_CREDIT, "payload":{}
-                    })),
-                )
-                .expect("the UI stream opens");
-            for sequence in 1..=INITIAL_STREAM_CREDIT {
+            for id in &streams {
                 state
                     .observe(
-                        Direction::PackageToHost,
+                        Direction::HostToPackage,
                         &frame(json!({
-                            "kind":"event", "streamId":"h:ui-1",
-                            "sequence":sequence.to_string(), "payload":{}
+                            "kind":"stream_open", "id":id, "topic":"t", "mountId":"bW91bnQ",
+                            "initialCredit":INITIAL_STREAM_CREDIT, "payload":{}
                         })),
                     )
-                    .expect("the window admits the event");
+                    .expect("the UI stream opens");
+                for sequence in 1..=INITIAL_STREAM_CREDIT {
+                    state
+                        .observe(
+                            Direction::PackageToHost,
+                            &frame(json!({
+                                "kind":"event", "streamId":id,
+                                "sequence":sequence.to_string(), "payload":{}
+                            })),
+                        )
+                        .expect("the window admits the event");
+                }
             }
         }
 
@@ -1592,8 +1619,10 @@ mod tests {
             let client = client.clone();
             async move {
                 let mut outcomes = Vec::new();
-                for _ in 0..INITIAL_STREAM_CREDIT {
-                    outcomes.push(client.credit("h:ui-1", 1).await);
+                for id in &streams {
+                    for _ in 0..INITIAL_STREAM_CREDIT {
+                        outcomes.push(client.credit(id, 1).await);
+                    }
                 }
                 outcomes
             }
@@ -1617,8 +1646,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             refused.is_empty(),
-            "{} of {INITIAL_STREAM_CREDIT} acknowledgements were destroyed by the control lane: {refused:?}",
-            refused.len()
+            "{} of {} acknowledgements were destroyed by the control lane, first {:?}",
+            refused.len(),
+            outcomes.len(),
+            refused.first()
         );
     }
 

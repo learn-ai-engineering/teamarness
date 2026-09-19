@@ -244,9 +244,12 @@ async fn immutable_record_stream_waits_for_a_new_scope() {
     // The empty scope's one state event, waited for rather than slept past:
     // the acknowledgement below credits exactly what arrived, so a late event
     // used to mean the credit was for work that never happened.
-    poll_immutable(&host, &mount, "the empty scope reports its state", |response| {
-        !events_of(response).is_empty()
-    })
+    poll_immutable(
+        &host,
+        &mount,
+        "the empty scope reports its state",
+        |response| !events_of(response).is_empty(),
+    )
     .await;
     assert_eq!(
         host.snapshot().await.instances[0].lifecycle,
@@ -321,9 +324,12 @@ async fn crediting_more_than_the_stream_delivered_keeps_the_generation() {
         object([]),
     )
     .await;
-    poll_immutable(&host, &mount, "the empty scope reports its state", |response| {
-        !events_of(response).is_empty()
-    })
+    poll_immutable(
+        &host,
+        &mount,
+        "the empty scope reports its state",
+        |response| !events_of(response).is_empty(),
+    )
     .await;
 
     let credited = fixture_request(

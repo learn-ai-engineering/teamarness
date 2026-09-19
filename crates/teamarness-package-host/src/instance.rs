@@ -607,10 +607,11 @@ impl InstanceActor {
         // believing it had released credit the Package never received: the
         // window would stay shut, a conforming Package would stop sending, and
         // this path is the only producer of `credit` there is.
-        let pending = route.acknowledge(through).await?;
-        process.client.credit(&stream, pending.amount()).await?;
-        pending.commit();
-        Ok(())
+        route
+            .acknowledge(through)
+            .await?
+            .commit(|amount| process.client.credit(&stream, amount))
+            .await
     }
 
     pub(crate) async fn close_subscription(
