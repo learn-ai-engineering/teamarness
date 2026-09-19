@@ -1,26 +1,57 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use teamarness_package_protocol::{
-    ContractState, Direction, Frame, FrameKind, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION,
-    MAX_WRITER_BYTES, decode_frame, encode_frame,
+    ContractState, Direction, Frame, FrameKind, INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES,
+    MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, Verdict, decode_frame, encode_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::ui::{AdmittedUi, MAX_UI_PAYLOAD_BYTES};
 use crate::{
-    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
-    PackageOwnedError, PackageValue,
+    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH,
+    MAX_UI_SUBSCRIPTIONS_PER_MOUNT, PackageErrorCode, PackageOwnedError, PackageValue,
 };
 
 type PendingRequests = Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<Value, WireFailure>>>>>;
 type UiEventRoutes = Arc<Mutex<BTreeMap<String, Arc<UiEventRoute>>>>;
+type SharedState = Arc<Mutex<ContractState>>;
 
-const UI_EVENT_CAPACITY: usize = 32;
-const UI_EVENT_BYTES: usize = 8 * 1024 * 1024;
+/// One UI event route holds the credit window the contract grants the stream.
+const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
+/// The route's byte budget: the whole writer budget one event stream may occupy.
+const UI_EVENT_BYTES: usize = MAX_WRITER_BYTES;
+
+/// Lifecycle, health and stream-control frames reserved on the control lane.
+///
+/// `initialize`, `ping` and `shutdown` are one frame each, and one
+/// `stream_open`, `credit` and `stream_close` may be queued for each of the
+/// subscriptions one mount may hold open.
+const CONTROL_RESERVE: usize = 3 + 3 * MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
+
+/// Slots on the control lane.
+///
+/// Every one of the in-flight capability answers the contract permits the
+/// Package travels here, and the reserved lifecycle traffic shares the lane. A
+/// lane shallower than the contract's own concurrency turns legal traffic into
+/// a refused frame, which the caller then reports as the process having exited.
+const CONTROL_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION + CONTROL_RESERVE;
+
+/// Slots on the data lane.
+///
+/// The Host's own in-flight requests travel here, each with the one `cancel`
+/// that may follow it, plus the events of Host-owned capability streams.
+const DATA_QUEUE: usize = 2 * MAX_IN_FLIGHT_EACH_DIRECTION;
+
+/// The control lane's byte budget: two contract-maximum frames, so one maximum
+/// answer never waits on another that is already queued.
+const CONTROL_BYTES: usize = 2 * MAX_FRAME_BYTES;
+
+/// The data lane keeps the rest of the writer budget the contract publishes.
+pub(crate) const DATA_BYTES: usize = MAX_WRITER_BYTES - CONTROL_BYTES;
 
 pub(crate) struct UiEvent {
     pub(crate) sequence: u64,
@@ -265,8 +296,7 @@ fn value_depth(value: &Value) -> usize {
 pub(crate) struct ProcessClient {
     writer: Writer,
     pending: PendingRequests,
-    tombstones: Arc<Mutex<BTreeSet<String>>>,
-    closed_streams: Arc<Mutex<BTreeSet<String>>>,
+    state: SharedState,
     ui_event_routes: UiEventRoutes,
     initialized: Arc<Mutex<Option<oneshot::Receiver<Frame>>>>,
     shutdown_ack: watch::Receiver<bool>,
@@ -283,8 +313,17 @@ struct Writer {
     data_bytes: Arc<Semaphore>,
 }
 
+/// The writing half of one Host-owned capability stream.
+///
+/// Every method runs on the stream's own task, so all three wait for writer
+/// capacity rather than refusing a frame: a slow reader is backpressure, and
+/// reporting it as a stream failure is what made ordinary congestion look like
+/// a permanent capability outage.
 #[derive(Clone)]
-pub(crate) struct HostStreamSender(Writer);
+pub(crate) struct HostStreamSender {
+    writer: Writer,
+    state: SharedState,
+}
 
 impl HostStreamSender {
     pub(crate) async fn event(
@@ -293,18 +332,38 @@ impl HostStreamSender {
         sequence: u64,
         payload: Value,
     ) -> Result<(), WireFailure> {
-        self.0
-            .data(json!({
-                "kind":"event", "streamId":stream_id,
-                "sequence":sequence.to_string(), "payload":payload
-            }))
+        self.writer
+            .send_waiting(
+                json!({
+                    "kind":"event", "streamId":stream_id,
+                    "sequence":sequence.to_string(), "payload":payload
+                }),
+                false,
+            )
             .await
     }
 
+    /// Ends the stream, behind every event it has already written.
+    ///
+    /// The close travels the data lane with those events. On the control lane
+    /// it would overtake them, and the Package would be told the stream ended
+    /// before the last events of it arrived.
     pub(crate) async fn close(&self, stream_id: &str, code: &str) -> Result<(), WireFailure> {
-        self.0
-            .control(json!({"kind":"stream_close","streamId":stream_id,"code":code}))
+        self.writer
+            .send_waiting(
+                json!({"kind":"stream_close","streamId":stream_id,"code":code}),
+                false,
+            )
             .await
+    }
+
+    /// Records that this stream stops being served now.
+    ///
+    /// Credit the Package released for events it had already accepted is still
+    /// in flight and arrives after the close; from here it is ignored instead
+    /// of read as the Package crediting a stream that does not exist.
+    pub(crate) async fn retire(&self, stream_id: &str) {
+        self.state.lock().await.retire_stream(stream_id);
     }
 }
 
@@ -349,6 +408,42 @@ impl Writer {
                 WireFailure::new(PackageErrorCode::ProcessExited)
             }
         })
+    }
+
+    /// Queues a frame, waiting for lane capacity instead of refusing it.
+    ///
+    /// A full lane behind a slow reader is ordinary backpressure, not a
+    /// failure: `writer_task` drains it as the child accepts bytes, and a peer
+    /// that has stopped reading altogether is caught by the health probe, which
+    /// fails the generation and closes these channels. Only a task that owns
+    /// its own work may call this; the reader loop must never block on the peer
+    /// for longer than one frame it is already answering.
+    async fn send_waiting(&self, value: Value, control: bool) -> Result<(), WireFailure> {
+        let frame =
+            Frame::try_from(value).map_err(|error| WireFailure::new(protocol_code(error)))?;
+        let size = encode_frame(&frame)
+            .map_err(|error| WireFailure::new(protocol_code(error)))?
+            .len();
+        let permits =
+            u32::try_from(size).map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        let semaphore = if control {
+            self.control_bytes.clone()
+        } else {
+            self.data_bytes.clone()
+        };
+        let permit = semaphore
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))?;
+        let queued = QueuedFrame {
+            frame,
+            _bytes: permit,
+        };
+        let sender = if control { &self.control } else { &self.data };
+        sender
+            .send(queued)
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))
     }
 }
 
@@ -401,13 +496,16 @@ pub(crate) trait CapabilityHandler: Send + Sync {
         Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
     >;
 
+    /// Routes one already-classified `credit` frame to its stream.
+    ///
+    /// It returns nothing: `ContractState` decides whether a credit frame is
+    /// legal, late or fatal, and an adapter that answered that question again
+    /// is how the two peers came to disagree about the same race.
     fn add_credit<'a>(
         &'a self,
         stream_id: &'a str,
         amount: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
     fn close_stream<'a>(
         &'a self,
@@ -451,10 +549,8 @@ impl CapabilityHandler for RejectCapabilities {
         &'a self,
         _stream_id: &'a str,
         _amount: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    > {
-        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
     }
 
     fn close_stream<'a>(
@@ -489,17 +585,15 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let (data_tx, data_rx) = mpsc::channel(48);
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
+    let (data_tx, data_rx) = mpsc::channel(DATA_QUEUE);
     let writer = Writer {
         control: control_tx,
         data: data_tx,
-        control_bytes: Arc::new(Semaphore::new(MAX_WRITER_BYTES / 8)),
-        data_bytes: Arc::new(Semaphore::new(MAX_WRITER_BYTES * 7 / 8)),
+        control_bytes: Arc::new(Semaphore::new(CONTROL_BYTES)),
+        data_bytes: Arc::new(Semaphore::new(DATA_BYTES)),
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
-    let tombstones = Arc::new(Mutex::new(BTreeSet::new()));
-    let closed_streams = Arc::new(Mutex::new(BTreeSet::new()));
     let ui_event_routes = Arc::new(Mutex::new(BTreeMap::new()));
     let state = Arc::new(Mutex::new(ContractState::default()));
     let (initialized_tx, initialized_rx) = oneshot::channel();
@@ -517,10 +611,8 @@ where
         reader,
         writer.clone(),
         pending.clone(),
-        tombstones.clone(),
-        closed_streams.clone(),
         ui_event_routes.clone(),
-        state,
+        state.clone(),
         initialized_tx,
         shutdown_tx,
         pong_tx,
@@ -531,8 +623,7 @@ where
     ProcessClient {
         writer,
         pending,
-        tombstones,
-        closed_streams,
+        state,
         ui_event_routes,
         initialized: Arc::new(Mutex::new(Some(initialized_rx))),
         shutdown_ack: shutdown_rx,
@@ -560,6 +651,12 @@ async fn writer_task<W>(
             return;
         };
         let result = async {
+            // The Host's own frames go through the same classifier as the
+            // Package's, for the state they carry and for the one question it
+            // asks. A `credit` or a `cancel` that crossed the state it names is
+            // in contract and is written; the Package runs the same classifier
+            // and ignores it. Only an out-of-contract frame fails the
+            // generation the Host is serving.
             state
                 .lock()
                 .await
@@ -588,10 +685,8 @@ async fn reader_task<R>(
     mut input: R,
     writer: Writer,
     pending: PendingRequests,
-    tombstones: Arc<Mutex<BTreeSet<String>>>,
-    closed_streams: Arc<Mutex<BTreeSet<String>>>,
     ui_event_routes: UiEventRoutes,
-    state: Arc<Mutex<ContractState>>,
+    state: SharedState,
     initialized: oneshot::Sender<Frame>,
     shutdown: watch::Sender<bool>,
     pongs: watch::Sender<Option<String>>,
@@ -635,7 +730,7 @@ async fn reader_task<R>(
                 if let Err(code) = result {
                     route.terminate(StreamEnd::Host(code));
                     ui_event_routes.lock().await.remove(stream_id);
-                    closed_streams.lock().await.insert(stream_id.to_owned());
+                    state.lock().await.retire_stream(stream_id);
                     let _ = writer
                         .control(json!({"kind":"stream_close","streamId":stream_id,"code":ui_stream_code(code)}))
                         .await;
@@ -643,24 +738,20 @@ async fn reader_task<R>(
                 continue;
             }
         }
-        let is_late_stream_frame =
-            if matches!(frame.kind(), FrameKind::Event | FrameKind::StreamClose) {
-                match frame.field("streamId").and_then(Value::as_str) {
-                    Some(id) => closed_streams.lock().await.contains(id),
-                    None => false,
-                }
-            } else {
-                false
-            };
-        if is_late_stream_frame {
+        // One classifier, before every branch. There is no side of `observe` on
+        // which an adapter can hold its own idea of which races are tolerable.
+        let verdict = match state.lock().await.observe(Direction::PackageToHost, &frame) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                let code = protocol_code(error);
+                let _ = failure.send(Some(code));
+                fail_pending(&pending, code).await;
+                fail_ui_routes(&ui_event_routes, code).await;
+                return;
+            }
+        };
+        if verdict == Verdict::Ignore {
             continue;
-        }
-        if let Err(error) = state.lock().await.observe(Direction::PackageToHost, &frame) {
-            let code = protocol_code(error);
-            let _ = failure.send(Some(code));
-            fail_pending(&pending, code).await;
-            fail_ui_routes(&ui_event_routes, code).await;
-            return;
         }
         match frame.kind() {
             FrameKind::Initialized => {
@@ -676,9 +767,6 @@ async fn reader_task<R>(
                     let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
                     return;
                 };
-                if tombstones.lock().await.remove(&id) {
-                    continue;
-                }
                 let Some(sender) = pending.lock().await.remove(&id) else {
                     let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                     return;
@@ -720,6 +808,7 @@ async fn reader_task<R>(
                 let writer = writer.clone();
                 let capabilities = capabilities.clone();
                 let failure = failure.clone();
+                let answered = id.clone();
                 // The method is read before the call, so a call that never
                 // returns can still be classified.
                 let method = payload
@@ -765,8 +854,33 @@ async fn reader_task<R>(
                             details
                         }
                     };
-                    if writer.control(response).await.is_err() {
-                        let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                    // The answer waits for control-lane capacity: a congested
+                    // lane is backpressure, and dropping the answer would leave
+                    // this request with no terminal frame at all. Congestion
+                    // that outlasts the call deadline is answered for that one
+                    // request id with a typed retryable error, never by tearing
+                    // the generation down.
+                    let delivered = match tokio::time::timeout(
+                        limits.capability_call,
+                        writer.send_waiting(response, true),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(WireFailure::new(PackageErrorCode::Overloaded)),
+                    };
+                    if let Err(wire) = delivered {
+                        if wire.code == PackageErrorCode::Overloaded {
+                            let overloaded = json!({
+                                "kind":"error", "id":answered, "code":"overloaded",
+                                "retryable":true, "details":{}
+                            });
+                            if writer.control(overloaded).await.is_err() {
+                                let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                            }
+                        } else {
+                            let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                        }
                     }
                 });
             }
@@ -790,7 +904,10 @@ async fn reader_task<R>(
                         topic,
                         initial_credit,
                         &payload,
-                        HostStreamSender(writer.clone()),
+                        HostStreamSender {
+                            writer: writer.clone(),
+                            state: state.clone(),
+                        },
                     )
                     .await
                 {
@@ -798,7 +915,10 @@ async fn reader_task<R>(
                         "kind":"stream_close", "streamId":id,
                         "code":capability_code(code)
                     });
-                    if writer.control(response).await.is_err() {
+                    // The Package is waiting for this stream to end, so the
+                    // rejection waits for lane capacity rather than being
+                    // dropped with the generation reported as exited.
+                    if writer.send_waiting(response, true).await.is_err() {
                         let _ = failure.send(Some(PackageErrorCode::ProcessExited));
                         return;
                     }
@@ -813,13 +933,10 @@ async fn reader_task<R>(
                     .field("amount")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
-                // What is left after the handler has absorbed the races it owns
-                // is the Package crediting outside the window the contract
-                // grants it, which ends the connection.
-                if capabilities.add_credit(stream_id, amount).await.is_err() {
-                    let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
-                    return;
-                }
+                // The classifier has already decided this frame: it names a
+                // live stream and sits inside the window the contract grants.
+                // What is left is routing it to the stream's own task.
+                capabilities.add_credit(stream_id, amount).await;
             }
             FrameKind::StreamClose => {
                 let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
@@ -828,7 +945,6 @@ async fn reader_task<R>(
                 };
                 if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
                     route.terminate(stream_end(&frame));
-                    closed_streams.lock().await.insert(stream_id.to_owned());
                 } else {
                     capabilities.close_stream(stream_id).await;
                 }
@@ -991,7 +1107,10 @@ impl ProcessClient {
                     Ok(Ok(result)) => result,
                     _ => {
                         self.pending.lock().await.remove(&id);
-                        self.tombstones.lock().await.insert(id);
+                        // The `cancel` already entered the tombstone when the
+                        // writer observed it; this covers the case where the
+                        // grace expired before it was written.
+                        self.state.lock().await.retire_request(&id);
                         let mut failure = WireFailure::new(if state_changing {
                             PackageErrorCode::OutcomeUncertain
                         } else {
@@ -1005,14 +1124,17 @@ impl ProcessClient {
         }
     }
 
+    /// Cancels one in-flight request.
+    ///
+    /// The Host stops waiting here, so the request is retired here too: a first
+    /// terminal frame that crossed the cancel is ignored, and a second is still
+    /// fatal. A repeated cancel, or one for a request the answer already
+    /// retired, is ignored by the same classifier when the writer observes it.
     pub(crate) async fn cancel(&self, target: &str) -> Result<(), WireFailure> {
         let removed = self.pending.lock().await.remove(target);
         if let Some(sender) = removed {
             let _ = sender.send(Err(WireFailure::new(PackageErrorCode::Cancelled)));
-        } else if self.tombstones.lock().await.contains(target) {
-            return Ok(());
         }
-        self.tombstones.lock().await.insert(target.to_owned());
         self.send_cancel(target).await
     }
 
@@ -1033,7 +1155,6 @@ impl ProcessClient {
         payload: PackageValue,
         contract: Arc<AdmittedUi>,
     ) -> Result<(UiEventReceiver, Arc<UiEventRoute>), WireFailure> {
-        self.closed_streams.lock().await.remove(&id);
         let (route, receiver) = UiEventRoute::new(contract, topic.to_owned());
         self.ui_event_routes
             .lock()
@@ -1054,21 +1175,23 @@ impl ProcessClient {
         Ok((receiver, route))
     }
 
+    /// Releases credit for events the subscriber has acknowledged.
+    ///
+    /// A stream that ended while the acknowledgement was in flight makes this
+    /// frame late, not wrong: the writer's classifier drops it.
     pub(crate) async fn credit(&self, stream_id: &str, amount: u64) -> Result<(), WireFailure> {
         self.writer
-            .control(json!({"kind":"credit","streamId":stream_id,"amount":amount.min(32)}))
+            .control(json!({
+                "kind":"credit", "streamId":stream_id,
+                "amount":amount.min(INITIAL_STREAM_CREDIT as u64)
+            }))
             .await
     }
 
     pub(crate) async fn stream_close(&self, stream_id: &str) -> Result<(), WireFailure> {
-        let mut closed = self.closed_streams.lock().await;
-        if !closed.insert(stream_id.to_owned()) {
-            return Ok(());
-        }
-        while closed.len() > 64 {
-            closed.pop_first();
-        }
-        drop(closed);
+        // The Host stops serving the stream here, so credit the Package
+        // released for events it had already accepted is ignored from now on.
+        self.state.lock().await.retire_stream(stream_id);
         if let Some(route) = self.ui_event_routes.lock().await.remove(stream_id) {
             route.terminate(StreamEnd::Host(PackageErrorCode::Cancelled));
         }
@@ -1146,10 +1269,35 @@ fn empty_object() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamEnd, package_owned_error, stream_end};
+    use super::{
+        CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE, StreamEnd,
+        UI_EVENT_CAPACITY, package_owned_error, stream_end,
+    };
     use crate::PackageErrorCode;
     use serde_json::{Value, json};
-    use teamarness_package_protocol::Frame;
+    use teamarness_package_protocol::{
+        Frame, INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION,
+        MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
+    };
+
+    /// Every writer bound admits the worst case the contract permits.
+    ///
+    /// These are the floors the lanes were sized below: a control lane that
+    /// cannot hold the answers to the requests the contract allows turns legal
+    /// traffic into a refused frame.
+    #[test]
+    fn writer_lanes_admit_the_traffic_the_contract_permits() {
+        const {
+            assert!(CONTROL_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION + CONTROL_RESERVE);
+            assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
+            assert!(CONTROL_QUEUE <= MAX_WRITER_FRAMES);
+            assert!(DATA_QUEUE <= MAX_WRITER_FRAMES);
+            assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
+            assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
+            assert!(CONTROL_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
+            assert!(UI_EVENT_CAPACITY == INITIAL_STREAM_CREDIT);
+        }
+    }
 
     fn frame(value: Value) -> Frame {
         Frame::try_from(value).expect("valid frame")

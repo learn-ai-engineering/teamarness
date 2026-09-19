@@ -5,9 +5,11 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::Mutex;
 
+use teamarness_package_protocol::TOMBSTONE_CAPACITY;
+
 use crate::protocol::{UiEventReceiver, UiEventRoute, WireFailure};
 use crate::supervisor::{self, CRASH_WINDOW, ProcessGeneration, ProcessSpec, RESTART_DELAYS};
-use crate::ui::AdmittedUi;
+use crate::ui::{AdmittedUi, MAX_UI_SUBSCRIPTIONS_PER_MOUNT};
 use crate::{
     LifecycleState, MountState, PackageErrorCode, PackageInstanceKey, PackageInstanceSnapshot,
     PackageValue, UiMountId, UiRequestId, UiSubscriptionId,
@@ -448,7 +450,7 @@ impl InstanceActor {
             let mut state = self.state.lock().await;
             state.requests.remove(&request_key);
             state.request_tombstones.insert(request_key);
-            while state.request_tombstones.len() > 64 {
+            while state.request_tombstones.len() > TOMBSTONE_CAPACITY {
                 state.request_tombstones.pop_first();
             }
         }
@@ -510,7 +512,7 @@ impl InstanceActor {
             let mut state = self.state.lock().await;
             let Some(wire_id) = state.requests.get(&request_key).cloned() else {
                 state.request_tombstones.insert(request_key);
-                while state.request_tombstones.len() > 64 {
+                while state.request_tombstones.len() > TOMBSTONE_CAPACITY {
                     state.request_tombstones.pop_first();
                 }
                 return Ok(());
@@ -548,7 +550,7 @@ impl InstanceActor {
                     .keys()
                     .filter(|(stream_mount, _)| stream_mount == mount)
                     .count()
-                    >= 8
+                    >= MAX_UI_SUBSCRIPTIONS_PER_MOUNT
             {
                 return Err(WireFailure::new(PackageErrorCode::Overloaded));
             }

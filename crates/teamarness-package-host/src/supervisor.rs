@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
+use teamarness_package_protocol::{
+    INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES,
+    MAX_WRITER_FRAMES,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -276,12 +280,14 @@ fn initialize_frame(
         "dataDirectory":{"path":spec.data_directory.to_string_lossy(),"continuityId":spec.continuity_id},
         "protocol":{"major":spec.template.protocol.0,"minor":spec.template.protocol.1},
         "capabilities":capabilities,
+        // The handshake publishes the contract's own limits table; the
+        // constants are read here so the wire and the code cannot drift.
         "limits":{
-            "maxFrameBytes":1048576,
-            "maxInFlightEachDirection":32,
-            "maxWriterFrames":64,
-            "maxWriterBytes":8388608,
-            "initialStreamCredit":32
+            "maxFrameBytes":MAX_FRAME_BYTES,
+            "maxInFlightEachDirection":MAX_IN_FLIGHT_EACH_DIRECTION,
+            "maxWriterFrames":MAX_WRITER_FRAMES,
+            "maxWriterBytes":MAX_WRITER_BYTES,
+            "initialStreamCredit":INITIAL_STREAM_CREDIT
         }
     })
 }

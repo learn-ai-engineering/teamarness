@@ -5,7 +5,9 @@ use std::sync::Arc;
 use crate::errors::{
     PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, host_error, instance_error,
 };
-use crate::values::{LifecycleState, PackageInstanceKey, UiMountId, UiResourceToken};
+use crate::values::{
+    LifecycleState, PackageInstanceKey, UiMountId, UiResourceToken, UiSubscriptionId,
+};
 use crate::{
     CloseUiMount, MountLease, OpenUiMount, PackageHost, PackageHostOutcome, ReadUiResource,
     ReportUiFault, UiLoaderDescriptor, UiPackageContext, UiWorkspaceContext, instance,
@@ -194,6 +196,28 @@ impl PackageHost {
         for mount in mounts {
             self.revoke_mount(&mount).await;
         }
+    }
+
+    /// Releases the Host's record of a stream the Package has ended.
+    ///
+    /// Nothing else removed it, so the acknowledgement for the last delivered
+    /// event — which is routinely still in flight when the stream ends — found
+    /// a live subscription and released credit for a stream the contract had
+    /// already closed.
+    pub(crate) async fn release_ui_subscription(
+        &self,
+        mount: &UiMountId,
+        subscription: &UiSubscriptionId,
+    ) {
+        if let Some(actor) = self.actor_for_mount(mount).await {
+            let _ = actor.close_subscription(mount, subscription).await;
+        }
+        self.inner
+            .data
+            .lock()
+            .await
+            .ui_routes
+            .remove(&(mount.clone(), subscription.clone()));
     }
 
     pub(crate) async fn fail_mount(&self, mount: &UiMountId) {

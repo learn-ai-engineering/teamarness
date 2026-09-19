@@ -374,6 +374,15 @@ async function serve() {
         } else if (frame.topic === "fixture.rejected_stream") {
           send({ kind: "stream_close", streamId: frame.id, code: "fixture.stream_rejected" });
           uiStreams.delete(frame.id);
+        } else if (frame.topic === "fixture.complete") {
+          // Events, then an ordinary completion: the subscriber's
+          // acknowledgement for the last event is still in flight when the
+          // stream ends.
+          for (let sequence = 1; sequence <= 2; sequence += 1) {
+            send({ kind: "event", streamId: frame.id, sequence: String(sequence), payload: { order: sequence } });
+          }
+          send({ kind: "stream_close", streamId: frame.id, code: "completed" });
+          uiStreams.delete(frame.id);
         } else if (frame.topic === "fixture.invalid_event") {
           send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: "invalid" } });
         } else if (frame.topic === "fixture.duplicate") {

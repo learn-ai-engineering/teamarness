@@ -324,6 +324,60 @@ async fn package_closed_stream_completes_without_stopping_the_backend() {
     );
 }
 
+/// V-01: a stream that completes normally is acknowledged for its last event.
+///
+/// The subscriber's acknowledgement is routinely still in flight when the
+/// stream ends, so it names a subscription the contract has already closed.
+/// That released credit for a closed stream and killed the generation, which
+/// `ProtocolViolation` does not even restart.
+#[tokio::test]
+async fn acknowledging_the_last_event_of_a_completed_stream_keeps_the_generation() {
+    let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let generation = host.snapshot().await.instances[0].process_generation;
+    let mount = mount(&host, 0).await;
+    let subscription = UiSubscriptionId::new("completing").unwrap();
+    host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+        mount: mount.clone(),
+        subscription: subscription.clone(),
+        operation: "fixture.complete".into(),
+        payload: empty(),
+    }))
+    .await
+    .unwrap();
+    let mut events = host
+        .subscribe(PackageHostSubscriptionSelector::UiEvents {
+            mount: mount.clone(),
+            subscription: subscription.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(sequence(events.changed().await.unwrap()), "1");
+    assert_eq!(sequence(events.changed().await.unwrap()), "2");
+    assert!(matches!(
+        events.changed().await.unwrap(),
+        PackageHostNotification::UiStreamCompleted(_)
+    ));
+
+    // The acknowledgement the subscriber had already queued for event 2.
+    let _ = host
+        .execute(PackageHostCommand::AcknowledgeUiEvents(
+            AcknowledgeUiEvents {
+                mount: mount.clone(),
+                subscription,
+                through_sequence: 2,
+            },
+        ))
+        .await;
+
+    let after = host.snapshot().await.instances[0].clone();
+    assert_eq!(after.lifecycle, LifecycleState::Active);
+    assert_eq!(after.process_generation, generation);
+    assert_eq!(after.mount_state, Some(MountState::Mounted));
+}
+
 /// A Package that rejects a subscription reports its own code to its own UI, and the mount
 /// stays healthy: only a host-owned stream failure is a mount fault.
 #[tokio::test]

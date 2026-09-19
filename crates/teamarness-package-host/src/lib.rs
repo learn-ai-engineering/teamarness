@@ -41,6 +41,7 @@ pub use crate::subscriptions::{
     HostStateNotification, PackageHostNotification, PackageHostSubscription,
     PackageHostSubscriptionSelector, UiEventNotification, UiStreamCompletedNotification,
 };
+pub use crate::ui::MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 pub use crate::values::{
     DiagnosticId, HostRevision, InstallationPublicIdentity, LifecycleState, MountState,
     PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,

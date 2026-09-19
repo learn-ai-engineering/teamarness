@@ -137,6 +137,7 @@ pub fn write_node_package_with_capabilities(
         },
         "subscriptions": {
             "fixture.close": {"request": {}, "event": {}},
+            "fixture.complete": {"request": {}, "event": {}},
             "fixture.duplicate": {"request": {}, "event": {}},
             "fixture.events": {"request": {}, "event": {}},
             "fixture.gap": {"request": {}, "event": {}},

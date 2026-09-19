@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 use teamarness_core::{
     CoreRuntime, MembershipEpoch, MembershipRole, PublicIdentity, PublicSignature, SigningContext,
 };
+use teamarness_package_protocol::INITIAL_STREAM_CREDIT;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
 use crate::protocol::{CapabilityFailure, HostStreamSender};
@@ -24,9 +25,26 @@ pub(crate) const MAX_OPEN_RECORDS: usize = 32;
 pub(crate) const MAX_OPEN_DECODED_BYTES: usize = 512 * 1024;
 /// The largest canonical payload one `append` call may carry.
 pub(crate) const MAX_CANONICAL_DECODED_BYTES: usize = 262_144;
-const MAX_STREAM_CREDIT: u64 = 32;
-/// The largest record page one blocking read may return, matching Core's bound.
-const RECORD_PAGE: u64 = 32;
+/// The credit window the contract grants one stream.
+const MAX_STREAM_CREDIT: u64 = INITIAL_STREAM_CREDIT as u64;
+/// The largest record page one blocking read may return.
+///
+/// A page is read against the credit the Package has released, so it can never
+/// exceed the window the contract grants. `record_page_fits_the_writer_budget`
+/// asserts that a full page of records at `BUDGETED_RECORD_BYTES` fits the
+/// writer's outbound data budget. A page of larger records does not fail: the
+/// stream's `event` waits for writer capacity, because a slow reader is
+/// backpressure rather than a capability outage.
+const RECORD_PAGE: u64 = MAX_STREAM_CREDIT;
+/// The record size one page is budgeted for.
+///
+/// A record event carries two unpadded base64url copies of the record — its
+/// canonical bytes and its sealed form — so one page of them is roughly
+/// `RECORD_PAGE * 2 * ceil(bytes * 4 / 3)` on the wire.
+/// Read by `record_page_fits_the_writer_budget`. Nothing in production reads
+/// it, because a page of larger records is backpressure, not an error.
+#[allow(dead_code)]
+const BUDGETED_RECORD_BYTES: usize = MAX_CANONICAL_DECODED_BYTES / 32;
 /// Slots in one stream task's command queue.
 ///
 /// A conformant Package returns credit only for events it has already accepted,
@@ -347,28 +365,17 @@ impl GenerationCapabilities {
         Ok(())
     }
 
-    /// Applies one `credit` frame.
+    /// Routes one already-classified `credit` frame to its stream.
     ///
-    /// Credit for a stream this generation no longer has is dropped rather than
-    /// refused: the stream task removes its own entry before the `stream_close`
-    /// reaches the Package, so credit the Package released for events it had
-    /// already accepted is still in flight and arrives afterwards. That race is
-    /// ordinary, and the same tolerance `stream_close` for an unknown stream
-    /// already gets.
-    pub(crate) async fn add_credit(
-        &self,
-        stream_id: &str,
-        amount: u64,
-    ) -> Result<(), PackageErrorCode> {
-        if amount == 0 || amount > MAX_STREAM_CREDIT {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
-        }
+    /// `ContractState` has decided the frame before it arrives here: the amount
+    /// is inside the window the contract grants, and credit for a stream this
+    /// generation has retired never reaches this function. What is left is a
+    /// send that `STREAM_COMMAND_QUEUE` is sized to accept.
+    pub(crate) async fn add_credit(&self, stream_id: &str, amount: u64) {
         let Some(sender) = self.streams.lock().await.get(stream_id).cloned() else {
-            return Ok(());
+            return;
         };
-        sender
-            .try_send(StreamCommand::Credit(amount))
-            .map_err(|_| PackageErrorCode::Overloaded)
+        let _ = sender.try_send(StreamCommand::Credit(amount));
     }
 
     pub(crate) async fn close_stream(&self, stream_id: &str) {
@@ -698,9 +705,7 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
         &'a self,
         stream_id: &'a str,
         amount: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(GenerationCapabilities::add_credit(self, stream_id, amount))
     }
 
@@ -846,6 +851,7 @@ async fn run_membership_stream(
     let mut epochs = match opened {
         Ok(Ok(receiver)) => receiver,
         _ => {
+            output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             let _ = output.close(&stream_id, "capability_unavailable").await;
             return;
@@ -859,6 +865,7 @@ async fn run_membership_stream(
         if !drain_commands(&mut commands, &mut credit).await
             || !await_credit(&mut commands, &mut credit, &mut cancelled).await
         {
+            output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             return;
         }
@@ -876,12 +883,14 @@ async fn run_membership_stream(
                         credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
                     }
                     Some(StreamCommand::Close) | None => {
+                        output.retire(&stream_id).await;
                         streams.lock().await.remove(&stream_id);
                         return;
                     }
                 },
                 result = cancelled.changed() => {
                     if result.is_err() || *cancelled.borrow() {
+                        output.retire(&stream_id).await;
                         streams.lock().await.remove(&stream_id);
                         return;
                     }
@@ -917,6 +926,7 @@ async fn run_membership_stream(
         after_epoch = transition.epoch().value();
         credit -= 1;
     }
+    output.retire(&stream_id).await;
     streams.lock().await.remove(&stream_id);
     let _ = output.close(&stream_id, "capability_unavailable").await;
 }
@@ -1045,18 +1055,21 @@ async fn run_record_stream(
             teamarness_core::SynchronizationError::CursorAhead
             | teamarness_core::SynchronizationError::CursorScopeMismatch,
         )) => {
+            output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             let _ = output.close(&stream_id, "cursor_invalid").await;
             return;
         }
         Ok(Err(error)) => {
             eprintln!("record stream subscribe failed: stream={stream_id} error={error}");
+            output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             let _ = output.close(&stream_id, "capability_unavailable").await;
             return;
         }
         Err(error) => {
             eprintln!("record stream subscribe task failed: stream={stream_id} error={error}");
+            output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             let _ = output.close(&stream_id, "capability_unavailable").await;
             return;
@@ -1074,6 +1087,7 @@ async fn run_record_stream(
         if !drain_commands(&mut commands, &mut credit).await
             || !await_credit(&mut commands, &mut credit, &mut cancelled).await
         {
+            output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             return;
         }
@@ -1214,18 +1228,21 @@ async fn run_record_stream(
                     credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
                 }
                 Some(StreamCommand::Close) | None => {
+                    output.retire(&stream_id).await;
                     streams.lock().await.remove(&stream_id);
                     return;
                 }
             },
             result = cancelled.changed() => {
                 if result.is_err() || *cancelled.borrow() {
+                    output.retire(&stream_id).await;
                     streams.lock().await.remove(&stream_id);
                     return;
                 }
             }
         }
     }
+    output.retire(&stream_id).await;
     streams.lock().await.remove(&stream_id);
     let _ = output.close(&stream_id, "capability_unavailable").await;
 }
@@ -1642,6 +1659,31 @@ mod tests {
                     &crate::PackageValue::Object(Default::default())
                 )
                 .is_err()
+        );
+    }
+
+    /// Rule 2's floor: one page of budgeted records fits the writer's data lane.
+    ///
+    /// The page the Host reads and the budget it writes into were chosen
+    /// independently, and a page that cannot fit was reported to the Package as
+    /// `capability_unavailable` — a code the SDK's own table calls permanent.
+    #[test]
+    fn record_page_fits_the_writer_budget() {
+        // base64url without padding, twice: the canonical bytes and the sealed form.
+        let encoded = |bytes: usize| (bytes * 4).div_ceil(3);
+        let page = RECORD_PAGE as usize * 2 * encoded(BUDGETED_RECORD_BYTES);
+        assert!(
+            page <= crate::protocol::DATA_BYTES,
+            "a page of {RECORD_PAGE} records at {BUDGETED_RECORD_BYTES} bytes is {page} wire bytes, over the {} byte data budget",
+            crate::protocol::DATA_BYTES
+        );
+        assert_eq!(RECORD_PAGE, MAX_STREAM_CREDIT);
+        assert_eq!(MAX_STREAM_CREDIT as usize, INITIAL_STREAM_CREDIT);
+        // A page of contract-maximum records does not fit any sane budget, and
+        // is what `HostStreamSender::event` waits for capacity to write.
+        assert!(
+            RECORD_PAGE as usize * 2 * encoded(MAX_CANONICAL_DECODED_BYTES)
+                > crate::protocol::DATA_BYTES
         );
     }
 

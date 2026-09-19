@@ -110,13 +110,17 @@ impl PackageHostSubscription {
                     sequence: event.sequence.to_string(),
                     payload: event.payload,
                 })),
-                Err(protocol::StreamEnd::Completed) => Ok(
-                    PackageHostNotification::UiStreamCompleted(UiStreamCompletedNotification {
-                        mount: mount.clone(),
-                        subscription: subscription.clone(),
-                    }),
-                ),
+                Err(protocol::StreamEnd::Completed) => {
+                    host.release_ui_subscription(mount, subscription).await;
+                    Ok(PackageHostNotification::UiStreamCompleted(
+                        UiStreamCompletedNotification {
+                            mount: mount.clone(),
+                            subscription: subscription.clone(),
+                        },
+                    ))
+                }
                 Err(protocol::StreamEnd::Package(package_error)) => {
+                    host.release_ui_subscription(mount, subscription).await;
                     let mut error =
                         host_error(PackageErrorCode::BackendError, PackageErrorStage::Ui);
                     error.retryable = package_error.retryable;

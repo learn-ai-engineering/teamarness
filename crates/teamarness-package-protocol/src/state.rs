@@ -40,6 +40,13 @@ impl Direction {
 /// legitimately differ for one round trip. A frame a conforming peer could have
 /// sent before it saw this side retire the state it names is not a violation:
 /// it is ignored. Anything else is either delivered or fatal.
+///
+/// The verdict is about *delivery*, so only a reader acts on `Ignore`. A writer
+/// observes its own frames for the state they carry and for the one question it
+/// asks — is this frame out of contract? — and then writes it. Withholding a
+/// frame the adapter asked for would break the contract's own guarantee that
+/// exactly one `response` or `error` is terminal for a request, and the peer
+/// runs this same classifier over what arrives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Verdict {
     /// The frame names live state and reaches the adapter.
@@ -170,7 +177,9 @@ impl ContractState {
             FrameKind::Initialize | FrameKind::Initialized => {
                 self.observe_version(frame).map(|()| Verdict::Deliver)
             }
-            FrameKind::Request => self.observe_request(direction, frame).map(|()| Verdict::Deliver),
+            FrameKind::Request => self
+                .observe_request(direction, frame)
+                .map(|()| Verdict::Deliver),
             FrameKind::Response | FrameKind::Error => self.observe_terminal(direction, frame),
             FrameKind::Cancel => self.observe_cancel(direction, frame),
             FrameKind::StreamOpen => self

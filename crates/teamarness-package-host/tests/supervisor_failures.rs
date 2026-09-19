@@ -16,8 +16,9 @@ use teamarness_package_host::{
     RecoverPackage, UiRequest, UiRequestId,
 };
 pub use teamarness_package_host::{
-    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
-    PackageIdentity, PackageOwnedError, PackageValue,
+    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH,
+    MAX_UI_SUBSCRIPTIONS_PER_MOUNT, PackageErrorCode, PackageIdentity, PackageOwnedError,
+    PackageValue,
 };
 
 #[tokio::test]

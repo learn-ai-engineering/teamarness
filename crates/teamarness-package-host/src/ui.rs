@@ -18,6 +18,14 @@ use crate::{PackageErrorCode, PackageValue};
 #[allow(unused_imports)]
 pub(crate) use teamarness_package_contract::ui_contract::MAX_UI_PAYLOAD_BYTES;
 
+/// The event streams one Package UI Mount may hold open at once.
+///
+/// The Shell enforces the same bound before it asks (`MAX_OPEN_SUBSCRIPTIONS`
+/// in `package-frame/protocol.ts`); `check-protocol-bounds.mjs` reads both so
+/// neither can move alone. A Shell that allowed more would have its extra
+/// subscriptions refused here as `overloaded`.
+pub const MAX_UI_SUBSCRIPTIONS_PER_MOUNT: usize = 8;
+
 #[derive(Debug)]
 pub(crate) struct UiContractFailure {
     pub(crate) code: PackageErrorCode,
