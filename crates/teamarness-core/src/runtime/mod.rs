@@ -127,7 +127,11 @@ impl CoreRuntime {
     async fn open_inner(
         config: CoreRuntimeConfig,
         clock: Box<dyn Clock>,
-        #[cfg_attr(not(test), allow(unused_variables))] test_readiness: Option<bool>,
+        #[cfg_attr(
+            not(any(test, feature = "test-hooks")),
+            allow(unused_variables)
+        )]
+        test_readiness: Option<bool>,
     ) -> Result<Self, CoreError> {
         let clock: Arc<dyn Clock> = Arc::from(clock);
         let opened_at_unix_ms = clock.now_unix_ms();
@@ -220,7 +224,7 @@ impl CoreRuntime {
             crate::membership_sync::membership_sync_registration(Arc::clone(&membership_replica)),
             package_sync,
         ];
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let transport = if let Some(ready_immediately) = test_readiness {
             crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_protocols(
                 secret_key.clone(),
@@ -238,7 +242,7 @@ impl CoreRuntime {
             )
             .await
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-hooks")))]
         let transport = crate::onboarding::transport::Transport::bind_production(
             secret_key.clone(),
             issuer,

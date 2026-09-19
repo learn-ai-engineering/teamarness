@@ -1,3 +1,11 @@
+//! The two-Profile recovery matrix, run twice over the same scenario.
+//!
+//! The default run is hermetic: real `CoreRuntime`s, real Iroh endpoints bound
+//! to loopback, real SQLite, a real Conversations Backend process. Nothing off
+//! this machine is contacted, so `cargo test --workspace` passes offline.
+//! The production-relay run of the identical scenario is `#[ignore]`d and runs
+//! under `npm run verify:conversations`, where it also qualifies the one thing
+//! loopback cannot: relay-mediated addressing and reachability (SF-002).
 #![cfg(unix)]
 
 mod support;
@@ -7,17 +15,30 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::harness::{
-    self, ConversationClient, GENERAL_ID, PACKAGE_ID, assert_no_plaintext_sentinel,
+    self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, assert_no_plaintext_sentinel,
     assert_projection_is_duplicate_free, channel_id, channel_is_hidden, channel_projection,
-    create_invitation, has_channel, has_message_on_page, message_projection, object, open_host,
-    open_mount, poll_short, poll_until, shutdown, snapshot_has_warning,
+    create_invitation, has_channel, has_message_on_page, introduce, message_projection, object,
+    open_core, open_host, open_mount, poll_short, poll_until, shutdown, snapshot_has_warning,
 };
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+use teamarness_core::CoreRuntime;
 use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
 
 /// Verifies: TEAM.SYS.CONV-R06, TEAM.SYS.CONV-R10, TEAM.SYS.CONV-R11, TEAM.SYS.CONV-R12
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn complete_two_profile_recovery_matrix() {
+    two_profile_recovery_matrix(Addressing::Loopback).await;
+}
+
+/// The same matrix over public relays: the realistic addressing the hermetic
+/// run cannot reach. Verifies: TEAM.SYS.CONV-R06, TEAM.SYS.CONV-R10,
+/// TEAM.SYS.CONV-R11, TEAM.SYS.CONV-R12, TEAM.SYS.TRANS-R06.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "production-relay qualification; run with npm run verify:conversations"]
+async fn complete_two_profile_recovery_matrix_over_production_relays() {
+    two_profile_recovery_matrix(Addressing::ProductionRelay).await;
+}
+
+async fn two_profile_recovery_matrix(addressing: Addressing) {
     let application = support::harness::StagedApplication::new();
     let application_path = application.application_path.clone();
     let alice_core_path = application.root.path().join("alice-core");
@@ -25,11 +46,7 @@ async fn complete_two_profile_recovery_matrix() {
     let alice_private = application.root.path().join("alice-private");
     let bob_private = application.root.path().join("bob-private");
 
-    let alice_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&alice_core_path))
-            .await
-            .unwrap(),
-    );
+    let alice_core = open_core(addressing, &alice_core_path).await;
     let workspace = alice_core.create_workspace("Conversations flow").unwrap();
     let workspace_id = workspace.id();
     let key = PackageInstanceKey::new(
@@ -57,11 +74,8 @@ async fn complete_two_profile_recovery_matrix() {
     let shared_channel = channel_id(&alice_snapshot, "shared-channel").unwrap();
 
     let invitation = create_invitation(&alice_core, workspace_id).await;
-    let bob_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&bob_core_path))
-            .await
-            .unwrap(),
-    );
+    let bob_core = open_core(addressing, &bob_core_path).await;
+    introduce(addressing, &[&alice_core, &bob_core]);
     bob_core.join_workspace(&invitation).await.unwrap();
     drop(invitation);
     let bob_host = open_host(&application_path, bob_private.clone(), bob_core.clone()).await;
@@ -91,8 +105,14 @@ async fn complete_two_profile_recovery_matrix() {
     drop(bob_core);
 
     // Alice reopens, sends offline messages, creates offline channel, stops.
-    let (alice_core, alice_host, alice_mount) =
-        reopen_profile(&application_path, &alice_core_path, &alice_private, &key).await;
+    let (alice_core, alice_host, alice_mount) = reopen_profile(
+        addressing,
+        &application_path,
+        &alice_core_path,
+        &alice_private,
+        &key,
+    )
+    .await;
     let alice = ConversationClient {
         host: &alice_host,
         mount: &alice_mount,
@@ -112,8 +132,14 @@ async fn complete_two_profile_recovery_matrix() {
     drop(alice_core);
 
     // Bob reopens, sends offline messages, creates offline channel, stops.
-    let (bob_core, bob_host, bob_mount) =
-        reopen_profile(&application_path, &bob_core_path, &bob_private, &key).await;
+    let (bob_core, bob_host, bob_mount) = reopen_profile(
+        addressing,
+        &application_path,
+        &bob_core_path,
+        &bob_private,
+        &key,
+    )
+    .await;
     let bob = ConversationClient {
         host: &bob_host,
         mount: &bob_mount,
@@ -131,18 +157,32 @@ async fn complete_two_profile_recovery_matrix() {
     drop(bob_core);
 
     // Both reopen simultaneously to trigger sync reconciliation.
-    let (alice_core, alice_host, alice_mount) =
-        reopen_profile(&application_path, &alice_core_path, &alice_private, &key).await;
+    let (alice_core, alice_host, alice_mount) = reopen_profile(
+        addressing,
+        &application_path,
+        &alice_core_path,
+        &alice_private,
+        &key,
+    )
+    .await;
     let alice = ConversationClient {
         host: &alice_host,
         mount: &alice_mount,
     };
-    let (bob_core, bob_host, bob_mount) =
-        reopen_profile(&application_path, &bob_core_path, &bob_private, &key).await;
+    let (bob_core, bob_host, bob_mount) = reopen_profile(
+        addressing,
+        &application_path,
+        &bob_core_path,
+        &bob_private,
+        &key,
+    )
+    .await;
     let bob = ConversationClient {
         host: &bob_host,
         mount: &bob_mount,
     };
+    // Both endpoints bound fresh ports on reopen, so re-introduce them.
+    introduce(addressing, &[&alice_core, &bob_core]);
 
     assert!(
         poll_until(Duration::from_secs(30), || async {
@@ -218,12 +258,19 @@ async fn complete_two_profile_recovery_matrix() {
     shutdown(bob_host).await;
     bob_core.shutdown().await.unwrap();
     drop(bob_core);
-    let (bob_core, bob_host, bob_mount) =
-        reopen_profile(&application_path, &bob_core_path, &bob_private, &key).await;
+    let (bob_core, bob_host, bob_mount) = reopen_profile(
+        addressing,
+        &application_path,
+        &bob_core_path,
+        &bob_private,
+        &key,
+    )
+    .await;
     let bob = ConversationClient {
         host: &bob_host,
         mount: &bob_mount,
     };
+    introduce(addressing, &[&alice_core, &bob_core]);
     assert_eq!(
         message_projection(&alice_host, &alice_mount).await,
         message_projection(&bob_host, &bob_mount).await,
@@ -288,11 +335,9 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
     let alice_private = application.root.path().join("alice-private");
     let bob_private = application.root.path().join("bob-private");
 
-    let alice_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&alice_core_path))
-            .await
-            .unwrap(),
-    );
+    // Timing is measured over the addressing the application really uses.
+    let addressing = Addressing::ProductionRelay;
+    let alice_core = open_core(addressing, &alice_core_path).await;
     let workspace = alice_core.create_workspace("Qualification").unwrap();
     let workspace_id = workspace.id();
     let key = PackageInstanceKey::new(
@@ -300,11 +345,7 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
         WorkspaceId::new(workspace_id.to_string()).unwrap(),
     );
     let invitation = create_invitation(&alice_core, workspace_id).await;
-    let bob_core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&bob_core_path))
-            .await
-            .unwrap(),
-    );
+    let bob_core = open_core(addressing, &bob_core_path).await;
     bob_core.join_workspace(&invitation).await.unwrap();
     drop(invitation);
 
@@ -364,8 +405,14 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
 
     // Bob reconnects and should catch up within the target.
     let catch_up_started = Instant::now();
-    let (bob_core, bob_host, bob_mount) =
-        reopen_profile(&application_path, &bob_core_path, &bob_private, &key).await;
+    let (bob_core, bob_host, bob_mount) = reopen_profile(
+        addressing,
+        &application_path,
+        &bob_core_path,
+        &bob_private,
+        &key,
+    )
+    .await;
     let bob = ConversationClient {
         host: &bob_host,
         mount: &bob_mount,
@@ -454,6 +501,7 @@ async fn ordinary_machine_qualification_meets_delivery_and_catch_up_targets() {
 // ------------------------------------------------------------------
 
 async fn reopen_profile(
+    addressing: Addressing,
     application: &std::path::Path,
     core_path: &std::path::Path,
     private_path: &std::path::Path,
@@ -463,11 +511,7 @@ async fn reopen_profile(
     teamarness_package_host::PackageHost,
     teamarness_package_host::UiMountId,
 ) {
-    let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(core_path))
-            .await
-            .unwrap(),
-    );
+    let core = open_core(addressing, core_path).await;
     let host = open_host(application, private_path.to_owned(), core.clone()).await;
     let mount = open_mount(&host, key).await;
     (core, host, mount)

@@ -1120,11 +1120,8 @@ async fn membership_stream_does_not_poll() {
     }
     let idle = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());
 
-    let joiner = teamarness_core::CoreRuntime::open(teamarness_core::CoreRuntimeConfig::new(
-        fixture._root.path().join("membership-joiner"),
-    ))
-    .await
-    .unwrap();
+    let joiner = common::open_core(fixture._root.path().join("membership-joiner")).await;
+    common::introduce(&fixture.core, &joiner);
     let invitation = common::invite(&fixture.core, workspace.id()).await;
     joiner.join_workspace(&invitation).await.unwrap();
     joiner.shutdown().await.unwrap();

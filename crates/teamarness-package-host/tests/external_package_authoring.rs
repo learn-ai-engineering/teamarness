@@ -44,7 +44,7 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
     .unwrap();
 
     let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(core_path))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(core_path))
             .await
             .unwrap(),
     );

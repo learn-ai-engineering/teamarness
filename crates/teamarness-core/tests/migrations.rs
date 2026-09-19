@@ -395,7 +395,9 @@ async fn migration_0010_adds_membership_wakes_and_parking_and_drops_pending_reco
 async fn accepted_membership_operations_bump_the_membership_wake() {
     let directory = private_data_directory("migration-membership-wake-bump");
     let joiner_directory = private_data_directory("migration-membership-wake-joiner");
-    let manager = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    // Real Installations over loopback addressing: the admission is the real
+    // one, and nothing off this machine is contacted (SF-002).
+    let manager = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let workspace = manager.create_workspace("Wakes").unwrap();
@@ -403,9 +405,11 @@ async fn accepted_membership_operations_bump_the_membership_wake() {
         .create_workspace_invitation(workspace.id())
         .await
         .unwrap();
-    let joiner = CoreRuntime::open(CoreRuntimeConfig::new(&joiner_directory))
+    let joiner = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&joiner_directory))
         .await
         .unwrap();
+    manager.remember_loopback_peer_for_tests(&joiner);
+    joiner.remember_loopback_peer_for_tests(&manager);
     joiner.join_workspace(&invitation).await.unwrap();
     manager
         .revoke_member(workspace.id(), joiner.public_identity())

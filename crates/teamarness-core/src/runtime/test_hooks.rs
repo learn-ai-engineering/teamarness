@@ -1116,6 +1116,35 @@ impl CoreRuntime {
         self.hold_state_inner()
     }
 
+    /// Opens an Installation whose Iroh endpoint is bound to loopback with no
+    /// relay and no discovery, so a multi-Installation test in another crate
+    /// needs nothing off this machine.
+    ///
+    /// Only the addressing changes. Storage, the Endpoint and Router, the
+    /// onboarding transport and the synchronization worker are the production
+    /// ones, and an invitation still carries the issuer's real endpoint
+    /// address. Because there is no relay to publish an address to, peers that
+    /// have never dialled each other are introduced with
+    /// [`Self::remember_loopback_peer_for_tests`]; an Installation that is
+    /// reopened binds a fresh loopback port, so the introduction is repeated
+    /// after every restart.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn open_loopback_for_tests(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
+        Self::open_inner(config, Box::new(SystemClock), Some(true)).await
+    }
+
+    /// Teaches this loopback Installation how to reach `peer`.
+    ///
+    /// Both Installations must come from [`Self::open_loopback_for_tests`]; on
+    /// a runtime bound the production way this records nothing.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn remember_loopback_peer_for_tests(&self, peer: &Self) {
+        self.transport
+            .remember_peer_address(peer.transport.endpoint_address());
+    }
+
     /// Stops and resumes synchronization scheduling from another crate.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]

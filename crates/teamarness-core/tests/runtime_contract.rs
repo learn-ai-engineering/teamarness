@@ -6,6 +6,18 @@ use teamarness_core::{
     MembershipOperationId, MembershipVersion, OnboardingError, SigningContext, WorkspaceId,
 };
 
+/// Opens a real Installation whose Iroh endpoint is bound to loopback.
+///
+/// Addressing is not the behaviour any test in this file is about, and an
+/// integration test is compiled out of crate, so the production binding would
+/// put a required check behind the public relays (SF-002). Storage, the
+/// endpoint and the onboarding protocol are the real ones either way.
+async fn open(directory: std::path::PathBuf) -> CoreRuntime {
+    CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(directory))
+        .await
+        .expect("an Installation opens on its private data directory")
+}
+
 /// Issues an invitation, waiting out the endpoint readiness this machine needs
 /// under load.
 ///
@@ -109,23 +121,21 @@ async fn durable_and_live_transitions_report_the_same_change_and_author() {
             .unwrap()
             .as_nanos()
     ));
-    let alice = CoreRuntime::open(CoreRuntimeConfig::new(root.join("alice")))
-        .await
-        .unwrap();
+    let alice = open(root.join("alice")).await;
     let workspace = alice.create_workspace("Transition change").unwrap();
     let mut live = alice
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
         .unwrap();
 
     let bob_invitation = invite(&alice, workspace.id()).await;
-    let bob = CoreRuntime::open(CoreRuntimeConfig::new(root.join("bob")))
-        .await
-        .unwrap();
+    let bob = open(root.join("bob")).await;
+    alice.remember_loopback_peer_for_tests(&bob);
+    bob.remember_loopback_peer_for_tests(&alice);
     bob.join_workspace(&bob_invitation).await.unwrap();
     let carol_invitation = invite(&alice, workspace.id()).await;
-    let carol = CoreRuntime::open(CoreRuntimeConfig::new(root.join("carol")))
-        .await
-        .unwrap();
+    let carol = open(root.join("carol")).await;
+    alice.remember_loopback_peer_for_tests(&carol);
+    carol.remember_loopback_peer_for_tests(&alice);
     carol.join_workspace(&carol_invitation).await.unwrap();
     alice
         .revoke_member(workspace.id(), bob.public_identity())

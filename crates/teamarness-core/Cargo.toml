@@ -38,4 +38,8 @@ zeroize.workspace = true
 nix = { workspace = true, features = ["user"] }
 
 [dev-dependencies]
+# This crate's own integration tests are compiled out of crate, so they see the
+# published API only. `test-hooks` is how they reach the loopback binding that
+# keeps them off the public relays; it never ships in the application.
+teamarness-core = { path = ".", features = ["test-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }

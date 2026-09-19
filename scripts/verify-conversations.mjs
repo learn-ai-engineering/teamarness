@@ -6,6 +6,9 @@ const checks = [
   // staged Package Directory. The system tests below build their own Backend
   // from source and no longer depend on this step (CR-012).
   ["npm", ["run", "build:conversations"]],
+  // The hermetic run of the recovery matrix is already in `npm run check`.
+  // This is the production-relay run of the same scenario: the realistic
+  // addressing the hermetic one cannot reach (SF-002).
   [
     "cargo",
     [
@@ -15,8 +18,9 @@ const checks = [
       "--test",
       "conversations_two_profile_flow",
       "--locked",
-      "complete_two_profile_recovery_matrix",
+      "complete_two_profile_recovery_matrix_over_production_relays",
       "--",
+      "--ignored",
       "--exact",
       "--nocapture",
     ],

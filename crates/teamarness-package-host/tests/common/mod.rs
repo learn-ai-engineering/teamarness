@@ -57,11 +57,7 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
-        let core = Arc::new(
-            CoreRuntime::open(CoreRuntimeConfig::new(core_dir))
-                .await
-                .unwrap(),
-        );
+        let core = Arc::new(open_core(core_dir).await);
         core.create_workspace("Fixture Workspace").unwrap();
         let config = PackageHostConfig::new(
             &application,
@@ -168,6 +164,28 @@ pub fn write_node_package_with_capabilities(
         },
         "capabilities": capabilities
     })).unwrap()).unwrap();
+}
+
+/// Opens a real Installation whose Iroh endpoint is bound to loopback.
+///
+/// Addressing is never the behaviour a Host test is about, and these tests are
+/// compiled out of crate, so the production binding would put `cargo test
+/// --workspace` behind the public relays (SF-002). Storage, the Endpoint and
+/// Router, and the onboarding and synchronization protocols are the real ones
+/// either way; only the relay is absent.
+pub async fn open_core(directory: impl Into<PathBuf>) -> CoreRuntime {
+    CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(directory.into()))
+        .await
+        .expect("an Installation opens on its private data directory")
+}
+
+/// Teaches two loopback Installations how to reach each other.
+///
+/// Loopback endpoints publish no address anywhere, so this stands in for the
+/// relay that would otherwise carry the introduction.
+pub fn introduce(left: &CoreRuntime, right: &CoreRuntime) {
+    left.remember_loopback_peer_for_tests(right);
+    right.remember_loopback_peer_for_tests(left);
 }
 
 /// Issues one Workspace invitation, waiting out endpoint readiness.

@@ -69,7 +69,7 @@ pub(crate) struct Transport {
 #[derive(Clone, Copy)]
 enum Readiness {
     EndpointOnline(Duration),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     Immediate,
 }
 
@@ -162,7 +162,7 @@ impl Transport {
                     .await
                     .map_err(fault!(OnboardingError::Readiness))?
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             Readiness::Immediate => {}
         }
         self.lifecycle.ensure_running()?;
@@ -283,7 +283,7 @@ impl Transport {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) async fn bind_loopback_with_issuer_and_protocols(
         secret_key: SecretKey,
         readiness_timeout: Duration,
@@ -301,7 +301,7 @@ impl Transport {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     async fn bind_loopback_inner(
         secret_key: SecretKey,
         readiness_timeout: Duration,
@@ -339,12 +339,12 @@ impl Transport {
     }
 
     /// Teaches a loopback endpoint how to reach a peer it has never dialled.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn remember_peer_address(&self, address: EndpointAddr) {
         self.network.remember_peer_address(address);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn endpoint_address(&self) -> EndpointAddr {
         self.network.endpoint().bound_sockets().into_iter().fold(
             EndpointAddr::new(self.network.endpoint().id()),

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use iroh::protocol::Router;
 use iroh::{Endpoint, RelayMode};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 use iroh_base::EndpointAddr;
 use iroh_base::{PublicKey, SecretKey};
 use tokio::sync::Semaphore;
@@ -37,7 +37,7 @@ pub(crate) struct Network {
     /// addresses here instead. Production binds with `loopback_only == false`,
     /// and the endpoint holds its own clone of the lookup, so only
     /// `remember_peer_address` reads this handle.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     address_book: Option<iroh::address_lookup::memory::MemoryLookup>,
     #[cfg(test)]
     alpns: Vec<Vec<u8>>,
@@ -114,7 +114,7 @@ impl Network {
     }
 
     /// Teaches a loopback endpoint how to reach a peer it has never dialled.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn remember_peer_address(&self, address: EndpointAddr) {
         if let Some(book) = &self.address_book {
             book.add_endpoint_info(address);

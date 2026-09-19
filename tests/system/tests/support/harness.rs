@@ -421,6 +421,51 @@ pub fn object<const N: usize>(entries: [(&str, PackageValue); N]) -> PackageValu
 // Host and Core lifecycle helpers
 // ------------------------------------------------------------------
 
+/// How the Installations in a scenario find each other.
+///
+/// Both modes run the same real components — a real `CoreRuntime`, a real Iroh
+/// endpoint and Router, real SQLite — and differ only in addressing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Addressing {
+    /// Endpoints bound to `127.0.0.1` with no relay and no discovery, so the
+    /// scenario is hermetic and belongs in `npm run check`. Peers that have
+    /// never dialled each other are introduced with [`introduce`].
+    Loopback,
+    /// The production binding: `RelayMode::Default`, public relays, relay
+    /// addressing. This needs the public internet, so a test that asks for it
+    /// is `#[ignore]`d and runs under `npm run verify:conversations`.
+    ProductionRelay,
+}
+
+/// Opens one Installation on `path` under the scenario's addressing.
+pub async fn open_core(addressing: Addressing, path: &Path) -> Arc<CoreRuntime> {
+    let config = teamarness_core::CoreRuntimeConfig::new(path);
+    let core = match addressing {
+        Addressing::Loopback => CoreRuntime::open_loopback_for_tests(config).await,
+        Addressing::ProductionRelay => CoreRuntime::open(config).await,
+    };
+    Arc::new(core.expect("an Installation opens on its private data directory"))
+}
+
+/// Teaches every Installation in `peers` how to reach every other one.
+///
+/// Loopback endpoints publish no address anywhere, so this stands in for the
+/// relay. It is a no-op under [`Addressing::ProductionRelay`], where the relay
+/// does the same job. A reopened Installation binds a fresh port, so callers
+/// repeat this after every restart.
+pub fn introduce(addressing: Addressing, peers: &[&CoreRuntime]) {
+    if addressing != Addressing::Loopback {
+        return;
+    }
+    for left in peers {
+        for right in peers {
+            if left.public_identity() != right.public_identity() {
+                left.remember_loopback_peer_for_tests(right);
+            }
+        }
+    }
+}
+
 pub async fn create_invitation(
     core: &CoreRuntime,
     workspace: teamarness_core::WorkspaceId,

@@ -66,7 +66,7 @@ async fn bundled_local_and_version_restarts_preserve_reference_state_and_process
     .unwrap();
 
     let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(core_path))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(core_path))
             .await
             .unwrap(),
     );
@@ -542,7 +542,7 @@ async fn reference_fail_reaches_the_host_as_a_package_owned_error() {
     .unwrap();
 
     let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("core")))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
             .await
             .unwrap(),
     );
