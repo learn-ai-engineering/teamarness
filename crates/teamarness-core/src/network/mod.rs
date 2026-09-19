@@ -52,6 +52,25 @@ impl std::fmt::Debug for Network {
     }
 }
 
+/// The relay mode a bind really uses.
+///
+/// `loopback_only` and `relay_mode` were two independent parameters, so a
+/// caller could ask for loopback and still get `RelayMode::Default` — a
+/// "loopback" endpoint that connects to a public n0 relay. The suite was
+/// hermetic only because the one loopback caller happened to pass `Disabled`
+/// next to it, which is a convention in a sibling module rather than an
+/// invariant of this one. Loopback now means relay-free by construction,
+/// whatever the caller asked for, and
+/// `loopback_is_relay_free_whatever_the_caller_asks_for` reads the relay set
+/// this produces rather than the argument a call site passed.
+fn effective_relay_mode(relay_mode: RelayMode, loopback_only: bool) -> RelayMode {
+    if loopback_only {
+        RelayMode::Disabled
+    } else {
+        relay_mode
+    }
+}
+
 impl Network {
     /// Binds the one Endpoint and Router this Installation uses.
     ///
@@ -68,7 +87,7 @@ impl Network {
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(configured_alpns.clone())
-            .relay_mode(relay_mode);
+            .relay_mode(effective_relay_mode(relay_mode, loopback_only));
         let address_book = if loopback_only {
             let lookup = iroh::address_lookup::memory::MemoryLookup::new();
             builder = builder
@@ -245,6 +264,34 @@ mod tests {
             "a loopback endpoint keeps only the in-memory address book"
         );
         network.shutdown().await.unwrap();
+    }
+
+    /// Hermeticity is a property of `bind`, not of what its call sites pass.
+    ///
+    /// The address-lookup count alone passed unchanged while a "loopback"
+    /// endpoint was `Connected` to `usw1-1.relay.n0.iroh.link`: a relay is not
+    /// an address-lookup service, and nothing forced the two arguments to
+    /// agree. This asks for the relay set a loopback bind really uses, with the
+    /// caller asking for production relays on purpose.
+    #[test]
+    fn loopback_is_relay_free_whatever_the_caller_asks_for() {
+        assert!(
+            effective_relay_mode(RelayMode::Default, true)
+                .relay_map()
+                .is_empty(),
+            "a loopback bind reaches no relay, however it was called"
+        );
+        assert!(
+            effective_relay_mode(RelayMode::Staging, true)
+                .relay_map()
+                .is_empty()
+        );
+        assert!(
+            !effective_relay_mode(RelayMode::Default, false)
+                .relay_map()
+                .is_empty(),
+            "a production bind still reaches the relays it asked for"
+        );
     }
 
     #[tokio::test]
