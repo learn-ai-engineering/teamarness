@@ -478,36 +478,16 @@ pub fn workspace_root() -> PathBuf {
         .expect("the workspace root exists")
 }
 
-/// The Backend executable `npm run build` stages for one Package.
+/// The Conversations Backend executable under test.
 ///
-/// `CARGO_BIN_EXE_*` only exists inside the crate that declares the binary, and
-/// these tests deliberately live outside every Package crate (ARC-10). The
-/// staged application directory is what the desktop application reads too, so
-/// these tests exercise the same artifact.
-pub fn staged_backend(identity: &str) -> PathBuf {
-    let directory = workspace_root()
-        .join("target/teamarness-packages")
-        .join(identity);
-    let manifest = directory.join("teamarness.package.json");
-    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap_or_else(|error| {
-        panic!(
-            "cannot read the staged Package manifest at {}: {error}\n\
-             hint: the bundled Application Packages under target/teamarness-packages are staged by npm. \
-             Run `npm ci && npm run build` from the repository root before `cargo test -p teamarness-system-tests`.",
-            manifest.display(),
-        )
-    }))
-    .expect("the staged Package manifest is JSON");
-    let relative = manifest["backends"]
-        .as_array()
-        .and_then(|backends| {
-            backends
-                .iter()
-                .find(|backend| backend["target"] == "aarch64-apple-darwin")
-        })
-        .and_then(|backend| backend["path"].as_str())
-        .expect("the staged manifest names an aarch64-apple-darwin Backend");
-    directory.join(relative)
+/// This crate declares the Package's own `src/main.rs` as a bin target (see its
+/// `Cargo.toml`), so cargo builds that executable from current sources as a
+/// prerequisite of this test binary and `CARGO_BIN_EXE_*` names the result.
+/// Resolving a prebuilt artifact instead — `npm run build`'s staged Package
+/// Directory — meant a Backend edit was never compiled for these tests, and a
+/// Backend that could not even start still passed them (CR-012).
+pub fn backend_executable() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_conversations-backend-under-test"))
 }
 
 pub fn stage_package(root: &Path) -> PathBuf {
@@ -516,7 +496,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
     fs::create_dir_all(package.join("backend")).unwrap();
     fs::create_dir_all(package.join("ui")).unwrap();
 
-    let backend = fs::read(staged_backend(PACKAGE_ID)).unwrap();
+    let backend = fs::read(backend_executable()).unwrap();
     let backend_path =
         package.join("backend/teamarness-conversations-package-aarch64-apple-darwin");
     fs::write(&backend_path, &backend).unwrap();

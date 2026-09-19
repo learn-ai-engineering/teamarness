@@ -2,7 +2,9 @@ import { availableParallelism } from "node:os";
 import { spawnSync } from "node:child_process";
 
 const checks = [
-  // The system tests read the Backend `npm run build` stages, so stage it first.
+  // Qualify the shipped artifact: the release Backend, the UI bundle and the
+  // staged Package Directory. The system tests below build their own Backend
+  // from source and no longer depend on this step (CR-012).
   ["npm", ["run", "build:conversations"]],
   [
     "cargo",

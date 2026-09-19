@@ -6,6 +6,21 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+# The Conversations Backend these tests drive is built here, as a bin target of
+# this crate, from the Package's own `src/main.rs`. Cargo therefore rebuilds it
+# as a prerequisite of every test binary below, and `CARGO_BIN_EXE_*` hands the
+# harness a path that is current by construction. Reading a prebuilt artifact
+# instead let a Backend regression pass these tests unnoticed (CR-012). ARC-10
+# is unaffected: the dependency points from the tests to the Package, never the
+# other way, and the Package still depends only on the SDK and the protocol.
+[[bin]]
+name = "conversations-backend-under-test"
+path = "../../packages/conversations-package/backend/src/main.rs"
+
+[dependencies]
+teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
+tokio.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
