@@ -354,6 +354,55 @@ describe("Shell-side Package UI port host", () => {
     expect(test.transport.calls.filter(({ method }) => method === "acknowledgeEvents")).toEqual([]);
   });
 
+  it("drops the in-flight unsubscribe for a stream that has already completed", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
+    await settle();
+    // The documented teardown: the frame calls `subscription.close()` while the
+    // `stream_terminated` for an ordinary completion is still in its queue, so
+    // the `unsubscribe` names an entry this side has already released.
+    test.transport.terminate("s1");
+    await settle();
+    expect(test.received.at(-1)).toEqual({ kind: "stream_terminated", id: 1, error: null });
+
+    test.fromFrame({ kind: "unsubscribe", id: 1 });
+    await settle();
+    expect(test.faults).toEqual([]);
+    expect(test.transport.calls.filter(({ method }) => method === "closeSubscription")).toHaveLength(1);
+  });
+
+  it("drops the in-flight cancel for a request that has already been answered", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "request", id: 1, operation: "reference.read", payload: {} });
+    await settle();
+    // The frame's abort handler fires while the queued `response` is still
+    // unprocessed, so its `cancel` names a request this side has retired.
+    test.transport.answerRequest("r1", { ok: true });
+    await settle();
+    expect(test.received.at(-1)).toMatchObject({ kind: "response", id: 1, ok: true });
+
+    test.fromFrame({ kind: "cancel", id: 1 });
+    await settle();
+    expect(test.faults).toEqual([]);
+    expect(test.transport.calls.filter(({ method }) => method === "cancelRequest")).toEqual([]);
+  });
+
+  it("still faults the mount for a message naming an identifier it never issued", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "unsubscribe", id: 7 });
+    await settle();
+    expect(test.faults).toEqual(["protocol"]);
+
+    const requests = harness();
+    await requests.greet();
+    requests.fromFrame({ kind: "cancel", id: 7 });
+    await settle();
+    expect(requests.faults).toEqual(["protocol"]);
+  });
+
   it("caps open subscriptions at the bound the Package Host enforces per mount", () => {
     // The Host refuses the ninth subscription on one mount as `overloaded`.
     expect(MAX_OPEN_SUBSCRIPTIONS).toBe(8);

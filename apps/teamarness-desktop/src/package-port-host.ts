@@ -3,7 +3,7 @@ import type { PackageHostTransport, PackageInstanceKey } from "./package-contrac
 import {
   MAX_OPEN_SUBSCRIPTIONS,
   MAX_OPERATION_LENGTH,
-  MAX_RETIRED_SUBSCRIPTIONS,
+  MAX_RETIRED_IDS,
   MAX_PAYLOAD_BYTES,
   MAX_PENDING_REQUESTS,
   isPackageValue,
@@ -72,8 +72,14 @@ export class PackagePortHost {
 
   private readonly pending = new Map<number, PendingRequest>();
   private readonly subscriptions = new Map<number, OpenSubscription>();
-  /** Bounded, insertion-ordered tombstones for subscriptions this host retired. */
-  private readonly retiredSubscriptions = new Set<number>();
+  /**
+   * Bounded, insertion-ordered tombstones for ids this host has retired.
+   *
+   * Requests and subscriptions share one id space — `isFreeId` already treats
+   * them as one — so one set answers the same question for both: has this host
+   * served this id and stopped, or did it never issue it at all?
+   */
+  private readonly retired = new Set<number>();
 
   private resolveReady: (() => void) | null = null;
   private settleMounted: ((error?: unknown) => void) | null = null;
@@ -238,6 +244,7 @@ export class PackagePortHost {
       this.fault("protocol");
       return;
     }
+    this.retired.delete(id);
     if (!this.admits(operation, payload)) {
       this.post({ kind: "response", id, ok: false, error: this.contractViolation() });
       return;
@@ -252,7 +259,7 @@ export class PackagePortHost {
     void this.transport.request({ mount: this.mount, request: entry.request, operation, payload }).then(
       (value) => {
         if (this.disposed || entry.cancelled || this.pending.get(id) !== entry) return;
-        this.pending.delete(id);
+        this.retire(id);
         if (!isPackageValue(value)) {
           this.post({ kind: "response", id, ok: false, error: this.bridgeUnavailable() });
           return;
@@ -261,20 +268,28 @@ export class PackagePortHost {
       },
       (error: unknown) => {
         if (this.disposed || entry.cancelled || this.pending.get(id) !== entry) return;
-        this.pending.delete(id);
+        this.retire(id);
         this.post({ kind: "response", id, ok: false, error: this.envelope(error) });
       },
     );
   }
 
+  /**
+   * Abandons one in-flight request.
+   *
+   * A cancel for a request this host has retired is the normal ordering for a
+   * frame that aborts while the answer is already queued towards it. It is
+   * dropped. An id that was never issued names nothing this host ever had, and
+   * stays a fault.
+   */
   private cancelRequest(id: number): void {
     const entry = this.pending.get(id);
     if (entry === undefined) {
-      this.fault("protocol");
+      if (!this.retired.has(id)) this.fault("protocol");
       return;
     }
     entry.cancelled = true;
-    this.pending.delete(id);
+    this.retire(id);
     void this.transport.cancelRequest({ mount: this.mount, request: entry.request }).catch(() => undefined);
   }
 
@@ -299,7 +314,7 @@ export class PackagePortHost {
       closed: false,
     };
     this.subscriptions.set(id, entry);
-    this.retiredSubscriptions.delete(id);
+    this.retired.delete(id);
     void this.transport.openSubscription(
       { mount: this.mount, subscription: entry.subscription, operation, payload },
       (event) => { this.deliver(id, entry, event.mount, event.subscription, event.sequence, event.payload); },
@@ -374,7 +389,7 @@ export class PackagePortHost {
   private acknowledge(id: number, sequence: string): void {
     const entry = this.subscriptions.get(id);
     if (entry === undefined || entry.closed) {
-      if (!this.retiredSubscriptions.has(id)) this.fault("protocol");
+      if (!this.retired.has(id)) this.fault("protocol");
       return;
     }
     let value: bigint;
@@ -394,10 +409,19 @@ export class PackagePortHost {
       .catch(() => undefined);
   }
 
+  /**
+   * Ends one subscription at the frame's request.
+   *
+   * An `unsubscribe` for a subscription this host has retired is the normal
+   * ordering for the documented teardown: the frame calls `close()` while the
+   * `stream_terminated` that ended the stream is still in its queue. It is
+   * dropped, and the frame's own `close()` await is already settled. An id that
+   * was never issued stays a fault.
+   */
   private stopSubscription(id: number): void {
     const entry = this.subscriptions.get(id);
     if (entry === undefined) {
-      this.fault("protocol");
+      if (!this.retired.has(id)) this.fault("protocol");
       return;
     }
     entry.closed = true;
@@ -408,15 +432,16 @@ export class PackagePortHost {
       .finally(() => { this.post({ kind: "unsubscribed", id }); });
   }
 
-  /** Drops one subscription and remembers its id, within a bounded window. */
+  /** Drops one request or subscription and remembers its id, within a bounded window. */
   private retire(id: number): void {
+    this.pending.delete(id);
     this.subscriptions.delete(id);
-    this.retiredSubscriptions.delete(id);
-    this.retiredSubscriptions.add(id);
-    while (this.retiredSubscriptions.size > MAX_RETIRED_SUBSCRIPTIONS) {
-      const oldest = this.retiredSubscriptions.values().next();
+    this.retired.delete(id);
+    this.retired.add(id);
+    while (this.retired.size > MAX_RETIRED_IDS) {
+      const oldest = this.retired.values().next();
       if (oldest.done === true) break;
-      this.retiredSubscriptions.delete(oldest.value);
+      this.retired.delete(oldest.value);
     }
   }
 
