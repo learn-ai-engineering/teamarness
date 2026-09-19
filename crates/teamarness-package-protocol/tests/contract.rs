@@ -4,7 +4,8 @@ use serde_json::Value;
 use teamarness_package_protocol::{
     ContractState, Direction, FrameDecoder, INITIAL_STREAM_CREDIT, MAX_DECODED_FRAME_BYTES,
     MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
-    ProtocolError, ProtocolRange, ProtocolVersion, decode_frame, decode_payload, negotiate_version,
+    ProtocolError, ProtocolRange, ProtocolVersion, Verdict, decode_frame, decode_payload,
+    negotiate_version,
 };
 
 fn contract_root() -> PathBuf {
@@ -21,6 +22,13 @@ fn json_files(directory: &str, extension: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Runs one corpus sequence through the classifier.
+///
+/// An entry either retires state — `{"retire":{"request":id}}` or
+/// `{"retire":{"stream":id}}` — or carries one frame and, where the corpus
+/// declares it, the verdict that frame must receive. Without the declared
+/// verdict a sequence proves only "this is not fatal", and would pass
+/// unchanged if one implementation delivered a frame the other ignored.
 fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
     let frames = value
         .as_array()
@@ -28,6 +36,16 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
         .expect("fixture sequence");
     let mut state = ContractState::default();
     for entry in frames {
+        if let Some(retire) = entry.get("retire") {
+            if let Some(id) = retire.get("request").and_then(Value::as_str) {
+                state.retire_request(id);
+            } else if let Some(id) = retire.get("stream").and_then(Value::as_str) {
+                state.retire_stream(id);
+            } else {
+                panic!("a retire entry names a request or a stream");
+            }
+            continue;
+        }
         let direction = match entry["direction"].as_str().expect("direction") {
             "host" => Direction::HostToPackage,
             "package" => Direction::PackageToHost,
@@ -35,7 +53,15 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
         };
         let bytes = serde_json::to_vec(&entry["frame"]).expect("frame JSON");
         let frame = decode_payload(&bytes)?;
-        state.observe(direction, &frame)?;
+        let verdict = state.observe(direction, &frame)?;
+        if let Some(expected) = entry.get("verdict").and_then(Value::as_str) {
+            let expected = match expected {
+                "deliver" => Verdict::Deliver,
+                "ignore" => Verdict::Ignore,
+                other => panic!("unknown verdict {other}"),
+            };
+            assert_eq!(verdict, expected, "{}", entry["frame"]);
+        }
     }
     Ok(())
 }
@@ -43,9 +69,10 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
 #[test]
 fn consumes_every_golden_sequence() {
     let paths = json_files("golden", "jsonl");
-    assert_eq!(paths.len(), 9, "the v1 golden set is intentional");
+    assert_eq!(paths.len(), 10, "the v1 golden set is intentional");
 
     let mut kinds = BTreeSet::new();
+    let mut verdicts = 0_usize;
     for path in paths {
         let entries = fs::read_to_string(&path)
             .expect("golden fixture")
@@ -53,7 +80,19 @@ fn consumes_every_golden_sequence() {
             .map(|line| serde_json::from_str::<Value>(line).expect("fixture JSON"))
             .collect::<Vec<_>>();
         for entry in &entries {
-            kinds.insert(entry["frame"]["kind"].as_str().unwrap().to_owned());
+            let Some(kind) = entry["frame"]["kind"].as_str() else {
+                continue;
+            };
+            kinds.insert(kind.to_owned());
+            // Every frame the corpus carries declares the verdict it receives,
+            // so a line cannot quietly stop asserting one.
+            assert!(
+                entry.get("verdict").is_some(),
+                "{}: {} declares no verdict",
+                path.display(),
+                entry["frame"]
+            );
+            verdicts += 1;
         }
         observe_sequence(&Value::Array(entries))
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
@@ -81,12 +120,16 @@ fn consumes_every_golden_sequence() {
         .map(str::to_owned)
         .collect()
     );
+    assert_eq!(
+        verdicts, 44,
+        "every frame in the golden corpus declares the verdict it receives"
+    );
 }
 
 #[test]
 fn consumes_every_malformed_fixture_with_its_stable_error() {
     let paths = json_files("invalid", "json");
-    assert_eq!(paths.len(), 15, "the v1 malformed set is intentional");
+    assert_eq!(paths.len(), 17, "the v1 malformed set is intentional");
 
     for path in paths {
         let fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

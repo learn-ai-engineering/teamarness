@@ -1,2 +1,2 @@
-{"direction":"host","frame":{"kind":"request","id":"h:activate-1","operation":"lifecycle.activate","deadlineUnixMs":"9007199254740994","payload":{}}}
-{"direction":"package","frame":{"kind":"response","id":"h:activate-1","payload":{"state":"active"}}}
+{"direction":"host","frame":{"kind":"request","id":"h:activate-1","operation":"lifecycle.activate","deadlineUnixMs":"9007199254740994","payload":{}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"response","id":"h:activate-1","payload":{"state":"active"}},"verdict":"deliver"}

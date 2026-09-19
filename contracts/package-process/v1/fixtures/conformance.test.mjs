@@ -8,6 +8,14 @@ import test from "node:test";
 
 import {
   ContractState,
+  DELIVER,
+  IGNORE,
+  INITIAL_STREAM_CREDIT,
+  MAX_DECODED_FRAME_BYTES,
+  MAX_FRAME_BYTES,
+  MAX_IN_FLIGHT_EACH_DIRECTION,
+  MAX_WRITER_BYTES,
+  MAX_WRITER_FRAMES,
   ProtocolFailure,
   decodeFrame,
   encodeFrame,
@@ -24,10 +32,35 @@ async function files(directory, suffix) {
     .map((name) => join(root, directory, name));
 }
 
+/**
+ * Runs one corpus sequence through the classifier.
+ *
+ * An entry either retires state — `{"retire":{"request":id}}` or
+ * `{"retire":{"stream":id}}` — or carries one frame and the verdict that frame
+ * must receive. Without the declared verdict a sequence proves only "this is
+ * not fatal", and would pass unchanged if this implementation delivered a
+ * frame the Rust one ignored.
+ */
 function observeSequence(entries) {
   const state = new ContractState();
-  for (const { direction, frame } of entries) {
-    state.observe(direction, parsePayload(Buffer.from(JSON.stringify(frame))));
+  for (const entry of entries) {
+    if (entry.retire !== undefined) {
+      if (entry.retire.request !== undefined) state.retireRequest(entry.retire.request);
+      else if (entry.retire.stream !== undefined) state.retireStream(entry.retire.stream);
+      else assert.fail("a retire entry names a request or a stream");
+      continue;
+    }
+    const verdict = state.observe(
+      entry.direction,
+      parsePayload(Buffer.from(JSON.stringify(entry.frame))),
+    );
+    if (entry.verdict !== undefined) {
+      assert.equal(
+        verdict,
+        { deliver: DELIVER, ignore: IGNORE }[entry.verdict],
+        JSON.stringify(entry.frame),
+      );
+    }
   }
 }
 
@@ -94,22 +127,46 @@ test("Node consumes every normative schema and golden sequence", async () => {
   }
 
   const goldenPaths = await files("golden", ".jsonl");
-  assert.equal(goldenPaths.length, 9);
+  assert.equal(goldenPaths.length, 10);
   const kinds = new Set();
+  let verdicts = 0;
   for (const path of goldenPaths) {
     const entries = (await readFile(path, "utf8")).trim().split("\n").map(JSON.parse);
-    entries.forEach(({ frame }) => kinds.add(frame.kind));
+    for (const entry of entries) {
+      if (entry.frame === undefined) continue;
+      kinds.add(entry.frame.kind);
+      // Every frame the corpus carries declares the verdict it receives, so a
+      // line cannot quietly stop asserting one.
+      assert.ok(entry.verdict !== undefined, `${path}: ${JSON.stringify(entry.frame)}`);
+      verdicts += 1;
+    }
     observeSequence(entries);
   }
   assert.deepEqual([...kinds].sort(), [
     "cancel", "credit", "error", "event", "initialize", "initialized", "ping", "pong",
     "request", "response", "shutdown", "shutdown_ack", "stream_close", "stream_open",
   ]);
+  assert.equal(verdicts, 44, "every frame in the golden corpus declares the verdict it receives");
+});
+
+test("the Node constants match the contract's own limits table", async () => {
+  const readme = await readFile(join(root, "README.md"), "utf8");
+  const published = (row) => {
+    const line = readme.split("\n").find((entry) => entry.startsWith(`| ${row} |`));
+    assert.ok(line, `the limits table has no \`${row}\` row`);
+    return Number(line.split("|").at(-2).trim().replaceAll(",", ""));
+  };
+  assert.equal(published("Payload bytes per frame"), MAX_FRAME_BYTES);
+  assert.equal(published("Payload bytes per frame"), MAX_DECODED_FRAME_BYTES);
+  assert.equal(published("In-flight requests in each direction"), MAX_IN_FLIGHT_EACH_DIRECTION);
+  assert.equal(published("Queued frames per writer"), MAX_WRITER_FRAMES);
+  assert.equal(published("Queued payload bytes per writer"), MAX_WRITER_BYTES);
+  assert.equal(published("Initial event credit per stream"), INITIAL_STREAM_CREDIT);
 });
 
 test("Node consumes every malformed fixture with its stable error", async () => {
   const paths = await files("invalid", ".json");
-  assert.equal(paths.length, 15);
+  assert.equal(paths.length, 17);
   for (const path of paths) {
     const fixture = JSON.parse(await readFile(path, "utf8"));
     const actual = errorCode(() => {

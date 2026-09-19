@@ -178,13 +178,18 @@ export class ContractState {
 
   observe(direction, frame) {
     validateDirection(direction, frame);
-    if (frame.kind === "initialize" && frame.protocol?.major !== 1) {
+    if ((frame.kind === "initialize" || frame.kind === "initialized") && frame.protocol?.major !== 1) {
       throw new ProtocolFailure("incompatible_version");
     }
     if (frame.kind === "request") {
       if (this.#pending.has(frame.id) || this.#answered.has(frame.id) || this.#abandoned.has(frame.id)) {
         throw new ProtocolFailure("duplicate_id");
       }
+      let inFlight = 0;
+      for (const pendingDirection of this.#pending.values()) {
+        if (pendingDirection === direction) inFlight += 1;
+      }
+      if (inFlight >= MAX_IN_FLIGHT_EACH_DIRECTION) throw new ProtocolFailure("overloaded");
       this.#pending.set(frame.id, direction);
     } else if (frame.kind === "response" || frame.kind === "error") {
       if (this.#answered.has(frame.id)) throw new ProtocolFailure("second_terminal_response");
@@ -212,6 +217,7 @@ export class ContractState {
       if (this.#streams.has(frame.id) || this.#closedStreams.has(frame.id)) {
         throw new ProtocolFailure("duplicate_id");
       }
+      if (frame.initialCredit !== INITIAL_STREAM_CREDIT) throw new ProtocolFailure("credit_violation");
       this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n, retired: false });
     } else if (frame.kind === "event") {
       if (this.#closedStreams.has(frame.streamId)) return IGNORE;
@@ -224,6 +230,11 @@ export class ContractState {
       stream.credit -= 1;
       stream.sequence = sequence;
     } else if (frame.kind === "credit") {
+      // The per-frame range is out of contract wherever the stream stands, so
+      // it is read before the tombstone: "credit outside `1..=32` is fatal".
+      if (frame.amount < 1 || frame.amount > INITIAL_STREAM_CREDIT) {
+        throw new ProtocolFailure("credit_violation");
+      }
       // Credit released for events the receiver had already accepted is
       // ordinary in-flight traffic, even when the stream has since closed.
       if (this.#closedStreams.has(frame.streamId)) return IGNORE;
