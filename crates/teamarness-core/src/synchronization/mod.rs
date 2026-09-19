@@ -95,7 +95,6 @@ const MAX_PURPOSE: usize = 64;
 const MAX_CANONICAL: usize = 262_144;
 const MAX_OPEN_ITEMS: usize = 32;
 const MAX_OPEN_BYTES: usize = 512 * 1024;
-const MAX_PARENTS: usize = 64;
 const RECORD_ID_DOMAIN: &[u8] = b"teamarness.immutable-record-id/v1";
 const SCOPE_DOMAIN: &[u8] = b"teamarness.immutable-record-scope/v1";
 const SIGNING_DOMAIN: &str = "teamarness.immutable-record/v1";
@@ -389,14 +388,6 @@ fn validate_open_batch(items: &[Vec<u8>]) -> Result<(), ValueParseError> {
         return Err(ValueParseError::new("open batch size"));
     }
     Ok(())
-}
-
-fn validate_frontier(parent_count: usize) -> Result<(), ValueParseError> {
-    if parent_count > MAX_PARENTS {
-        Err(ValueParseError::new("causal frontier"))
-    } else {
-        Ok(())
-    }
 }
 
 fn validate_fields(package: &str, purpose: &str, canonical: &[u8]) -> Result<(), ValueParseError> {
@@ -2219,7 +2210,6 @@ mod tests {
             );
             assert!(validate_open_batch(&[]).is_err());
             assert!(validate_open_batch(&[vec![0; MAX_OPEN_BYTES + 1]]).is_err());
-            assert!(validate_frontier(MAX_PARENTS + 1).is_err());
         }
     }
 

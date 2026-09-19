@@ -945,7 +945,6 @@ impl ProtocolHandler for LogSyncHandler {
 pub(crate) mod tests {
     use super::*;
 
-    use p2panda_sync::protocols::LogSyncEvent;
     use std::sync::Mutex as StdMutex;
 
     /// A scripted Core seam. It exists only to inject a rejection: everything
@@ -1055,13 +1054,6 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|operation| self.receive_operation(peer, workspace, package, operation))
                 .collect()
-        }
-    }
-
-    pub(crate) fn received(operation: Operation<()>) -> LogSyncEvent<()> {
-        LogSyncEvent::OperationReceived {
-            operation: Box::new(operation),
-            metrics: p2panda_sync::protocols::LogSyncMetrics::default(),
         }
     }
 

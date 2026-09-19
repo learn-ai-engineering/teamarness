@@ -2,11 +2,15 @@
 //!
 //! # Dependency boundary
 //!
-//! Iroh endpoint and ticket crates are isolated behind the private onboarding
-//! boundary. `p2panda-auth` and `p2panda-core` are isolated behind the private
-//! membership adapter, and `rusqlite` is isolated behind private storage
-//! modules. Canonical membership bytes do not depend on serde-derived p2panda
-//! representations.
+//! Iroh types appear in the private `network`, `onboarding`, `membership_sync`
+//! and `synchronization` modules, and in `runtime` internals. The p2panda
+//! crates are used by `membership` and `synchronization`. `rusqlite` stays
+//! behind `storage` and the private `RuntimeState`. The two Ed25519 stacks
+//! those dependencies carry meet only in `synchronization::key_bridge`.
+//!
+//! No dependency type appears in a public signature, which
+//! `tests/public_api.rs` enforces with compile-fail fixtures. Canonical
+//! membership bytes do not depend on serde-derived p2panda representations.
 //!
 //! # Visibility boundary
 //!
@@ -22,22 +26,16 @@ mod blocking;
 mod error;
 mod runtime;
 
-// These boundaries are intentionally private. Later phases deepen them without
-// changing which implementation details callers can name.
+// These boundaries are intentionally private: nothing outside the crate can
+// name what is behind them.
 mod identity;
-// These authenticated private values are constructed by the workspace and
-// redemption workflows in later phases.
-#[allow(dead_code)]
 mod invitation;
 mod membership;
 mod membership_sync;
-#[allow(dead_code)]
 mod network;
-#[allow(dead_code)]
 mod onboarding;
 mod storage;
 mod subscription;
-#[allow(dead_code)]
 mod synchronization;
 mod workspace;
 

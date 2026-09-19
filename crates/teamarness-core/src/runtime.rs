@@ -604,6 +604,9 @@ pub struct CoreRuntime {
     clock: Arc<dyn Clock>,
     transport: Arc<crate::onboarding::transport::Transport>,
     sync_worker: Arc<crate::synchronization::SyncWorker>,
+    /// The worker owns the demand it acts on; this handle exists so a test that
+    /// drives a session by hand builds a receiver with the same demand.
+    #[cfg_attr(not(test), allow(dead_code))]
     membership_demand: Arc<crate::membership_sync::MembershipDemand>,
     /// What recent sessions said about reaching each peer, per scope.
     health: Arc<crate::synchronization::SyncHealthRegistry>,
@@ -1284,7 +1287,10 @@ impl CoreRuntime {
     /// This verifies only version-1 structure, content identity, admission proof, and signatures.
     /// Trust anchoring, dependency resolution, timestamp policy, and authorization remain part of
     /// durable workspace processing.
-    pub fn authenticate_membership_operation(
+    /// Verifies a canonical membership envelope without a runtime. The
+    /// canonical format's own tests are its only callers.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn authenticate_membership_operation(
         canonical_envelope: &[u8],
     ) -> Result<MembershipOperationId, MembershipError> {
         crate::membership::authenticate(canonical_envelope).map(|envelope| envelope.id)
@@ -2299,55 +2305,6 @@ impl CoreRuntime {
             .entry(workspace_id)
             .or_insert_with(|| tokio::sync::watch::Sender::new(epoch))
             .subscribe())
-    }
-
-    /// Reconciles the locally accepted immutable records with a current peer.
-    ///
-    /// The network operation is finite and bounded. The runtime releases its
-    /// local state lock before dialing, so replication never blocks local
-    /// commands on network I/O.
-    pub async fn replicate_records_to(
-        &self,
-        workspace_id: WorkspaceId,
-        package_identity: &str,
-        peer: PublicIdentity,
-    ) -> Result<usize, crate::SynchronizationError> {
-        {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
-            if state.poisoned {
-                return Err(crate::SynchronizationError::RuntimeUnavailable);
-            }
-            let current = state
-                .memberships
-                .get(&workspace_id)
-                .is_some_and(|projection| projection.contains_member(self.public_identity));
-            if !current {
-                return Err(crate::SynchronizationError::NotCurrentMember);
-            }
-        }
-        let receiver: Arc<dyn crate::synchronization::SyncReceiver> =
-            Arc::new(RuntimeSyncReceiver {
-                state: Arc::downgrade(&self.state),
-                clock: Arc::clone(&self.clock),
-                demand: Arc::clone(&self.membership_demand),
-                health: Arc::clone(&self.health),
-            });
-        let address = iroh_base::EndpointAddr::new(peer.as_public_key());
-        let accepted = self
-            .transport
-            .send_log_sync(
-                address,
-                receiver,
-                workspace_id,
-                package_identity.to_owned(),
-                peer,
-            )
-            .await
-            .map_err(map_log_session_error)?;
-        Ok(accepted.outcomes.applied)
     }
 
     /// Runs one outbound session, retrying while the peer is already running
@@ -3965,25 +3922,6 @@ pub(crate) fn respond_to_join(
             }
             Err(map_invitation_onboarding_error(error))
         }
-    }
-}
-
-/// Reports a refused package synchronization session as the capability error
-/// the caller can act on, instead of as a generic unavailability.
-fn map_log_session_error(
-    error: crate::synchronization::LogSessionError,
-) -> crate::SynchronizationError {
-    match error {
-        crate::synchronization::LogSessionError::Refused(
-            crate::synchronization::Refusal::NotAuthorized,
-        )
-        | crate::synchronization::LogSessionError::LocalNotAuthorized => {
-            crate::SynchronizationError::NotCurrentMember
-        }
-        crate::synchronization::LogSessionError::Refused(
-            crate::synchronization::Refusal::KeyMismatch,
-        ) => crate::SynchronizationError::WrongScope,
-        _ => crate::SynchronizationError::RuntimeUnavailable,
     }
 }
 

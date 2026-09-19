@@ -152,17 +152,6 @@ impl ScopeHead {
         self.watch.subscribe()
     }
 
-    pub(crate) fn state(&self) -> HeadState {
-        self.state.lock().map_or(
-            HeadState {
-                sequence: 0,
-                scope_exists: false,
-                revision: 0,
-            },
-            |guard| *guard,
-        )
-    }
-
     /// Blocks until the head differs from `seen` or `timeout` elapses.
     fn wait_until_changed(&self, seen: HeadState, timeout: Duration) {
         let Ok(guard) = self.state.lock() else {

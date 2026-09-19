@@ -211,19 +211,6 @@ pub(crate) fn insert_remote(
     Ok(*operation_id)
 }
 
-pub(crate) fn queue_recovery(
-    tx: &Transaction<'_>,
-    teamarness_operation_id: RecordId,
-) -> Result<(), StorageError> {
-    tx.execute(
-        "INSERT OR IGNORE INTO p2panda_projection_recovery
-         (teamarness_operation_id, reason) VALUES (?1, 'missing_author_key')",
-        [teamarness_operation_id.as_bytes().as_slice()],
-    )
-    .map(|_| ())
-    .map_err(|_| StorageError::Database)
-}
-
 pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<(), StorageError> {
     connection
         .execute_batch(

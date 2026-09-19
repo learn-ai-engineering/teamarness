@@ -43,6 +43,7 @@ pub(crate) struct VerifiedInvitationClaim {
 
 impl InvitationToken {
     /// Returns the token's transport-safe lowercase hexadecimal form.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn encoded(&self) -> &str {
         &self.0
@@ -69,6 +70,7 @@ impl FromStr for InvitationToken {
 
 impl InvitationClaim {
     /// Returns the claim's transport-safe lowercase hexadecimal form.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn encoded(&self) -> &str {
         &self.0

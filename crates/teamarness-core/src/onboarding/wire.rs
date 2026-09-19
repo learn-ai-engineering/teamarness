@@ -67,6 +67,9 @@ pub(super) fn decode_request(frame: &[u8]) -> Result<JoinRequest, CodecError> {
     Ok(JoinRequest { claim })
 }
 
+/// Encodes with the production limits. The wire tests exercise the limits
+/// themselves through `encode_success_with_limits`, so only they call this.
+#[cfg(test)]
 pub(crate) fn encode_success(response: &SuccessResponse) -> Result<Vec<u8>, CodecError> {
     encode_success_with_limits(response, MAX_RESPONSE_BODY_BYTES, MAX_OPERATIONS)
 }

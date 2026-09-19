@@ -412,6 +412,7 @@ impl SchedulerCore {
             .min()
     }
 
+    #[cfg(test)]
     pub(crate) const fn in_flight(&self) -> usize {
         self.in_flight
     }
@@ -453,6 +454,7 @@ pub(crate) fn production_jitter(delay: Duration) -> Duration {
 }
 
 /// The same delay every time, so a test asserts a deadline rather than a range.
+#[cfg(test)]
 pub(crate) const fn no_jitter(delay: Duration) -> Duration {
     delay
 }

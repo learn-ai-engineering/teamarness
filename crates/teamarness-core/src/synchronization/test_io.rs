@@ -262,13 +262,6 @@ impl RecordingReceiver {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
-
-    pub(crate) fn rows_loaded(&self) -> usize {
-        *self
-            .rows_loaded
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
 }
 
 impl SyncReceiver for RecordingReceiver {
@@ -370,56 +363,5 @@ impl SyncReceiver for RecordingReceiver {
         _operation: Operation<()>,
     ) -> Result<OperationOutcome, FatalSyncError> {
         Ok(OperationOutcome::Applied)
-    }
-}
-
-/// A writer that stops accepting bytes after `remaining`, without waking.
-///
-/// It stands in for a peer that has stopped reading, so a test can observe
-/// transport backpressure rather than a growing buffer.
-pub(crate) struct StallAfter<W> {
-    inner: W,
-    remaining: usize,
-}
-
-impl<W> StallAfter<W> {
-    pub(crate) fn new(inner: W, remaining: usize) -> Self {
-        Self { inner, remaining }
-    }
-}
-
-impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for StallAfter<W> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-        buffer: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        if this.remaining == 0 {
-            // No waker is stored: the writer never makes progress again.
-            return std::task::Poll::Pending;
-        }
-        let take = buffer.len().min(this.remaining);
-        match std::pin::Pin::new(&mut this.inner).poll_write(context, &buffer[..take]) {
-            std::task::Poll::Ready(Ok(written)) => {
-                this.remaining -= written;
-                std::task::Poll::Ready(Ok(written))
-            }
-            other => other,
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
     }
 }

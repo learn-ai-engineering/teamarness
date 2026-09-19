@@ -19,7 +19,6 @@ pub(crate) enum RecordFault {
     Decode,
     OrderKey,
     Open,
-    Projection,
 }
 
 impl RecordFault {
@@ -28,7 +27,6 @@ impl RecordFault {
             Self::Decode => "decode",
             Self::OrderKey => "order_key",
             Self::Open => "open",
-            Self::Projection => "projection",
         }
     }
 }
@@ -106,21 +104,6 @@ pub(crate) fn is_scope_quarantined(
         .query_row(
             "SELECT 1 FROM quarantined_scopes WHERE scope_id=?1",
             [scope.as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|found| found.is_some())
-        .map_err(|_| super::storage_error())
-}
-
-pub(crate) fn is_record_quarantined(
-    connection: &rusqlite::Connection,
-    record_id: [u8; 32],
-) -> Result<bool, SynchronizationError> {
-    connection
-        .query_row(
-            "SELECT 1 FROM quarantined_records WHERE record_id=?1",
-            [record_id.as_slice()],
             |_| Ok(()),
         )
         .optional()

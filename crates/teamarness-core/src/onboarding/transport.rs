@@ -332,24 +332,6 @@ impl Transport {
     }
 
     #[cfg(test)]
-    pub(crate) async fn bind_loopback_with_issuer(
-        secret_key: SecretKey,
-        readiness_timeout: Duration,
-        ready_immediately: bool,
-        issuer: IssuerService,
-    ) -> Result<Arc<Self>, OnboardingError> {
-        Self::bind_loopback_inner(
-            secret_key,
-            readiness_timeout,
-            ready_immediately,
-            Some(issuer),
-            None,
-            Vec::new(),
-        )
-        .await
-    }
-
-    #[cfg(test)]
     pub(crate) async fn bind_loopback_with_issuer_and_services(
         secret_key: SecretKey,
         readiness_timeout: Duration,

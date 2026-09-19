@@ -119,7 +119,10 @@ pub(crate) struct Network {
     outbound_extra: Arc<Semaphore>,
     services: SyncServices,
     /// Loopback runtimes have no relay and no discovery, so tests register peer
-    /// addresses here instead. Production binds with `loopback_only == false`.
+    /// addresses here instead. Production binds with `loopback_only == false`,
+    /// and the endpoint holds its own clone of the lookup, so only
+    /// `remember_peer_address` reads this handle.
+    #[cfg_attr(not(test), allow(dead_code))]
     address_book: Option<iroh::address_lookup::memory::MemoryLookup>,
     #[cfg(test)]
     log_sync: Arc<LogSyncHandler>,
