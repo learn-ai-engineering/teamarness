@@ -96,6 +96,7 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`).
 - Collaborative planning documents (vision success criterion 4).
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
+- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
 
 ## Not planned
 

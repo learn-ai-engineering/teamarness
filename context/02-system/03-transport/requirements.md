@@ -14,7 +14,7 @@ The system SHALL use Iroh's default public relays (`RelayMode::Default`) for NAT
 
 ## TEAM.SYS.TRANS-R03 — Package Transport Access
 
-Packages SHALL access Teamarness-owned peer transport through versioned, typed Semantic Capabilities. The generic immutable-record capability SHALL use finite production LogSync sessions over a Core-owned durable operation projection, with continuation recorded as durable wakes. Invalid or out-of-order operations SHALL be isolated without partially committing Teamarness records. The Core Runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, relay configuration, P2Panda types, or SQLite handles to Packages. A future custom-transport capability MAY provide a Package-scoped escape hatch without exposing those resources.
+Packages SHALL access Teamarness-owned peer transport through versioned, typed Semantic Capabilities. The generic immutable-record capability SHALL use finite production LogSync sessions over a Core-owned durable operation projection, with continuation recorded as durable wakes. Invalid or out-of-order operations SHALL be isolated without partially committing Teamarness records. The Core Runtime SHALL NOT expose raw `Endpoint` handles, `SecretKey` material, relay configuration, P2Panda types, or SQLite handles to Packages through any Teamarness contract (see PKG-R11). A future custom-transport capability MAY provide a Package-scoped escape hatch without exposing those resources.
 
 ## TEAM.SYS.TRANS-R04 — Copyable Workspace Invitation
 

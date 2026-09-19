@@ -18,6 +18,8 @@ Create this file under the selected application data directory:
 
 Named development profiles use `.teamarness-dev/<profile>` as `<app-data>`. An expert `--data-dir` launch uses the absolute directory supplied to that option. Ordinary packaged launches use the platform application-data directory selected by Tauri.
 
+Start Teamarness once with that data directory before writing the file. The Core Runtime refuses a data directory that holds unrelated files (`TEAM.SYS.ID-R07`, ADR 0017), so it must be one Teamarness has already created.
+
 The registration file must be a regular, non-symlink file owned by the current user. On macOS, make its parent private and the file owner-only:
 
 ```sh

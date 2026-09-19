@@ -19,7 +19,7 @@ The data directory was accepted on trust. `prepare_private_directory` created an
 
 Each Content Key was stored twice: once in `sync_scopes.content_key`, and again in `protection_state.state_bytes` behind a `teamarness.secret-bundle/v1` prefix that no code ever read.
 
-Requirement text also overstated the guarantee. ID-R01 said the private key "SHALL never leave the runtime", and two code comments claimed that the protection projection contains no plaintext content key. Neither was true.
+Requirement text also overstated the guarantee: ID-R01 claimed the private key was confined to the runtime, and two code comments claimed that the protection projection holds no plaintext content key. Neither was true.
 
 ## Decision
 

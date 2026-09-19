@@ -46,4 +46,4 @@ A Synchronization Capability SHALL provide generic, versioned, Package-scoped re
 
 ## TEAM.SYS.PKG-R11 — Native Trust Limits
 
-A trusted Package Process MAY use ordinary native filesystem and network access under the current user's authority. Teamarness SHALL identify installation-local Packages and SHALL NOT describe process separation as a sandbox. Teamarness-owned identity, canonical membership, signing, and Iroh transport SHALL remain available only through Semantic Capabilities.
+A trusted Package Process MAY use ordinary native filesystem and network access under the current user's authority. Teamarness SHALL identify installation-local Packages and SHALL NOT describe process separation as a sandbox. Teamarness-owned identity, canonical membership, signing, and Iroh transport SHALL remain available only through Semantic Capabilities. Because trusted Package Processes run with the user's authority, they can read the Core Runtime's private data directory, including the Installation secret, Content Keys, and Package Registrations. The Semantic Capability boundary is a supported-contract boundary, not a confidentiality boundary against trusted Package code.
