@@ -1249,14 +1249,16 @@ impl ProcessClient {
 
     /// Releases credit for events the subscriber has acknowledged.
     ///
+    /// The amount is the acknowledged delta and nothing else. Clamping it here
+    /// would put a frame on the wire that says something the Host did not
+    /// account for; the classifier reads the frame the adapter asked for and
+    /// fails the generation if the Host ever asks for one out of contract.
+    ///
     /// A stream that ended while the acknowledgement was in flight makes this
-    /// frame late, not wrong: the writer's classifier drops it.
+    /// frame late, not wrong: the writer's classifier ignores it.
     pub(crate) async fn credit(&self, stream_id: &str, amount: u64) -> Result<(), WireFailure> {
         self.writer
-            .control(json!({
-                "kind":"credit", "streamId":stream_id,
-                "amount":amount.min(INITIAL_STREAM_CREDIT as u64)
-            }))
+            .control(json!({"kind":"credit", "streamId":stream_id, "amount":amount}))
             .await
     }
 
