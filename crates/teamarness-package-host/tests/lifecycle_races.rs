@@ -77,6 +77,18 @@ impl FakePackage {
         }
     }
 
+    /// Reads one chunk without completing a frame.
+    ///
+    /// The first byte of a frame the pipe cannot hold proves the Host's writer
+    /// is inside `write_all` and will stay there until this end drains the
+    /// rest, which is how a test holds the writer still without a sleep.
+    async fn read_one_chunk(&mut self) {
+        let mut chunk = [0_u8; 4096];
+        let read = self.stream.read(&mut chunk).await.expect("read");
+        assert!(read > 0, "the Host closed the pipe");
+        self.buffer.extend_from_slice(&chunk[..read]);
+    }
+
     async fn next_frame(&mut self) -> Frame {
         loop {
             if self.buffer.len() >= 4 {
@@ -345,6 +357,74 @@ async fn a_cancel_that_races_its_answer_does_not_kill_the_writer() {
     client.cancel("h:one").await.expect("cancel queued");
     package.round_trip("p:probe-cancel").await;
     assert_eq!(client.failure(), None);
+}
+
+/// CR2-001: a `response` that crossed the Host's own `cancel` is ignored.
+///
+/// The Host stops waiting for the request inside `cancel`, so the request is
+/// retired there. Retiring only when the writer observes the queued `cancel`
+/// leaves a window — one the writer holds open for as long as it is blocked on
+/// a slow pipe — in which the answer names a request the classifier still
+/// calls live and the adapter has already forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_that_crossed_the_hosts_cancel_leaves_the_generation_alive() {
+    // A pipe far smaller than the second request, so the writer blocks inside
+    // `write_all` with the `cancel` still queued behind it.
+    let (client, mut package) = connect(Arc::new(ClosingStream), 1024);
+    let cancelled = client.clone();
+    let first = tokio::spawn(async move {
+        cancelled
+            .request(
+                "h:one".to_owned(),
+                "ui.read",
+                None,
+                PackageValue::Object(Default::default()),
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+    });
+    package.read_until(FrameKind::Request).await;
+
+    let blocked = client.clone();
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert(
+        "canonical".to_owned(),
+        PackageValue::String("A".repeat(256 * 1024)),
+    );
+    let held = tokio::spawn(async move {
+        blocked
+            .request(
+                "h:two".to_owned(),
+                "ui.read",
+                None,
+                PackageValue::Object(payload),
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+    });
+    // One chunk of the oversized request: the writer is now inside `write_all`
+    // and cannot reach the `cancel` queued behind it.
+    package.read_one_chunk().await;
+
+    client.cancel("h:one").await.expect("cancel queued");
+    package
+        .send(json!({"kind":"response","id":"h:one","payload":{}}))
+        .await;
+    assert_eq!(
+        first.await.expect("join").expect_err("cancelled").code,
+        PackageErrorCode::Cancelled
+    );
+
+    // Draining the pipe releases the writer; the probe proves the reader, the
+    // handler and the writer all survived the answer that crossed the cancel.
+    // A reader that failed the generation never answers it.
+    tokio::time::timeout(Duration::from_secs(10), package.round_trip("p:probe-crossing"))
+        .await
+        .expect("the generation still answers after the crossing response");
+    assert_eq!(client.failure(), None);
+    held.abort();
 }
 
 /// CR-004: every in-flight capability call the contract permits is answered,

@@ -1106,11 +1106,12 @@ impl ProcessClient {
                 match tokio::time::timeout(Duration::from_millis(500), &mut receiver).await {
                     Ok(Ok(result)) => result,
                     _ => {
-                        self.pending.lock().await.remove(&id);
-                        // The `cancel` already entered the tombstone when the
-                        // writer observed it; this covers the case where the
-                        // grace expired before it was written.
+                        // Retire before the adapter entry goes, in that order
+                        // and for the same reason as `cancel`: between the two
+                        // the classifier and the adapter must never disagree
+                        // about whether this request is still live.
                         self.state.lock().await.retire_request(&id);
+                        self.pending.lock().await.remove(&id);
                         let mut failure = WireFailure::new(if state_changing {
                             PackageErrorCode::OutcomeUncertain
                         } else {
@@ -1131,6 +1132,13 @@ impl ProcessClient {
     /// fatal. A repeated cancel, or one for a request the answer already
     /// retired, is ignored by the same classifier when the writer observes it.
     pub(crate) async fn cancel(&self, target: &str) -> Result<(), WireFailure> {
+        // Retire in the classifier before the adapter forgets the request. The
+        // `cancel` frame is only queued here, and the writer may be blocked on
+        // a slow pipe for as long as it takes to drain one; until it observes
+        // the frame the classifier still calls the request live, so an answer
+        // arriving in that window would be delivered to an adapter that no
+        // longer holds it and read as a violation.
+        self.state.lock().await.retire_request(target);
         let removed = self.pending.lock().await.remove(target);
         if let Some(sender) = removed {
             let _ = sender.send(Err(WireFailure::new(PackageErrorCode::Cancelled)));
