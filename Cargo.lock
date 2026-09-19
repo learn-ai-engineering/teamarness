@@ -7671,7 +7671,6 @@ name = "teamarness-repo-aware-package"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "futures",
  "gix",
  "serde",
  "serde_json",

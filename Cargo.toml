@@ -21,6 +21,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 getrandom = { version = "=0.4.3", features = ["std"] }
+gix = { version = "=0.87.1", default-features = false, features = ["status", "sha1", "sha256", "parallel"] }
 iroh = "=1.2.0"
 iroh-base = { version = "=1.2.0", default-features = false, features = ["key"] }
 iroh-tickets = "=1.0.0"
