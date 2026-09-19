@@ -558,7 +558,7 @@ mod tests {
             let existing = before.instances[0].clone();
             core.create_workspace("Second Workspace").unwrap();
             host.execute(PackageHostCommand::ReconcileWorkspaces(
-                teamarness_package_host::ReconcileWorkspaces { workspaces: vec![] },
+                teamarness_package_host::ReconcileWorkspaces {},
             ))
             .await
             .unwrap();

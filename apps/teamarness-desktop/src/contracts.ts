@@ -46,6 +46,7 @@ export type BridgeErrorCode =
   | "local_conflict"
   | "admission_no_longer_current"
   | "uncertain_storage_outcome"
+  | "package_reconciliation"
   | "shutdown";
 
 export type BridgeError = Readonly<{

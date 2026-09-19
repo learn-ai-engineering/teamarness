@@ -87,3 +87,21 @@ Design uncertainties that need resolution before or during implementation. Each 
 **Direction (2026-09-17, developer):** Teams using Teamarness know each other, so each person gives a single name field (typically a first name, with no surname) when creating or joining a Workspace, and every other Member sees that name. Generated adjective-animal aliases are temporary and will be removed. Ownership, signing, rename, conflict, and fallback rules remain to be designed.
 
 **Intended destination:** The Shell and Package UI polish workstream (`ui-polish-member-names`) resolves this for one Installation per person. Phase 5 extends it to multiple devices.
+
+---
+
+## TEAM-DQ9 - Package Instance lifecycle on Workspace leave or local revocation
+
+**Status:** open.
+
+**Blocks:** Roadmap Phase 5 (Membership Management), which introduces Workspace leave and member removal.
+
+**Question:** When the local Installation leaves a Workspace or is revoked from it, does the Package Host suspend that Workspace's Package Instances, dispose them, or retain them and their Package Data Directories?
+
+**Current state:** `ReconcileWorkspaces` activates every admitted Package for every Workspace the Core Runtime lists, and never disposes an Instance. Nothing tells the Package Host that a Workspace has gone away, so a left or revoked Workspace keeps its Backends running until the application stops.
+
+**Options:** the Package Host subscribes to a Core Runtime workspace-set or local-membership stream through a narrow port trait (ARC-06), or the Shell drives suspension and disposal as part of the leave command it already issues.
+
+**Note:** the Core Runtime already gates every capability call on current membership, so this is a lifecycle and resource question, not an authorization one. A revoked Installation's Packages cannot read or write Workspace data; they merely keep running.
+
+**Owner:** roadmap Phase 5.

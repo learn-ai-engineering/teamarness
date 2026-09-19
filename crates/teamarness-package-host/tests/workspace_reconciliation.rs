@@ -29,7 +29,7 @@ async fn reconciliation_eagerly_activates_the_package_workspace_product() {
     fixture.core.create_workspace("Second Workspace").unwrap();
     let outcome = host
         .execute(PackageHostCommand::ReconcileWorkspaces(
-            ReconcileWorkspaces { workspaces: vec![] },
+            ReconcileWorkspaces {},
         ))
         .await
         .unwrap();

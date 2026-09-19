@@ -136,12 +136,10 @@ async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
         .package_host()
         .map_err(|_| BridgeError::shutdown())?
         .execute(PackageHostCommand::ReconcileWorkspaces(
-            ReconcileWorkspaces {
-                workspaces: Vec::new(),
-            },
+            ReconcileWorkspaces {},
         ))
         .await
-        .map_err(|_| BridgeError::shutdown())?;
+        .map_err(|error| BridgeError::reconcile(&error))?;
     Ok(())
 }
 

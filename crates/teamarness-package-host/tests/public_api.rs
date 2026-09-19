@@ -41,7 +41,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
     let subscription = teamarness_package_host::UiSubscriptionId::new("subscription-1").unwrap();
 
     let commands = vec![
-        PackageHostCommand::ReconcileWorkspaces(ReconcileWorkspaces { workspaces: vec![] }),
+        PackageHostCommand::ReconcileWorkspaces(ReconcileWorkspaces {}),
         PackageHostCommand::Suspend(SuspendPackage {
             instance: instance.clone(),
         }),

@@ -8,11 +8,11 @@ use crate::values::{
     WorkspaceId,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Activates every admitted Package for every Workspace Core lists. Never disposes
+/// instances; see open question `TEAM-DQ9`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReconcileWorkspaces {
-    pub workspaces: Vec<WorkspaceId>,
-}
+pub struct ReconcileWorkspaces {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuspendPackage {
     pub instance: PackageInstanceKey,

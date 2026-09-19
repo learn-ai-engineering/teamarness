@@ -527,7 +527,7 @@ async fn rejects_cross_workspace_cross_installation_and_stale_generation_grants(
 
     fixture.core.create_workspace("Second Workspace").unwrap();
     host.execute(PackageHostCommand::ReconcileWorkspaces(
-        ReconcileWorkspaces { workspaces: vec![] },
+        ReconcileWorkspaces {},
     ))
     .await
     .unwrap();
