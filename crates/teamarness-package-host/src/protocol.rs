@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use teamarness_package_protocol::{
     ContractState, Direction, Frame, FrameKind, INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES,
-    MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, Verdict, decode_frame, encode_frame,
+    MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES, Verdict, decode_frame,
+    encode_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -34,24 +35,41 @@ const CONTROL_RESERVE: usize = 3 + 3 * MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 
 /// Slots on the control lane.
 ///
-/// Every one of the in-flight capability answers the contract permits the
-/// Package travels here, and the reserved lifecycle traffic shares the lane. A
-/// lane shallower than the contract's own concurrency turns legal traffic into
-/// a refused frame, which the caller then reports as the process having exited.
-const CONTROL_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION + CONTROL_RESERVE;
+/// The two lanes share the one writer budget the contract publishes and the
+/// handshake transmits, so their depths are a split of `MAX_WRITER_FRAMES`,
+/// exactly as their byte budgets are a split of `MAX_WRITER_BYTES`. The
+/// control lane takes the reserve: those are the frames a refusing send
+/// queues, and a lane shallower than them turns legal traffic into a refused
+/// frame. A capability answer needs no slot of its own here — it waits for
+/// one, because the task that writes it owns its work.
+const CONTROL_QUEUE: usize = CONTROL_RESERVE;
 
-/// Slots on the data lane.
+/// Slots on the data lane: the rest of the writer's published frame budget.
 ///
-/// The Host's own in-flight requests travel here, each with the one `cancel`
-/// that may follow it, plus the events of Host-owned capability streams.
-const DATA_QUEUE: usize = 2 * MAX_IN_FLIGHT_EACH_DIRECTION;
+/// Worst case: every in-flight request the contract permits, queued at once.
+/// The one `cancel` that may follow a request is sent after that request's
+/// deadline expires, by which time its frame has left the lane.
+const DATA_QUEUE: usize = MAX_WRITER_FRAMES - CONTROL_QUEUE;
 
-/// The control lane's byte budget: two contract-maximum frames, so one maximum
-/// answer never waits on another that is already queued.
+/// The control lane's shared byte budget: two contract-maximum frames, so one
+/// maximum answer never waits on another that is already queued.
 const CONTROL_BYTES: usize = 2 * MAX_FRAME_BYTES;
 
+/// One typed terminal error frame: `error`, an id of the contract's maximum
+/// 128 bytes, a stable code, `retryable`, and an empty details object.
+/// `an_overloaded_answer_fits_its_reserve` is the floor.
+const TERMINAL_ERROR_BYTES: usize = 256;
+
+/// Control-lane bytes only a request's typed terminal answer may use.
+///
+/// Rule 1's third verdict has to be deliverable under exactly the saturation
+/// that produces it. An `overloaded` answer that competed for the budget whose
+/// exhaustion triggered it would be refused precisely when it is owed, so one
+/// frame is reserved for each in-flight request the contract permits.
+const TERMINAL_RESERVE_BYTES: usize = MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES;
+
 /// The data lane keeps the rest of the writer budget the contract publishes.
-pub(crate) const DATA_BYTES: usize = MAX_WRITER_BYTES - CONTROL_BYTES;
+pub(crate) const DATA_BYTES: usize = MAX_WRITER_BYTES - CONTROL_BYTES - TERMINAL_RESERVE_BYTES;
 
 pub(crate) struct UiEvent {
     pub(crate) sequence: u64,
@@ -311,6 +329,7 @@ struct Writer {
     data: mpsc::Sender<QueuedFrame>,
     control_bytes: Arc<Semaphore>,
     data_bytes: Arc<Semaphore>,
+    terminal_bytes: Arc<Semaphore>,
 }
 
 /// The writing half of one Host-owned capability stream.
@@ -408,6 +427,35 @@ impl Writer {
                 WireFailure::new(PackageErrorCode::ProcessExited)
             }
         })
+    }
+
+    /// Queues one request's typed terminal error on its own reserve.
+    ///
+    /// The shared control budget is what the answer this replaces could not
+    /// get, so this frame never asks for it. The reserve holds one such frame
+    /// for every in-flight request the contract permits, which is the most
+    /// that can be owed at once.
+    async fn send_terminal_error(&self, value: Value) -> Result<(), WireFailure> {
+        let frame =
+            Frame::try_from(value).map_err(|error| WireFailure::new(protocol_code(error)))?;
+        let size = encode_frame(&frame)
+            .map_err(|error| WireFailure::new(protocol_code(error)))?
+            .len();
+        let permits =
+            u32::try_from(size).map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        let permit = self
+            .terminal_bytes
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))?;
+        self.control
+            .send(QueuedFrame {
+                frame,
+                _bytes: permit,
+            })
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))
     }
 
     /// Queues a frame, waiting for lane capacity instead of refusing it.
@@ -592,6 +640,7 @@ where
         data: data_tx,
         control_bytes: Arc::new(Semaphore::new(CONTROL_BYTES)),
         data_bytes: Arc::new(Semaphore::new(DATA_BYTES)),
+        terminal_bytes: Arc::new(Semaphore::new(TERMINAL_RESERVE_BYTES)),
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let ui_event_routes = Arc::new(Mutex::new(BTreeMap::new()));
@@ -875,7 +924,15 @@ async fn reader_task<R>(
                                 "kind":"error", "id":answered, "code":"overloaded",
                                 "retryable":true, "details":{}
                             });
-                            if writer.control(overloaded).await.is_err() {
+                            // The typed error is still this request's one
+                            // terminal frame, so it is owed. It goes on the
+                            // reserve rather than on the budget the answer it
+                            // replaces could not get: a refusing send, or a
+                            // second wait for the same exhausted budget, drops
+                            // the answer under exactly the saturation that
+                            // produced it, which is the outcome this whole
+                            // path exists to replace.
+                            if writer.send_terminal_error(overloaded).await.is_err() {
                                 let _ = failure.send(Some(PackageErrorCode::ProcessExited));
                             }
                         } else {
@@ -1279,7 +1336,8 @@ fn empty_object() -> Value {
 mod tests {
     use super::{
         CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE, StreamEnd,
-        UI_EVENT_CAPACITY, package_owned_error, stream_end,
+        TERMINAL_ERROR_BYTES, TERMINAL_RESERVE_BYTES, UI_EVENT_CAPACITY, package_owned_error,
+        stream_end,
     };
     use crate::PackageErrorCode;
     use serde_json::{Value, json};
@@ -1288,23 +1346,44 @@ mod tests {
         MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
     };
 
-    /// Every writer bound admits the worst case the contract permits.
+    /// Every writer bound admits the worst case the contract permits, and the
+    /// two lanes together stay inside the one budget the handshake publishes.
     ///
-    /// These are the floors the lanes were sized below: a control lane that
-    /// cannot hold the answers to the requests the contract allows turns legal
-    /// traffic into a refused frame.
+    /// Both halves are asserted as sums. A per-lane floor alone is what let the
+    /// frame budget drift: each lane was sized against the contract's
+    /// concurrency, and together they queued 123 frames against the 64 the Host
+    /// tells the Package it will hold.
     #[test]
     fn writer_lanes_admit_the_traffic_the_contract_permits() {
         const {
-            assert!(CONTROL_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION + CONTROL_RESERVE);
+            assert!(CONTROL_QUEUE >= CONTROL_RESERVE);
             assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
-            assert!(CONTROL_QUEUE <= MAX_WRITER_FRAMES);
-            assert!(DATA_QUEUE <= MAX_WRITER_FRAMES);
+            assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
             assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
             assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
-            assert!(CONTROL_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
+            assert!(TERMINAL_RESERVE_BYTES == MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES);
+            assert!(CONTROL_BYTES + TERMINAL_RESERVE_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
             assert!(UI_EVENT_CAPACITY == INITIAL_STREAM_CREDIT);
         }
+    }
+
+    /// The reserve holds the frame it exists for: a typed terminal `error` for
+    /// an id of the contract's maximum length.
+    #[test]
+    fn an_overloaded_answer_fits_its_reserve() {
+        let longest = format!("p:{}", "a".repeat(126));
+        assert_eq!(longest.len(), 128);
+        let overloaded = frame(json!({
+            "kind":"error", "id":longest, "code":"overloaded",
+            "retryable":true, "details":{}
+        }));
+        let encoded = teamarness_package_protocol::encode_frame(&overloaded)
+            .expect("encoded frame")
+            .len();
+        assert!(
+            encoded <= TERMINAL_ERROR_BYTES,
+            "the reserve holds {TERMINAL_ERROR_BYTES} bytes per answer, the frame needs {encoded}"
+        );
     }
 
     fn frame(value: Value) -> Frame {

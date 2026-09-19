@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use teamarness_package_protocol::{Frame, FrameKind, MAX_IN_FLIGHT_EACH_DIRECTION, encode_frame};
+use teamarness_package_protocol::{
+    Frame, FrameKind, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, encode_frame,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use host_protocol::{
@@ -111,10 +113,17 @@ fn connect(
     capabilities: Arc<dyn host_protocol::CapabilityHandler>,
     pipe_bytes: usize,
 ) -> (ProcessClient, FakePackage) {
+    connect_with_limits(capabilities, pipe_bytes, ProtocolLimits::CURRENT)
+}
+
+fn connect_with_limits(
+    capabilities: Arc<dyn host_protocol::CapabilityHandler>,
+    pipe_bytes: usize,
+    limits: ProtocolLimits,
+) -> (ProcessClient, FakePackage) {
     let (host_end, package_end) = tokio::io::duplex(pipe_bytes);
     let (host_read, host_write) = tokio::io::split(host_end);
-    let client =
-        start_with_capabilities(host_read, host_write, capabilities, ProtocolLimits::CURRENT);
+    let client = start_with_capabilities(host_read, host_write, capabilities, limits);
     (
         client,
         FakePackage {
@@ -420,9 +429,12 @@ async fn a_response_that_crossed_the_hosts_cancel_leaves_the_generation_alive() 
     // Draining the pipe releases the writer; the probe proves the reader, the
     // handler and the writer all survived the answer that crossed the cancel.
     // A reader that failed the generation never answers it.
-    tokio::time::timeout(Duration::from_secs(10), package.round_trip("p:probe-crossing"))
-        .await
-        .expect("the generation still answers after the crossing response");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        package.round_trip("p:probe-crossing"),
+    )
+    .await
+    .expect("the generation still answers after the crossing response");
     assert_eq!(client.failure(), None);
     held.abort();
 }
@@ -503,6 +515,154 @@ async fn every_in_flight_capability_call_is_answered_behind_a_slow_pipe() {
         assert!(answered.insert(id), "exactly one terminal frame per id");
     }
     assert_eq!(client.failure(), None);
+}
+
+/// SF2-002: Rule 1's third verdict, under the congestion that triggers it.
+///
+/// A capability answer that cannot get control-lane capacity within the call
+/// deadline is answered for that one request id with a typed retryable error,
+/// never by dropping the answer and never by failing the generation. The
+/// fallback is itself that request's one terminal frame, so it waits for
+/// capacity too: the budget is exactly full here, which is the one condition
+/// under which a refusing send degrades the third verdict back to the
+/// `ProcessExited` it exists to replace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded() {
+    /// Answers sized so two of them hold the whole control byte budget
+    /// (`CONTROL_BYTES == 2 * MAX_FRAME_BYTES`) and leave nothing behind.
+    struct BudgetFillingAnswer;
+
+    impl host_protocol::CapabilityHandler for BudgetFillingAnswer {
+        fn call<'a>(
+            &'a self,
+            _grant: Option<&'a str>,
+            payload: &'a Value,
+            _started: Arc<AtomicBool>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
+        > {
+            let bytes = payload
+                .get("bytes")
+                .and_then(Value::as_u64)
+                .expect("the test sizes the answer") as usize;
+            Box::pin(async move { Ok(json!({"canonical":"A".repeat(bytes)})) })
+        }
+
+        fn open_stream<'a>(
+            &'a self,
+            _stream_id: String,
+            _topic: &'a str,
+            _initial_credit: u64,
+            _payload: &'a Value,
+            _output: HostStreamSender,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+        }
+
+        fn add_credit<'a>(
+            &'a self,
+            _stream_id: &'a str,
+            _amount: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn close_stream<'a>(
+            &'a self,
+            _stream_id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    const CALLS: usize = 8;
+    // Half the control lane's byte budget per answer: two fill it exactly.
+    let target = MAX_FRAME_BYTES;
+    let sized = |id: &str, bytes: usize| -> usize {
+        let frame = Frame::try_from(json!({
+            "kind":"response", "id":id, "payload":{"canonical":"A".repeat(bytes)}
+        }))
+        .expect("valid frame");
+        encode_frame(&frame).expect("encoded frame").len()
+    };
+    // One ASCII byte of payload is one byte of frame, so one probe is enough.
+    let probe = sized("p:slow-0", 1024);
+    let answer_bytes = 1024 + target - probe;
+    assert_eq!(sized("p:slow-0", answer_bytes), target);
+
+    // A pipe far smaller than one answer, and a call deadline short enough
+    // that congestion outlasts it while this end holds the pipe shut.
+    let (client, mut package) = connect_with_limits(
+        Arc::new(BudgetFillingAnswer),
+        1024,
+        ProtocolLimits {
+            capability_call: Duration::from_millis(50),
+        },
+    );
+    for index in 0..CALLS {
+        package
+            .send(json!({
+                "kind":"request", "id":format!("p:slow-{index}"),
+                "operation":"capability.call", "grant":"Z3JhbnQx",
+                "deadlineUnixMs":"9007199254740998",
+                "payload":{"method":"open","bytes":answer_bytes}
+            }))
+            .await;
+    }
+    // The answers must reach the point of waiting for capacity, and that wait
+    // must outlast the call deadline, before this end drains a byte.
+    // settle: the writer exposes no event for "a queued frame is waiting".
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut answered = std::collections::BTreeMap::new();
+    let collected = tokio::time::timeout(Duration::from_secs(30), async {
+        while answered.len() < CALLS {
+            let frame = package.next_frame().await;
+            assert!(
+                matches!(frame.kind(), FrameKind::Response | FrameKind::Error),
+                "unexpected frame {:?}",
+                frame.kind()
+            );
+            let id = frame
+                .field("id")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_owned();
+            let code = frame
+                .field("code")
+                .and_then(Value::as_str)
+                .unwrap_or("response")
+                .to_owned();
+            if code == "overloaded" {
+                assert_eq!(
+                    frame.field("retryable").and_then(Value::as_bool),
+                    Some(true),
+                    "the third verdict is retryable"
+                );
+            }
+            assert!(
+                answered.insert(id, code).is_none(),
+                "exactly one terminal frame per id"
+            );
+        }
+    })
+    .await;
+    assert!(
+        collected.is_ok(),
+        "only {} of {CALLS} calls were answered: {answered:?}",
+        answered.len()
+    );
+    assert!(
+        answered.values().any(|code| code == "overloaded"),
+        "congestion that outlasts the deadline is answered `overloaded`: {answered:?}"
+    );
+    assert_eq!(
+        client.failure(),
+        None,
+        "the generation survives its own congestion"
+    );
 }
 
 async fn wait_for_failure(client: &ProcessClient) -> PackageErrorCode {
