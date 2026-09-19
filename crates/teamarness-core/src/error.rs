@@ -28,28 +28,6 @@ impl fmt::Display for ValueParseError {
 
 impl Error for ValueParseError {}
 
-macro_rules! error_family {
-    ($name:ident, $summary:literal) => {
-        #[doc = $summary]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        #[non_exhaustive]
-        pub enum $name {
-            /// The operation is part of the public contract but is not available in this scaffold.
-            RuntimeUnavailable,
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("the core runtime is not available in the repository scaffold")
-            }
-        }
-
-        impl Error for $name {}
-    };
-}
-
-error_family!(ConfigurationError, "A runtime configuration error.");
-
 /// A durable core storage or recovery error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -439,8 +417,6 @@ impl Error for SubscriptionError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CoreError {
-    /// Runtime configuration could not be accepted.
-    Configuration(ConfigurationError),
     /// Installation identity initialization failed.
     Identity(IdentityError),
     /// Durable storage initialization or recovery failed.
@@ -452,7 +428,6 @@ pub enum CoreError {
 impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Configuration(error) => error.fmt(formatter),
             Self::Identity(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Onboarding(error) => error.fmt(formatter),
@@ -469,7 +444,6 @@ impl From<StorageError> for CoreError {
 impl Error for CoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Configuration(error) => Some(error),
             Self::Identity(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Onboarding(error) => Some(error),

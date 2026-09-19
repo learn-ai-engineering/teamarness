@@ -42,8 +42,8 @@ mod synchronization;
 mod workspace;
 
 pub use error::{
-    ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError,
-    OnboardingError, StorageError, SubscriptionError, ValueParseError, WorkspaceError,
+    CoreError, IdentityError, InvitationError, MembershipError, OnboardingError, StorageError,
+    SubscriptionError, ValueParseError, WorkspaceError,
 };
 pub use membership::MembershipOperationId;
 pub use onboarding::WorkspaceInvitation;
