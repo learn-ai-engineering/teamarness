@@ -23,8 +23,13 @@ type SharedState = Arc<Mutex<ContractState>>;
 
 /// One UI event route holds the credit window the contract grants the stream.
 const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
-/// The route's byte budget: the whole writer budget one event stream may occupy.
-const UI_EVENT_BYTES: usize = MAX_WRITER_BYTES;
+/// The route's byte budget.
+///
+/// Worst case: every event the credit window admits, each at the largest UI
+/// payload the UI contract allows, queued at once. The classifier is what
+/// bounds the count, so a budget derived from anything else would refuse an
+/// event the classifier had already admitted.
+const UI_EVENT_BYTES: usize = INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES;
 
 /// Lifecycle, health and stream-control frames reserved on the control lane.
 ///
@@ -103,9 +108,12 @@ pub(crate) struct UiEventRoute {
     operation: String,
 }
 
+/// What the route owes its subscriber, and nothing about the wire.
+///
+/// Sequence and credit are the classifier's decisions. These two counters
+/// answer the one question the classifier cannot: how far the subscriber has
+/// read, which is what an acknowledgement is measured against.
 struct UiEventRouteState {
-    next_expected: u64,
-    highest_received: u64,
     highest_delivered: u64,
     highest_acknowledged: u64,
 }
@@ -123,10 +131,7 @@ impl UiEventReceiver {
                 if matches!(end, StreamEnd::Completed | StreamEnd::Package(_)) {
                     match self.events.try_recv() {
                         Ok(event) => {
-                            self.route
-                                .mark_delivered(event.sequence)
-                                .await
-                                .map_err(StreamEnd::Host)?;
+                            self.route.mark_delivered(event.sequence).await;
                             return Ok(event);
                         }
                         Err(
@@ -146,10 +151,7 @@ impl UiEventReceiver {
                 }
                 event = self.events.recv() => {
                     let event = event.ok_or(StreamEnd::Host(PackageErrorCode::ProcessExited))?;
-                    self.route
-                        .mark_delivered(event.sequence)
-                        .await
-                        .map_err(StreamEnd::Host)?;
+                    self.route.mark_delivered(event.sequence).await;
                     return Ok(event);
                 }
             }
@@ -166,8 +168,6 @@ impl UiEventRoute {
             terminal,
             bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES)),
             state: Mutex::new(UiEventRouteState {
-                next_expected: 1,
-                highest_received: 0,
                 highest_delivered: 0,
                 highest_acknowledged: 0,
             }),
@@ -182,7 +182,18 @@ impl UiEventRoute {
         (route, event_receiver)
     }
 
-    async fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
+    /// Hands the classifier's next event to the subscriber.
+    ///
+    /// The route decides nothing about the wire. The classifier has already
+    /// ruled that this event names a live stream, carries the next sequence and
+    /// sits inside the window the contract grants; what is left is the UI
+    /// contract the payload must satisfy and the bounds this queue holds, both
+    /// of which end this one stream rather than the generation.
+    ///
+    /// The bounds cannot be reached by a conforming Package: the queue and its
+    /// byte budget both hold the whole credit window, and credit returns only
+    /// for an event the subscriber has acknowledged.
+    fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
         let payload: PackageValue =
             serde_json::from_value(value).map_err(|_| PackageErrorCode::UiContractViolation)?;
         self.contract
@@ -193,17 +204,6 @@ impl UiEventRoute {
             serde_json::to_vec(&payload).map_err(|_| PackageErrorCode::UiContractViolation)?;
         if encoded.len() > MAX_UI_PAYLOAD_BYTES {
             return Err(PackageErrorCode::UiContractViolation);
-        }
-        let mut state = self.state.lock().await;
-        if sequence != state.next_expected {
-            return Err(PackageErrorCode::ProtocolViolation);
-        }
-        if state
-            .highest_received
-            .saturating_sub(state.highest_acknowledged)
-            >= UI_EVENT_CAPACITY as u64
-        {
-            return Err(PackageErrorCode::EventLagged);
         }
         let permits =
             u32::try_from(encoded.len()).map_err(|_| PackageErrorCode::UiContractViolation)?;
@@ -219,18 +219,15 @@ impl UiEventRoute {
                 _bytes: bytes,
             })
             .map_err(|_| PackageErrorCode::EventLagged)?;
-        state.next_expected = state.next_expected.saturating_add(1);
-        state.highest_received = sequence;
         Ok(())
     }
 
-    async fn mark_delivered(&self, sequence: u64) -> Result<(), PackageErrorCode> {
-        let mut state = self.state.lock().await;
-        if sequence != state.highest_delivered.saturating_add(1) {
-            return Err(PackageErrorCode::ProtocolViolation);
-        }
-        state.highest_delivered = sequence;
-        Ok(())
+    /// Records how far the subscriber has read.
+    ///
+    /// The queue is first in, first out and the classifier admits one sequence
+    /// at a time, so this is a record, not a check.
+    async fn mark_delivered(&self, sequence: u64) {
+        self.state.lock().await.highest_delivered = sequence;
     }
 
     pub(crate) async fn acknowledge(&self, through: u64) -> Result<u64, WireFailure> {
@@ -756,39 +753,9 @@ async fn reader_task<R>(
                 return;
             }
         };
-        if frame.kind() == FrameKind::Event {
-            let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
-                let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
-                fail_ui_routes(&ui_event_routes, PackageErrorCode::MalformedFrame).await;
-                return;
-            };
-            let ui_route = {
-                let routes = ui_event_routes.lock().await;
-                routes.get(stream_id).cloned()
-            };
-            if let Some(route) = ui_route {
-                let sequence = frame
-                    .field("sequence")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse::<u64>().ok());
-                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
-                let result = match sequence {
-                    Some(sequence) => route.event(sequence, payload).await,
-                    None => Err(PackageErrorCode::ProtocolViolation),
-                };
-                if let Err(code) = result {
-                    route.terminate(StreamEnd::Host(code));
-                    ui_event_routes.lock().await.remove(stream_id);
-                    state.lock().await.retire_stream(stream_id);
-                    let _ = writer
-                        .control(json!({"kind":"stream_close","streamId":stream_id,"code":ui_stream_code(code)}))
-                        .await;
-                }
-                continue;
-            }
-        }
         // One classifier, before every branch. There is no side of `observe` on
-        // which an adapter can hold its own idea of which races are tolerable.
+        // which an adapter can hold its own idea of which races are tolerable,
+        // and no frame kind that reaches its adapter without being classified.
         let verdict = match state.lock().await.observe(Direction::PackageToHost, &frame) {
             Ok(verdict) => verdict,
             Err(error) => {
@@ -1016,7 +983,47 @@ async fn reader_task<R>(
                     .map(str::to_owned);
                 let _ = pongs.send(nonce);
             }
-            FrameKind::Event => {}
+            FrameKind::Event => {
+                let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
+                    let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
+                    return;
+                };
+                let route = {
+                    let routes = ui_event_routes.lock().await;
+                    routes.get(stream_id).cloned()
+                };
+                // A live stream whose route has gone is the subscriber having
+                // left; the stream ends on its own path and the classifier
+                // ignores what follows the close.
+                let Some(route) = route else { continue };
+                let Some(sequence) = frame
+                    .field("sequence")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<u64>().ok())
+                else {
+                    // Unreachable: the classifier read this field as a decimal.
+                    let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
+                    return;
+                };
+                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
+                if let Err(code) = route.event(sequence, payload) {
+                    // The UI contract and the route's own bounds end this one
+                    // stream. The frame was in contract, so the generation
+                    // lives and the Package is told the stream is over.
+                    // Retire in the classifier before the adapter forgets the
+                    // route, so the two can never disagree about whether this
+                    // stream is still served.
+                    state.lock().await.retire_stream(stream_id);
+                    ui_event_routes.lock().await.remove(stream_id);
+                    route.terminate(StreamEnd::Host(code));
+                    let _ = writer
+                        .control(json!({
+                            "kind":"stream_close", "streamId":stream_id,
+                            "code":ui_stream_code(code)
+                        }))
+                        .await;
+                }
+            }
             _ => {
                 let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                 return;

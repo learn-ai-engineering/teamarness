@@ -176,13 +176,19 @@ async fn one_mount_accepts_at_most_eight_event_routes() {
     assert_eq!(error.code, PackageErrorCode::Overloaded);
 }
 
+/// A UI event is classified by the one shared classifier, like every other
+/// frame.
+///
+/// A duplicate sequence, a gap, and a 33rd event against the 32-event window
+/// are `event_sequence` and `credit_violation`: out of contract, and fatal to
+/// the process generation. A route that decided them itself reported its own
+/// codes, kept the generation alive and failed only the mount, which is the
+/// divergence this asserts is gone. Events the Package sent before the
+/// violation still reach the subscriber in order, so nothing is dropped in
+/// silence.
 #[tokio::test]
-async fn sequence_violations_and_route_overflow_are_terminal_without_silent_drop() {
-    for (operation, expected) in [
-        ("fixture.duplicate", PackageErrorCode::ProtocolViolation),
-        ("fixture.gap", PackageErrorCode::ProtocolViolation),
-        ("fixture.overflow", PackageErrorCode::EventLagged),
-    ] {
+async fn events_the_contract_forbids_fail_the_generation_and_not_only_the_mount() {
+    for operation in ["fixture.duplicate", "fixture.gap", "fixture.overflow"] {
         let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
         let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
             .await
@@ -199,17 +205,25 @@ async fn sequence_violations_and_route_overflow_are_terminal_without_silent_drop
                 Err(error) => break error,
             }
         };
-        assert_eq!(error.code, expected, "{operation}");
+        assert_eq!(
+            error.code,
+            PackageErrorCode::ProtocolViolation,
+            "{operation}"
+        );
         for (index, actual) in delivered.iter().enumerate() {
             assert_eq!(actual, &(index + 1).to_string(), "{operation}");
         }
         assert_eq!(
             host.snapshot().await.instances[0].lifecycle,
-            LifecycleState::Active
+            LifecycleState::Failed,
+            "{operation}"
         );
+        // The generation failed, so its mounts went with it: a protocol
+        // violation is not restartable and clears the process state.
         assert_eq!(
             host.snapshot().await.instances[0].mount_state,
-            Some(MountState::Failed)
+            None,
+            "{operation}"
         );
     }
 }
