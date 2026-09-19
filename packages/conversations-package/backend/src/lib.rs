@@ -141,6 +141,55 @@ mod tests {
         );
     }
 
+    /// Every slug the duplicate-slug path synthesizes travels in the Package's own
+    /// `conversations.snapshot` response, and a response the Package UI contract refuses fails the
+    /// Mount for good. So the projection's slugs obey the contract grammar even when truncating to
+    /// fit the length bound lands on a hyphen.
+    // Verifies: TEAM.SYS.CONV-R05
+    #[test]
+    fn duplicate_slug_suffix_obeys_the_contract_grammar() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        // 40 characters, contract-valid, whose 39th character is the hyphen the eight-character
+        // channel-id suffix truncates onto.
+        let base = format!("{}-b", "a".repeat(38));
+        let first = DomainRecord::channel_create_with_id([4; 16], "author", &base).unwrap();
+        let second = DomainRecord::channel_create_with_id([5; 16], "author", &base).unwrap();
+        for (record, order_key) in [(&first, "01"), (&second, "02")] {
+            assert_eq!(
+                store
+                    .ingest(
+                        &hex_id(record.id()),
+                        order_key,
+                        "author",
+                        record.kind(),
+                        "signature",
+                        &record.encode(),
+                        b"sealed",
+                        None,
+                    )
+                    .unwrap(),
+                IngestResult::Applied
+            );
+        }
+
+        let slugs = store
+            .channels()
+            .unwrap()
+            .into_iter()
+            .map(|channel| channel.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(slugs.len(), 3);
+        for slug in &slugs {
+            assert!(
+                crate::domain::validate_slug(slug).is_ok(),
+                "the projection presented {slug:?}, which its own decoder and the UI contract \
+                 pattern ^[a-z0-9]+(-[a-z0-9]+)*$ both refuse"
+            );
+        }
+        assert_eq!(slugs.iter().filter(|slug| **slug == base).count(), 1);
+    }
+
     #[test]
     fn persistence_contains_sealed_bytes_and_opaque_indexes_only() {
         let d = tempfile::tempdir().unwrap();
