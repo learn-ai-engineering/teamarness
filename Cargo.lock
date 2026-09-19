@@ -7566,6 +7566,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-tickets",
+ "nix",
  "p2panda-auth",
  "p2panda-core",
  "p2panda-encryption",

@@ -12,6 +12,12 @@ use crate::identity::DEFAULT_DISPLAY_NAME;
 
 pub(crate) const DATABASE_FILE_NAME: &str = "core.sqlite3";
 
+/// Marks a directory as one the Core Runtime owns, so a directory holding
+/// unrelated files is never adopted or restricted.
+pub(crate) const PRIVATE_DIRECTORY_MARKER: &str = ".teamarness-private-directory";
+#[cfg_attr(not(unix), expect(dead_code, reason = "the marker is Unix-only"))]
+const PRIVATE_DIRECTORY_MARKER_CONTENT: &[u8] = b"teamarness private data directory v1\n";
+
 pub(crate) struct StoredRuntime {
     pub(crate) connection: Connection,
     pub(crate) secret_key: SecretKey,
@@ -173,12 +179,108 @@ pub(crate) fn update_display_name(
         .map_err(|_| StorageError::UncertainOutcome)
 }
 
-fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
-    fs::create_dir_all(path).map_err(|_| StorageError::Io)?;
-    if !fs::metadata(path).map_err(|_| StorageError::Io)?.is_dir() {
+/// Decides whether a path may be used as the private data directory, and
+/// whether the marker still has to be written.
+///
+/// A pure predicate so the rule can be tested without `chown`. `Ok(true)`
+/// means the directory is acceptable and needs its marker; `Ok(false)` means
+/// it is already marked.
+#[cfg_attr(not(unix), expect(dead_code, reason = "the rule is Unix-only"))]
+fn directory_acceptable(
+    is_symlink: bool,
+    is_dir: bool,
+    owner_uid: u32,
+    effective_uid: u32,
+    has_marker: bool,
+    is_empty: bool,
+    has_core_database: bool,
+) -> Result<bool, StorageError> {
+    if is_symlink || !is_dir || owner_uid != effective_uid {
         return Err(StorageError::InvalidDataDirectory);
     }
-    set_directory_permissions(path)
+    if has_marker {
+        return Ok(false);
+    }
+    if is_empty || has_core_database {
+        return Ok(true);
+    }
+    Err(StorageError::InvalidDataDirectory)
+}
+
+/// Accepts a private data directory, or refuses the path.
+///
+/// Only the final path component is checked for a symbolic link: macOS
+/// temporary paths reach through system links such as `/var` to
+/// `/private/var`, so an ancestor link is normal and is not a signal.
+#[cfg(unix)]
+fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let write_marker = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            let is_symlink = file_type.is_symlink();
+            let is_dir = file_type.is_dir();
+            let (has_marker, is_empty, has_core_database) = if is_dir {
+                (
+                    path.join(PRIVATE_DIRECTORY_MARKER).exists(),
+                    fs::read_dir(path)
+                        .map_err(|_| StorageError::Io)?
+                        .next()
+                        .is_none(),
+                    path.join(DATABASE_FILE_NAME).exists(),
+                )
+            } else {
+                (false, false, false)
+            };
+            directory_acceptable(
+                is_symlink,
+                is_dir,
+                metadata.uid(),
+                nix::unistd::geteuid().as_raw(),
+                has_marker,
+                is_empty,
+                has_core_database,
+            )?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|_| StorageError::Io)?;
+            true
+        }
+        Err(_) => return Err(StorageError::Io),
+    };
+
+    set_directory_permissions(path)?;
+    if write_marker {
+        write_private_directory_marker(path)?;
+    }
+    Ok(())
+}
+
+/// Fails closed where the directory cannot be restricted to its owner.
+#[cfg(not(unix))]
+fn prepare_private_directory(_path: &Path) -> Result<(), StorageError> {
+    Err(StorageError::Permission)
+}
+
+#[cfg(unix)]
+fn write_private_directory_marker(path: &Path) -> Result<(), StorageError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path.join(PRIVATE_DIRECTORY_MARKER))
+    {
+        Ok(mut marker) => marker
+            .write_all(PRIVATE_DIRECTORY_MARKER_CONTENT)
+            .map_err(|_| StorageError::Io),
+        // Another runtime opening the same directory wrote it first.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => Err(StorageError::Io),
+    }
 }
 
 fn prepare_private_database_file(path: &Path) -> Result<(), StorageError> {
@@ -215,11 +317,6 @@ fn set_directory_permissions(path: &Path) -> Result<(), StorageError> {
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|_| StorageError::Permission)
-}
-
-#[cfg(not(unix))]
-fn set_directory_permissions(_path: &Path) -> Result<(), StorageError> {
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -292,5 +389,50 @@ mod tests {
         assert_eq!(reopened_again.secret_key.public(), identity);
         drop(reopened_again);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Verifies: TEAM.SYS.ID-R07
+    #[test]
+    fn directory_predicate_rejects_symlink_foreign_owner_and_unrelated_contents() {
+        // A symbolic link, even one pointing at a marked directory of ours.
+        assert_eq!(
+            directory_acceptable(true, false, 501, 501, true, false, true),
+            Err(StorageError::InvalidDataDirectory)
+        );
+        // A regular file where the directory should be.
+        assert_eq!(
+            directory_acceptable(false, false, 501, 501, false, false, false),
+            Err(StorageError::InvalidDataDirectory)
+        );
+        // Another user's directory, however well marked.
+        assert_eq!(
+            directory_acceptable(false, true, 502, 501, true, false, true),
+            Err(StorageError::InvalidDataDirectory)
+        );
+        // Somebody's home directory: ours to neither adopt nor chmod.
+        assert_eq!(
+            directory_acceptable(false, true, 501, 501, false, false, false),
+            Err(StorageError::InvalidDataDirectory)
+        );
+    }
+
+    // Verifies: TEAM.SYS.ID-R07
+    #[test]
+    fn directory_predicate_accepts_marker_empty_and_legacy_core_database() {
+        // Already marked: accepted without rewriting the marker.
+        assert_eq!(
+            directory_acceptable(false, true, 501, 501, true, false, true),
+            Ok(false)
+        );
+        // Empty: accepted, and marked.
+        assert_eq!(
+            directory_acceptable(false, true, 501, 501, false, true, false),
+            Ok(true)
+        );
+        // Holds a core database but lost its marker: adopted, and re-marked.
+        assert_eq!(
+            directory_acceptable(false, true, 501, 501, false, false, true),
+            Ok(true)
+        );
     }
 }

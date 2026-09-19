@@ -177,6 +177,9 @@ async fn open_runtime_modules(
                 CoreError::Storage(StorageError::LegacyProtectionState) => {
                     "This data directory was created by an older development build whose key grants are no longer supported. Delete it to start fresh."
                 }
+                CoreError::Storage(StorageError::InvalidDataDirectory) => {
+                    "The data directory is not a private Teamarness directory (symlink, other owner, or unrelated contents)"
+                }
                 _ => "Core Runtime startup failed",
             })?,
     );

@@ -54,7 +54,8 @@ error_family!(ConfigurationError, "A runtime configuration error.");
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StorageError {
-    /// The private data directory is not a directory.
+    /// The private data path is not a private Teamarness directory: it is a
+    /// symbolic link, belongs to another user, or holds unrelated files.
     InvalidDataDirectory,
     /// A filesystem operation failed.
     Io,
@@ -81,7 +82,9 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::InvalidDataDirectory => "the private data path is not a directory",
+            Self::InvalidDataDirectory => {
+                "the private data path is not a private Teamarness directory"
+            }
             Self::Io => "private storage filesystem operation failed",
             Self::Permission => "private storage permissions could not be restricted",
             Self::Database => "core database operation failed",
