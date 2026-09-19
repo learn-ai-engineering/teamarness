@@ -18,15 +18,39 @@ pub(crate) type SharedState = Arc<Mutex<ContractState>>;
 /// stream's own task, which waits for a slot rather than refusing.
 const DATA_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION;
 
+/// Frames the dispatcher loop owes besides the terminal answers.
+///
+/// `pong`, a cancelled request's `error`, and `shutdown_ack`: three, which is
+/// the lifecycle reserve `cb31744` deleted while leaving this comment behind.
+const LIFECYCLE_RESERVE: usize = 3;
+
+/// Every frame the control lane can owe at once.
+///
+/// One terminal answer for each of the in-flight requests the contract permits
+/// the Host, plus the three lifecycle frames.
+const CONTROL_WORST_CASE: usize = MAX_IN_FLIGHT_EACH_DIRECTION + LIFECYCLE_RESERVE;
+
+/// Whether a full control lane makes its sender wait rather than refusing.
+///
+/// It does, and that is why the reserve is not restored: 35 control slots
+/// beside the data lane's 32 is 67 against the 64 frames the contract
+/// publishes for the whole writer, so the lifecycle frames wait behind the
+/// terminal answers instead of having slots of their own. Both
+/// [`PriorityWriter::send`] and [`PriorityWriter::control_waiting`] wait on
+/// depth (`sender.send(..).await`); neither refuses a frame for want of a
+/// slot. The wait is bounded by [`run`], which drains as the Host reads, and
+/// by the Host's five-second health probe.
+const CONTROL_WAITS_FOR_A_SLOT: bool = true;
+
 /// Slots on the control lane: the rest of the writer's published frame budget.
 ///
 /// The two lanes share the one writer budget the contract publishes and the
 /// Host's handshake transmits, so their depths are a split of
 /// `MAX_WRITER_FRAMES`, exactly as their byte budgets are a split of
-/// `MAX_WRITER_BYTES`. Worst case here is one terminal frame for each of the
+/// `MAX_WRITER_BYTES`. The lane holds one terminal frame for each of the
 /// in-flight requests the contract permits the Host; `initialized`, `pong` and
-/// `shutdown_ack` are one frame each and wait for a slot beside them, because
-/// no send on this writer refuses on depth.
+/// `shutdown_ack` wait for a slot behind them, because no send on this writer
+/// refuses on depth.
 const CONTROL_QUEUE: usize = MAX_WRITER_FRAMES - DATA_QUEUE;
 
 /// The control lane's byte budget: two contract-maximum frames, so one maximum
@@ -35,6 +59,29 @@ const CONTROL_BYTES: usize = 2 * MAX_FRAME_BYTES;
 
 /// The data lane keeps the rest of the writer budget the contract publishes.
 const DATA_BYTES: usize = MAX_WRITER_BYTES - CONTROL_BYTES;
+
+// Rule 2's floors for this crate, asserted beside the bounds they guard so a
+// bound that stops admitting its worst case fails the build rather than a
+// suite. ADR 0019 §3 names them.
+//
+// Each left-hand side is written from the traffic, independently of the bound
+// it guards, so none of them can be satisfied by moving the bound it reads.
+const _: () = {
+    // The lane cannot hold its worst case, so it must wait for a slot. This is
+    // the assertion the deleted lifecycle reserve should have left behind:
+    // it cannot be met by widening, because the data lane's own worst case
+    // already claims half the published budget.
+    assert!(CONTROL_QUEUE >= CONTROL_WORST_CASE || CONTROL_WAITS_FOR_A_SLOT);
+    assert!(CONTROL_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
+    assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
+    // Both lanes' independently counted worst cases must fit the one budget
+    // the handshake names. This is the assertion an SF2-001 recurrence breaks.
+    assert!(DATA_QUEUE + MAX_IN_FLIGHT_EACH_DIRECTION <= MAX_WRITER_FRAMES);
+    assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
+    assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
+    assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
+    assert!(CONTROL_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
+};
 
 pub(crate) struct QueuedFrame {
     frame: Frame,
@@ -80,10 +127,14 @@ impl PriorityWriter {
     /// Queues a control frame, waiting for the lane's byte budget rather than
     /// refusing it.
     ///
-    /// A saturated lane behind a slow reader is ordinary backpressure. Only a
-    /// task that owns its own work may wait here — the dispatcher loop must
-    /// not, because a Package that stopped reading would stop answering
-    /// everything else too. The request's one terminal frame is exactly such a
+    /// The wait this adds is for *bytes*. Every send on this writer already
+    /// waits for a slot (`CONTROL_WAITS_FOR_A_SLOT`), which is bounded by the
+    /// writer task draining to the Host. A saturated byte budget behind a slow
+    /// reader is ordinary backpressure too, but it can hold a whole
+    /// contract-maximum frame, so only a task that owns its own work may wait
+    /// for it — the dispatcher loop must not, because a Package that stopped
+    /// reading would stop answering everything else too. The request's one
+    /// terminal frame is exactly such a
     /// task's work: the contract says a sender never withholds a frame it
     /// owes, and the handler has already claimed this request's only one, so
     /// refusing it leaves the request with no terminal frame at all.
@@ -195,28 +246,46 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONTROL_BYTES, CONTROL_QUEUE, DATA_BYTES, DATA_QUEUE, MAX_IN_FLIGHT_EACH_DIRECTION,
-        MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
-    };
-    use teamarness_package_protocol::MAX_FRAME_BYTES;
+    use std::time::Duration;
 
-    /// Every writer bound admits the worst case the contract permits, and the
-    /// two lanes together stay inside the one budget the Host publishes.
+    use serde_json::json;
+
+    use super::{CONTROL_QUEUE, PriorityWriter};
+
+    /// The three lifecycle frames have no slots of their own, so they wait
+    /// behind a full lane of terminal answers instead of being refused.
     ///
-    /// Both halves are asserted as sums. A per-lane floor alone is what let the
-    /// frame budget drift: each lane was sized against the contract's
-    /// concurrency, and together they queued 99 frames against the 64 the
-    /// handshake names.
-    #[test]
-    fn writer_lanes_admit_the_traffic_the_contract_permits() {
-        const {
-            assert!(CONTROL_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
-            assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
-            assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
-            assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
-            assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
-            assert!(CONTROL_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
+    /// This is the property the lane's comment claims and the floor's
+    /// `CONTROL_WAITS_FOR_A_SLOT` stands on. `cb31744` deleted the reserve the
+    /// comment named and nothing noticed, because nothing asserted either the
+    /// reserve or the wait that replaced it. A send changed back to `try_send`
+    /// fails here.
+    #[tokio::test]
+    async fn no_control_send_refuses_for_want_of_a_slot() {
+        let (writer, mut control, _data) = PriorityWriter::channels();
+        let pong = || json!({"kind":"pong", "nonce":"bm9uY2U"});
+        for index in 0..CONTROL_QUEUE {
+            writer
+                .control(pong())
+                .await
+                .unwrap_or_else(|error| panic!("lifecycle frame {index} was refused: {error:?}"));
         }
+
+        let waiting = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.control(pong()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the send did not wait for a slot on a full lane"
+        );
+
+        control.recv().await.expect("a queued frame");
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting send settles once a slot frees")
+            .expect("the waiting task")
+            .expect("the frame is queued, not refused");
     }
 }
