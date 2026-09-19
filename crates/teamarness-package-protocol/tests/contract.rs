@@ -3,9 +3,9 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use serde_json::Value;
 use teamarness_package_protocol::{
     ContractState, Direction, FrameDecoder, INITIAL_STREAM_CREDIT, MAX_DECODED_FRAME_BYTES,
-    MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
-    ProtocolError, ProtocolRange, ProtocolVersion, Verdict, decode_frame, decode_payload,
-    negotiate_version,
+    MAX_FRAME_BYTES, MAX_ID_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES,
+    MAX_WRITER_FRAMES, ProtocolError, ProtocolRange, ProtocolVersion, Verdict, decode_frame,
+    decode_payload, negotiate_version,
 };
 
 fn contract_root() -> PathBuf {
@@ -260,6 +260,12 @@ fn every_schema_is_local_and_every_frame_kind_has_a_schema() {
     )
     .unwrap();
     assert_eq!(frame_schema["oneOf"].as_array().unwrap().len(), 14);
+    // The schema publishes the ID bound every frame's ID fields share, and
+    // this crate declares it; both are read here so neither can move alone.
+    assert_eq!(
+        frame_schema["$defs"]["id"]["maxLength"].as_u64(),
+        Some(MAX_ID_BYTES as u64)
+    );
 
     for path in schemas {
         let schema: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

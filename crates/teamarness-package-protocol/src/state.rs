@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde_json::Value;
 
-use crate::{Frame, FrameKind, INITIAL_STREAM_CREDIT, MAX_IN_FLIGHT_EACH_DIRECTION, ProtocolError};
+use crate::{
+    Frame, FrameKind, INITIAL_STREAM_CREDIT, MAX_ID_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION,
+    ProtocolError,
+};
 
 /// Tombstone entries kept per originating direction.
 ///
@@ -432,7 +435,7 @@ fn id<'a>(frame: &'a Frame, field: &str) -> Result<&'a str, ProtocolError> {
     frame
         .field(field)
         .and_then(Value::as_str)
-        .filter(|value| value.len() <= 128)
+        .filter(|value| value.len() <= MAX_ID_BYTES)
         .ok_or_else(|| ProtocolError::new("malformed_frame"))
 }
 

@@ -33,8 +33,13 @@ export const MAX_OPEN_SUBSCRIPTIONS = 8;
  * acknowledgement, `unsubscribe` or `cancel` for it is still queued, so that
  * message names an entry this side has already released. An id that was never
  * issued has no tombstone and stays a fault.
+ *
+ * The window is one round trip, so the most ids that can need a tombstone at
+ * once is every pending request plus every open subscription: the set is
+ * exactly that, derived rather than chosen, because an id evicted from it is a
+ * fault again.
  */
-export const MAX_RETIRED_IDS = 64;
+export const MAX_RETIRED_IDS = MAX_PENDING_REQUESTS + MAX_OPEN_SUBSCRIPTIONS;
 
 const THEME_VALUE = /^[^;{}<>\\\r\n]{0,256}$/;
 const PACKAGE_ERROR_CODE = /^[a-z][a-z0-9_.-]{0,127}$/;

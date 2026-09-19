@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use teamarness_package_protocol::{
     ContractState, Direction, Frame, FrameKind, INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES,
-    MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES, Verdict, decode_frame,
-    encode_frame,
+    MAX_ID_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES, Verdict,
+    decode_frame, encode_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -55,10 +55,10 @@ const DATA_QUEUE: usize = MAX_WRITER_FRAMES - CONTROL_QUEUE;
 /// maximum answer never waits on another that is already queued.
 const CONTROL_BYTES: usize = 2 * MAX_FRAME_BYTES;
 
-/// One typed terminal error frame: `error`, an id of the contract's maximum
-/// 128 bytes, a stable code, `retryable`, and an empty details object.
-/// `an_overloaded_answer_fits_its_reserve` is the floor.
-const TERMINAL_ERROR_BYTES: usize = 256;
+/// One typed terminal error frame: `error`, an id of the schema's maximum
+/// length, a stable code, `retryable`, and an empty details object, plus the
+/// length prefix. `an_overloaded_answer_fits_its_reserve` is the floor.
+const TERMINAL_ERROR_BYTES: usize = MAX_ID_BYTES + 128;
 
 /// Control-lane bytes only a request's typed terminal answer may use.
 ///
@@ -1335,9 +1335,9 @@ fn empty_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE, StreamEnd,
-        TERMINAL_ERROR_BYTES, TERMINAL_RESERVE_BYTES, UI_EVENT_CAPACITY, package_owned_error,
-        stream_end,
+        CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE, MAX_ID_BYTES,
+        StreamEnd, TERMINAL_ERROR_BYTES, TERMINAL_RESERVE_BYTES, UI_EVENT_CAPACITY,
+        package_owned_error, stream_end,
     };
     use crate::PackageErrorCode;
     use serde_json::{Value, json};
@@ -1371,8 +1371,8 @@ mod tests {
     /// an id of the contract's maximum length.
     #[test]
     fn an_overloaded_answer_fits_its_reserve() {
-        let longest = format!("p:{}", "a".repeat(126));
-        assert_eq!(longest.len(), 128);
+        let longest = format!("p:{}", "a".repeat(MAX_ID_BYTES - 2));
+        assert_eq!(longest.len(), MAX_ID_BYTES);
         let overloaded = frame(json!({
             "kind":"error", "id":longest, "code":"overloaded",
             "retryable":true, "details":{}
