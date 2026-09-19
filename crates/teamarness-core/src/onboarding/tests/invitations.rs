@@ -35,10 +35,7 @@ fn database(directory: &Path) -> Connection {
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
-        .collect()
+    crate::encoding::hex_decode(value).expect("hex fixture")
 }
 
 fn tamper_hex_byte(value: &mut String, offset: usize) {

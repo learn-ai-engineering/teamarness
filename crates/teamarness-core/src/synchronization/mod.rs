@@ -57,6 +57,7 @@ pub(crate) fn records_loaded_for_test() -> usize {
     RECORDS_LOADED.load(std::sync::atomic::Ordering::Relaxed)
 }
 use crate::diag::fault;
+use crate::encoding::ByteReader;
 pub(crate) use peer_sessions::PeerSessions;
 
 /// The Core services one bound Network needs to serve and run synchronization
@@ -157,7 +158,7 @@ impl RecordId {
 
 impl fmt::Display for RecordId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
+        crate::encoding::write_hex(&self.0, f)
     }
 }
 
@@ -214,7 +215,7 @@ impl OrderKey {
 
 impl fmt::Display for OrderKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
+        crate::encoding::write_hex(&self.0, f)
     }
 }
 
@@ -270,7 +271,7 @@ impl Cursor {
 
 impl fmt::Display for Cursor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
+        crate::encoding::write_hex(&self.0, f)
     }
 }
 
@@ -448,17 +449,17 @@ impl SealedRecordV1 {
         if ciphertext_len == 0 || ciphertext_len != bytes.len() - PREFIX {
             return Err(ValueParseError::new("sealed record"));
         }
-        let mut at = 2;
-        let scope_digest = take_array::<32>(bytes, &mut at)?;
-        let record_id = RecordId(take_array::<32>(bytes, &mut at)?);
-        let order_key = OrderKey(take_array::<41>(bytes, &mut at)?);
+        let mut reader = ByteReader::new(&bytes[2..]);
+        let scope_digest = reader.take_array::<32>().ok_or_else(malformed)?;
+        let record_id = RecordId(reader.take_array::<32>().ok_or_else(malformed)?);
+        let order_key = OrderKey(reader.take_array::<41>().ok_or_else(malformed)?);
         // An order key is part of the sealed bytes, so a peer cannot move a
         // record in the order without breaking this binding.
         if order_key.0[0] != VERSION || order_key.0[9..41] != record_id.0 {
             return Err(ValueParseError::new("order key binding"));
         }
-        let content_key_id = take_array::<32>(bytes, &mut at)?;
-        let nonce = take_array::<24>(bytes, &mut at)?;
+        let content_key_id = reader.take_array::<32>().ok_or_else(malformed)?;
+        let nonce = reader.take_array::<24>().ok_or_else(malformed)?;
         Ok(Self {
             scope_digest,
             record_id,
@@ -600,22 +601,23 @@ fn decode_signed(unsigned: &[u8], signature: &[u8]) -> Result<SignedRecordV1, Va
     if signature.len() != 64 || unsigned.len() < 1 + 2 + 16 + 2 + 4 + 32 {
         return Err(ValueParseError::new("signed record"));
     }
-    let mut at = 0;
-    if take_byte(unsigned, &mut at)? != VERSION {
+    let mut reader = ByteReader::new(unsigned);
+    if reader.take_u8().ok_or_else(malformed)? != VERSION {
         return Err(ValueParseError::new("signed record version"));
     }
-    let package_len = u16::from_be_bytes(take_array::<2>(unsigned, &mut at)?) as usize;
-    let package = String::from_utf8(take_vec(unsigned, &mut at, package_len)?)
+    let package_len = u16::from_be_bytes(reader.take_array::<2>().ok_or_else(malformed)?) as usize;
+    let package = String::from_utf8(reader.take(package_len).ok_or_else(malformed)?.to_vec())
         .map_err(|_| ValueParseError::new("package identity"))?;
-    let workspace_id = WorkspaceId::from_bytes(take_array::<16>(unsigned, &mut at)?);
-    let purpose_len = u16::from_be_bytes(take_array::<2>(unsigned, &mut at)?) as usize;
-    let purpose = String::from_utf8(take_vec(unsigned, &mut at, purpose_len)?)
+    let workspace_id = WorkspaceId::from_bytes(reader.take_array::<16>().ok_or_else(malformed)?);
+    let purpose_len = u16::from_be_bytes(reader.take_array::<2>().ok_or_else(malformed)?) as usize;
+    let purpose = String::from_utf8(reader.take(purpose_len).ok_or_else(malformed)?.to_vec())
         .map_err(|_| ValueParseError::new("record purpose"))?;
-    let canonical_len = u32::from_be_bytes(take_array::<4>(unsigned, &mut at)?) as usize;
-    let canonical = take_vec(unsigned, &mut at, canonical_len)?;
-    let author = PublicIdentity::from_bytes(take_array::<32>(unsigned, &mut at)?)
+    let canonical_len =
+        u32::from_be_bytes(reader.take_array::<4>().ok_or_else(malformed)?) as usize;
+    let canonical = reader.take(canonical_len).ok_or_else(malformed)?.to_vec();
+    let author = PublicIdentity::from_bytes(reader.take_array::<32>().ok_or_else(malformed)?)
         .map_err(|_| ValueParseError::new("record author"))?;
-    if at != unsigned.len() {
+    if reader.finish().is_none() {
         return Err(ValueParseError::new("signed record"));
     }
     let signature = Signature::from_bytes(signature.try_into().expect("checked signature width"));
@@ -631,54 +633,13 @@ fn decode_signed(unsigned: &[u8], signature: &[u8]) -> Result<SignedRecordV1, Va
     Ok(record)
 }
 
-fn take_byte(bytes: &[u8], at: &mut usize) -> Result<u8, ValueParseError> {
-    if *at >= bytes.len() {
-        return Err(ValueParseError::new("canonical record"));
-    }
-    let value = bytes[*at];
-    *at += 1;
-    Ok(value)
+/// The shared reader, with this codec's one error value.
+fn malformed() -> ValueParseError {
+    ValueParseError::new("canonical record")
 }
-fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], ValueParseError> {
-    if bytes.len().saturating_sub(*at) < N {
-        return Err(ValueParseError::new("canonical record"));
-    }
-    let value = bytes[*at..*at + N].try_into().expect("checked width");
-    *at += N;
-    Ok(value)
-}
-fn take_vec(bytes: &[u8], at: &mut usize, len: usize) -> Result<Vec<u8>, ValueParseError> {
-    if bytes.len().saturating_sub(*at) < len {
-        return Err(ValueParseError::new("canonical record"));
-    }
-    let value = bytes[*at..*at + len].to_vec();
-    *at += len;
-    Ok(value)
-}
+
 fn parse_hex<const N: usize>(value: &str, label: &'static str) -> Result<[u8; N], ValueParseError> {
-    if value.len() != N * 2 {
-        return Err(ValueParseError::new(label));
-    }
-    let mut out = [0; N];
-    for (index, pair) in value.as_bytes().chunks(2).enumerate() {
-        out[index] = (hex_digit(pair[0]).ok_or(ValueParseError::new(label))? << 4)
-            | hex_digit(pair[1]).ok_or(ValueParseError::new(label))?;
-    }
-    Ok(out)
-}
-fn hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-fn write_hex(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(f, "{byte:02x}")?;
-    }
-    Ok(())
+    crate::encoding::hex_decode_fixed(value).ok_or_else(|| ValueParseError::new(label))
 }
 
 /// A committed immutable record returned by local append.

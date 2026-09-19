@@ -8,6 +8,7 @@ use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::content_key::ContentKey;
+use crate::encoding::ByteReader;
 use crate::error::StorageError;
 use crate::{PublicIdentity, WorkspaceId};
 
@@ -216,19 +217,21 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ProtectionControl, StorageError> {
     if kind != KIND_CREATE && kind != KIND_GRANT {
         return Err(StorageError::CorruptWorkspace);
     }
-    let mut at = DOMAIN_V2.len() + 2;
-    let scope = take_array::<32>(bytes, &mut at)?;
-    let workspace = WorkspaceId::from_bytes(take_array::<16>(bytes, &mut at)?);
-    let author = take_identity(bytes, &mut at)?;
-    let recipient = take_identity(bytes, &mut at)?;
-    let admission = take_array::<32>(bytes, &mut at)?;
-    let content_key_id = take_array::<32>(bytes, &mut at)?;
-    debug_assert_eq!(at, AAD_END);
-    let enc = take_array::<ENC_LEN>(bytes, &mut at)?;
-    let ciphertext = take_array::<CIPHERTEXT_LEN>(bytes, &mut at)?;
-    debug_assert_eq!(at, SIGNED_END);
-    let signature = take_array::<64>(bytes, &mut at)?;
-    if at != bytes.len() {
+    // The reader starts after the domain and version header, so its position in
+    // the whole control is `bytes.len() - reader.remaining()`.
+    let mut reader = ByteReader::new(&bytes[DOMAIN_V2.len() + 2..]);
+    let scope = take_array::<32>(&mut reader)?;
+    let workspace = WorkspaceId::from_bytes(take_array::<16>(&mut reader)?);
+    let author = take_identity(&mut reader)?;
+    let recipient = take_identity(&mut reader)?;
+    let admission = take_array::<32>(&mut reader)?;
+    let content_key_id = take_array::<32>(&mut reader)?;
+    debug_assert_eq!(bytes.len() - reader.remaining(), AAD_END);
+    let enc = take_array::<ENC_LEN>(&mut reader)?;
+    let ciphertext = take_array::<CIPHERTEXT_LEN>(&mut reader)?;
+    debug_assert_eq!(bytes.len() - reader.remaining(), SIGNED_END);
+    let signature = take_array::<64>(&mut reader)?;
+    if reader.finish().is_none() {
         return Err(StorageError::CorruptWorkspace);
     }
     if kind == KIND_CREATE && (recipient != author || admission != [0; 32]) {
@@ -332,15 +335,14 @@ pub(crate) fn verify_origin(
     Ok(())
 }
 
-fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], StorageError> {
-    let end = at.checked_add(N).ok_or(StorageError::CorruptWorkspace)?;
-    let value = bytes.get(*at..end).ok_or(StorageError::CorruptWorkspace)?;
-    *at = end;
-    value.try_into().map_err(|_| StorageError::CorruptWorkspace)
+fn take_array<const N: usize>(reader: &mut ByteReader<'_>) -> Result<[u8; N], StorageError> {
+    reader
+        .take_array::<N>()
+        .ok_or(StorageError::CorruptWorkspace)
 }
 
-fn take_identity(bytes: &[u8], at: &mut usize) -> Result<PublicIdentity, StorageError> {
-    PublicIdentity::from_bytes(take_array::<32>(bytes, at)?)
+fn take_identity(reader: &mut ByteReader<'_>) -> Result<PublicIdentity, StorageError> {
+    PublicIdentity::from_bytes(take_array::<32>(reader)?)
         .map_err(|_| StorageError::CorruptWorkspace)
 }
 

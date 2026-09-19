@@ -43,8 +43,5 @@ fn malformed_tampered_and_changed_target_values_are_rejected() {
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
-        .collect()
+    crate::encoding::hex_decode(value).expect("hex fixture")
 }

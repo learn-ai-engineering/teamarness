@@ -50,11 +50,11 @@ impl InvitationToken {
     }
 
     pub(crate) fn verified(&self) -> Result<VerifiedInvitationToken, InvitationError> {
-        decode_token(&decode_hex(&self.0).map_err(|_| InvitationError::Malformed)?)
+        decode_token(&hex_decode(&self.0).ok_or(InvitationError::Malformed)?)
     }
 
     pub(crate) fn from_verified(token: &VerifiedInvitationToken) -> Self {
-        Self(encode_hex(&token.bytes))
+        Self(hex_encode(&token.bytes))
     }
 }
 
@@ -62,7 +62,7 @@ impl FromStr for InvitationToken {
     type Err = ValueParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let bytes = decode_hex(value).map_err(|_| ValueParseError::new("invitation token"))?;
+        let bytes = hex_decode(value).ok_or_else(|| ValueParseError::new("invitation token"))?;
         decode_token(&bytes).map_err(|_| ValueParseError::new("invitation token"))?;
         Ok(Self(value.to_owned()))
     }
@@ -77,11 +77,11 @@ impl InvitationClaim {
     }
 
     pub(crate) fn verified(&self) -> Result<VerifiedInvitationClaim, InvitationError> {
-        decode_claim(&decode_hex(&self.0).map_err(|_| InvitationError::Malformed)?)
+        decode_claim(&hex_decode(&self.0).ok_or(InvitationError::Malformed)?)
     }
 
     pub(crate) fn from_verified(claim: &VerifiedInvitationClaim) -> Self {
-        Self(encode_hex(&claim.bytes))
+        Self(hex_encode(&claim.bytes))
     }
 }
 
@@ -89,7 +89,7 @@ impl FromStr for InvitationClaim {
     type Err = ValueParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let bytes = decode_hex(value).map_err(|_| ValueParseError::new("invitation claim"))?;
+        let bytes = hex_decode(value).ok_or_else(|| ValueParseError::new("invitation claim"))?;
         decode_claim(&bytes).map_err(|_| ValueParseError::new("invitation claim"))?;
         Ok(Self(value.to_owned()))
     }
@@ -249,27 +249,10 @@ fn claim_signature_payload(token_id: Hash, invitee: PublicIdentity) -> Vec<u8> {
     bytes
 }
 
+use crate::encoding::{hex_decode, hex_encode};
+
 fn copy_array<const N: usize>(bytes: &[u8]) -> [u8; N] {
     bytes.try_into().expect("validated canonical slice width")
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    encoded
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
-    if !value.len().is_multiple_of(2) || !value.is_ascii() {
-        return Err(());
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| ()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -375,7 +358,7 @@ mod tests {
         .unwrap();
         let claim = sign_claim(&secret(8), &token).unwrap();
         assert_eq!(
-            encode_hex(&token.bytes),
+            hex_encode(&token.bytes),
             "01020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03"
         );
         assert_eq!(
@@ -383,7 +366,7 @@ mod tests {
             "390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d417"
         );
         assert_eq!(
-            encode_hex(&claim.bytes),
+            hex_encode(&claim.bytes),
             "0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca511c5aeb0f1f776e59dea0e74c30ee2d1eae9a0eb75c2167d6f7e37683103e2635e528ef81502b64ad857773766eef6de1282266792da0f519f26320f6461c06"
         );
     }

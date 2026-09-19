@@ -265,7 +265,5 @@ mod tests {
         u32::try_from(length).unwrap().to_be_bytes().to_vec()
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+    use crate::encoding::hex_encode as hex;
 }

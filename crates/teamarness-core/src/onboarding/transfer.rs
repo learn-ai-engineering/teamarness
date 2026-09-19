@@ -164,20 +164,9 @@ fn copy_array<const N: usize>(bytes: &[u8]) -> [u8; N] {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    encoded
+    crate::encoding::hex_encode(bytes)
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, ValueParseError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(invalid());
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| invalid()))
-        .collect()
+    crate::encoding::hex_decode(value).ok_or_else(invalid)
 }

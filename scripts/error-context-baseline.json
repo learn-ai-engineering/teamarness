@@ -13,7 +13,7 @@
   "crates/teamarness-core/src/runtime/replication.rs": 3,
   "crates/teamarness-core/src/runtime/sync_receiver.rs": 20,
   "crates/teamarness-core/src/runtime/subscription.rs": 0,
-  "crates/teamarness-core/src/runtime/types.rs": 3,
+  "crates/teamarness-core/src/runtime/types.rs": 2,
   "crates/teamarness-core/src/network/mod.rs": 0,
   "crates/teamarness-core/src/network/error.rs": 0,
   "crates/teamarness-core/src/onboarding/transport.rs": 1,

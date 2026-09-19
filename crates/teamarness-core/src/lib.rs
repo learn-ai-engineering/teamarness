@@ -24,6 +24,7 @@
 
 mod blocking;
 mod diag;
+mod encoding;
 mod error;
 mod runtime;
 

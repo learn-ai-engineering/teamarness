@@ -1,6 +1,7 @@
 use iroh_base::{SecretKey, Signature};
 use p2panda_core::Hash;
 
+use crate::encoding::ByteReader;
 use crate::error::MembershipError;
 use crate::invitation::{VerifiedInvitationClaim, decode_claim};
 use crate::membership::{INSTALLATION_TAG, WORKSPACE_TAG};
@@ -283,34 +284,30 @@ fn encode_envelope(
     bytes
 }
 
-struct Reader<'a> {
-    remaining: &'a [u8],
-}
+/// The shared byte reader, with this codec's one error value.
+struct Reader<'a>(ByteReader<'a>);
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self(ByteReader::new(bytes))
     }
 
     fn byte(&mut self) -> Result<u8, MembershipError> {
-        Ok(self.take(1)?[0])
+        self.0.take_u8().ok_or(MembershipError::MalformedAction)
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], MembershipError> {
-        Ok(copy_array(self.take(N)?))
+        self.0
+            .take_array::<N>()
+            .ok_or(MembershipError::MalformedAction)
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], MembershipError> {
-        if length > self.remaining.len() {
-            return Err(MembershipError::MalformedAction);
-        }
-        let (value, remaining) = self.remaining.split_at(length);
-        self.remaining = remaining;
-        Ok(value)
+        self.0.take(length).ok_or(MembershipError::MalformedAction)
     }
 
-    fn is_empty(&self) -> bool {
-        self.remaining.is_empty()
+    const fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -327,9 +324,7 @@ mod tests {
         SecretKey::from_bytes(&[byte; 32])
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+    use crate::encoding::hex_encode as hex;
 
     #[test]
     fn canonical_create_is_stable_and_dependencies_are_sorted_unique() {

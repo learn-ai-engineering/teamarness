@@ -141,10 +141,7 @@ macro_rules! fixed_hex_value {
 
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                for byte in self.0 {
-                    write!(formatter, "{byte:02x}")?;
-                }
-                Ok(())
+                $crate::encoding::write_hex(&self.0, formatter)
             }
         }
 
@@ -211,17 +208,7 @@ fn parse_fixed_hex<const N: usize>(
     value: &str,
     label: &'static str,
 ) -> Result<[u8; N], ValueParseError> {
-    if value.len() != N * 2 || !value.is_ascii() {
-        return Err(ValueParseError::new(label));
-    }
-
-    let mut bytes = [0_u8; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
-            .map_err(|_| ValueParseError::new(label))?;
-    }
-    Ok(bytes)
+    crate::encoding::hex_decode_fixed(value).ok_or_else(|| ValueParseError::new(label))
 }
 
 /// A workspace-local durable cursor for committed membership transitions.
@@ -411,10 +398,7 @@ impl fmt::Debug for PublicSignature {
 
 impl fmt::Display for PublicSignature {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        crate::encoding::write_hex(&self.0, formatter)
     }
 }
 
