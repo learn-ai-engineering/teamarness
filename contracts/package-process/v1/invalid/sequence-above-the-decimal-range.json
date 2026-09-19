@@ -1,0 +1,28 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "stream_open",
+        "id": "h:wide-sequence",
+        "topic": "ui.events",
+        "mountId": "bW91bnQx",
+        "initialCredit": 32,
+        "payload": {}
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:wide-sequence",
+        "sequence": "18446744073709551616",
+        "payload": {}
+      }
+    }
+  ],
+  "expectedError": "invalid_decimal",
+  "description": "an event sequence one past the 64-bit range both peers parse a decimal string into"
+}

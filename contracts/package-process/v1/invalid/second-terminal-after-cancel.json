@@ -10,7 +10,8 @@
         "mountId": "bW91bnQx",
         "deadlineUnixMs": "1",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "host",
@@ -18,7 +19,8 @@
         "kind": "cancel",
         "id": "h:cancel-abandoned",
         "targetId": "h:abandoned"
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -26,7 +28,8 @@
         "kind": "response",
         "id": "h:abandoned",
         "payload": {}
-      }
+      },
+      "verdict": "ignore"
     },
     {
       "direction": "package",

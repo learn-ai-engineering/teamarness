@@ -39,7 +39,7 @@ async function files(directory, suffix) {
  * `{"retire":{"stream":id}}` — or carries one frame and the verdict that frame
  * must receive. Without the declared verdict a sequence proves only "this is
  * not fatal", and would pass unchanged if this implementation delivered a
- * frame the Rust one ignored.
+ * frame the Rust one ignored. Both corpora declare them.
  */
 function observeSequence(entries) {
   const state = new ContractState();
@@ -54,13 +54,19 @@ function observeSequence(entries) {
       entry.direction,
       parsePayload(Buffer.from(JSON.stringify(entry.frame))),
     );
-    if (entry.verdict !== undefined) {
-      assert.equal(
-        verdict,
-        { deliver: DELIVER, ignore: IGNORE }[entry.verdict],
-        JSON.stringify(entry.frame),
-      );
-    }
+    // Every frame the classifier accepts declares the verdict it receives,
+    // in `invalid/` as well as `golden/`. An `invalid/` sequence without them
+    // asserts only that its last frame is fatal, so the frames that set the
+    // state up could drift between the two implementations unnoticed.
+    assert.ok(
+      entry.verdict !== undefined,
+      `a frame the classifier accepted declares no verdict: ${JSON.stringify(entry.frame)}`,
+    );
+    assert.equal(
+      verdict,
+      { deliver: DELIVER, ignore: IGNORE }[entry.verdict],
+      JSON.stringify(entry.frame),
+    );
   }
 }
 
@@ -68,6 +74,9 @@ function errorCode(action) {
   try {
     action();
   } catch (error) {
+    // An assertion inside the sequence is this test failing, not the fixture's
+    // expected protocol error; rethrow it so its own message survives.
+    if (error instanceof assert.AssertionError) throw error;
     assert.ok(error instanceof ProtocolFailure);
     return error.code;
   }
@@ -166,7 +175,7 @@ test("the Node constants match the contract's own limits table", async () => {
 
 test("Node consumes every malformed fixture with its stable error", async () => {
   const paths = await files("invalid", ".json");
-  assert.equal(paths.length, 18);
+  assert.equal(paths.length, 19);
   for (const path of paths) {
     const fixture = JSON.parse(await readFile(path, "utf8"));
     const actual = errorCode(() => {

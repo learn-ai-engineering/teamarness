@@ -268,11 +268,21 @@ function validateDirection(direction, frame) {
   }
 }
 
+/** The largest value a decimal string may carry: both peers parse into 64 bits. */
+const MAX_DECIMAL = 2n ** 64n - 1n;
+
 function decimal(value) {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
     throw new ProtocolFailure("invalid_decimal");
   }
-  return BigInt(value);
+  const parsed = BigInt(value);
+  // A decimal string above the 64-bit range is not a number either peer can
+  // carry, and the Rust adapter, which parses into `u64`, calls that
+  // `invalid_decimal`. An unbounded BigInt survived to the sequence
+  // comparison instead and was reported as `event_sequence`, so the two
+  // implementations gave the same frame two different stable codes.
+  if (parsed > MAX_DECIMAL) throw new ProtocolFailure("invalid_decimal");
+  return parsed;
 }
 
 function rejectDuplicateKeys(text) {

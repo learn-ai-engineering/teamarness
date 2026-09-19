@@ -10,7 +10,8 @@
         "mountId": "bW91bnQx",
         "initialCredit": 32,
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -19,7 +20,8 @@
         "streamId": "h:out-of-range",
         "sequence": "1",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "host",

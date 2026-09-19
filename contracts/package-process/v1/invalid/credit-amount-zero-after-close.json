@@ -10,7 +10,8 @@
         "mountId": "bW91bnQx",
         "initialCredit": 32,
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -18,7 +19,8 @@
         "kind": "stream_close",
         "streamId": "h:zero-credit",
         "code": "completed"
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "host",

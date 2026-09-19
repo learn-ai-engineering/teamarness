@@ -25,10 +25,10 @@ fn json_files(directory: &str, extension: &str) -> Vec<PathBuf> {
 /// Runs one corpus sequence through the classifier.
 ///
 /// An entry either retires state — `{"retire":{"request":id}}` or
-/// `{"retire":{"stream":id}}` — or carries one frame and, where the corpus
-/// declares it, the verdict that frame must receive. Without the declared
-/// verdict a sequence proves only "this is not fatal", and would pass
-/// unchanged if one implementation delivered a frame the other ignored.
+/// `{"retire":{"stream":id}}` — or carries one frame and the verdict that frame
+/// must receive. Without the declared verdict a sequence proves only "this is
+/// not fatal", and would pass unchanged if one implementation delivered a
+/// frame the other ignored.
 fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
     let frames = value
         .as_array()
@@ -54,14 +54,26 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
         let bytes = serde_json::to_vec(&entry["frame"]).expect("frame JSON");
         let frame = decode_payload(&bytes)?;
         let verdict = state.observe(direction, &frame)?;
-        if let Some(expected) = entry.get("verdict").and_then(Value::as_str) {
-            let expected = match expected {
-                "deliver" => Verdict::Deliver,
-                "ignore" => Verdict::Ignore,
-                other => panic!("unknown verdict {other}"),
-            };
-            assert_eq!(verdict, expected, "{}", entry["frame"]);
-        }
+        // Every frame the classifier accepts declares the verdict it receives,
+        // in `invalid/` as well as `golden/`. An `invalid/` sequence without
+        // them asserts only that its last frame is fatal, so the frames that
+        // set the state up could drift between the two implementations
+        // unnoticed.
+        let expected = entry
+            .get("verdict")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a frame the classifier accepted declares no verdict: {}",
+                    entry["frame"]
+                )
+            });
+        let expected = match expected {
+            "deliver" => Verdict::Deliver,
+            "ignore" => Verdict::Ignore,
+            other => panic!("unknown verdict {other}"),
+        };
+        assert_eq!(verdict, expected, "{}", entry["frame"]);
     }
     Ok(())
 }
@@ -129,7 +141,7 @@ fn consumes_every_golden_sequence() {
 #[test]
 fn consumes_every_malformed_fixture_with_its_stable_error() {
     let paths = json_files("invalid", "json");
-    assert_eq!(paths.len(), 18, "the v1 malformed set is intentional");
+    assert_eq!(paths.len(), 19, "the v1 malformed set is intentional");
 
     for path in paths {
         let fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
