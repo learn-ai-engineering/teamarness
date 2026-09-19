@@ -255,7 +255,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     for column in [
         "scope_id",
         "log_id",
@@ -328,7 +328,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -454,8 +454,9 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     drop(runtime);
 
     // Rewind to the schema before this migration, keeping the workspace row.
-    // `pending_protection_records` is restored only so the forward migration
-    // has the table it drops; its columns are not the subject of this test.
+    // `pending_protection_records` and `protection_state.state_bytes` are
+    // restored only so the forward migrations have the table and the column
+    // they drop; neither shape is the subject of this test.
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection
         .execute_batch(
@@ -467,6 +468,7 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
              DROP TABLE membership_sync_wakes;
              DROP TABLE parked_operations;
              CREATE TABLE pending_protection_records (pending_id INTEGER PRIMARY KEY);
+             ALTER TABLE protection_state ADD COLUMN state_bytes BLOB;
              PRAGMA user_version = 9;",
         )
         .unwrap();
@@ -535,4 +537,44 @@ fn hex_bytes(value: &str) -> Vec<u8> {
     (0..value.len() / 2)
         .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
         .collect()
+}
+
+#[tokio::test]
+// Verifies: TEAM.SYS.ID-R07
+async fn migration_0012_removes_duplicate_content_key_copy() {
+    let directory = private_data_directory("migration-single-content-key");
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    let columns: Vec<String> = {
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('protection_state')")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    };
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+
+    assert!(
+        !columns.iter().any(|column| column == "state_bytes"),
+        "the second content-key copy is gone: {columns:?}"
+    );
+    assert!(columns.iter().any(|column| column == "content_key_id"));
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "creator_public_identity")
+    );
+    assert_eq!(version, 12);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
 }

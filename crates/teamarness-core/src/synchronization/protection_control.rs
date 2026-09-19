@@ -3,11 +3,11 @@ use hpke_rs::{Hpke, HpkePrivateKey, HpkePublicKey, Mode};
 use hpke_rs_crypto::types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
 use hpke_rs_rust_crypto::HpkeRustCrypto;
 use iroh_base::{SecretKey, Signature};
-use p2panda_core::Hash;
 use rusqlite::Transaction;
 use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
+use super::content_key::ContentKey;
 use crate::error::StorageError;
 use crate::{PublicIdentity, WorkspaceId};
 
@@ -119,11 +119,11 @@ pub(crate) fn seal_control(
     workspace: WorkspaceId,
     recipient: PublicIdentity,
     admission: [u8; 32],
-    content_key: &[u8; 32],
+    content_key: &ContentKey,
 ) -> Result<Vec<u8>, StorageError> {
     let author = PublicIdentity::from_bytes(*secret.public().as_bytes())
         .map_err(|_| StorageError::CorruptWorkspace)?;
-    let content_key_id = *Hash::digest(content_key).as_bytes();
+    let content_key_id = content_key.id();
     let header = header_bytes(
         kind,
         scope,
@@ -139,7 +139,7 @@ pub(crate) fn seal_control(
             &public,
             HPKE_INFO,
             &header,
-            content_key.as_slice(),
+            content_key.expose().as_slice(),
             None,
             None,
             None,
@@ -166,7 +166,7 @@ pub(crate) fn create(
     workspace: WorkspaceId,
     recipient: PublicIdentity,
     admission: [u8; 32],
-    content_key: [u8; 32],
+    content_key: &ContentKey,
 ) -> Result<Vec<u8>, StorageError> {
     seal_control(
         secret,
@@ -175,7 +175,7 @@ pub(crate) fn create(
         workspace,
         recipient,
         admission,
-        &content_key,
+        content_key,
     )
 }
 
@@ -186,7 +186,7 @@ pub(crate) fn grant(
     workspace: WorkspaceId,
     recipient: PublicIdentity,
     admission: [u8; 32],
-    content_key: [u8; 32],
+    content_key: &ContentKey,
 ) -> Result<Vec<u8>, StorageError> {
     seal_control(
         secret,
@@ -195,7 +195,7 @@ pub(crate) fn grant(
         workspace,
         recipient,
         admission,
-        &content_key,
+        content_key,
     )
 }
 
@@ -264,7 +264,7 @@ pub(crate) fn open_control(
     control: &ProtectionControl,
     header: &[u8],
     local: &SecretKey,
-) -> Result<Zeroizing<[u8; 32]>, StorageError> {
+) -> Result<ContentKey, StorageError> {
     let local_identity = PublicIdentity::from_bytes(*local.public().as_bytes())
         .map_err(|_| StorageError::CorruptWorkspace)?;
     if control.recipient != local_identity || header.len() != AAD_END {
@@ -290,7 +290,8 @@ pub(crate) fn open_control(
         return Err(StorageError::CorruptWorkspace);
     }
     key.copy_from_slice(plaintext.as_slice());
-    if *Hash::digest(key.as_slice()).as_bytes() != control.content_key_id {
+    let key = ContentKey::from_opened(key);
+    if key.id() != control.content_key_id {
         return Err(StorageError::CorruptWorkspace);
     }
     Ok(key)
@@ -386,7 +387,13 @@ mod tests {
         PublicIdentity::from_bytes(*secret(seed).public().as_bytes()).unwrap()
     }
 
-    fn sample_grant(author: &SecretKey, recipient: PublicIdentity, key: [u8; 32]) -> Vec<u8> {
+    use p2panda_core::Hash;
+
+    fn sample_key(byte: u8) -> ContentKey {
+        ContentKey::from_column(vec![byte; 32]).expect("a test key")
+    }
+
+    fn sample_grant(author: &SecretKey, recipient: PublicIdentity, key: &ContentKey) -> Vec<u8> {
         grant(
             author,
             [3; 32],
@@ -416,14 +423,16 @@ mod tests {
     fn grant_round_trip_opens_only_with_recipient_secret() {
         let author = secret(7);
         let recipient = secret(9);
-        let bytes = sample_grant(&author, identity(9), [8; 32]);
+        let bytes = sample_grant(&author, identity(9), &sample_key(8));
 
         let control = decode(&bytes).unwrap();
 
         assert_eq!(control.kind, KIND_GRANT);
         assert_eq!(control.recipient, identity(9));
         assert_eq!(
-            *open_control(&control, &bytes[..AAD_END], &recipient).unwrap(),
+            *open_control(&control, &bytes[..AAD_END], &recipient)
+                .unwrap()
+                .expose(),
             [8; 32]
         );
         assert!(open_control(&control, &bytes[..AAD_END], &author).is_err());
@@ -433,10 +442,10 @@ mod tests {
     // Verifies: TEAM.SYS.ID-R08
     #[test]
     fn grant_bytes_do_not_contain_the_content_key_or_a_public_wrap() {
-        let key = [8; 32];
-        let bytes = sample_grant(&secret(7), identity(9), key);
+        let key = sample_key(8);
+        let bytes = sample_grant(&secret(7), identity(9), &key);
 
-        assert!(!bytes.windows(32).any(|window| window == key));
+        assert!(!bytes.windows(32).any(|window| window == key.expose()));
 
         let mut wrap = Vec::with_capacity(DOMAIN_V1.len() + 64);
         wrap.extend_from_slice(DOMAIN_V1);
@@ -457,7 +466,7 @@ mod tests {
     // Verifies: TEAM.SYS.ID-R08
     #[test]
     fn header_tamper_breaks_signature() {
-        let bytes = sample_grant(&secret(7), identity(9), [8; 32]);
+        let bytes = sample_grant(&secret(7), identity(9), &sample_key(8));
 
         for offset in 0..SIGNED_END {
             let mut tampered = bytes.clone();
@@ -473,7 +482,7 @@ mod tests {
     #[test]
     fn resigned_control_with_other_author_does_not_open() {
         let recipient = secret(9);
-        let bytes = sample_grant(&secret(7), identity(9), [8; 32]);
+        let bytes = sample_grant(&secret(7), identity(9), &sample_key(8));
         let attacker = secret(12);
 
         let mut forged = bytes.clone();
@@ -507,7 +516,7 @@ mod tests {
                 WorkspaceId::from_bytes([4; 16]),
                 identity_point,
                 [5; 32],
-                [8; 32],
+                &sample_key(8),
             ),
             Err(StorageError::CorruptWorkspace)
         );
@@ -522,7 +531,7 @@ mod tests {
             WorkspaceId::from_bytes([4; 16]),
             identity(7),
             [0; 32],
-            [8; 32],
+            &sample_key(8),
         )
         .unwrap();
         assert_eq!(decode(&bytes).unwrap().kind, KIND_CREATE);
@@ -534,7 +543,7 @@ mod tests {
             WorkspaceId::from_bytes([4; 16]),
             identity(9),
             [0; 32],
-            &[8; 32],
+            &sample_key(8),
         )
         .unwrap();
         assert_eq!(
@@ -549,7 +558,7 @@ mod tests {
             WorkspaceId::from_bytes([4; 16]),
             identity(7),
             [5; 32],
-            &[8; 32],
+            &sample_key(8),
         )
         .unwrap();
         assert_eq!(
@@ -560,7 +569,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_version_1_controls_as_legacy() {
-        let mut bytes = sample_grant(&secret(7), identity(9), [8; 32]);
+        let mut bytes = sample_grant(&secret(7), identity(9), &sample_key(8));
         bytes[..DOMAIN_V1.len()].copy_from_slice(DOMAIN_V1);
 
         assert_eq!(decode(&bytes), Err(StorageError::LegacyProtectionState));
@@ -569,7 +578,7 @@ mod tests {
     // Verifies: TEAM.SYS.ID-R08
     #[test]
     fn control_signature_uses_domain_separated_context() {
-        let bytes = sample_grant(&secret(7), identity(9), [8; 32]);
+        let bytes = sample_grant(&secret(7), identity(9), &sample_key(8));
         let signature = Signature::from_bytes(&bytes[SIGNED_END..].try_into().unwrap());
 
         assert!(
@@ -596,16 +605,17 @@ mod tests {
         let recipient = identity(3);
         let scope = [7; 32];
         let workspace = WorkspaceId::from_bytes([8; 16]);
-        let key = [9; 32];
+        let key = sample_key(9);
         let genuine =
-            decode(&create(&creator, scope, workspace, identity(1), [0; 32], key).unwrap())
+            decode(&create(&creator, scope, workspace, identity(1), [0; 32], &key).unwrap())
                 .unwrap();
         let granted =
-            decode(&grant(&holder, scope, workspace, recipient, [5; 32], key).unwrap()).unwrap();
+            decode(&grant(&holder, scope, workspace, recipient, [5; 32], &key).unwrap()).unwrap();
         assert_eq!(verify_origin(&genuine, &granted, identity(1)), Ok(()));
 
         let minted =
-            decode(&create(&holder, scope, workspace, identity(2), [0; 32], key).unwrap()).unwrap();
+            decode(&create(&holder, scope, workspace, identity(2), [0; 32], &key).unwrap())
+                .unwrap();
         assert_eq!(
             verify_origin(&minted, &granted, identity(1)),
             Err(OriginError::NotCreator)
@@ -617,19 +627,29 @@ mod tests {
         let creator = secret(1);
         let recipient = identity(3);
         let workspace = WorkspaceId::from_bytes([8; 16]);
-        let key = [9; 32];
+        let key = sample_key(9);
         let granted =
-            decode(&grant(&creator, [7; 32], workspace, recipient, [5; 32], key).unwrap()).unwrap();
+            decode(&grant(&creator, [7; 32], workspace, recipient, [5; 32], &key).unwrap())
+                .unwrap();
         let other_scope =
-            decode(&create(&creator, [6; 32], workspace, identity(1), [0; 32], key).unwrap())
+            decode(&create(&creator, [6; 32], workspace, identity(1), [0; 32], &key).unwrap())
                 .unwrap();
         assert_eq!(
             verify_origin(&other_scope, &granted, identity(1)),
             Err(OriginError::ScopeMismatch)
         );
-        let other_key =
-            decode(&create(&creator, [7; 32], workspace, identity(1), [0; 32], [1; 32]).unwrap())
-                .unwrap();
+        let other_key = decode(
+            &create(
+                &creator,
+                [7; 32],
+                workspace,
+                identity(1),
+                [0; 32],
+                &sample_key(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             verify_origin(&other_key, &granted, identity(1)),
             Err(OriginError::KeyMismatch)
@@ -640,9 +660,18 @@ mod tests {
     fn create_control_is_not_accepted_as_a_grant() {
         let creator = secret(1);
         let workspace = WorkspaceId::from_bytes([8; 16]);
-        let control =
-            decode(&create(&creator, [7; 32], workspace, identity(1), [0; 32], [9; 32]).unwrap())
-                .unwrap();
+        let control = decode(
+            &create(
+                &creator,
+                [7; 32],
+                workspace,
+                identity(1),
+                [0; 32],
+                &sample_key(9),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(control.kind, KIND_CREATE);
         assert_eq!(
             verify_origin(&control, &control, identity(2)),

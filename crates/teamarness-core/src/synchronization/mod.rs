@@ -3,6 +3,7 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
+mod content_key;
 pub(crate) mod exchange;
 pub(crate) mod frames;
 pub(crate) mod health;
@@ -21,6 +22,7 @@ pub(crate) mod scheduler;
 pub(crate) mod test_io;
 pub(crate) mod worker;
 
+pub(crate) use content_key::ContentKey;
 pub(crate) use health::{PeerOutcome, SyncHealthRegistry};
 #[cfg(test)]
 pub(crate) use operation_store::log_id as operation_log_id;
@@ -96,9 +98,9 @@ const MAX_PARENTS: usize = 64;
 const RECORD_ID_DOMAIN: &[u8] = b"teamarness.immutable-record-id/v1";
 const SCOPE_DOMAIN: &[u8] = b"teamarness.immutable-record-scope/v1";
 const SIGNING_DOMAIN: &str = "teamarness.immutable-record/v1";
-type ScopeState = ([u8; 16], [u8; 32], [u8; 32]);
+type ScopeState = ([u8; 16], ContentKey, [u8; 32]);
 type StoredRecordFields = (Vec<u8>, Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>);
-type ScopeRecoveryRow = ([u8; 32], String, WorkspaceId, [u8; 32], [u8; 32]);
+type ScopeRecoveryRow = ([u8; 32], String, WorkspaceId, ContentKey, [u8; 32]);
 type RecordFields<'a> = (
     &'a [u8],
     &'a [u8],
@@ -489,7 +491,7 @@ trait RecordProtection {
 struct P2pandaRecordProtection {
     package_identity: String,
     workspace_id: WorkspaceId,
-    content_key: [u8; 32],
+    content_key: ContentKey,
 }
 
 impl P2pandaRecordProtection {
@@ -502,7 +504,7 @@ impl P2pandaRecordProtection {
     }
 
     fn key_id(&self) -> [u8; 32] {
-        *Hash::digest(self.content_key).as_bytes()
+        self.content_key.id()
     }
 }
 
@@ -531,7 +533,7 @@ impl RecordProtection for P2pandaRecordProtection {
         plaintext.extend_from_slice(&canonical);
         plaintext.extend_from_slice(Hash::digest(preliminary.prefix()).as_bytes());
         let ciphertext = p2panda_encryption::crypto::xchacha20::x_aead_encrypt(
-            &self.content_key,
+            self.content_key.expose(),
             &plaintext,
             nonce,
             None,
@@ -549,7 +551,7 @@ impl RecordProtection for P2pandaRecordProtection {
             return Err(ValueParseError::new("sealed record scope"));
         }
         let plaintext = p2panda_encryption::crypto::xchacha20::x_aead_decrypt(
-            &self.content_key,
+            self.content_key.expose(),
             &sealed.ciphertext,
             sealed.nonce,
             None,
@@ -874,9 +876,6 @@ pub(crate) fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) ->
     input.extend_from_slice(workspace_id.as_bytes());
     *Hash::digest(input).as_bytes()
 }
-fn key_id(key: &[u8; 32]) -> [u8; 32] {
-    *Hash::digest(key).as_bytes()
-}
 fn storage_error() -> SynchronizationError {
     SynchronizationError::Storage(StorageError::Database)
 }
@@ -905,18 +904,15 @@ fn ensure_scope(
         .optional()
         .map_err(|_| storage_error())?;
     if let Some((journal, key)) = found {
-        return Ok((fixed(journal)?, fixed(key)?, digest));
+        return Ok((fixed(journal)?, ContentKey::from_column(key)?, digest));
     }
     let mut journal = [0_u8; 16];
-    let mut key = [0_u8; 32];
     getrandom::fill(&mut journal).map_err(|_| storage_error())?;
-    getrandom::fill(&mut key).map_err(|_| storage_error())?;
-    conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key_id(&key).as_slice(), key.as_slice()]).map_err(|_| storage_error())?;
-    let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
-    bundle.extend_from_slice(&key);
+    let key = ContentKey::generate()?;
+    conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key.id().as_slice(), key.expose().as_slice()]).map_err(|_| storage_error())?;
     conn.execute(
-        "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![digest.as_slice(), bundle, key_id(&key).as_slice(), creator.as_bytes().as_slice()],
+        "INSERT INTO protection_state(scope_id,content_key_id,creator_public_identity) VALUES(?1,?2,?3)",
+        rusqlite::params![digest.as_slice(), key.id().as_slice(), creator.as_bytes().as_slice()],
     )
     .map_err(|_| storage_error())?;
     conn.execute(
@@ -945,7 +941,7 @@ pub(crate) fn export_protection_grant(
         .optional()
         .map_err(|_| storage_error())?
         .ok_or(SynchronizationError::WorkspaceNotFound)
-        .and_then(fixed)?;
+        .and_then(ContentKey::from_column)?;
     let author = secret.public();
     let existing = conn
         .query_row(
@@ -969,7 +965,7 @@ pub(crate) fn export_protection_grant(
     {
         return Ok(existing);
     }
-    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, key)
+    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, &key)
         .map_err(storage_or_corrupt)?;
     let control =
         protection_control::decode(&bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
@@ -1020,14 +1016,14 @@ pub(crate) fn forge_cross_scope_operation_for_test(
             |row| row.get(0),
         )
         .expect("a record in the source scope");
-    let content_key = |scope: [u8; 32]| -> [u8; 32] {
+    let content_key = |scope: [u8; 32]| -> ContentKey {
         conn.query_row(
             "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
             [scope.as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| ContentKey::from_column(bytes).ok())
         .expect("a held content key")
     };
     let signed = P2pandaRecordProtection {
@@ -1109,14 +1105,14 @@ pub(crate) fn forge_order_key_operation_for_test(
     let signed = SignedRecordV1::sign(secret, package, workspace, "message.post", canonical)
         .expect("a signable test record");
     let record_id = RecordId::digest(&signed.canonical_bytes());
-    let content_key: [u8; 32] = conn
+    let content_key = conn
         .query_row(
             "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
             [scope.as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| ContentKey::from_column(bytes).ok())
         .expect("a held content key");
     let sequence: i64 = conn
         .query_row(
@@ -1175,11 +1171,10 @@ pub(crate) fn forge_protection_bundle_for_test(
 ) -> (Vec<u8>, Vec<u8>) {
     let scope = scope_digest(package, workspace);
     let author = PublicIdentity::from_bytes(*secret.public().as_bytes()).expect("test identity");
-    let mut key = [0_u8; 32];
-    getrandom::fill(&mut key).expect("test randomness");
-    let origin = protection_control::create(secret, scope, workspace, author, [0; 32], key)
+    let key = ContentKey::generate().expect("test randomness");
+    let origin = protection_control::create(secret, scope, workspace, author, [0; 32], &key)
         .expect("test origin");
-    let grant = protection_control::grant(secret, scope, workspace, recipient, [5; 32], key)
+    let grant = protection_control::grant(secret, scope, workspace, recipient, [5; 32], &key)
         .expect("test grant");
     (origin, grant)
 }
@@ -1239,13 +1234,11 @@ pub(crate) fn import_protection_grant(
         getrandom::fill(&mut journal).map_err(|_| storage_error())?;
         tx.execute(
             "INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.as_slice()],
+            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.expose().as_slice()],
         ).map_err(|_| storage_error())?;
-        let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
-        bundle.extend_from_slice(key.as_slice());
         tx.execute(
-            "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![scope.as_slice(), bundle, control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
+            "INSERT INTO protection_state(scope_id,content_key_id,creator_public_identity) VALUES(?1,?2,?3)",
+            rusqlite::params![scope.as_slice(), control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
         ).map_err(|_| storage_error())?;
         tx.execute(
             "INSERT INTO durable_wakes(scope_id,wake_generation) VALUES(?1,0)",
@@ -1360,7 +1353,7 @@ pub(crate) fn append(
     let protection = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
-        content_key: key,
+        content_key: key.clone(),
     };
     let existing: Option<StoredRecordFields> = tx.query_row("SELECT o.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM immutable_operations o JOIN immutable_records r ON r.record_id=o.record_id JOIN immutable_idempotency i ON i.record_id=o.record_id WHERE i.scope_id=?1 AND i.record_id=?2", rusqlite::params![scope.as_slice(), record_id.as_bytes().as_slice()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| storage_error())?;
     if let Some((id, order, author, p, sig, sealed)) = existing {
@@ -1409,7 +1402,7 @@ pub(crate) fn append(
         &[],
         height,
         purpose,
-        key_id(&key),
+        key.id(),
     )
     .map_err(|_| storage_error())?;
     if tx
@@ -1422,7 +1415,7 @@ pub(crate) fn append(
         == 0
     {
         let control =
-            protection_control::create(secret, scope, workspace, signed.author, [0; 32], key)
+            protection_control::create(secret, scope, workspace, signed.author, [0; 32], &key)
                 .map_err(|_| storage_error())?;
         let parsed = protection_control::decode(&control).map_err(|_| storage_error())?;
         protection_control::insert(
@@ -1486,7 +1479,7 @@ pub(crate) fn open_records(
         .optional()
         .map_err(|_| storage_error())?
         .ok_or(SynchronizationError::WorkspaceNotFound)?;
-    let key = fixed(key)?;
+    let key = ContentKey::from_column(key)?;
     let protector = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
@@ -1616,7 +1609,7 @@ pub(crate) fn insert_remote_operation(
     if sealed.scope_digest != scope {
         return Err(RemoteInsertError::WrongScope);
     }
-    let (journal, key, content_key_id): ([u8; 16], [u8; 32], [u8; 32]) = conn
+    let (journal, key, content_key_id): ([u8; 16], ContentKey, [u8; 32]) = conn
         .query_row(
             "SELECT journal_id,content_key,content_key_id FROM sync_scopes WHERE scope_id=?1",
             [scope.as_slice()],
@@ -1625,8 +1618,7 @@ pub(crate) fn insert_remote_operation(
                     row.get::<_, Vec<u8>>(0)?
                         .try_into()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    row.get::<_, Vec<u8>>(1)?
-                        .try_into()
+                    ContentKey::from_column(row.get::<_, Vec<u8>>(1)?)
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     row.get::<_, Vec<u8>>(2)?
                         .try_into()
@@ -1916,7 +1908,7 @@ fn validate_protection_controls(
         let Some(scope_key_id) = scope_key_id else {
             return Err(StorageError::CorruptWorkspace);
         };
-        if scope_key_id != key_id(&key).as_slice() {
+        if scope_key_id != key.id().as_slice() {
             return Err(StorageError::CorruptWorkspace);
         }
     }
@@ -1954,7 +1946,7 @@ pub(crate) fn recover(
                         .try_into()
                         .map_err(|_| StorageError::CorruptWorkspace)?,
                 ),
-                key.try_into().map_err(|_| StorageError::CorruptWorkspace)?,
+                ContentKey::from_column(key).map_err(|_| StorageError::CorruptWorkspace)?,
                 id.try_into().map_err(|_| StorageError::CorruptWorkspace)?,
             ))
         })
@@ -1964,7 +1956,8 @@ pub(crate) fn recover(
     let mut report = RecoveryReport::default();
     // Scope identity comes first: a scope whose binding or key identity is
     // broken is isolated before anything that reads it runs.
-    let mut sound = Vec::with_capacity(scopes.len());
+    let mut sound: Vec<([u8; 32], String, WorkspaceId, ContentKey)> =
+        Vec::with_capacity(scopes.len());
     for (scope, package, workspace, key, id) in scopes {
         report.scopes_checked += 1;
         if quarantine::is_scope_quarantined(conn, scope).map_err(|_| StorageError::Database)? {
@@ -1973,7 +1966,7 @@ pub(crate) fn recover(
         }
         let fault = if scope_digest(&package, workspace) != scope {
             Some(quarantine::ScopeFault::ScopeBinding)
-        } else if key_id(&key) != id {
+        } else if key.id() != id {
             Some(quarantine::ScopeFault::ContentKeyId)
         } else {
             None
@@ -2011,7 +2004,7 @@ fn validate_scope_records(
     scope: [u8; 32],
     package: &str,
     workspace: WorkspaceId,
-    key: [u8; 32],
+    key: ContentKey,
     now_unix_ms: i64,
     report: &mut RecoveryReport,
 ) -> Result<(), StorageError> {
@@ -2237,7 +2230,7 @@ mod tests {
             let protector = P2pandaRecordProtection {
                 package_identity: record.package_identity.clone(),
                 workspace_id: record.workspace_id,
-                content_key: [9; 32],
+                content_key: ContentKey::from_column(vec![9; 32]).unwrap(),
             };
             let id = RecordId::digest(&record.canonical_bytes());
             let sealed = protector
@@ -2263,7 +2256,7 @@ mod tests {
             let protector = P2pandaRecordProtection {
                 package_identity: package_identity.to_owned(),
                 workspace_id,
-                content_key: [9; 32],
+                content_key: ContentKey::from_column(vec![9; 32]).unwrap(),
             };
             let id = RecordId::digest(&record.canonical_bytes());
             let sealed = protector
@@ -2322,20 +2315,18 @@ mod tests {
         }
 
         #[test]
-        fn serialized_secret_and_concurrent_holders_keep_one_key_id() {
+        fn concurrent_holders_keep_one_key_id() {
             let first = P2pandaRecordProtection {
                 package_identity: "pkg".into(),
                 workspace_id: WorkspaceId::from_bytes([1; 16]),
-                content_key: [8; 32],
+                content_key: ContentKey::from_column(vec![8; 32]).unwrap(),
             };
             let second = P2pandaRecordProtection {
-                content_key: first.content_key,
+                content_key: first.content_key.clone(),
                 ..first.clone()
             };
+
             assert_eq!(first.key_id(), second.key_id());
-            let serialized = serde_json::to_vec(&first.content_key).unwrap();
-            let restored: [u8; 32] = serde_json::from_slice(&serialized).unwrap();
-            assert_eq!(restored, first.content_key);
         }
     }
 }

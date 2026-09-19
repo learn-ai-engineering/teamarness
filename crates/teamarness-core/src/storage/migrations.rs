@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 11;
+const LATEST_SCHEMA_VERSION: i64 = 12;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_core.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_workspaces_membership.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_invitations.sql");
@@ -14,6 +14,7 @@ const MIGRATION_0008: &str = include_str!("../../migrations/0008_protection_cont
 const MIGRATION_0009: &str = include_str!("../../migrations/0009_synchronization_worker.sql");
 const MIGRATION_0010: &str = include_str!("../../migrations/0010_membership_replication.sql");
 const MIGRATION_0011: &str = include_str!("../../migrations/0011_sync_bounds_and_recovery.sql");
+const MIGRATION_0012: &str = include_str!("../../migrations/0012_single_content_key_copy.sql");
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
     let transaction = connection
@@ -80,6 +81,11 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
     if current_version < 11 {
         transaction
             .execute_batch(MIGRATION_0011)
+            .map_err(|_| StorageError::Migration)?;
+    }
+    if current_version < 12 {
+        transaction
+            .execute_batch(MIGRATION_0012)
             .map_err(|_| StorageError::Migration)?;
     }
     transaction

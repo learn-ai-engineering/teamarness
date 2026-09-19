@@ -388,3 +388,92 @@ async fn core_database_contains_sealed_payload_not_canonical_record_bytes() {
     );
     fs::remove_dir_all(path).unwrap();
 }
+
+/// Counts how many BLOB values anywhere in the database contain `needle`.
+fn blob_occurrences(connection: &Connection, needle: &[u8]) -> usize {
+    let tables: Vec<String> = {
+        let mut statement = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    };
+    let mut found = 0;
+    for table in tables {
+        let columns: Vec<String> = {
+            let mut statement = connection
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        for column in columns {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT \"{column}\" FROM \"{table}\" WHERE typeof(\"{column}\") = 'blob'"
+                ))
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap();
+            for value in rows.map(Result::unwrap) {
+                found += value
+                    .windows(needle.len())
+                    .filter(|window| *window == needle)
+                    .count();
+            }
+        }
+    }
+    found
+}
+
+// Verifies: TEAM.SYS.ID-R07
+#[tokio::test]
+async fn content_key_is_stored_exactly_once() {
+    let path = directory();
+    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&path))
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Custody").unwrap();
+    runtime
+        .append_record(
+            workspace.id(),
+            "teamarness.test",
+            "message.post",
+            b"one key",
+        )
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let database = path.join("core.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    let key: Vec<u8> = connection
+        .query_row("SELECT content_key FROM sync_scopes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(key.len(), 32);
+
+    assert_eq!(
+        blob_occurrences(&connection, &key),
+        1,
+        "the content key appears in exactly one stored value"
+    );
+    drop(connection);
+
+    // And exactly once in the file itself, so no freed page still holds it.
+    let raw = fs::read(&database).unwrap();
+    let on_disk = raw
+        .windows(key.len())
+        .filter(|window| *window == key.as_slice())
+        .count();
+    assert_eq!(
+        on_disk, 1,
+        "the content key appears once in the database file"
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}

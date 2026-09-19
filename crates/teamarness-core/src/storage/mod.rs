@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use iroh_base::SecretKey;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use zeroize::Zeroizing;
 
 use crate::error::StorageError;
 use crate::identity::DEFAULT_DISPLAY_NAME;
@@ -58,6 +59,12 @@ fn open_inner(
     prepare_private_database_file(&database_path)?;
 
     let mut connection = Connection::open(&database_path).map_err(|_| StorageError::Database)?;
+    // ADR 0017: freed pages are overwritten, so a dropped column's key bytes
+    // and a deleted row's contents do not survive on disk. Set before the
+    // migrations run, because migration 0012 frees exactly such pages.
+    connection
+        .pragma_update(None, "secure_delete", "ON")
+        .map_err(|_| StorageError::Database)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|_| StorageError::Database)?;
@@ -88,16 +95,24 @@ fn load_identity(connection: &Connection) -> Result<Option<(SecretKey, String)>,
              FROM installation_identity
              WHERE singleton_id = 1",
             [],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    // The seed leaves SQLite straight into a zeroizing buffer.
+                    Zeroizing::new(row.get::<_, Vec<u8>>(0)?),
+                    row.get::<_, String>(1)?,
+                ))
+            },
         )
         .optional()
         .map_err(|_| StorageError::Database)?;
 
     stored
         .map(|(secret_bytes, display_name)| {
-            let bytes: [u8; 32] = secret_bytes
-                .try_into()
-                .map_err(|_| StorageError::CorruptIdentity)?;
+            if secret_bytes.len() != 32 {
+                return Err(StorageError::CorruptIdentity);
+            }
+            let mut bytes = Zeroizing::new([0_u8; 32]);
+            bytes.copy_from_slice(secret_bytes.as_slice());
             crate::identity::validate_display_name(&display_name)
                 .map_err(|_| StorageError::CorruptIdentity)?;
             Ok((SecretKey::from_bytes(&bytes), display_name))
@@ -119,7 +134,10 @@ fn initialize_identity(connection: &mut Connection) -> Result<(SecretKey, String
                 .execute(
                     "INSERT INTO installation_identity (singleton_id, secret_key, display_name)
                      VALUES (1, ?1, ?2)",
-                    params![secret_key.to_bytes().as_slice(), DEFAULT_DISPLAY_NAME],
+                    params![
+                        Zeroizing::new(secret_key.to_bytes()).as_slice(),
+                        DEFAULT_DISPLAY_NAME
+                    ],
                 )
                 .map_err(|_| StorageError::Database)?;
             transaction
@@ -388,6 +406,22 @@ mod tests {
         let reopened_again = open(&directory, 0).unwrap();
         assert_eq!(reopened_again.secret_key.public(), identity);
         drop(reopened_again);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Verifies: TEAM.SYS.ID-R07
+    #[test]
+    fn secure_delete_is_enabled_on_open() {
+        let directory = test_directory("secure-delete");
+        let stored = open(&directory, 0).unwrap();
+
+        let secure_delete: i64 = stored
+            .connection
+            .pragma_query_value(None, "secure_delete", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(secure_delete, 1);
+        drop(stored);
         fs::remove_dir_all(directory).unwrap();
     }
 

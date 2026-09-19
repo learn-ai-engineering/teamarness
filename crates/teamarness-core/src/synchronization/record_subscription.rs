@@ -18,12 +18,12 @@ use crate::runtime::RuntimeState;
 
 use super::health::{self, AvailabilityInputs, SyncHealthRegistry};
 use super::{
-    Cursor, P2pandaRecordProtection, RecordEvent, RecordProtection, SealedRecordV1,
+    ContentKey, Cursor, P2pandaRecordProtection, RecordEvent, RecordProtection, SealedRecordV1,
     SynchronizationError, fixed, parking, quarantine, record_from_row, scope_digest, storage_error,
 };
 
 /// A scope's delivery journal identity and content key.
-type ScopeKeys = ([u8; 16], [u8; 32]);
+type ScopeKeys = ([u8; 16], ContentKey);
 /// One delivery row: sequence, record identity, order key, author, purpose,
 /// signature, sealed envelope, and whether the record is quarantined.
 type DeliveryRow = (
@@ -654,7 +654,7 @@ impl RecordSubscription {
             .optional()
             .map_err(|_| storage_error())?;
         match found {
-            Some((journal, key)) => Ok(Some((fixed(journal)?, fixed(key)?))),
+            Some((journal, key)) => Ok(Some((fixed(journal)?, ContentKey::from_column(key)?))),
             None => Ok(None),
         }
     }

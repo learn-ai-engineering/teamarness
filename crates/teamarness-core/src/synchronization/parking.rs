@@ -299,7 +299,7 @@ mod tests {
     use p2panda_core::{Body, Hash, Header, SigningKey};
 
     use super::super::{
-        OrderKey, P2pandaRecordProtection, RecordId, RecordProtection, SignedRecordV1,
+        ContentKey, OrderKey, P2pandaRecordProtection, RecordId, RecordProtection, SignedRecordV1,
     };
     use super::*;
 
@@ -321,7 +321,7 @@ mod tests {
         connection: Connection,
         secret: SecretKey,
         workspace: WorkspaceId,
-        key: [u8; 32],
+        key: ContentKey,
         next_sequence: u32,
         previous: Option<Hash>,
     }
@@ -340,7 +340,7 @@ mod tests {
                 connection: stored.connection,
                 secret: stored.secret_key,
                 workspace: WorkspaceId::from_bytes([11; 16]),
-                key: [7; 32],
+                key: ContentKey::from_column(vec![7; 32]).expect("a test key"),
                 next_sequence: 0,
                 previous: None,
             }
@@ -362,7 +362,7 @@ mod tests {
             let protection = P2pandaRecordProtection {
                 package_identity: package.to_owned(),
                 workspace_id: self.workspace,
-                content_key: self.key,
+                content_key: self.key.clone(),
             };
             let record_id = RecordId::digest(&signed.canonical_bytes());
             let order = OrderKey::from_height_and_id(height, record_id);
