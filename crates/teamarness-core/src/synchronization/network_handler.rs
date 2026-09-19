@@ -411,6 +411,72 @@ fn parse_truncated_suffix(bytes: &[u8], prefix: &[u8]) -> Result<bool, LogSessio
     }
 }
 
+/// The protection bundle this side offers, when it holds the scope's content
+/// key and the peer does not. Both roles offer on the same condition; only the
+/// frame it travels in differs.
+async fn protection_offer(
+    receiver: &Arc<dyn SyncReceiver>,
+    grant: &SessionGrant,
+    remote_key: Option<[u8; 32]>,
+    workspace: WorkspaceId,
+    package: &str,
+    peer: PublicIdentity,
+) -> Option<ProtectionBundle> {
+    if grant.content_key_id.is_none() || remote_key.is_some() {
+        return None;
+    }
+    let scope = package.to_owned();
+    note_rejection(
+        crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.protection_bundle_for(workspace, &scope, peer)
+        })
+        .await,
+    )
+    .flatten()
+}
+
+/// Imports the protection bundle the peer offered, if it offered one. A bundle
+/// this Installation cannot use is not a session failure: the session simply
+/// carries no content it can open.
+async fn import_offered_bundle(
+    receiver: &Arc<dyn SyncReceiver>,
+    offered: Option<ProtectionBundleWire>,
+    workspace: WorkspaceId,
+    package: &str,
+    peer: PublicIdentity,
+) -> Result<(), LogSessionError> {
+    let Some(offered) = offered else {
+        return Ok(());
+    };
+    let bundle = offered.validated().map_err(LogSessionError::Protocol)?;
+    let scope = package.to_owned();
+    note_rejection(
+        crate::blocking::receiver_call(receiver, move |receiver| {
+            receiver.import_protection_bundle(peer, workspace, &scope, bundle)
+        })
+        .await,
+    );
+    Ok(())
+}
+
+/// Two Installations that disagree about membership are exactly the case a
+/// membership session resolves, so the worker is asked to run one.
+async fn note_membership_mismatch(
+    receiver: &Arc<dyn SyncReceiver>,
+    remote_version: [u8; 32],
+    grant: &SessionGrant,
+    workspace: WorkspaceId,
+    peer: PublicIdentity,
+) {
+    if remote_version == grant.membership_version {
+        return;
+    }
+    let _ = crate::blocking::receiver_call(receiver, move |receiver| {
+        receiver.note_membership_mismatch(workspace, peer);
+    })
+    .await;
+}
+
 /// Loads what this side will offer and runs the exchange.
 #[allow(clippy::too_many_arguments)]
 async fn exchange_and_acknowledge(
@@ -574,34 +640,9 @@ async fn outbound_session_body(
         connection.close(CLOSE_KEY_MISMATCH.into(), b"key mismatch");
         return Err(LogSessionError::Refused(Refusal::KeyMismatch));
     }
-    if let Some(bundle) = welcome_bundle {
-        let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
-        let scope = package.to_owned();
-        note_rejection(
-            crate::blocking::receiver_call(receiver, move |receiver| {
-                receiver.import_protection_bundle(peer, workspace, &scope, bundle)
-            })
-            .await,
-        );
-    }
-    if remote_version != grant.membership_version {
-        let _ = crate::blocking::receiver_call(receiver, move |receiver| {
-            receiver.note_membership_mismatch(workspace, peer);
-        })
-        .await;
-    }
-    let offer = if grant.content_key_id.is_some() && remote_key.is_none() {
-        let scope = package.to_owned();
-        note_rejection(
-            crate::blocking::receiver_call(receiver, move |receiver| {
-                receiver.protection_bundle_for(workspace, &scope, peer)
-            })
-            .await,
-        )
-        .flatten()
-    } else {
-        None
-    };
+    import_offered_bundle(receiver, welcome_bundle, workspace, package, peer).await?;
+    note_membership_mismatch(receiver, remote_version, &grant, workspace, peer).await;
+    let offer = protection_offer(receiver, &grant, remote_key, workspace, package, peer).await;
     sink.send(LogSyncWire::Ready {
         protection: offer.map(ProtectionBundleWire::from_bundle),
     })
@@ -876,18 +917,7 @@ async fn run_log_session_body(
     {
         return Err(refuse(&mut sink, connection, Refusal::KeyMismatch).await);
     }
-    let bundle = if grant.content_key_id.is_some() && remote_key.is_none() {
-        let scope = package.clone();
-        note_rejection(
-            crate::blocking::receiver_call(receiver, move |receiver| {
-                receiver.protection_bundle_for(workspace, &scope, peer)
-            })
-            .await,
-        )
-        .flatten()
-    } else {
-        None
-    };
+    let bundle = protection_offer(receiver, &grant, remote_key, workspace, &package, peer).await;
     sink.send(LogSyncWire::Welcome {
         membership_version: grant.membership_version,
         content_key_id: grant.content_key_id,
@@ -895,28 +925,14 @@ async fn run_log_session_body(
     })
     .await
     .map_err(|error| transport_error(connection, &error))?;
-    if remote_version != grant.membership_version {
-        let _ = crate::blocking::receiver_call(receiver, move |receiver| {
-            receiver.note_membership_mismatch(workspace, peer);
-        })
-        .await;
-    }
+    note_membership_mismatch(receiver, remote_version, &grant, workspace, peer).await;
     match reader
         .next_wire()
         .await
         .map_err(|error| transport_error(connection, &error))?
     {
         LogSyncWire::Ready { protection } => {
-            if let Some(bundle) = protection {
-                let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
-                let scope = package.clone();
-                note_rejection(
-                    crate::blocking::receiver_call(receiver, move |receiver| {
-                        receiver.import_protection_bundle(peer, workspace, &scope, bundle)
-                    })
-                    .await,
-                );
-            }
+            import_offered_bundle(receiver, protection, workspace, &package, peer).await?;
         }
         LogSyncWire::Refused { reason } => {
             return Err(LogSessionError::Refused(
