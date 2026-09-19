@@ -371,6 +371,15 @@ impl GenerationCapabilities {
     /// is inside the window the contract grants, and credit for a stream this
     /// generation has retired never reaches this function. What is left is a
     /// send that `STREAM_COMMAND_QUEUE` is sized to accept.
+    ///
+    /// The stream tasks therefore add what they are given and do not clamp it.
+    /// The classifier decrements at dequeue and the task at enqueue, so the
+    /// task's credit is never above the classifier's, and the classifier
+    /// refuses any grant past the window on the reader before this is reached
+    /// (`state.rs`,
+    /// `credit_cannot_carry_a_stream_past_the_window_it_was_opened_with`). A
+    /// clamp here would be a second copy of a classifier rule inside an
+    /// adapter, which is how the two sides come to disagree.
     pub(crate) async fn add_credit(&self, stream_id: &str, amount: u64) {
         let Some(sender) = self.streams.lock().await.get(stream_id).cloned() else {
             return;
@@ -800,7 +809,7 @@ async fn drain_commands(commands: &mut mpsc::Receiver<StreamCommand>, credit: &m
     while let Ok(command) = commands.try_recv() {
         match command {
             StreamCommand::Credit(amount) => {
-                *credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+                *credit = credit.saturating_add(amount);
             }
             StreamCommand::Close => return false,
         }
@@ -819,7 +828,7 @@ async fn await_credit(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => {
-                    *credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+                    *credit = credit.saturating_add(amount);
                 }
                 Some(StreamCommand::Close) | None => return false,
             },
@@ -880,7 +889,7 @@ async fn run_membership_stream(
                 }
                 command = commands.recv() => match command {
                     Some(StreamCommand::Credit(amount)) => {
-                        credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+                        credit = credit.saturating_add(amount);
                     }
                     Some(StreamCommand::Close) | None => {
                         output.retire(&stream_id).await;
@@ -1225,7 +1234,7 @@ async fn run_record_stream(
             }
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => {
-                    credit = credit.saturating_add(amount).min(MAX_STREAM_CREDIT);
+                    credit = credit.saturating_add(amount);
                 }
                 Some(StreamCommand::Close) | None => {
                     output.retire(&stream_id).await;
