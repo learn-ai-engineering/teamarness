@@ -50,6 +50,19 @@ pub(crate) fn open_with_fault(
     open_inner(private_data_directory, now_unix_ms, fault)
 }
 
+/// A migrated, empty schema in memory, for tests that exercise one statement
+/// rather than a whole runtime. Foreign keys stay off, so a test writes the one
+/// table it is about.
+#[cfg(test)]
+pub(crate) fn memory_schema_for_test() -> Connection {
+    let mut connection = Connection::open_in_memory().expect("an in-memory database opens");
+    migrations::apply(&mut connection).expect("the migration batch applies");
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("foreign keys can be turned off");
+    connection
+}
+
 fn open_inner(
     private_data_directory: &Path,
     now_unix_ms: i64,

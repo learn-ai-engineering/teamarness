@@ -8,6 +8,7 @@ mod content_key;
 pub(crate) mod exchange;
 pub(crate) mod frames;
 pub(crate) mod health;
+mod journal_sql;
 pub(crate) mod key_bridge;
 pub(crate) mod limits;
 pub(crate) mod log_view;
@@ -1343,7 +1344,29 @@ pub(crate) fn append(
     let sealed_bytes = sealed.encode();
     let operation_id = RecordId::digest(&sealed_bytes);
     let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(fault!(storage_error()))?;
-    tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),order.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,sealed_bytes.as_slice(),Vec::<u8>::new(),height]).map_err(fault!(storage_error()))?;
+    let operation_id_bytes = operation_id.as_bytes();
+    let record_id_bytes = record_id.as_bytes();
+    let order_bytes = order.as_bytes();
+    let author_bytes = signed.author.as_bytes();
+    let signature_bytes = signed.signature.to_bytes();
+    let row = journal_sql::AcceptedOperation {
+        operation_id: operation_id_bytes.as_slice(),
+        scope: scope.as_slice(),
+        record_id: record_id_bytes.as_slice(),
+        order_key: order_bytes.as_slice(),
+        author: author_bytes.as_slice(),
+        sequence,
+        operation_bytes: sealed_bytes.as_slice(),
+        parents: &[],
+        causal_height: height,
+        purpose,
+        canonical,
+        signature: signature_bytes.as_slice(),
+        sealed_record: sealed_bytes.as_slice(),
+        journal: journal.as_slice(),
+        created_at_unix_ms: now_unix_ms,
+    };
+    journal_sql::insert_operation(&tx, &row).map_err(fault!(storage_error()))?;
     let projection_operation_id = operation_store::insert(
         &tx,
         secret,
@@ -1383,25 +1406,8 @@ pub(crate) fn append(
         )?;
         let _ = projection_operation_id;
     }
-    tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),sealed_bytes.as_slice()]).map_err(fault!(storage_error()))?;
-    tx.execute(
-        "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
-        rusqlite::params![
-            record_id.as_bytes().as_slice(),
-            scope.as_slice(),
-            sealed_bytes.as_slice()
-        ],
-    )
-    .map_err(fault!(storage_error()))?;
-    tx.execute("INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),record_id.as_bytes().as_slice()]).map_err(fault!(storage_error()))?;
-    tx.execute("INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id) VALUES(?1,?2,?3) ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),operation_id.as_bytes().as_slice()]).map_err(fault!(storage_error()))?;
-    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice(),now_unix_ms]).map_err(fault!(storage_error()))?;
-    let delivery_sequence = tx.last_insert_rowid();
-    tx.execute(
-        "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
-        [scope.as_slice()],
-    )
-    .map_err(fault!(storage_error()))?;
+    let delivery_sequence =
+        journal_sql::insert_record_rows(&tx, &row).map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
     let record = record_from_row((
@@ -1692,23 +1698,29 @@ pub(crate) fn insert_remote_operation(
     }
     // All Teamarness rows and the P2Panda projection share this transaction.
     // An invalid projection therefore rolls back the accepted record too.
-    transaction
-        .execute(
-            "INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')",
-            rusqlite::params![
-                teamarness_operation_id.as_bytes().as_slice(),
-                scope.as_slice(),
-                record_id.as_bytes().as_slice(),
-                sealed.order_key.as_bytes().as_slice(),
-                signed.author.as_bytes(),
-                i64::from(operation.header.seq_num),
-                payload.as_slice(),
-                Vec::<u8>::new(),
-                sealed.order_key.height(),
-            ],
-        )
-        .map_err(insert_error)?;
+    let operation_id_bytes = teamarness_operation_id.as_bytes();
+    let record_id_bytes = record_id.as_bytes();
+    let order_bytes = sealed.order_key.as_bytes();
+    let author_bytes = signed.author.as_bytes();
+    let signature_bytes = signed.signature.to_bytes();
+    let row = journal_sql::AcceptedOperation {
+        operation_id: operation_id_bytes.as_slice(),
+        scope: scope.as_slice(),
+        record_id: record_id_bytes.as_slice(),
+        order_key: order_bytes.as_slice(),
+        author: author_bytes.as_slice(),
+        sequence: i64::from(operation.header.seq_num),
+        operation_bytes: payload.as_slice(),
+        parents: &[],
+        causal_height: sealed.order_key.height(),
+        purpose: &signed.purpose,
+        canonical: &signed.canonical,
+        signature: signature_bytes.as_slice(),
+        sealed_record: payload.as_slice(),
+        journal: journal.as_slice(),
+        created_at_unix_ms: now_unix_ms,
+    };
+    journal_sql::insert_operation(&transaction, &row).map_err(insert_error)?;
     operation_store::insert_remote(
         &transaction,
         scope,
@@ -1720,70 +1732,8 @@ pub(crate) fn insert_remote_operation(
         sealed.content_key_id,
     )
     .map_err(|_| RemoteInsertError::Conflict)?;
-    transaction
-        .execute(
-            "INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![
-                record_id.as_bytes().as_slice(),
-                scope.as_slice(),
-                signed.purpose,
-                Hash::digest(&signed.canonical).as_bytes().as_slice(),
-                signed.signature.to_bytes().as_slice(),
-                payload.as_slice(),
-            ],
-        )
-        .map_err(insert_error)?;
-    transaction
-        .execute(
-            "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
-            rusqlite::params![
-                record_id.as_bytes().as_slice(),
-                scope.as_slice(),
-                payload.as_slice()
-            ],
-        )
-        .map_err(insert_error)?;
-    transaction
-        .execute(
-            "INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id)
-             VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![
-                scope.as_slice(),
-                signed.author.as_bytes(),
-                signed.purpose,
-                Hash::digest(&signed.canonical).as_bytes().as_slice(),
-                record_id.as_bytes().as_slice(),
-            ],
-        )
-        .map_err(insert_error)?;
-    transaction
-        .execute(
-            "INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id)
-             VALUES(?1,?2,?3)
-             ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id",
-            rusqlite::params![scope.as_slice(), signed.author.as_bytes(), teamarness_operation_id.as_bytes().as_slice()],
-        )
-        .map_err(insert_error)?;
-    transaction
-        .execute(
-            "INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms)
-             VALUES(?1,?2,?3,?4)",
-            rusqlite::params![
-                scope.as_slice(),
-                journal.as_slice(),
-                record_id.as_bytes().as_slice(),
-                now_unix_ms
-            ],
-        )
-        .map_err(insert_error)?;
-    let delivery_sequence = transaction.last_insert_rowid();
-    transaction
-        .execute(
-            "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
-            [scope.as_slice()],
-        )
-        .map_err(insert_error)?;
+    let delivery_sequence =
+        journal_sql::insert_record_rows(&transaction, &row).map_err(insert_error)?;
     transaction
         .commit()
         .map_err(|_| RemoteInsertError::Storage)?;
