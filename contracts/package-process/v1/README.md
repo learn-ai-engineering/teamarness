@@ -32,11 +32,27 @@ After initialization, the host sends a `request` whose operation is `lifecycle.a
 
 The launch nonce and capability grants are non-secret opaque base64url values. They bind traffic to one admitted process generation but do not authenticate against a hostile local process.
 
+## Frame verdicts
+
+Every frame gets one of three verdicts, and the same classifier produces them on both sides.
+
+| Verdict | When | What the receiver does |
+|---|---|---|
+| Deliver | The frame names state the receiver still holds. | Act on it. |
+| Ignore | The frame is well formed and would have been legal when the sender sent it; the receiver has since retired that request or closed that stream. | Drop it. Do not deliver it and do not fail. |
+| Fatal | No conforming peer that had seen everything this receiver sent could have sent this frame. | Fail the process generation. |
+
+A receiver retires a request or a stream at the moment it stops being willing to serve it, not when a later grace period expires, and keeps a bounded tombstone for its ID. Tombstones are bounded by count, not by clock: 64 IDs per direction for answered requests, 64 for abandoned requests, and 64 for closed streams, evicted oldest first. A frame naming an ID that no longer has a tombstone is out of contract, because the peer exceeded the window the contract grants.
+
+A sender never withholds a frame it owes. Exactly one `response` or `error` still reaches the wire for every request, even one the peer cancelled, and the peer applies these verdicts to what arrives.
+
+Ignore never widens a budget. Events beyond the credit window, a sequence gap on a live stream, credit outside `1..=32`, a 33rd in-flight request, a second terminal frame, and anything naming state that never existed are all fatal.
+
 ## Requests, terminal frames, and cancellation
 
 `request` carries an origin-scoped `id`, an operation, an optional opaque capability `grant`, optional `mountId`, a deadline in Unix milliseconds, and an object payload. Package-originated capability calls use a `p:` ID and a grant. Host lifecycle and UI requests use an `h:` ID. Mount traffic always carries `mountId`.
 
-Exactly one `response` or `error` is terminal for a request. Responses may finish out of request order. An unknown response or second terminal frame is fatal. The receiver keeps bounded tombstones for cancelled and timed-out IDs, so a late first terminal frame can be ignored without accepting a second one.
+Exactly one `response` or `error` is terminal for a request. Responses may finish out of request order. An unknown response or second terminal frame is fatal. The receiver keeps bounded tombstones for cancelled and timed-out IDs, so a late first terminal frame can be ignored without accepting a second one. A receiver enters that tombstone when it sends `cancel` or abandons a deadline, not when a grace period later expires.
 
 `cancel` names the original request ID. Cancellation is best effort. A request deadline causes cancellation; failure to stop within 500 milliseconds terminates the generation. A state-changing request can then report `outcome_uncertain` and is never replayed automatically.
 
@@ -49,6 +65,10 @@ A Package's `error` answer to a host request is forwarded, not replaced. The hos
 `stream_open` creates one origin-scoped stream and grants 32 events initially. `event` carries that stream ID, an increasing decimal-string sequence, and an object payload. The sender must not send without credit. `credit` adds a positive bounded amount only after the receiving adapter has accepted preceding work. `stream_close` closes either direction and can include a stable reason code.
 
 The reason code on a Package's `stream_close` says who owns the ending. No code, `completed` or `closed` is an ordinary completion. `cancelled` and `overloaded` are host codes. Every other code is the Package's own termination code and is forwarded to the subscriber as a Package-owned error, with `retryable` false and no details, because `stream_close` carries neither. A completion and a Package-owned termination both end that one stream and nothing else; only a Teamarness-owned terminal stream error causes Package UI Mount recovery.
+
+A receiver that has observed `stream_close` for a stream, in either direction, keeps a bounded tombstone for its ID and ignores a later `event`, `credit` or `stream_close` naming it. Credit released for events already accepted, and events already written before the close was observed, are ordinary in-flight traffic and are not protocol violations. A frame naming a stream ID that was never opened remains fatal, and a `stream_open` reusing a tombstoned ID is `duplicate_id`.
+
+A sender keeps `stream_close` behind the events of the same stream, so a close never overtakes the events it ends.
 
 Sequence values increase by one within a stream. Streams have no ordering relationship to requests or other streams. Mount-scoped streams carry `mountId` and stop when that mount closes or its process generation changes.
 
@@ -73,4 +93,4 @@ For application shutdown the host sends `shutdown`, waits up to three seconds fo
 
 ## Contract files
 
-`schemas/frame.schema.json` dispatches to the schema for every frame kind. The other schema files expose each frame definition directly. `golden/*.jsonl` are valid bidirectional sequences. `invalid/*.json` are malformed encoding or state-machine cases with one expected stable error code. Both the Rust contract test and direct Node test enumerate every file, so adding a fixture without coverage fails the suites.
+`schemas/frame.schema.json` dispatches to the schema for every frame kind. The other schema files expose each frame definition directly. `golden/*.jsonl` are valid bidirectional sequences, including the lifecycle races the verdict table tolerates. `invalid/*.json` are malformed encoding or state-machine cases with one expected stable error code. Both the Rust contract test and direct Node test enumerate every file, so adding a fixture without coverage fails the suites.

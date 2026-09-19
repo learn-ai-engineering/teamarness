@@ -26,6 +26,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0016](0016-package-error-fidelity-and-author-validation.md) | Package error fidelity and author validation | accepted (2026-09-19) | – | – | In the ADR | Refines 0010 (validator crate, provenance); Package-owned errors, one admission rule set, SDK machinery, contract-typed UI requests |
 | [0017](0017-key-custody-and-protection-grants.md) | Version 1 key custody and recipient-bound protection grants | accepted (2026-09-19) | – | – | In the ADR | Refines 0008/0009 custody wording; grants are ADR 0013 |
 | [0018](0018-package-seam-versioning.md) | Package seam versioning | accepted (2026-09-19) | – | – | In the ADR | Refines 0007 and 0008 (seam versioning); three version lines, family-plus-version negotiation, additive families, intended deprecation window |
+| [0019](0019-lifecycle-verdicts-and-derived-bounds.md) | Lifecycle verdicts and derived bounds | accepted (2026-09-20) | – | – | In the ADR | Refines 0007, 0016 and 0018; three frame verdicts in one classifier, bounded tombstones, every internal bound derived from the contract constant it serves |
 
 ### Former file names
 
