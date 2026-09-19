@@ -796,7 +796,7 @@ async fn fixture_request(
             payload,
         }))
         .await
-        .unwrap()
+        .unwrap_or_else(|error| panic!("{request}/{operation}: {error:?}"))
     {
         PackageHostOutcome::UiResponse {
             payload: PackageValue::Object(value),
@@ -1106,39 +1106,73 @@ async fn membership_stream_does_not_poll() {
         object([("afterEpoch", PackageValue::String("0".into()))]),
     )
     .await;
-    // Three credit round trips each run the stream task's command arm, so the
-    // loop has certainly run between the two counter reads.
-    for attempt in 0..3 {
-        fixture_request(
-            &host,
-            &mount,
-            &format!("membership-credit-{attempt}"),
-            "fixture.membership_credit",
-            object([("amount", PackageValue::Integer(1))]),
-        )
-        .await;
-    }
+
+    // The stream delivers transitions in epoch order, one Core subscription
+    // each, so the Package holding the newest one is the task parked on the
+    // epoch watch with every earlier subscription already counted. That is the
+    // probe for "the loop has run"; a credit round trip cannot be, because
+    // credit is only owed for an event the Package has consumed.
+    join_one_member(&fixture, &workspace, "membership-joiner-one").await;
+    await_membership_events(&host, &mount, "one", 1).await;
+    // One event consumed, one credit released: the round trip runs the stream
+    // task's command arm without widening the window the stream was opened
+    // with.
+    fixture_request(
+        &host,
+        &mount,
+        "membership-credit",
+        "fixture.membership_credit",
+        object([("amount", PackageValue::Integer(1))]),
+    )
+    .await;
     let idle = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());
 
-    let joiner = common::open_core(fixture._root.path().join("membership-joiner")).await;
+    join_one_member(&fixture, &workspace, "membership-joiner-two").await;
+    await_membership_events(&host, &mount, "two", 2).await;
+    let after = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());
+    assert_eq!(
+        after - idle,
+        1,
+        "one transition opens exactly one Core subscription"
+    );
+}
+
+/// Admits one more Installation to the workspace, which is one membership
+/// transition.
+async fn join_one_member(
+    fixture: &common::Fixture,
+    workspace: &teamarness_core::WorkspaceSummary,
+    directory: &str,
+) {
+    let joiner = common::open_core(fixture._root.path().join(directory)).await;
     common::introduce(&fixture.core, &joiner);
     let invitation = common::invite(&fixture.core, workspace.id()).await;
     joiner.join_workspace(&invitation).await.unwrap();
     joiner.shutdown().await.unwrap();
+}
 
+/// Waits until the Package has recorded `count` membership events.
+async fn await_membership_events(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    label: &str,
+    count: usize,
+) {
     let expiry = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut attempt = 0_u64;
     loop {
+        attempt += 1;
         let response = fixture_request(
-            &host,
-            &mount,
-            "membership-events",
+            host,
+            mount,
+            &format!("membership-events-{label}-{attempt}"),
             "fixture.membership_events",
             object([]),
         )
         .await;
-        if matches!(response.get("events"), Some(PackageValue::Array(events)) if !events.is_empty())
+        if matches!(response.get("events"), Some(PackageValue::Array(events)) if events.len() >= count)
         {
-            break;
+            return;
         }
         assert!(
             std::time::Instant::now() < expiry,
@@ -1147,12 +1181,6 @@ async fn membership_stream_does_not_poll() {
         // poll-interval: the interval of this loop, which is bounded by its own deadline.
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    let after = teamarness_core::membership_subscriptions_opened_for_tests(workspace.id());
-    assert_eq!(
-        after - idle,
-        1,
-        "one transition opens exactly one Core subscription"
-    );
 }
 
 /// Renders one recorded stream event as a compact, comparable string.

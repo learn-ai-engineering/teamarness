@@ -333,6 +333,11 @@ async function serve() {
   const pendingCapabilityCalls = new Map();
   const membershipEvents = [];
   let membershipStream;
+  // Events consumed on the current membership stream that credit has already
+  // been released for. The contract lets a sender release credit only for work
+  // the receiving adapter has accepted, so this is the ceiling on what
+  // `fixture.membership_credit` may put on the wire.
+  let membershipCredited = 0;
   const immutableEvents = [];
   let immutableStream;
   let immutableCloseCode = null;
@@ -424,6 +429,9 @@ async function serve() {
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_open") {
         capabilitySequence += 1;
         membershipStream = `p:membership-${capabilitySequence}`;
+        // A new stream carries a fresh window: only events this stream
+        // delivers can be credited back to it.
+        membershipCredited = membershipEvents.length;
         send({
           kind: "stream_open",
           id: membershipStream,
@@ -437,8 +445,16 @@ async function serve() {
         });
         send({ kind: "response", id: frame.id, payload: { streamId: membershipStream } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_credit") {
-        send({ kind: "credit", streamId: membershipStream, amount: frame.payload.amount });
-        send({ kind: "response", id: frame.id, payload: { credited: true } });
+        // What crosses the wire is what this stream has consumed and not yet
+        // credited, never what the request asked for: credit released for
+        // events that were never accepted would widen the window past the 32
+        // the stream was opened with.
+        const amount = Math.min(frame.payload.amount, membershipEvents.length - membershipCredited);
+        if (amount > 0) {
+          membershipCredited += amount;
+          send({ kind: "credit", streamId: membershipStream, amount });
+        }
+        send({ kind: "response", id: frame.id, payload: { credited: amount } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_close") {
         if (membershipStream) send({ kind: "stream_close", streamId: membershipStream, code: "closed" });
         membershipStream = undefined;
