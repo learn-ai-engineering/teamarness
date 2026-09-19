@@ -158,13 +158,15 @@ async fn a_relay_scenario() {
 });
 
 test("the same reach through a local helper still fails", () => {
-  const scenario = `async fn matrix(addressing: Addressing) {
-    let core = open_core(addressing, &path).await;
+  // The test names no addressing itself; the helper does. Reading only the
+  // test body would miss it, which is the shape the round-3 evasion used.
+  const scenario = `async fn production_matrix() {
+    let core = open_core(Addressing::ProductionRelay, &path).await;
 }
 
 #[tokio::test]
 async fn a_relay_scenario() {
-    matrix(Addressing::ProductionRelay).await;
+    production_matrix().await;
 }
 `;
   const problems = findProductionReachability([["tests/system/tests/a.rs", scenario]]);
