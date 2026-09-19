@@ -917,6 +917,90 @@ async fn record_stream_closes_with_cursor_invalid_for_a_future_cursor() {
     assert!(events_of(&response).is_empty(), "no record was delivered");
 }
 
+/// A Package catching up on a backlog returns its whole credit window one event
+/// at a time, which is what the SDK's commit-before-credit rule produces. Every
+/// one of those frames is in the contract, so none of them may be refused and
+/// none may cost the Package its process.
+#[tokio::test]
+async fn a_whole_credit_window_returned_at_once_keeps_the_backend_running() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":0,"maxMinor":0
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    let package = "dev.teamarness.fixture";
+
+    fixture_request(
+        &host,
+        &mount,
+        "window-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    for index in 0..200_u32 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                package,
+                "fixture.record",
+                &index.to_be_bytes(),
+            )
+            .unwrap();
+    }
+    // The window carries one state event before the records, so a spent window
+    // is 31 records, not 32.
+    poll_immutable(&host, &mount, "the initial window is spent", |response| {
+        events_of(response).len() >= 32
+    })
+    .await;
+
+    // The whole window comes back as 32 single-event frames in one burst.
+    fixture_request(
+        &host,
+        &mount,
+        "window-credit",
+        "fixture.immutable_credit",
+        object([
+            ("amount", PackageValue::Integer(1)),
+            ("frames", PackageValue::Integer(32)),
+        ]),
+    )
+    .await;
+
+    poll_immutable(
+        &host,
+        &mount,
+        "the second window is delivered",
+        |response| record_events(response) >= 55,
+    )
+    .await;
+    assert_eq!(
+        host.snapshot().await.instances[0].lifecycle,
+        teamarness_package_host::LifecycleState::Active,
+        "returning the credit window cost the Package its process"
+    );
+    // The mount outlives the catch-up, so the UI keeps working through it.
+    fixture_request(
+        &host,
+        &mount,
+        "window-after",
+        "fixture.immutable_events",
+        object([]),
+    )
+    .await;
+}
+
 /// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test]
 async fn slow_package_leaves_core_without_buffered_events() {

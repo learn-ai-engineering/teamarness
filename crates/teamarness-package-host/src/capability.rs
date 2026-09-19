@@ -27,6 +27,16 @@ pub(crate) const MAX_CANONICAL_DECODED_BYTES: usize = 262_144;
 const MAX_STREAM_CREDIT: u64 = 32;
 /// The largest record page one blocking read may return, matching Core's bound.
 const RECORD_PAGE: u64 = 32;
+/// Slots in one stream task's command queue.
+///
+/// A conformant Package returns credit only for events it has already accepted,
+/// and the Host sends no event without credit, so at most `MAX_STREAM_CREDIT`
+/// `credit` frames can be queued before the stream task drains any of them —
+/// the SDK returns credit one event at a time, so a 32-event catch-up really
+/// does produce 32 frames. One more slot carries `Close`. Anything smaller
+/// turns routine catch-up backpressure into a refused `credit` frame, which the
+/// reader reports as a Package protocol violation and kills the Backend for.
+const STREAM_COMMAND_QUEUE: usize = MAX_STREAM_CREDIT as usize + 1;
 
 /// The Host-wide bound on concurrent blocking Core work for Package capability
 /// calls.
@@ -291,7 +301,7 @@ impl GenerationCapabilities {
         if after_epoch.is_none() && after_cursor.is_none() {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
-        let (commands, command_receiver) = mpsc::channel(8);
+        let (commands, command_receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
         let mut streams = self.streams.lock().await;
         if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
             return Err(PackageErrorCode::Overloaded);

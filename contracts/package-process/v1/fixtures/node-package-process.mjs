@@ -370,7 +370,12 @@ async function serve() {
       } else if (frame.kind === "request" && ["fixture.immutable_events", "fixture.record_events"].includes(frame.operation)) {
         send({ kind: "response", id: frame.id, payload: { events: immutableEvents, closeCode: immutableCloseCode } });
       } else if (frame.kind === "request" && ["fixture.immutable_credit", "fixture.record_credit"].includes(frame.operation)) {
-        send({ kind: "credit", streamId: immutableStream, amount: frame.payload.amount });
+        // `frames` returns the window one event at a time, the way a consumer
+        // that commits before crediting does; the default is a single frame.
+        const frames = frame.payload.frames ?? 1;
+        for (let index = 0; index < frames; index += 1) {
+          send({ kind: "credit", streamId: immutableStream, amount: frame.payload.amount });
+        }
         send({ kind: "response", id: frame.id, payload: { credited: true } });
       } else if (frame.kind === "request" && ["fixture.immutable_close", "fixture.record_close"].includes(frame.operation)) {
         if (immutableStream) send({ kind: "stream_close", streamId: immutableStream, code: "closed" });
