@@ -34,6 +34,12 @@ pub fn validate_path(path: &str) -> Result<String, ErrorInfo> {
 
 /// Resolves one registration request to its checkout root, stopping if the request is cancelled.
 ///
+/// TEAM.SYS.REPO-R02: the working-tree root is found **first**, and the checkout is then validated
+/// at that root. `validate_git_checkout` uses `gix::open`, which accepts only a work tree or a git
+/// directory itself; validating the caller's path would refuse every subdirectory, which is exactly
+/// the input the requirement says to accept. `git_root` searches upward, so a subdirectory — at any
+/// depth — resolves to the root that is then validated.
+///
 /// Every step is a filesystem call, so the cancellation flag is checked between them: a Package UI
 /// that walks away never leaves a worker inspecting a repository nobody is waiting for.
 ///
@@ -45,11 +51,12 @@ pub fn resolve_registration(path: &str, cancel: &CancellationToken) -> Result<St
     if cancel.is_cancelled() {
         return Err(error::SNAPSHOT_INTERRUPTED);
     }
-    validate_git_checkout(&canonical)?;
+    let root = git_root(&canonical)?;
     if cancel.is_cancelled() {
         return Err(error::SNAPSHOT_INTERRUPTED);
     }
-    git_root(&canonical)
+    validate_git_checkout(&root)?;
+    Ok(root)
 }
 
 pub fn validate_git_checkout(path: &str) -> Result<(), ErrorInfo> {
