@@ -180,7 +180,12 @@ impl SqliteLogView {
         .map_err(|_| LogViewError("runtime state is unavailable".to_owned()))?;
         match sizes {
             Ok(sizes) => Ok(Some(sizes)),
-            Err(()) => Ok(None),
+            Err(rejection) => {
+                // Offering nothing is the session's answer; the reason is what
+                // used to be erased into `()`.
+                crate::diag::record(concat!(file!(), ":", line!()), &rejection);
+                Ok(None)
+            }
         }
     }
 

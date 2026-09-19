@@ -17,6 +17,7 @@ use iroh_base::EndpointAddr;
 use iroh_base::{PublicKey, SecretKey};
 use tokio::sync::Semaphore;
 
+use crate::diag::fault;
 pub(crate) use error::NetworkError;
 
 /// One extra Core protocol the runtime composition point registers with the
@@ -74,12 +75,15 @@ impl Network {
                 .address_lookup(lookup.clone())
                 .clear_ip_transports()
                 .bind_addr("127.0.0.1:0")
-                .map_err(|_| NetworkError::Readiness)?;
+                .map_err(fault!(NetworkError::Readiness))?;
             Some(lookup)
         } else {
             None
         };
-        let endpoint = builder.bind().await.map_err(|_| NetworkError::Readiness)?;
+        let endpoint = builder
+            .bind()
+            .await
+            .map_err(fault!(NetworkError::Readiness))?;
         let mut builder = Router::builder(endpoint.clone());
         for (alpn, handler) in protocols {
             builder = builder.accept(alpn, handler);
@@ -155,7 +159,7 @@ impl Network {
         self.router
             .shutdown()
             .await
-            .map_err(|_| NetworkError::Shutdown)
+            .map_err(fault!(NetworkError::Shutdown))
     }
 }
 

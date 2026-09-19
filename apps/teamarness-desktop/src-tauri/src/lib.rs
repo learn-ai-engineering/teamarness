@@ -173,6 +173,13 @@ async fn open_runtime_modules(
     let runtime = Arc::new(
         CoreRuntime::open(CoreRuntimeConfig::new(data_directory.clone()))
             .await
+            .map_err(|error| {
+                // The user-facing text stays deliberately vague; the cause is
+                // written once to stderr so a developer can see what failed.
+                // Every Core error's `Display` is already redacted.
+                eprintln!("teamarness-desktop startup failed stage=core error={error}");
+                error
+            })
             .map_err(|error| match error {
                 CoreError::Storage(StorageError::LegacyProtectionState) => {
                     "This data directory was created by an older development build whose key grants are no longer supported. Delete it to start fresh."
@@ -197,7 +204,8 @@ async fn open_runtime_modules(
     .await
     {
         Ok(packages) => Arc::new(packages),
-        Err(_) => {
+        Err(error) => {
+            eprintln!("teamarness-desktop startup failed stage=host error={error}");
             let _ = runtime.shutdown().await;
             return Err("Package Host startup failed");
         }

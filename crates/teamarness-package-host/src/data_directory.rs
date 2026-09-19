@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+use crate::diag::fault;
 use crate::host_store::HostStore;
 use crate::manifest::sha256;
 use crate::{InstallationPublicIdentity, PackageErrorCode, PackageIdentity, WorkspaceId};
@@ -84,16 +85,16 @@ fn validate_relative_mapping(value: &str) -> Result<PathBuf, DataDirectoryFailur
 }
 
 fn create_private_tree(root: &Path, leaf: &Path) -> Result<(), DataDirectoryFailure> {
-    let expected_owner = fs::metadata(root).map_err(|_| unavailable())?.uid();
+    let expected_owner = fs::metadata(root).map_err(fault!(unavailable()))?.uid();
     let mut current = root.to_owned();
-    let relative = leaf.strip_prefix(root).map_err(|_| permission())?;
+    let relative = leaf.strip_prefix(root).map_err(fault!(permission()))?;
     for component in relative.components() {
         let Component::Normal(component) = component else {
             return Err(permission());
         };
         current.push(component);
         if current.exists() {
-            let metadata = fs::symlink_metadata(&current).map_err(|_| unavailable())?;
+            let metadata = fs::symlink_metadata(&current).map_err(fault!(unavailable()))?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_dir()
                 || metadata.uid() != expected_owner
@@ -104,9 +105,9 @@ fn create_private_tree(root: &Path, leaf: &Path) -> Result<(), DataDirectoryFail
                 return Err(permission());
             }
         } else {
-            fs::create_dir(&current).map_err(|_| unavailable())?;
+            fs::create_dir(&current).map_err(fault!(unavailable()))?;
             fs::set_permissions(&current, fs::Permissions::from_mode(0o700))
-                .map_err(|_| unavailable())?;
+                .map_err(fault!(unavailable()))?;
         }
     }
     Ok(())

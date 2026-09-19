@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 mod blocking;
+mod diag;
 mod error;
 mod runtime;
 

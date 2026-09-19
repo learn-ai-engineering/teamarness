@@ -11,6 +11,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::capability::{CapabilityRequirement, CapabilityScope, GenerationCapabilities};
+use crate::diag::fault;
 use crate::host_store::{HostStore, HostStoreHandle, ProcessLease};
 use crate::manifest::sha256;
 use crate::protocol::{self, ProcessClient, WireFailure};
@@ -95,16 +96,18 @@ pub(crate) async fn spawn(
     let expected_digest = spec.template.backend_digest.clone();
     let executable = tokio::task::spawn_blocking(move || {
         let current = fs::read(&backend_path)
-            .map_err(|_| WireFailure::new(PackageErrorCode::ArtifactChanged))?;
+            .map_err(fault!(WireFailure::new(PackageErrorCode::ArtifactChanged)))?;
         if sha256(&current) != expected_digest {
             return Err(WireFailure::new(PackageErrorCode::ArtifactChanged));
         }
-        fs::canonicalize(&backend_path).map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))
+        fs::canonicalize(&backend_path)
+            .map_err(fault!(WireFailure::new(PackageErrorCode::SpawnFailed)))
     })
     .await
-    .map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))??;
+    .map_err(fault!(WireFailure::new(PackageErrorCode::SpawnFailed)))??;
     let mut random = [0_u8; 32];
-    getrandom::fill(&mut random).map_err(|_| WireFailure::new(PackageErrorCode::SpawnFailed))?;
+    getrandom::fill(&mut random)
+        .map_err(fault!(WireFailure::new(PackageErrorCode::SpawnFailed)))?;
     let launch_token = URL_SAFE_NO_PAD.encode(random);
     let mut command = Command::new(&executable);
     command

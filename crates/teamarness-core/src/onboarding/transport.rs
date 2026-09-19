@@ -11,6 +11,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use super::handler::{IssuerService, OnboardingHandler};
 use crate::OnboardingError;
+use crate::diag::fault;
 use crate::network::{Network, NetworkError};
 
 /// Onboarding maps the shared network's failures at its own boundary, so
@@ -159,7 +160,7 @@ impl Transport {
             Readiness::EndpointOnline(duration) => {
                 timeout(duration, self.network.endpoint().online())
                     .await
-                    .map_err(|_| OnboardingError::Readiness)?
+                    .map_err(fault!(OnboardingError::Readiness))?
             }
             #[cfg(test)]
             Readiness::Immediate => {}
@@ -200,8 +201,8 @@ impl Transport {
             self.network.endpoint().connect(address, ONBOARDING_ALPN),
         )
         .await
-        .map_err(|_| OnboardingError::Timeout)?
-        .map_err(|_| OnboardingError::Authentication)
+        .map_err(fault!(OnboardingError::Timeout))?
+        .map_err(fault!(OnboardingError::Authentication))
     }
 
     #[allow(dead_code)]
@@ -211,7 +212,7 @@ impl Transport {
     ) -> Result<T, OnboardingError> {
         timeout(RESPONSE_IO_TIMEOUT, future)
             .await
-            .map_err(|_| OnboardingError::Timeout)?
+            .map_err(fault!(OnboardingError::Timeout))?
     }
 
     pub(crate) async fn whole_join_until<T>(
@@ -225,7 +226,7 @@ impl Transport {
         }
         timeout_at(Instant::from_std(deadline), future)
             .await
-            .map_err(|_| OnboardingError::Timeout)?
+            .map_err(fault!(OnboardingError::Timeout))?
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
@@ -683,7 +684,7 @@ mod tests {
         assert_eq!(WHOLE_JOIN_TIMEOUT, Duration::from_secs(60));
         let classified = timeout(Duration::from_millis(1), std::future::pending::<()>())
             .await
-            .map_err(|_| OnboardingError::Timeout);
+            .map_err(fault!(OnboardingError::Timeout));
         assert_eq!(classified.unwrap_err(), OnboardingError::Timeout);
     }
 

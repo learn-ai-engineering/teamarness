@@ -1,6 +1,8 @@
 //! The Core side of every package synchronization session.
 
 use super::*;
+use crate::diag::fault;
+use crate::synchronization::SyncRejection;
 
 /// The Core side of every package synchronization session.
 ///
@@ -70,13 +72,16 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         workspace: WorkspaceId,
         package: &str,
         recipient: PublicIdentity,
-    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
-        let state = self.state.upgrade().ok_or(())?;
-        let mut state = state.lock().map_err(|_| ())?;
-        let projection = state.memberships.get(&workspace).ok_or(())?;
+    ) -> Result<Option<crate::synchronization::ProtectionBundle>, SyncRejection> {
+        let state = self.state.upgrade().ok_or(SyncRejection::RuntimeGone)?;
+        let mut state = state.lock().map_err(|_| SyncRejection::RuntimeGone)?;
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(SyncRejection::UnknownWorkspace)?;
         let local = PublicIdentity(state.secret_key.public());
         if !projection.contains_member(local) || !projection.contains_member(recipient) {
-            return Err(());
+            return Err(SyncRejection::NotMember);
         }
         let admission = *projection.snapshot().version().as_bytes();
         let scope = crate::synchronization::scope_digest(package, workspace);
@@ -89,7 +94,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| ())?;
+            .map_err(fault!(SyncRejection::Storage))?;
         // Without the creator's origin this Installation cannot prove the key's
         // authority, so it offers nothing rather than an unusable grant.
         let Some(origin) = origin else {
@@ -109,7 +114,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
                 grant,
             })),
             Err(crate::SynchronizationError::WorkspaceNotFound) => Ok(None),
-            Err(_) => Err(()),
+            Err(error) => Err(fault!(SyncRejection::Grant)(error)),
         }
     }
 
@@ -119,16 +124,21 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         workspace: WorkspaceId,
         package: &str,
         bundle: crate::synchronization::ProtectionBundle,
-    ) -> Result<usize, ()> {
-        let state = self.state.upgrade().ok_or(())?;
-        let mut state = state.lock().map_err(|_| ())?;
-        if crate::synchronization::protection_control_author(&bundle.grant).map_err(|_| ())? != peer
+    ) -> Result<usize, SyncRejection> {
+        let state = self.state.upgrade().ok_or(SyncRejection::RuntimeGone)?;
+        let mut state = state.lock().map_err(|_| SyncRejection::RuntimeGone)?;
+        if crate::synchronization::protection_control_author(&bundle.grant)
+            .map_err(|_| SyncRejection::InvalidProof)?
+            != peer
         {
-            return Err(());
+            return Err(SyncRejection::InvalidProof);
         }
-        let projection = state.memberships.get(&workspace).ok_or(())?;
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(SyncRejection::UnknownWorkspace)?;
         if !projection.contains_member(peer) {
-            return Err(());
+            return Err(SyncRejection::NotMember);
         }
         let creator = projection.creator();
         let secret = state.secret_key.clone();
@@ -141,14 +151,15 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             &bundle.origin,
             &bundle.grant,
         )
-        .map_err(|_| ())?;
+        .map_err(fault!(SyncRejection::Grant))?;
         // The scope now exists, so a subscription that was waiting for history
         // access can proceed even when nothing was parked.
         crate::synchronization::record_subscription::publish_scope_exists(
             &state, workspace, package,
         );
         // Records that arrived before the key can now be applied.
-        replication::promote_scope(&mut state, workspace, package).map_err(|_| ())
+        replication::promote_scope(&mut state, workspace, package)
+            .map_err(fault!(SyncRejection::Storage))
     }
 
     /// Two Installations that disagree about membership are exactly the case a
@@ -250,14 +261,14 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         after: Option<u32>,
         until: Option<u32>,
         limit: usize,
-    ) -> Result<Vec<(u32, usize)>, ()> {
-        let state = self.state.upgrade().ok_or(())?;
-        let state = state.lock().map_err(|_| ())?;
+    ) -> Result<Vec<(u32, usize)>, SyncRejection> {
+        let state = self.state.upgrade().ok_or(SyncRejection::RuntimeGone)?;
+        let state = state.lock().map_err(|_| SyncRejection::RuntimeGone)?;
         if !state.memberships.get(&workspace).is_some_and(|projection| {
             projection.contains_member(PublicIdentity(state.secret_key.public()))
                 && projection.contains_member(peer)
         }) {
-            return Err(());
+            return Err(SyncRejection::NotMember);
         }
         let scope = crate::synchronization::scope_digest(package, workspace);
         let mut statement = state
@@ -269,7 +280,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
                    AND author_sequence > ?3 AND author_sequence <= ?4
                  ORDER BY author_sequence LIMIT ?5",
             )
-            .map_err(|_| ())?;
+            .map_err(fault!(SyncRejection::Storage))?;
         let rows = statement
             .query_map(
                 rusqlite::params![
@@ -283,13 +294,13 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
                 ],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
-            .map_err(|_| ())?;
+            .map_err(fault!(SyncRejection::Storage))?;
         let mut sizes = Vec::new();
         for row in rows {
-            let (sequence, bytes) = row.map_err(|_| ())?;
+            let (sequence, bytes) = row.map_err(fault!(SyncRejection::Storage))?;
             sizes.push((
-                u32::try_from(sequence).map_err(|_| ())?,
-                usize::try_from(bytes).map_err(|_| ())?,
+                u32::try_from(sequence).map_err(|_| SyncRejection::Storage)?,
+                usize::try_from(bytes).map_err(|_| SyncRejection::Storage)?,
             ));
         }
         Ok(sizes)

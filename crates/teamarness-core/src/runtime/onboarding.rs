@@ -1,6 +1,7 @@
 //! Invitations, claims, redemption, and joining a Workspace.
 
 use super::*;
+use crate::diag::fault;
 
 impl CoreRuntime {
     /// Issues an expiring invitation as the local manager.
@@ -70,7 +71,7 @@ impl CoreRuntime {
             .map_err(map_invitation_onboarding_error)?;
         let verified = token
             .verified()
-            .map_err(|_| crate::OnboardingError::Authentication)?;
+            .map_err(fault!(crate::OnboardingError::Authentication))?;
         let invitation = crate::WorkspaceInvitation::from_parts(&verified, operation.address())
             .map_err(|_| crate::OnboardingError::InvalidInput);
         drop(operation);

@@ -38,7 +38,7 @@ pub(crate) use exchange::ExchangeReport;
 pub(crate) use network_handler::{
     FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, ProtectionBundle,
     RangeLoadError, Refusal, RejectReason, ReplicationEntry, SessionGrant, SessionSeed,
-    SyncReceiver,
+    SyncReceiver, SyncRejection,
 };
 
 /// How many stored operation rows sessions have read since the process began.
@@ -56,6 +56,7 @@ pub(crate) fn note_record_loaded_for_test() {
 pub(crate) fn records_loaded_for_test() -> usize {
     RECORDS_LOADED.load(std::sync::atomic::Ordering::Relaxed)
 }
+use crate::diag::fault;
 pub(crate) use peer_sessions::PeerSessions;
 
 /// The Core services one bound Network needs to serve and run synchronization
@@ -895,24 +896,24 @@ fn ensure_scope(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     if let Some((journal, key)) = found {
         return Ok((fixed(journal)?, ContentKey::from_column(key)?, digest));
     }
     let mut journal = [0_u8; 16];
-    getrandom::fill(&mut journal).map_err(|_| storage_error())?;
+    getrandom::fill(&mut journal).map_err(fault!(storage_error()))?;
     let key = ContentKey::generate()?;
-    conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key.id().as_slice(), key.expose().as_slice()]).map_err(|_| storage_error())?;
+    conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key.id().as_slice(), key.expose().as_slice()]).map_err(fault!(storage_error()))?;
     conn.execute(
         "INSERT INTO protection_state(scope_id,content_key_id,creator_public_identity) VALUES(?1,?2,?3)",
         rusqlite::params![digest.as_slice(), key.id().as_slice(), creator.as_bytes().as_slice()],
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     conn.execute(
         "INSERT INTO durable_wakes(scope_id,wake_generation) VALUES(?1,0)",
         [digest.as_slice()],
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     Ok((journal, key, digest))
 }
 
@@ -932,7 +933,7 @@ pub(crate) fn export_protection_grant(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .ok_or(SynchronizationError::WorkspaceNotFound)
         .and_then(ContentKey::from_column)?;
     let author = secret.public();
@@ -952,7 +953,7 @@ pub(crate) fn export_protection_grant(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     if let Some(existing) = existing
         && existing.starts_with(protection_control::DOMAIN_V2)
     {
@@ -964,7 +965,7 @@ pub(crate) fn export_protection_grant(
         protection_control::decode(&bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     protection_control::insert(
         &tx,
         scope,
@@ -973,7 +974,7 @@ pub(crate) fn export_protection_grant(
         &control,
         &bytes,
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
     Ok(bytes)
@@ -1209,7 +1210,7 @@ pub(crate) fn import_protection_grant(
     .map_err(storage_or_corrupt)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     let existing: Option<Vec<u8>> = tx
         .query_row(
             "SELECT content_key_id FROM sync_scopes WHERE scope_id=?1",
@@ -1217,27 +1218,27 @@ pub(crate) fn import_protection_grant(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     if let Some(existing) = existing {
         if existing != control.content_key_id {
             return Err(SynchronizationError::CorruptRecord);
         }
     } else {
         let mut journal = [0; 16];
-        getrandom::fill(&mut journal).map_err(|_| storage_error())?;
+        getrandom::fill(&mut journal).map_err(fault!(storage_error()))?;
         tx.execute(
             "INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)",
             rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.expose().as_slice()],
-        ).map_err(|_| storage_error())?;
+        ).map_err(fault!(storage_error()))?;
         tx.execute(
             "INSERT INTO protection_state(scope_id,content_key_id,creator_public_identity) VALUES(?1,?2,?3)",
             rusqlite::params![scope.as_slice(), control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
-        ).map_err(|_| storage_error())?;
+        ).map_err(fault!(storage_error()))?;
         tx.execute(
             "INSERT INTO durable_wakes(scope_id,wake_generation) VALUES(?1,0)",
             [scope.as_slice()],
         )
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     }
     // The importer keeps the creator's origin so it can later prove the key's
     // authority when it grants to someone else.
@@ -1249,7 +1250,7 @@ pub(crate) fn import_protection_grant(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     match stored_origin {
         Some(stored) if stored != origin_bytes => return Err(SynchronizationError::CorruptRecord),
         Some(_) => {}
@@ -1261,7 +1262,7 @@ pub(crate) fn import_protection_grant(
             &origin,
             origin_bytes,
         )
-        .map_err(|_| storage_error())?,
+        .map_err(fault!(storage_error()))?,
     }
     protection_control::insert(
         &tx,
@@ -1271,7 +1272,7 @@ pub(crate) fn import_protection_grant(
         &control,
         bytes,
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
     // Records that arrived before the key are parked, not pending: plan phase 3
@@ -1332,7 +1333,7 @@ pub(crate) fn append(
             |_| Ok(()),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .is_some();
     if !scope_exists && !is_creator {
         return Err(SynchronizationError::ContentKeyUnavailable);
@@ -1341,14 +1342,14 @@ pub(crate) fn append(
     let record_id = RecordId::digest(&canonical_signed);
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     let (journal, key, scope) = ensure_scope(&tx, package, workspace, signed.author)?;
     let protection = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
         content_key: key.clone(),
     };
-    let existing: Option<StoredRecordFields> = tx.query_row("SELECT o.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM immutable_operations o JOIN immutable_records r ON r.record_id=o.record_id JOIN immutable_idempotency i ON i.record_id=o.record_id WHERE i.scope_id=?1 AND i.record_id=?2", rusqlite::params![scope.as_slice(), record_id.as_bytes().as_slice()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| storage_error())?;
+    let existing: Option<StoredRecordFields> = tx.query_row("SELECT o.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM immutable_operations o JOIN immutable_records r ON r.record_id=o.record_id JOIN immutable_idempotency i ON i.record_id=o.record_id WHERE i.scope_id=?1 AND i.record_id=?2", rusqlite::params![scope.as_slice(), record_id.as_bytes().as_slice()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(fault!(storage_error()))?;
     if let Some((id, order, author, p, sig, sealed)) = existing {
         let opened = protection
             .open(
@@ -1362,11 +1363,11 @@ pub(crate) fn append(
                 [id.as_slice()],
                 |row| row.get(0),
             )
-            .map_err(|_| storage_error())?;
+            .map_err(fault!(storage_error()))?;
         let record = record_from_row((&id, &order, &author, &p, &sig, &opened.canonical, &sealed))?;
         return Ok((record, delivery));
     }
-    let max_height: Option<i64> = tx.query_row("SELECT MAX(causal_height) FROM immutable_operations WHERE scope_id=?1 AND status='accepted'", [scope.as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
+    let max_height: Option<i64> = tx.query_row("SELECT MAX(causal_height) FROM immutable_operations WHERE scope_id=?1 AND status='accepted'", [scope.as_slice()], |r| r.get(0)).map_err(fault!(storage_error()))?;
     let height = match max_height {
         Some(max) => u64::try_from(max)
             .ok()
@@ -1380,8 +1381,8 @@ pub(crate) fn append(
         .map_err(|_| SynchronizationError::CorruptRecord)?;
     let sealed_bytes = sealed.encode();
     let operation_id = RecordId::digest(&sealed_bytes);
-    let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),order.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,sealed_bytes.as_slice(),Vec::<u8>::new(),height]).map_err(|_| storage_error())?;
+    let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(fault!(storage_error()))?;
+    tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),order.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,sealed_bytes.as_slice(),Vec::<u8>::new(),height]).map_err(fault!(storage_error()))?;
     let projection_operation_id = operation_store::insert(
         &tx,
         secret,
@@ -1397,20 +1398,20 @@ pub(crate) fn append(
         purpose,
         key.id(),
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     if tx
         .query_row::<i64, _, _>(
             "SELECT COUNT(*) FROM protection_control_operations WHERE scope_id=?1",
             [scope.as_slice()],
             |row| row.get(0),
         )
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         == 0
     {
         let control =
             protection_control::create(secret, scope, workspace, signed.author, [0; 32], &key)
-                .map_err(|_| storage_error())?;
-        let parsed = protection_control::decode(&control).map_err(|_| storage_error())?;
+                .map_err(fault!(storage_error()))?;
+        let parsed = protection_control::decode(&control).map_err(fault!(storage_error()))?;
         protection_control::insert(
             &tx,
             scope,
@@ -1421,7 +1422,7 @@ pub(crate) fn append(
         )?;
         let _ = projection_operation_id;
     }
-    tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),sealed_bytes.as_slice()]).map_err(|_| storage_error())?;
+    tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),sealed_bytes.as_slice()]).map_err(fault!(storage_error()))?;
     tx.execute(
         "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
         rusqlite::params![
@@ -1430,16 +1431,16 @@ pub(crate) fn append(
             sealed_bytes.as_slice()
         ],
     )
-    .map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),record_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id) VALUES(?1,?2,?3) ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),operation_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice(),now_unix_ms]).map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
+    tx.execute("INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),record_id.as_bytes().as_slice()]).map_err(fault!(storage_error()))?;
+    tx.execute("INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id) VALUES(?1,?2,?3) ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),operation_id.as_bytes().as_slice()]).map_err(fault!(storage_error()))?;
+    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice(),now_unix_ms]).map_err(fault!(storage_error()))?;
     let delivery_sequence = tx.last_insert_rowid();
     tx.execute(
         "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
         [scope.as_slice()],
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
     let record = record_from_row((
@@ -1470,7 +1471,7 @@ pub(crate) fn open_records(
             |r| r.get(0),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .ok_or(SynchronizationError::WorkspaceNotFound)?;
     let key = ContentKey::from_column(key)?;
     let protector = P2pandaRecordProtection {
@@ -1525,7 +1526,7 @@ fn note_unopenable_record(
             |_| Ok(()),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .is_some();
     if stored {
         quarantine::quarantine_record(
@@ -1855,7 +1856,7 @@ fn validate_protection_controls(
                 "SELECT scope_id,recipient_public_identity,control_bytes
                  FROM protection_control_operations",
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1864,7 +1865,7 @@ fn validate_protection_controls(
                     row.get::<_, Vec<u8>>(2)?,
                 ))
             })
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         rows.collect::<Result<_, _>>()
             .map_err(|_| StorageError::CorruptWorkspace)?
     };
@@ -1882,7 +1883,9 @@ fn validate_protection_controls(
             .map_err(|_| StorageError::CorruptWorkspace)?;
         // A scope that restart already isolated is not held against the
         // Installation a second time.
-        if quarantine::is_scope_quarantined(conn, scope_id).map_err(|_| StorageError::Database)? {
+        if quarantine::is_scope_quarantined(conn, scope_id)
+            .map_err(fault!(StorageError::Database))?
+        {
             continue;
         }
         let key = protection_control::open_control(
@@ -1897,7 +1900,7 @@ fn validate_protection_controls(
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         let Some(scope_key_id) = scope_key_id else {
             return Err(StorageError::CorruptWorkspace);
         };
@@ -1914,7 +1917,7 @@ pub(crate) fn recover(
     now_unix_ms: i64,
 ) -> Result<RecoveryReport, StorageError> {
     let scopes: Vec<ScopeRecoveryRow> = {
-        let mut stmt = conn.prepare("SELECT scope_id,package_identity,workspace_id,content_key,content_key_id FROM sync_scopes").map_err(|_| StorageError::Database)?;
+        let mut stmt = conn.prepare("SELECT scope_id,package_identity,workspace_id,content_key,content_key_id FROM sync_scopes").map_err(fault!(StorageError::Database))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -1925,7 +1928,7 @@ pub(crate) fn recover(
                     r.get::<_, Vec<u8>>(4)?,
                 ))
             })
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         rows.map(|row| {
             let (scope, package, workspace, key, id) =
                 row.map_err(|_| StorageError::CorruptWorkspace)?;
@@ -1953,7 +1956,7 @@ pub(crate) fn recover(
         Vec::with_capacity(scopes.len());
     for (scope, package, workspace, key, id) in scopes {
         report.scopes_checked += 1;
-        if quarantine::is_scope_quarantined(conn, scope).map_err(|_| StorageError::Database)? {
+        if quarantine::is_scope_quarantined(conn, scope).map_err(fault!(StorageError::Database))? {
             report.scopes_quarantined += 1;
             continue;
         }
@@ -1966,7 +1969,7 @@ pub(crate) fn recover(
         };
         if let Some(fault) = fault {
             quarantine::quarantine_scope(conn, scope, fault, now_unix_ms)
-                .map_err(|_| StorageError::Database)?;
+                .map_err(fault!(StorageError::Database))?;
             report.scopes_quarantined += 1;
             continue;
         }
@@ -2008,7 +2011,7 @@ fn validate_scope_records(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| StorageError::Database)?
+        .map_err(fault!(StorageError::Database))?
         .unwrap_or(0);
     type PendingRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
     let pending: Vec<PendingRow> = {
@@ -2021,7 +2024,7 @@ fn validate_scope_records(
                  WHERE d.scope_id=?1 AND d.delivery_sequence>?2
                  ORDER BY d.delivery_sequence",
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         let rows = stmt
             .query_map(rusqlite::params![scope.as_slice(), mark], |r| {
                 Ok((
@@ -2032,9 +2035,9 @@ fn validate_scope_records(
                     r.get::<_, Vec<u8>>(4)?,
                 ))
             })
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         rows.collect::<Result<_, _>>()
-            .map_err(|_| StorageError::Database)?
+            .map_err(fault!(StorageError::Database))?
     };
     if pending.is_empty() {
         return Ok(());
@@ -2046,7 +2049,7 @@ fn validate_scope_records(
     };
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     let mut scope_isolated = false;
     let mut validated_through = mark;
     for (sequence, record_id, order, bytes, operation_id) in pending {
@@ -2057,7 +2060,7 @@ fn validate_scope_records(
                 quarantine::ScopeFault::Projection,
                 now_unix_ms,
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
             report.scopes_quarantined += 1;
             scope_isolated = true;
             break;
@@ -2088,7 +2091,7 @@ fn validate_scope_records(
         };
         if let Some(fault) = fault {
             quarantine::quarantine_record(&transaction, scope, expected_id, fault, now_unix_ms)
-                .map_err(|_| StorageError::Database)?;
+                .map_err(fault!(StorageError::Database))?;
             report.records_quarantined += 1;
         }
         report.records_validated += 1;
@@ -2101,11 +2104,11 @@ fn validate_scope_records(
                  ON CONFLICT(scope_id) DO UPDATE SET validated_through_sequence=excluded.validated_through_sequence",
                 rusqlite::params![scope.as_slice(), validated_through],
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
     }
     transaction
         .commit()
-        .map_err(|_| StorageError::UncertainOutcome)?;
+        .map_err(fault!(StorageError::UncertainOutcome))?;
     Ok(())
 }
 

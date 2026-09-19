@@ -65,7 +65,10 @@ impl crate::synchronization::SyncReceiver for InjectingReceiver {
         workspace: WorkspaceId,
         package: &str,
         recipient: PublicIdentity,
-    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
+    ) -> Result<
+        Option<crate::synchronization::ProtectionBundle>,
+        crate::synchronization::SyncRejection,
+    > {
         self.inner
             .protection_bundle_for(workspace, package, recipient)
     }
@@ -76,7 +79,7 @@ impl crate::synchronization::SyncReceiver for InjectingReceiver {
         workspace: WorkspaceId,
         package: &str,
         bundle: crate::synchronization::ProtectionBundle,
-    ) -> Result<usize, ()> {
+    ) -> Result<usize, crate::synchronization::SyncRejection> {
         self.inner
             .import_protection_bundle(peer, workspace, package, bundle)
     }
@@ -115,7 +118,7 @@ impl crate::synchronization::SyncReceiver for InjectingReceiver {
         after: Option<u32>,
         until: Option<u32>,
         limit: usize,
-    ) -> Result<Vec<(u32, usize)>, ()> {
+    ) -> Result<Vec<(u32, usize)>, crate::synchronization::SyncRejection> {
         let mut sizes = self
             .inner
             .range_sizes(peer, workspace, package, author, after, until, limit)?;
@@ -196,7 +199,10 @@ impl crate::synchronization::SyncReceiver for ProbeReceiver {
         _workspace: WorkspaceId,
         _package: &str,
         _recipient: PublicIdentity,
-    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
+    ) -> Result<
+        Option<crate::synchronization::ProtectionBundle>,
+        crate::synchronization::SyncRejection,
+    > {
         Ok(None)
     }
 
@@ -206,7 +212,7 @@ impl crate::synchronization::SyncReceiver for ProbeReceiver {
         _workspace: WorkspaceId,
         _package: &str,
         _bundle: crate::synchronization::ProtectionBundle,
-    ) -> Result<usize, ()> {
+    ) -> Result<usize, crate::synchronization::SyncRejection> {
         Ok(0)
     }
 
@@ -228,7 +234,7 @@ impl crate::synchronization::SyncReceiver for ProbeReceiver {
         _after: Option<u32>,
         _until: Option<u32>,
         _limit: usize,
-    ) -> Result<Vec<(u32, usize)>, ()> {
+    ) -> Result<Vec<(u32, usize)>, crate::synchronization::SyncRejection> {
         Ok(Vec::new())
     }
 

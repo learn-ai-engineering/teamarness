@@ -4,6 +4,7 @@ use p2panda_auth::group::resolver::StrongRemove;
 use p2panda_core::Hash;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::diag::fault;
 use crate::error::{MembershipError, StorageError, WorkspaceError};
 use crate::membership::{
     AuthId, MembershipAction, MembershipEnvelope, OperationAdapter, validate_context,
@@ -199,7 +200,7 @@ fn finish_request_with_fault(
     let version = membership_version(request.workspace_id, request.genesis_id);
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
 
     if let Some(existing) = load_workspace(&transaction, request.workspace_id)? {
         if !workspace_matches_request(&existing, request) {
@@ -237,7 +238,7 @@ fn finish_request_with_fault(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     match existing_operation {
         Some(bytes) if bytes != request.genesis_envelope => {
             return Err(StorageError::CorruptWorkspace);
@@ -270,14 +271,14 @@ fn finish_request_with_fault(
              WHERE workspace_id = ?1 AND status = 'Pending'",
             [request.workspace_id.as_bytes().as_slice()],
         )
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     if updated > 1 {
         return Err(StorageError::CorruptWorkspace);
     }
     fault(CreationBoundary::DuringTransactionTwo)?;
     transaction
         .commit()
-        .map_err(|_| StorageError::UncertainOutcome)?;
+        .map_err(fault!(StorageError::UncertainOutcome))?;
     fault(CreationBoundary::AfterTransactionTwoCommit)?;
     Ok(())
 }
@@ -340,7 +341,7 @@ fn insert_or_verify_state(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     match stored {
         Some((0, stored_version)) if stored_version == version.as_bytes() => Ok(()),
         Some(_) => Err(StorageError::CorruptWorkspace),
@@ -374,7 +375,7 @@ fn insert_or_verify_creator(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     match stored {
         Some(1) => Ok(()),
         Some(_) => Err(StorageError::CorruptWorkspace),
@@ -422,7 +423,7 @@ fn verify_ready(connection: &Connection) -> Result<(), StorageError> {
                 },
             )
             .optional()
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         if !matches!(
             operation,
             Some((workspace, author, timestamp, 0, bytes))
@@ -439,14 +440,14 @@ fn verify_ready(connection: &Connection) -> Result<(), StorageError> {
                 [request.genesis_id.as_bytes().as_slice()],
                 |row| row.get(0),
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         if dependency_count != 0 {
             return Err(StorageError::CorruptWorkspace);
         }
     }
     let ready_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     if ready_count != i64::try_from(requests.len()).map_err(|_| StorageError::CorruptWorkspace)? {
         return Err(StorageError::CorruptWorkspace);
     }
@@ -471,7 +472,7 @@ fn load_requests(
     };
     let mut statement = connection
         .prepare(sql)
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     let map_row = |row: &rusqlite::Row<'_>| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
@@ -487,16 +488,20 @@ fn load_requests(
     if let Some(status) = status {
         let rows = statement
             .query_map([status], map_row)
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         for row in rows {
-            requests.push(request_from_row(row.map_err(|_| StorageError::Database)?)?);
+            requests.push(request_from_row(
+                row.map_err(fault!(StorageError::Database))?,
+            )?);
         }
     } else {
         let rows = statement
             .query_map([], map_row)
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         for row in rows {
-            requests.push(request_from_row(row.map_err(|_| StorageError::Database)?)?);
+            requests.push(request_from_row(
+                row.map_err(fault!(StorageError::Database))?,
+            )?);
         }
     }
     Ok(requests)
@@ -538,7 +543,7 @@ fn load_workspace(
             },
         )
         .optional()
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     row.map(
         |(workspace, creator, name, authored_at, genesis_id, genesis_envelope)| {
             request_from_row((

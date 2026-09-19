@@ -12,6 +12,8 @@ use tempfile::TempDir;
 
 #[path = "../src/data_directory.rs"]
 mod data_directory;
+#[path = "../src/diag.rs"]
+mod diag;
 #[path = "../src/host_store.rs"]
 mod host_store;
 #[path = "../src/manifest.rs"]

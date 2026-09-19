@@ -14,6 +14,7 @@ use super::network_handler::{
     FatalSyncError, OperationOutcome, ProtectionBundle, RangeLoadError, Refusal, ReplicationEntry,
     SessionGrant, SessionSeed, SyncReceiver,
 };
+use crate::synchronization::SyncRejection;
 use crate::{PublicIdentity, WorkspaceId};
 
 /// A `LogStore` over operations held in memory.
@@ -282,7 +283,7 @@ impl SyncReceiver for RecordingReceiver {
         _workspace: WorkspaceId,
         _package: &str,
         _recipient: PublicIdentity,
-    ) -> Result<Option<ProtectionBundle>, ()> {
+    ) -> Result<Option<ProtectionBundle>, SyncRejection> {
         Ok(None)
     }
 
@@ -292,7 +293,7 @@ impl SyncReceiver for RecordingReceiver {
         _workspace: WorkspaceId,
         _package: &str,
         _bundle: ProtectionBundle,
-    ) -> Result<usize, ()> {
+    ) -> Result<usize, SyncRejection> {
         Ok(0)
     }
 
@@ -314,7 +315,7 @@ impl SyncReceiver for RecordingReceiver {
         after: Option<u32>,
         until: Option<u32>,
         limit: usize,
-    ) -> Result<Vec<(u32, usize)>, ()> {
+    ) -> Result<Vec<(u32, usize)>, SyncRejection> {
         Ok(self
             .store
             .range(author, after, until)

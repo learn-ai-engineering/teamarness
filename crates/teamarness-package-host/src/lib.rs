@@ -10,6 +10,7 @@ mod capability;
 mod catalog;
 mod commands;
 mod data_directory;
+mod diag;
 mod errors;
 mod host;
 mod host_store;

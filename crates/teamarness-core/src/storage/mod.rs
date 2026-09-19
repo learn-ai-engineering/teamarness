@@ -8,6 +8,7 @@ use iroh_base::SecretKey;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
+use crate::diag::fault;
 use crate::error::StorageError;
 use crate::identity::DEFAULT_DISPLAY_NAME;
 
@@ -58,19 +59,20 @@ fn open_inner(
     let database_path = private_data_directory.join(DATABASE_FILE_NAME);
     prepare_private_database_file(&database_path)?;
 
-    let mut connection = Connection::open(&database_path).map_err(|_| StorageError::Database)?;
+    let mut connection =
+        Connection::open(&database_path).map_err(fault!(StorageError::Database))?;
     // ADR 0017: freed pages are overwritten, so a dropped column's key bytes
     // and a deleted row's contents do not survive on disk. Set before the
     // migrations run, because migration 0012 frees exactly such pages.
     connection
         .pragma_update(None, "secure_delete", "ON")
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     connection
         .busy_timeout(Duration::from_secs(5))
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     migrations::apply(&mut connection)?;
 
     fault(IdentityTransactionBoundary::Before)?;
@@ -104,7 +106,7 @@ fn load_identity(connection: &Connection) -> Result<Option<(SecretKey, String)>,
             },
         )
         .optional()
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
 
     stored
         .map(|(secret_bytes, display_name)| {
@@ -123,7 +125,7 @@ fn load_identity(connection: &Connection) -> Result<Option<(SecretKey, String)>,
 fn initialize_identity(connection: &mut Connection) -> Result<(SecretKey, String), StorageError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     let stored = load_identity(&transaction)?;
     let identity = match stored {
         Some(identity) => identity,
@@ -139,7 +141,7 @@ fn initialize_identity(connection: &mut Connection) -> Result<(SecretKey, String
                         DEFAULT_DISPLAY_NAME
                     ],
                 )
-                .map_err(|_| StorageError::Database)?;
+                .map_err(fault!(StorageError::Database))?;
             transaction
                 .execute(
                     "INSERT INTO identity_subjects (
@@ -148,13 +150,13 @@ fn initialize_identity(connection: &mut Connection) -> Result<(SecretKey, String
                      ) VALUES (?1, NULL)",
                     params![public_key.as_bytes().as_slice()],
                 )
-                .map_err(|_| StorageError::Database)?;
+                .map_err(fault!(StorageError::Database))?;
             (secret_key, DEFAULT_DISPLAY_NAME.to_owned())
         }
     };
     transaction
         .commit()
-        .map_err(|_| StorageError::UncertainOutcome)?;
+        .map_err(fault!(StorageError::UncertainOutcome))?;
     Ok(identity)
 }
 
@@ -169,7 +171,7 @@ fn authenticate_local_subject(
             params![secret_key.public().as_bytes().as_slice()],
             |row| row.get(0),
         )
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     if count != 1 {
         return Err(StorageError::CorruptIdentity);
     }
@@ -182,19 +184,19 @@ pub(crate) fn update_display_name(
 ) -> Result<(), StorageError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     let updated = transaction
         .execute(
             "UPDATE installation_identity SET display_name = ?1 WHERE singleton_id = 1",
             [display_name],
         )
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     if updated != 1 {
         return Err(StorageError::CorruptIdentity);
     }
     transaction
         .commit()
-        .map_err(|_| StorageError::UncertainOutcome)
+        .map_err(fault!(StorageError::UncertainOutcome))
 }
 
 /// Decides whether a path may be used as the private data directory, and
@@ -243,7 +245,7 @@ fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
                 (
                     path.join(PRIVATE_DIRECTORY_MARKER).exists(),
                     fs::read_dir(path)
-                        .map_err(|_| StorageError::Io)?
+                        .map_err(fault!(StorageError::Io))?
                         .next()
                         .is_none(),
                     path.join(DATABASE_FILE_NAME).exists(),
@@ -262,7 +264,7 @@ fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
             )?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).map_err(|_| StorageError::Io)?;
+            fs::create_dir_all(path).map_err(fault!(StorageError::Io))?;
             true
         }
         Err(_) => return Err(StorageError::Io),
@@ -294,7 +296,7 @@ fn write_private_directory_marker(path: &Path) -> Result<(), StorageError> {
     {
         Ok(mut marker) => marker
             .write_all(PRIVATE_DIRECTORY_MARKER_CONTENT)
-            .map_err(|_| StorageError::Io),
+            .map_err(fault!(StorageError::Io)),
         // Another runtime opening the same directory wrote it first.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(_) => Err(StorageError::Io),
@@ -316,7 +318,7 @@ fn create_database_file(path: &Path) -> Result<(), StorageError> {
         .mode(0o600)
         .open(path)
         .map(|_| ())
-        .map_err(|_| StorageError::Io)
+        .map_err(fault!(StorageError::Io))
 }
 
 #[cfg(not(unix))]
@@ -326,7 +328,7 @@ fn create_database_file(path: &Path) -> Result<(), StorageError> {
         .append(true)
         .open(path)
         .map(|_| ())
-        .map_err(|_| StorageError::Io)
+        .map_err(fault!(StorageError::Io))
 }
 
 #[cfg(unix)]
@@ -334,7 +336,7 @@ fn set_directory_permissions(path: &Path) -> Result<(), StorageError> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|_| StorageError::Permission)
+        .map_err(fault!(StorageError::Permission))
 }
 
 #[cfg(unix)]
@@ -342,7 +344,7 @@ fn set_database_permissions(path: &Path) -> Result<(), StorageError> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|_| StorageError::Permission)
+        .map_err(fault!(StorageError::Permission))
 }
 
 #[cfg(not(unix))]

@@ -63,6 +63,63 @@ pub(crate) enum Refusal {
     KeyMismatch = 3,
 }
 
+/// Why a [`SyncReceiver`] could not answer a session question.
+///
+/// The wire behaviour does not depend on the variant: a session that cannot get
+/// a protection bundle or a range of sizes offers nothing and carries on. The
+/// variant exists so the cause reaches one diagnostic line instead of being
+/// erased into `()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncRejection {
+    /// The named Workspace has no local membership projection.
+    UnknownWorkspace,
+    /// Either this Installation or the peer is not a current Member.
+    NotMember,
+    /// A protection control did not prove what it claims.
+    InvalidProof,
+    /// A protection grant could not be exported or imported.
+    Grant,
+    /// Stored state could not be read or written.
+    Storage,
+    /// The runtime state is gone or poisoned.
+    RuntimeGone,
+}
+
+impl SyncRejection {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::UnknownWorkspace => "unknown_workspace",
+            Self::NotMember => "not_member",
+            Self::InvalidProof => "invalid_proof",
+            Self::Grant => "grant",
+            Self::Storage => "storage",
+            Self::RuntimeGone => "runtime_gone",
+        }
+    }
+}
+
+impl std::fmt::Display for SyncRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// Records why a receiver refused a session question and returns what the
+/// session offers instead. The wire behaviour is unchanged: a rejection means
+/// "nothing to offer", as the erased `()` did.
+fn note_rejection<T>(
+    outcome: Result<Result<T, SyncRejection>, crate::blocking::StateUnavailable>,
+) -> Option<T> {
+    match outcome {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(rejection)) => {
+            crate::diag::record(concat!(file!(), ":", line!()), &rejection);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 impl Refusal {
     const fn reason(self) -> u8 {
         self as u8
@@ -207,7 +264,7 @@ pub(crate) trait SyncReceiver: Send + Sync {
         workspace: WorkspaceId,
         package: &str,
         recipient: PublicIdentity,
-    ) -> Result<Option<ProtectionBundle>, ()>;
+    ) -> Result<Option<ProtectionBundle>, SyncRejection>;
 
     fn import_protection_bundle(
         &self,
@@ -215,7 +272,7 @@ pub(crate) trait SyncReceiver: Send + Sync {
         workspace: WorkspaceId,
         package: &str,
         bundle: ProtectionBundle,
-    ) -> Result<usize, ()>;
+    ) -> Result<usize, SyncRejection>;
 
     /// Records that the peer's membership view differs from the local one, so
     /// the worker can run a membership session with it.
@@ -245,7 +302,7 @@ pub(crate) trait SyncReceiver: Send + Sync {
         after: Option<u32>,
         until: Option<u32>,
         limit: usize,
-    ) -> Result<Vec<(u32, usize)>, ()>;
+    ) -> Result<Vec<(u32, usize)>, SyncRejection>;
 
     /// One page of an author's operations, authenticated against the stored
     /// projection as it is read.
@@ -520,10 +577,12 @@ async fn outbound_session_body(
     if let Some(bundle) = welcome_bundle {
         let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
         let scope = package.to_owned();
-        let _ = crate::blocking::receiver_call(receiver, move |receiver| {
-            receiver.import_protection_bundle(peer, workspace, &scope, bundle)
-        })
-        .await;
+        note_rejection(
+            crate::blocking::receiver_call(receiver, move |receiver| {
+                receiver.import_protection_bundle(peer, workspace, &scope, bundle)
+            })
+            .await,
+        );
     }
     if remote_version != grant.membership_version {
         let _ = crate::blocking::receiver_call(receiver, move |receiver| {
@@ -533,12 +592,13 @@ async fn outbound_session_body(
     }
     let offer = if grant.content_key_id.is_some() && remote_key.is_none() {
         let scope = package.to_owned();
-        crate::blocking::receiver_call(receiver, move |receiver| {
-            receiver.protection_bundle_for(workspace, &scope, peer)
-        })
-        .await
-        .unwrap_or(Ok(None))
-        .unwrap_or(None)
+        note_rejection(
+            crate::blocking::receiver_call(receiver, move |receiver| {
+                receiver.protection_bundle_for(workspace, &scope, peer)
+            })
+            .await,
+        )
+        .flatten()
     } else {
         None
     };
@@ -818,12 +878,13 @@ async fn run_log_session_body(
     }
     let bundle = if grant.content_key_id.is_some() && remote_key.is_none() {
         let scope = package.clone();
-        crate::blocking::receiver_call(receiver, move |receiver| {
-            receiver.protection_bundle_for(workspace, &scope, peer)
-        })
-        .await
-        .unwrap_or(Ok(None))
-        .unwrap_or(None)
+        note_rejection(
+            crate::blocking::receiver_call(receiver, move |receiver| {
+                receiver.protection_bundle_for(workspace, &scope, peer)
+            })
+            .await,
+        )
+        .flatten()
     } else {
         None
     };
@@ -849,10 +910,12 @@ async fn run_log_session_body(
             if let Some(bundle) = protection {
                 let bundle = bundle.validated().map_err(LogSessionError::Protocol)?;
                 let scope = package.clone();
-                let _ = crate::blocking::receiver_call(receiver, move |receiver| {
-                    receiver.import_protection_bundle(peer, workspace, &scope, bundle)
-                })
-                .await;
+                note_rejection(
+                    crate::blocking::receiver_call(receiver, move |receiver| {
+                        receiver.import_protection_bundle(peer, workspace, &scope, bundle)
+                    })
+                    .await,
+                );
             }
         }
         LogSyncWire::Refused { reason } => {
@@ -974,7 +1037,7 @@ pub(crate) mod tests {
             _workspace: WorkspaceId,
             _package: &str,
             _recipient: PublicIdentity,
-        ) -> Result<Option<ProtectionBundle>, ()> {
+        ) -> Result<Option<ProtectionBundle>, SyncRejection> {
             Ok(None)
         }
 
@@ -984,7 +1047,7 @@ pub(crate) mod tests {
             _workspace: WorkspaceId,
             _package: &str,
             _bundle: ProtectionBundle,
-        ) -> Result<usize, ()> {
+        ) -> Result<usize, SyncRejection> {
             Ok(0)
         }
 
@@ -1006,7 +1069,7 @@ pub(crate) mod tests {
             _after: Option<u32>,
             _until: Option<u32>,
             _limit: usize,
-        ) -> Result<Vec<(u32, usize)>, ()> {
+        ) -> Result<Vec<(u32, usize)>, SyncRejection> {
             Ok(Vec::new())
         }
 

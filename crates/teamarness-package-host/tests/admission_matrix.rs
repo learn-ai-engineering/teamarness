@@ -18,6 +18,8 @@ pub use teamarness_package_host::{
 mod admission;
 #[path = "../src/catalog.rs"]
 mod catalog;
+#[path = "../src/diag.rs"]
+mod diag;
 #[path = "../src/host_store.rs"]
 mod host_store;
 #[path = "../src/manifest.rs"]
