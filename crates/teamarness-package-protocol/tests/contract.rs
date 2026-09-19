@@ -2,8 +2,9 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use serde_json::Value;
 use teamarness_package_protocol::{
-    ContractState, Direction, FrameDecoder, MAX_FRAME_BYTES, ProtocolError, ProtocolRange,
-    ProtocolVersion, decode_frame, decode_payload, negotiate_version,
+    ContractState, Direction, FrameDecoder, INITIAL_STREAM_CREDIT, MAX_DECODED_FRAME_BYTES,
+    MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
+    ProtocolError, ProtocolRange, ProtocolVersion, decode_frame, decode_payload, negotiate_version,
 };
 
 fn contract_root() -> PathBuf {
@@ -121,7 +122,46 @@ fn framing_round_trips_at_the_boundary_and_rejects_truncation() {
         decode_frame(truncated).unwrap_err().code(),
         "truncated_frame"
     );
-    assert_eq!(MAX_FRAME_BYTES, 1_048_576);
+}
+
+/// The contract publishes the limits table; this crate declares the constants.
+///
+/// Both are read here, so a limit cannot move on one side alone. Pinning a
+/// constant to a literal instead only restated the code in the test.
+#[test]
+fn every_constant_matches_the_contract_limits_table() {
+    let readme = fs::read_to_string(contract_root().join("README.md")).expect("contract README");
+    let published = |row: &str| -> usize {
+        let line = readme
+            .lines()
+            .find(|line| line.starts_with(&format!("| {row} |")))
+            .unwrap_or_else(|| panic!("the limits table has no `{row}` row"));
+        line.rsplit('|')
+            .nth(1)
+            .expect("a value cell")
+            .trim()
+            .replace(',', "")
+            .parse()
+            .expect("a decimal limit")
+    };
+    assert_eq!(published("Payload bytes per frame"), MAX_FRAME_BYTES);
+    assert_eq!(
+        published("Payload bytes per frame"),
+        MAX_DECODED_FRAME_BYTES
+    );
+    assert_eq!(
+        published("In-flight requests in each direction"),
+        MAX_IN_FLIGHT_EACH_DIRECTION
+    );
+    assert_eq!(published("Queued frames per writer"), MAX_WRITER_FRAMES);
+    assert_eq!(
+        published("Queued payload bytes per writer"),
+        MAX_WRITER_BYTES
+    );
+    assert_eq!(
+        published("Initial event credit per stream"),
+        INITIAL_STREAM_CREDIT
+    );
 }
 
 #[test]
