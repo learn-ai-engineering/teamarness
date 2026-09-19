@@ -86,6 +86,37 @@ export async function checkSharedSubscriptionBound(root = repositoryRoot) {
   return [];
 }
 
+/**
+ * The Shell decides how often it acknowledges; the Package Host sizes its
+ * control lane against that decision, so one behaviour is published in two
+ * languages and neither may move alone.
+ *
+ * A bound derived from the protocol's vocabulary instead — "one `credit` frame
+ * per subscription" — was wrong by a factor of 32 and every floor test agreed
+ * with it, because the granularity that makes it wrong lived only in
+ * TypeScript and the Rust side had no name for it.
+ */
+export async function checkSharedAcknowledgementGranularity(root = repositoryRoot) {
+  const hostPath = "crates/teamarness-package-host/src/protocol.rs";
+  const shellPath = "apps/teamarness-desktop/src/package-frame/protocol.ts";
+  const host = rustConstant(
+    await readFile(join(root, hostPath), "utf8"),
+    "EVENTS_PER_ACKNOWLEDGEMENT",
+  );
+  const shell = typeScriptConstant(
+    await readFile(join(root, shellPath), "utf8"),
+    "EVENTS_PER_ACKNOWLEDGEMENT",
+  );
+  if (host === null) return [`${hostPath} no longer declares EVENTS_PER_ACKNOWLEDGEMENT`];
+  if (shell === null) return [`${shellPath} no longer declares EVENTS_PER_ACKNOWLEDGEMENT`];
+  if (host !== shell) {
+    return [
+      `${shellPath} acknowledges every ${shell} event while ${hostPath} sizes the control lane for every ${host}; the Host's \`CONTROL_WORST_CASE\` counts \`credit\` frames the Shell no longer sends at that rate`,
+    ];
+  }
+  return [];
+}
+
 async function trackedFiles(root) {
   const { stdout } = await execFileAsync("git", ["ls-files", "*.rs"], { cwd: root });
   return stdout
@@ -99,6 +130,7 @@ export async function checkProtocolBounds(root = repositoryRoot) {
     problems.push(...findBareBounds(file, await readFile(join(root, file), "utf8")));
   }
   problems.push(...(await checkSharedSubscriptionBound(root)));
+  problems.push(...(await checkSharedAcknowledgementGranularity(root)));
   return problems;
 }
 

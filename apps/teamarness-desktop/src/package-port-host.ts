@@ -385,6 +385,14 @@ export class PackagePortHost {
    * ordering for a synchronous listener: the ack for the last delivered event
    * is already queued when the stream ends. It is dropped. An id that was
    * never issued names nothing this host ever had, and stays a fault.
+   *
+   * The record moves only once the Package Host has taken the acknowledgement.
+   * Advancing first and discarding the result is what made a lost
+   * acknowledgement permanent: this host would refuse to ask again, the
+   * Package Host had already counted the credit it never released, and the
+   * stream stalled with nothing said. A failure now ends the subscription
+   * instead of being swallowed, and until it settles the events stay owed, so
+   * the next acknowledgement covers them.
    */
   private acknowledge(id: number, sequence: string): void {
     const entry = this.subscriptions.get(id);
@@ -403,10 +411,16 @@ export class PackagePortHost {
       this.fault("protocol");
       return;
     }
-    entry.acknowledged = value;
     void this.transport
       .acknowledgeEvents({ mount: this.mount, subscription: entry.subscription, throughSequence: sequence })
-      .catch(() => undefined);
+      .then(
+        () => {
+          // Acknowledgements settle independently, so the record only ever
+          // moves forwards.
+          if (value > entry.acknowledged) entry.acknowledged = value;
+        },
+        (error: unknown) => { this.terminate(id, entry, error); },
+      );
   }
 
   /**

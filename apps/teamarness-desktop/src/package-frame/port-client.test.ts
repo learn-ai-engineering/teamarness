@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { isPackageRequestError, packageErrorCode, type PackageRequestError } from "@teamarness/package-ui-sdk";
 import { createPortPackageClient, type PortPackageClient } from "./port-client";
-import { parseShellMessage, type BridgeErrorEnvelope, type ShellToFrameMessage } from "./protocol";
+import {
+  EVENTS_PER_ACKNOWLEDGEMENT,
+  parseShellMessage,
+  type BridgeErrorEnvelope,
+  type ShellToFrameMessage,
+} from "./protocol";
 
 const envelope: BridgeErrorEnvelope = Object.freeze({
   version: 1,
@@ -119,6 +124,29 @@ describe("port-backed Package client", () => {
       { kind: "ack", id: 1, sequence: "0" },
       { kind: "ack", id: 1, sequence: "1" },
     ]);
+  });
+
+  it("acknowledges at the granularity the Package Host's control lane is sized for", async () => {
+    const test = harness();
+    const subscribing = test.bridge.client.subscribe<string>("reference.changes", {}, () => undefined);
+    test.deliver({ kind: "subscribed", id: 1 });
+    await subscribing;
+
+    const events = 5;
+    for (let index = 0; index < events; index += 1) {
+      test.deliver({ kind: "event", id: 1, sequence: String(index), payload: "a" });
+    }
+    await settle();
+
+    // `EVENTS_PER_ACKNOWLEDGEMENT` is the behaviour the Package Host counts a
+    // subscription's queued `credit` frames with (`protocol.rs`,
+    // `CONTROL_WORST_CASE`). A client that batched acknowledgements without
+    // moving that constant would leave the Host's control lane sized for
+    // traffic it no longer sends, which is the shape of the defect this
+    // constant exists to stop.
+    expect(test.posted.filter((message) => message.kind === "ack")).toHaveLength(
+      Math.ceil(events / EVENTS_PER_ACKNOWLEDGEMENT),
+    );
   });
 
   it("closes without acknowledgement and reports a rejected listener once", async () => {

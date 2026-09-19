@@ -9,7 +9,7 @@ use teamarness_package_protocol::{
     decode_frame, encode_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::ui::{AdmittedUi, MAX_UI_PAYLOAD_BYTES};
 use crate::{
@@ -31,30 +31,76 @@ const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
 /// event the classifier had already admitted.
 const UI_EVENT_BYTES: usize = INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES;
 
-/// Lifecycle, health and stream-control frames reserved on the control lane.
+/// Events the Shell acknowledges with one `ack`.
+///
+/// `apps/teamarness-desktop/src/package-frame/port-client.ts` posts one `ack`
+/// for every event it hands its listener, and
+/// `apps/teamarness-desktop/src/package-frame/protocol.ts` publishes that
+/// granularity as `EVENTS_PER_ACKNOWLEDGEMENT`.
+/// `scripts/check-protocol-bounds.mjs` reads both, so a Shell that started
+/// batching acknowledgements would have to move this constant with it.
+///
+/// This is the behaviour the control lane's worst case is measured in, and
+/// until this round it existed only in TypeScript. A bound derived from the
+/// protocol's vocabulary instead — "one `credit` per subscription" — was wrong
+/// by a factor of 32 and no floor could say so.
+pub(crate) const EVENTS_PER_ACKNOWLEDGEMENT: usize = 1;
+
+/// `credit` frames one subscription can owe at once.
+///
+/// Not one. A subscription does not hold one `credit` outstanding; it holds as
+/// many as its window has events the subscriber has read and not yet had
+/// credited, which is the whole window when the Shell acknowledges one event
+/// at a time.
+const CREDIT_FRAMES_PER_SUBSCRIPTION: usize =
+    INITIAL_STREAM_CREDIT.div_ceil(EVENTS_PER_ACKNOWLEDGEMENT);
+
+/// Every control frame the Host can owe at once, counted from the behaviour
+/// that produces them rather than from the protocol's vocabulary.
+///
+/// `initialize`, `ping` and `shutdown` are one frame each; every subscription
+/// one mount may hold open can owe a `stream_open`, a `stream_close` and a
+/// whole window of `credit`.
+const CONTROL_WORST_CASE: usize =
+    3 + MAX_UI_SUBSCRIPTIONS_PER_MOUNT * (2 + CREDIT_FRAMES_PER_SUBSCRIPTION);
+
+/// Whether `ProcessClient::credit` waits for a control slot instead of
+/// refusing when the lane is full.
+///
+/// `CONTROL_WORST_CASE` is 275 against the 64 queued frames the contract
+/// publishes for the whole writer, so no split of that budget admits it and
+/// the lane cannot be widened to satisfy the floor below. Waiting is the only
+/// way the worst case is served at all.
+/// `a_full_control_lane_never_destroys_acknowledged_credit` is what proves
+/// this claim is true of the code rather than of this comment.
+const CREDIT_WAITS_FOR_A_SLOT: bool = true;
+
+/// Control frames a *refusing* send may have outstanding.
 ///
 /// `initialize`, `ping` and `shutdown` are one frame each, and one
-/// `stream_open`, `credit` and `stream_close` may be queued for each of the
-/// subscriptions one mount may hold open.
-const CONTROL_RESERVE: usize = 3 + 3 * MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
+/// `stream_open` and one `stream_close` may be queued for each subscription a
+/// mount may hold open. `credit` is not counted here: it waits, because the
+/// window it releases does not fit any lane.
+const CONTROL_RESERVE: usize = 3 + 2 * MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 
-/// Slots on the control lane.
-///
-/// The two lanes share the one writer budget the contract publishes and the
-/// handshake transmits, so their depths are a split of `MAX_WRITER_FRAMES`,
-/// exactly as their byte budgets are a split of `MAX_WRITER_BYTES`. The
-/// control lane takes the reserve: those are the frames a refusing send
-/// queues, and a lane shallower than them turns legal traffic into a refused
-/// frame. A capability answer needs no slot of its own here — it waits for
-/// one, because the task that writes it owns its work.
-const CONTROL_QUEUE: usize = CONTROL_RESERVE;
-
-/// Slots on the data lane: the rest of the writer's published frame budget.
+/// Slots on the data lane.
 ///
 /// Worst case: every in-flight request the contract permits, queued at once.
 /// The one `cancel` that may follow a request is sent after that request's
 /// deadline expires, by which time its frame has left the lane.
-const DATA_QUEUE: usize = MAX_WRITER_FRAMES - CONTROL_QUEUE;
+const DATA_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION;
+
+/// Slots on the control lane: the rest of the writer's published frame budget.
+///
+/// The two lanes share the one writer budget the contract publishes and the
+/// handshake transmits, so their depths are a split of `MAX_WRITER_FRAMES`,
+/// exactly as their byte budgets are a split of `MAX_WRITER_BYTES`. The data
+/// lane takes its own worst case and the control lane keeps the rest, which
+/// must still cover `CONTROL_RESERVE` — the frames a refusing send queues, and
+/// a lane shallower than them turns legal traffic into a refused frame. A
+/// capability answer needs no slot of its own here, and neither does `credit`:
+/// both wait, because the tasks that write them own their work.
+const CONTROL_QUEUE: usize = MAX_WRITER_FRAMES - DATA_QUEUE;
 
 /// The control lane's shared byte budget: two contract-maximum frames, so one
 /// maximum answer never waits on another that is already queued.
@@ -75,6 +121,41 @@ const TERMINAL_RESERVE_BYTES: usize = MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ER
 
 /// The data lane keeps the rest of the writer budget the contract publishes.
 pub(crate) const DATA_BYTES: usize = MAX_WRITER_BYTES - CONTROL_BYTES - TERMINAL_RESERVE_BYTES;
+
+// Rule 2's floors for this crate, asserted beside the bounds they guard so a
+// bound that stops admitting its worst case fails the build rather than a
+// suite. ADR 0019 §3 names them.
+//
+// Each left-hand side is written from the traffic, independently of the bound
+// it guards. A floor that restates its own bound's definition cannot fail on a
+// change to any input, and that is how the control lane came to be sized for
+// one `credit` per subscription while the Shell acknowledged one event at a
+// time: the floor re-read the same wrong worst case and agreed with it.
+const _: () = {
+    // The anchor. Its left-hand side names `INITIAL_STREAM_CREDIT` through
+    // `CREDIT_FRAMES_PER_SUBSCRIPTION`, so a change to the credit window moves
+    // it, and it cannot be satisfied by widening the lane: 275 does not fit
+    // the 64 frames the contract publishes for the whole writer. The only way
+    // to meet it is the waiting send, which
+    // `a_full_control_lane_never_destroys_acknowledged_credit` proves is what
+    // the code does.
+    assert!(CONTROL_QUEUE >= CONTROL_WORST_CASE || CREDIT_WAITS_FOR_A_SLOT);
+    // The frames a refusing send queues must fit the lane they refuse on.
+    // `CONTROL_RESERVE` is counted from those senders, not from
+    // `CONTROL_QUEUE`, so a ninth subscription per mount fails here.
+    assert!(CONTROL_QUEUE >= CONTROL_RESERVE);
+    assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
+    // Both lanes' independently counted worst cases must fit the one budget
+    // the handshake publishes. This is the assertion an SF2-001 recurrence
+    // breaks: each lane sized against the contract's concurrency on its own,
+    // together past the budget.
+    assert!(DATA_QUEUE + CONTROL_RESERVE <= MAX_WRITER_FRAMES);
+    assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
+    assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
+    assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
+    assert!(TERMINAL_RESERVE_BYTES == MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES);
+    assert!(CONTROL_BYTES + TERMINAL_RESERVE_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
+};
 
 pub(crate) struct UiEvent {
     pub(crate) sequence: u64,
@@ -230,8 +311,22 @@ impl UiEventRoute {
         self.state.lock().await.highest_delivered = sequence;
     }
 
-    pub(crate) async fn acknowledge(&self, through: u64) -> Result<u64, WireFailure> {
-        let mut state = self.state.lock().await;
+    /// Counts the credit an acknowledgement releases, without recording it.
+    ///
+    /// The record only moves when the `credit` frame that accounts for it is
+    /// on the wire. Advancing first is what made a refused frame permanent:
+    /// the Host believed it had released credit the Package never received, a
+    /// repeat was refused by this method's own first guard, and the only other
+    /// producer of `credit` is this one path. The window stayed shut and
+    /// nothing said so.
+    ///
+    /// The guard holds the route's state for the length of the send, so one
+    /// stream's acknowledgements reach the wire in the order they were counted.
+    pub(crate) async fn acknowledge(
+        &self,
+        through: u64,
+    ) -> Result<PendingAcknowledgement<'_>, WireFailure> {
+        let state = self.state.lock().await;
         if through <= state.highest_acknowledged
             || through > state.highest_delivered
             || through.saturating_sub(state.highest_acknowledged) > UI_EVENT_CAPACITY as u64
@@ -239,12 +334,37 @@ impl UiEventRoute {
             return Err(WireFailure::new(PackageErrorCode::ProtocolViolation));
         }
         let amount = through - state.highest_acknowledged;
-        state.highest_acknowledged = through;
-        Ok(amount)
+        Ok(PendingAcknowledgement {
+            state,
+            through,
+            amount,
+        })
     }
 
     fn terminate(&self, end: StreamEnd) {
         self.terminal.send_replace(Some(end));
+    }
+}
+
+/// Credit an acknowledgement has released but whose frame is not yet queued.
+///
+/// Dropping it without [`PendingAcknowledgement::commit`] leaves the route
+/// exactly where it was, so the next acknowledgement covers the same events
+/// again and the credit is not lost.
+pub(crate) struct PendingAcknowledgement<'route> {
+    state: MutexGuard<'route, UiEventRouteState>,
+    through: u64,
+    amount: u64,
+}
+
+impl PendingAcknowledgement<'_> {
+    pub(crate) const fn amount(&self) -> u64 {
+        self.amount
+    }
+
+    /// Records the acknowledgement, now that its `credit` frame is queued.
+    pub(crate) fn commit(mut self) {
+        self.state.highest_acknowledged = self.through;
     }
 }
 
@@ -1256,9 +1376,21 @@ impl ProcessClient {
     ///
     /// A stream that ended while the acknowledgement was in flight makes this
     /// frame late, not wrong: the writer's classifier ignores it.
+    ///
+    /// This send waits for a control slot rather than refusing one
+    /// (`CREDIT_WAITS_FOR_A_SLOT`). A subscription at a full window owes a
+    /// whole window of `credit` frames, which is more than the writer's whole
+    /// published frame budget, so a refusing send here destroys credit on
+    /// ordinary legal traffic. The wait is bounded: the caller is the UI
+    /// command's own task, never the reader or the writer loop, and a Package
+    /// that has stopped reading is failed by the five-second health probe,
+    /// which closes these channels.
     pub(crate) async fn credit(&self, stream_id: &str, amount: u64) -> Result<(), WireFailure> {
         self.writer
-            .control(json!({"kind":"credit", "streamId":stream_id, "amount":amount}))
+            .send_waiting(
+                json!({"kind":"credit", "streamId":stream_id, "amount":amount}),
+                true,
+            )
             .await
     }
 
@@ -1344,40 +1476,150 @@ fn empty_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE, MAX_ID_BYTES,
-        MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES, TERMINAL_RESERVE_BYTES,
-        UI_EVENT_BYTES, UI_EVENT_CAPACITY, package_owned_error, stream_end,
+        Duration, MAX_ID_BYTES, MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES,
+        package_owned_error, start, stream_end,
     };
     use crate::PackageErrorCode;
     use serde_json::{Value, json};
-    use teamarness_package_protocol::{
-        Frame, INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION,
-        MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
-    };
+    use teamarness_package_protocol::{Direction, Frame, INITIAL_STREAM_CREDIT};
+    use tokio::io::AsyncReadExt;
 
-    /// Every writer bound admits the worst case the contract permits, and the
-    /// two lanes together stay inside the one budget the handshake publishes.
+    /// One route admits every event the credit window grants, at the largest
+    /// payload the UI contract allows, without refusing one.
     ///
-    /// Both halves are asserted as sums. A per-lane floor alone is what let the
-    /// frame budget drift: each lane was sized against the contract's
-    /// concurrency, and together they queued 123 frames against the 64 the Host
-    /// tells the Package it will hold.
-    #[test]
-    fn writer_lanes_admit_the_traffic_the_contract_permits() {
-        const {
-            assert!(CONTROL_QUEUE >= CONTROL_RESERVE);
-            assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
-            assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
-            assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
-            assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
-            assert!(TERMINAL_RESERVE_BYTES == MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES);
-            assert!(CONTROL_BYTES + TERMINAL_RESERVE_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
-            assert!(UI_EVENT_CAPACITY == INITIAL_STREAM_CREDIT);
-            // One UI event route holds every event the window admits, at the
-            // largest payload the UI contract allows. The classifier bounds the
-            // count, so a shallower budget would refuse an event it admitted.
-            assert!(UI_EVENT_BYTES >= INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES);
+    /// This replaces `UI_EVENT_CAPACITY == INITIAL_STREAM_CREDIT` and
+    /// `UI_EVENT_BYTES >= INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES`, which
+    /// restated the definitions two lines above them. The route is what the
+    /// classifier hands events to, so a capacity or a byte budget that stopped
+    /// holding the window fails here — with `EventLagged`, the code a
+    /// subscriber would actually see — instead of agreeing with itself.
+    #[tokio::test]
+    async fn a_route_admits_a_full_window_of_largest_events() {
+        let (route, _receiver) = super::UiEventRoute::new(ui_contract(), "fixture.events".into());
+        // `{"text":"` and `"}` are the eleven bytes around the filler.
+        let filler = "a".repeat(MAX_UI_PAYLOAD_BYTES - 11);
+        for sequence in 1..=INITIAL_STREAM_CREDIT as u64 {
+            let admitted = route.event(sequence, json!({ "text": filler }));
+            assert!(
+                admitted.is_ok(),
+                "the route refused event {sequence} of the {INITIAL_STREAM_CREDIT} the window grants: {admitted:?}"
+            );
         }
+    }
+
+    /// A `credit` frame that never reached the writer leaves the
+    /// acknowledgement unrecorded, so the next one covers the same events.
+    ///
+    /// The route advanced first and the Host had no way back: `acknowledge`'s
+    /// own first guard refuses a repeat, and this path is the only producer of
+    /// `credit` there is.
+    #[tokio::test]
+    async fn an_uncommitted_acknowledgement_leaves_its_credit_to_claim_again() {
+        let (route, _receiver) = super::UiEventRoute::new(ui_contract(), "fixture.events".into());
+        route.mark_delivered(2).await;
+        {
+            let pending = route.acknowledge(2).await.expect("two events to credit");
+            assert_eq!(pending.amount(), 2);
+            // Dropped without `commit`: the frame never reached the writer.
+        }
+        let again = route
+            .acknowledge(2)
+            .await
+            .expect("the same two events are still owed credit");
+        assert_eq!(again.amount(), 2);
+        again.commit();
+        assert!(
+            route.acknowledge(2).await.is_err(),
+            "a committed acknowledgement is not owed twice"
+        );
+    }
+
+    fn ui_contract() -> std::sync::Arc<crate::ui::AdmittedUi> {
+        std::sync::Arc::new(crate::ui::AdmittedUi {
+            cache: crate::ui::UiCacheRecord {
+                admitted_root: std::path::PathBuf::new(),
+                entrypoint: String::new(),
+                resources: std::collections::BTreeMap::new(),
+                contract_digest: String::new(),
+            },
+            contract: crate::ui::compile_contract(
+                br#"{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{"fixture.events":{"request":{"type":"object","additionalProperties":false},"event":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}}}}"#,
+            )
+            .expect("a compiled UI contract"),
+        })
+    }
+
+    /// One subscription's legal acknowledgement traffic never loses a `credit`
+    /// frame, however full the control lane is.
+    ///
+    /// The Shell acknowledges one event at a time, so a subscription at a full
+    /// window owes `INITIAL_STREAM_CREDIT` `credit` frames at once — more than
+    /// any split of the 64 frames the contract publishes can hold. A refusing
+    /// send destroys the ones that do not fit, and the Host has no second
+    /// producer of `credit`: the window stays shut, a conforming Package stops
+    /// sending, and the instance is still reported `Active`.
+    #[tokio::test]
+    async fn a_full_control_lane_never_destroys_acknowledged_credit() {
+        // A child that has taken the pipe and stopped reading, which is the
+        // congestion the lane exists to absorb.
+        let (child, mut pipe) = tokio::io::duplex(1);
+        let client = start(tokio::io::empty(), child);
+        {
+            let mut state = client.state.lock().await;
+            state
+                .observe(
+                    Direction::HostToPackage,
+                    &frame(json!({
+                        "kind":"stream_open", "id":"h:ui-1", "topic":"t", "mountId":"bW91bnQ",
+                        "initialCredit":INITIAL_STREAM_CREDIT, "payload":{}
+                    })),
+                )
+                .expect("the UI stream opens");
+            for sequence in 1..=INITIAL_STREAM_CREDIT {
+                state
+                    .observe(
+                        Direction::PackageToHost,
+                        &frame(json!({
+                            "kind":"event", "streamId":"h:ui-1",
+                            "sequence":sequence.to_string(), "payload":{}
+                        })),
+                    )
+                    .expect("the window admits the event");
+            }
+        }
+
+        let acknowledgements = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let mut outcomes = Vec::new();
+                for _ in 0..INITIAL_STREAM_CREDIT {
+                    outcomes.push(client.credit("h:ui-1", 1).await);
+                }
+                outcomes
+            }
+        });
+        // Long enough for the lane to fill behind the stalled child.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let drain = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            while matches!(pipe.read(&mut buffer).await, Ok(count) if count > 0) {}
+        });
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(20), acknowledgements)
+            .await
+            .expect("every acknowledgement settles")
+            .expect("the acknowledging task");
+        drain.abort();
+        let refused = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .map(|failure| failure.code)
+            .collect::<Vec<_>>();
+        assert!(
+            refused.is_empty(),
+            "{} of {INITIAL_STREAM_CREDIT} acknowledgements were destroyed by the control lane: {refused:?}",
+            refused.len()
+        );
     }
 
     /// The reserve holds the frame it exists for: a typed terminal `error` for

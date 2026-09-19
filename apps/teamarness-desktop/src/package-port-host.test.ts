@@ -48,6 +48,8 @@ type Recorder = {
   terminate(subscription: string, error?: unknown): void;
   failOpen(subscription: string, error: unknown): void;
   openFailures: Map<string, (error: unknown) => void>;
+  /** Makes every later `acknowledgeEvents` reject, as a dead generation does. */
+  refuseAcknowledgements(error: unknown): void;
 };
 
 function recorder(): Recorder {
@@ -58,6 +60,7 @@ function recorder(): Recorder {
     Readonly<{ deliver(event: HostUiEvent): void; terminate(outcome: Readonly<{ error: unknown }>): void }>
   >();
   const openFailures = new Map<string, (error: unknown) => void>();
+  let acknowledgementFailure: unknown;
   const record = (method: string, input: unknown): void => {
     calls.push({ method, input: input as Record<string, unknown> });
   };
@@ -73,7 +76,10 @@ function recorder(): Recorder {
       openFailures.set(input.subscription, reject);
       resolve();
     }),
-    acknowledgeEvents: async (input) => { record("acknowledgeEvents", input); },
+    acknowledgeEvents: async (input) => {
+      record("acknowledgeEvents", input);
+      if (acknowledgementFailure !== undefined) throw acknowledgementFailure;
+    },
     closeSubscription: async (input) => { record("closeSubscription", input); },
     reportUiFault: async (input) => { record("reportUiFault", input); },
   };
@@ -86,6 +92,7 @@ function recorder(): Recorder {
     terminate: (subscription, error = null) => { streams.get(subscription)?.terminate({ error }); },
     failOpen: (subscription, error) => { openFailures.get(subscription)?.(error); },
     openFailures,
+    refuseAcknowledgements: (error) => { acknowledgementFailure = error; },
   };
 }
 
@@ -333,6 +340,24 @@ describe("Shell-side Package UI port host", () => {
     await settle();
     expect(test.faults).toEqual(["protocol"]);
     expect(test.transport.calls.filter(({ method }) => method === "acknowledgeEvents")).toHaveLength(1);
+  });
+
+  it("keeps a refused acknowledgement owed and ends the stream instead of stalling it", async () => {
+    const test = harness();
+    await test.greet();
+    test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
+    await settle();
+    test.transport.deliver({ mount: MOUNT, subscription: "s1", sequence: "0", payload: { a: 1 } });
+    await settle();
+
+    // The Package Host could not take the acknowledgement. Recording it anyway
+    // and discarding the rejection is what lost the credit permanently: this
+    // host would refuse to ask again, and nothing anywhere said so.
+    test.transport.refuseAcknowledgements(hostEnvelope("package.process_exited"));
+    test.fromFrame({ kind: "ack", id: 1, sequence: "0" });
+    await settle();
+    expect(test.received.at(-1)).toMatchObject({ kind: "stream_terminated", id: 1 });
+    expect(test.faults).toEqual(["stream_terminated"]);
   });
 
   it("drops the in-flight acknowledgement for a stream that has already completed", async () => {

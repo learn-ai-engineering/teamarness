@@ -602,8 +602,15 @@ impl InstanceActor {
             }
             (process, stream.wire_id.clone(), stream.route.clone())
         };
-        let amount = route.acknowledge(through).await?;
-        process.client.credit(&stream, amount).await
+        // The record moves only once the frame is queued. A `credit` frame
+        // that never reached the writer would otherwise leave the Host
+        // believing it had released credit the Package never received: the
+        // window would stay shut, a conforming Package would stop sending, and
+        // this path is the only producer of `credit` there is.
+        let pending = route.acknowledge(through).await?;
+        process.client.credit(&stream, pending.amount()).await?;
+        pending.commit();
+        Ok(())
     }
 
     pub(crate) async fn close_subscription(

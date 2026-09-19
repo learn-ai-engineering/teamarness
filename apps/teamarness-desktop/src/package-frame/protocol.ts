@@ -26,6 +26,22 @@ export const MAX_PENDING_REQUESTS = 64;
 export const MAX_OPEN_SUBSCRIPTIONS = 8;
 
 /**
+ * Events the frame client acknowledges with one `ack`.
+ *
+ * `port-client.ts` posts one `ack` for every event it hands its listener, so a
+ * subscription at a full credit window makes the Package Host owe a whole
+ * window of `credit` frames at once — not one. That number is what the Host's
+ * control lane must be sized against, and until this constant existed it lived
+ * only in this file, in another language, with nothing in the Host naming it.
+ * The Host mirrors it as `EVENTS_PER_ACKNOWLEDGEMENT` in `protocol.rs` and
+ * `check-protocol-bounds.mjs` reads both, so a Shell that started batching
+ * acknowledgements has to move the Host's worst case with it.
+ * `port-client.test.ts` asserts the client really acknowledges at this
+ * granularity.
+ */
+export const EVENTS_PER_ACKNOWLEDGEMENT = 1;
+
+/**
  * Ids the Shell keeps after it stops serving them.
  *
  * Requests and subscriptions share one id space, so they share one tombstone
