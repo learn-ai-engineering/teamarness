@@ -155,6 +155,22 @@ Declare only the capabilities you call. Teamarness provides Workspace context, c
 
 The `initialize` frame grants an absolute Package Data Directory, which the SDK gives an activation hook as `Activation::data_directory()`. Your Backend owns that directory's files, schema, and migration policy. The directory remains bound to Installation, Workspace, and Package Identity across Package source changes, versions, process generations, disposal, and application restarts. Teamarness does not inspect, migrate, back up, or delete Package-owned data.
 
+## What can change under you
+
+Three things cross the Package boundary, and each carries its own version.
+
+| Line | Version today | What it covers |
+|---|---|---|
+| Package Process Protocol | 1.0 | the frame set, the lifecycle operations, the `initialize` handshake |
+| Semantic Capability family | one per family, for example the record log's | that family's request and event shapes, bounds, vocabularies, and error codes |
+| Package UI bridge | `uiHostVersion` 1 | the mount contract your `mount(context)` is given |
+
+A capability is negotiated at activation: you declare a family and the versions of it you accept, the Host offers a major and a range of minors, and the highest minor both accept is granted. Within a major, a minor only adds — new optional request fields, new event kinds you may ignore, wider bounds. Nothing is removed or narrowed, and a value added to a closed vocabulary such as the record log's `availability` states is a new major, not a minor, so your Package never has to interpret a state it does not know.
+
+A capability family the Host does not provide is an unavailable capability, not a version error. A **new** family — document-oriented synchronization, say — is added beside the existing ones. It changes no existing family, no lifecycle operation, no protocol version, and no UI contract, so a Package that does not declare it is unaffected.
+
+When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. No such window exists yet, because nothing has broken yet. See ADR 0018, Package seam versioning.
+
 ## Trust limits
 
 A Package Backend is trusted native code. It has the current user's ambient filesystem, network, and process authority. Process supervision handles ordinary exits, deadlines, graceful shutdown, and conservative orphan cleanup. It is not a sandbox and does not contain hostile code or deliberately evasive descendants.

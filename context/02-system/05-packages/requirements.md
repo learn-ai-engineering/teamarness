@@ -14,7 +14,7 @@ The Package Host SHALL manage Package Instances through explicit `activate`, `su
 
 ## TEAM.SYS.PKG-R03 — Semantic Capability Contracts
 
-A Package SHALL access Teamarness-owned authority and generic behavior only through declared, versioned Semantic Capabilities. Capability calls and events SHALL be typed and SHALL NOT expose private keys, raw secret bytes, Core Runtime database handles, Core Runtime types, or raw transport handles. Activation SHALL fail clearly when Teamarness cannot fulfill a required capability version. Phase 3 SHALL provide capabilities for canonical Workspace metadata and membership, membership transitions, historical membership checks, and domain-separated signing.
+A Package SHALL access Teamarness-owned authority and generic behavior only through declared, versioned Semantic Capabilities. Capability calls and events SHALL be typed and SHALL NOT expose private keys, raw secret bytes, Core Runtime database handles, Core Runtime types, or raw transport handles. Activation SHALL fail clearly when Teamarness cannot fulfill a required capability version. Phase 3 SHALL provide capabilities for canonical Workspace metadata and membership, membership transitions, historical membership checks, and domain-separated signing. A Semantic Capability SHALL be identified by a family and a version; the Package Host and the Package SHALL negotiate one version within a family, and a new family SHALL be addable without changing the lifecycle contract, the Package Process Protocol, or the Package UI contract.
 
 ## TEAM.SYS.PKG-R04 — Backend and UI Boundary
 
