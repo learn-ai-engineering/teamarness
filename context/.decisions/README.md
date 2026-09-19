@@ -60,7 +60,10 @@ ADRs numbered `0011` and later use this template. Earlier ADRs keep their origin
 
 ## Context
 
-Why a decision is needed now, and the facts that constrain it.
+The constraints that make this decision necessary, written in the present
+tense as facts that hold now. Not a narrative of what the code used to do,
+what was wrong with it, or what changed: an ADR states the system as it is
+decided, and a reader who never saw the earlier shape must lose nothing.
 
 ## Decision
 

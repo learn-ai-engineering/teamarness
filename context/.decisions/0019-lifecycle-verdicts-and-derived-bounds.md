@@ -5,11 +5,11 @@
 
 ## Context
 
-The Package Process Protocol is a distributed state machine, and the two peers' views of it legitimately differ for one round trip. A stream close and the credit for events already accepted cross on the wire. A cancel and the answer it races cross on the wire. The contract already requires a receiver to survive both.
+The Package Process Protocol is a distributed state machine, and the two peers' views of it legitimately differ for one round trip. A stream close and the credit for events already accepted cross on the wire. A cancel and the answer it races cross on the wire. A receiver has to survive both, and the contract says so.
 
-The code had no verdict for that. Every frame and every internal condition was sorted into "proceed" or "fatal", so a one-round-trip disagreement was read as the peer misbehaving. Because the tolerance lived in each adapter rather than in the shared state machine, the Host and the Package classified the same race differently, and one file classified a late event and a late acknowledgement for the same subscription two different ways forty lines apart.
+Two verdicts are not enough to express that. "Proceed" and "fatal" leave a one-round-trip disagreement nowhere to go but the fatal bucket, and `ProtocolViolation` costs the whole Package Instance: its mounts are cleared and every later UI request is `StaleMount`. Tolerance held in each adapter is worse than none, because two adapters holding it separately classify the same race two ways, and nothing makes them agree.
 
-The second half is the same mistake at a different altitude. Internal queues and pages were sized without reading the contract constant they serve: a control lane holding 16 frames for the 32 in-flight answers the contract permits, a record page that cannot fit the writer budget. An undersized bound overflows on legal traffic, and the overflow was then reported as the process having exited or the capability being unavailable.
+The same gap exists at a lower altitude. An internal queue, buffer or page carries traffic the contract sizes, so a bound chosen without reading that constant overflows on traffic the contract permits — and the overflow reaches the peer as the process having exited or the capability being unavailable, neither of which is true and neither of which is retryable.
 
 ## Decision
 
@@ -41,7 +41,7 @@ Under ADR 0018 this adds no frame kind, no field and no vocabulary value, so the
 
 ## Rejected alternatives
 
-- **Leaving the tolerance in the adapters and patching each defect.** That is how the Host and the SDK came to disagree about the same race, and it would have left seven new special cases behind.
+- **Leaving the tolerance in the adapters and patching each defect.** Two adapters holding the tolerance separately classify the same race two ways, and nothing makes them agree; patching each defect leaves one special case per defect and the next race unclassified.
 - **Ignoring any frame for an unknown stream or request.** It deletes the `unknown_stream` and `unknown_response` verdicts, which are what separate a peer that is behind from a peer that is inventing. The tombstone is the mechanism that keeps the distinction decidable.
 - **Tolerating a frame for an evicted tombstone.** Same objection, reached by a slower path.
 - **Reducing the record page instead of fixing the backpressure.** The page is the credit window the contract grants. An ordinary slow reader must stop being reported as a permanent capability failure whatever the page size is.
@@ -49,20 +49,20 @@ Under ADR 0018 this adds no frame kind, no field and no vocabulary value, so the
 
 ## Consequences
 
-- `observe`'s signature changed, so the compiler enumerates every place this class of defect can live.
-- `overloaded` becomes reachable where `ProcessExited` was. It is retryable by the contract's own table and by the SDK's.
-- Malformed and out-of-contract traffic stays fatal. The three state-machine fixtures in `contracts/package-process/v1/invalid/` are unchanged and still fail, and a fourth now pins the line the tolerance stops at: a cancelled request tolerates one late terminal frame, never two.
+- `observe` returns a verdict, so the compiler enumerates every place this class of defect can live: an adapter that reaches the classifier must say what it does with each of the three answers.
+- A congested writer answers `overloaded` for the one request it cannot serve, and that answer is owed: it travels a reserve the answer it replaces cannot consume. The code is retryable by the contract's own table and by the SDK's, so a Package retries rather than restarts.
+- Malformed and out-of-contract traffic stays fatal. The state-machine fixtures in `contracts/package-process/v1/invalid/` pin where the tolerance stops: an answer for a request that never existed, a second terminal frame, a second terminal frame after one late one has been tolerated, an event past the credit window, and credit outside `1..=32` on a live stream or on a closed one.
 - Nothing enforces the "comment naming the worst case" half of the bounds rule mechanically. The guard catches a bare literal; only review catches a derived bound whose derivation is wrong.
 
 ## Evidence
 
 - `crates/teamarness-package-protocol/src/state.rs` — `Verdict`, `IgnoredFrames`, the three bounded tombstone sets, `retire_request`, `retire_stream`, and the unit tests for each verdict including `an_evicted_tombstone_is_fatal_again`.
-- `crates/teamarness-package-protocol/tests/contract.rs` — `every_constant_matches_the_contract_limits_table`, and the golden and invalid corpora.
+- `crates/teamarness-package-protocol/tests/contract.rs` — `every_constant_matches_the_contract_limits_table`, and the golden and invalid corpora. Every golden frame declares the verdict it receives, and a corpus entry can retire a request or a stream between frames, so the corpora assert the classification rather than only that a sequence is not fatal.
 - `contracts/package-process/v1/fixtures/node-package-process.mjs` — the language-neutral reference implementation of the same rules.
-- `crates/teamarness-package-host/tests/lifecycle_races.rs` — the Host's reader and writer under each race, and `every_in_flight_capability_call_is_answered_behind_a_slow_pipe`.
+- `crates/teamarness-package-host/tests/lifecycle_races.rs` — the Host's reader and writer under each race, `every_in_flight_capability_call_is_answered_behind_a_slow_pipe`, and `a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded` for the third verdict under the congestion that produces it.
 - `crates/teamarness-package-sdk/tests/lifecycle_races.rs` — the Package's side, with a `ContractState` standing in for the Host's reader.
 - `crates/teamarness-package-host/tests/ui_event_stream.rs` — `acknowledging_the_last_event_of_a_completed_stream_keeps_the_generation`.
-- `apps/teamarness-desktop/src/package-port-host.test.ts` — the Shell's bounded subscription tombstones, and that an id never issued is still a fault.
+- `apps/teamarness-desktop/src/package-port-host.test.ts` — the Shell's one bounded tombstone set over requests and subscriptions, consulted by the acknowledgement, the `unsubscribe` and the `cancel` handlers, and that an id never issued is still a fault.
 - `scripts/check-protocol-bounds.mjs` and its test — the bare-literal guard and the shared subscription bound.
 
 ### Provenance (non-versioned)
