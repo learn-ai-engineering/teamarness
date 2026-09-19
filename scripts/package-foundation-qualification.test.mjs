@@ -74,11 +74,17 @@ test("Package authoring guidance follows the local Package development path", as
     "not a sandbox",
     "sandboxed frame",
     "There is no hot reload",
+    "npm run validate",
+    "typedPackageClient",
     "Workspace enablement",
     "synchronization",
     "sharing",
     "collaboration",
   ]) assert.ok(guide.includes(phrase), `guide must include ${phrase}`);
+  const authorGuide = await read("docs/package-author-guide.md");
+  for (const phrase of ["teamarness-package-validate", "npm run validate", "typedPackageClient"]) {
+    assert.ok(authorGuide.includes(phrase), `author guide must include ${phrase}`);
+  }
   assert.ok(readme.includes("npm run create:package --"));
   assert.equal((guide.match(/Agent brief/g) ?? []).length, 5);
   assert.equal((guide.match(/### Human checkpoint/g) ?? []).length, 5);

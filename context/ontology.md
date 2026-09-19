@@ -65,6 +65,8 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Catalog** | The Package Host's list of admitted Packages, each with Package Identity, version, display name, Package Source kind, Package Trust kind, and UI contract digest. It excludes filesystem paths and loader URLs |
 | **Host Revision** | A monotonic number identifying one authoritative Package Host snapshot. Consumers use it to discard stale updates |
 | **Package Instance Lifecycle State** | One of `admitted`, `activating`, `active`, `suspending`, `suspended`, `recovering`, `failed`, `crash_loop`, `disposing`, `disposed`. `crash_loop` means automatic restarts were exhausted; `failed` needs explicit recovery or disposal. Shell UI wording may differ; see the Shell |
+| **Package-Owned Error** | A Package Backend's stable error code, retryability, and bounded details, carried to the Package UI beside the Teamarness error code |
+| **Package Validator** | The author-runnable command that applies Package Admission's Package Manifest and UI contract rules to a Package project or Package Directory |
 | **Capability Grant** | An opaque, per-process-generation token that binds one Package Instance's declared Semantic Capability to its Package Identity, Workspace, and Installation. Grants are implicit in capability calls and are not transferable |
 | **Package Source Label** | A presentation alias shown by the Shell: `Team` for Package Source `bundled`, `Personal` for `local`. It is not a trust verdict and does not define Registration Scope, Workspace enablement, or sharing |
 

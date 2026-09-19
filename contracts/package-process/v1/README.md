@@ -42,9 +42,13 @@ Exactly one `response` or `error` is terminal for a request. Responses may finis
 
 `error` contains a stable host or Package-owned code, retryability, an optional bounded details object, and an optional `outcomeUncertain` flag. Operating-system error text and stderr do not cross this frame. A Host capability error with code `overloaded` or `deadline_exceeded` is retryable. A state-changing capability call that exceeded its deadline after starting reports `outcomeUncertain`.
 
+A Package's `error` answer to a host request is forwarded, not replaced. The host keeps its own authoritative code for what it did with the failure and carries the Package's code, retryability and bounded details beside it, so a Package UI reads both. Details are bounded rather than truncated: a details object over the limit is dropped whole, and the code and retryability still cross.
+
 ## Streams and credit
 
 `stream_open` creates one origin-scoped stream and grants 32 events initially. `event` carries that stream ID, an increasing decimal-string sequence, and an object payload. The sender must not send without credit. `credit` adds a positive bounded amount only after the receiving adapter has accepted preceding work. `stream_close` closes either direction and can include a stable reason code.
+
+The reason code on a Package's `stream_close` says who owns the ending. No code, `completed` or `closed` is an ordinary completion. `cancelled` and `overloaded` are host codes. Every other code is the Package's own termination code and is forwarded to the subscriber as a Package-owned error, with `retryable` false and no details, because `stream_close` carries neither. A completion and a Package-owned termination both end that one stream and nothing else; only a Teamarness-owned terminal stream error causes Package UI Mount recovery.
 
 Sequence values increase by one within a stream. Streams have no ordering relationship to requests or other streams. Mount-scoped streams carry `mountId` and stop when that mount closes or its process generation changes.
 

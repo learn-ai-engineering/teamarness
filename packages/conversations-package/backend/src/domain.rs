@@ -231,6 +231,10 @@ pub(crate) fn validate_identity(v: &str) -> Result<(), DomainError> {
         Ok(())
     }
 }
+/// The Channel slug grammar, which is the UI contract's `^[a-z0-9]+(-[a-z0-9]+)*$`.
+///
+/// A remote record carries a slug this Installation did not write, so the decoder holds the same
+/// rule the contract does: a slug it accepted but the contract refused would fail every snapshot.
 pub(crate) fn validate_slug(v: &str) -> Result<(), DomainError> {
     if !(1..=MAX_SLUG_LEN).contains(&v.len())
         || !v.is_ascii()
@@ -238,6 +242,7 @@ pub(crate) fn validate_slug(v: &str) -> Result<(), DomainError> {
             .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
         || v.starts_with('-')
         || v.ends_with('-')
+        || v.contains("--")
     {
         Err(DomainError::InvalidSlug)
     } else {
@@ -322,4 +327,53 @@ pub fn row_message(r: &rusqlite::Row<'_>) -> Result<store::MessageRow, rusqlite:
         r.get(4)?,
         r.get::<_, i64>(5)? as u64,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_slug;
+
+    /// The decoder's grammar is the UI contract's, for a locally created Channel and for a
+    /// remote record alike.
+    // Verifies: TEAM.SYS.CONV-R05
+    #[test]
+    fn slug_grammar_matches_the_ui_contract_pattern() {
+        let pattern = regex_like();
+        for candidate in [
+            "general",
+            "a",
+            "a-b",
+            "team-1",
+            "0",
+            &"a".repeat(48),
+            "",
+            "-a",
+            "a-",
+            "a--b",
+            "A",
+            "a_b",
+            "a b",
+            &"a".repeat(49),
+        ] {
+            assert_eq!(
+                validate_slug(candidate).is_ok(),
+                pattern(candidate),
+                "{candidate:?} must be judged the same way by the decoder and the contract"
+            );
+        }
+    }
+
+    /// `^[a-z0-9]+(-[a-z0-9]+)*$` with the contract's length bounds, without a regex dependency.
+    fn regex_like() -> impl Fn(&str) -> bool {
+        |value: &str| {
+            !value.is_empty()
+                && value.len() <= 48
+                && value.split('-').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                })
+        }
+    }
 }
