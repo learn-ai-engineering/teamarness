@@ -413,6 +413,28 @@ impl Error for SubscriptionError {
     }
 }
 
+/// An error returned while stopping the core runtime.
+///
+/// Local identity, Workspace, and membership commands stay available whether or
+/// not the shared transport stopped cleanly, so a caller that only wants a
+/// clean exit can ignore this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownError {
+    /// The shared Endpoint and Router did not stop cleanly.
+    Transport,
+}
+
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport => formatter.write_str("the shared transport did not stop cleanly"),
+        }
+    }
+}
+
+impl Error for ShutdownError {}
+
 /// An error returned while opening the core runtime.
 #[derive(Debug)]
 #[non_exhaustive]

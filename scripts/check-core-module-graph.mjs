@@ -9,6 +9,17 @@ const scriptPath = fileURLToPath(import.meta.url);
 export const repositoryRoot = resolve(dirname(scriptPath), "..");
 
 export const CORE_SOURCE = "crates/teamarness-core/src";
+
+// `network` owns the Endpoint and Router and nothing else: every protocol
+// reaches it as an opaque registration from the runtime composition point.
+// `onboarding` and `synchronization` are peers over it, neither above the
+// other. Register C-12 puts the membership protocol in the crate-root module
+// `membership_sync/` for the same reason, so `network` never names it either.
+export const MODULE_RULES = [
+  { directory: "network", forbidden: ["crate::onboarding", "crate::synchronization", "crate::membership", "crate::membership_sync"] },
+  { directory: "synchronization", forbidden: ["crate::onboarding"] },
+  { directory: "onboarding", forbidden: ["crate::synchronization"] },
+];
 export const TEST_HOOKS_ATTRIBUTE = '#[cfg(feature = "test-hooks")]';
 
 // Production escape hatches that plan phase 8 removed from the supported API.
@@ -109,6 +120,31 @@ export function findDemotedBehindTestHooks(file, text) {
   return problems;
 }
 
+// Everything from the first `#[cfg(test)]`-gated module to the end of the file
+// is test code, which the module rules do not police.
+function productionLines(text) {
+  const lines = text.split("\n");
+  const end = lines.findIndex(
+    (line, index) =>
+      /^\s*mod tests \{/.test(line) && /^\s*#\[cfg\(test\)\]/.test(lines[index - 1] ?? ""),
+  );
+  return end === -1 ? lines : lines.slice(0, end - 1);
+}
+
+export function findModuleGraphBreaks(directory, file, text, forbidden) {
+  const problems = [];
+  for (const [index, line] of productionLines(text).entries()) {
+    for (const name of forbidden) {
+      if (line.includes(name)) {
+        problems.push(
+          `${file}:${index + 1} \`${directory}\` must not name \`${name}\`; it is a leaf or a peer of that module`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
 async function trackedFiles(root, pattern) {
   const { stdout } = await execFileAsync("git", ["ls-files", pattern], { cwd: root });
   return stdout.split("\n").filter((entry) => entry !== "");
@@ -122,6 +158,14 @@ export async function checkCoreModuleGraph(root = repositoryRoot) {
   for (const file of await trackedFiles(root, `${CORE_SOURCE}/*.rs`)) {
     problems.push(...findDemotedBehindTestHooks(file, await readFile(join(root, file), "utf8")));
   }
+  for (const { directory, forbidden } of MODULE_RULES) {
+    for (const file of await trackedFiles(root, `${CORE_SOURCE}/${directory}/*.rs`)) {
+      if (/(^|\/)tests\//.test(file)) continue;
+      problems.push(
+        ...findModuleGraphBreaks(directory, file, await readFile(join(root, file), "utf8"), forbidden),
+      );
+    }
+  }
   return problems;
 }
 
@@ -132,7 +176,7 @@ if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
         console.error(problems.join("\n"));
         process.exitCode = 1;
       } else {
-        console.log("The core boundary rules hold.");
+        console.log("The core module graph and test-hooks rules hold.");
       }
     })
     .catch((error) => {

@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 
 use crate::blocking::StateUnavailable;
 use crate::membership_sync::{MembershipDemand, MembershipReplica, MembershipSessionError};
-use crate::onboarding::transport::Transport;
+use crate::network::Network;
 use crate::runtime::RuntimeState;
 use crate::synchronization::limits::SchedulerLimits;
 use crate::synchronization::scheduler::{
@@ -68,7 +68,7 @@ pub(crate) type SessionReports = Arc<
 const REPORT_RING: usize = 64;
 
 pub(crate) struct NetworkSessionRunner {
-    network: Arc<Transport>,
+    network: Arc<Network>,
     services: SyncServices,
     replica: Arc<dyn MembershipReplica>,
     demand: Arc<MembershipDemand>,
@@ -80,7 +80,7 @@ pub(crate) struct NetworkSessionRunner {
 
 impl NetworkSessionRunner {
     pub(crate) fn new(
-        network: Arc<Transport>,
+        network: Arc<Network>,
         services: SyncServices,
         replica: Arc<dyn MembershipReplica>,
         demand: Arc<MembershipDemand>,
@@ -147,7 +147,8 @@ impl SessionRunner for NetworkSessionRunner {
             let address = iroh_base::EndpointAddr::new(peer.as_public_key());
             let outcome = match &job.key {
                 JobKey::Membership { workspace, peer } => {
-                    let session = runner.network.run_membership_session(
+                    let session = crate::membership_sync::run_membership_session_on(
+                        &runner.network,
                         address,
                         Arc::clone(&runner.replica),
                         *workspace,
@@ -164,7 +165,9 @@ impl SessionRunner for NetworkSessionRunner {
                     peer,
                     ..
                 } => {
-                    let session = runner.network.send_log_sync(
+                    let session = crate::synchronization::client::send_log_sync(
+                        &runner.network,
+                        &runner.services,
                         address,
                         Arc::clone(&runner.services.receiver),
                         *workspace,

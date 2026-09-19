@@ -1,114 +1,29 @@
 //! Shared Core networking primitives.
 //!
-//! This module is the sole owner of the installation Endpoint and Router. The
-//! onboarding and synchronization protocols are registered together here so a
-//! runtime never accidentally creates a second endpoint for replication.
+//! This module is the sole owner of the installation Endpoint and Router, and
+//! it is a leaf: it names no protocol, no ALPN and no Core domain module. Every
+//! protocol is handed to [`Network::bind`] as an opaque registration by the
+//! runtime composition point, so a runtime never accidentally creates a second
+//! endpoint for replication and this module never depends on what it carries.
+
+mod error;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use iroh::protocol::Router;
 use iroh::{Endpoint, RelayMode};
-use iroh_base::{EndpointAddr, PublicKey, SecretKey};
+#[cfg(test)]
+use iroh_base::EndpointAddr;
+use iroh_base::{PublicKey, SecretKey};
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
 
-use crate::OnboardingError;
-use crate::onboarding::handler::OnboardingHandler;
-use crate::synchronization::limits::SessionLimits;
-use crate::synchronization::{
-    ExchangeReport, FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome,
-    PeerSessions, Refusal, SessionGrant, SyncReceiver, SyncServices,
-};
-
-pub(crate) const PACKAGE_SYNC_ALPN: &[u8] = crate::synchronization::network_handler::LOG_SYNC_ALPN;
+pub(crate) use error::NetworkError;
 
 /// One extra Core protocol the runtime composition point registers with the
 /// shared Router. Keeping it opaque here is what lets this module own the
 /// Endpoint and Router while naming no protocol or synchronization type.
 pub(crate) type ProtocolRegistration = (Vec<u8>, Box<dyn iroh::protocol::DynProtocolHandler>);
 pub(crate) const MAX_OUTBOUND_PEERS: usize = 4;
-
-/// The receiver a Network bound without Core services uses. It authorizes
-/// nothing, so an unattached endpoint serves no Workspace.
-#[derive(Debug)]
-struct RejectingSyncReceiver;
-
-impl SyncReceiver for RejectingSyncReceiver {
-    fn authorize_session(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-    ) -> Result<SessionGrant, Refusal> {
-        Err(Refusal::NotAuthorized)
-    }
-
-    fn protection_bundle_for(
-        &self,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-        _recipient: crate::PublicIdentity,
-    ) -> Result<Option<crate::synchronization::ProtectionBundle>, ()> {
-        Ok(None)
-    }
-
-    fn import_protection_bundle(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-        _bundle: crate::synchronization::ProtectionBundle,
-    ) -> Result<usize, ()> {
-        Err(())
-    }
-
-    fn session_seed(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-    ) -> Result<crate::synchronization::SessionSeed, Refusal> {
-        Err(Refusal::NotAuthorized)
-    }
-
-    fn range_sizes(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-        _author: crate::PublicIdentity,
-        _after: Option<u32>,
-        _until: Option<u32>,
-        _limit: usize,
-    ) -> Result<Vec<(u32, usize)>, ()> {
-        Err(())
-    }
-
-    fn load_range_page(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-        _author: crate::PublicIdentity,
-        _from: u32,
-        _until: u32,
-        _rows: usize,
-    ) -> Result<Vec<crate::synchronization::ReplicationEntry>, crate::synchronization::RangeLoadError>
-    {
-        Err(crate::synchronization::RangeLoadError::Unavailable)
-    }
-
-    fn receive_operation(
-        &self,
-        _peer: crate::PublicIdentity,
-        _workspace: crate::WorkspaceId,
-        _package: &str,
-        _operation: p2panda_core::Operation<()>,
-    ) -> Result<OperationOutcome, FatalSyncError> {
-        Err(FatalSyncError::PeerRevoked)
-    }
-}
 
 pub(crate) struct Network {
     endpoint: Endpoint,
@@ -117,15 +32,12 @@ pub(crate) struct Network {
     /// A second peer budget, for the Core protocols registered beside package
     /// sync. A session stalled on one protocol cannot starve the other.
     outbound_extra: Arc<Semaphore>,
-    services: SyncServices,
     /// Loopback runtimes have no relay and no discovery, so tests register peer
     /// addresses here instead. Production binds with `loopback_only == false`,
     /// and the endpoint holds its own clone of the lookup, so only
     /// `remember_peer_address` reads this handle.
     #[cfg_attr(not(test), allow(dead_code))]
     address_book: Option<iroh::address_lookup::memory::MemoryLookup>,
-    #[cfg(test)]
-    log_sync: Arc<LogSyncHandler>,
     #[cfg(test)]
     alpns: Vec<Vec<u8>>,
 }
@@ -140,17 +52,18 @@ impl std::fmt::Debug for Network {
 }
 
 impl Network {
+    /// Binds the one Endpoint and Router this Installation uses.
+    ///
+    /// `protocols` is registered in the order given, and the ALPN list the
+    /// endpoint advertises is exactly those ALPNs in that order.
     pub(crate) async fn bind(
         secret_key: SecretKey,
         relay_mode: RelayMode,
         loopback_only: bool,
-        onboarding: Arc<OnboardingHandler>,
-        services: Option<SyncServices>,
         protocols: Vec<ProtocolRegistration>,
-    ) -> Result<Arc<Self>, OnboardingError> {
-        let mut configured_alpns = vec![crate::onboarding::transport::ONBOARDING_ALPN.to_vec()];
-        configured_alpns.extend(protocols.iter().map(|(alpn, _)| alpn.clone()));
-        configured_alpns.push(PACKAGE_SYNC_ALPN.to_vec());
+    ) -> Result<Arc<Self>, NetworkError> {
+        let configured_alpns: Vec<Vec<u8>> =
+            protocols.iter().map(|(alpn, _)| alpn.clone()).collect();
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(configured_alpns.clone())
@@ -161,38 +74,22 @@ impl Network {
                 .address_lookup(lookup.clone())
                 .clear_ip_transports()
                 .bind_addr("127.0.0.1:0")
-                .map_err(|_| OnboardingError::Readiness)?;
+                .map_err(|_| NetworkError::Readiness)?;
             Some(lookup)
         } else {
             None
         };
-        let endpoint = builder
-            .bind()
-            .await
-            .map_err(|_| OnboardingError::Readiness)?;
-        let services = services.unwrap_or_else(|| SyncServices {
-            receiver: Arc::new(RejectingSyncReceiver),
-            sessions: PeerSessions::new(),
-            health: crate::synchronization::SyncHealthRegistry::new(Arc::default()),
-            limits: SessionLimits::CURRENT,
-        });
-        let log_sync = Arc::new(LogSyncHandler::new(services.clone(), services.limits));
-        let mut builder = Router::builder(endpoint.clone())
-            .accept(crate::onboarding::transport::ONBOARDING_ALPN, onboarding);
+        let endpoint = builder.bind().await.map_err(|_| NetworkError::Readiness)?;
+        let mut builder = Router::builder(endpoint.clone());
         for (alpn, handler) in protocols {
             builder = builder.accept(alpn, handler);
         }
-        let router = builder
-            .accept(PACKAGE_SYNC_ALPN, Arc::clone(&log_sync))
-            .spawn();
+        let router = builder.spawn();
         Ok(Arc::new(Self {
             endpoint,
             router,
-            #[cfg(test)]
-            log_sync,
             outbound: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
             outbound_extra: Arc::new(Semaphore::new(MAX_OUTBOUND_PEERS)),
-            services,
             address_book,
             #[cfg(test)]
             alpns: configured_alpns,
@@ -205,21 +102,6 @@ impl Network {
 
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
-    }
-
-    /// How many inbound package synchronization sessions hold a slot.
-    #[cfg(test)]
-    pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
-        self.log_sync.active_for_test()
-    }
-
-    /// How many inbound sessions one peer has ever been given a slot for.
-    #[cfg(test)]
-    pub(crate) fn inbound_package_sessions_from_for_test(
-        &self,
-        peer: crate::PublicIdentity,
-    ) -> usize {
-        self.log_sync.accepted_from_for_test(peer)
     }
 
     #[cfg(test)]
@@ -235,61 +117,27 @@ impl Network {
         }
     }
 
-    pub(crate) async fn send_log_sync(
-        &self,
-        address: EndpointAddr,
-        receiver: Arc<dyn SyncReceiver>,
-        workspace: crate::WorkspaceId,
-        package: String,
-        peer: crate::PublicIdentity,
-    ) -> Result<ExchangeReport, LogSessionError> {
-        self.send_log_sync_with_timeout(
-            address,
-            receiver,
-            workspace,
-            package,
-            peer,
-            self.services.limits.session_timeout,
-        )
-        .await
-    }
-
-    async fn send_log_sync_with_timeout(
-        &self,
-        address: EndpointAddr,
-        receiver: Arc<dyn SyncReceiver>,
-        workspace: crate::WorkspaceId,
-        package: String,
-        peer: crate::PublicIdentity,
-        session_timeout: Duration,
-    ) -> Result<ExchangeReport, LogSessionError> {
-        timeout(session_timeout, async {
-            let _permit = self
-                .outbound
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| LogSessionError::Refused(Refusal::Unavailable))?;
-            crate::synchronization::network_handler::outbound_log_session(
-                &self.endpoint,
-                address,
-                receiver,
-                Arc::clone(&self.services.sessions),
-                Arc::clone(&self.services.health),
-                workspace,
-                package,
-                peer,
-                self.services.limits,
-            )
-            .await
-        })
-        .await
-        .map_err(|_| LogSessionError::Transport("package sync timed out".to_owned()))?
-    }
-
-    /// Runs one outbound session on the shared endpoint within the outbound
-    /// peer budget. The session itself is supplied by the caller, so this
-    /// module never names the protocol it carries.
+    /// Runs one outbound session on the shared endpoint within the primary
+    /// outbound peer budget. The session itself is supplied by the caller, so
+    /// this module never names the protocol it carries.
     pub(crate) async fn run_outbound<T, E, Fut>(
+        &self,
+        overloaded: E,
+        session: impl FnOnce(Endpoint) -> Fut,
+    ) -> Result<T, E>
+    where
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let Ok(_permit) = self.outbound.clone().try_acquire_owned() else {
+            return Err(overloaded);
+        };
+        session(self.endpoint.clone()).await
+    }
+
+    /// Runs one outbound session within the second peer budget, which the Core
+    /// protocols registered beside the primary one share. A session stalled on
+    /// one budget cannot starve the other.
+    pub(crate) async fn run_extra_outbound<T, E, Fut>(
         &self,
         overloaded: E,
         session: impl FnOnce(Endpoint) -> Fut,
@@ -303,18 +151,16 @@ impl Network {
         session(self.endpoint.clone()).await
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), NetworkError> {
         self.router
             .shutdown()
             .await
-            .map_err(|_| OnboardingError::Shutdown)
+            .map_err(|_| NetworkError::Shutdown)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use iroh_base::SecretKey;
 
     use super::*;
@@ -338,19 +184,23 @@ mod tests {
         }
     }
 
+    fn opaque(alpn: &[u8]) -> ProtocolRegistration {
+        (
+            alpn.to_vec(),
+            Box::new(OpaqueProtocol) as Box<dyn iroh::protocol::DynProtocolHandler>,
+        )
+    }
+
     #[tokio::test]
-    async fn one_router_registers_onboarding_composed_protocols_and_package_sync() {
-        let handler = Arc::new(OnboardingHandler::new(Duration::from_secs(1)));
+    async fn one_router_advertises_the_composed_protocols_in_order() {
         let network = Network::bind(
             secret(1),
             RelayMode::Disabled,
             true,
-            handler,
-            None,
-            vec![(
-                b"teamarness/opaque-protocol/1".to_vec(),
-                Box::new(OpaqueProtocol) as Box<dyn iroh::protocol::DynProtocolHandler>,
-            )],
+            vec![
+                opaque(b"teamarness/first-protocol/1"),
+                opaque(b"teamarness/second-protocol/1"),
+            ],
         )
         .await
         .unwrap();
@@ -358,54 +208,35 @@ mod tests {
         assert_eq!(
             network.alpns(),
             vec![
-                crate::onboarding::transport::ONBOARDING_ALPN.to_vec(),
-                b"teamarness/opaque-protocol/1".to_vec(),
-                b"teamarness/package-sync/2".to_vec(),
+                b"teamarness/first-protocol/1".to_vec(),
+                b"teamarness/second-protocol/1".to_vec(),
             ]
         );
         network.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn an_unattached_network_authorizes_no_session() {
-        let handler = Arc::new(OnboardingHandler::new(Duration::from_secs(1)));
-        let server = Network::bind(
-            secret(3),
-            RelayMode::Disabled,
-            true,
-            handler,
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-        let client = Network::bind(
-            secret(4),
-            RelayMode::Disabled,
-            true,
-            Arc::new(OnboardingHandler::new(Duration::from_secs(1))),
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-        let address = server.endpoint().bound_sockets().into_iter().fold(
-            EndpointAddr::new(server.endpoint_id()),
-            EndpointAddr::with_ip_addr,
+    async fn each_outbound_budget_refuses_on_its_own() {
+        let network = Network::bind(secret(2), RelayMode::Disabled, true, Vec::new())
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..MAX_OUTBOUND_PEERS {
+            held.push(network.outbound.clone().try_acquire_owned().unwrap());
+        }
+        assert_eq!(
+            network
+                .run_outbound("overloaded", |_| async { Ok::<(), _>(()) })
+                .await,
+            Err("overloaded")
         );
-        let result = client
-            .send_log_sync(
-                address,
-                Arc::new(RejectingSyncReceiver),
-                crate::WorkspaceId::from_bytes([8; 16]),
-                "teamarness.test".to_owned(),
-                crate::PublicIdentity::from_bytes(*server.endpoint_id().as_bytes()).unwrap(),
-            )
-            .await;
-        // The local gate refuses before anything is dialled, so the failure
-        // names this side rather than the peer's answer.
-        assert_eq!(result.unwrap_err(), LogSessionError::LocalNotAuthorized);
-        client.shutdown().await.unwrap();
-        server.shutdown().await.unwrap();
+        // The second budget is untouched by the first being exhausted.
+        assert_eq!(
+            network
+                .run_extra_outbound("overloaded", |_| async { Ok::<(), &str>(()) })
+                .await,
+            Ok(())
+        );
+        network.shutdown().await.unwrap();
     }
 }

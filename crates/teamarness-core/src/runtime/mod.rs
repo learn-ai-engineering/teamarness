@@ -41,6 +41,14 @@ pub struct CoreRuntime {
     recovery_report: crate::synchronization::RecoveryReport,
     #[cfg(test)]
     session_limits: crate::synchronization::limits::SessionLimits,
+    /// The shared Endpoint, so a test can drive one session by hand.
+    #[cfg(test)]
+    network: Arc<crate::network::Network>,
+    /// The package-sync services and inbound handler, for the same reason.
+    #[cfg(test)]
+    sync_services: crate::synchronization::SyncServices,
+    #[cfg(test)]
+    log_sync: Arc<crate::synchronization::LogSyncHandler>,
 }
 
 impl fmt::Debug for CoreRuntime {
@@ -203,20 +211,22 @@ impl CoreRuntime {
                 #[cfg(test)]
                 Arc::clone(&membership_paused),
             ));
-        let protocols = vec![(
-            crate::membership_sync::MEMBERSHIP_SYNC_ALPN.to_vec(),
-            Box::new(crate::membership_sync::MembershipSyncHandler::new(
-                Arc::clone(&membership_replica),
-            )) as Box<dyn iroh::protocol::DynProtocolHandler>,
-        )];
+        let (package_sync, log_sync) =
+            crate::synchronization::client::package_sync_registration(services.clone());
+        // Only a test reads the inbound handler back; production just routes it.
+        #[cfg(not(test))]
+        let _ = log_sync;
+        let protocols = vec![
+            crate::membership_sync::membership_sync_registration(Arc::clone(&membership_replica)),
+            package_sync,
+        ];
         #[cfg(test)]
         let transport = if let Some(ready_immediately) = test_readiness {
-            crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_services(
+            crate::onboarding::transport::Transport::bind_loopback_with_issuer_and_protocols(
                 secret_key.clone(),
                 std::time::Duration::from_millis(5),
                 ready_immediately,
                 issuer,
-                services.clone(),
                 protocols,
             )
             .await
@@ -224,7 +234,6 @@ impl CoreRuntime {
             crate::onboarding::transport::Transport::bind_production(
                 secret_key.clone(),
                 issuer,
-                Some(services.clone()),
                 protocols,
             )
             .await
@@ -233,7 +242,6 @@ impl CoreRuntime {
         let transport = crate::onboarding::transport::Transport::bind_production(
             secret_key.clone(),
             issuer,
-            Some(services.clone()),
             protocols,
         )
         .await;
@@ -244,8 +252,11 @@ impl CoreRuntime {
         // outside the runtime state mutex.
         #[cfg(test)]
         let session_reports: crate::synchronization::worker::SessionReports = Arc::default();
+        let network = Arc::clone(transport.network());
+        #[cfg(test)]
+        let sync_services = services.clone();
         let runner = crate::synchronization::worker::NetworkSessionRunner::new(
-            Arc::clone(&transport),
+            Arc::clone(&network),
             services,
             Arc::clone(&membership_replica),
             Arc::clone(&demand),
@@ -281,18 +292,27 @@ impl CoreRuntime {
             recovery_report: recovery,
             #[cfg(test)]
             session_limits,
+            #[cfg(test)]
+            network,
+            #[cfg(test)]
+            sync_services,
+            #[cfg(test)]
+            log_sync,
         })
     }
 
     /// Stops accepting onboarding and synchronization work and awaits closure.
     ///
     /// Local identity, Workspace, and membership commands remain available.
-    pub async fn shutdown(&self) -> Result<(), crate::OnboardingError> {
+    pub async fn shutdown(&self) -> Result<(), crate::ShutdownError> {
         // Stop the scheduler and await every session before Router/Endpoint
         // shutdown. This ordering prevents SQLite callbacks from racing the
         // shared network teardown.
         self.sync_worker.shutdown().await;
-        self.transport.shutdown().await
+        self.transport
+            .shutdown()
+            .await
+            .map_err(|_| crate::ShutdownError::Transport)
     }
 }
 

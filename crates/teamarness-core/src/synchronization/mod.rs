@@ -3,6 +3,7 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
+pub(crate) mod client;
 mod content_key;
 pub(crate) mod exchange;
 pub(crate) mod frames;

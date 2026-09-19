@@ -351,7 +351,7 @@ impl CoreRuntime {
     /// How many inbound package synchronization sessions hold a slot.
     #[cfg(test)]
     pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
-        self.transport.inbound_package_sessions_for_test()
+        self.log_sync.active_for_test()
     }
 
     /// How many records one scope's delivery journal holds.
@@ -387,7 +387,10 @@ impl CoreRuntime {
         let connection = self
             .transport
             .endpoint()
-            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .connect(
+                address,
+                crate::synchronization::network_handler::LOG_SYNC_ALPN,
+            )
             .await
             .ok()?;
         let (mut send, _receive) = connection.open_bi().await.ok()?;
@@ -398,7 +401,7 @@ impl CoreRuntime {
     /// How many inbound sessions one peer has ever been given a slot for.
     #[cfg(test)]
     pub(crate) fn inbound_sessions_from_for_test(&self, peer: PublicIdentity) -> usize {
-        self.transport.inbound_package_sessions_from_for_test(peer)
+        self.log_sync.accepted_from_for_test(peer)
     }
 
     /// The last record-session reports this Installation ran, newest last.
@@ -676,15 +679,16 @@ impl CoreRuntime {
                 demand: Arc::clone(&self.membership_demand),
                 health: Arc::clone(&self.health),
             });
-        self.transport
-            .send_log_sync(
-                address,
-                receiver,
-                workspace_id,
-                package_identity.to_owned(),
-                peer,
-            )
-            .await
+        crate::synchronization::client::send_log_sync(
+            &self.network,
+            &self.sync_services,
+            address,
+            receiver,
+            workspace_id,
+            package_identity.to_owned(),
+            peer,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -822,14 +826,14 @@ impl CoreRuntime {
         crate::membership_sync::MembershipSessionReport,
         crate::membership_sync::MembershipSessionError,
     > {
-        self.transport
-            .run_membership_session(
-                address,
-                Arc::clone(&self.membership_replica),
-                workspace_id,
-                peer,
-            )
-            .await
+        crate::membership_sync::run_membership_session_on(
+            &self.network,
+            address,
+            Arc::clone(&self.membership_replica),
+            workspace_id,
+            peer,
+        )
+        .await
     }
 
     /// Dials the membership protocol pushing nothing, and reports what the
@@ -961,7 +965,10 @@ impl CoreRuntime {
         let connection = self
             .transport
             .endpoint()
-            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .connect(
+                address,
+                crate::synchronization::network_handler::LOG_SYNC_ALPN,
+            )
             .await
             .ok()?;
         let (mut send, _receive) = connection.open_bi().await.ok()?;
@@ -988,7 +995,10 @@ impl CoreRuntime {
         let connection = self
             .transport
             .endpoint()
-            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .connect(
+                address,
+                crate::synchronization::network_handler::LOG_SYNC_ALPN,
+            )
             .await
             .expect("the responder accepts the connection");
         let (mut send, _receive) = connection
@@ -1015,7 +1025,10 @@ impl CoreRuntime {
         let connection = self
             .transport
             .endpoint()
-            .connect(address, crate::network::PACKAGE_SYNC_ALPN)
+            .connect(
+                address,
+                crate::synchronization::network_handler::LOG_SYNC_ALPN,
+            )
             .await
             .ok()?;
         match tokio::time::timeout(wait, connection.closed()).await.ok()? {

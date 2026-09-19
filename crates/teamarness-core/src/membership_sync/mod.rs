@@ -29,6 +29,43 @@ pub(crate) const MAX_MEMBERSHIP_HANDLERS: usize = 8;
 pub(crate) use handler::MembershipSyncHandler;
 pub(crate) use session::run_membership_session;
 
+/// The membership-sync registration the runtime composition point hands to
+/// `network`, which names neither this protocol nor its handler.
+pub(crate) fn membership_sync_registration(
+    replica: Arc<dyn MembershipReplica>,
+) -> crate::network::ProtocolRegistration {
+    (
+        MEMBERSHIP_SYNC_ALPN.to_vec(),
+        Box::new(MembershipSyncHandler::new(replica))
+            as Box<dyn iroh::protocol::DynProtocolHandler>,
+    )
+}
+
+/// Reconciles one Workspace's canonical membership with one peer, inside the
+/// session timeout and the second outbound peer budget.
+pub(crate) async fn run_membership_session_on(
+    network: &crate::network::Network,
+    address: iroh_base::EndpointAddr,
+    replica: Arc<dyn MembershipReplica>,
+    workspace: WorkspaceId,
+    peer: PublicIdentity,
+) -> Result<MembershipSessionReport, MembershipSessionError> {
+    let overloaded = MembershipSessionError::Transport("no outbound peer slot is free".to_owned());
+    network
+        .run_extra_outbound(overloaded, move |endpoint| async move {
+            match tokio::time::timeout(
+                MEMBERSHIP_SESSION_TIMEOUT,
+                run_membership_session(&endpoint, address, replica, workspace, peer),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(MembershipSessionError::Timeout),
+            }
+        })
+        .await
+}
+
 /// What one Installation advertises about a Workspace it knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MembershipSummary {

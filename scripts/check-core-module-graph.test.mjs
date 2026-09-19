@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   checkCoreModuleGraph,
   findDemotedBehindTestHooks,
+  findModuleGraphBreaks,
   findTestHooksMisuse,
   repositoryRoot,
 } from "./check-core-module-graph.mjs";
@@ -72,4 +73,32 @@ pub use runtime::insert_remote_record;
   assert.equal(problems.length, 2);
   assert.match(problems[0], /lib\.rs:3 .*replicate_records_to/);
   assert.match(problems[1], /lib\.rs:10 .*insert_remote_record/);
+});
+
+test("a forbidden module name in production code is reported", () => {
+  const source = `use crate::network::Network;
+use crate::onboarding::transport::Transport;
+
+pub(crate) fn bind() {}
+`;
+  const problems = findModuleGraphBreaks("network", "network/mod.rs", source, [
+    "crate::onboarding",
+    "crate::synchronization",
+  ]);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /network\/mod\.rs:2 .*crate::onboarding/);
+});
+
+test("the same name inside the file's own test module is allowed", () => {
+  const source = `use crate::network::Network;
+
+#[cfg(test)]
+mod tests {
+    use crate::onboarding::transport::Transport;
+}
+`;
+  assert.deepEqual(
+    findModuleGraphBreaks("network", "network/mod.rs", source, ["crate::onboarding"]),
+    [],
+  );
 });

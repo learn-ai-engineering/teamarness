@@ -11,7 +11,16 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use super::handler::{IssuerService, OnboardingHandler};
 use crate::OnboardingError;
-use crate::network::Network;
+use crate::network::{Network, NetworkError};
+
+/// Onboarding maps the shared network's failures at its own boundary, so
+/// `network` names no onboarding type.
+fn map_network_error(error: NetworkError) -> OnboardingError {
+    match error {
+        NetworkError::Readiness => OnboardingError::Readiness,
+        NetworkError::Shutdown => OnboardingError::Shutdown,
+    }
+}
 
 pub(crate) const ONBOARDING_ALPN: &[u8] = b"teamarness/workspace-join/1";
 pub(crate) const INVITATION_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,7 +76,6 @@ impl Transport {
     pub(crate) async fn bind_production(
         secret_key: SecretKey,
         issuer: IssuerService,
-        services: Option<crate::synchronization::SyncServices>,
         protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
@@ -80,32 +88,36 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             Some(issuer),
-            services,
             protocols,
         )
         .await
     }
 
+    /// Binds the shared Endpoint with onboarding registered first, followed by
+    /// whatever protocols the composition point supplies.
     async fn bind(
         secret_key: SecretKey,
         options: BindOptions,
         issuer: Option<IssuerService>,
-        services: Option<crate::synchronization::SyncServices>,
         protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         let handler = Arc::new(match issuer {
             Some(issuer) => OnboardingHandler::with_issuer(options.request_timeout, issuer),
             None => OnboardingHandler::new(options.request_timeout),
         });
+        let mut registrations: Vec<crate::network::ProtocolRegistration> = vec![(
+            ONBOARDING_ALPN.to_vec(),
+            Box::new(Arc::clone(&handler)) as Box<dyn iroh::protocol::DynProtocolHandler>,
+        )];
+        registrations.extend(protocols);
         let network = Network::bind(
             secret_key,
             options.relay_mode,
             options.loopback_only,
-            Arc::clone(&handler),
-            services,
-            protocols,
+            registrations,
         )
-        .await?;
+        .await
+        .map_err(map_network_error)?;
         Ok(Arc::new(Self {
             network,
             handler,
@@ -135,21 +147,6 @@ impl Transport {
             #[cfg(test)]
             post_response_block_ms: std::sync::atomic::AtomicU64::new(0),
         }))
-    }
-
-    /// How many inbound package synchronization sessions hold a slot.
-    #[cfg(test)]
-    pub(crate) fn inbound_package_sessions_for_test(&self) -> usize {
-        self.network.inbound_package_sessions_for_test()
-    }
-
-    /// How many inbound sessions one peer has ever been given a slot for.
-    #[cfg(test)]
-    pub(crate) fn inbound_package_sessions_from_for_test(
-        &self,
-        peer: crate::PublicIdentity,
-    ) -> usize {
-        self.network.inbound_package_sessions_from_for_test(peer)
     }
 
     pub(crate) fn endpoint_id(&self) -> iroh_base::PublicKey {
@@ -231,51 +228,6 @@ impl Transport {
             .map_err(|_| OnboardingError::Timeout)?
     }
 
-    pub(crate) async fn send_log_sync(
-        &self,
-        address: EndpointAddr,
-        receiver: Arc<dyn crate::synchronization::SyncReceiver>,
-        workspace: crate::WorkspaceId,
-        package: String,
-        peer: crate::PublicIdentity,
-    ) -> Result<crate::synchronization::ExchangeReport, crate::synchronization::LogSessionError>
-    {
-        self.network
-            .send_log_sync(address, receiver, workspace, package, peer)
-            .await
-    }
-
-    /// Reconciles one Workspace's canonical membership with one peer.
-    pub(crate) async fn run_membership_session(
-        &self,
-        address: EndpointAddr,
-        replica: Arc<dyn crate::membership_sync::MembershipReplica>,
-        workspace: crate::WorkspaceId,
-        peer: crate::PublicIdentity,
-    ) -> Result<
-        crate::membership_sync::MembershipSessionReport,
-        crate::membership_sync::MembershipSessionError,
-    > {
-        let overloaded = crate::membership_sync::MembershipSessionError::Transport(
-            "no outbound peer slot is free".to_owned(),
-        );
-        self.network
-            .run_outbound(overloaded, move |endpoint| async move {
-                match timeout(
-                    crate::membership_sync::MEMBERSHIP_SESSION_TIMEOUT,
-                    crate::membership_sync::run_membership_session(
-                        &endpoint, address, replica, workspace, peer,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(crate::membership_sync::MembershipSessionError::Timeout),
-                }
-            })
-            .await
-    }
-
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
         self.lifecycle.stop();
         self.handler.stop();
@@ -283,7 +235,7 @@ impl Transport {
             .shutdown
             .get_or_init(|| async {
                 self.lifecycle.wait_for_idle().await;
-                let result = self.network.shutdown().await;
+                let result = self.network.shutdown().await.map_err(map_network_error);
                 self.lifecycle.stopped();
                 result
             })
@@ -325,19 +277,17 @@ impl Transport {
             readiness_timeout,
             ready_immediately,
             None,
-            None,
             Vec::new(),
         )
         .await
     }
 
     #[cfg(test)]
-    pub(crate) async fn bind_loopback_with_issuer_and_services(
+    pub(crate) async fn bind_loopback_with_issuer_and_protocols(
         secret_key: SecretKey,
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: IssuerService,
-        services: crate::synchronization::SyncServices,
         protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind_loopback_inner(
@@ -345,7 +295,6 @@ impl Transport {
             readiness_timeout,
             ready_immediately,
             Some(issuer),
-            Some(services),
             protocols,
         )
         .await
@@ -357,7 +306,6 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: Option<IssuerService>,
-        services: Option<crate::synchronization::SyncServices>,
         protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
@@ -374,10 +322,14 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             issuer,
-            services,
             protocols,
         )
         .await
+    }
+
+    /// The shared Endpoint and Router this Installation runs every protocol on.
+    pub(crate) fn network(&self) -> &Arc<Network> {
+        &self.network
     }
 
     #[cfg(test)]
