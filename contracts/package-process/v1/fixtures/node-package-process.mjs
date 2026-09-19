@@ -4,6 +4,10 @@ import { pathToFileURL } from "node:url";
 
 export const MAX_FRAME_BYTES = 1_048_576;
 export const MAX_DECODED_FRAME_BYTES = 1_048_576;
+export const MAX_IN_FLIGHT_EACH_DIRECTION = 32;
+export const MAX_WRITER_FRAMES = 64;
+export const MAX_WRITER_BYTES = 8_388_608;
+export const INITIAL_STREAM_CREDIT = 32;
 const immutableCapability = `teamarness.synchro${"nization"}.immutable-record-log`;
 const KNOWN_KINDS = new Set([
   "initialize", "initialized", "request", "response", "error", "cancel", "stream_open",
@@ -106,10 +110,71 @@ export function encodeFrame(frame) {
   return Buffer.concat([prefix, payload]);
 }
 
+/** Tombstone entries kept per originating direction, bounded by two contract windows. */
+export const TOMBSTONE_CAPACITY = 2 * MAX_IN_FLIGHT_EACH_DIRECTION;
+
+/** The frame is in contract and names live state. */
+export const DELIVER = "deliver";
+/** The frame is in contract but names state this side has already retired. */
+export const IGNORE = "ignore";
+
+/** A bounded FIFO set of IDs, one queue per originating namespace. */
+class Tombstones {
+  #queues = { "h:": [], "p:": [] };
+  #sets = { "h:": new Set(), "p:": new Set() };
+
+  #side(id) {
+    return id.startsWith("h:") ? "h:" : "p:";
+  }
+
+  add(id) {
+    const side = this.#side(id);
+    if (this.#sets[side].has(id)) return;
+    this.#sets[side].add(id);
+    this.#queues[side].push(id);
+    while (this.#queues[side].length > TOMBSTONE_CAPACITY) {
+      this.#sets[side].delete(this.#queues[side].shift());
+    }
+  }
+
+  has(id) {
+    return this.#sets[this.#side(id)].has(id);
+  }
+
+  delete(id) {
+    const side = this.#side(id);
+    if (!this.#sets[side].delete(id)) return false;
+    this.#queues[side] = this.#queues[side].filter((value) => value !== id);
+    return true;
+  }
+}
+
+/**
+ * The one classifier both peers run over every frame, in both directions.
+ *
+ * `observe` returns `DELIVER` for a frame that names live state and `IGNORE`
+ * for one a conforming peer sent before it could see this side retire the
+ * state it names. Everything else throws and is fatal to the generation.
+ */
 export class ContractState {
   #pending = new Map();
-  #terminal = new Set();
+  #answered = new Tombstones();
+  #abandoned = new Tombstones();
+  #closedStreams = new Tombstones();
   #streams = new Map();
+
+  /** Retires a request this side has stopped waiting for. */
+  retireRequest(id) {
+    if (this.#answered.has(id)) return;
+    this.#pending.delete(id);
+    this.#abandoned.add(id);
+  }
+
+  /** Retires a stream this side has stopped serving. */
+  retireStream(id) {
+    const stream = this.#streams.get(id);
+    if (stream) stream.retired = true;
+  }
 
   observe(direction, frame) {
     validateDirection(direction, frame);
@@ -117,41 +182,65 @@ export class ContractState {
       throw new ProtocolFailure("incompatible_version");
     }
     if (frame.kind === "request") {
-      if (this.#pending.has(frame.id) || this.#terminal.has(frame.id)) {
+      if (this.#pending.has(frame.id) || this.#answered.has(frame.id) || this.#abandoned.has(frame.id)) {
         throw new ProtocolFailure("duplicate_id");
       }
       this.#pending.set(frame.id, direction);
     } else if (frame.kind === "response" || frame.kind === "error") {
-      if (this.#terminal.has(frame.id)) throw new ProtocolFailure("second_terminal_response");
+      if (this.#answered.has(frame.id)) throw new ProtocolFailure("second_terminal_response");
+      // A late first terminal for a cancelled or timed-out ID is ignored
+      // without accepting a second one.
+      if (this.#abandoned.delete(frame.id)) {
+        this.#answered.add(frame.id);
+        return IGNORE;
+      }
       const requestDirection = this.#pending.get(frame.id);
       if (!requestDirection || requestDirection === direction) {
         throw new ProtocolFailure("unknown_response");
       }
       this.#pending.delete(frame.id);
-      this.#terminal.add(frame.id);
+      this.#answered.add(frame.id);
     } else if (frame.kind === "cancel") {
+      if (this.#answered.has(frame.targetId) || this.#abandoned.has(frame.targetId)) return IGNORE;
       const requestDirection = this.#pending.get(frame.targetId);
       if (!requestDirection || requestDirection !== direction) {
         throw new ProtocolFailure("unknown_request");
       }
+      this.#pending.delete(frame.targetId);
+      this.#abandoned.add(frame.targetId);
     } else if (frame.kind === "stream_open") {
-      if (this.#streams.has(frame.id)) throw new ProtocolFailure("duplicate_id");
-      this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n });
+      if (this.#streams.has(frame.id) || this.#closedStreams.has(frame.id)) {
+        throw new ProtocolFailure("duplicate_id");
+      }
+      this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n, retired: false });
     } else if (frame.kind === "event") {
+      if (this.#closedStreams.has(frame.streamId)) return IGNORE;
       const stream = this.#streams.get(frame.streamId);
       if (!stream || stream.sender !== direction) throw new ProtocolFailure("unknown_stream");
+      if (stream.retired) return IGNORE;
       if (stream.credit === 0) throw new ProtocolFailure("credit_violation");
       const sequence = decimal(frame.sequence);
       if (sequence !== stream.sequence + 1n) throw new ProtocolFailure("event_sequence");
       stream.credit -= 1;
       stream.sequence = sequence;
     } else if (frame.kind === "credit") {
+      // Credit released for events the receiver had already accepted is
+      // ordinary in-flight traffic, even when the stream has since closed.
+      if (this.#closedStreams.has(frame.streamId)) return IGNORE;
       const stream = this.#streams.get(frame.streamId);
       if (!stream || stream.sender === direction) throw new ProtocolFailure("unknown_stream");
+      if (stream.retired) return IGNORE;
       stream.credit += frame.amount;
     } else if (frame.kind === "stream_close") {
-      if (!this.#streams.delete(frame.streamId)) throw new ProtocolFailure("unknown_stream");
+      if (this.#streams.delete(frame.streamId)) {
+        this.#closedStreams.add(frame.streamId);
+      } else if (this.#closedStreams.has(frame.streamId)) {
+        return IGNORE;
+      } else {
+        throw new ProtocolFailure("unknown_stream");
+      }
     }
+    return DELIVER;
   }
 }
 

@@ -94,7 +94,7 @@ test("Node consumes every normative schema and golden sequence", async () => {
   }
 
   const goldenPaths = await files("golden", ".jsonl");
-  assert.equal(goldenPaths.length, 8);
+  assert.equal(goldenPaths.length, 9);
   const kinds = new Set();
   for (const path of goldenPaths) {
     const entries = (await readFile(path, "utf8")).trim().split("\n").map(JSON.parse);
@@ -109,7 +109,7 @@ test("Node consumes every normative schema and golden sequence", async () => {
 
 test("Node consumes every malformed fixture with its stable error", async () => {
   const paths = await files("invalid", ".json");
-  assert.equal(paths.length, 14);
+  assert.equal(paths.length, 15);
   for (const path of paths) {
     const fixture = JSON.parse(await readFile(path, "utf8"));
     const actual = errorCode(() => {

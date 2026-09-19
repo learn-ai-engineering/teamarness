@@ -1,0 +1,43 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "request",
+        "id": "h:abandoned",
+        "operation": "ui.mutate",
+        "mountId": "bW91bnQx",
+        "deadlineUnixMs": "1",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "cancel",
+        "id": "h:cancel-abandoned",
+        "targetId": "h:abandoned"
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "response",
+        "id": "h:abandoned",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "error",
+        "id": "h:abandoned",
+        "code": "fixture.second",
+        "retryable": false
+      }
+    }
+  ],
+  "expectedError": "second_terminal_response",
+  "description": "a cancelled request tolerates one late terminal frame, never two"
+}

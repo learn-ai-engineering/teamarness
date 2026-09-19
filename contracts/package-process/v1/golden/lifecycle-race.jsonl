@@ -1,0 +1,13 @@
+{"direction":"host","frame":{"kind":"stream_open","id":"h:race-ui","topic":"ui.events","mountId":"bW91bnQx","initialCredit":32,"payload":{}}}
+{"direction":"package","frame":{"kind":"event","streamId":"h:race-ui","sequence":"1","payload":{}}}
+{"direction":"package","frame":{"kind":"stream_close","streamId":"h:race-ui","code":"completed"}}
+{"direction":"host","frame":{"kind":"credit","streamId":"h:race-ui","amount":1}}
+{"direction":"host","frame":{"kind":"stream_close","streamId":"h:race-ui","code":"closed"}}
+{"direction":"package","frame":{"kind":"stream_open","id":"p:race-cap","topic":"capability.stream","initialCredit":32,"payload":{"grant":"Z3JhbnQx"}}}
+{"direction":"host","frame":{"kind":"event","streamId":"p:race-cap","sequence":"1","payload":{}}}
+{"direction":"host","frame":{"kind":"stream_close","streamId":"p:race-cap","code":"capability_unavailable"}}
+{"direction":"package","frame":{"kind":"credit","streamId":"p:race-cap","amount":1}}
+{"direction":"host","frame":{"kind":"request","id":"h:race-call","operation":"ui.mutate","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740998","payload":{}}}
+{"direction":"host","frame":{"kind":"cancel","id":"h:race-cancel","targetId":"h:race-call"}}
+{"direction":"package","frame":{"kind":"error","id":"h:race-call","code":"cancelled","retryable":true}}
+{"direction":"host","frame":{"kind":"cancel","id":"h:race-cancel-again","targetId":"h:race-call"}}

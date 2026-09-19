@@ -14,7 +14,7 @@ pub use codec::{
     Frame, FrameDecoder, FrameKind, ProtocolError, decode_frame, decode_payload, encode_frame,
 };
 pub use serde_json::Value as JsonValue;
-pub use state::{ContractState, Direction};
+pub use state::{ContractState, Direction, IgnoredFrames, TOMBSTONE_CAPACITY, Verdict};
 pub use version::{ProtocolRange, ProtocolVersion, negotiate_version};
 
 pub const MAX_FRAME_BYTES: usize = 1_048_576;

@@ -42,7 +42,7 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
 #[test]
 fn consumes_every_golden_sequence() {
     let paths = json_files("golden", "jsonl");
-    assert_eq!(paths.len(), 8, "the v1 golden set is intentional");
+    assert_eq!(paths.len(), 9, "the v1 golden set is intentional");
 
     let mut kinds = BTreeSet::new();
     for path in paths {
@@ -85,7 +85,7 @@ fn consumes_every_golden_sequence() {
 #[test]
 fn consumes_every_malformed_fixture_with_its_stable_error() {
     let paths = json_files("invalid", "json");
-    assert_eq!(paths.len(), 14, "the v1 malformed set is intentional");
+    assert_eq!(paths.len(), 15, "the v1 malformed set is intentional");
 
     for path in paths {
         let fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
