@@ -99,10 +99,108 @@ fn start() -> (
     Session,
     HostView,
 ) {
-    let (host_read, sdk_write) = tokio::io::duplex(1024 * 1024);
-    let (sdk_read, host_write) = tokio::io::duplex(1024 * 1024);
-    let service = tokio::spawn(Package::builder(Arc::new(Fixture)).serve_io(sdk_read, sdk_write));
+    start_with(Arc::new(Fixture), 1024 * 1024)
+}
+
+fn start_with<B>(
+    backend: Arc<B>,
+    pipe_bytes: usize,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    Session,
+    HostView,
+)
+where
+    B: Backend + 'static,
+{
+    let (host_read, sdk_write) = tokio::io::duplex(pipe_bytes);
+    let (sdk_read, host_write) = tokio::io::duplex(pipe_bytes);
+    let service = tokio::spawn(Package::builder(backend).serve_io(sdk_read, sdk_write));
     (host_read, host_write, service, HostView::new())
+}
+
+/// CR2-002: every legal in-budget request is answered, however saturated the
+/// Package's own writer is.
+///
+/// The contract's guarantee is absolute: "A sender never withholds a frame it
+/// owes. Exactly one `response` or `error` still reaches the wire for every
+/// request." A control lane that refuses on bytes breaks it silently — the
+/// handler task has already claimed the request's one terminal frame, so the
+/// cancel path will not write one either, and the request receives nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_in_flight_request_is_answered_behind_a_saturated_writer() {
+    /// Answers big enough that only two fit the control lane's byte budget.
+    const ANSWER_BYTES: usize = 900_000;
+    const REQUESTS: usize = 8;
+
+    /// Holds every handler until all of them have an answer to write, so they
+    /// contend for the byte budget before any frame has drained.
+    struct SaturatingAnswers {
+        released: Arc<tokio::sync::Barrier>,
+    }
+
+    impl Backend for SaturatingAnswers {
+        fn handle(
+            &self,
+            _request: BackendRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+            Box::pin(async move {
+                self.released.wait().await;
+                let mut payload = JsonValue::Object(Default::default());
+                payload.as_object_mut().unwrap().insert(
+                    "canonical".into(),
+                    JsonValue::String("A".repeat(ANSWER_BYTES)),
+                );
+                Ok(payload)
+            })
+        }
+    }
+
+    // A pipe far smaller than one answer, so a frame that has acquired its
+    // permits holds them for many round trips.
+    let (mut host_read, mut host_write, service, mut host) = start_with(
+        Arc::new(SaturatingAnswers {
+            released: Arc::new(tokio::sync::Barrier::new(REQUESTS)),
+        }),
+        1024,
+    );
+    handshake(&mut host_read, &mut host_write, &mut host).await;
+    for index in 0..REQUESTS {
+        let request = format!(
+            r#"{{"kind":"request","id":"h:big-{index}","operation":"fixture.echo","deadlineUnixMs":"9999999999999","payload":{{}}}}"#
+        );
+        host.observe_to_package(&request);
+        write_json(&mut host_write, &request).await;
+    }
+
+    let mut answered = std::collections::BTreeSet::new();
+    let collected = tokio::time::timeout(Duration::from_secs(30), async {
+        while answered.len() < REQUESTS {
+            let frame = read_frame(&mut host_read).await;
+            assert!(
+                matches!(frame.kind(), FrameKind::Response | FrameKind::Error),
+                "unexpected frame {:?}",
+                frame.kind()
+            );
+            host.observe_from_package(&frame);
+            answered.insert(
+                frame
+                    .field("id")
+                    .and_then(JsonValue::as_str)
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+    })
+    .await;
+    assert!(
+        collected.is_ok(),
+        "only {} of {REQUESTS} requests were answered: {answered:?}",
+        answered.len()
+    );
+    drop(host_write);
+    let _ = service.await;
 }
 
 async fn handshake(

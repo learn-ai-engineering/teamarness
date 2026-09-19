@@ -141,8 +141,13 @@ pub(crate) async fn run(
                             // Claim the one terminal frame before writing it,
                             // so a cancel that reaches the dispatcher while
                             // this task is finishing cannot write a second.
+                            // The claim is why the write must then wait for
+                            // capacity: nothing else will ever answer this id,
+                            // so a refused frame is a request that receives no
+                            // terminal frame at all. Only a session that has
+                            // already ended can fail this send.
                             if !task_answered.swap(true, Ordering::AcqRel) {
-                                let _ = writer.control(terminal(&id, result)).await;
+                                let _ = writer.control_waiting(terminal(&id, result)).await;
                             }
                             let _ = done.send(id).await;
                         });

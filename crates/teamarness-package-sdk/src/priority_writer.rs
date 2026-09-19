@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use teamarness_package_protocol::{
     ContractState, Direction, Frame, JsonValue, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION,
-    MAX_WRITER_BYTES, encode_frame,
+    MAX_WRITER_BYTES, MAX_WRITER_FRAMES, encode_frame,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -11,24 +11,23 @@ use crate::SdkError;
 
 pub(crate) type SharedState = Arc<Mutex<ContractState>>;
 
-/// Lifecycle and health frames reserved beside the answers on the control lane.
-///
-/// `initialized`, `pong` and `shutdown_ack` are one frame each.
-const CONTROL_RESERVE: usize = 3;
-
-/// Slots on the control lane.
-///
-/// Worst case: one terminal frame for each of the in-flight requests the
-/// contract permits the Host, plus the reserved lifecycle frames. A lane
-/// shallower than the contract's own concurrency makes a Package that answers
-/// its requests wait on its own writer.
-const CONTROL_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION + CONTROL_RESERVE;
-
 /// Slots on the data lane.
 ///
-/// The Package's own in-flight capability requests travel here, each with the
-/// stream frames that may follow it.
-const DATA_QUEUE: usize = 2 * MAX_IN_FLIGHT_EACH_DIRECTION;
+/// Worst case: every capability request the contract permits the Package,
+/// queued at once. The stream frames that follow one are written by the
+/// stream's own task, which waits for a slot rather than refusing.
+const DATA_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION;
+
+/// Slots on the control lane: the rest of the writer's published frame budget.
+///
+/// The two lanes share the one writer budget the contract publishes and the
+/// Host's handshake transmits, so their depths are a split of
+/// `MAX_WRITER_FRAMES`, exactly as their byte budgets are a split of
+/// `MAX_WRITER_BYTES`. Worst case here is one terminal frame for each of the
+/// in-flight requests the contract permits the Host; `initialized`, `pong` and
+/// `shutdown_ack` are one frame each and wait for a slot beside them, because
+/// no send on this writer refuses on depth.
+const CONTROL_QUEUE: usize = MAX_WRITER_FRAMES - DATA_QUEUE;
 
 /// The control lane's byte budget: two contract-maximum frames, so one maximum
 /// answer never waits on another that is already queued.
@@ -78,10 +77,35 @@ impl PriorityWriter {
         self.send(value, false).await
     }
 
+    /// Queues a control frame, waiting for the lane's byte budget rather than
+    /// refusing it.
+    ///
+    /// A saturated lane behind a slow reader is ordinary backpressure. Only a
+    /// task that owns its own work may wait here — the dispatcher loop must
+    /// not, because a Package that stopped reading would stop answering
+    /// everything else too. The request's one terminal frame is exactly such a
+    /// task's work: the contract says a sender never withholds a frame it
+    /// owes, and the handler has already claimed this request's only one, so
+    /// refusing it leaves the request with no terminal frame at all.
+    pub(crate) async fn control_waiting(&self, value: JsonValue) -> Result<(), SdkError> {
+        let (frame, permits) = self.measure(value)?;
+        let permit = self
+            .control_bytes
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| SdkError::ParentClosed)?;
+        self.control
+            .send(QueuedFrame {
+                frame,
+                _bytes: permit,
+            })
+            .await
+            .map_err(|_| SdkError::ParentClosed)
+    }
+
     async fn send(&self, value: JsonValue, control: bool) -> Result<(), SdkError> {
-        let frame = Frame::try_from(value).map_err(SdkError::protocol)?;
-        let size = encode_frame(&frame).map_err(SdkError::protocol)?.len();
-        let permits = u32::try_from(size).map_err(|_| SdkError::Protocol("overloaded"))?;
+        let (frame, permits) = self.measure(value)?;
         let semaphore = if control {
             self.control_bytes.clone()
         } else {
@@ -99,6 +123,14 @@ impl PriorityWriter {
             .send(queued)
             .await
             .map_err(|_| SdkError::ParentClosed)
+    }
+
+    /// Validates one frame and reports the byte permits it needs.
+    fn measure(&self, value: JsonValue) -> Result<(Frame, u32), SdkError> {
+        let frame = Frame::try_from(value).map_err(SdkError::protocol)?;
+        let size = encode_frame(&frame).map_err(SdkError::protocol)?.len();
+        let permits = u32::try_from(size).map_err(|_| SdkError::Protocol("overloaded"))?;
+        Ok((frame, permits))
     }
 }
 
@@ -164,19 +196,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE,
-        MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES,
+        CONTROL_BYTES, CONTROL_QUEUE, DATA_BYTES, DATA_QUEUE, MAX_IN_FLIGHT_EACH_DIRECTION,
+        MAX_WRITER_BYTES, MAX_WRITER_FRAMES,
     };
-    use teamarness_package_protocol::{MAX_FRAME_BYTES, MAX_WRITER_FRAMES};
+    use teamarness_package_protocol::MAX_FRAME_BYTES;
 
-    /// Every writer bound admits the worst case the contract permits.
+    /// Every writer bound admits the worst case the contract permits, and the
+    /// two lanes together stay inside the one budget the Host publishes.
+    ///
+    /// Both halves are asserted as sums. A per-lane floor alone is what let the
+    /// frame budget drift: each lane was sized against the contract's
+    /// concurrency, and together they queued 99 frames against the 64 the
+    /// handshake names.
     #[test]
     fn writer_lanes_admit_the_traffic_the_contract_permits() {
         const {
-            assert!(CONTROL_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION + CONTROL_RESERVE);
+            assert!(CONTROL_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
             assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
-            assert!(CONTROL_QUEUE <= MAX_WRITER_FRAMES);
-            assert!(DATA_QUEUE <= MAX_WRITER_FRAMES);
+            assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
             assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
             assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
             assert!(CONTROL_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
