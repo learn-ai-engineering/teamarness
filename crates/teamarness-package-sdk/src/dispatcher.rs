@@ -16,6 +16,18 @@ use crate::capability::{CapabilityClient, CapabilityStreams, PendingCapabilities
 use crate::priority_writer::{PriorityWriter, SharedState};
 use crate::{Backend, BackendError, BackendRequest, Initialization, SdkError, object};
 
+/// Streams one Host may hold open on this session at once.
+///
+/// The contract publishes no concurrent-stream limit, so this is the SDK's own
+/// bound on the tasks one session holds. ADR 0019 §3 forbids an adapter-chosen
+/// bound with a fatal verdict, and this one used to end the generation. It is
+/// set at the in-flight request budget the contract does publish — the most
+/// concurrent work either peer may ask of the other, and comfortably above the
+/// eight UI subscriptions one mount may hold — and a stream past it is
+/// answered with `stream_close` carrying `overloaded`, which ends that one
+/// stream and is retryable.
+const MAX_OPEN_HOST_STREAMS: usize = MAX_IN_FLIGHT_EACH_DIRECTION;
+
 /// One in-flight request: its task, its cancellation signal, and whether it is a lifecycle call.
 struct InFlight {
     task: JoinHandle<()>,
@@ -211,10 +223,18 @@ pub(crate) async fn run(
                     }
                     FrameKind::StreamOpen => {
                         streams.retain(|_, (task, _, _)| !task.is_finished());
-                        if streams.len() >= MAX_IN_FLIGHT_EACH_DIRECTION {
-                            return Err(SdkError::Protocol("overloaded"));
-                        }
                         let id = string_field(&frame, "id")?;
+                        if streams.len() >= MAX_OPEN_HOST_STREAMS {
+                            // One stream is refused, not the session. The
+                            // contract publishes no concurrent-stream limit and
+                            // its fatal list names a 33rd in-flight *request*,
+                            // so ending the generation over an adapter's own
+                            // bound was out of contract. `overloaded` is the
+                            // host code for exactly this, and the SDK's own
+                            // table calls it retryable.
+                            writer.data(stream_close(&id, "overloaded")).await?;
+                            continue;
+                        }
                         let cancellation = CancellationToken::new();
                         let request = BackendRequest {
                             operation: string_field(&frame, "topic")?,

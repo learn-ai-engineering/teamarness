@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use teamarness_package_protocol::{FrameKind, JsonValue};
+use teamarness_package_protocol::{FrameKind, JsonValue, MAX_IN_FLIGHT_EACH_DIRECTION};
 use teamarness_package_sdk::{
     ActivationKind, BackendError, Empty, Package, Router, SdkError, event_channel,
 };
@@ -103,6 +103,17 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
             .await;
         let _ = observed;
         result.map(|()| serde_json::json!({}))
+    })
+    .subscription("fixture.forever", |_context, _: Empty| async move {
+        let (sender, subscription) = event_channel(2);
+        // The sender is parked rather than dropped, so the stream stays open
+        // until the host closes it. A stream whose task has finished is not an
+        // open stream, so a bound on open streams needs one that has not.
+        tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(sender);
+        });
+        Ok(subscription)
     })
     .subscription("fixture.watch", |context, request: Add| async move {
         let (sender, subscription) = event_channel(2);
@@ -367,7 +378,10 @@ fn operations_lists_registered_names_sorted() {
             "fixture.state"
         ]
     );
-    assert_eq!(operations.subscriptions, ["fixture.watch"]);
+    assert_eq!(
+        operations.subscriptions,
+        ["fixture.forever", "fixture.watch"]
+    );
 }
 
 #[test]
@@ -421,5 +435,45 @@ async fn subscription_handlers_receive_typed_requests_and_stream_events() {
     assert_eq!(event.kind(), FrameKind::Event);
     assert_eq!(event.field("payload").unwrap().get("sum").unwrap(), 7);
     assert_eq!(event.field("payload").unwrap().get("state").unwrap(), 1);
+    session.finish().await;
+}
+
+/// A stream past the SDK's own bound ends that stream, not the session.
+///
+/// The contract publishes no concurrent-stream limit and its fatal list names
+/// a 33rd in-flight *request*, so ending the generation on an adapter-chosen
+/// stream bound is what ADR 0019 §3 forbids in terms. The 33rd stream is
+/// answered with `stream_close` carrying `overloaded`, which the SDK's own
+/// table calls retryable, and the session keeps answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_past_the_open_bound_is_refused_without_ending_the_session() {
+    let mut session = start(counting_router(Arc::new(Hooks::default()))).await;
+    session
+        .request("h:activate", "lifecycle.activate", "{}")
+        .await;
+    for index in 1..=MAX_IN_FLIGHT_EACH_DIRECTION {
+        write_json(
+            &mut session.host_write,
+            &format!(
+                r#"{{"kind":"stream_open","id":"h:forever-{index}","topic":"fixture.forever","mountId":"bW91bnQx","initialCredit":32,"payload":{{}}}}"#
+            ),
+        )
+        .await;
+    }
+    write_json(
+        &mut session.host_write,
+        r#"{"kind":"stream_open","id":"h:one-too-many","topic":"fixture.forever","mountId":"bW91bnQx","initialCredit":32,"payload":{}}"#,
+    )
+    .await;
+
+    let closed = read_frame(&mut session.host_read).await;
+    assert_eq!(closed.kind(), FrameKind::StreamClose);
+    assert_eq!(closed.field("streamId").unwrap(), "h:one-too-many");
+    assert_eq!(closed.field("code").unwrap(), "overloaded");
+
+    let answer = session
+        .request("h:still-here", "fixture.add", r#"{"a":1,"b":2}"#)
+        .await;
+    assert_eq!(answer.kind(), FrameKind::Response);
     session.finish().await;
 }
