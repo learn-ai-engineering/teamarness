@@ -266,41 +266,53 @@ fn await_frame(
 }
 
 fn answer(stdin: &mut ChildStdin, frame: &Frame) -> Result<(), ContractError> {
+    match answer_frame(frame)? {
+        Some(value) => send(stdin, value),
+        None => Ok(()),
+    }
+}
+
+/// The frame the validator owes one the Package sent, if it owes one at all.
+///
+/// Separated from the write so the answers can be read back in a test: the
+/// `stream_open` arm answered nothing for a year because it looked for a field
+/// the schema forbids on that frame.
+fn answer_frame(frame: &Frame) -> Result<Option<Value>, ContractError> {
+    let field = |name: &str| frame.field(name).and_then(Value::as_str);
     match frame.kind() {
         FrameKind::Request => {
-            let Some(id) = frame.field("id").and_then(Value::as_str) else {
+            let Some(id) = field("id") else {
                 return Err(failure("smoke.protocol_violation"));
             };
-            send(
-                stdin,
-                json!({
-                    "kind": "error",
-                    "id": id,
-                    "code": "capability_unavailable",
-                    "retryable": false,
-                }),
-            )
+            Ok(Some(json!({
+                "kind": "error",
+                "id": id,
+                "code": "capability_unavailable",
+                "retryable": false,
+            })))
         }
         FrameKind::StreamOpen => {
-            let Some(stream) = frame.field("streamId").and_then(Value::as_str) else {
+            // `stream_open` names the new stream in its own `id`. The schema
+            // requires `["kind","id","topic","initialCredit","payload"]` with
+            // `additionalProperties: false`, so it has no `streamId` and
+            // reading one took this arm's error branch on every well-formed
+            // frame.
+            let Some(stream) = field("id") else {
                 return Err(failure("smoke.protocol_violation"));
             };
-            send(
-                stdin,
-                json!({
-                    "kind": "stream_close",
-                    "streamId": stream,
-                    "code": "capability_unavailable",
-                }),
-            )
+            Ok(Some(json!({
+                "kind": "stream_close",
+                "streamId": stream,
+                "code": "capability_unavailable",
+            })))
         }
         FrameKind::Ping => {
-            let Some(nonce) = frame.field("nonce").and_then(Value::as_str) else {
+            let Some(nonce) = field("nonce") else {
                 return Err(failure("smoke.protocol_violation"));
             };
-            send(stdin, json!({"kind": "pong", "nonce": nonce}))
+            Ok(Some(json!({"kind": "pong", "nonce": nonce})))
         }
-        FrameKind::StreamClose | FrameKind::Credit | FrameKind::Event => Ok(()),
+        FrameKind::StreamClose | FrameKind::Credit | FrameKind::Event => Ok(None),
         _ => Err(failure("smoke.protocol_violation")),
     }
 }
@@ -359,4 +371,58 @@ fn await_exit(child: &mut Child) -> Result<(), ContractError> {
         }
     }
     Err(failure("smoke.shutdown_timeout"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{answer_frame, failure};
+    use serde_json::{Value, json};
+    use teamarness_package_protocol::Frame;
+
+    fn frame(value: Value) -> Frame {
+        Frame::try_from(value).expect("valid frame")
+    }
+
+    /// A Package that opens a stream while it activates is answered, not left
+    /// waiting on a validator that read the wrong field.
+    #[test]
+    fn a_stream_open_is_closed_by_the_id_it_names() {
+        let answer = answer_frame(&frame(json!({
+            "kind":"stream_open", "id":"p:smoke-1", "topic":"capability.stream",
+            "initialCredit":32, "payload":{}
+        })))
+        .expect("answered");
+        assert_eq!(
+            answer,
+            Some(json!({
+                "kind":"stream_close", "streamId":"p:smoke-1",
+                "code":"capability_unavailable"
+            }))
+        );
+    }
+
+    #[test]
+    fn a_request_is_answered_and_a_ping_is_ponged() {
+        assert_eq!(
+            answer_frame(&frame(json!({
+                "kind":"request", "id":"p:smoke-call", "operation":"capability.call",
+                "deadlineUnixMs":"9007199254740998", "payload":{}
+            })))
+            .expect("answered"),
+            Some(json!({
+                "kind":"error", "id":"p:smoke-call",
+                "code":"capability_unavailable", "retryable":false
+            }))
+        );
+        assert_eq!(
+            answer_frame(&frame(json!({"kind":"ping","nonce":"cGluZw"}))).expect("answered"),
+            Some(json!({"kind":"pong","nonce":"cGluZw"}))
+        );
+    }
+
+    #[test]
+    fn a_frame_the_sequence_does_not_allow_is_a_protocol_violation() {
+        let error = answer_frame(&frame(json!({"kind":"shutdown_ack"}))).unwrap_err();
+        assert_eq!(error.rule, failure("smoke.protocol_violation").rule);
+    }
 }

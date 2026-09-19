@@ -70,6 +70,29 @@ fn accepts_bundled_package_manifests() {
     assert_eq!(seen, 4, "expected four bundled Package manifests");
 }
 
+/// The schema's `maxLength` counts code points, so the manifest rule does too.
+///
+/// Counting bytes rejected a display name the schema admits: 128 characters
+/// outside ASCII are more than 128 bytes.
+#[test]
+fn a_display_name_is_bounded_in_code_points_as_the_schema_publishes_it() {
+    let longest = "é".repeat(128);
+    assert_eq!(longest.chars().count(), 128);
+    assert_eq!(longest.len(), 256);
+    let document = parse_manifest(
+        &serde_json::to_vec(&manifest(
+            json!({"presentation": {"displayName": longest.clone()}}),
+        ))
+        .unwrap(),
+    )
+    .expect("the schema admits 128 code points");
+    assert_eq!(document.display_name, longest);
+
+    let error = reject(json!({"presentation": {"displayName": "é".repeat(129)}}));
+    assert_eq!(error.code, ContractErrorCode::ManifestMalformed);
+    assert_eq!(error.rule, "manifest.display_name");
+}
+
 #[test]
 fn accepts_placeholder_sizes_and_digests_in_a_source_tree() {
     let document = parse_manifest(

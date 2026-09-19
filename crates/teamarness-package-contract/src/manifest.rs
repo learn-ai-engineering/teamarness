@@ -479,9 +479,11 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
 }
 
 fn validate_display_name(value: &str) -> Result<(), ContractError> {
+    // The schema publishes `"maxLength": 128`, which JSON Schema 2020-12
+    // counts in code points. Counting bytes rejected a name the schema admits.
     if value.trim() != value
         || value.is_empty()
-        || value.len() > 128
+        || value.chars().count() > 128
         || value.chars().any(char::is_control)
     {
         return Err(malformed("manifest.display_name").at("/presentation/displayName"));
