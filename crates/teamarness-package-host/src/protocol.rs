@@ -1345,8 +1345,8 @@ fn empty_object() -> Value {
 mod tests {
     use super::{
         CONTROL_BYTES, CONTROL_QUEUE, CONTROL_RESERVE, DATA_BYTES, DATA_QUEUE, MAX_ID_BYTES,
-        StreamEnd, TERMINAL_ERROR_BYTES, TERMINAL_RESERVE_BYTES, UI_EVENT_CAPACITY,
-        package_owned_error, stream_end,
+        MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES, TERMINAL_RESERVE_BYTES,
+        UI_EVENT_BYTES, UI_EVENT_CAPACITY, package_owned_error, stream_end,
     };
     use crate::PackageErrorCode;
     use serde_json::{Value, json};
@@ -1373,6 +1373,10 @@ mod tests {
             assert!(TERMINAL_RESERVE_BYTES == MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES);
             assert!(CONTROL_BYTES + TERMINAL_RESERVE_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
             assert!(UI_EVENT_CAPACITY == INITIAL_STREAM_CREDIT);
+            // One UI event route holds every event the window admits, at the
+            // largest payload the UI contract allows. The classifier bounds the
+            // count, so a shallower budget would refuse an event it admitted.
+            assert!(UI_EVENT_BYTES >= INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES);
         }
     }
 
