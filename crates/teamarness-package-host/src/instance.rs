@@ -607,11 +607,17 @@ impl InstanceActor {
         // believing it had released credit the Package never received: the
         // window would stay shut, a conforming Package would stop sending, and
         // this path is the only producer of `credit` there is.
-        route
-            .acknowledge(through)
-            .await?
-            .commit(|amount| process.client.credit(&stream, amount))
-            .await
+        match route.acknowledge(through).await? {
+            Some(pending) => {
+                pending
+                    .commit(|amount| process.client.credit(&stream, amount))
+                    .await
+            }
+            // The ignore verdict: the route has already credited these events,
+            // so there is nothing to send and nothing to record. Crediting
+            // them again is the one thing the credit section makes fatal.
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn close_subscription(

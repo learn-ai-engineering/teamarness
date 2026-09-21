@@ -322,23 +322,41 @@ impl UiEventRoute {
     ///
     /// The guard holds the route's state for the length of the send, so one
     /// stream's acknowledgements reach the wire in the order they were counted.
+    /// That wait is unbounded from this method's side — the health probe, not
+    /// the writer, bounds it — which widens the window in which a second
+    /// acknowledgement for the same subscription takes the lock first.
+    ///
+    /// `None` is the ignore verdict: this acknowledgement names events the
+    /// route has already credited. Each acknowledgement is its own Tauri task
+    /// and the Shell does not await them, so two are routinely in flight and
+    /// the earlier one can arrive behind the later. The contract calls that
+    /// ordinary in-flight traffic — credit for events already accepted is not a
+    /// violation — and the verdict table ignores a frame whose state the
+    /// receiver has moved past. It releases no credit, because crediting the
+    /// same events twice is what would carry the stream past its window.
+    ///
+    /// Fatality stays where the contract puts it: an acknowledgement for events
+    /// this route never delivered names state that never existed, and one
+    /// reaching past the window is a budget violation.
     pub(crate) async fn acknowledge(
         &self,
         through: u64,
-    ) -> Result<PendingAcknowledgement<'_>, WireFailure> {
+    ) -> Result<Option<PendingAcknowledgement<'_>>, WireFailure> {
         let state = self.state.lock().await;
-        if through <= state.highest_acknowledged
-            || through > state.highest_delivered
+        if through > state.highest_delivered
             || through.saturating_sub(state.highest_acknowledged) > UI_EVENT_CAPACITY as u64
         {
             return Err(WireFailure::new(PackageErrorCode::ProtocolViolation));
         }
+        if through <= state.highest_acknowledged {
+            return Ok(None);
+        }
         let amount = through - state.highest_acknowledged;
-        Ok(PendingAcknowledgement {
+        Ok(Some(PendingAcknowledgement {
             state,
             through,
             amount,
-        })
+        }))
     }
 
     fn terminate(&self, end: StreamEnd) {
@@ -1528,6 +1546,7 @@ mod tests {
         let refused = route
             .acknowledge(2)
             .await
+            .expect("acknowledge to be servable")
             .expect("two events to credit")
             .commit(|amount| {
                 assert_eq!(amount, 2);
@@ -1540,6 +1559,7 @@ mod tests {
         route
             .acknowledge(2)
             .await
+            .expect("acknowledge to be servable")
             .expect("the same two events are still owed credit")
             .commit(|amount| {
                 credited = Some(amount);
@@ -1549,8 +1569,9 @@ mod tests {
             .expect("the second attempt is queued");
         assert_eq!(credited, Some(2));
         assert!(
-            route.acknowledge(2).await.is_err(),
-            "a committed acknowledgement is not owed twice"
+            matches!(route.acknowledge(2).await, Ok(None)),
+            "a committed acknowledgement is not owed twice: the repeat takes \
+             the ignore verdict (CF-002), releasing no credit"
         );
     }
 

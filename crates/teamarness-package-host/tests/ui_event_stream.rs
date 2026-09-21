@@ -132,7 +132,28 @@ async fn thirty_two_credit_window_replenishes_only_the_acknowledged_delta() {
     .unwrap();
     assert_eq!(sequence(events.changed().await.unwrap()), "33");
 
-    for through in [1, 0, 34, 65] {
+    // Repeats are the ignore verdict, not violations: the acknowledgement
+    // names events the route has already credited, so it releases nothing
+    // and answers `UiEventsAcknowledged` (CF-002). Still unservable are an
+    // acknowledgement past what was delivered (34) and one that reaches
+    // past the window (65).
+    for through in [1, 0] {
+        let answer = host
+            .execute(PackageHostCommand::AcknowledgeUiEvents(
+                AcknowledgeUiEvents {
+                    mount: mount.clone(),
+                    subscription: UiSubscriptionId::new("saturation").unwrap(),
+                    through_sequence: through,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, PackageHostOutcome::UiEventsAcknowledged),
+            "{through}"
+        );
+    }
+    for through in [34, 65] {
         let error = host
             .execute(PackageHostCommand::AcknowledgeUiEvents(
                 AcknowledgeUiEvents {
@@ -145,6 +166,82 @@ async fn thirty_two_credit_window_replenishes_only_the_acknowledged_delta() {
             .unwrap_err();
         assert_eq!(error.code, PackageErrorCode::ProtocolViolation, "{through}");
     }
+}
+
+/// CF-002: an acknowledgement the route has already recorded is ignored.
+///
+/// The Shell fires each acknowledgement without awaiting it, and each one is
+/// its own Tauri task, so two for the same subscription are routinely in
+/// flight together and the later one can take the route's lock first. The
+/// earlier one then names events the route has already credited. The contract
+/// calls that ordinary in-flight traffic rather than a violation — "credit
+/// released for events already accepted ... are not protocol violations" — and
+/// the verdict table ignores a frame whose state the receiver has moved past.
+///
+/// Ignoring it must release no credit: a no-op that credited again would carry
+/// the stream past the window the contract grants, which is the one thing the
+/// credit section does make fatal.
+#[tokio::test]
+async fn an_acknowledgement_the_route_has_already_recorded_releases_no_credit() {
+    let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let generation = host.snapshot().await.instances[0].process_generation;
+    let mount = mount(&host, 0).await;
+    let subscription = UiSubscriptionId::new("saturation").unwrap();
+    let mut events = open(&host, &mount, "saturation", "fixture.saturation").await;
+    let acknowledge = async |through: u64| {
+        host.execute(PackageHostCommand::AcknowledgeUiEvents(
+            AcknowledgeUiEvents {
+                mount: mount.clone(),
+                subscription: subscription.clone(),
+                through_sequence: through,
+            },
+        ))
+        .await
+    };
+
+    for expected in 1..=32 {
+        assert_eq!(
+            sequence(events.changed().await.unwrap()),
+            expected.to_string()
+        );
+    }
+    acknowledge(2).await.unwrap();
+    assert_eq!(sequence(events.changed().await.unwrap()), "33");
+    assert_eq!(sequence(events.changed().await.unwrap()), "34");
+
+    // The acknowledgement for event 1, which lost the race to the one for
+    // event 2 and arrives behind it.
+    assert!(matches!(
+        acknowledge(1).await.unwrap(),
+        PackageHostOutcome::UiEventsAcknowledged
+    ));
+    // Acknowledging nothing at all is the same answer.
+    assert!(matches!(
+        acknowledge(0).await.unwrap(),
+        PackageHostOutcome::UiEventsAcknowledged
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), events.changed())
+            .await
+            .is_err(),
+        "an already-recorded acknowledgement released credit a second time"
+    );
+
+    // The window is exactly where the recorded acknowledgement left it.
+    acknowledge(3).await.unwrap();
+    assert_eq!(sequence(events.changed().await.unwrap()), "35");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), events.changed())
+            .await
+            .is_err()
+    );
+
+    let after = host.snapshot().await.instances[0].clone();
+    assert_eq!(after.lifecycle, LifecycleState::Active);
+    assert_eq!(after.process_generation, generation);
 }
 
 #[tokio::test]
