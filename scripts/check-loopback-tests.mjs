@@ -21,8 +21,8 @@ export const repositoryRoot = resolve(dirname(scriptPath), "..");
 //
 //  - **Reachability.** No test that the required checks run may reach
 //    production addressing. `Addressing::ProductionRelay` is the system
-//    harness's name for it, and a test reaches it directly or through a helper
-//    in the same file. This is the guard that matters: a substring scan over
+//    harness's name for it, and a test reaches it directly or through helpers
+//    in any tracked file. This is the guard that matters: a substring scan over
 //    `CoreRuntime::open(` was evaded eleven of twelve ways, including by a
 //    `#[tokio::test]` with no `#[ignore]` that bound production relays through
 //    the one helper the marker exempts.
@@ -157,9 +157,14 @@ const TEST_ATTRIBUTE = /^#\[(?:tokio::)?test\b/;
  *
  * `sources` is `[file, text]` pairs, because the seam and the tests that reach
  * it live in different files — which is exactly why reading the seam's own
- * `#[ignore]` attribute said nothing. The corpus is the files that name
- * `Addressing` or carry the seam marker: the addressing choice is spelled
- * where it is made, and a wider corpus only collides function names.
+ * `#[ignore]` attribute said nothing. The seeds only ever grow where the
+ * production choice is spelled, but the caller walk runs over every tracked
+ * `.rs` file: a test reaches the seam through helpers of its own, and the file
+ * holding such a test names no addressing at all — that gap was an executed
+ * evasion. A wider walk can collide two unrelated functions of the same name,
+ * which over-taints and reports a caller the walk need not have reached; that
+ * is the safe direction for a guard whose failures otherwise end in a test
+ * run that leaves this machine.
  */
 export function findProductionReachability(sources) {
   const functions = [];
@@ -244,9 +249,11 @@ export async function checkLoopbackTests(root = repositoryRoot) {
   const sources = [];
   for (const file of await trackedFiles(root)) {
     const text = await readFile(join(root, file), "utf8");
-    if (/\bAddressing\b/.test(text) || text.includes(PRODUCTION_MARKER)) {
-      sources.push([file, text]);
-    }
+    // Every tracked file feeds the reachability walk, not only the files
+    // that spell addressing: a test that reaches the seam through a helper
+    // can live in a file that never names `Addressing`, and only the seed
+    // — the production choice itself — needs the spelling.
+    sources.push([file, text]);
     problems.push(...findProductionBindings(file, text));
   }
   problems.push(...findProductionReachability(sources));

@@ -1,4 +1,9 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { test } from "node:test";
 
 import {
@@ -8,6 +13,8 @@ import {
   isCompileFailFixture,
   repositoryRoot,
 } from "./check-loopback-tests.mjs";
+
+const execFileAsync = promisify(execFile);
 
 test("every test Installation in the repository binds loopback addressing", async () => {
   assert.deepEqual(await checkLoopbackTests(repositoryRoot), []);
@@ -187,4 +194,48 @@ async fn the_hermetic_twin() {
 }
 `;
   assert.deepEqual(findProductionReachability([["tests/system/tests/a.rs", scenario]]), []);
+});
+
+// The composed guard, exercised the way the repository runs it: from `git
+// ls-files` over a real tree. The one problem the fixture holds is one only
+// the reachability walk can find — a non-ignored `#[tokio::test]` in a file
+// that never spells addressing, calling a tainted helper declared in a file
+// that does — so the test fails if the walk loses any file it needs: the
+// corpus filter that hid the scenario's file, or the wiring that feeds the
+// walk its sources at all. Both were executed evasions.
+test("the composed check finds a reach whose caller names no addressing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "loopback-guard-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  const harness = `pub async fn open_core(addressing: Addressing, path: &Path) {
+    match addressing {
+        // production-addressing: the one seam that binds public relays.
+        Addressing::ProductionRelay => CoreRuntime::open(config).await,
+        Addressing::Loopback => CoreRuntime::open_loopback_for_tests(config).await,
+    }
+}
+
+pub async fn production_matrix(path: &Path) {
+    let core = open_core(Addressing::ProductionRelay, path).await;
+}
+`;
+  // No `Addressing` spelling anywhere in this file: under the corpus filter
+  // that once selected the reachability inputs, nothing here was ever read.
+  const scenario = `#[tokio::test]
+async fn a_relay_scenario() {
+    let core = production_matrix(&path).await;
+}
+`;
+  for (const [file, text] of [
+    ["tests/system/tests/support/harness.rs", harness],
+    ["tests/system/tests/a.rs", scenario],
+  ]) {
+    const target = join(root, file);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, text);
+  }
+  await execFileAsync("git", ["add", "."], { cwd: root });
+
+  const problems = await checkLoopbackTests(root);
+  assert.equal(problems.length, 1, JSON.stringify(problems, null, 2));
+  assert.match(problems[0], /a_relay_scenario/);
 });
