@@ -60,9 +60,15 @@ impl std::fmt::Debug for Network {
 /// hermetic only because the one loopback caller happened to pass `Disabled`
 /// next to it, which is a convention in a sibling module rather than an
 /// invariant of this one. Loopback now means relay-free by construction,
-/// whatever the caller asked for, and
+/// whatever the caller asked for.
+///
+/// Two tests hold it, and only the second holds `bind`.
 /// `loopback_is_relay_free_whatever_the_caller_asks_for` reads the relay set
-/// this produces rather than the argument a call site passed.
+/// this function produces rather than the argument a call site passed, which
+/// leaves the call inside `bind` unguarded: reverting that one line to
+/// `.relay_mode(relay_mode)` keeps this function correct and unused.
+/// `a_loopback_bind_dials_no_relay_even_when_its_caller_asks_for_one` binds for
+/// real against a relay socket it owns and fails on exactly that revert.
 fn effective_relay_mode(relay_mode: RelayMode, loopback_only: bool) -> RelayMode {
     if loopback_only {
         RelayMode::Disabled
@@ -197,8 +203,23 @@ mod tests {
 
     use super::*;
 
+    /// How long a relay-carrying endpoint is given to dial its relay. Generous:
+    /// the control assertion only fails if nothing dials at all.
+    const RELAY_DIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    /// How much longer the loopback endpoint is watched after the control dial.
+    const RELAY_DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
     fn secret(seed: u8) -> SecretKey {
         SecretKey::from_bytes(&[seed; 32])
+    }
+
+    /// A loopback socket standing in for a relay server, and the relay map that
+    /// names it. Nothing answers it: a connection arriving is the whole signal.
+    async fn relay_listener() -> (tokio::net::TcpListener, iroh::RelayMap) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url: iroh_base::RelayUrl = format!("http://127.0.0.1:{port}/").parse().unwrap();
+        (listener, iroh::RelayMap::from_iter([url]))
     }
 
     /// A protocol this module knows nothing about, which is the point: the
@@ -292,6 +313,61 @@ mod tests {
                 .is_empty(),
             "a production bind still reaches the relays it asked for"
         );
+    }
+
+    /// The rule above, asserted of `Network::bind` rather than of its helper.
+    ///
+    /// `loopback_is_relay_free_whatever_the_caller_asks_for` asserts
+    /// `effective_relay_mode`, so reverting `bind` to `.relay_mode(relay_mode)`
+    /// leaves the helper correct, unused, and every test green — while a caller
+    /// that asks for relays puts a "loopback" endpoint on public relays. This
+    /// test watches the socket instead: a relay is a URL the endpoint dials, so
+    /// a listener standing in for one records whether the bind reached it.
+    ///
+    /// The control is what makes the silence mean something. It is the same
+    /// builder shape with a relay left configured, so it proves a relay-carrying
+    /// endpoint dials within the window this test waits, and the loopback bind's
+    /// silence is therefore a decision rather than a slow start. Both relays are
+    /// loopback sockets this test owns, so the test itself contacts nothing off
+    /// this machine.
+    #[tokio::test]
+    async fn a_loopback_bind_dials_no_relay_even_when_its_caller_asks_for_one() {
+        let (control_relay, control_map) = relay_listener().await;
+        let (loopback_relay, loopback_map) = relay_listener().await;
+
+        // The endpoint under test binds first, so it has had at least as long
+        // to dial as the control by the time the control is seen.
+        let network = Network::bind(secret(4), RelayMode::Custom(loopback_map), true, Vec::new())
+            .await
+            .unwrap();
+        let control = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(secret(5))
+            .alpns(Vec::new())
+            .relay_mode(RelayMode::Custom(control_map))
+            .clear_address_lookup()
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(RELAY_DIAL_WINDOW, control_relay.accept())
+                .await
+                .is_ok(),
+            "the control endpoint never dialled its relay, so this test cannot \
+             tell a hermetic bind from a slow one"
+        );
+        assert!(
+            tokio::time::timeout(RELAY_DIAL_GRACE, loopback_relay.accept())
+                .await
+                .is_err(),
+            "a loopback bind dialled the relay its caller asked for"
+        );
+
+        network.shutdown().await.unwrap();
+        control.close().await;
     }
 
     #[tokio::test]
