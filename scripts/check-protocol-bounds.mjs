@@ -49,16 +49,23 @@ export function findBareBounds(file, text) {
   return problems;
 }
 
-/** Reads one `pub const NAME: usize = <digits>;` out of a Rust source file. */
+/** Reads one `pub const NAME: usize = <digits or digit product>;` out of a Rust source file. */
 function rustConstant(text, name) {
-  const match = new RegExp(`const\\s+${name}\\s*:\\s*usize\\s*=\\s*([0-9_]+)\\s*;`).exec(text);
-  return match ? Number(match[1].replaceAll("_", "")) : null;
+  const match = new RegExp(`const\\s+${name}\\s*:\\s*usize\\s*=\\s*([0-9_]+(?:\\s*\\*\\s*[0-9_]+)*)\\s*;`).exec(text);
+  return match ? productOf(match[1]) : null;
 }
 
-/** Reads one `export const NAME = <digits>;` out of a TypeScript source file. */
+/** Reads one `export const NAME = <digits or digit product>;` out of a TypeScript source file. */
 function typeScriptConstant(text, name) {
-  const match = new RegExp(`export const ${name}\\s*=\\s*([0-9_]+)\\s*;`).exec(text);
-  return match ? Number(match[1].replaceAll("_", "")) : null;
+  const match = new RegExp(`export const ${name}\\s*=\\s*([0-9_]+(?:\\s*\\*\\s*[0-9_]+)*)\\s*;`).exec(text);
+  return match ? productOf(match[1]) : null;
+}
+
+/** Evaluates a digit expression — `4096`, `256 * 1024` — so a paired constant may be derived. */
+function productOf(expression) {
+  return expression
+    .split("*")
+    .reduce((total, term) => total * Number(term.replaceAll("_", "").trim()), 1);
 }
 
 /**
@@ -117,6 +124,34 @@ export async function checkSharedAcknowledgementGranularity(root = repositoryRoo
   return [];
 }
 
+/**
+ * The Shell refuses a payload larger than the contract admits before it
+ * reaches the Host, so one limit is published in two languages and neither
+ * may move alone: a Shell that admitted more would accept payloads the Host
+ * then refuses as a contract violation, and one that admitted less would
+ * refuse payloads the contract permits.
+ */
+export async function checkSharedPayloadBound(root = repositoryRoot) {
+  const contractPath = "crates/teamarness-package-contract/src/ui_contract.rs";
+  const shellPath = "apps/teamarness-desktop/src/package-frame/protocol.ts";
+  const contract = rustConstant(
+    await readFile(join(root, contractPath), "utf8"),
+    "MAX_UI_PAYLOAD_BYTES",
+  );
+  const shell = typeScriptConstant(
+    await readFile(join(root, shellPath), "utf8"),
+    "MAX_PAYLOAD_BYTES",
+  );
+  if (contract === null) return [`${contractPath} no longer declares MAX_UI_PAYLOAD_BYTES`];
+  if (shell === null) return [`${shellPath} no longer declares MAX_PAYLOAD_BYTES`];
+  if (contract !== shell) {
+    return [
+      `${shellPath} admits ${shell}-byte payloads while ${contractPath} permits ${contract}; the extra payloads are accepted by the Shell and refused by the Host as a contract violation`,
+    ];
+  }
+  return [];
+}
+
 async function trackedFiles(root) {
   const { stdout } = await execFileAsync("git", ["ls-files", "*.rs"], { cwd: root });
   return stdout
@@ -131,6 +166,7 @@ export async function checkProtocolBounds(root = repositoryRoot) {
   }
   problems.push(...(await checkSharedSubscriptionBound(root)));
   problems.push(...(await checkSharedAcknowledgementGranularity(root)));
+  problems.push(...(await checkSharedPayloadBound(root)));
   return problems;
 }
 

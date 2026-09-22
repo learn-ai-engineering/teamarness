@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   checkProtocolBounds,
   checkSharedAcknowledgementGranularity,
+  checkSharedPayloadBound,
   checkSharedSubscriptionBound,
   findBareBounds,
   repositoryRoot,
@@ -53,6 +54,47 @@ fn start() {
 
 test("the Shell and the Host publish one acknowledgement granularity", async () => {
   assert.deepEqual(await checkSharedAcknowledgementGranularity(repositoryRoot), []);
+});
+
+test("the Shell and the contract publish one payload bound", async () => {
+  assert.deepEqual(await checkSharedPayloadBound(repositoryRoot), []);
+});
+
+/** Builds a throwaway tree holding only the files the payload-bound check reads. */
+async function payloadBoundTree(contractSource, shellSource) {
+  const root = await mkdtemp(join(tmpdir(), "protocol-bounds-payload-"));
+  const contract = join(root, "crates/teamarness-package-contract/src");
+  const shell = join(root, "apps/teamarness-desktop/src/package-frame");
+  await mkdir(contract, { recursive: true });
+  await mkdir(shell, { recursive: true });
+  await writeFile(join(contract, "ui_contract.rs"), contractSource);
+  await writeFile(join(shell, "protocol.ts"), shellSource);
+  return root;
+}
+
+test("a payload bound that moves in one language alone fails, in either direction", async () => {
+  const shellGrew = await payloadBoundTree(
+    "pub const MAX_UI_PAYLOAD_BYTES: usize = 256 * 1024;\n",
+    "export const MAX_PAYLOAD_BYTES = 256 * 1024 * 2;\n",
+  );
+  assert.match(
+    (await checkSharedPayloadBound(shellGrew))[0],
+    /admits 524288-byte payloads while .* permits 262144/,
+  );
+  const shellShrank = await payloadBoundTree(
+    "pub const MAX_UI_PAYLOAD_BYTES: usize = 512 * 1024;\n",
+    "export const MAX_PAYLOAD_BYTES = 256 * 1024;\n",
+  );
+  assert.match(
+    (await checkSharedPayloadBound(shellShrank))[0],
+    /admits 262144-byte payloads while .* permits 524288/,
+  );
+});
+
+test("the payload-bound check fails loudly when its constant is gone", async () => {
+  const root = await payloadBoundTree("// nothing here\n", "// nothing here\n");
+  const problems = await checkSharedPayloadBound(root);
+  assert.match(problems[0], /no longer declares MAX_UI_PAYLOAD_BYTES/);
 });
 
 /**
