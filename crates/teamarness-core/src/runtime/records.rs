@@ -37,7 +37,7 @@ impl CoreRuntime {
             .is_some_and(|projection| projection.creator() == self.public_identity);
         let secret_key = state.secret_key.clone();
         let now = self.clock.now_unix_ms();
-        let (record, delivery_sequence) = crate::synchronization::append(
+        let (record, delivery_sequence) = match crate::synchronization::append(
             &mut state.connection,
             &secret_key,
             workspace_id,
@@ -47,7 +47,19 @@ impl CoreRuntime {
             standing,
             is_creator,
             now,
-        )?;
+        ) {
+            Err(crate::SynchronizationError::ContentKeyUnavailable) => {
+                if crate::synchronization::declare_member_key_demand(
+                    &state.connection,
+                    workspace_id,
+                    package_identity,
+                )? {
+                    self.sync_worker.wake();
+                }
+                return Err(crate::SynchronizationError::ContentKeyUnavailable);
+            }
+            other => other?,
+        };
         crate::synchronization::record_subscription::publish_commit(
             &state,
             workspace_id,
@@ -172,6 +184,17 @@ impl CoreRuntime {
                 records::publish_scope_exists(&state, workspace_id, package_identity);
                 self.sync_worker.wake();
             }
+        } else if state
+            .memberships
+            .get(&workspace_id)
+            .is_some_and(|projection| projection.contains_member(self.public_identity))
+            && crate::synchronization::declare_member_key_demand(
+                &state.connection,
+                workspace_id,
+                package_identity,
+            )?
+        {
+            self.sync_worker.wake();
         }
         let journal = records::journal_of(&state.connection, scope)?;
         let head = records::scope_head(&state, scope);

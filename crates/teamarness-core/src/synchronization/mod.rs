@@ -927,6 +927,26 @@ pub(crate) fn declare_creator_scope(
     Ok(created)
 }
 
+/// A key-less current Member declares one persistent scope demand. Callers own
+/// the membership gate; only a new row needs to wake the scheduler.
+pub(crate) fn declare_member_key_demand(
+    conn: &rusqlite::Connection,
+    workspace: WorkspaceId,
+    package: &str,
+) -> Result<bool, SynchronizationError> {
+    let scope = scope_digest(package, workspace);
+    let inserted = conn
+        .execute(
+            "INSERT INTO sync_scope_key_demands(scope_id, package_identity, workspace_id, demand_generation)
+             SELECT ?1, ?2, ?3, 1
+             WHERE NOT EXISTS (SELECT 1 FROM sync_scopes WHERE scope_id = ?1)
+             ON CONFLICT DO NOTHING",
+            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice()],
+        )
+        .map_err(fault!(storage_error()))?;
+    Ok(inserted != 0)
+}
+
 pub(crate) fn export_protection_grant(
     conn: &mut rusqlite::Connection,
     secret: &SecretKey,

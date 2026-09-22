@@ -94,7 +94,17 @@ pub(super) fn after_membership_accepted(
     CoreRuntime::publish_transition(state, transition.clone());
     let workspace = transition.workspace_id();
     match transition.change() {
-        MembershipChange::Revoked { member } => state.peer_sessions.cancel(member),
+        MembershipChange::Revoked { member } => {
+            state.peer_sessions.cancel(member);
+            if member.as_bytes() == state.secret_key.public().as_bytes()
+                && let Err(error) = state.connection.execute(
+                    "DELETE FROM sync_scope_key_demands WHERE workspace_id = ?1",
+                    [workspace.as_bytes().as_slice()],
+                )
+            {
+                eprintln!("pending scope demand cleanup after local revocation failed: {error}");
+            }
+        }
         MembershipChange::Admitted { member } => {
             if let Err(error) = promote_author(state, workspace, member) {
                 eprintln!("parked records for a newly admitted author were not applied: {error}");

@@ -255,7 +255,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     for column in [
         "scope_id",
         "log_id",
@@ -330,7 +330,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -468,7 +468,9 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE sync_peer_progress;
+            "DROP TABLE sync_scope_key_demand_peer_progress;
+             DROP TABLE sync_scope_key_demands;
+             DROP TABLE sync_peer_progress;
              DROP TABLE membership_peer_progress;
              DROP TABLE scope_validation;
              DROP TABLE quarantined_scopes;
@@ -541,6 +543,151 @@ async fn migration_0011_adds_progress_and_quarantine_tables() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[tokio::test]
+async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
+    let directory = private_data_directory("migration-key-demand");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Demand").unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    let workspace_bytes = hex_bytes(&workspace.id().to_string());
+    let insert = "INSERT INTO sync_scope_key_demands(scope_id, package_identity, workspace_id, demand_generation) VALUES (?1, ?2, ?3, ?4)";
+    let scope = [3_u8; 32];
+    connection
+        .execute(
+            insert,
+            params![scope.as_slice(), "teamarness.test", workspace_bytes, 1],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![[4_u8; 32].as_slice(), "teamarness.test", workspace_bytes, 1]
+            )
+            .is_err(),
+        "Package and Workspace uniquely determine demand"
+    );
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![scope.as_slice(), "other", workspace_bytes, 1]
+            )
+            .is_err(),
+        "scope digest is unique"
+    );
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![[5_u8; 31].as_slice(), "other", workspace_bytes, 1]
+            )
+            .is_err(),
+        "scope digest must be 32 bytes"
+    );
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![[5_u8; 32].as_slice(), "other", workspace_bytes, -1]
+            )
+            .is_err(),
+        "generation cannot be negative"
+    );
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![[5_u8; 32].as_slice(), "other", [8_u8; 16].as_slice(), 1]
+            )
+            .is_err(),
+        "Workspace must exist"
+    );
+    let progress = "INSERT INTO sync_scope_key_demand_peer_progress(scope_id, peer_public_identity, consumed_generation) VALUES (?1, ?2, ?3)";
+    connection
+        .execute(
+            progress,
+            params![scope.as_slice(), [7_u8; 32].as_slice(), 0],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                progress,
+                params![scope.as_slice(), [8_u8; 31].as_slice(), 0]
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                progress,
+                params![scope.as_slice(), [8_u8; 32].as_slice(), -1]
+            )
+            .is_err()
+    );
+    connection
+        .execute("DELETE FROM sync_scope_key_demands", [])
+        .unwrap();
+    let left: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sync_scope_key_demand_peer_progress",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "peer progress cascades when demand is cleared");
+    connection.execute_batch("DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
+    drop(connection);
+
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+    connection
+        .execute(
+            insert,
+            params![scope.as_slice(), "teamarness.test", workspace_bytes, 1],
+        )
+        .unwrap();
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn migration_0013_rejects_future_schema_versions() {
+    let directory = private_data_directory("migration-future-schema");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection.pragma_update(None, "user_version", 14).unwrap();
+    drop(connection);
+    assert!(matches!(
+        CoreRuntime::open_loopback_for_tests(config).await,
+        Err(teamarness_core::CoreError::Storage(
+            teamarness_core::StorageError::UnsupportedSchema
+        ))
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn hex_bytes(value: &str) -> Vec<u8> {
     (0..value.len() / 2)
         .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
@@ -581,7 +728,7 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();

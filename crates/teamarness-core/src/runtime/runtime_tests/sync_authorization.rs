@@ -402,6 +402,210 @@ async fn non_creator_holder_welcomes_a_new_member() {
     cluster.finish().await;
 }
 
+// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_key_demand_subscription_and_append_coalesce_across_restart() {
+    let mut cluster = SyncCluster::start("member-key-demand-restart", &["a", "b"]).await;
+    let workspace = cluster.node("a").create_workspace("Demand").unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster.stop("a").await;
+
+    let count = |cluster: &SyncCluster| {
+        let state = cluster.node("b").state.lock().unwrap();
+        let demands: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let scopes: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scopes WHERE workspace_id=?1",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (demands, scopes)
+    };
+    assert_eq!(
+        count(&cluster),
+        (0, 0),
+        "a Package that does not subscribe has no demand"
+    );
+    let _first = cluster
+        .node("b")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    let _second = cluster
+        .node("b")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .node("b")
+            .append_record(id, PACKAGE, "message.post", b"blocked")
+            .unwrap_err(),
+        crate::SynchronizationError::ContentKeyUnavailable
+    );
+    assert_eq!(
+        count(&cluster),
+        (1, 0),
+        "subscription and failed append share one key-less row"
+    );
+    cluster.stop("b").await;
+    cluster.restart("b").await;
+    assert_eq!(
+        count(&cluster),
+        (1, 0),
+        "demand survives a restart without creating a key"
+    );
+    cluster.finish().await;
+}
+
+// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_key_demand_append_fallback_does_not_depend_on_subscription() {
+    let mut cluster = SyncCluster::start("member-key-demand-fallback", &["a", "b", "x"]).await;
+    let workspace = cluster
+        .node("a")
+        .create_workspace("Append fallback")
+        .unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    cluster.stop("a").await;
+
+    // An unknown Installation can still open a waiting stream, but cannot
+    // create a demand. It cannot use an append as a back door either.
+    let _unknown = cluster
+        .node("x")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .node("x")
+            .append_record(id, PACKAGE, "message.post", b"no")
+            .unwrap_err(),
+        crate::SynchronizationError::NotCurrentMember
+    );
+    {
+        let unknown_state = cluster.node("x").state.lock().unwrap();
+        let unknown: i64 = unknown_state
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_scope_key_demands", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(unknown, 0);
+    }
+
+    for _ in 0..2 {
+        assert_eq!(
+            cluster
+                .node("b")
+                .append_record(id, PACKAGE, "message.post", b"blocked")
+                .unwrap_err(),
+            crate::SynchronizationError::ContentKeyUnavailable
+        );
+    }
+    {
+        let state = cluster.node("b").state.lock().unwrap();
+        let demand: (i64, i64) = state.connection.query_row(
+            "SELECT COUNT(*), MIN(demand_generation) FROM sync_scope_key_demands WHERE workspace_id=?1 AND package_identity=?2",
+            rusqlite::params![id.as_bytes().as_slice(), PACKAGE],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let scopes: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            demand,
+            (1, 1),
+            "blocked appends share an initially due demand"
+        );
+        assert_eq!(
+            scopes, 0,
+            "a Member does not mint a key or a placeholder scope"
+        );
+    }
+    cluster.finish().await;
+}
+
+// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_key_demand_local_revocation_clears_pending_and_prevents_recreation() {
+    let cluster = SyncCluster::start("member-key-demand-revoke", &["a", "b"]).await;
+    let workspace = cluster
+        .node("a")
+        .create_workspace("Demand revocation")
+        .unwrap();
+    let id = workspace.id();
+    cluster.admit("a", "b", id).await;
+    let _subscription = cluster
+        .node("b")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    let count = || {
+        let state = cluster.node("b").state.lock().unwrap();
+        state
+            .connection
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count(), 1);
+    {
+        let state = cluster.node("b").state.lock().unwrap();
+        let scope = crate::synchronization::scope_digest(PACKAGE, id);
+        state.connection.execute(
+            "INSERT INTO sync_scope_key_demand_peer_progress(scope_id,peer_public_identity,consumed_generation) VALUES(?1,?2,0)",
+            rusqlite::params![scope.as_slice(), cluster.identity("a").as_bytes().as_slice()],
+        ).unwrap();
+    }
+    cluster
+        .node("a")
+        .revoke_member(id, cluster.identity("b"))
+        .unwrap();
+    cluster.replicate_membership("b", "a", id).await;
+    assert_eq!(count(), 0, "accepted local revocation removes demand");
+    {
+        let state = cluster.node("b").state.lock().unwrap();
+        let progress: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scope_key_demand_peer_progress",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(progress, 0, "revocation cascades peer progress");
+    }
+    let _waiting = cluster
+        .node("b")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .node("b")
+            .append_record(id, PACKAGE, "message.post", b"blocked")
+            .unwrap_err(),
+        crate::SynchronizationError::RevokedMember
+    );
+    assert_eq!(
+        count(),
+        0,
+        "revoked subscription and append cannot recreate demand"
+    );
+    cluster.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_without_key_gets_content_key_unavailable() {
     let mut cluster = SyncCluster::start("no-key-yet", &["a", "b"]).await;
