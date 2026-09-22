@@ -1,0 +1,36 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "stream_open",
+        "id": "h:zero-credit",
+        "topic": "ui.events",
+        "mountId": "bW91bnQx",
+        "initialCredit": 32,
+        "payload": {}
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "stream_close",
+        "streamId": "h:zero-credit",
+        "code": "completed"
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "credit",
+        "streamId": "h:zero-credit",
+        "amount": 0
+      }
+    }
+  ],
+  "expectedError": "credit_violation",
+  "description": "credit of zero is out of contract wherever the stream stands, so the range is read before the tombstone"
+}

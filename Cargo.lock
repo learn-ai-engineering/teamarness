@@ -7542,10 +7542,8 @@ dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
  "rusqlite",
+ "serde",
  "serde_json",
- "sha2 0.11.0",
- "teamarness-core",
- "teamarness-package-host",
  "teamarness-package-protocol",
  "teamarness-package-sdk",
  "tempfile",
@@ -7556,11 +7554,16 @@ dependencies = [
 name = "teamarness-core"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek 5.0.0",
  "futures-util",
  "getrandom 0.4.3",
+ "hpke-rs",
+ "hpke-rs-crypto",
+ "hpke-rs-rust-crypto",
  "iroh",
  "iroh-base",
  "iroh-tickets",
+ "nix",
  "p2panda-auth",
  "p2panda-core",
  "p2panda-encryption",
@@ -7570,7 +7573,10 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "teamarness-core",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -7589,6 +7595,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamarness-package-contract"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "mime",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "teamarness-package-protocol",
+ "tempfile",
+]
+
+[[package]]
 name = "teamarness-package-host"
 version = "0.1.0"
 dependencies = [
@@ -7604,6 +7624,7 @@ dependencies = [
  "sha2 0.11.0",
  "sysinfo",
  "teamarness-core",
+ "teamarness-package-contract",
  "teamarness-package-protocol",
  "tempfile",
  "tokio",
@@ -7622,7 +7643,12 @@ dependencies = [
 name = "teamarness-package-sdk"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "serde",
+ "serde_json",
  "teamarness-package-protocol",
+ "teamarness-package-sdk",
+ "tempfile",
  "tokio",
 ]
 
@@ -7643,7 +7669,6 @@ name = "teamarness-repo-aware-package"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "futures",
  "gix",
  "serde",
  "serde_json",
@@ -7652,6 +7677,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "teamarness-system-tests"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.0",
+ "teamarness-conversations-package",
+ "teamarness-core",
+ "teamarness-package-host",
+ "teamarness-package-protocol",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

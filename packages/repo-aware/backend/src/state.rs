@@ -7,7 +7,6 @@ use uuid::Uuid;
 use crate::error::{self, ErrorInfo};
 
 const STATE_FILE_NAME: &str = "repo-aware.v1.json";
-const TEMP_FILE_NAME: &str = "repo-aware.v1.json.tmp";
 const STATE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,14 +125,13 @@ impl StateStore {
     }
 }
 
+/// Replaces the registration document, leaving the previous one intact on any failure.
+///
+/// The SDK's helper flushes the bytes and the directory entry before the rename, so a crash never
+/// leaves a half-written document behind. Its temporary name is `repo-aware.v1.json.tmp`.
 fn write_state(directory: &Path, state: &StateDocument) -> Result<(), ErrorInfo> {
-    let temporary = directory.join(TEMP_FILE_NAME);
-    let destination = directory.join(STATE_FILE_NAME);
-    let bytes = serde_json::to_vec_pretty(state).map_err(|_| error::STORAGE_FAILED)?;
-    std::fs::write(&temporary, bytes).map_err(|_| error::STORAGE_FAILED)?;
-    if let Err(_write_error) = std::fs::rename(&temporary, &destination) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error::STORAGE_FAILED);
-    }
-    Ok(())
+    let mut bytes = serde_json::to_vec_pretty(state).map_err(|_| error::STORAGE_FAILED)?;
+    bytes.push(b'\n');
+    teamarness_package_sdk::storage::write_atomic(&directory.join(STATE_FILE_NAME), &bytes)
+        .map_err(|_| error::STORAGE_FAILED)
 }

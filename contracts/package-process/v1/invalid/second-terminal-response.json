@@ -10,7 +10,8 @@
         "mountId": "bW91bnQx",
         "deadlineUnixMs": "1",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -18,7 +19,8 @@
         "kind": "response",
         "id": "h:twice",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",

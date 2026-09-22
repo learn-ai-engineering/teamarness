@@ -10,7 +10,8 @@
         "mountId": "bW91bnQx",
         "initialCredit": 32,
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -19,7 +20,8 @@
         "streamId": "h:no-credit",
         "sequence": "1",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -28,7 +30,8 @@
         "streamId": "h:no-credit",
         "sequence": "2",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -37,7 +40,8 @@
         "streamId": "h:no-credit",
         "sequence": "3",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -46,7 +50,8 @@
         "streamId": "h:no-credit",
         "sequence": "4",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -55,7 +60,8 @@
         "streamId": "h:no-credit",
         "sequence": "5",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -64,7 +70,8 @@
         "streamId": "h:no-credit",
         "sequence": "6",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -73,7 +80,8 @@
         "streamId": "h:no-credit",
         "sequence": "7",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -82,7 +90,8 @@
         "streamId": "h:no-credit",
         "sequence": "8",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -91,7 +100,8 @@
         "streamId": "h:no-credit",
         "sequence": "9",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -100,7 +110,8 @@
         "streamId": "h:no-credit",
         "sequence": "10",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -109,7 +120,8 @@
         "streamId": "h:no-credit",
         "sequence": "11",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -118,7 +130,8 @@
         "streamId": "h:no-credit",
         "sequence": "12",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -127,7 +140,8 @@
         "streamId": "h:no-credit",
         "sequence": "13",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -136,7 +150,8 @@
         "streamId": "h:no-credit",
         "sequence": "14",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -145,7 +160,8 @@
         "streamId": "h:no-credit",
         "sequence": "15",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -154,7 +170,8 @@
         "streamId": "h:no-credit",
         "sequence": "16",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -163,7 +180,8 @@
         "streamId": "h:no-credit",
         "sequence": "17",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -172,7 +190,8 @@
         "streamId": "h:no-credit",
         "sequence": "18",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -181,7 +200,8 @@
         "streamId": "h:no-credit",
         "sequence": "19",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -190,7 +210,8 @@
         "streamId": "h:no-credit",
         "sequence": "20",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -199,7 +220,8 @@
         "streamId": "h:no-credit",
         "sequence": "21",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -208,7 +230,8 @@
         "streamId": "h:no-credit",
         "sequence": "22",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -217,7 +240,8 @@
         "streamId": "h:no-credit",
         "sequence": "23",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -226,7 +250,8 @@
         "streamId": "h:no-credit",
         "sequence": "24",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -235,7 +260,8 @@
         "streamId": "h:no-credit",
         "sequence": "25",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -244,7 +270,8 @@
         "streamId": "h:no-credit",
         "sequence": "26",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -253,7 +280,8 @@
         "streamId": "h:no-credit",
         "sequence": "27",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -262,7 +290,8 @@
         "streamId": "h:no-credit",
         "sequence": "28",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -271,7 +300,8 @@
         "streamId": "h:no-credit",
         "sequence": "29",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -280,7 +310,8 @@
         "streamId": "h:no-credit",
         "sequence": "30",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -289,7 +320,8 @@
         "streamId": "h:no-credit",
         "sequence": "31",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",
@@ -298,7 +330,8 @@
         "streamId": "h:no-credit",
         "sequence": "32",
         "payload": {}
-      }
+      },
+      "verdict": "deliver"
     },
     {
       "direction": "package",

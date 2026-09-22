@@ -11,6 +11,13 @@ impl ValueParseError {
     pub(crate) const fn new(value_name: &'static str) -> Self {
         Self { value_name }
     }
+
+    /// Names the value that failed to parse, so callers inside the crate can
+    /// distinguish one parse failure from another without matching strings in
+    /// the public `Display` text.
+    pub(crate) const fn value_name(&self) -> &'static str {
+        self.value_name
+    }
 }
 
 impl fmt::Display for ValueParseError {
@@ -21,33 +28,12 @@ impl fmt::Display for ValueParseError {
 
 impl Error for ValueParseError {}
 
-macro_rules! error_family {
-    ($name:ident, $summary:literal) => {
-        #[doc = $summary]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        #[non_exhaustive]
-        pub enum $name {
-            /// The operation is part of the public contract but is not available in this scaffold.
-            RuntimeUnavailable,
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("the core runtime is not available in the repository scaffold")
-            }
-        }
-
-        impl Error for $name {}
-    };
-}
-
-error_family!(ConfigurationError, "A runtime configuration error.");
-
 /// A durable core storage or recovery error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StorageError {
-    /// The private data directory is not a directory.
+    /// The private data path is not a private Teamarness directory: it is a
+    /// symbolic link, belongs to another user, or holds unrelated files.
     InvalidDataDirectory,
     /// A filesystem operation failed.
     Io,
@@ -63,6 +49,8 @@ pub enum StorageError {
     CorruptIdentity,
     /// Durable workspace trust anchors or canonical genesis records disagree.
     CorruptWorkspace,
+    /// The core database holds retired version-1 protection controls; reset this data directory.
+    LegacyProtectionState,
     /// SQLite may have committed, so the active runtime cannot safely continue.
     UncertainOutcome,
     /// The active runtime is poisoned and must be reopened.
@@ -72,7 +60,9 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::InvalidDataDirectory => "the private data path is not a directory",
+            Self::InvalidDataDirectory => {
+                "the private data path is not a private Teamarness directory"
+            }
             Self::Io => "private storage filesystem operation failed",
             Self::Permission => "private storage permissions could not be restricted",
             Self::Database => "core database operation failed",
@@ -80,6 +70,9 @@ impl fmt::Display for StorageError {
             Self::UnsupportedSchema => "core database schema is newer than this runtime",
             Self::CorruptIdentity => "durable installation identity is corrupt",
             Self::CorruptWorkspace => "durable workspace trust anchor is corrupt",
+            Self::LegacyProtectionState => {
+                "the core database holds retired version-1 protection controls; reset this data directory"
+            }
             Self::UncertainOutcome => "database commit outcome is uncertain",
             Self::RuntimePoisoned => "the runtime must be reopened before another command",
         };
@@ -420,12 +413,32 @@ impl Error for SubscriptionError {
     }
 }
 
+/// An error returned while stopping the core runtime.
+///
+/// Local identity, Workspace, and membership commands stay available whether or
+/// not the shared transport stopped cleanly, so a caller that only wants a
+/// clean exit can ignore this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownError {
+    /// The shared Endpoint and Router did not stop cleanly.
+    Transport,
+}
+
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport => formatter.write_str("the shared transport did not stop cleanly"),
+        }
+    }
+}
+
+impl Error for ShutdownError {}
+
 /// An error returned while opening the core runtime.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CoreError {
-    /// Runtime configuration could not be accepted.
-    Configuration(ConfigurationError),
     /// Installation identity initialization failed.
     Identity(IdentityError),
     /// Durable storage initialization or recovery failed.
@@ -437,7 +450,6 @@ pub enum CoreError {
 impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Configuration(error) => error.fmt(formatter),
             Self::Identity(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Onboarding(error) => error.fmt(formatter),
@@ -454,7 +466,6 @@ impl From<StorageError> for CoreError {
 impl Error for CoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Configuration(error) => Some(error),
             Self::Identity(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Onboarding(error) => Some(error),

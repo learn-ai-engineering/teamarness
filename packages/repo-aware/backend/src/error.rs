@@ -47,13 +47,18 @@ pub const SNAPSHOT_INTERRUPTED: ErrorInfo = ErrorInfo {
     code: "repo_aware.snapshot_interrupted",
     retryable: true,
 };
-pub const INVALID_REQUEST: ErrorInfo = ErrorInfo {
-    code: "repo_aware.invalid_request",
+/// The path exists but this Installation cannot read it.
+pub const PATH_UNAVAILABLE: ErrorInfo = ErrorInfo {
+    code: "repo_aware.path_unavailable",
     retryable: false,
 };
 
 impl From<ErrorInfo> for teamarness_package_sdk::BackendError {
     fn from(info: ErrorInfo) -> Self {
-        Self::new(info.code, info.retryable, teamarness_package_protocol::JsonValue::Object(Default::default()))
+        Self::new(
+            info.code,
+            info.retryable,
+            teamarness_package_protocol::JsonValue::Object(Default::default()),
+        )
     }
 }

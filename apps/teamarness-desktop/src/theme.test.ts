@@ -102,6 +102,24 @@ describe("Installation theme preference", () => {
     expect(failingRoot.theme()).toBe("system");
   });
 
+  it("notifies subscribers after a preference change and stops after unsubscribe", () => {
+    const root = new TestRoot();
+    const stored = storageWith(null);
+    const controller = createInstallationThemeController({ root, storage: stored.storage });
+    const seen: ThemePreference[] = [];
+    const stop = controller.subscribe((preference) => seen.push(preference));
+
+    controller.selectPreference("dark");
+    controller.selectPreference("light");
+    expect(seen).toEqual(["dark", "light"]);
+    expect(root.theme()).toBe("light");
+
+    stop();
+    stop();
+    controller.selectPreference("system");
+    expect(seen).toEqual(["dark", "light"]);
+  });
+
   it("contains a write failure and resolves the selection to System", () => {
     const root = new TestRoot();
     const storage: ThemeStorage = {

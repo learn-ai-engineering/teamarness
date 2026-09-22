@@ -4,6 +4,10 @@ import { pathToFileURL } from "node:url";
 
 export const MAX_FRAME_BYTES = 1_048_576;
 export const MAX_DECODED_FRAME_BYTES = 1_048_576;
+export const MAX_IN_FLIGHT_EACH_DIRECTION = 32;
+export const MAX_WRITER_FRAMES = 64;
+export const MAX_WRITER_BYTES = 8_388_608;
+export const INITIAL_STREAM_CREDIT = 32;
 const immutableCapability = `teamarness.synchro${"nization"}.immutable-record-log`;
 const KNOWN_KINDS = new Set([
   "initialize", "initialized", "request", "response", "error", "cancel", "stream_open",
@@ -106,52 +110,154 @@ export function encodeFrame(frame) {
   return Buffer.concat([prefix, payload]);
 }
 
+/** Tombstone entries kept per originating direction, bounded by two contract windows. */
+export const TOMBSTONE_CAPACITY = 2 * MAX_IN_FLIGHT_EACH_DIRECTION;
+
+/** The frame is in contract and names live state. */
+export const DELIVER = "deliver";
+/** The frame is in contract but names state this side has already retired. */
+export const IGNORE = "ignore";
+
+/** A bounded FIFO set of IDs, one queue per originating namespace. */
+class Tombstones {
+  #queues = { "h:": [], "p:": [] };
+  #sets = { "h:": new Set(), "p:": new Set() };
+
+  #side(id) {
+    return id.startsWith("h:") ? "h:" : "p:";
+  }
+
+  add(id) {
+    const side = this.#side(id);
+    if (this.#sets[side].has(id)) return;
+    this.#sets[side].add(id);
+    this.#queues[side].push(id);
+    while (this.#queues[side].length > TOMBSTONE_CAPACITY) {
+      this.#sets[side].delete(this.#queues[side].shift());
+    }
+  }
+
+  has(id) {
+    return this.#sets[this.#side(id)].has(id);
+  }
+
+  delete(id) {
+    const side = this.#side(id);
+    if (!this.#sets[side].delete(id)) return false;
+    this.#queues[side] = this.#queues[side].filter((value) => value !== id);
+    return true;
+  }
+}
+
+/**
+ * The one classifier both peers run over every frame, in both directions.
+ *
+ * `observe` returns `DELIVER` for a frame that names live state and `IGNORE`
+ * for one a conforming peer sent before it could see this side retire the
+ * state it names. Everything else throws and is fatal to the generation.
+ */
 export class ContractState {
   #pending = new Map();
-  #terminal = new Set();
+  #answered = new Tombstones();
+  #abandoned = new Tombstones();
+  #closedStreams = new Tombstones();
   #streams = new Map();
+
+  /** Retires a request this side has stopped waiting for. */
+  retireRequest(id) {
+    if (this.#answered.has(id)) return;
+    this.#pending.delete(id);
+    this.#abandoned.add(id);
+  }
+
+  /** Retires a stream this side has stopped serving. */
+  retireStream(id) {
+    const stream = this.#streams.get(id);
+    if (stream) stream.retired = true;
+  }
 
   observe(direction, frame) {
     validateDirection(direction, frame);
-    if (frame.kind === "initialize" && frame.protocol?.major !== 1) {
+    if ((frame.kind === "initialize" || frame.kind === "initialized") && frame.protocol?.major !== 1) {
       throw new ProtocolFailure("incompatible_version");
     }
     if (frame.kind === "request") {
-      if (this.#pending.has(frame.id) || this.#terminal.has(frame.id)) {
+      if (this.#pending.has(frame.id) || this.#answered.has(frame.id) || this.#abandoned.has(frame.id)) {
         throw new ProtocolFailure("duplicate_id");
       }
+      let inFlight = 0;
+      for (const pendingDirection of this.#pending.values()) {
+        if (pendingDirection === direction) inFlight += 1;
+      }
+      if (inFlight >= MAX_IN_FLIGHT_EACH_DIRECTION) throw new ProtocolFailure("overloaded");
       this.#pending.set(frame.id, direction);
     } else if (frame.kind === "response" || frame.kind === "error") {
-      if (this.#terminal.has(frame.id)) throw new ProtocolFailure("second_terminal_response");
+      if (this.#answered.has(frame.id)) throw new ProtocolFailure("second_terminal_response");
+      // A late first terminal for a cancelled or timed-out ID is ignored
+      // without accepting a second one.
+      if (this.#abandoned.delete(frame.id)) {
+        this.#answered.add(frame.id);
+        return IGNORE;
+      }
       const requestDirection = this.#pending.get(frame.id);
       if (!requestDirection || requestDirection === direction) {
         throw new ProtocolFailure("unknown_response");
       }
       this.#pending.delete(frame.id);
-      this.#terminal.add(frame.id);
+      this.#answered.add(frame.id);
     } else if (frame.kind === "cancel") {
+      if (this.#answered.has(frame.targetId) || this.#abandoned.has(frame.targetId)) return IGNORE;
       const requestDirection = this.#pending.get(frame.targetId);
       if (!requestDirection || requestDirection !== direction) {
         throw new ProtocolFailure("unknown_request");
       }
+      this.#pending.delete(frame.targetId);
+      this.#abandoned.add(frame.targetId);
     } else if (frame.kind === "stream_open") {
-      if (this.#streams.has(frame.id)) throw new ProtocolFailure("duplicate_id");
-      this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n });
+      if (this.#streams.has(frame.id) || this.#closedStreams.has(frame.id)) {
+        throw new ProtocolFailure("duplicate_id");
+      }
+      if (frame.initialCredit !== INITIAL_STREAM_CREDIT) throw new ProtocolFailure("credit_violation");
+      this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n, retired: false });
     } else if (frame.kind === "event") {
+      if (this.#closedStreams.has(frame.streamId)) return IGNORE;
       const stream = this.#streams.get(frame.streamId);
       if (!stream || stream.sender !== direction) throw new ProtocolFailure("unknown_stream");
+      if (stream.retired) return IGNORE;
       if (stream.credit === 0) throw new ProtocolFailure("credit_violation");
       const sequence = decimal(frame.sequence);
       if (sequence !== stream.sequence + 1n) throw new ProtocolFailure("event_sequence");
       stream.credit -= 1;
       stream.sequence = sequence;
     } else if (frame.kind === "credit") {
+      // The per-frame range is out of contract wherever the stream stands, so
+      // it is read before the tombstone: "credit outside `1..=32` is fatal".
+      if (frame.amount < 1 || frame.amount > INITIAL_STREAM_CREDIT) {
+        throw new ProtocolFailure("credit_violation");
+      }
+      // Credit released for events the receiver had already accepted is
+      // ordinary in-flight traffic, even when the stream has since closed.
+      if (this.#closedStreams.has(frame.streamId)) return IGNORE;
       const stream = this.#streams.get(frame.streamId);
       if (!stream || stream.sender === direction) throw new ProtocolFailure("unknown_stream");
+      if (stream.retired) return IGNORE;
+      // The window is a ceiling, not a starting balance: credit pays for
+      // events the receiving adapter has already accepted, so a grant past the
+      // window the stream was opened with pays for work that never happened.
+      if (stream.credit + frame.amount > INITIAL_STREAM_CREDIT) {
+        throw new ProtocolFailure("credit_violation");
+      }
       stream.credit += frame.amount;
     } else if (frame.kind === "stream_close") {
-      if (!this.#streams.delete(frame.streamId)) throw new ProtocolFailure("unknown_stream");
+      if (this.#streams.delete(frame.streamId)) {
+        this.#closedStreams.add(frame.streamId);
+      } else if (this.#closedStreams.has(frame.streamId)) {
+        return IGNORE;
+      } else {
+        throw new ProtocolFailure("unknown_stream");
+      }
     }
+    return DELIVER;
   }
 }
 
@@ -162,11 +268,21 @@ function validateDirection(direction, frame) {
   }
 }
 
+/** The largest value a decimal string may carry: both peers parse into 64 bits. */
+const MAX_DECIMAL = 2n ** 64n - 1n;
+
 function decimal(value) {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
     throw new ProtocolFailure("invalid_decimal");
   }
-  return BigInt(value);
+  const parsed = BigInt(value);
+  // A decimal string above the 64-bit range is not a number either peer can
+  // carry, and the Rust adapter, which parses into `u64`, calls that
+  // `invalid_decimal`. An unbounded BigInt survived to the sequence
+  // comparison instead and was reported as `event_sequence`, so the two
+  // implementations gave the same frame two different stable codes.
+  if (parsed > MAX_DECIMAL) throw new ProtocolFailure("invalid_decimal");
+  return parsed;
 }
 
 function rejectDuplicateKeys(text) {
@@ -233,8 +349,18 @@ async function serve() {
   const pendingCapabilityCalls = new Map();
   const membershipEvents = [];
   let membershipStream;
+  // Events consumed on the current membership stream that credit has already
+  // been released for. The contract lets a sender release credit only for work
+  // the receiving adapter has accepted, so this is the ceiling on what
+  // `fixture.membership_credit` may put on the wire.
+  let membershipCredited = 0;
   const immutableEvents = [];
+  /** Events recorded before the open immutable stream, which it never credits. */
+  let immutableCreditBase = 0;
+  /** Events of the open immutable stream this fixture has already credited. */
+  let immutableCredited = 0;
   let immutableStream;
+  let immutableCloseCode = null;
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -266,7 +392,7 @@ async function serve() {
       } else if ((frame.kind === "response" || frame.kind === "error") && pendingCapabilityCalls.has(frame.id)) {
         const requestId = pendingCapabilityCalls.get(frame.id);
         pendingCapabilityCalls.delete(frame.id);
-        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code } });
+        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code, retryable: frame.retryable ?? false, outcomeUncertain: frame.outcomeUncertain ?? false } });
       } else if (frame.kind === "event" && frame.streamId === membershipStream) {
         membershipEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === immutableStream) {
@@ -274,11 +400,24 @@ async function serve() {
       } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
         membershipStream = undefined;
       } else if (frame.kind === "stream_close" && frame.streamId === immutableStream) {
+        immutableCloseCode = frame.code ?? null;
         immutableStream = undefined;
       } else if (frame.kind === "stream_open") {
         uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
         if (frame.topic === "fixture.close") {
           send({ kind: "stream_close", streamId: frame.id, code: "closed" });
+          uiStreams.delete(frame.id);
+        } else if (frame.topic === "fixture.rejected_stream") {
+          send({ kind: "stream_close", streamId: frame.id, code: "fixture.stream_rejected" });
+          uiStreams.delete(frame.id);
+        } else if (frame.topic === "fixture.complete") {
+          // Events, then an ordinary completion: the subscriber's
+          // acknowledgement for the last event is still in flight when the
+          // stream ends.
+          for (let sequence = 1; sequence <= 2; sequence += 1) {
+            send({ kind: "event", streamId: frame.id, sequence: String(sequence), payload: { order: sequence } });
+          }
+          send({ kind: "stream_close", streamId: frame.id, code: "completed" });
           uiStreams.delete(frame.id);
         } else if (frame.topic === "fixture.invalid_event") {
           send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: "invalid" } });
@@ -310,6 +449,9 @@ async function serve() {
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_open") {
         capabilitySequence += 1;
         membershipStream = `p:membership-${capabilitySequence}`;
+        // A new stream carries a fresh window: only events this stream
+        // delivers can be credited back to it.
+        membershipCredited = membershipEvents.length;
         send({
           kind: "stream_open",
           id: membershipStream,
@@ -323,8 +465,16 @@ async function serve() {
         });
         send({ kind: "response", id: frame.id, payload: { streamId: membershipStream } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_credit") {
-        send({ kind: "credit", streamId: membershipStream, amount: frame.payload.amount });
-        send({ kind: "response", id: frame.id, payload: { credited: true } });
+        // What crosses the wire is what this stream has consumed and not yet
+        // credited, never what the request asked for: credit released for
+        // events that were never accepted would widen the window past the 32
+        // the stream was opened with.
+        const amount = Math.min(frame.payload.amount, membershipEvents.length - membershipCredited);
+        if (amount > 0) {
+          membershipCredited += amount;
+          send({ kind: "credit", streamId: membershipStream, amount });
+        }
+        send({ kind: "response", id: frame.id, payload: { credited: amount } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_close") {
         if (membershipStream) send({ kind: "stream_close", streamId: membershipStream, code: "closed" });
         membershipStream = undefined;
@@ -354,6 +504,8 @@ async function serve() {
       } else if (frame.kind === "request" && ["fixture.immutable_subscribe", "fixture.record_subscribe"].includes(frame.operation)) {
         capabilitySequence += 1;
         immutableStream = `p:immutable-${capabilitySequence}`;
+        immutableCreditBase = immutableEvents.length;
+        immutableCredited = 0;
         send({
           kind: "stream_open", id: immutableStream, topic: "capability.stream", initialCredit: 32,
           payload: {
@@ -363,10 +515,27 @@ async function serve() {
         });
         send({ kind: "response", id: frame.id, payload: { streamId: immutableStream } });
       } else if (frame.kind === "request" && ["fixture.immutable_events", "fixture.record_events"].includes(frame.operation)) {
-        send({ kind: "response", id: frame.id, payload: { events: immutableEvents } });
+        send({ kind: "response", id: frame.id, payload: { events: immutableEvents, closeCode: immutableCloseCode } });
       } else if (frame.kind === "request" && ["fixture.immutable_credit", "fixture.record_credit"].includes(frame.operation)) {
-        send({ kind: "credit", streamId: immutableStream, amount: frame.payload.amount });
-        send({ kind: "response", id: frame.id, payload: { credited: true } });
+        // `frames` returns the window one event at a time, the way a consumer
+        // that commits before crediting does; the default is a single frame.
+        //
+        // What crosses the wire is what this stream has consumed and not yet
+        // credited, never what the request asked for. The 32 events are a
+        // ceiling on the window, so a grant that would carry the stream past
+        // it is `credit_violation` and fatal to the generation — two frames of
+        // one is enough on an empty scope, which emits a single state event.
+        const frames = frame.payload.frames ?? 1;
+        let credited = 0;
+        for (let index = 0; index < frames; index += 1) {
+          const consumed = immutableEvents.length - immutableCreditBase - immutableCredited;
+          const amount = Math.min(frame.payload.amount, consumed);
+          if (amount <= 0) break;
+          immutableCredited += amount;
+          credited += amount;
+          send({ kind: "credit", streamId: immutableStream, amount });
+        }
+        send({ kind: "response", id: frame.id, payload: { credited } });
       } else if (frame.kind === "request" && ["fixture.immutable_close", "fixture.record_close"].includes(frame.operation)) {
         if (immutableStream) send({ kind: "stream_close", streamId: immutableStream, code: "closed" });
         immutableStream = undefined;
@@ -390,7 +559,7 @@ async function serve() {
       } else if (frame.kind === "request" && frame.operation === "fixture.invalid_response") {
         send({ kind: "response", id: frame.id, payload: { value: false } });
       } else if (frame.kind === "request" && frame.operation === "fixture.error") {
-        send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: {} });
+        send({ kind: "error", id: frame.id, code: "fixture.error", retryable: false, details: { field: "value" } });
       } else if (frame.kind === "request" && frame.operation === "fixture.abort") {
         await import("node:fs/promises").then((fs) => fs.appendFile("mutation-attempts", "1\n"));
         process.abort();

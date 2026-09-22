@@ -3,27 +3,104 @@
 //! The public API deliberately exposes only semantic values. P2Panda operation,
 //! reconciliation, encryption, storage, and transport types stay in this module.
 
-mod log_sync;
+pub(crate) mod client;
+mod content_key;
+pub(crate) mod exchange;
+pub(crate) mod frames;
+pub(crate) mod health;
+mod journal_sql;
+pub(crate) mod key_bridge;
+pub(crate) mod limits;
+pub(crate) mod log_view;
 pub(crate) mod network_handler;
 mod operation_store;
 pub(crate) mod p2panda_adapter;
+pub(crate) mod parking;
+pub(crate) mod peer_sessions;
 mod protection_control;
-mod scheduler;
-mod wakes;
-mod worker;
+pub(crate) mod quarantine;
+pub(crate) mod record_subscription;
+pub(crate) mod scheduler;
+#[cfg(test)]
+pub(crate) mod test_io;
+pub(crate) mod worker;
 
+pub(crate) use content_key::ContentKey;
+pub(crate) use health::{PeerOutcome, SyncHealthRegistry};
+#[cfg(test)]
 pub(crate) use operation_store::log_id as operation_log_id;
+pub(crate) use quarantine::RecoveryReport;
+pub use record_subscription::{
+    RecordAvailability, RecordPage, RecordSubscription, SyncAvailability, SyncWarning,
+};
 pub(crate) use worker::SyncWorker;
 
+pub(crate) use exchange::ExchangeReport;
 pub(crate) use network_handler::{
-    LogSyncHandler, PackageSyncHandler, SyncBatch, SyncReceiver, encode_batch,
+    FatalSyncError, LogSessionError, LogSyncHandler, OperationOutcome, ProtectionBundle,
+    RangeLoadError, Refusal, RejectReason, ReplicationEntry, SessionGrant, SessionSeed,
+    SyncReceiver, SyncRejection,
 };
 
-use std::collections::VecDeque;
+/// How many stored operation rows sessions have read, per scope.
+///
+/// A session that serves a peer which is already up to date must read none.
+/// The count is per scope because every test in this binary runs in one
+/// process: a single global counter measures every concurrent test's reads as
+/// well as the caller's, which is what made
+/// `session_does_not_load_the_whole_scope` flake. A scope digest is derived
+/// from a Package identity and a Workspace identity, and a test's Workspace is
+/// its own.
+#[cfg(test)]
+static RECORDS_LOADED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn note_record_loaded_for_test(scope: [u8; 32]) {
+    *RECORDS_LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(scope)
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn records_loaded_for_test(scope: [u8; 32]) -> usize {
+    RECORDS_LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&scope)
+        .copied()
+        .unwrap_or(0)
+}
+use crate::diag::fault;
+use crate::encoding::ByteReader;
+pub(crate) use peer_sessions::PeerSessions;
+
+/// The Core services one bound Network needs to serve and run synchronization
+/// sessions. Plan phase 3 Step 8 adds the membership replica to this bundle.
+#[derive(Clone)]
+pub(crate) struct SyncServices {
+    pub(crate) receiver: std::sync::Arc<dyn SyncReceiver>,
+    pub(crate) sessions: std::sync::Arc<PeerSessions>,
+    /// Where every session reports what it saw of its peer, so subscriptions
+    /// can say whether this Installation is reaching anyone.
+    pub(crate) health: std::sync::Arc<SyncHealthRegistry>,
+    /// Every bound one session obeys. Tests inject small values here, the same
+    /// way they inject parking limits.
+    pub(crate) limits: limits::SessionLimits,
+}
+
+impl fmt::Debug for SyncServices {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncServices")
+            .finish_non_exhaustive()
+    }
+}
+
 use std::fmt;
 use std::str::FromStr;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
 
 use iroh_base::{SecretKey, Signature};
 use p2panda_core::{Hash, Operation};
@@ -38,13 +115,12 @@ const MAX_PURPOSE: usize = 64;
 const MAX_CANONICAL: usize = 262_144;
 const MAX_OPEN_ITEMS: usize = 32;
 const MAX_OPEN_BYTES: usize = 512 * 1024;
-const MAX_PARENTS: usize = 64;
 const RECORD_ID_DOMAIN: &[u8] = b"teamarness.immutable-record-id/v1";
 const SCOPE_DOMAIN: &[u8] = b"teamarness.immutable-record-scope/v1";
 const SIGNING_DOMAIN: &str = "teamarness.immutable-record/v1";
-type ScopeState = ([u8; 16], [u8; 32], [u8; 32]);
+type ScopeState = ([u8; 16], ContentKey, [u8; 32]);
 type StoredRecordFields = (Vec<u8>, Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>);
-type ScopeRecoveryRow = ([u8; 32], String, WorkspaceId, [u8; 32], [u8; 32]);
+type ScopeRecoveryRow = ([u8; 32], String, WorkspaceId, ContentKey, [u8; 32]);
 type RecordFields<'a> = (
     &'a [u8],
     &'a [u8],
@@ -89,11 +165,17 @@ impl RecordId {
     pub(crate) const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    /// Names a record identity that belongs to no record, for forgery tests.
+    #[cfg(test)]
+    pub(crate) const fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Display for RecordId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
+        crate::encoding::write_hex(&self.0, f)
     }
 }
 
@@ -129,7 +211,7 @@ impl<'de> Deserialize<'de> for OrderKey {
 }
 
 impl OrderKey {
-    fn from_height_and_id(height: u64, record_id: RecordId) -> Self {
+    pub(crate) fn from_height_and_id(height: u64, record_id: RecordId) -> Self {
         let mut bytes = [0; 41];
         bytes[0] = VERSION;
         bytes[1..9].copy_from_slice(&height.to_be_bytes());
@@ -150,7 +232,7 @@ impl OrderKey {
 
 impl fmt::Display for OrderKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
+        crate::encoding::write_hex(&self.0, f)
     }
 }
 
@@ -206,7 +288,7 @@ impl Cursor {
 
 impl fmt::Display for Cursor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
+        crate::encoding::write_hex(&self.0, f)
     }
 }
 
@@ -328,14 +410,6 @@ fn validate_open_batch(items: &[Vec<u8>]) -> Result<(), ValueParseError> {
     Ok(())
 }
 
-fn validate_frontier(parent_count: usize) -> Result<(), ValueParseError> {
-    if parent_count > MAX_PARENTS {
-        Err(ValueParseError::new("causal frontier"))
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_fields(package: &str, purpose: &str, canonical: &[u8]) -> Result<(), ValueParseError> {
     if package.is_empty() || package.len() > u16::MAX as usize || !package.is_ascii() {
         return Err(ValueParseError::new("package identity"));
@@ -392,12 +466,17 @@ impl SealedRecordV1 {
         if ciphertext_len == 0 || ciphertext_len != bytes.len() - PREFIX {
             return Err(ValueParseError::new("sealed record"));
         }
-        let mut at = 2;
-        let scope_digest = take_array::<32>(bytes, &mut at)?;
-        let record_id = RecordId(take_array::<32>(bytes, &mut at)?);
-        let order_key = OrderKey(take_array::<41>(bytes, &mut at)?);
-        let content_key_id = take_array::<32>(bytes, &mut at)?;
-        let nonce = take_array::<24>(bytes, &mut at)?;
+        let mut reader = ByteReader::new(&bytes[2..]);
+        let scope_digest = reader.take_array::<32>().ok_or_else(malformed)?;
+        let record_id = RecordId(reader.take_array::<32>().ok_or_else(malformed)?);
+        let order_key = OrderKey(reader.take_array::<41>().ok_or_else(malformed)?);
+        // An order key is part of the sealed bytes, so a peer cannot move a
+        // record in the order without breaking this binding.
+        if order_key.0[0] != VERSION || order_key.0[9..41] != record_id.0 {
+            return Err(ValueParseError::new("order key binding"));
+        }
+        let content_key_id = reader.take_array::<32>().ok_or_else(malformed)?;
+        let nonce = reader.take_array::<24>().ok_or_else(malformed)?;
         Ok(Self {
             scope_digest,
             record_id,
@@ -424,7 +503,7 @@ trait RecordProtection {
 struct P2pandaRecordProtection {
     package_identity: String,
     workspace_id: WorkspaceId,
-    content_key: [u8; 32],
+    content_key: ContentKey,
 }
 
 impl P2pandaRecordProtection {
@@ -437,7 +516,7 @@ impl P2pandaRecordProtection {
     }
 
     fn key_id(&self) -> [u8; 32] {
-        *Hash::digest(self.content_key).as_bytes()
+        self.content_key.id()
     }
 }
 
@@ -466,7 +545,7 @@ impl RecordProtection for P2pandaRecordProtection {
         plaintext.extend_from_slice(&canonical);
         plaintext.extend_from_slice(Hash::digest(preliminary.prefix()).as_bytes());
         let ciphertext = p2panda_encryption::crypto::xchacha20::x_aead_encrypt(
-            &self.content_key,
+            self.content_key.expose(),
             &plaintext,
             nonce,
             None,
@@ -484,7 +563,7 @@ impl RecordProtection for P2pandaRecordProtection {
             return Err(ValueParseError::new("sealed record scope"));
         }
         let plaintext = p2panda_encryption::crypto::xchacha20::x_aead_decrypt(
-            &self.content_key,
+            self.content_key.expose(),
             &sealed.ciphertext,
             sealed.nonce,
             None,
@@ -510,7 +589,28 @@ impl RecordProtection for P2pandaRecordProtection {
         if RecordId::digest(canonical) != sealed.record_id || parsed.verify().is_err() {
             return Err(ValueParseError::new("record authentication"));
         }
+        // SEC-05: the author signs the package and workspace it wrote for, so a
+        // record sealed into another scope never opens there.
+        if parsed.package_identity != self.package_identity
+            || parsed.workspace_id != self.workspace_id
+        {
+            return Err(ValueParseError::new(SCOPE_BINDING));
+        }
         Ok(parsed)
+    }
+}
+
+/// The value name [`RecordProtection::open`] reports when a record is signed for
+/// a package or workspace other than the scope that sealed it.
+const SCOPE_BINDING: &str = "record scope binding";
+
+/// Distinguishes a record signed for another scope from an otherwise unreadable
+/// record, so one forged record is rejected as such instead of as corruption.
+fn map_open_error(error: &ValueParseError) -> SynchronizationError {
+    if error.value_name() == SCOPE_BINDING {
+        SynchronizationError::WrongScope
+    } else {
+        SynchronizationError::CorruptRecord
     }
 }
 
@@ -518,22 +618,23 @@ fn decode_signed(unsigned: &[u8], signature: &[u8]) -> Result<SignedRecordV1, Va
     if signature.len() != 64 || unsigned.len() < 1 + 2 + 16 + 2 + 4 + 32 {
         return Err(ValueParseError::new("signed record"));
     }
-    let mut at = 0;
-    if take_byte(unsigned, &mut at)? != VERSION {
+    let mut reader = ByteReader::new(unsigned);
+    if reader.take_u8().ok_or_else(malformed)? != VERSION {
         return Err(ValueParseError::new("signed record version"));
     }
-    let package_len = u16::from_be_bytes(take_array::<2>(unsigned, &mut at)?) as usize;
-    let package = String::from_utf8(take_vec(unsigned, &mut at, package_len)?)
+    let package_len = u16::from_be_bytes(reader.take_array::<2>().ok_or_else(malformed)?) as usize;
+    let package = String::from_utf8(reader.take(package_len).ok_or_else(malformed)?.to_vec())
         .map_err(|_| ValueParseError::new("package identity"))?;
-    let workspace_id = WorkspaceId::from_bytes(take_array::<16>(unsigned, &mut at)?);
-    let purpose_len = u16::from_be_bytes(take_array::<2>(unsigned, &mut at)?) as usize;
-    let purpose = String::from_utf8(take_vec(unsigned, &mut at, purpose_len)?)
+    let workspace_id = WorkspaceId::from_bytes(reader.take_array::<16>().ok_or_else(malformed)?);
+    let purpose_len = u16::from_be_bytes(reader.take_array::<2>().ok_or_else(malformed)?) as usize;
+    let purpose = String::from_utf8(reader.take(purpose_len).ok_or_else(malformed)?.to_vec())
         .map_err(|_| ValueParseError::new("record purpose"))?;
-    let canonical_len = u32::from_be_bytes(take_array::<4>(unsigned, &mut at)?) as usize;
-    let canonical = take_vec(unsigned, &mut at, canonical_len)?;
-    let author = PublicIdentity::from_bytes(take_array::<32>(unsigned, &mut at)?)
+    let canonical_len =
+        u32::from_be_bytes(reader.take_array::<4>().ok_or_else(malformed)?) as usize;
+    let canonical = reader.take(canonical_len).ok_or_else(malformed)?.to_vec();
+    let author = PublicIdentity::from_bytes(reader.take_array::<32>().ok_or_else(malformed)?)
         .map_err(|_| ValueParseError::new("record author"))?;
-    if at != unsigned.len() {
+    if reader.finish().is_none() {
         return Err(ValueParseError::new("signed record"));
     }
     let signature = Signature::from_bytes(signature.try_into().expect("checked signature width"));
@@ -549,87 +650,13 @@ fn decode_signed(unsigned: &[u8], signature: &[u8]) -> Result<SignedRecordV1, Va
     Ok(record)
 }
 
-fn take_byte(bytes: &[u8], at: &mut usize) -> Result<u8, ValueParseError> {
-    if *at >= bytes.len() {
-        return Err(ValueParseError::new("canonical record"));
-    }
-    let value = bytes[*at];
-    *at += 1;
-    Ok(value)
-}
-fn take_array<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], ValueParseError> {
-    if bytes.len().saturating_sub(*at) < N {
-        return Err(ValueParseError::new("canonical record"));
-    }
-    let value = bytes[*at..*at + N].try_into().expect("checked width");
-    *at += N;
-    Ok(value)
-}
-fn take_vec(bytes: &[u8], at: &mut usize, len: usize) -> Result<Vec<u8>, ValueParseError> {
-    if bytes.len().saturating_sub(*at) < len {
-        return Err(ValueParseError::new("canonical record"));
-    }
-    let value = bytes[*at..*at + len].to_vec();
-    *at += len;
-    Ok(value)
-}
-fn parse_hex<const N: usize>(value: &str, label: &'static str) -> Result<[u8; N], ValueParseError> {
-    if value.len() != N * 2 {
-        return Err(ValueParseError::new(label));
-    }
-    let mut out = [0; N];
-    for (index, pair) in value.as_bytes().chunks(2).enumerate() {
-        out[index] = (hex_digit(pair[0]).ok_or(ValueParseError::new(label))? << 4)
-            | hex_digit(pair[1]).ok_or(ValueParseError::new(label))?;
-    }
-    Ok(out)
-}
-fn hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-fn write_hex(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(f, "{byte:02x}")?;
-    }
-    Ok(())
+/// The shared reader, with this codec's one error value.
+fn malformed() -> ValueParseError {
+    ValueParseError::new("canonical record")
 }
 
-// These private seams are intentionally named and kept independent so production and
-// deterministic adapters can be tested through identical semantic behavior.
-trait ReplicatedRecordStore {
-    fn put(&mut self, record: SealedRecordV1) -> Result<(), ValueParseError>;
-}
-trait ReplicaEngine {
-    fn record_id(&self, operation: &[u8]) -> RecordId;
-}
-trait PeerSessionTransport {
-    fn bounds(&self) -> (usize, usize);
-}
-struct DeterministicStore(Vec<SealedRecordV1>);
-impl ReplicatedRecordStore for DeterministicStore {
-    fn put(&mut self, record: SealedRecordV1) -> Result<(), ValueParseError> {
-        if !self.0.iter().any(|old| old.record_id == record.record_id) {
-            self.0.push(record);
-        }
-        Ok(())
-    }
-}
-struct DeterministicReplica;
-impl ReplicaEngine for DeterministicReplica {
-    fn record_id(&self, operation: &[u8]) -> RecordId {
-        RecordId::digest(operation)
-    }
-}
-struct DeterministicTransport;
-impl PeerSessionTransport for DeterministicTransport {
-    fn bounds(&self) -> (usize, usize) {
-        (4_096, 64 * 1024 * 1024)
-    }
+fn parse_hex<const N: usize>(value: &str, label: &'static str) -> Result<[u8; N], ValueParseError> {
+    crate::encoding::hex_decode_fixed(value).ok_or_else(|| ValueParseError::new(label))
 }
 
 /// A committed immutable record returned by local append.
@@ -765,7 +792,10 @@ pub enum SynchronizationError {
     RevokedMember,
     InvalidInput,
     WrongScope,
+    ContentKeyUnavailable,
+    KeyOriginRejected,
     CorruptRecord,
+    ScopeQuarantined,
     CursorScopeMismatch,
     CursorAhead,
     RuntimeUnavailable,
@@ -779,7 +809,14 @@ impl fmt::Display for SynchronizationError {
             Self::RevokedMember => "a revoked workspace member may not append",
             Self::InvalidInput => "invalid immutable record input",
             Self::WrongScope => "sealed record belongs to another scope",
+            Self::ContentKeyUnavailable => "the package content key has not been received yet",
+            Self::KeyOriginRejected => {
+                "protection grant does not trace to the workspace creator's key"
+            }
             Self::CorruptRecord => "immutable record is corrupt",
+            Self::ScopeQuarantined => {
+                "the package record log is quarantined after a local integrity failure"
+            }
             Self::CursorScopeMismatch => "cursor belongs to another delivery journal",
             Self::CursorAhead => "cursor is ahead of the delivery journal",
             Self::RuntimeUnavailable => "synchronization runtime is unavailable",
@@ -788,37 +825,19 @@ impl fmt::Display for SynchronizationError {
     }
 }
 impl std::error::Error for SynchronizationError {}
-impl From<StorageError> for SynchronizationError {
-    fn from(e: StorageError) -> Self {
-        Self::Storage(e)
+/// Keeps a refusal of retired version-1 protection controls distinguishable
+/// from an ordinary corrupt record, so startup can tell the user to reset.
+fn storage_or_corrupt(error: StorageError) -> SynchronizationError {
+    if matches!(error, StorageError::LegacyProtectionState) {
+        SynchronizationError::Storage(error)
+    } else {
+        SynchronizationError::CorruptRecord
     }
 }
 
-/// A blocking, at-least-once delivery subscription.
-pub struct RecordSubscription {
-    durable: VecDeque<RecordEvent>,
-    live: Receiver<RecordEvent>,
-}
-impl fmt::Debug for RecordSubscription {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RecordSubscription").finish_non_exhaustive()
-    }
-}
-impl RecordSubscription {
-    pub fn next_event(&mut self) -> Result<Option<RecordEvent>, SynchronizationError> {
-        Ok(self.durable.pop_front().or_else(|| self.live.recv().ok()))
-    }
-    pub fn next_event_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<RecordEvent>, SynchronizationError> {
-        if let Some(event) = self.durable.pop_front() {
-            return Ok(Some(event));
-        }
-        match self.live.recv_timeout(timeout) {
-            Ok(event) => Ok(Some(event)),
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(None),
-        }
+impl From<StorageError> for SynchronizationError {
+    fn from(e: StorageError) -> Self {
+        Self::Storage(e)
     }
 }
 
@@ -828,9 +847,6 @@ pub(crate) fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) ->
     input.extend_from_slice(package_identity.as_bytes());
     input.extend_from_slice(workspace_id.as_bytes());
     *Hash::digest(input).as_bytes()
-}
-fn key_id(key: &[u8; 32]) -> [u8; 32] {
-    *Hash::digest(key).as_bytes()
 }
 fn storage_error() -> SynchronizationError {
     SynchronizationError::Storage(StorageError::Database)
@@ -858,27 +874,24 @@ fn ensure_scope(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     if let Some((journal, key)) = found {
-        return Ok((fixed(journal)?, fixed(key)?, digest));
+        return Ok((fixed(journal)?, ContentKey::from_column(key)?, digest));
     }
     let mut journal = [0_u8; 16];
-    let mut key = [0_u8; 32];
-    getrandom::fill(&mut journal).map_err(|_| storage_error())?;
-    getrandom::fill(&mut key).map_err(|_| storage_error())?;
-    conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key_id(&key).as_slice(), key.as_slice()]).map_err(|_| storage_error())?;
-    let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
-    bundle.extend_from_slice(&key);
+    getrandom::fill(&mut journal).map_err(fault!(storage_error()))?;
+    let key = ContentKey::generate()?;
+    conn.execute("INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![digest.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), key.id().as_slice(), key.expose().as_slice()]).map_err(fault!(storage_error()))?;
     conn.execute(
-        "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![digest.as_slice(), bundle, key_id(&key).as_slice(), creator.as_bytes().as_slice()],
+        "INSERT INTO protection_state(scope_id,content_key_id,creator_public_identity) VALUES(?1,?2,?3)",
+        rusqlite::params![digest.as_slice(), key.id().as_slice(), creator.as_bytes().as_slice()],
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     conn.execute(
         "INSERT INTO durable_wakes(scope_id,wake_generation) VALUES(?1,0)",
         [digest.as_slice()],
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     Ok((journal, key, digest))
 }
 
@@ -898,9 +911,9 @@ pub(crate) fn export_protection_grant(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .ok_or(SynchronizationError::WorkspaceNotFound)
-        .and_then(fixed)?;
+        .and_then(ContentKey::from_column)?;
     let author = secret.public();
     let existing = conn
         .query_row(
@@ -918,16 +931,19 @@ pub(crate) fn export_protection_grant(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| storage_error())?;
-    if let Some(existing) = existing {
+        .map_err(fault!(storage_error()))?;
+    if let Some(existing) = existing
+        && existing.starts_with(protection_control::DOMAIN_V2)
+    {
         return Ok(existing);
     }
-    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, key);
+    let bytes = protection_control::grant(secret, scope, workspace, recipient, admission, &key)
+        .map_err(storage_or_corrupt)?;
     let control =
         protection_control::decode(&bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     protection_control::insert(
         &tx,
         scope,
@@ -936,7 +952,7 @@ pub(crate) fn export_protection_grant(
         &control,
         &bytes,
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
     Ok(bytes)
@@ -950,28 +966,229 @@ pub(crate) fn protection_control_author(
         .map_err(|_| SynchronizationError::CorruptRecord)
 }
 
-pub(crate) fn import_protection_grant(
-    conn: &mut rusqlite::Connection,
-    local_identity: PublicIdentity,
+/// Re-seals one of this Installation's own records into another scope.
+///
+/// Every signature is genuine and the operation is well formed: only the
+/// record's own signed Package and Workspace binding (SEC-05) refuses it.
+#[cfg(test)]
+pub(crate) fn forge_cross_scope_operation_for_test(
+    conn: &rusqlite::Connection,
+    secret: &SecretKey,
+    workspace: WorkspaceId,
+    from_package: &str,
+    to_package: &str,
+    record_id: RecordId,
+) -> Operation<()> {
+    let from_scope = scope_digest(from_package, workspace);
+    let to_scope = scope_digest(to_package, workspace);
+    let sealed: Vec<u8> = conn
+        .query_row(
+            "SELECT sealed_record FROM immutable_records WHERE scope_id=?1 AND record_id=?2",
+            rusqlite::params![from_scope.as_slice(), record_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("a record in the source scope");
+    let content_key = |scope: [u8; 32]| -> ContentKey {
+        conn.query_row(
+            "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+        .and_then(|bytes| ContentKey::from_column(bytes).ok())
+        .expect("a held content key")
+    };
+    let signed = P2pandaRecordProtection {
+        package_identity: from_package.to_owned(),
+        workspace_id: workspace,
+        content_key: content_key(from_scope),
+    }
+    .open(&SealedRecordV1::decode(&sealed).expect("a sealed record"))
+    .expect("the source record opens in its own scope");
+    let (sequence, backlink): (i64, Option<Vec<u8>>) = {
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(author_sequence),-1)+1 FROM p2panda_operations
+                 WHERE scope_id=?1 AND author_public_identity=?2",
+                rusqlite::params![to_scope.as_slice(), secret.public().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("an author sequence");
+        let backlink = if next == 0 {
+            None
+        } else {
+            conn.query_row(
+                "SELECT operation_id FROM p2panda_operations
+                 WHERE scope_id=?1 AND author_public_identity=?2 AND author_sequence=?3",
+                rusqlite::params![
+                    to_scope.as_slice(),
+                    secret.public().as_bytes().as_slice(),
+                    next - 1
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+        };
+        (next, backlink)
+    };
+    let payload = P2pandaRecordProtection {
+        package_identity: to_package.to_owned(),
+        workspace_id: workspace,
+        content_key: content_key(to_scope),
+    }
+    .seal(
+        &signed,
+        OrderKey::from_height_and_id(
+            u64::try_from(sequence).expect("a sequence height"),
+            RecordId::digest(&signed.canonical_bytes()),
+        ),
+    )
+    .expect("the record re-seals under the target scope")
+    .encode();
+    let header = p2panda_core::Header::<()>::builder()
+        .body(payload.as_slice())
+        .seq_num(u32::try_from(sequence).expect("a p2panda sequence"))
+        .backlink(backlink.map(|bytes| {
+            Hash::from_bytes(bytes.try_into().expect("a stored operation identifier"))
+        }))
+        .build(
+            &p2panda_core::SigningKey::from_bytes(&secret.to_bytes()),
+            (),
+        );
+    Operation::from_parts(header, Some(p2panda_core::Body::from_bytes(&payload)))
+}
+
+/// Seals a new record for this Installation under an order key the test picks.
+///
+/// Every signature is genuine and the P2Panda sequence and backlink are
+/// correct, so only the order key's own rules refuse it. `order_key` receives
+/// the record's identity, so a test can bind the key correctly and still choose
+/// an impossible height.
+#[cfg(test)]
+pub(crate) fn forge_order_key_operation_for_test(
+    conn: &rusqlite::Connection,
+    secret: &SecretKey,
     workspace: WorkspaceId,
     package: &str,
+    canonical: &[u8],
+    order_key: impl FnOnce(RecordId) -> [u8; 41],
+) -> Operation<()> {
+    let scope = scope_digest(package, workspace);
+    let signed = SignedRecordV1::sign(secret, package, workspace, "message.post", canonical)
+        .expect("a signable test record");
+    let record_id = RecordId::digest(&signed.canonical_bytes());
+    let content_key = conn
+        .query_row(
+            "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+        .and_then(|bytes| ContentKey::from_column(bytes).ok())
+        .expect("a held content key");
+    let sequence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(author_sequence),-1)+1 FROM p2panda_operations
+             WHERE scope_id=?1 AND author_public_identity=?2",
+            rusqlite::params![scope.as_slice(), secret.public().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("an author sequence");
+    let backlink: Option<Vec<u8>> = if sequence == 0 {
+        None
+    } else {
+        conn.query_row(
+            "SELECT operation_id FROM p2panda_operations
+             WHERE scope_id=?1 AND author_public_identity=?2 AND author_sequence=?3",
+            rusqlite::params![
+                scope.as_slice(),
+                secret.public().as_bytes().as_slice(),
+                sequence - 1
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+    };
+    let payload = P2pandaRecordProtection {
+        package_identity: package.to_owned(),
+        workspace_id: workspace,
+        content_key,
+    }
+    .seal(&signed, OrderKey(order_key(record_id)))
+    .expect("the record seals under its own scope")
+    .encode();
+    let header = p2panda_core::Header::<()>::builder()
+        .body(payload.as_slice())
+        .seq_num(u32::try_from(sequence).expect("a p2panda sequence"))
+        .backlink(backlink.map(|bytes| {
+            Hash::from_bytes(bytes.try_into().expect("a stored operation identifier"))
+        }))
+        .build(
+            &p2panda_core::SigningKey::from_bytes(&secret.to_bytes()),
+            (),
+        );
+    Operation::from_parts(header, Some(p2panda_core::Body::from_bytes(&payload)))
+}
+
+/// Mints a self-authored origin and grant for a key this Installation invented.
+///
+/// This is the forgery a non-creator Member could attempt: every signature is
+/// genuine, so only the creator-origin rule refuses it.
+#[cfg(test)]
+pub(crate) fn forge_protection_bundle_for_test(
+    secret: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+    recipient: PublicIdentity,
+) -> (Vec<u8>, Vec<u8>) {
+    let scope = scope_digest(package, workspace);
+    let author = PublicIdentity::from_bytes(*secret.public().as_bytes()).expect("test identity");
+    let key = ContentKey::generate().expect("test randomness");
+    let origin = protection_control::create(secret, scope, workspace, author, [0; 32], &key)
+        .expect("test origin");
+    let grant = protection_control::grant(secret, scope, workspace, recipient, [5; 32], &key)
+        .expect("test grant");
+    (origin, grant)
+}
+
+/// Imports a content-key grant that traces to the Workspace creator's origin.
+///
+/// `origin` is the creator's own `create` control for the scope. Any current
+/// Member holding the key may author the grant, but a scope's first key is
+/// accepted only with the creator's signed origin (ADR 0008), and a `create`
+/// control is never accepted as a grant.
+pub(crate) fn import_protection_grant(
+    conn: &mut rusqlite::Connection,
+    local_secret: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+    creator: PublicIdentity,
+    origin_bytes: &[u8],
     bytes: &[u8],
 ) -> Result<usize, SynchronizationError> {
-    let control =
-        protection_control::decode(bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
+    let local_identity = PublicIdentity::from_bytes(*local_secret.public().as_bytes())
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let control = protection_control::decode(bytes).map_err(storage_or_corrupt)?;
     let scope = scope_digest(package, workspace);
     if control.scope != scope
         || control.workspace != workspace
         || control.recipient != local_identity
-        || !matches!(control.kind, 1 | 3)
+        || control.kind != protection_control::KIND_GRANT
     {
         return Err(SynchronizationError::WrongScope);
     }
-    let key = protection_control::decrypt_key(&control)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let origin = protection_control::decode(origin_bytes).map_err(storage_or_corrupt)?;
+    protection_control::verify_origin(&origin, &control, creator)
+        .map_err(|_| SynchronizationError::KeyOriginRejected)?;
+    let key = protection_control::open_control(
+        &control,
+        &bytes[..protection_control::AAD_END],
+        local_secret,
+    )
+    .map_err(storage_or_corrupt)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     let existing: Option<Vec<u8>> = tx
         .query_row(
             "SELECT content_key_id FROM sync_scopes WHERE scope_id=?1",
@@ -979,61 +1196,66 @@ pub(crate) fn import_protection_grant(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     if let Some(existing) = existing {
         if existing != control.content_key_id {
             return Err(SynchronizationError::CorruptRecord);
         }
     } else {
         let mut journal = [0; 16];
-        getrandom::fill(&mut journal).map_err(|_| storage_error())?;
+        getrandom::fill(&mut journal).map_err(fault!(storage_error()))?;
         tx.execute(
             "INSERT INTO sync_scopes(scope_id,package_identity,workspace_id,journal_id,content_key_id,content_key) VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.as_slice()],
-        ).map_err(|_| storage_error())?;
-        let mut bundle = b"teamarness.secret-bundle/v1".to_vec();
-        bundle.extend_from_slice(&key);
+            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), journal.as_slice(), control.content_key_id.as_slice(), key.expose().as_slice()],
+        ).map_err(fault!(storage_error()))?;
         tx.execute(
-            "INSERT INTO protection_state(scope_id,state_bytes,content_key_id,creator_public_identity) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![scope.as_slice(), bundle, control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
-        ).map_err(|_| storage_error())?;
+            "INSERT INTO protection_state(scope_id,content_key_id,creator_public_identity) VALUES(?1,?2,?3)",
+            rusqlite::params![scope.as_slice(), control.content_key_id.as_slice(), control.author.as_bytes().as_slice()],
+        ).map_err(fault!(storage_error()))?;
         tx.execute(
             "INSERT INTO durable_wakes(scope_id,wake_generation) VALUES(?1,0)",
             [scope.as_slice()],
         )
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
+    }
+    // The importer keeps the creator's origin so it can later prove the key's
+    // authority when it grants to someone else.
+    let stored_origin: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT control_bytes FROM protection_control_operations
+             WHERE scope_id=?1 AND operation_kind='create' LIMIT 1",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(fault!(storage_error()))?;
+    match stored_origin {
+        Some(stored) if stored != origin_bytes => return Err(SynchronizationError::CorruptRecord),
+        Some(_) => {}
+        None => protection_control::insert(
+            &tx,
+            scope,
+            RecordId::digest(origin_bytes).as_bytes(),
+            "create",
+            &origin,
+            origin_bytes,
+        )
+        .map_err(fault!(storage_error()))?,
     }
     protection_control::insert(
         &tx,
         scope,
         RecordId::digest(bytes).as_bytes(),
-        if control.kind == 1 { "create" } else { "grant" },
+        "grant",
         &control,
         bytes,
     )
-    .map_err(|_| storage_error())?;
-    let pending: Vec<Vec<u8>> = {
-        let mut statement = tx.prepare("SELECT sealed_record FROM pending_protection_records WHERE scope_id=?1 ORDER BY pending_id").map_err(|_| storage_error())?;
-        statement
-            .query_map([scope.as_slice()], |row| row.get(0))
-            .map_err(|_| storage_error())?
-            .collect::<Result<_, _>>()
-            .map_err(|_| storage_error())?
-    };
+    .map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-    let mut promoted = 0;
-    for sealed in pending {
-        if insert_remote(conn, workspace, package, &sealed).is_ok() {
-            conn.execute(
-                "DELETE FROM pending_protection_records WHERE scope_id=?1 AND sealed_record=?2",
-                rusqlite::params![scope.as_slice(), sealed],
-            )
-            .map_err(|_| storage_error())?;
-            promoted += 1;
-        }
-    }
-    Ok(promoted)
+    // Records that arrived before the key are parked, not pending: plan phase 3
+    // Step 7 promotes them from `parked_operations` after a successful import.
+    Ok(0)
 }
 
 fn record_from_row(row: RecordFields<'_>) -> Result<ImmutableRecord, SynchronizationError> {
@@ -1049,6 +1271,15 @@ fn record_from_row(row: RecordFields<'_>) -> Result<ImmutableRecord, Synchroniza
     })
 }
 
+/// What the local Installation's membership says about an append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipStanding {
+    Current,
+    /// Known to this Workspace's membership history, but not a current Member.
+    Revoked,
+    None,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append(
     conn: &mut rusqlite::Connection,
@@ -1057,11 +1288,19 @@ pub(crate) fn append(
     package: &str,
     purpose: &str,
     canonical: &[u8],
-    is_member: bool,
+    standing: MembershipStanding,
     is_creator: bool,
-) -> Result<ImmutableRecord, SynchronizationError> {
-    if !is_member {
-        return Err(SynchronizationError::NotCurrentMember);
+    now_unix_ms: i64,
+) -> Result<(ImmutableRecord, i64), SynchronizationError> {
+    match standing {
+        MembershipStanding::Current => {}
+        // An Installation that was a Member and is not one now was revoked;
+        // one that was never a Member is simply not in this Workspace.
+        MembershipStanding::Revoked => return Err(SynchronizationError::RevokedMember),
+        MembershipStanding::None => return Err(SynchronizationError::NotCurrentMember),
+    }
+    if quarantine::is_scope_quarantined(conn, scope_digest(package, workspace))? {
+        return Err(SynchronizationError::ScopeQuarantined);
     }
     let signed = SignedRecordV1::sign(secret, package, workspace, purpose, canonical)
         .map_err(|_| SynchronizationError::InvalidInput)?;
@@ -1072,23 +1311,23 @@ pub(crate) fn append(
             |_| Ok(()),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .is_some();
     if !scope_exists && !is_creator {
-        return Err(SynchronizationError::NotCurrentMember);
+        return Err(SynchronizationError::ContentKeyUnavailable);
     }
     let canonical_signed = signed.canonical_bytes();
     let record_id = RecordId::digest(&canonical_signed);
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(fault!(storage_error()))?;
     let (journal, key, scope) = ensure_scope(&tx, package, workspace, signed.author)?;
     let protection = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
-        content_key: key,
+        content_key: key.clone(),
     };
-    let existing: Option<StoredRecordFields> = tx.query_row("SELECT o.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM immutable_operations o JOIN immutable_records r ON r.record_id=o.record_id JOIN immutable_idempotency i ON i.record_id=o.record_id WHERE i.scope_id=?1 AND i.record_id=?2", rusqlite::params![scope.as_slice(), record_id.as_bytes().as_slice()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| storage_error())?;
+    let existing: Option<StoredRecordFields> = tx.query_row("SELECT o.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM immutable_operations o JOIN immutable_records r ON r.record_id=o.record_id JOIN immutable_idempotency i ON i.record_id=o.record_id WHERE i.scope_id=?1 AND i.record_id=?2", rusqlite::params![scope.as_slice(), record_id.as_bytes().as_slice()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(fault!(storage_error()))?;
     if let Some((id, order, author, p, sig, sealed)) = existing {
         let opened = protection
             .open(
@@ -1096,19 +1335,54 @@ pub(crate) fn append(
                     .map_err(|_| SynchronizationError::CorruptRecord)?,
             )
             .map_err(|_| SynchronizationError::CorruptRecord)?;
-        return record_from_row((&id, &order, &author, &p, &sig, &opened.canonical, &sealed));
+        let delivery: i64 = tx
+            .query_row(
+                "SELECT delivery_sequence FROM record_delivery WHERE record_id=?1",
+                [id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(fault!(storage_error()))?;
+        let record = record_from_row((&id, &order, &author, &p, &sig, &opened.canonical, &sealed))?;
+        return Ok((record, delivery));
     }
-    let max_height: Option<i64> = tx.query_row("SELECT MAX(causal_height) FROM immutable_operations WHERE scope_id=?1 AND status='accepted'", [scope.as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
-    let height = u64::try_from(max_height.unwrap_or(-1).saturating_add(1))
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let max_height: Option<i64> = tx.query_row("SELECT MAX(causal_height) FROM immutable_operations WHERE scope_id=?1 AND status='accepted'", [scope.as_slice()], |r| r.get(0)).map_err(fault!(storage_error()))?;
+    let height = match max_height {
+        Some(max) => u64::try_from(max)
+            .ok()
+            .and_then(|max| max.checked_add(1))
+            .ok_or(SynchronizationError::CorruptRecord)?,
+        None => 0,
+    };
     let order = OrderKey::from_height_and_id(height, record_id);
     let sealed = protection
         .seal(&signed, order)
         .map_err(|_| SynchronizationError::CorruptRecord)?;
     let sealed_bytes = sealed.encode();
     let operation_id = RecordId::digest(&sealed_bytes);
-    let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),order.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,sealed_bytes.as_slice(),Vec::<u8>::new(),height]).map_err(|_| storage_error())?;
+    let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(), signed.author.as_bytes().as_slice()], |r| r.get(0)).map_err(fault!(storage_error()))?;
+    let operation_id_bytes = operation_id.as_bytes();
+    let record_id_bytes = record_id.as_bytes();
+    let order_bytes = order.as_bytes();
+    let author_bytes = signed.author.as_bytes();
+    let signature_bytes = signed.signature.to_bytes();
+    let row = journal_sql::AcceptedOperation {
+        operation_id: operation_id_bytes.as_slice(),
+        scope: scope.as_slice(),
+        record_id: record_id_bytes.as_slice(),
+        order_key: order_bytes.as_slice(),
+        author: author_bytes.as_slice(),
+        sequence,
+        operation_bytes: sealed_bytes.as_slice(),
+        parents: &[],
+        causal_height: height,
+        purpose,
+        canonical,
+        signature: signature_bytes.as_slice(),
+        sealed_record: sealed_bytes.as_slice(),
+        journal: journal.as_slice(),
+        created_at_unix_ms: now_unix_ms,
+    };
+    journal_sql::insert_operation(&tx, &row).map_err(fault!(storage_error()))?;
     let projection_operation_id = operation_store::insert(
         &tx,
         secret,
@@ -1122,21 +1396,22 @@ pub(crate) fn append(
         &[],
         height,
         purpose,
-        key_id(&key),
+        key.id(),
     )
-    .map_err(|_| storage_error())?;
+    .map_err(fault!(storage_error()))?;
     if tx
         .query_row::<i64, _, _>(
             "SELECT COUNT(*) FROM protection_control_operations WHERE scope_id=?1",
             [scope.as_slice()],
             |row| row.get(0),
         )
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         == 0
     {
         let control =
-            protection_control::create(secret, scope, workspace, signed.author, [0; 32], key);
-        let parsed = protection_control::decode(&control).map_err(|_| storage_error())?;
+            protection_control::create(secret, scope, workspace, signed.author, [0; 32], &key)
+                .map_err(fault!(storage_error()))?;
+        let parsed = protection_control::decode(&control).map_err(fault!(storage_error()))?;
         protection_control::insert(
             &tx,
             scope,
@@ -1147,27 +1422,11 @@ pub(crate) fn append(
         )?;
         let _ = projection_operation_id;
     }
-    tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),sealed_bytes.as_slice()]).map_err(|_| storage_error())?;
-    tx.execute(
-        "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
-        rusqlite::params![
-            record_id.as_bytes().as_slice(),
-            scope.as_slice(),
-            sealed_bytes.as_slice()
-        ],
-    )
-    .map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),purpose,Hash::digest(canonical).as_bytes().as_slice(),record_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id) VALUES(?1,?2,?3) ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),operation_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice(),0_i64]).map_err(|_| storage_error())?;
-    tx.execute(
-        "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
-        [scope.as_slice()],
-    )
-    .map_err(|_| storage_error())?;
+    let delivery_sequence =
+        journal_sql::insert_record_rows(&tx, &row).map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-    record_from_row((
+    let record = record_from_row((
         record_id.as_bytes().as_slice(),
         order.as_bytes().as_slice(),
         signed.author.as_bytes(),
@@ -1175,7 +1434,8 @@ pub(crate) fn append(
         signed.signature.to_bytes().as_slice(),
         canonical,
         sealed_bytes.as_slice(),
-    ))
+    ))?;
+    Ok((record, delivery_sequence))
 }
 
 pub(crate) fn open_records(
@@ -1183,6 +1443,7 @@ pub(crate) fn open_records(
     workspace: WorkspaceId,
     package: &str,
     envelopes: &[Vec<u8>],
+    now_unix_ms: i64,
 ) -> Result<Vec<OpenedRecord>, SynchronizationError> {
     validate_open_batch(envelopes).map_err(|_| SynchronizationError::InvalidInput)?;
     let scope = scope_digest(package, workspace);
@@ -1193,9 +1454,9 @@ pub(crate) fn open_records(
             |r| r.get(0),
         )
         .optional()
-        .map_err(|_| storage_error())?
+        .map_err(fault!(storage_error()))?
         .ok_or(SynchronizationError::WorkspaceNotFound)?;
-    let key = fixed(key)?;
+    let key = ContentKey::from_column(key)?;
     let protector = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
@@ -1209,9 +1470,16 @@ pub(crate) fn open_records(
             if sealed.scope_digest != scope {
                 return Err(SynchronizationError::WrongScope);
             }
-            let record = protector
-                .open(&sealed)
-                .map_err(|_| SynchronizationError::CorruptRecord)?;
+            let record = match protector.open(&sealed) {
+                Ok(record) => record,
+                Err(error) => {
+                    // An envelope that names a record this Installation stores
+                    // and no longer opens is a local integrity failure, so the
+                    // record is isolated before it is read again.
+                    note_unopenable_record(conn, scope, sealed.record_id, now_unix_ms)?;
+                    return Err(map_open_error(&error));
+                }
+            };
             Ok(OpenedRecord {
                 record_id: sealed.record_id,
                 order_key: sealed.order_key,
@@ -1224,216 +1492,101 @@ pub(crate) fn open_records(
         .collect()
 }
 
-pub(crate) fn subscribe(
+/// Isolates a stored record that no longer opens under its scope's key.
+///
+/// An envelope that this Installation does not store is a caller's value, not a
+/// local fault, so nothing is recorded for it.
+fn note_unopenable_record(
     conn: &rusqlite::Connection,
-    workspace: WorkspaceId,
-    package: &str,
-    after: Option<Cursor>,
-    live: Receiver<RecordEvent>,
-) -> Result<RecordSubscription, SynchronizationError> {
-    let scope = scope_digest(package, workspace);
-    let journal: Vec<u8> = conn
+    scope: [u8; 32],
+    record_id: RecordId,
+    now_unix_ms: i64,
+) -> Result<(), SynchronizationError> {
+    let stored = conn
         .query_row(
-            "SELECT journal_id FROM sync_scopes WHERE scope_id=?1",
-            [scope.as_slice()],
-            |r| r.get(0),
+            "SELECT 1 FROM immutable_records WHERE record_id=?1 AND scope_id=?2",
+            rusqlite::params![record_id.as_bytes().as_slice(), scope.as_slice()],
+            |_| Ok(()),
         )
         .optional()
-        .map_err(|_| storage_error())?
-        .ok_or(SynchronizationError::WorkspaceNotFound)?;
-    let journal = fixed::<16>(journal)?;
-    let start = match after {
-        Some(cursor) => {
-            let bytes = cursor.as_bytes();
-            if bytes[1..17] != journal {
-                return Err(SynchronizationError::CursorScopeMismatch);
-            }
-            i64::try_from(u64::from_be_bytes(
-                bytes[17..25].try_into().expect("cursor width"),
-            ))
-            .map_err(|_| SynchronizationError::CursorAhead)?
+        .map_err(fault!(storage_error()))?
+        .is_some();
+    if stored {
+        quarantine::quarantine_record(
+            conn,
+            scope,
+            record_id.as_bytes(),
+            quarantine::RecordFault::Open,
+            now_unix_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// A row insert that violates a constraint is one peer's conflicting history,
+/// not a local fault; anything else from SQLite is a storage failure.
+fn insert_error(error: rusqlite::Error) -> RemoteInsertError {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            RemoteInsertError::Conflict
         }
-        None => 0,
-    };
-    let mut statement = conn.prepare("SELECT d.delivery_sequence,r.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM record_delivery d JOIN immutable_records r ON r.record_id=d.record_id JOIN immutable_operations o ON o.record_id=r.record_id WHERE d.scope_id=?1 AND d.delivery_sequence>?2 ORDER BY d.delivery_sequence").map_err(|_| storage_error())?;
-    let rows = statement
-        .query_map(rusqlite::params![scope.as_slice(), start], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Vec<u8>>(5)?,
-                r.get::<_, Vec<u8>>(6)?,
-            ))
-        })
-        .map_err(|_| storage_error())?;
-    let mut durable = VecDeque::new();
-    for row in rows {
-        let (sequence, id, order, author, purpose, sig, sealed) =
-            row.map_err(|_| storage_error())?;
-        let sealed_record =
-            SealedRecordV1::decode(&sealed).map_err(|_| SynchronizationError::CorruptRecord)?;
-        let key: [u8; 32] = conn
-            .query_row(
-                "SELECT content_key FROM sync_scopes WHERE scope_id=?1",
-                [scope.as_slice()],
-                |r| r.get(0),
-            )
-            .map_err(|_| storage_error())
-            .and_then(fixed)?;
-        let protection = P2pandaRecordProtection {
-            package_identity: package.to_owned(),
-            workspace_id: workspace,
-            content_key: key,
-        };
-        let opened = protection
-            .open(&sealed_record)
-            .map_err(|_| SynchronizationError::CorruptRecord)?;
-        let record = record_from_row((
-            &id,
-            &order,
-            &author,
-            &purpose,
-            &sig,
-            &opened.canonical,
-            &sealed,
-        ))?;
-        durable.push_back(RecordEvent {
-            record,
-            cursor: Cursor::new(
-                journal,
-                u64::try_from(sequence).map_err(|_| SynchronizationError::CorruptRecord)?,
-            ),
-        });
+        _ => RemoteInsertError::Storage,
     }
-    Ok(RecordSubscription { durable, live })
 }
 
-pub(crate) fn insert_remote(
-    conn: &mut rusqlite::Connection,
-    workspace: WorkspaceId,
-    package: &str,
-    bytes: &[u8],
-) -> Result<ImmutableRecord, SynchronizationError> {
-    let scope = scope_digest(package, workspace);
-    let sealed = SealedRecordV1::decode(bytes).map_err(|_| SynchronizationError::CorruptRecord)?;
-    if sealed.scope_digest != scope {
-        return Err(SynchronizationError::WrongScope);
-    }
-    let scope_keys: Option<([u8; 16], [u8; 32], [u8; 32])> = conn
-        .query_row(
-            "SELECT journal_id,content_key,content_key_id FROM sync_scopes WHERE scope_id=?1",
-            [scope.as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?
-                        .try_into()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    row.get::<_, Vec<u8>>(1)?
-                        .try_into()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    row.get::<_, Vec<u8>>(2)?
-                        .try_into()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|_| storage_error())?;
-    let Some((journal, key, content_key_id)) = scope_keys else {
-        conn.execute(
-            "INSERT OR IGNORE INTO pending_protection_records(scope_id,package_identity,workspace_id,content_key_id,sealed_record) VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), sealed.content_key_id.as_slice(), bytes],
-        ).map_err(|_| storage_error())?;
-        return Err(SynchronizationError::RuntimeUnavailable);
-    };
-    if content_key_id != sealed.content_key_id {
-        conn.execute(
-            "INSERT OR IGNORE INTO pending_protection_records(scope_id,package_identity,workspace_id,content_key_id,sealed_record) VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![scope.as_slice(), package, workspace.as_bytes().as_slice(), sealed.content_key_id.as_slice(), bytes],
-        ).map_err(|_| storage_error())?;
-        return Err(SynchronizationError::RuntimeUnavailable);
-    }
-    let protector = P2pandaRecordProtection {
-        package_identity: package.to_owned(),
-        workspace_id: workspace,
-        content_key: key,
-    };
-    let signed = protector
-        .open(&sealed)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
-    let record_id = RecordId::digest(&signed.canonical_bytes());
-    if record_id != sealed.record_id {
-        return Err(SynchronizationError::CorruptRecord);
-    }
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
-    let existing: Option<StoredRecordFields> = tx.query_row("SELECT o.record_id,o.order_key,o.author_public_identity,r.purpose,r.signature,r.sealed_record FROM immutable_operations o JOIN immutable_records r ON r.record_id=o.record_id WHERE o.record_id=?1", [record_id.as_bytes().as_slice()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| storage_error())?;
-    if let Some((id, order, author, purpose, signature, sealed)) = existing {
-        tx.commit()
-            .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-        return record_from_row((
-            &id,
-            &order,
-            &author,
-            &purpose,
-            &signature,
-            &signed.canonical,
-            &sealed,
-        ));
-    }
-    let operation_id = RecordId::digest(bytes);
-    let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(author_sequence),-1)+1 FROM immutable_operations WHERE scope_id=?1 AND author_public_identity=?2", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice()], |row| row.get(0)).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')", rusqlite::params![operation_id.as_bytes().as_slice(),scope.as_slice(),record_id.as_bytes().as_slice(),sealed.order_key.as_bytes().as_slice(),signed.author.as_bytes().as_slice(),sequence,bytes,Vec::<u8>::new(),sealed.order_key.height()]).map_err(|_| storage_error())?;
-    operation_store::queue_recovery(&tx, operation_id).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![record_id.as_bytes().as_slice(),scope.as_slice(),signed.purpose,Hash::digest(&signed.canonical).as_bytes().as_slice(),signed.signature.to_bytes().as_slice(),bytes]).map_err(|_| storage_error())?;
-    tx.execute(
-        "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
-        rusqlite::params![record_id.as_bytes().as_slice(), scope.as_slice(), bytes],
-    )
-    .map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),signed.purpose,Hash::digest(&signed.canonical).as_bytes().as_slice(),record_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id) VALUES(?1,?2,?3) ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id", rusqlite::params![scope.as_slice(),signed.author.as_bytes().as_slice(),operation_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.execute("INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms) VALUES(?1,?2,?3,0)", rusqlite::params![scope.as_slice(),journal.as_slice(),record_id.as_bytes().as_slice()]).map_err(|_| storage_error())?;
-    tx.commit()
-        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-    record_from_row((
-        record_id.as_bytes().as_slice(),
-        sealed.order_key.as_bytes().as_slice(),
-        signed.author.as_bytes(),
-        &signed.purpose,
-        signed.signature.to_bytes().as_slice(),
-        &signed.canonical,
-        bytes,
-    ))
+/// Whether a remote operation was newly applied or already stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteInsert {
+    Applied {
+        record: ImmutableRecord,
+        delivery_sequence: i64,
+    },
+    Duplicate(ImmutableRecord),
 }
 
+/// Why a remote operation was not applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteInsertError {
+    MissingScope,
+    KeyMismatch,
+    WrongScope,
+    Invalid,
+    Conflict,
+    /// The order key claims a causal height too far beyond this scope's own.
+    HeightOutOfRange,
+    Storage,
+}
+
+/// Applies one authenticated remote operation, classifying every refusal.
+///
+/// A caller decides what each refusal means for the session: only
+/// [`RemoteInsertError::Storage`] is fatal, and `MissingScope` means the
+/// operation should be parked until the scope's content key arrives.
 pub(crate) fn insert_remote_operation(
     conn: &mut rusqlite::Connection,
     workspace: WorkspaceId,
     package: &str,
     operation: &Operation<()>,
-) -> Result<ImmutableRecord, SynchronizationError> {
+    now_unix_ms: i64,
+) -> Result<RemoteInsert, RemoteInsertError> {
     // Validate the complete P2Panda operation before touching the Teamarness
     // journal. In particular, an occupied sequence or backlink conflict must
     // not leave behind a sealed record that recovery cannot project.
     p2panda_core::operation::validate_operation(operation)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+        .map_err(|_| RemoteInsertError::Invalid)?;
     let payload = operation
         .body
         .as_ref()
-        .ok_or(SynchronizationError::CorruptRecord)?
+        .ok_or(RemoteInsertError::Invalid)?
         .to_bytes();
     let scope = scope_digest(package, workspace);
-    let sealed =
-        SealedRecordV1::decode(&payload).map_err(|_| SynchronizationError::CorruptRecord)?;
+    let sealed = SealedRecordV1::decode(&payload).map_err(|_| RemoteInsertError::Invalid)?;
     if sealed.scope_digest != scope {
-        return Err(SynchronizationError::WrongScope);
+        return Err(RemoteInsertError::WrongScope);
     }
-    let (journal, key, content_key_id): ([u8; 16], [u8; 32], [u8; 32]) = conn
+    let (journal, key, content_key_id): ([u8; 16], ContentKey, [u8; 32]) = conn
         .query_row(
             "SELECT journal_id,content_key,content_key_id FROM sync_scopes WHERE scope_id=?1",
             [scope.as_slice()],
@@ -1442,8 +1595,7 @@ pub(crate) fn insert_remote_operation(
                     row.get::<_, Vec<u8>>(0)?
                         .try_into()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    row.get::<_, Vec<u8>>(1)?
-                        .try_into()
+                    ContentKey::from_column(row.get::<_, Vec<u8>>(1)?)
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     row.get::<_, Vec<u8>>(2)?
                         .try_into()
@@ -1452,30 +1604,34 @@ pub(crate) fn insert_remote_operation(
             },
         )
         .optional()
-        .map_err(|_| storage_error())?
-        .ok_or(SynchronizationError::RuntimeUnavailable)?;
+        .map_err(|_| RemoteInsertError::Storage)?
+        .ok_or(RemoteInsertError::MissingScope)?;
     if sealed.content_key_id != content_key_id {
-        return Err(SynchronizationError::RuntimeUnavailable);
+        return Err(RemoteInsertError::KeyMismatch);
     }
     let protector = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
         content_key: key,
     };
-    let signed = protector
-        .open(&sealed)
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let signed = protector.open(&sealed).map_err(|error| {
+        if matches!(map_open_error(&error), SynchronizationError::WrongScope) {
+            RemoteInsertError::WrongScope
+        } else {
+            RemoteInsertError::Invalid
+        }
+    })?;
     if operation.header.verifying_key.as_bytes() != signed.author.as_bytes() {
-        return Err(SynchronizationError::CorruptRecord);
+        return Err(RemoteInsertError::Invalid);
     }
     let record_id = RecordId::digest(&signed.canonical_bytes());
     if record_id != sealed.record_id {
-        return Err(SynchronizationError::CorruptRecord);
+        return Err(RemoteInsertError::Invalid);
     }
     let teamarness_operation_id = RecordId::digest(&payload);
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|_| storage_error())?;
+        .map_err(|_| RemoteInsertError::Storage)?;
     let existing: Option<Vec<u8>> = transaction
         .query_row(
             "SELECT teamarness_operation_id FROM p2panda_operations WHERE operation_id=?1",
@@ -1483,22 +1639,25 @@ pub(crate) fn insert_remote_operation(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| storage_error())?;
+        .map_err(|_| RemoteInsertError::Storage)?;
     if let Some(existing) = existing {
         if existing != teamarness_operation_id.as_bytes() {
-            return Err(SynchronizationError::CorruptRecord);
+            return Err(RemoteInsertError::Invalid);
         }
         transaction
             .commit()
-            .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-        return record_from_row((
-            record_id.as_bytes().as_slice(),
-            sealed.order_key.as_bytes().as_slice(),
-            signed.author.as_bytes(),
-            &signed.purpose,
-            signed.signature.to_bytes().as_slice(),
-            &signed.canonical,
-            &payload,
+            .map_err(|_| RemoteInsertError::Storage)?;
+        return Ok(RemoteInsert::Duplicate(
+            record_from_row((
+                record_id.as_bytes().as_slice(),
+                sealed.order_key.as_bytes().as_slice(),
+                signed.author.as_bytes(),
+                &signed.purpose,
+                signed.signature.to_bytes().as_slice(),
+                &signed.canonical,
+                &payload,
+            ))
+            .map_err(|_| RemoteInsertError::Invalid)?,
         ));
     }
     let expected = transaction
@@ -1508,9 +1667,9 @@ pub(crate) fn insert_remote_operation(
             rusqlite::params![scope.as_slice(), operation.header.verifying_key.as_bytes()],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|_| storage_error())?;
+        .map_err(|_| RemoteInsertError::Storage)?;
     if i64::from(operation.header.seq_num) != expected {
-        return Err(SynchronizationError::CorruptRecord);
+        return Err(RemoteInsertError::Conflict);
     }
     let expected_backlink: Option<Vec<u8>> = if operation.header.seq_num == 0 {
         None
@@ -1527,34 +1686,57 @@ pub(crate) fn insert_remote_operation(
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| storage_error())?
+            .map_err(|_| RemoteInsertError::Storage)?
     };
     let actual_backlink = operation
         .header
         .backlink
         .map(|value| value.as_bytes().to_vec());
     if expected_backlink != actual_backlink {
-        return Err(SynchronizationError::CorruptRecord);
+        return Err(RemoteInsertError::Conflict);
+    }
+    // A height far beyond this scope's own is a claim nothing local can check,
+    // and it would push every later record behind it.
+    let local_max: Option<i64> = transaction
+        .query_row(
+            "SELECT MAX(causal_height) FROM immutable_operations
+             WHERE scope_id=?1 AND status='accepted'",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| RemoteInsertError::Storage)?;
+    let ceiling = local_max
+        .and_then(|height| u64::try_from(height).ok())
+        .unwrap_or(0)
+        .saturating_add(limits::MAX_HEIGHT_ADVANCE);
+    if sealed.order_key.height() > ceiling {
+        return Err(RemoteInsertError::HeightOutOfRange);
     }
     // All Teamarness rows and the P2Panda projection share this transaction.
     // An invalid projection therefore rolls back the accepted record too.
-    transaction
-        .execute(
-            "INSERT INTO immutable_operations(operation_id,scope_id,record_id,order_key,author_public_identity,author_sequence,operation_bytes,parents,causal_height,status)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted')",
-            rusqlite::params![
-                teamarness_operation_id.as_bytes().as_slice(),
-                scope.as_slice(),
-                record_id.as_bytes().as_slice(),
-                sealed.order_key.as_bytes().as_slice(),
-                signed.author.as_bytes(),
-                i64::from(operation.header.seq_num),
-                payload.as_slice(),
-                Vec::<u8>::new(),
-                sealed.order_key.height(),
-            ],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    let operation_id_bytes = teamarness_operation_id.as_bytes();
+    let record_id_bytes = record_id.as_bytes();
+    let order_bytes = sealed.order_key.as_bytes();
+    let author_bytes = signed.author.as_bytes();
+    let signature_bytes = signed.signature.to_bytes();
+    let row = journal_sql::AcceptedOperation {
+        operation_id: operation_id_bytes.as_slice(),
+        scope: scope.as_slice(),
+        record_id: record_id_bytes.as_slice(),
+        order_key: order_bytes.as_slice(),
+        author: author_bytes.as_slice(),
+        sequence: i64::from(operation.header.seq_num),
+        operation_bytes: payload.as_slice(),
+        parents: &[],
+        causal_height: sealed.order_key.height(),
+        purpose: &signed.purpose,
+        canonical: &signed.canonical,
+        signature: signature_bytes.as_slice(),
+        sealed_record: payload.as_slice(),
+        journal: journal.as_slice(),
+        created_at_unix_ms: now_unix_ms,
+    };
+    journal_sql::insert_operation(&transaction, &row).map_err(insert_error)?;
     operation_store::insert_remote(
         &transaction,
         scope,
@@ -1565,128 +1747,104 @@ pub(crate) fn insert_remote_operation(
         &signed.purpose,
         sealed.content_key_id,
     )
-    .map_err(|_| SynchronizationError::CorruptRecord)?;
-    transaction
-        .execute(
-            "INSERT INTO immutable_records(record_id,scope_id,purpose,canonical_digest,signature,sealed_record)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![
-                record_id.as_bytes().as_slice(),
-                scope.as_slice(),
-                signed.purpose,
-                Hash::digest(&signed.canonical).as_bytes().as_slice(),
-                signed.signature.to_bytes().as_slice(),
-                payload.as_slice(),
-            ],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
-    transaction
-        .execute(
-            "INSERT INTO sealed_envelopes(record_id,scope_id,envelope) VALUES(?1,?2,?3)",
-            rusqlite::params![
-                record_id.as_bytes().as_slice(),
-                scope.as_slice(),
-                payload.as_slice()
-            ],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
-    transaction
-        .execute(
-            "INSERT INTO immutable_idempotency(scope_id,author_public_identity,purpose,canonical_digest,record_id)
-             VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![
-                scope.as_slice(),
-                signed.author.as_bytes(),
-                signed.purpose,
-                Hash::digest(&signed.canonical).as_bytes().as_slice(),
-                record_id.as_bytes().as_slice(),
-            ],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
-    transaction
-        .execute(
-            "INSERT INTO immutable_author_heads(scope_id,author_public_identity,operation_id)
-             VALUES(?1,?2,?3)
-             ON CONFLICT(scope_id,author_public_identity) DO UPDATE SET operation_id=excluded.operation_id",
-            rusqlite::params![scope.as_slice(), signed.author.as_bytes(), teamarness_operation_id.as_bytes().as_slice()],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
-    transaction
-        .execute(
-            "INSERT INTO record_delivery(scope_id,journal_id,record_id,created_at_unix_ms)
-             VALUES(?1,?2,?3,0)",
-            rusqlite::params![
-                scope.as_slice(),
-                journal.as_slice(),
-                record_id.as_bytes().as_slice()
-            ],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
-    transaction
-        .execute(
-            "UPDATE durable_wakes SET wake_generation=wake_generation+1 WHERE scope_id=?1",
-            [scope.as_slice()],
-        )
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+    .map_err(|_| RemoteInsertError::Conflict)?;
+    let delivery_sequence =
+        journal_sql::insert_record_rows(&transaction, &row).map_err(insert_error)?;
     transaction
         .commit()
-        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
-    record_from_row((
-        record_id.as_bytes().as_slice(),
-        sealed.order_key.as_bytes().as_slice(),
-        signed.author.as_bytes(),
-        &signed.purpose,
-        signed.signature.to_bytes().as_slice(),
-        &signed.canonical,
-        &payload,
-    ))
-}
-
-pub(crate) fn records_for_replication(
-    conn: &rusqlite::Connection,
-    workspace: WorkspaceId,
-    package: &str,
-) -> Result<Vec<Vec<u8>>, SynchronizationError> {
-    let scope = scope_digest(package, workspace);
-    let mut statement = conn
-        .prepare("SELECT sealed_record FROM immutable_records WHERE scope_id=?1 ORDER BY record_id")
-        .map_err(|_| storage_error())?;
-    let rows = statement
-        .query_map([scope.as_slice()], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(|_| storage_error())?;
-    rows.map(|row| row.map_err(|_| storage_error())).collect()
-}
-
-pub(crate) fn event_for_record(
-    conn: &rusqlite::Connection,
-    workspace: WorkspaceId,
-    package: &str,
-    record: ImmutableRecord,
-) -> Option<RecordEvent> {
-    let scope = scope_digest(package, workspace);
-    let (journal, sequence): (Vec<u8>, i64) = conn
-        .query_row(
-            "SELECT sync_scopes.journal_id, record_delivery.delivery_sequence
-         FROM sync_scopes JOIN record_delivery USING(scope_id)
-         WHERE sync_scopes.scope_id=?1 AND record_delivery.record_id=?2",
-            rusqlite::params![scope.as_slice(), record.record_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok()?;
-    let journal: [u8; 16] = journal.try_into().ok()?;
-    let sequence = u64::try_from(sequence).ok()?;
-    Some(RecordEvent {
-        record,
-        cursor: Cursor::new(journal, sequence),
+        .map_err(|_| RemoteInsertError::Storage)?;
+    Ok(RemoteInsert::Applied {
+        record: record_from_row((
+            record_id.as_bytes().as_slice(),
+            sealed.order_key.as_bytes().as_slice(),
+            signed.author.as_bytes(),
+            &signed.purpose,
+            signed.signature.to_bytes().as_slice(),
+            &signed.canonical,
+            &payload,
+        ))
+        .map_err(|_| RemoteInsertError::Invalid)?,
+        delivery_sequence,
     })
+}
+
+/// Refuses a data directory that still holds retired version-1 protection
+/// controls, and proves that every control addressed to this Installation still
+/// opens to the content key its scope records.
+fn validate_protection_controls(
+    conn: &rusqlite::Connection,
+    secret: &SecretKey,
+) -> Result<(), StorageError> {
+    let local = PublicIdentity::from_bytes(*secret.public().as_bytes())
+        .map_err(|_| StorageError::CorruptIdentity)?;
+    let controls: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT scope_id,recipient_public_identity,control_bytes
+                 FROM protection_control_operations",
+            )
+            .map_err(fault!(StorageError::Database))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(fault!(StorageError::Database))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|_| StorageError::CorruptWorkspace)?
+    };
+    for (scope, recipient, bytes) in controls {
+        let control = protection_control::decode(&bytes)?;
+        if recipient != control.recipient.as_bytes().as_slice() {
+            return Err(StorageError::CorruptWorkspace);
+        }
+        if control.recipient != local {
+            continue;
+        }
+        let scope_id: [u8; 32] = scope
+            .clone()
+            .try_into()
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+        // A scope that restart already isolated is not held against the
+        // Installation a second time.
+        if quarantine::is_scope_quarantined(conn, scope_id)
+            .map_err(fault!(StorageError::Database))?
+        {
+            continue;
+        }
+        let key = protection_control::open_control(
+            &control,
+            &bytes[..protection_control::AAD_END],
+            secret,
+        )?;
+        let scope_key_id: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT content_key_id FROM sync_scopes WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(fault!(StorageError::Database))?;
+        let Some(scope_key_id) = scope_key_id else {
+            return Err(StorageError::CorruptWorkspace);
+        };
+        if scope_key_id != key.id().as_slice() {
+            return Err(StorageError::CorruptWorkspace);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn recover(
     conn: &mut rusqlite::Connection,
     secret: &SecretKey,
-) -> Result<(), StorageError> {
+    now_unix_ms: i64,
+) -> Result<RecoveryReport, StorageError> {
     let scopes: Vec<ScopeRecoveryRow> = {
-        let mut stmt = conn.prepare("SELECT scope_id,package_identity,workspace_id,content_key,content_key_id FROM sync_scopes").map_err(|_| StorageError::Database)?;
+        let mut stmt = conn.prepare("SELECT scope_id,package_identity,workspace_id,content_key,content_key_id FROM sync_scopes").map_err(fault!(StorageError::Database))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -1697,7 +1855,7 @@ pub(crate) fn recover(
                     r.get::<_, Vec<u8>>(4)?,
                 ))
             })
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         rows.map(|row| {
             let (scope, package, workspace, key, id) =
                 row.map_err(|_| StorageError::CorruptWorkspace)?;
@@ -1711,56 +1869,173 @@ pub(crate) fn recover(
                         .try_into()
                         .map_err(|_| StorageError::CorruptWorkspace)?,
                 ),
-                key.try_into().map_err(|_| StorageError::CorruptWorkspace)?,
+                ContentKey::from_column(key).map_err(|_| StorageError::CorruptWorkspace)?,
                 id.try_into().map_err(|_| StorageError::CorruptWorkspace)?,
             ))
         })
         .collect::<Result<_, StorageError>>()?
     };
     operation_store::repair(conn, secret)?;
-    operation_store::validate(conn)?;
+    let mut report = RecoveryReport::default();
+    // Scope identity comes first: a scope whose binding or key identity is
+    // broken is isolated before anything that reads it runs.
+    let mut sound: Vec<([u8; 32], String, WorkspaceId, ContentKey)> =
+        Vec::with_capacity(scopes.len());
     for (scope, package, workspace, key, id) in scopes {
-        if scope_digest(&package, workspace) != scope || key_id(&key) != id {
-            return Err(StorageError::CorruptWorkspace);
+        report.scopes_checked += 1;
+        if quarantine::is_scope_quarantined(conn, scope).map_err(fault!(StorageError::Database))? {
+            report.scopes_quarantined += 1;
+            continue;
         }
-        let protector = P2pandaRecordProtection {
-            package_identity: package,
-            workspace_id: workspace,
-            content_key: key,
+        let fault = if scope_digest(&package, workspace) != scope {
+            Some(quarantine::ScopeFault::ScopeBinding)
+        } else if key.id() != id {
+            Some(quarantine::ScopeFault::ContentKeyId)
+        } else {
+            None
         };
+        if let Some(fault) = fault {
+            quarantine::quarantine_scope(conn, scope, fault, now_unix_ms)
+                .map_err(fault!(StorageError::Database))?;
+            report.scopes_quarantined += 1;
+            continue;
+        }
+        sound.push((scope, package, workspace, key));
+    }
+    validate_protection_controls(conn, secret)?;
+    for (scope, package, workspace, key) in sound {
+        validate_scope_records(
+            conn,
+            scope,
+            &package,
+            workspace,
+            key,
+            now_unix_ms,
+            &mut report,
+        )?;
+    }
+    Ok(report)
+}
+
+/// Validates the records of one scope committed since its last validated start
+/// and moves the scope's validation mark forward.
+///
+/// A projection fault isolates the scope and stops it here; a decode, order-key
+/// or open fault isolates that one record and validation continues.
+fn validate_scope_records(
+    conn: &mut rusqlite::Connection,
+    scope: [u8; 32],
+    package: &str,
+    workspace: WorkspaceId,
+    key: ContentKey,
+    now_unix_ms: i64,
+    report: &mut RecoveryReport,
+) -> Result<(), StorageError> {
+    let mark: i64 = conn
+        .query_row(
+            "SELECT validated_through_sequence FROM scope_validation WHERE scope_id=?1",
+            [scope.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(fault!(StorageError::Database))?
+        .unwrap_or(0);
+    type PendingRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    let pending: Vec<PendingRow> = {
         let mut stmt = conn
             .prepare(
-                "SELECT r.record_id,o.order_key,r.sealed_record FROM immutable_records r JOIN immutable_operations o ON o.record_id=r.record_id WHERE r.scope_id=?1",
+                "SELECT d.delivery_sequence,r.record_id,o.order_key,r.sealed_record,o.operation_id
+                 FROM record_delivery d
+                 JOIN immutable_records r ON r.record_id=d.record_id
+                 JOIN immutable_operations o ON o.record_id=r.record_id
+                 WHERE d.scope_id=?1 AND d.delivery_sequence>?2
+                 ORDER BY d.delivery_sequence",
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         let rows = stmt
-            .query_map([scope.as_slice()], |r| {
+            .query_map(rusqlite::params![scope.as_slice(), mark], |r| {
                 Ok((
-                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
                     r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
                 ))
             })
-            .map_err(|_| StorageError::Database)?;
-        for row in rows {
-            let (record_id, order, bytes) = row.map_err(|_| StorageError::CorruptWorkspace)?;
-            let sealed =
-                SealedRecordV1::decode(&bytes).map_err(|_| StorageError::CorruptWorkspace)?;
-            let expected_id: [u8; 32] = record_id
-                .try_into()
-                .map_err(|_| StorageError::CorruptWorkspace)?;
-            let expected_order: [u8; 41] = order
-                .try_into()
-                .map_err(|_| StorageError::CorruptWorkspace)?;
-            if sealed.scope_digest != scope
-                || sealed.record_id.as_bytes() != expected_id
-                || sealed.order_key.as_bytes() != expected_order
-                || protector.open(&sealed).is_err()
-            {
-                return Err(StorageError::CorruptWorkspace);
-            }
-        }
+            .map_err(fault!(StorageError::Database))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(fault!(StorageError::Database))?
+    };
+    if pending.is_empty() {
+        return Ok(());
     }
+    let protector = P2pandaRecordProtection {
+        package_identity: package.to_owned(),
+        workspace_id: workspace,
+        content_key: key,
+    };
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(fault!(StorageError::Database))?;
+    let mut scope_isolated = false;
+    let mut validated_through = mark;
+    for (sequence, record_id, order, bytes, operation_id) in pending {
+        if operation_store::validate_projection_row(&transaction, &operation_id).is_err() {
+            quarantine::quarantine_scope(
+                &transaction,
+                scope,
+                quarantine::ScopeFault::Projection,
+                now_unix_ms,
+            )
+            .map_err(fault!(StorageError::Database))?;
+            report.scopes_quarantined += 1;
+            scope_isolated = true;
+            break;
+        }
+        let expected_id: [u8; 32] = record_id
+            .try_into()
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+        let expected_order: [u8; 41] = order
+            .try_into()
+            .map_err(|_| StorageError::CorruptWorkspace)?;
+        let fault = match SealedRecordV1::decode(&bytes) {
+            Err(error) if error.value_name() == "order key binding" => {
+                Some(quarantine::RecordFault::OrderKey)
+            }
+            Err(_) => Some(quarantine::RecordFault::Decode),
+            Ok(sealed) => {
+                if sealed.scope_digest != scope
+                    || sealed.record_id.as_bytes() != expected_id
+                    || sealed.order_key.as_bytes() != expected_order
+                {
+                    Some(quarantine::RecordFault::Decode)
+                } else if protector.open(&sealed).is_err() {
+                    Some(quarantine::RecordFault::Open)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(fault) = fault {
+            quarantine::quarantine_record(&transaction, scope, expected_id, fault, now_unix_ms)
+                .map_err(fault!(StorageError::Database))?;
+            report.records_quarantined += 1;
+        }
+        report.records_validated += 1;
+        validated_through = sequence;
+    }
+    if !scope_isolated {
+        transaction
+            .execute(
+                "INSERT INTO scope_validation(scope_id,validated_through_sequence) VALUES(?1,?2)
+                 ON CONFLICT(scope_id) DO UPDATE SET validated_through_sequence=excluded.validated_through_sequence",
+                rusqlite::params![scope.as_slice(), validated_through],
+            )
+            .map_err(fault!(StorageError::Database))?;
+    }
+    transaction
+        .commit()
+        .map_err(fault!(StorageError::UncertainOutcome))?;
     Ok(())
 }
 
@@ -1800,6 +2075,46 @@ mod tests {
         }
 
         #[test]
+        fn decode_rejects_order_key_with_wrong_version() {
+            let record = signed();
+            let id = RecordId::digest(&record.canonical_bytes());
+            let mut order = OrderKey::from_height_and_id(3, id).as_bytes();
+            order[0] = 2;
+            let sealed = SealedRecordV1 {
+                scope_digest: [1; 32],
+                record_id: id,
+                order_key: OrderKey(order),
+                content_key_id: [2; 32],
+                nonce: [3; 24],
+                ciphertext: vec![4],
+            };
+
+            let error = SealedRecordV1::decode(&sealed.encode())
+                .expect_err("an order key of another version must not decode");
+
+            assert_eq!(error.to_string(), "invalid order key binding");
+        }
+
+        #[test]
+        fn decode_rejects_order_key_embedding_another_record_id() {
+            let record = signed();
+            let id = RecordId::digest(&record.canonical_bytes());
+            let sealed = SealedRecordV1 {
+                scope_digest: [1; 32],
+                record_id: id,
+                order_key: OrderKey::from_height_and_id(3, RecordId([9; 32])),
+                content_key_id: [2; 32],
+                nonce: [3; 24],
+                ciphertext: vec![4],
+            };
+
+            let error = SealedRecordV1::decode(&sealed.encode())
+                .expect_err("an order key naming another record must not decode");
+
+            assert_eq!(error.to_string(), "invalid order key binding");
+        }
+
+        #[test]
         fn malformed_contract_values_are_rejected() {
             assert!(RecordId::from_str("00").is_err());
             assert!(OrderKey::from_str(&"00".repeat(41)).is_err());
@@ -1826,32 +2141,6 @@ mod tests {
             );
             assert!(validate_open_batch(&[]).is_err());
             assert!(validate_open_batch(&[vec![0; MAX_OPEN_BYTES + 1]]).is_err());
-            assert!(validate_frontier(MAX_PARENTS + 1).is_err());
-        }
-    }
-
-    pub(crate) mod replica_compatibility {
-        use super::*;
-        #[test]
-        fn deterministic_replica_and_store_deduplicate_operations() {
-            let replica = DeterministicReplica;
-            let operation = b"operation";
-            assert_eq!(replica.record_id(operation), replica.record_id(operation));
-            let record = signed();
-            let id = RecordId::digest(&record.canonical_bytes());
-            let sealed = SealedRecordV1 {
-                scope_digest: [1; 32],
-                record_id: id,
-                order_key: OrderKey::from_height_and_id(0, id),
-                content_key_id: [2; 32],
-                nonce: [3; 24],
-                ciphertext: vec![4],
-            };
-            let mut store = DeterministicStore(Vec::new());
-            store.put(sealed.clone()).unwrap();
-            store.put(sealed).unwrap();
-            assert_eq!(store.0.len(), 1);
-            assert_eq!(DeterministicTransport.bounds(), (4_096, 64 * 1024 * 1024));
         }
     }
 
@@ -1863,7 +2152,7 @@ mod tests {
             let protector = P2pandaRecordProtection {
                 package_identity: record.package_identity.clone(),
                 workspace_id: record.workspace_id,
-                content_key: [9; 32],
+                content_key: ContentKey::from_column(vec![9; 32]).unwrap(),
             };
             let id = RecordId::digest(&record.canonical_bytes());
             let sealed = protector
@@ -1881,21 +2170,85 @@ mod tests {
             assert!(wrong.open(&sealed).is_err());
         }
 
+        fn seal_into(
+            record: &SignedRecordV1,
+            package_identity: &str,
+            workspace_id: WorkspaceId,
+        ) -> (P2pandaRecordProtection, SealedRecordV1) {
+            let protector = P2pandaRecordProtection {
+                package_identity: package_identity.to_owned(),
+                workspace_id,
+                content_key: ContentKey::from_column(vec![9; 32]).unwrap(),
+            };
+            let id = RecordId::digest(&record.canonical_bytes());
+            let sealed = protector
+                .seal(record, OrderKey::from_height_and_id(2, id))
+                .unwrap();
+            (protector, sealed)
+        }
+
+        // Verifies: TEAM.SYS.TRANS-R06
         #[test]
-        fn serialized_secret_and_concurrent_holders_keep_one_key_id() {
+        fn open_rejects_record_signed_for_another_package() {
+            let record = signed();
+            let (protector, sealed) = seal_into(&record, "other.package", record.workspace_id);
+
+            let Err(error) = protector.open(&sealed) else {
+                panic!("a record signed for another scope must not open");
+            };
+
+            assert_eq!(error.to_string(), "invalid record scope binding");
+            assert_eq!(map_open_error(&error), SynchronizationError::WrongScope);
+        }
+
+        // Verifies: TEAM.SYS.TRANS-R06
+        #[test]
+        fn open_rejects_record_signed_for_another_workspace() {
+            let record = signed();
+            let (protector, sealed) = seal_into(
+                &record,
+                &record.package_identity,
+                WorkspaceId::from_bytes([4; 16]),
+            );
+
+            let Err(error) = protector.open(&sealed) else {
+                panic!("a record signed for another scope must not open");
+            };
+
+            assert_eq!(error.to_string(), "invalid record scope binding");
+            assert_eq!(map_open_error(&error), SynchronizationError::WrongScope);
+        }
+
+        #[test]
+        fn open_accepts_record_for_its_own_scope() {
+            let record = signed();
+            let (protector, sealed) =
+                seal_into(&record, &record.package_identity, record.workspace_id);
+
+            let opened = protector.open(&sealed).unwrap();
+
+            assert_eq!(opened.canonical, record.canonical);
+            assert_eq!(opened.package_identity, record.package_identity);
+            assert_eq!(opened.workspace_id, record.workspace_id);
+            assert_eq!(
+                map_open_error(&ValueParseError::new("record decryption")),
+                SynchronizationError::CorruptRecord
+            );
+        }
+
+        #[test]
+        fn concurrent_holders_keep_one_key_id() {
             let first = P2pandaRecordProtection {
                 package_identity: "pkg".into(),
                 workspace_id: WorkspaceId::from_bytes([1; 16]),
-                content_key: [8; 32],
+                content_key: ContentKey::from_column(vec![8; 32]).unwrap(),
             };
             let second = P2pandaRecordProtection {
-                content_key: first.content_key,
+                content_key: first.content_key.clone(),
                 ..first.clone()
             };
+
             assert_eq!(first.key_id(), second.key_id());
-            let serialized = serde_json::to_vec(&first.content_key).unwrap();
-            let restored: [u8; 32] = serde_json::from_slice(&serialized).unwrap();
-            assert_eq!(restored, first.content_key);
         }
     }
 }

@@ -88,13 +88,17 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         .unwrap(),
         PackageHostOutcome::UiResponse { .. }
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        std::fs::read_dir(fixture._private.join("packages/logs"))
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().ends_with("log.1"))
-    );
+    common::eventually(
+        std::time::Duration::from_secs(5),
+        "the Backend's stderr is rotated into packages/logs",
+        || async {
+            std::fs::read_dir(fixture._private.join("packages/logs"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with("log.1"))
+        },
+    )
+    .await;
 
     assert!(matches!(
         host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
@@ -149,6 +153,7 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
             }))
             .await
     });
+    // settle: lets the request reach the Backend before it is cancelled.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(matches!(
         host.execute(PackageHostCommand::CancelUiRequest(CancelUiRequest {

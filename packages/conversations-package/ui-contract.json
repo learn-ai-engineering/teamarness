@@ -4,15 +4,16 @@
     "channelId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
     "slug": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 },
     "before": { "type": "string", "minLength": 1 },
-    "availability": { "type": "string", "enum": ["waiting_for_history_access", "offline", "catching_up", "current", "degraded"] },
+    "availability": { "type": "string", "enum": ["waiting_for_history_access", "offline", "catching_up", "current"] },
     "channel": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "slug", "canHide"],
+      "required": ["id", "slug", "canHide", "unreadCount"],
       "properties": {
         "id": { "$ref": "#/$defs/channelId" },
         "slug": { "$ref": "#/$defs/slug" },
-        "canHide": { "type": "boolean" }
+        "canHide": { "type": "boolean" },
+        "unreadCount": { "type": "integer", "minimum": 0 }
       }
     },
     "message": {

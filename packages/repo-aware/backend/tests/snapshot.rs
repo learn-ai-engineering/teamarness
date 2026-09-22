@@ -1,6 +1,6 @@
 use std::fs;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use teamarness_repo_aware_package::error;
 use teamarness_repo_aware_package::registration;
@@ -57,8 +57,8 @@ fn snapshot_all_fields() {
     assert!(result.github_url.is_none());
     assert_eq!(result.head.kind, "branch");
     assert!(
-        result.head.name.as_deref() == Some("master") ||
-        result.head.name.as_deref() == Some("main")
+        result.head.name.as_deref() == Some("master")
+            || result.head.name.as_deref() == Some("main")
     );
     assert!(result.head.commit.is_none());
     assert!(!result.commit.is_empty());
@@ -222,7 +222,10 @@ fn normalize_github_url_ssh() {
 
 #[test]
 fn normalize_github_url_unrecognized() {
-    assert_eq!(normalize_github_url(Some("https://gitlab.com/owner/repo.git")), None);
+    assert_eq!(
+        normalize_github_url(Some("https://gitlab.com/owner/repo.git")),
+        None
+    );
     assert_eq!(normalize_github_url(Some("https://example.com/repo")), None);
     assert_eq!(normalize_github_url(None), None);
 }
@@ -235,7 +238,12 @@ fn snapshot_with_origin_remote() {
 
     // Set origin remote
     std::process::Command::new("git")
-        .args(["remote", "add", "origin", "https://github.com/owner/repo.git"])
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ])
         .current_dir(&git_path)
         .output()
         .unwrap();
@@ -249,8 +257,14 @@ fn snapshot_with_origin_remote() {
     let cancel = Arc::new(AtomicBool::new(false));
     let result = snapshot::compute_snapshot(&id, &store, cancel).unwrap();
 
-    assert_eq!(result.origin_remote, Some("https://github.com/owner/repo.git".into()));
-    assert_eq!(result.github_url, Some("https://github.com/owner/repo".into()));
+    assert_eq!(
+        result.origin_remote,
+        Some("https://github.com/owner/repo.git".into())
+    );
+    assert_eq!(
+        result.github_url,
+        Some("https://github.com/owner/repo".into())
+    );
 }
 
 #[test]
@@ -274,5 +288,8 @@ fn snapshot_with_ssh_origin() {
     let cancel = Arc::new(AtomicBool::new(false));
     let result = snapshot::compute_snapshot(&id, &store, cancel).unwrap();
 
-    assert_eq!(result.github_url, Some("https://github.com/owner/repo".into()));
+    assert_eq!(
+        result.github_url,
+        Some("https://github.com/owner/repo".into())
+    );
 }

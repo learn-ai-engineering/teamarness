@@ -18,7 +18,9 @@ fn private_data_directory() -> PathBuf {
 async fn public_runtime_local_workflow_is_network_independent_and_survives_reopen() {
     let directory = private_data_directory();
     let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open(config.clone()).await.unwrap();
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let identity = runtime.public_identity();
 
     let workspace = runtime.create_workspace("Acceptance Workspace").unwrap();
@@ -39,7 +41,7 @@ async fn public_runtime_local_workflow_is_network_independent_and_survives_reope
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let reopened = CoreRuntime::open(config).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     assert_eq!(reopened.public_identity(), identity);
     assert_eq!(reopened.list_workspaces().unwrap(), vec![workspace]);
     assert_eq!(

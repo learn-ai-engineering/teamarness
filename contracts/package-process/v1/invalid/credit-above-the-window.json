@@ -1,0 +1,37 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "stream_open",
+        "id": "h:above-the-window",
+        "topic": "ui.events",
+        "mountId": "bW91bnQx",
+        "initialCredit": 32,
+        "payload": {}
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:above-the-window",
+        "sequence": "1",
+        "payload": {}
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "credit",
+        "streamId": "h:above-the-window",
+        "amount": 2
+      }
+    }
+  ],
+  "expectedError": "credit_violation",
+  "description": "credit carrying a stream past the window it was opened with"
+}

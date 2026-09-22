@@ -4,14 +4,14 @@
   "version": "0.1.0",
   "identifier": "dev.teamarness.desktop",
   "build": {
-    "beforeDevCommand": "npm run build:application-packages && npm run dev",
+    "beforeDevCommand": "npm run build:application-packages && npm run build:frame-runtime && npm run dev",
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build:application-packages && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost teamarness-package:; img-src 'self' data: teamarness-package:; font-src 'self' teamarness-package:; style-src 'self' teamarness-package:; script-src 'self' teamarness-package:"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; font-src 'self'; style-src 'self'; script-src 'self'; frame-src teamarness-package:"
     },
     "windows": [
       {

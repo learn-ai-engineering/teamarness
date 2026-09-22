@@ -1,21 +1,30 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! Host adapter over the shared UI contract profile, plus the admitted UI resource cache.
+//!
+//! The profile rules live in `teamarness-package-contract` so the author validator applies the
+//! same code. This module keeps the Host's cache, resource resolution and error mapping.
+
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
-use jsonschema::{Draft, Validator};
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use teamarness_package_contract::ui_contract as contract;
 
-use crate::manifest::{LoadedManifest, VerifiedFile, sha256, strict_json};
+use crate::manifest::{LoadedManifest, VerifiedFile, sha256};
 use crate::{PackageErrorCode, PackageValue};
 
-pub(crate) const MAX_UI_PAYLOAD_BYTES: usize = 256 * 1024;
-const MAX_CONTRACT_BYTES: usize = 1024 * 1024;
-const MAX_SCHEMA_DEPTH: usize = 64;
-const MAX_SCHEMA_NODES: usize = 16_384;
-const MAX_OPERATIONS_PER_DIRECTION: usize = 128;
-const MAX_OPERATIONS: usize = 256;
+// The protocol layer bounds UI payloads with the shared constant; a `#[path]`-included test
+// module may not use it.
+#[allow(unused_imports)]
+pub(crate) use teamarness_package_contract::ui_contract::MAX_UI_PAYLOAD_BYTES;
+
+/// The event streams one Package UI Mount may hold open at once.
+///
+/// The Shell enforces the same bound before it asks (`MAX_OPEN_SUBSCRIPTIONS`
+/// in `package-frame/protocol.ts`); `check-protocol-bounds.mjs` reads both so
+/// neither can move alone. A Shell that allowed more would have its extra
+/// subscriptions refused here as `overloaded`.
+pub const MAX_UI_SUBSCRIPTIONS_PER_MOUNT: usize = 8;
 
 #[derive(Debug)]
 pub(crate) struct UiContractFailure {
@@ -27,44 +36,9 @@ pub(crate) struct AdmittedUi {
     pub(crate) contract: CompiledUiContract,
 }
 
-pub(crate) struct CompiledUiContract {
-    requests: BTreeMap<String, DirectionalRequest>,
-    subscriptions: BTreeMap<String, DirectionalSubscription>,
-}
-
-struct DirectionalRequest {
-    request: Validator,
-    response: Validator,
-}
-
-struct DirectionalSubscription {
-    request: Validator,
-    event: Validator,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ContractDocument {
-    schema_version: u16,
-    #[serde(rename = "$defs")]
-    definitions: Map<String, Value>,
-    requests: BTreeMap<String, RequestDescriptor>,
-    subscriptions: BTreeMap<String, SubscriptionDescriptor>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RequestDescriptor {
-    request: Value,
-    response: Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SubscriptionDescriptor {
-    request: Value,
-    event: Value,
-}
+/// An admitted UI contract. The Host reports only the stable code; the shared crate's `rule` and
+/// `pointer` are author diagnostics and stop here.
+pub(crate) struct CompiledUiContract(contract::CompiledUiContract);
 
 #[derive(Debug, Clone)]
 pub(crate) struct UiCacheRecord {
@@ -93,10 +67,7 @@ impl CompiledUiContract {
         operation: &str,
         payload: &PackageValue,
     ) -> Result<(), UiContractFailure> {
-        self.requests
-            .get(operation)
-            .ok_or_else(failure)
-            .and_then(|entry| validate_payload(&entry.request, payload))
+        self.validate(payload, |value| self.0.validate_request(operation, value))
     }
 
     pub(crate) fn validate_response(
@@ -104,10 +75,7 @@ impl CompiledUiContract {
         operation: &str,
         payload: &PackageValue,
     ) -> Result<(), UiContractFailure> {
-        self.requests
-            .get(operation)
-            .ok_or_else(failure)
-            .and_then(|entry| validate_payload(&entry.response, payload))
+        self.validate(payload, |value| self.0.validate_response(operation, value))
     }
 
     pub(crate) fn validate_subscription(
@@ -115,10 +83,9 @@ impl CompiledUiContract {
         operation: &str,
         payload: &PackageValue,
     ) -> Result<(), UiContractFailure> {
-        self.subscriptions
-            .get(operation)
-            .ok_or_else(failure)
-            .and_then(|entry| validate_payload(&entry.request, payload))
+        self.validate(payload, |value| {
+            self.0.validate_subscription(operation, value)
+        })
     }
 
     pub(crate) fn validate_event(
@@ -126,273 +93,23 @@ impl CompiledUiContract {
         operation: &str,
         payload: &PackageValue,
     ) -> Result<(), UiContractFailure> {
-        self.subscriptions
-            .get(operation)
-            .ok_or_else(failure)
-            .and_then(|entry| validate_payload(&entry.event, payload))
+        self.validate(payload, |value| self.0.validate_event(operation, value))
+    }
+
+    fn validate(
+        &self,
+        payload: &PackageValue,
+        check: impl FnOnce(&serde_json::Value) -> Result<(), teamarness_package_contract::ContractError>,
+    ) -> Result<(), UiContractFailure> {
+        let value = serde_json::to_value(payload).map_err(|_| failure())?;
+        check(&value).map_err(|_| failure())
     }
 }
 
 pub(crate) fn compile_contract(bytes: &[u8]) -> Result<CompiledUiContract, UiContractFailure> {
-    if bytes.len() > MAX_CONTRACT_BYTES {
-        return Err(failure());
-    }
-    let value = strict_json(bytes).map_err(|_| failure())?;
-    let document: ContractDocument = serde_json::from_value(value).map_err(|_| failure())?;
-    if document.schema_version != 1
-        || document.requests.len() > MAX_OPERATIONS_PER_DIRECTION
-        || document.subscriptions.len() > MAX_OPERATIONS_PER_DIRECTION
-        || document.requests.len() + document.subscriptions.len() > MAX_OPERATIONS
-    {
-        return Err(failure());
-    }
-    if document
-        .requests
-        .keys()
-        .chain(document.subscriptions.keys())
-        .any(|name| !valid_operation_name(name))
-    {
-        return Err(failure());
-    }
-
-    let mut node_count = 0;
-    let definition_names: BTreeSet<_> = document.definitions.keys().cloned().collect();
-    let mut definition_edges = BTreeMap::new();
-    for (name, schema) in &document.definitions {
-        let mut references = BTreeSet::new();
-        walk_schema(
-            schema,
-            0,
-            &mut node_count,
-            &definition_names,
-            &mut references,
-        )?;
-        definition_edges.insert(name.clone(), references);
-    }
-    for descriptor in document.requests.values() {
-        walk_schema(
-            &descriptor.request,
-            0,
-            &mut node_count,
-            &definition_names,
-            &mut BTreeSet::new(),
-        )?;
-        walk_schema(
-            &descriptor.response,
-            0,
-            &mut node_count,
-            &definition_names,
-            &mut BTreeSet::new(),
-        )?;
-    }
-    for descriptor in document.subscriptions.values() {
-        walk_schema(
-            &descriptor.request,
-            0,
-            &mut node_count,
-            &definition_names,
-            &mut BTreeSet::new(),
-        )?;
-        walk_schema(
-            &descriptor.event,
-            0,
-            &mut node_count,
-            &definition_names,
-            &mut BTreeSet::new(),
-        )?;
-    }
-    reject_reference_cycles(&definition_edges)?;
-
-    let definitions = Value::Object(document.definitions);
-    let requests = document
-        .requests
-        .into_iter()
-        .map(|(name, descriptor)| {
-            Ok((
-                name,
-                DirectionalRequest {
-                    request: compile_schema(&definitions, descriptor.request)?,
-                    response: compile_schema(&definitions, descriptor.response)?,
-                },
-            ))
-        })
-        .collect::<Result<_, UiContractFailure>>()?;
-    let subscriptions = document
-        .subscriptions
-        .into_iter()
-        .map(|(name, descriptor)| {
-            Ok((
-                name,
-                DirectionalSubscription {
-                    request: compile_schema(&definitions, descriptor.request)?,
-                    event: compile_schema(&definitions, descriptor.event)?,
-                },
-            ))
-        })
-        .collect::<Result<_, UiContractFailure>>()?;
-    Ok(CompiledUiContract {
-        requests,
-        subscriptions,
-    })
-}
-
-fn compile_schema(definitions: &Value, schema: Value) -> Result<Validator, UiContractFailure> {
-    let wrapped = json!({"$defs": definitions, "allOf": [schema]});
-    jsonschema::options()
-        .with_draft(Draft::Draft202012)
-        .build(&wrapped)
+    contract::compile_ui_contract(bytes)
+        .map(CompiledUiContract)
         .map_err(|_| failure())
-}
-
-fn valid_operation_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 128 || !name.is_ascii() {
-        return false;
-    }
-    name.split('.').all(|segment| {
-        !segment.is_empty()
-            && segment.as_bytes()[0].is_ascii_lowercase()
-            && segment.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-            })
-    })
-}
-
-fn walk_schema(
-    value: &Value,
-    depth: usize,
-    node_count: &mut usize,
-    definitions: &BTreeSet<String>,
-    references: &mut BTreeSet<String>,
-) -> Result<(), UiContractFailure> {
-    *node_count += 1;
-    if *node_count > MAX_SCHEMA_NODES
-        || (matches!(value, Value::Object(_) | Value::Array(_)) && depth > MAX_SCHEMA_DEPTH)
-    {
-        return Err(failure());
-    }
-    match value {
-        Value::Object(object) => {
-            for forbidden in [
-                "$dynamicRef",
-                "$dynamicAnchor",
-                "$recursiveRef",
-                "$recursiveAnchor",
-            ] {
-                if object.contains_key(forbidden) {
-                    return Err(failure());
-                }
-            }
-            if let Some(reference) = object.get("$ref") {
-                let target = definition_reference(reference.as_str().ok_or_else(failure)?)?;
-                if !definitions.contains(&target) {
-                    return Err(failure());
-                }
-                references.insert(target);
-            }
-            for child in object.values() {
-                walk_schema(child, depth + 1, node_count, definitions, references)?;
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                walk_schema(child, depth + 1, node_count, definitions, references)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn definition_reference(reference: &str) -> Result<String, UiContractFailure> {
-    let encoded = reference.strip_prefix("#/$defs/").ok_or_else(failure)?;
-    if encoded.is_empty() || encoded.contains('/') {
-        return Err(failure());
-    }
-    let mut decoded = String::new();
-    let mut chars = encoded.chars();
-    while let Some(character) = chars.next() {
-        if character != '~' {
-            decoded.push(character);
-            continue;
-        }
-        match chars.next() {
-            Some('0') => decoded.push('~'),
-            Some('1') => decoded.push('/'),
-            _ => return Err(failure()),
-        }
-    }
-    Ok(decoded)
-}
-
-fn reject_reference_cycles(
-    references: &BTreeMap<String, BTreeSet<String>>,
-) -> Result<(), UiContractFailure> {
-    fn visit(
-        node: &str,
-        references: &BTreeMap<String, BTreeSet<String>>,
-        active: &mut BTreeSet<String>,
-        complete: &mut BTreeSet<String>,
-    ) -> bool {
-        if active.contains(node) {
-            return false;
-        }
-        if complete.contains(node) {
-            return true;
-        }
-        active.insert(node.to_owned());
-        if references.get(node).is_some_and(|targets| {
-            targets
-                .iter()
-                .any(|target| !visit(target, references, active, complete))
-        }) {
-            return false;
-        }
-        active.remove(node);
-        complete.insert(node.to_owned());
-        true
-    }
-    let mut active = BTreeSet::new();
-    let mut complete = BTreeSet::new();
-    for node in references.keys() {
-        if !visit(node, references, &mut active, &mut complete) {
-            return Err(failure());
-        }
-    }
-    Ok(())
-}
-
-fn validate_payload(
-    validator: &Validator,
-    payload: &PackageValue,
-) -> Result<(), UiContractFailure> {
-    let value = serde_json::to_value(payload).map_err(|_| failure())?;
-    let bytes = serde_json::to_vec(&value).map_err(|_| failure())?;
-    if bytes.len() > MAX_UI_PAYLOAD_BYTES || value_depth(&value, 0)? > MAX_SCHEMA_DEPTH {
-        return Err(failure());
-    }
-    validator.validate(&value).map_err(|_| failure())
-}
-
-fn value_depth(value: &Value, depth: usize) -> Result<usize, UiContractFailure> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return Err(failure());
-    }
-    let child_depth = match value {
-        Value::Array(values) => values
-            .iter()
-            .map(|child| value_depth(child, depth + 1))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .max(),
-        Value::Object(values) => values
-            .values()
-            .map(|child| value_depth(child, depth + 1))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .max(),
-        _ => None,
-    };
-    Ok(child_depth.unwrap_or(depth))
 }
 
 pub(crate) fn populate_cache(

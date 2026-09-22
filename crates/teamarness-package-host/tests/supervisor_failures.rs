@@ -15,7 +15,11 @@ use teamarness_package_host::{
     LifecycleState, OpenUiMount, PackageHost, PackageHostCommand, PackageHostOutcome,
     RecoverPackage, UiRequest, UiRequestId,
 };
-pub use teamarness_package_host::{PackageErrorCode, PackageIdentity, PackageValue};
+pub use teamarness_package_host::{
+    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH,
+    MAX_UI_SUBSCRIPTIONS_PER_MOUNT, PackageErrorCode, PackageIdentity, PackageOwnedError,
+    PackageValue,
+};
 
 #[tokio::test]
 async fn package_error_preserves_generation_and_unrelated_instance() {
@@ -54,6 +58,20 @@ async fn package_error_preserves_generation_and_unrelated_instance() {
         .await
         .unwrap_err();
     assert_eq!(error.code, PackageErrorCode::BackendError);
+    // The Package's own code, retryability and bounded details reach the caller beside the
+    // host code.
+    assert!(!error.retryable);
+    assert_eq!(
+        error.package_error,
+        Some(teamarness_package_host::PackageOwnedError {
+            code: "fixture.error".into(),
+            retryable: false,
+            details: serde_json::Map::from_iter([(
+                "field".to_owned(),
+                serde_json::Value::String("value".to_owned())
+            )]),
+        })
+    );
     let after = host.snapshot().await;
     let target_after = after
         .instances
@@ -71,6 +89,7 @@ async fn package_error_preserves_generation_and_unrelated_instance() {
     assert_eq!(other_after.process_generation, other.process_generation);
 }
 
+/// Verifies: TEAM.SYS.PKG-R02
 #[tokio::test]
 async fn lifecycle_error_fails_without_automatic_restarts_or_cross_instance_effects() {
     let fixture = common::Fixture::node(&[
@@ -104,6 +123,10 @@ async fn lifecycle_error_fails_without_automatic_restarts_or_cross_instance_effe
         .await
         .unwrap_err();
     assert_eq!(error.code, PackageErrorCode::BackendError);
+    let package_error = error.package_error.as_ref().expect("Package-owned error");
+    assert_eq!(package_error.code, "fixture.lifecycle");
+    assert!(package_error.retryable);
+    assert!(error.retryable);
     let after_recovery = host.snapshot().await;
     let failing_after_recovery = after_recovery
         .instances
@@ -158,6 +181,7 @@ async fn exit_invalidates_generation_without_replaying_the_request_and_explicit_
             if snapshot.lifecycle == LifecycleState::Active {
                 break snapshot;
             }
+            // poll-interval: the interval of this loop, which is bounded by its own timeout.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })

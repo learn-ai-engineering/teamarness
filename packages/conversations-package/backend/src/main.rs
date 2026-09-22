@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::process::ExitCode;
+
 #[tokio::main]
-async fn main() {
-    if let Err(error) = teamarness_conversations_package::ConversationsBackend::serve().await {
-        eprintln!("conversations Package stopped: {error}");
-        std::process::exit(1);
-    }
+async fn main() -> ExitCode {
+    teamarness_conversations_package::router().run().await
 }

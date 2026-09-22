@@ -1,14 +1,16 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { createTauriPackageTransport, type PackageTransport, type PackageValue } from "@teamarness/package-ui-sdk";
+import type { PackageValue } from "@teamarness/package-ui-sdk";
 import type {
+  HostUiEvent,
   OpenPackageMount,
   PackageHostSnapshot,
   PackageHostStateNotification,
+  PackageHostTransport,
   PackageInstanceKey,
 } from "./package-contracts";
 
 export interface PackageShellBridge {
-  readonly transport: PackageTransport;
+  readonly transport: PackageHostTransport;
   snapshot(): Promise<PackageHostSnapshot>;
   subscribeHostState(afterRevision: number, listener: (event: PackageHostStateNotification) => void): Promise<void>;
   openMount(instance: PackageInstanceKey): Promise<OpenPackageMount>;
@@ -19,8 +21,38 @@ export interface PackageShellBridge {
   disposeBackend(instance: PackageInstanceKey): Promise<void>;
 }
 
+/**
+ * The Shell's own Tauri command surface for one Package UI Mount. Only the
+ * Shell realm holds it; a Package UI Frame reaches it through the port bridge.
+ */
+export function createTauriPackageHostTransport(
+  call: typeof invoke = invoke,
+  makeChannel: <T>(handler: (message: T) => void) => Channel<T> = (handler) => new Channel(handler),
+): PackageHostTransport {
+  const transport: PackageHostTransport = {
+    request: async (input) => call<PackageValue>("package_request", input),
+    cancelRequest: async (input) => { await call("package_cancel_request", input); },
+    openSubscription: async (input, deliver, terminate) => {
+      type StreamMessage =
+        | Readonly<{ kind: "event"; value: HostUiEvent }>
+        | Readonly<{ kind: "failure"; value: unknown }>
+        | Readonly<{ kind: "completed"; value: Readonly<{ mount: string; subscription: string }> }>;
+      const onEvent = makeChannel<StreamMessage>((message) => {
+        if (message.kind === "event") deliver(message.value);
+        else if (message.kind === "completed") terminate({ error: null });
+        else terminate({ error: message.value });
+      });
+      await call("package_open_stream", { ...input, onEvent });
+    },
+    acknowledgeEvents: async (input) => { await call("package_acknowledge_events", input); },
+    closeSubscription: async (input) => { await call("package_close_stream", input); },
+    reportUiFault: async (input) => { await call("package_report_ui_fault", input); },
+  };
+  return Object.freeze(transport);
+}
+
 const tauriPackageBridge: PackageShellBridge = {
-  transport: createTauriPackageTransport(),
+  transport: createTauriPackageHostTransport(),
   snapshot: () => invoke<PackageHostSnapshot>("package_catalog_snapshot"),
   subscribeHostState: async (afterRevision, listener) => {
     const onEvent = new Channel(listener);

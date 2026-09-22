@@ -51,6 +51,7 @@ fn observes_exact_child_identity_then_terminates_and_reaps_its_process_group() {
             let _ = child.wait();
             panic!("sysinfo did not expose complete process evidence within five seconds");
         }
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
         thread::sleep(Duration::from_millis(20));
     };
 

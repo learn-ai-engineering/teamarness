@@ -42,7 +42,7 @@
       }
     },
     "recordEvent": { "type": "object", "additionalProperties": false, "required": ["kind", "cursor", "recordId", "orderKey", "author", "purpose", "signature", "canonical", "sealedRecord"], "properties": { "kind": { "const": "record" }, "cursor": { "$ref": "#/$defs/cursor" }, "recordId": { "$ref": "#/$defs/recordId" }, "orderKey": { "$ref": "#/$defs/orderKey" }, "author": { "$ref": "#/$defs/identity" }, "purpose": { "$ref": "#/$defs/purpose" }, "signature": { "$ref": "#/$defs/base64url" }, "canonical": { "$ref": "#/$defs/base64url" }, "sealedRecord": { "$ref": "#/$defs/sealed" } } },
-    "stateEvent": { "type": "object", "additionalProperties": false, "required": ["kind", "availability", "pendingRecordCount"], "properties": { "kind": { "const": "state" }, "availability": { "enum": ["waiting_for_history_access", "offline", "catching_up", "current", "degraded"] }, "pendingRecordCount": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" } } },
+    "stateEvent": { "type": "object", "additionalProperties": false, "required": ["kind", "availability", "pendingRecordCount"], "properties": { "kind": { "const": "state" }, "availability": { "enum": ["waiting_for_history_access", "offline", "catching_up", "current"] }, "pendingRecordCount": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" } } },
     "warningEvent": { "type": "object", "additionalProperties": false, "required": ["kind", "code"], "properties": { "kind": { "const": "warning" }, "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" } } },
     "open": {
       "type": "object", "additionalProperties": false,

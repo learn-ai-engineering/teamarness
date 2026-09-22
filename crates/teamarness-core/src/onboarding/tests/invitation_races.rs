@@ -27,21 +27,24 @@ fn now_unix_ms() -> i64 {
     .unwrap()
 }
 
+/// Verifies: TEAM.SYS.MEM-R03
 #[tokio::test]
 async fn concurrent_exact_redemption_recovers_one_shared_admission() {
     let issuer_directory = private_data_directory("invitation-race-issuer");
     let invitee_directory = private_data_directory("invitation-race-invitee");
     let config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(config.clone()).await.unwrap();
+    let issuer = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let workspace = issuer.create_workspace("Race").unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
     let claim = invitee.create_invitation_claim(&token).unwrap();
-    let other_issuer = CoreRuntime::open(config).await.unwrap();
+    let other_issuer = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     let barrier = Arc::new(Barrier::new(2));
 
     let first_barrier = Arc::clone(&barrier);

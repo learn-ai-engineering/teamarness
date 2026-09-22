@@ -38,10 +38,19 @@ async fn active_marker_advances_and_suspension_stops_it() {
     let state = ReferenceState::open(root.path().join("state.sqlite3")).unwrap();
     let activity = state.start_background_activity(Duration::from_millis(10));
 
-    tokio::time::sleep(Duration::from_millis(45)).await;
+    let expiry = std::time::Instant::now() + Duration::from_secs(5);
+    while state.snapshot().unwrap().background_marker < 2 {
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until the background activity advanced its marker"
+        );
+        // poll-interval: the interval of this loop, which is bounded by its own deadline.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     activity.stop().await;
     let stopped = state.snapshot().unwrap().background_marker;
     assert!(stopped >= 2);
+    // negative-wait: a bounded window proving a stopped activity's marker stays put.
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(state.snapshot().unwrap().background_marker, stopped);
 }

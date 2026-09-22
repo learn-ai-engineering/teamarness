@@ -129,6 +129,7 @@ function errorMessage(code: BridgeErrorCode): string {
     local_conflict: "Local Workspace state conflicts with this Workspace Invitation.",
     admission_no_longer_current: "This admission is no longer current.",
     uncertain_storage_outcome: "Storage outcome is uncertain. Restart Teamarness.",
+    package_reconciliation: "Some Packages could not start for this Workspace. Try again, or reopen Teamarness.",
     shutdown: "Teamarness is shutting down. Try again after reopening.",
   };
   return messages[code];

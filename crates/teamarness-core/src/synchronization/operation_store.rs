@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{OrderKey, RecordId, SealedRecordV1};
 use crate::PublicIdentity;
+use crate::diag::fault;
 use crate::error::StorageError;
 
 const LOG_DOMAIN: &[u8] = b"teamarness.immutable-record-log/v1";
@@ -34,7 +35,7 @@ pub(crate) fn log_id(scope_id: [u8; 32]) -> [u8; 32] {
     *Hash::digest(input).as_bytes()
 }
 
-fn encode_operation(header: &Header<()>, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_operation(header: &Header<()>, payload: &[u8]) -> Vec<u8> {
     let header = header.encode();
     let mut bytes = Vec::with_capacity(1 + 4 + header.len() + payload.len());
     bytes.push(OPERATION_VERSION);
@@ -99,7 +100,7 @@ pub(crate) fn insert(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| StorageError::Database)?
+        .map_err(fault!(StorageError::Database))?
         .map(|bytes| bytes.try_into().map_err(|_| StorageError::CorruptWorkspace))
         .transpose()?
     };
@@ -147,7 +148,7 @@ pub(crate) fn insert(
             operation_kind,
         ],
     )
-    .map_err(|_| StorageError::Database)?;
+    .map_err(fault!(StorageError::Database))?;
     Ok(operation_id)
 }
 
@@ -170,8 +171,8 @@ pub(crate) fn insert_remote(
         .as_ref()
         .ok_or(StorageError::CorruptWorkspace)?
         .to_bytes();
-    let author = PublicIdentity::from_bytes(*operation.header.verifying_key.as_bytes())
-        .map_err(|_| StorageError::CorruptWorkspace)?;
+    let author = super::key_bridge::identity(&operation.header.verifying_key)
+        .ok_or(StorageError::CorruptWorkspace)?;
     let operation_id = operation.hash.as_bytes();
     let backlink = operation
         .header
@@ -211,19 +212,6 @@ pub(crate) fn insert_remote(
     Ok(*operation_id)
 }
 
-pub(crate) fn queue_recovery(
-    tx: &Transaction<'_>,
-    teamarness_operation_id: RecordId,
-) -> Result<(), StorageError> {
-    tx.execute(
-        "INSERT OR IGNORE INTO p2panda_projection_recovery
-         (teamarness_operation_id, reason) VALUES (?1, 'missing_author_key')",
-        [teamarness_operation_id.as_bytes().as_slice()],
-    )
-    .map(|_| ())
-    .map_err(|_| StorageError::Database)
-}
-
 pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<(), StorageError> {
     connection
         .execute_batch(
@@ -235,7 +223,7 @@ pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<
             CREATE INDEX IF NOT EXISTS p2panda_projection_recovery_reason
                 ON p2panda_projection_recovery(reason);",
         )
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
 
     let rows: Vec<RepairRow> = {
         let mut statement = connection
@@ -248,7 +236,7 @@ pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<
                  LEFT JOIN p2panda_operations p ON p.teamarness_operation_id=o.operation_id
                  WHERE p.teamarness_operation_id IS NULL AND o.status='accepted'",
             )
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         let result = statement
             .query_map([], |row| {
                 Ok((
@@ -263,17 +251,17 @@ pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<
                     row.get(8)?,
                 ))
             })
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         result
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| StorageError::Database)?
+            .map_err(fault!(StorageError::Database))?
     };
 
     let local_author = *secret.public().as_bytes();
     for (teamarness_id, scope, record, order, author, sequence, purpose, sealed, height) in rows {
         let transaction = connection
             .transaction()
-            .map_err(|_| StorageError::Database)?;
+            .map_err(fault!(StorageError::Database))?;
         let author_is_local = author.as_slice() == local_author.as_slice();
         let result = if author_is_local {
             let scope_id: [u8; 32] = scope
@@ -333,20 +321,27 @@ pub(crate) fn repair(connection: &mut Connection, secret: &SecretKey) -> Result<
                     [teamarness_id.as_slice()],
                 )
                 .map(|_| ())
-                .map_err(|_| StorageError::Database)
+                .map_err(fault!(StorageError::Database))
         };
         match result {
             Ok(()) => transaction
                 .commit()
-                .map_err(|_| StorageError::UncertainOutcome)?,
+                .map_err(fault!(StorageError::UncertainOutcome))?,
             Err(error) => return Err(error),
         }
     }
     Ok(())
 }
 
-/// Check every durable projection before the runtime accepts capability calls.
-pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
+/// Check one durable projection row, named by the Teamarness operation it
+/// projects.
+///
+/// Restart validation checks only the records committed since the last
+/// validated start, so this is per row rather than per table.
+pub(crate) fn validate_projection_row(
+    connection: &Connection,
+    teamarness_operation_id: &[u8],
+) -> Result<(), StorageError> {
     let mut statement = connection
         .prepare(
             "SELECT p.operation_id, p.teamarness_operation_id, p.scope_id, p.log_id,
@@ -357,12 +352,12 @@ pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
                     o.causal_height
              FROM p2panda_operations p
              JOIN immutable_operations o ON o.operation_id=p.teamarness_operation_id
-             WHERE p.status='accepted'
-             ORDER BY p.scope_id, p.author_public_identity, p.author_sequence",
+             WHERE p.status='accepted' AND p.teamarness_operation_id=?1",
         )
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
+    let mut seen = false;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([teamarness_operation_id], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -388,7 +383,7 @@ pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
                 row.get::<_, i64>(21)?,
             ))
         })
-        .map_err(|_| StorageError::Database)?;
+        .map_err(fault!(StorageError::Database))?;
     for row in rows {
         let (
             operation_id,
@@ -464,13 +459,19 @@ pub(crate) fn validate(connection: &Connection) -> Result<(), StorageError> {
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|_| StorageError::Database)?
+                .map_err(fault!(StorageError::Database))?
         } else {
             None
         };
         if expected_backlink != backlink {
             return Err(StorageError::CorruptWorkspace);
         }
+        seen = true;
+    }
+    // A committed record with no accepted projection row is as broken as a row
+    // that fails a check.
+    if !seen {
+        return Err(StorageError::CorruptWorkspace);
     }
     Ok(())
 }

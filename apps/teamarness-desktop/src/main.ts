@@ -1,7 +1,7 @@
 import "./styles.css";
 import { bridge } from "./bridge";
 import { packageBridge } from "./package-bridge";
-import { PackageMountController } from "./package-mount";
+import { browserFrameDom, browserThemeSource, PackageMountController } from "./package-mount";
 import { createPackageShell } from "./package-shell";
 import { Shell, shellFrameFromDocument } from "./shell";
 import { createInstallationThemeController } from "./theme";
@@ -11,7 +11,16 @@ const theme = createInstallationThemeController();
 const frame = shellFrameFromDocument();
 const packageShell = createPackageShell(
   packageBridge,
-  new PackageMountController(packageBridge),
+  new PackageMountController(
+    packageBridge,
+    browserFrameDom,
+    browserThemeSource({
+      root: document.documentElement,
+      getComputedStyle: (element) => getComputedStyle(element),
+      matchMedia: (query) => window.matchMedia(query),
+      preferences: theme,
+    }),
+  ),
   frame.packageMount,
 );
 

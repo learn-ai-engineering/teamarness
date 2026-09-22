@@ -2,8 +2,10 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use serde_json::Value;
 use teamarness_package_protocol::{
-    ContractState, Direction, FrameDecoder, MAX_FRAME_BYTES, ProtocolError, ProtocolRange,
-    ProtocolVersion, decode_frame, decode_payload, negotiate_version,
+    ContractState, Direction, FrameDecoder, INITIAL_STREAM_CREDIT, MAX_DECODED_FRAME_BYTES,
+    MAX_FRAME_BYTES, MAX_ID_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES,
+    MAX_WRITER_FRAMES, ProtocolError, ProtocolRange, ProtocolVersion, Verdict, decode_frame,
+    decode_payload, negotiate_version,
 };
 
 fn contract_root() -> PathBuf {
@@ -20,6 +22,13 @@ fn json_files(directory: &str, extension: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Runs one corpus sequence through the classifier.
+///
+/// An entry either retires state — `{"retire":{"request":id}}` or
+/// `{"retire":{"stream":id}}` — or carries one frame and the verdict that frame
+/// must receive. Without the declared verdict a sequence proves only "this is
+/// not fatal", and would pass unchanged if one implementation delivered a
+/// frame the other ignored.
 fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
     let frames = value
         .as_array()
@@ -27,6 +36,16 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
         .expect("fixture sequence");
     let mut state = ContractState::default();
     for entry in frames {
+        if let Some(retire) = entry.get("retire") {
+            if let Some(id) = retire.get("request").and_then(Value::as_str) {
+                state.retire_request(id);
+            } else if let Some(id) = retire.get("stream").and_then(Value::as_str) {
+                state.retire_stream(id);
+            } else {
+                panic!("a retire entry names a request or a stream");
+            }
+            continue;
+        }
         let direction = match entry["direction"].as_str().expect("direction") {
             "host" => Direction::HostToPackage,
             "package" => Direction::PackageToHost,
@@ -34,7 +53,27 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
         };
         let bytes = serde_json::to_vec(&entry["frame"]).expect("frame JSON");
         let frame = decode_payload(&bytes)?;
-        state.observe(direction, &frame)?;
+        let verdict = state.observe(direction, &frame)?;
+        // Every frame the classifier accepts declares the verdict it receives,
+        // in `invalid/` as well as `golden/`. An `invalid/` sequence without
+        // them asserts only that its last frame is fatal, so the frames that
+        // set the state up could drift between the two implementations
+        // unnoticed.
+        let expected = entry
+            .get("verdict")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a frame the classifier accepted declares no verdict: {}",
+                    entry["frame"]
+                )
+            });
+        let expected = match expected {
+            "deliver" => Verdict::Deliver,
+            "ignore" => Verdict::Ignore,
+            other => panic!("unknown verdict {other}"),
+        };
+        assert_eq!(verdict, expected, "{}", entry["frame"]);
     }
     Ok(())
 }
@@ -42,9 +81,10 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
 #[test]
 fn consumes_every_golden_sequence() {
     let paths = json_files("golden", "jsonl");
-    assert_eq!(paths.len(), 8, "the v1 golden set is intentional");
+    assert_eq!(paths.len(), 10, "the v1 golden set is intentional");
 
     let mut kinds = BTreeSet::new();
+    let mut verdicts = 0_usize;
     for path in paths {
         let entries = fs::read_to_string(&path)
             .expect("golden fixture")
@@ -52,7 +92,19 @@ fn consumes_every_golden_sequence() {
             .map(|line| serde_json::from_str::<Value>(line).expect("fixture JSON"))
             .collect::<Vec<_>>();
         for entry in &entries {
-            kinds.insert(entry["frame"]["kind"].as_str().unwrap().to_owned());
+            let Some(kind) = entry["frame"]["kind"].as_str() else {
+                continue;
+            };
+            kinds.insert(kind.to_owned());
+            // Every frame the corpus carries declares the verdict it receives,
+            // so a line cannot quietly stop asserting one.
+            assert!(
+                entry.get("verdict").is_some(),
+                "{}: {} declares no verdict",
+                path.display(),
+                entry["frame"]
+            );
+            verdicts += 1;
         }
         observe_sequence(&Value::Array(entries))
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
@@ -80,12 +132,16 @@ fn consumes_every_golden_sequence() {
         .map(str::to_owned)
         .collect()
     );
+    assert_eq!(
+        verdicts, 44,
+        "every frame in the golden corpus declares the verdict it receives"
+    );
 }
 
 #[test]
 fn consumes_every_malformed_fixture_with_its_stable_error() {
     let paths = json_files("invalid", "json");
-    assert_eq!(paths.len(), 14, "the v1 malformed set is intentional");
+    assert_eq!(paths.len(), 19, "the v1 malformed set is intentional");
 
     for path in paths {
         let fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -121,7 +177,46 @@ fn framing_round_trips_at_the_boundary_and_rejects_truncation() {
         decode_frame(truncated).unwrap_err().code(),
         "truncated_frame"
     );
-    assert_eq!(MAX_FRAME_BYTES, 1_048_576);
+}
+
+/// The contract publishes the limits table; this crate declares the constants.
+///
+/// Both are read here, so a limit cannot move on one side alone. Pinning a
+/// constant to a literal instead only restated the code in the test.
+#[test]
+fn every_constant_matches_the_contract_limits_table() {
+    let readme = fs::read_to_string(contract_root().join("README.md")).expect("contract README");
+    let published = |row: &str| -> usize {
+        let line = readme
+            .lines()
+            .find(|line| line.starts_with(&format!("| {row} |")))
+            .unwrap_or_else(|| panic!("the limits table has no `{row}` row"));
+        line.rsplit('|')
+            .nth(1)
+            .expect("a value cell")
+            .trim()
+            .replace(',', "")
+            .parse()
+            .expect("a decimal limit")
+    };
+    assert_eq!(published("Payload bytes per frame"), MAX_FRAME_BYTES);
+    assert_eq!(
+        published("Payload bytes per frame"),
+        MAX_DECODED_FRAME_BYTES
+    );
+    assert_eq!(
+        published("In-flight requests in each direction"),
+        MAX_IN_FLIGHT_EACH_DIRECTION
+    );
+    assert_eq!(published("Queued frames per writer"), MAX_WRITER_FRAMES);
+    assert_eq!(
+        published("Queued payload bytes per writer"),
+        MAX_WRITER_BYTES
+    );
+    assert_eq!(
+        published("Initial event credit per stream"),
+        INITIAL_STREAM_CREDIT
+    );
 }
 
 #[test]
@@ -177,6 +272,12 @@ fn every_schema_is_local_and_every_frame_kind_has_a_schema() {
     )
     .unwrap();
     assert_eq!(frame_schema["oneOf"].as_array().unwrap().len(), 14);
+    // The schema publishes the ID bound every frame's ID fields share, and
+    // this crate declares it; both are read here so neither can move alone.
+    assert_eq!(
+        frame_schema["$defs"]["id"]["maxLength"].as_u64(),
+        Some(MAX_ID_BYTES as u64)
+    );
 
     for path in schemas {
         let schema: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

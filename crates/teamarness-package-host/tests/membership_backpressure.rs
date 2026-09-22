@@ -3,7 +3,6 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
 use teamarness_package_host::{
     OpenUiMount, PackageHost, PackageHostCommand, PackageHostOutcome, PackageValue, UiRequest,
     UiRequestId,
@@ -56,16 +55,9 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         .unwrap();
     let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
     for index in 0..33 {
-        let joiner = CoreRuntime::open(CoreRuntimeConfig::new(
-            fixture._root.path().join(format!("joiner-{index}")),
-        ))
-        .await
-        .unwrap();
-        let invitation = fixture
-            .core
-            .create_workspace_invitation(workspace.id())
-            .await
-            .unwrap();
+        let joiner = common::open_core(fixture._root.path().join(format!("joiner-{index}"))).await;
+        common::introduce(&fixture.core, &joiner);
+        let invitation = common::invite(&fixture.core, workspace.id()).await;
         joiner.join_workspace(&invitation).await.unwrap();
         joiner.shutdown().await.unwrap();
     }
@@ -104,6 +96,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
             {
                 break response;
             }
+            // poll-interval: the interval of this loop, which is bounded by its own timeout.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -155,6 +148,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
             {
                 break response;
             }
+            // poll-interval: the interval of this loop, which is bounded by its own timeout.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -180,6 +174,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         object([("afterEpoch", PackageValue::String("33".into()))]),
     )
     .await;
+    // settle: lets the reopened subscription deliver before its events are read.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let resumed = request(
         &host,

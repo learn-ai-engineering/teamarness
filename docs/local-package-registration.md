@@ -18,6 +18,8 @@ Create this file under the selected application data directory:
 
 Named development profiles use `.teamarness-dev/<profile>` as `<app-data>`. An expert `--data-dir` launch uses the absolute directory supplied to that option. Ordinary packaged launches use the platform application-data directory selected by Tauri.
 
+Start Teamarness once with that data directory before writing the file. The Core Runtime refuses a data directory that holds unrelated files (`TEAM.SYS.ID-R07`, ADR 0017), so it must be one Teamarness has already created.
+
 The registration file must be a regular, non-symlink file owned by the current user. On macOS, make its parent private and the file owner-only:
 
 ```sh
@@ -48,7 +50,7 @@ Replace `<app-data>` and the Package Directory below with absolute paths. Do not
 
 `expectedIdentity` must exactly match the Package Manifest. The complete `trusted_native_code_v1` evidence is explicit acknowledgement that the Backend can use the current user's ambient filesystem, network, and process authority. Process separation is not a sandbox.
 
-The Package UI runs in the Shell's main webview. Its Shadow Root limits styles, but the code retains DOM and known Tauri-command authority. It is not a UI sandbox. Register only code you trust.
+The Package UI runs in its own sandboxed frame inside the Shell webview. It cannot reach the Shell's DOM, browser storage, the network, or any Tauri command, and it talks to Teamarness only through its mount-scoped bridge. Frame isolation does not contain a UI that blocks its thread, and it does not limit what the Backend can do. Register only code you trust.
 
 ## Override a bundled Package
 
@@ -83,16 +85,18 @@ To test continuity without inspecting private database contents:
 
 1. Start on bundled code and make one visible Package state change.
 2. Stop Teamarness cleanly.
-3. add the explicit local override and restart;
-4. confirm the local Package Source is presented as `Personal`, confirm its trust, and inspect the visible state;
-5. stop Teamarness, remove the registration, and restart;
-6. confirm the bundled Package Source is presented as `Team` and inspect the same visible state.
+3. Add the explicit local override and restart.
+4. Confirm the local Package Source is presented as `Personal`, confirm its trust, and inspect the visible state.
+5. Stop Teamarness, remove the registration, and restart.
+6. Confirm the bundled Package Source is presented as `Team` and inspect the same visible state.
 
 Disposal stops Package-owned resources but does not delete the Package Data Directory. Teamarness has no Package-data deletion, backup, or migration service in this phase.
 
 ## Diagnose a rejected registration
 
 Check the Shell's stable Package diagnostic and recovery action. Common failures include a relative or symlink path, group or world permissions on the registration file, missing trust evidence, identity mismatch, an omitted bundled override, duplicate local registrations, unsupported target, missing file, digest mismatch, malformed manifest, or invalid UI contract.
+
+For everything about the Package Directory itself, `teamarness-package-validate` gives the same verdict without the application, and names the rule that failed: run `npm run validate:dist` in a generated project, or `cargo run -p teamarness-package-contract --bin teamarness-package-validate -- directory <path> --smoke` from a Teamarness checkout.
 
 Correct the source or registration, then restart. Do not weaken file permissions or change `expectedIdentity` merely to silence a mismatch. Keep the expected identity tied to the Package you reviewed.
 

@@ -68,7 +68,23 @@ async fn open(name: &str) -> (std::path::PathBuf, CoreRuntime) {
 async fn close(runtime: CoreRuntime, path: &std::path::Path) {
     runtime.shutdown().await.unwrap();
     drop(runtime);
-    fs::remove_dir_all(path).unwrap();
+    remove_directory(path);
+}
+
+/// Removes a test directory, tolerating the readdir and rmdir race this
+/// platform shows when a directory is being torn down under load.
+///
+/// The failure it retries is the operating system's, not the product's.
+fn remove_directory(path: &std::path::Path) {
+    for attempt in 0..50 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt == 49 => panic!("{}: {error}", path.display()),
+            // negative-wait: backoff between retries of the platform's own readdir and rmdir race.
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 #[tokio::test]
@@ -120,6 +136,7 @@ async fn fresh_join_matches_the_export_boundary_and_survives_both_restarts() {
     close(reopened_joiner, &joiner_directory).await;
 }
 
+/// Verifies: TEAM.SYS.MEM-R09, TEAM.SYS.TRANS-R05
 #[tokio::test]
 async fn response_loss_recovers_one_admission_through_the_public_join_operation() {
     let (issuer_directory, issuer) = open("loss-issuer").await;
@@ -166,6 +183,7 @@ async fn retry_after_expiry_imports_later_current_state_but_refuses_a_revoked_in
         .await
         .unwrap();
     second.join_workspace(&second_invitation).await.unwrap();
+    // negative-wait: waits past the first invitation's wall-clock expiry.
     std::thread::sleep(Duration::from_millis(35));
 
     let (_, first_snapshot) = first.join_workspace(&first_invitation).await.unwrap();
@@ -371,6 +389,6 @@ async fn malformed_frame_and_shutdown_during_active_work_fail_without_admission(
     drop(issuer);
     let client = Arc::try_unwrap(client).expect("shutdown task released runtime");
     drop(client);
-    fs::remove_dir_all(issuer_directory).unwrap();
-    fs::remove_dir_all(client_directory).unwrap();
+    remove_directory(&issuer_directory);
+    remove_directory(&client_directory);
 }

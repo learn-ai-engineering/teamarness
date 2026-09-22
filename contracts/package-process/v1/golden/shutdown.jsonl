@@ -1,2 +1,2 @@
-{"direction":"host","frame":{"kind":"shutdown","reason":"application_shutdown"}}
-{"direction":"package","frame":{"kind":"shutdown_ack"}}
+{"direction":"host","frame":{"kind":"shutdown","reason":"application_shutdown"},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"shutdown_ack"},"verdict":"deliver"}

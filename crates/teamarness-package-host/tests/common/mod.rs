@@ -57,11 +57,7 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
-        let core = Arc::new(
-            CoreRuntime::open(CoreRuntimeConfig::new(core_dir))
-                .await
-                .unwrap(),
-        );
+        let core = Arc::new(open_core(core_dir).await);
         core.create_workspace("Fixture Workspace").unwrap();
         let config = PackageHostConfig::new(
             &application,
@@ -137,11 +133,13 @@ pub fn write_node_package_with_capabilities(
         },
         "subscriptions": {
             "fixture.close": {"request": {}, "event": {}},
+            "fixture.complete": {"request": {}, "event": {}},
             "fixture.duplicate": {"request": {}, "event": {}},
             "fixture.events": {"request": {}, "event": {}},
             "fixture.gap": {"request": {}, "event": {}},
             "fixture.invalid_event": {"request": {}, "event": {"type":"object","properties":{"order":{"type":"integer"}},"required":["order"],"additionalProperties":false}},
             "fixture.overflow": {"request": {}, "event": {}},
+            "fixture.rejected_stream": {"request": {}, "event": {}},
             "fixture.saturation": {"request": {}, "event": {}}
         }
     }))
@@ -166,4 +164,72 @@ pub fn write_node_package_with_capabilities(
         },
         "capabilities": capabilities
     })).unwrap()).unwrap();
+}
+
+/// Opens a real Installation whose Iroh endpoint is bound to loopback.
+///
+/// Addressing is never the behaviour a Host test is about, and these tests are
+/// compiled out of crate, so the production binding would put `cargo test
+/// --workspace` behind the public relays (SF-002). Storage, the Endpoint and
+/// Router, and the onboarding and synchronization protocols are the real ones
+/// either way; only the relay is absent.
+pub async fn open_core(directory: impl Into<PathBuf>) -> CoreRuntime {
+    CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(directory.into()))
+        .await
+        .expect("an Installation opens on its private data directory")
+}
+
+/// Teaches two loopback Installations how to reach each other.
+///
+/// Loopback endpoints publish no address anywhere, so this stands in for the
+/// relay that would otherwise carry the introduction.
+pub fn introduce(left: &CoreRuntime, right: &CoreRuntime) {
+    left.remember_loopback_peer_for_tests(right);
+    right.remember_loopback_peer_for_tests(left);
+}
+
+/// Issues one Workspace invitation, waiting out endpoint readiness.
+///
+/// Readiness is a real-network condition, not the behaviour any Host test is
+/// about, so the deadline only bounds failure.
+pub async fn invite(
+    core: &CoreRuntime,
+    workspace: teamarness_core::WorkspaceId,
+) -> teamarness_core::WorkspaceInvitation {
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match core.create_workspace_invitation(workspace).await {
+            Ok(invitation) => return invitation,
+            Err(teamarness_core::OnboardingError::Readiness)
+                if std::time::Instant::now() < expiry =>
+            {
+                // negative-wait: backoff between retries; the endpoint offers
+                // no readiness event to await.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("the invitation could not be issued: {error}"),
+        }
+    }
+}
+
+/// Waits for a condition instead of guessing how long it takes.
+///
+/// Polls every 10 ms and panics with `what` on timeout, so a failure names the
+/// condition that never held rather than an assertion about a marker.
+pub async fn eventually<F, Fut>(timeout: std::time::Duration, what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let expiry = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }

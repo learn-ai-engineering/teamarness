@@ -5,9 +5,11 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::Mutex;
 
+use teamarness_package_protocol::TOMBSTONE_CAPACITY;
+
 use crate::protocol::{UiEventReceiver, UiEventRoute, WireFailure};
 use crate::supervisor::{self, CRASH_WINDOW, ProcessGeneration, ProcessSpec, RESTART_DELAYS};
-use crate::ui::AdmittedUi;
+use crate::ui::{AdmittedUi, MAX_UI_SUBSCRIPTIONS_PER_MOUNT};
 use crate::{
     LifecycleState, MountState, PackageErrorCode, PackageInstanceKey, PackageInstanceSnapshot,
     PackageValue, UiMountId, UiRequestId, UiSubscriptionId,
@@ -31,6 +33,8 @@ struct InstanceState {
     request_tombstones: BTreeSet<(UiMountId, UiRequestId)>,
     subscriptions: BTreeMap<(UiMountId, UiSubscriptionId), SubscriptionState>,
     next_wire_id: u64,
+    /// Set once host shutdown begins; no generation may be started afterwards.
+    shutting_down: bool,
 }
 
 struct MountRecord {
@@ -59,6 +63,7 @@ impl InstanceActor {
                 request_tombstones: BTreeSet::new(),
                 subscriptions: BTreeMap::new(),
                 next_wire_id: 0,
+                shutting_down: false,
             }),
             lifecycle_gate: Mutex::new(()),
         }
@@ -81,6 +86,9 @@ impl InstanceActor {
             }
             let generation = {
                 let mut state = self.state.lock().await;
+                if state.shutting_down {
+                    return Err(WireFailure::new(PackageErrorCode::ShuttingDown));
+                }
                 if state
                     .active_since
                     .is_some_and(|since| since.elapsed() >= CRASH_WINDOW)
@@ -100,6 +108,13 @@ impl InstanceActor {
                     let process = Arc::new(process);
                     {
                         let mut state = self.state.lock().await;
+                        if state.shutting_down {
+                            // Shutdown began while this generation was spawning and
+                            // could not see it; reap it here instead of orphaning it.
+                            drop(state);
+                            process.shutdown().await;
+                            return Err(WireFailure::new(PackageErrorCode::ShuttingDown));
+                        }
                         state.process = Some(process.clone());
                         state.lifecycle = LifecycleState::Active;
                         state.active_since = Some(Instant::now());
@@ -435,7 +450,7 @@ impl InstanceActor {
             let mut state = self.state.lock().await;
             state.requests.remove(&request_key);
             state.request_tombstones.insert(request_key);
-            while state.request_tombstones.len() > 64 {
+            while state.request_tombstones.len() > TOMBSTONE_CAPACITY {
                 state.request_tombstones.pop_first();
             }
         }
@@ -449,8 +464,9 @@ impl InstanceActor {
                     let _gate = self.lifecycle_gate.lock().await;
                     let handling = {
                         let mut state = self.state.lock().await;
-                        if state.process.as_ref().map(|live| live.generation)
-                            == Some(process.generation)
+                        if !state.shutting_down
+                            && state.process.as_ref().map(|live| live.generation)
+                                == Some(process.generation)
                         {
                             clear_process_state(&mut state);
                             state.failures.push_back(Instant::now());
@@ -496,7 +512,7 @@ impl InstanceActor {
             let mut state = self.state.lock().await;
             let Some(wire_id) = state.requests.get(&request_key).cloned() else {
                 state.request_tombstones.insert(request_key);
-                while state.request_tombstones.len() > 64 {
+                while state.request_tombstones.len() > TOMBSTONE_CAPACITY {
                     state.request_tombstones.pop_first();
                 }
                 return Ok(());
@@ -534,7 +550,7 @@ impl InstanceActor {
                     .keys()
                     .filter(|(stream_mount, _)| stream_mount == mount)
                     .count()
-                    >= 8
+                    >= MAX_UI_SUBSCRIPTIONS_PER_MOUNT
             {
                 return Err(WireFailure::new(PackageErrorCode::Overloaded));
             }
@@ -586,8 +602,22 @@ impl InstanceActor {
             }
             (process, stream.wire_id.clone(), stream.route.clone())
         };
-        let amount = route.acknowledge(through).await?;
-        process.client.credit(&stream, amount).await
+        // The record moves only once the frame is queued. A `credit` frame
+        // that never reached the writer would otherwise leave the Host
+        // believing it had released credit the Package never received: the
+        // window would stay shut, a conforming Package would stop sending, and
+        // this path is the only producer of `credit` there is.
+        match route.acknowledge(through).await? {
+            Some(pending) => {
+                pending
+                    .commit(|amount| process.client.credit(&stream, amount))
+                    .await
+            }
+            // The ignore verdict: the route has already credited these events,
+            // so there is nothing to send and nothing to record. Crediting
+            // them again is the one thing the credit section makes fatal.
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn close_subscription(
@@ -620,7 +650,9 @@ impl InstanceActor {
             let _gate = actor.lifecycle_gate.lock().await;
             let handling = {
                 let mut state = actor.state.lock().await;
-                if state.lifecycle != LifecycleState::Active
+                // A process exiting because host shutdown stopped it is not a crash.
+                if state.shutting_down
+                    || state.lifecycle != LifecycleState::Active
                     || state.process.as_ref().map(|live| live.generation)
                         != Some(process.generation)
                 {
@@ -653,6 +685,11 @@ impl InstanceActor {
     }
 
     pub(crate) async fn shutdown(&self) {
+        // Mark shutdown before waiting for the lifecycle gate so failure monitors and
+        // in-flight (re)starts stop creating generations, then serialize with any
+        // lifecycle transition that is already running so its process is visible here.
+        self.state.lock().await.shutting_down = true;
+        let _gate = self.lifecycle_gate.lock().await;
         let process = self.state.lock().await.process.clone();
         if let Some(process) = process {
             process.shutdown().await;

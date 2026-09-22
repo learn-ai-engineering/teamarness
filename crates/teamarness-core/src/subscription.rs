@@ -6,9 +6,10 @@ use p2panda_core::Hash;
 use rusqlite::Connection;
 
 use crate::error::{StorageError, SubscriptionError};
+use crate::membership::MembershipEnvelope;
 use crate::{
-    MembershipEpoch, MembershipOperationId, MembershipSnapshotDigest, MembershipTransition,
-    MembershipVersion, WorkspaceId,
+    MembershipChange, MembershipEpoch, MembershipOperationId, MembershipSnapshotDigest,
+    MembershipTransition, MembershipVersion, PublicIdentity, WorkspaceId,
 };
 
 pub(crate) type TransitionSender = Sender<MembershipTransition>;
@@ -114,9 +115,11 @@ fn load_after_with_limit(
     let after = i64::try_from(after_epoch.value()).map_err(|_| SubscriptionError::CursorAhead)?;
     let mut statement = connection
         .prepare(
-            "SELECT epoch, membership_version, cause_operation_id, snapshot_digest
-             FROM membership_transitions
-             WHERE workspace_id = ?1 AND epoch > ?2 ORDER BY epoch LIMIT ?3",
+            "SELECT t.epoch, t.membership_version, t.cause_operation_id, t.snapshot_digest,
+                    o.canonical_envelope
+             FROM membership_transitions t
+             JOIN membership_operations o ON o.operation_id = t.cause_operation_id
+             WHERE t.workspace_id = ?1 AND t.epoch > ?2 ORDER BY t.epoch LIMIT ?3",
         )
         .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
     let rows = statement
@@ -134,14 +137,22 @@ fn load_after_with_limit(
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
                 ))
             },
         )
         .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
     let mut transitions = Vec::new();
     for row in rows {
-        let (epoch, version, cause, digest) =
+        let (epoch, version, cause, digest, canonical_envelope) =
             row.map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+        let cause = MembershipOperationId::from_hash(Hash::from_bytes(fixed(&cause)?));
+        let envelope = crate::membership::authenticate(&canonical_envelope)
+            .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+        if envelope.id != cause || envelope.workspace_id != workspace_id {
+            return Err(SubscriptionError::Storage(StorageError::CorruptWorkspace));
+        }
+        let (change, author) = change_from_envelope(&envelope)?;
         transitions.push(MembershipTransition::new(
             workspace_id,
             MembershipEpoch::new(
@@ -149,11 +160,24 @@ fn load_after_with_limit(
                     .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?,
             ),
             MembershipVersion::from_bytes(fixed(&version)?),
-            MembershipOperationId::from_hash(Hash::from_bytes(fixed(&cause)?)),
+            cause,
             MembershipSnapshotDigest::from_bytes(fixed(&digest)?),
+            change,
+            author,
         ));
     }
     Ok(transitions)
+}
+
+/// Derives a durable transition's change and author from the canonical bytes of
+/// the operation that caused it. A `create` operation causes no transition, so
+/// finding one stored as a cause means the workspace is corrupt.
+fn change_from_envelope(
+    envelope: &MembershipEnvelope,
+) -> Result<(MembershipChange, PublicIdentity), SubscriptionError> {
+    let change = crate::membership::projection::change_from_action(&envelope.action)
+        .ok_or(SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+    Ok((change, envelope.author))
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], SubscriptionError> {
@@ -163,3 +187,71 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], SubscriptionError> {
 }
 
 use rusqlite::OptionalExtension;
+
+#[cfg(test)]
+mod tests {
+    use iroh_base::SecretKey;
+
+    use crate::invitation::{sign_claim, sign_token};
+    use crate::membership::{AdmissionProof, MembershipAction, MembershipEnvelope};
+    use crate::{MembershipOperationId, PublicIdentity, WorkspaceId};
+
+    use super::{MembershipChange, SubscriptionError, change_from_envelope};
+
+    fn secret(byte: u8) -> SecretKey {
+        SecretKey::from_bytes(&[byte; 32])
+    }
+
+    fn envelope(author: &SecretKey, action: MembershipAction) -> MembershipEnvelope {
+        MembershipEnvelope::sign(
+            author,
+            WorkspaceId::from_bytes([3; 16]),
+            1_100,
+            action,
+            vec![MembershipOperationId::digest(b"genesis")],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn change_is_derived_from_the_cause_envelope() {
+        let manager = secret(7);
+        let author = PublicIdentity::from_bytes(*manager.public().as_bytes()).unwrap();
+
+        let create = envelope(&manager, MembershipAction::Create);
+        assert!(matches!(
+            change_from_envelope(&create),
+            Err(SubscriptionError::Storage(
+                crate::error::StorageError::CorruptWorkspace
+            ))
+        ));
+
+        let token = sign_token(
+            &manager,
+            WorkspaceId::from_bytes([3; 16]),
+            1_000,
+            2_000,
+            [9; 32],
+        )
+        .unwrap();
+        let claim = sign_claim(&secret(8), &token).unwrap();
+        let joiner = claim.invitee;
+        let admit = envelope(
+            &manager,
+            MembershipAction::Admit {
+                target: joiner,
+                proof: Box::new(AdmissionProof { claim }),
+            },
+        );
+        assert_eq!(
+            change_from_envelope(&admit).unwrap(),
+            (MembershipChange::Admitted { member: joiner }, author)
+        );
+
+        let revoke = envelope(&manager, MembershipAction::Revoke { target: joiner });
+        assert_eq!(
+            change_from_envelope(&revoke).unwrap(),
+            (MembershipChange::Revoked { member: joiner }, author)
+        );
+    }
+}

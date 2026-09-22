@@ -18,6 +18,8 @@ pub use teamarness_package_host::{
 mod admission;
 #[path = "../src/catalog.rs"]
 mod catalog;
+#[path = "../src/diag.rs"]
+mod diag;
 #[path = "../src/host_store.rs"]
 mod host_store;
 #[path = "../src/manifest.rs"]
@@ -147,6 +149,15 @@ fn package_ids(report: &admission::AdmissionReport) -> Vec<String> {
 
 type FixtureMutation = Box<dyn Fn(&mut Fixture)>;
 
+/// Admits through a freshly opened store, as `PackageHost::open` does through
+/// its shared store handle.
+fn admit(
+    config: &PackageHostConfig,
+) -> Result<admission::AdmissionReport, admission::AdmissionFailure> {
+    let store = host_store::HostStore::open(config.private_data_directory()).unwrap();
+    admission::admit(config, &store)
+}
+
 #[test]
 fn each_invalid_source_isolated_from_an_unrelated_valid_identity() {
     let cases: Vec<(&str, FixtureMutation)> = vec![
@@ -208,7 +219,7 @@ fn each_invalid_source_isolated_from_an_unrelated_valid_identity() {
         let mut fixture = Fixture::new();
         fixture.add_application("good", "com.example.good", "1.0.0");
         mutate(&mut fixture);
-        let report = admission::admit(&fixture.config()).unwrap();
+        let report = admit(&fixture.config()).unwrap();
         assert!(
             package_ids(&report).contains(&"com.example.good".to_owned()),
             "{name}"
@@ -229,7 +240,7 @@ fn dangling_registration_symlink_is_reported_instead_of_silent_bundled_fallback(
     )
     .unwrap();
 
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
 
     assert!(package_ids(&report).contains(&"dev.teamarness.reference".to_owned()));
     assert!(
@@ -274,7 +285,7 @@ fn local_registration_can_add_a_package_without_an_application_counterpart() {
     let local = fixture.add_local("dev.teamarness.tutorial", "1.0.0");
     fixture.registrations(vec![local_entry(&local, "dev.teamarness.tutorial", false)]);
 
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
 
     assert!(package_ids(&report).contains(&"dev.teamarness.tutorial".to_owned()));
     assert!(report.snapshot.diagnostics.is_empty());
@@ -286,12 +297,12 @@ fn local_registration_requires_absolute_owner_only_non_symlink_file_and_complete
     fixture.add_application("good", "com.example.good", "1.0.0");
     let local = fixture.add_local("com.example.local", "1.0.0");
     fixture.registrations(vec![local_entry(&local, "com.example.local", false)]);
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert!(package_ids(&report).contains(&"com.example.local".to_owned()));
 
     let path = fixture.private.join("packages/registrations.v1.json");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert_eq!(
         report.snapshot.diagnostics[0].code,
         PackageErrorCode::InvalidRegistration
@@ -302,7 +313,7 @@ fn local_registration_requires_absolute_owner_only_non_symlink_file_and_complete
     let target = fixture.root.path().join("registrations-target.json");
     fs::write(&target, b"{}").unwrap();
     symlink(target, &path).unwrap();
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert_eq!(
         report.snapshot.diagnostics[0].code,
         PackageErrorCode::InvalidRegistration
@@ -315,7 +326,7 @@ fn local_registration_requires_absolute_owner_only_non_symlink_file_and_complete
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert_eq!(
         report.snapshot.diagnostics[0].code,
         PackageErrorCode::InvalidRegistration
@@ -325,7 +336,7 @@ fn local_registration_requires_absolute_owner_only_non_symlink_file_and_complete
         "directory":"relative/path", "expectedIdentity":"com.example.local",
         "trust":{"kind":"trusted_native_code_v1","acceptedRisks":["filesystem"]}
     })]);
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert!(
         report
             .snapshot
@@ -338,7 +349,7 @@ fn local_registration_requires_absolute_owner_only_non_symlink_file_and_complete
         "directory":local, "expectedIdentity":"com.example.local",
         "trust":{"kind":"trusted_native_code_v1","acceptedRisks":["filesystem"]}
     })]);
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert!(
         report
             .snapshot
@@ -372,7 +383,7 @@ fn explicit_override_matrix_is_order_and_version_independent() {
                 vec![unrelated, replacement]
             };
             fixture.registrations(entries);
-            let report = admission::admit(&fixture.config()).unwrap();
+            let report = admit(&fixture.config()).unwrap();
             let selected = report
                 .snapshot
                 .packages
@@ -399,7 +410,7 @@ fn explicit_override_matrix_is_order_and_version_independent() {
             entry["trust"] = serde_json::Value::Null;
         }
         fixture.registrations(vec![entry]);
-        let report = admission::admit(&fixture.config()).unwrap();
+        let report = admit(&fixture.config()).unwrap();
         assert!(
             report.snapshot.packages.is_empty(),
             "{defect} must not fall back"
@@ -424,7 +435,7 @@ fn duplicate_local_or_application_identities_are_unavailable() {
     let fixture = Fixture::new();
     fixture.add_application("one", "com.example.same", "1.0.0");
     fixture.add_application("two", "com.example.same", "2.0.0");
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert!(report.snapshot.packages.is_empty());
     assert_eq!(
         report.snapshot.diagnostics[0].code,
@@ -438,7 +449,7 @@ fn duplicate_local_or_application_identities_are_unavailable() {
         local_entry(&first, "com.example.same", false),
         local_entry(&second, "com.example.same", false),
     ]);
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert!(report.snapshot.packages.is_empty());
     assert_eq!(
         report.snapshot.diagnostics[0].code,
@@ -453,7 +464,7 @@ fn invalid_declared_override_never_falls_back_and_unrelated_package_remains() {
     fixture.add_application("good", "com.example.good", "1.0.0");
     let missing = fixture.root.path().join("missing-local");
     fixture.registrations(vec![local_entry(&missing, "com.example.same", true)]);
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     assert_eq!(package_ids(&report), vec!["com.example.good"]);
     let diagnostic = report
         .snapshot
@@ -467,7 +478,7 @@ fn invalid_declared_override_never_falls_back_and_unrelated_package_remains() {
             .as_ref()
             .is_some_and(|id| id.as_str() == "com.example.same")
     );
-    let repeated = admission::admit(&fixture.config()).unwrap();
+    let repeated = admit(&fixture.config()).unwrap();
     assert_eq!(
         repeated
             .snapshot
@@ -484,7 +495,7 @@ fn invalid_declared_override_never_falls_back_and_unrelated_package_remains() {
 fn ui_cache_is_digest_addressed_read_only_and_public_snapshot_is_url_neutral() {
     let fixture = Fixture::new();
     fixture.add_application("one", "com.example.one", "1.0.0");
-    let report = admission::admit(&fixture.config()).unwrap();
+    let report = admit(&fixture.config()).unwrap();
     let admitted = &report.admissions[0];
     assert_eq!(
         admitted
@@ -518,7 +529,7 @@ fn ui_cache_is_digest_addressed_read_only_and_public_snapshot_is_url_neutral() {
     assert!(!public.contains("tauri"));
     assert!(!public.contains("asset:"));
 
-    let second = admission::admit(&fixture.config()).unwrap();
+    let second = admit(&fixture.config()).unwrap();
     assert_eq!(
         second.admissions[0].ui.cache.admitted_root,
         admitted.ui.cache.admitted_root

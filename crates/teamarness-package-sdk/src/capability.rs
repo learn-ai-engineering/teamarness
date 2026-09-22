@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use teamarness_package_protocol::JsonValue;
+use teamarness_package_protocol::{INITIAL_STREAM_CREDIT, JsonValue};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::priority_writer::PriorityWriter;
+use crate::priority_writer::{PriorityWriter, SharedState};
 use crate::{BackendError, object};
+
+/// How long a capability call waits for the Host's answer.
+///
+/// One second longer than the Host's own call deadline, so a Host that is
+/// answering slowly reports its own `deadline_exceeded` first.
+pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(11);
 
 pub(crate) type PendingCapabilities =
     Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<JsonValue, BackendError>>>>>;
@@ -15,7 +21,6 @@ pub(crate) type CapabilityStreams = Arc<Mutex<BTreeMap<String, CapabilityStreamR
 
 pub(crate) struct CapabilityStreamRoute {
     pub(crate) sender: mpsc::Sender<Result<JsonValue, BackendError>>,
-    pub(crate) next_sequence: u64,
 }
 
 /// A cloneable client for generation-scoped Semantic Capability calls.
@@ -25,6 +30,7 @@ pub struct CapabilityClient {
     pending: PendingCapabilities,
     next_id: Arc<AtomicU64>,
     streams: CapabilityStreams,
+    state: SharedState,
 }
 
 /// A credit-controlled stream opened through a Semantic Capability.
@@ -33,6 +39,7 @@ pub struct CapabilitySubscription {
     receiver: mpsc::Receiver<Result<JsonValue, BackendError>>,
     writer: Arc<PriorityWriter>,
     streams: CapabilityStreams,
+    state: SharedState,
     closed: bool,
 }
 
@@ -53,12 +60,36 @@ impl CapabilitySubscription {
         event
     }
 
+    /// Receives one event and the credit it consumed, so the caller decides when to ask for more.
+    ///
+    /// The host sends no further event until the returned [`StreamCredit`] is released, which is
+    /// what lets a consumer commit an event before accepting the next one.
+    pub async fn recv_with_credit(
+        &mut self,
+    ) -> Option<Result<(JsonValue, StreamCredit), BackendError>> {
+        match self.receiver.recv().await? {
+            Ok(payload) => Some(Ok((
+                payload,
+                StreamCredit {
+                    id: self.id.clone(),
+                    writer: self.writer.clone(),
+                },
+            ))),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
     /// Closes the stream and releases its registry entry.
+    ///
+    /// The stream is retired before the entry goes, so events the host wrote
+    /// against credit it still held are ignored rather than read as events for
+    /// a stream that does not exist.
     pub async fn close(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
+        self.state.lock().await.retire_stream(&self.id);
         self.streams.lock().await.remove(&self.id);
         let _ = self
             .writer
@@ -66,6 +97,30 @@ impl CapabilitySubscription {
                 ("kind", JsonValue::String("stream_close".into())),
                 ("streamId", JsonValue::String(self.id.clone())),
                 ("code", JsonValue::String("closed".into())),
+            ]))
+            .await;
+    }
+}
+
+/// One event's worth of credit, still owed to the host.
+///
+/// Dropping it without releasing it keeps the window closed, which is how a consumer applies
+/// back pressure while it commits what it has already received.
+#[must_use = "the host sends no further event until this credit is released"]
+pub struct StreamCredit {
+    id: String,
+    writer: Arc<PriorityWriter>,
+}
+
+impl StreamCredit {
+    /// Returns the credit, allowing the host to send one more event.
+    pub async fn release(self) {
+        let _ = self
+            .writer
+            .control(object([
+                ("kind", JsonValue::String("credit".into())),
+                ("streamId", JsonValue::String(self.id)),
+                ("amount", JsonValue::from(1_u64)),
             ]))
             .await;
     }
@@ -79,8 +134,10 @@ impl Drop for CapabilitySubscription {
         let id = self.id.clone();
         let streams = self.streams.clone();
         let writer = self.writer.clone();
+        let state = self.state.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                state.lock().await.retire_stream(&id);
                 streams.lock().await.remove(&id);
                 let _ = writer
                     .control(object([
@@ -107,12 +164,14 @@ impl CapabilityClient {
         writer: Arc<PriorityWriter>,
         pending: PendingCapabilities,
         streams: CapabilityStreams,
+        state: SharedState,
     ) -> Self {
         Self {
             writer,
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
             streams,
+            state,
         }
     }
 
@@ -135,19 +194,21 @@ impl CapabilityClient {
             "p:cap-stream-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed)
         );
-        let (sender, receiver) = mpsc::channel(32);
-        self.streams.lock().await.insert(
-            id.clone(),
-            CapabilityStreamRoute {
-                sender,
-                next_sequence: 1,
-            },
-        );
+        // The route holds exactly the credit window the contract grants, so a
+        // conforming host can never overrun it.
+        let (sender, receiver) = mpsc::channel(INITIAL_STREAM_CREDIT);
+        self.streams
+            .lock()
+            .await
+            .insert(id.clone(), CapabilityStreamRoute { sender });
         let value = object([
             ("kind", JsonValue::String("stream_open".into())),
             ("id", JsonValue::String(id.clone())),
             ("topic", JsonValue::String("capability.stream".into())),
-            ("initialCredit", JsonValue::from(32_u64)),
+            (
+                "initialCredit",
+                JsonValue::from(INITIAL_STREAM_CREDIT as u64),
+            ),
             ("payload", JsonValue::Object(payload)),
         ]);
         if self.writer.control(value).await.is_err() {
@@ -159,24 +220,27 @@ impl CapabilityClient {
             receiver,
             writer: self.writer.clone(),
             streams: self.streams.clone(),
+            state: self.state.clone(),
             closed: false,
         })
     }
 
+    /// Routes one already-classified event to its stream.
+    ///
+    /// `ContractState` decides whether an event is legal, late or fatal before
+    /// it reaches here, including its sequence. A route this side has already
+    /// dropped is a race the classifier tolerated, so the event is discarded
+    /// rather than reclassified. A full route is the one condition left, and a
+    /// conforming host cannot produce it inside the credit window.
     pub(crate) async fn event(
         streams: &CapabilityStreams,
         id: &str,
-        sequence: u64,
         payload: JsonValue,
     ) -> Result<(), &'static str> {
         let mut routes = streams.lock().await;
         let Some(route) = routes.get_mut(id) else {
-            return Err("unknown_stream");
+            return Ok(());
         };
-        if sequence != route.next_sequence {
-            return Err("event_sequence");
-        }
-        route.next_sequence = route.next_sequence.saturating_add(1);
         route
             .sender
             .try_send(Ok(payload))
@@ -243,7 +307,37 @@ impl CapabilityClient {
             self.pending.lock().await.remove(&id);
             return Err(unavailable());
         }
-        receiver.await.unwrap_or_else(|_| Err(unavailable()))
+        match tokio::time::timeout(CALL_DEADLINE, receiver).await {
+            Ok(answer) => answer.unwrap_or_else(|_| Err(unavailable())),
+            Err(_) => {
+                // The caller stops waiting here, so the request is retired
+                // here: the host always answers, and its late first terminal
+                // frame is then ignored instead of read as an answer to a
+                // request this side never made.
+                self.pending.lock().await.remove(&id);
+                self.state.lock().await.retire_request(&id);
+                Err(BackendError::new(
+                    "deadline_exceeded",
+                    true,
+                    JsonValue::Object(Default::default()),
+                ))
+            }
+        }
+    }
+}
+
+/// Fails every capability call and stream that is still waiting.
+///
+/// Called once the dispatcher has returned: nothing will answer them now, and a
+/// Package task holding a client must not wait forever.
+pub(crate) async fn fail_all(pending: &PendingCapabilities, streams: &CapabilityStreams) {
+    let waiting = std::mem::take(&mut *pending.lock().await);
+    for (_, sender) in waiting {
+        let _ = sender.send(Err(unavailable()));
+    }
+    let routes = std::mem::take(&mut *streams.lock().await);
+    for (_, route) in routes {
+        let _ = route.sender.send(Err(unavailable())).await;
     }
 }
 

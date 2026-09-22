@@ -10,32 +10,35 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Installation** | One running instance of Teamarness on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
 | **Package** | A vertical module that owns one product domain, including its model, records, schemas, projections, policy, UI, and Package-specific membership. A Package consumes Semantic Capabilities for Teamarness-owned authority and generic services |
-| **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and Teamarness implementations of Semantic Capabilities |
-| **Shell** | The Tauri desktop host that owns Package navigation and UI mounting, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
+| **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and the authority and state behind Semantic Capabilities |
+| **Shell** | The Tauri desktop host that owns Package navigation and UI mounting in Package UI Frames, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
 
 ## Identity and Membership
 
 | Term | Definition |
 |---|---|
-| **Installation Identity** | A permanent Ed25519 keypair generated on first launch. The `SecretKey` is the Iroh endpoint secret; the `PublicKey` is the Iroh `EndpointId`. This is the device's network identity |
+| **Installation Identity** | A permanent Ed25519 keypair generated on first launch. The `SecretKey` is the Iroh endpoint secret; the `PublicKey` is the Iroh `EndpointId`. This is the device's network identity. It is also converted to an X25519 key to open Protection Grants (ADR 0013) |
 | **Installation Display Name** | User-changeable, validated human-readable metadata for the local Installation. It does not replace the Public Identity and is not currently shared through canonical membership |
 | **Public Identity** | The public half of an installation identity (`EndpointId`), shared with workspaces as a member identifier |
 | **Member** | An installation identity admitted to a workspace. Membership is canonical and interval-based. A human may have multiple device identities; devices are first-class members |
+| **Manager** | A Member whose role authorizes admitting and revoking Members and issuing Invitations. In version 1 the Workspace creator is the only Manager (`MembershipRole::Manager`). Manager assignment and transfer are roadmap Phase 5 work |
 | **Membership Interval** | A bounded period `[admitted, revoked?)` during which an identity was a workspace member. Intervals are contiguous; a member cannot have gaps |
 | **Canonical Membership** | The signed, causally ordered, append-only membership operation DAG that is the sole authority for who is a workspace member. Built above Iroh's transport identity. Iroh connects peers; the membership DAG authorizes them |
 | **Invitation** | A single-use, cryptographically signed token that authorizes one Installation to join a Workspace. It carries the inviter identity, Workspace identity, and expiry. An exact retry by the already admitted Installation may recover the same committed admission; recovery is not a second use |
 | **Workspace Invitation** | The opaque, copied onboarding value that wraps a signed Invitation and the issuer's public Iroh endpoint ticket. It is sensitive bearer admission material |
-| **Revocation** | A signed membership operation that ends a member's current interval. The revoked member retains past data but cannot read or write future content. Triggers key rotation in affected packages |
-| **Epoch** | A workspace-local, monotonically increasing cursor for committed membership transitions. It orders local delivery but does not identify distributed membership state |
+| **Revocation** | A signed membership operation that ends a Member's current interval. It replicates to every Member; once an Installation accepts it, that Installation stops synchronizing with the revoked Installation. The revoked Installation keeps data and Content Keys it already received. Version 1 does not rotate Content Keys on revocation; rotation is roadmap Phase 5 work |
+| **Epoch** | A workspace-local, monotonically increasing cursor for committed membership transitions, including transitions received through Membership Replication. It orders local delivery but does not identify distributed membership state and is not a Content Key Generation |
 | **Membership Version** | A content-derived identifier for a workspace's accepted membership operation set. Peers with the same operation set have the same membership version |
 | **Membership Operation** | A signed `admit` or `revoke` entry in the canonical membership DAG. Its content-derived ID authenticates the canonical bytes, and its dependency links record causal history |
+| **Membership Replication** | Core-owned exchange of accepted Membership Operations between Installations of one Workspace, independent of Package records. It is idempotent, causal, and resumes after disconnection |
 
 ## Package Architecture
 
 | Term | Definition |
 |---|---|
-| **Package Host** | The Teamarness boundary that operates Package Instances and routes Package Process, data-directory, Semantic Capability, and UI contracts without product-specific branches |
+| **Package Host** | The Teamarness boundary that operates Package Instances and routes Package Process, data-directory, Semantic Capability, and UI contracts without product-specific branches. It owns each Semantic Capability's wire contract, limits, and version negotiation |
 | **Semantic Capability** | A versioned, typed interface through which a Package uses Teamarness-owned authority or generic behavior without receiving host secrets or resources |
+| **Semantic Capability Family** | The stable name of one Semantic Capability contract shape, such as the immutable record log. A family evolves by version; a different shape is a new family, declared and negotiated beside the existing ones |
 | **Synchronization Capability** | A Package-scoped Semantic Capability that uses Core Runtime-owned replication and transport machinery for Package-defined records. The Package still owns its schemas, projections, and domain policy |
 | **Synchronization Projection** | Core's private authenticated P2Panda operation view of a Teamarness semantic record. It supplies bounded LogSync ranges without replacing `RecordId`, `OrderKey`, or the Installation-local `Cursor` |
 | **Durable Wake** | A coalesced Core persistence marker that records synchronization work needing a later bounded session, including after restart |
@@ -47,6 +50,9 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Process** | One supervised operating-system process running a Package Backend for one Package Instance |
 | **Package Process Protocol** | The versioned, language-neutral executable contract between the Package Host and a Package Process |
 | **Package UI Mount** | The Shell-owned attachment of a Package UI to the visible Package pane for one Package Instance. Mounting and visibility do not define Backend lifetime |
+| **Package UI Frame** | The sandboxed frame, with an opaque origin, in which the Shell runs one Package UI Mount's code, separate from the Shell's JavaScript realm |
+| **Package UI Bridge** | The mount-scoped message channel between a Package UI Frame and the Shell. The Shell derives mount identity from the channel, never from message content |
+| **Frame Runtime** | The Shell-owned script inside a Package UI Frame that builds the mount context and client and calls the Package UI's `mount` |
 | **Package Data Directory** | The durable local directory assigned to one Package Identity, Workspace, and Installation. The Package owns its contents and local representation |
 | **Package Artifact** | A built Package file selected for a specific target and entrypoint |
 | **Package Directory** | A directory containing one Package Manifest and the Package Artifacts it identifies. A configured local Package path identifies this directory |
@@ -56,6 +62,13 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Registration Scope** | The authority boundary for a Package Registration: `application`, `installation`, or `workspace`. Phase 3 uses application registrations for bundled sources and installation registrations for configured local sources |
 | **Package Admission** | The Teamarness decision to accept a validated Package Source for execution as a Package Identity |
 | **Package Trust** | The authority Teamarness grants during Package Admission. A Package Manifest cannot grant trust to its own Package |
+| **Package Catalog** | The Package Host's list of admitted Packages, each with Package Identity, version, display name, Package Source kind, Package Trust kind, and UI contract digest. It excludes filesystem paths and loader URLs |
+| **Host Revision** | A monotonic number identifying one authoritative Package Host snapshot. Consumers use it to discard stale updates |
+| **Package Instance Lifecycle State** | One of `admitted`, `activating`, `active`, `suspending`, `suspended`, `recovering`, `failed`, `crash_loop`, `disposing`, `disposed`. `crash_loop` means automatic restarts were exhausted; `failed` needs explicit recovery or disposal. Shell UI wording may differ; see the Shell |
+| **Package-Owned Error** | A Package Backend's stable error code, retryability, and bounded details, carried to the Package UI beside the Teamarness error code |
+| **Package Validator** | The author-runnable command that applies Package Admission's Package Manifest and UI contract rules to a Package project or Package Directory |
+| **Capability Grant** | An opaque, per-process-generation token that binds one Package Instance's declared Semantic Capability to its Package Identity, Workspace, and Installation. Grants are implicit in capability calls and are not transferable |
+| **Package Source Label** | A presentation alias shown by the Shell: `Team` for Package Source `bundled`, `Personal` for `local`. It is not a trust verdict and does not define Registration Scope, Workspace enablement, or sharing |
 
 ## Conversations
 
@@ -65,6 +78,21 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a Channel through the generic immutable-record capability. Transport details remain Core-owned |
 | **Channel Membership** | Package-owned policy determining who can read and post in a specific Channel, bounded by Canonical Membership. Phase 4 has no separate Channel Membership records because every current Workspace Member participates in every Channel |
 | **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns records and domain policy; `teamarness.synchronization.immutable-record-log` owns reusable transport, replication, retry, and backpressure |
+
+## Synchronization and Protection
+
+| Term | Definition |
+|---|---|
+| **Immutable Record** | A Package-defined canonical byte value appended once to a Package-and-Workspace record log through `teamarness.synchronization.immutable-record-log`, authenticated by its author, and never changed |
+| **Record ID** | The authenticated content-derived identifier of an Immutable Record (`RecordId`) |
+| **Order Key** | Core's versioned, convergent sort position for an Immutable Record (`OrderKey`). Every Installation sorts accepted records the same way. It is not wall-clock time |
+| **Cursor** | An Installation-local delivery position in a record subscription (`Cursor`). It is progress, not an order offset, and differs between Installations |
+| **Sealed Record** | The Teamarness-owned versioned binary envelope that carries an encrypted Immutable Record. Packages store and pass sealed records but open them only through the capability |
+| **Content Key** | The symmetric key that seals one Package-and-Workspace record log. Core holds it and never exposes it to Packages. Version 1 has one Content Key per scope and no rotation |
+| **Protection Grant** | Core-to-Core material that gives one current Member the Content Key for a scope. It is sealed to its recipient Installation's key, so only that Installation can open it, and it is signed by its author through the domain-separated signing interface. It carries the Content Key Origin and is distinct from a Capability Grant |
+| **Content Key Generation** | The period during which one Content Key seals new records in a Package scope. Version 1 has exactly one generation per scope, started by the Workspace creator's first append. Roadmap Phase 5 starts a new generation on revocation so a revoked Member cannot open records sealed afterwards |
+| **Content Key Origin** | The Workspace creator's signed record naming a scope's first Content Key. A Protection Grant carries it, and an Installation accepts a first Content Key only with it |
+| **Parked Operation** | A received, authenticated synchronization operation that Core cannot apply yet because its author's admission or its scope's Content Key is not yet known locally. It is kept within fixed bounds and applied when that state arrives |
 
 ## Transport (Iroh)
 
@@ -79,5 +107,4 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 
 | Term | Definition |
 |---|---|
-| **Repository Registration** | Binding a local Git clone to a workspace so packages can read it. Teamarness does not replicate repository files |
-| **Workspace Files** | Collaborative documents owned by the workspace-files package. Filesystem-first authority with signed operations, transported as Iroh blobs |
+| **Repository Registration** | A Package-owned record binding a local Git working tree, by canonical path, to one Installation and Workspace so that Package can read it. Registrations and repository content are not replicated |

@@ -60,7 +60,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Decision:** Use Tauri 2.11 with exact package pins, vanilla TypeScript, Vite, Vitest, and npm workspaces. Commit the Rust and npm lockfiles. Re-check patch versions if implementation begins after the research date, while preserving Tauri minor-version compatibility.
 
-**Rationale:** The official Tauri release index and package registries confirmed compatible current versions and support the repository's Node.js 24 and Rust 1.96 minimums. The shell and reference package do not need a frontend framework. See `.myflow/workstreams/shell-package-lifecycle/research/20260912T221751Z_tauri-package-execution-storage-and-core-boundary.md`.
+**Rationale:** The official Tauri release index and package registries confirmed compatible current versions and support the repository's Node.js 24 and Rust 1.96 minimums. The shell and reference package do not need a frontend framework. Research on 2026-09-12 found `tauri` 2.11.5, `tauri-build` 2.6.3, `@tauri-apps/api` 2.11.1, and `@tauri-apps/cli` 2.11.4 in the official release index. The Rust crate and the JavaScript API must share the 2.11 minor. Vite 8.3.0, TypeScript 7.0.2, and Vitest 5.0.0 accept Node.js 24. Tauri recommends the vanilla TypeScript template when no framework is needed, and committing lockfiles. No build was run at research time; later phases built and bundled with these pins.
 
 ---
 
@@ -70,7 +70,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Decision:** Keep onboarding behind high-level Core Runtime operations. Wrap the existing signed invitation in a bounded `WorkspaceInvitation` with an Iroh endpoint ticket. Bind both authenticated peers to the token and claim, commit admission before response delivery, validate and import the complete bootstrap atomically, and report local join only after that import. An exact retry recovers the original admission before expiry checks, then exports the issuer's complete current accepted set at one consistency boundary without creating another admission.
 
-**Rationale:** The issuer and joiner have independent databases, so retry must bridge two commit points rather than pretend they share a transaction. Current-state join completion preserves the matching-membership requirement if another admission or revocation commits before retry. The operation remains bounded and claim-specific; continuous membership synchronization is a separate protocol. See `context/.decisions/0005-iroh-workspace-onboarding.md` and `.myflow/workstreams/shell-package-lifecycle/design/20260913T002055Z_workspace-onboarding-protocol.md`.
+**Rationale:** The issuer and joiner have independent databases, so retry must bridge two commit points rather than pretend they share a transaction. Current-state join completion preserves the matching-membership requirement if another admission or revocation commits before retry. The operation remains bounded and claim-specific; continuous membership synchronization is a separate protocol (ADR 0013). See `context/.decisions/0005-iroh-workspace-onboarding.md`. Its evidence summary is in ADR 0011. Every membership mutation pre-checks that the complete bootstrap stays within 8 MiB and 1,024 operations, so an exact retry can always be exported.
 
 ---
 
@@ -88,6 +88,24 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Unresolved: Workspace-scoped or Installation-scoped name (2026-09-17).** The developer considered letting a person use a different name, or an emoji, in each Workspace. That conflicts with `TEAM.SYS.ID-R05`, which defines one Installation Display Name per Installation and does not allow emoji. No decision is made. Before choosing, compare the approaches and their trade-offs: a per-Workspace name, a per-Installation name, or a per-Installation default with per-Workspace overrides. Cover storage, validation, privacy, rename behavior, and multi-device support.
 
-**Sequencing (2026-09-17, developer):** Implementation waits for membership synchronization from the architecture review, because peers other than the issuer and joiner do not currently learn of admissions.
+**Sequencing (2026-09-17, developer):** Implementation waits for membership synchronization from the architecture review, which main now carries (merged 2026-09-22).
 
 **Intended destination:** The Member names follow-up workstream in `context/roadmap.md` resolves this for one Installation per person, after the architecture review delivers membership synchronization. Phase 5 extends it to multiple devices.
+
+---
+
+## TEAM-DQ9 - Package Instance lifecycle on Workspace leave or local revocation
+
+**Status:** open.
+
+**Blocks:** Roadmap Phase 5 (Membership Management), which introduces Workspace leave and member removal.
+
+**Question:** When the local Installation leaves a Workspace or is revoked from it, does the Package Host suspend that Workspace's Package Instances, dispose them, or retain them and their Package Data Directories?
+
+**Current state:** `ReconcileWorkspaces` activates every admitted Package for every Workspace the Core Runtime lists, and never disposes an Instance. Nothing tells the Package Host that a Workspace has gone away, so a left or revoked Workspace keeps its Backends running until the application stops.
+
+**Options:** the Package Host subscribes to a Core Runtime workspace-set or local-membership stream through a narrow port trait (ARC-06), or the Shell drives suspension and disposal as part of the leave command it already issues.
+
+**Note:** the Core Runtime already gates every capability call on current membership, so this is a lifecycle and resource question, not an authorization one. A revoked Installation's Packages cannot read or write Workspace data; they merely keep running.
+
+**Owner:** roadmap Phase 5.

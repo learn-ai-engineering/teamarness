@@ -2,6 +2,7 @@
 members = [
     "apps/teamarness-desktop/src-tauri",
     "crates/teamarness-core",
+    "crates/teamarness-package-contract",
     "crates/teamarness-package-host",
     "crates/teamarness-package-protocol",
     "crates/teamarness-package-sdk",
@@ -9,6 +10,7 @@ members = [
     "packages/tutorial/backend",
     "packages/conversations-package/backend",
     "packages/repo-aware/backend",
+    "tests/system",
 ]
 resolver = "3"
 
@@ -20,6 +22,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 getrandom = { version = "=0.4.3", features = ["std"] }
+gix = { version = "=0.87.1", default-features = false, features = ["status", "sha1", "sha256", "parallel"] }
 iroh = "=1.2.0"
 iroh-base = { version = "=1.2.0", default-features = false, features = ["key"] }
 iroh-tickets = "=1.0.0"
@@ -45,3 +48,8 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 uuid = { version = "=1.26.1", default-features = false, features = ["v4"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["now", "serde"] }
+curve25519-dalek = { version = "=5.0.0", default-features = false }
+hpke-rs = "=0.7.0"
+hpke-rs-crypto = "=0.7.0"
+hpke-rs-rust-crypto = "=0.7.0"
+zeroize = "=1.9.0"

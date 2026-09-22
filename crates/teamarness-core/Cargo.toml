@@ -7,8 +7,15 @@ license.workspace = true
 
 [features]
 p2panda-sync-adapter = []
+# Observation hooks for tests in other crates. Enabled only from a
+# `[dev-dependencies]` entry; it never re-exposes production API.
+test-hooks = []
 
 [dependencies]
+curve25519-dalek.workspace = true
+hpke-rs.workspace = true
+hpke-rs-crypto.workspace = true
+hpke-rs-rust-crypto.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true
 iroh-tickets.workspace = true
@@ -23,7 +30,16 @@ getrandom.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
 
 [dev-dependencies]
-serde_json.workspace = true
+# This crate's own integration tests are compiled out of crate, so they see the
+# published API only. `test-hooks` is how they reach the loopback binding that
+# keeps them off the public relays; it never ships in the application.
+teamarness-core = { path = ".", features = ["test-hooks"] }
+tokio = { workspace = true, features = ["test-util"] }

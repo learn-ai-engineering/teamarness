@@ -11,7 +11,17 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use super::handler::{IssuerService, OnboardingHandler};
 use crate::OnboardingError;
-use crate::network::Network;
+use crate::diag::fault;
+use crate::network::{Network, NetworkError};
+
+/// Onboarding maps the shared network's failures at its own boundary, so
+/// `network` names no onboarding type.
+fn map_network_error(error: NetworkError) -> OnboardingError {
+    match error {
+        NetworkError::Readiness => OnboardingError::Readiness,
+        NetworkError::Shutdown => OnboardingError::Shutdown,
+    }
+}
 
 pub(crate) const ONBOARDING_ALPN: &[u8] = b"teamarness/workspace-join/1";
 pub(crate) const INVITATION_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,7 +69,7 @@ pub(crate) struct Transport {
 #[derive(Clone, Copy)]
 enum Readiness {
     EndpointOnline(Duration),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     Immediate,
 }
 
@@ -67,7 +77,7 @@ impl Transport {
     pub(crate) async fn bind_production(
         secret_key: SecretKey,
         issuer: IssuerService,
-        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -79,29 +89,36 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             Some(issuer),
-            receiver,
+            protocols,
         )
         .await
     }
 
+    /// Binds the shared Endpoint with onboarding registered first, followed by
+    /// whatever protocols the composition point supplies.
     async fn bind(
         secret_key: SecretKey,
         options: BindOptions,
         issuer: Option<IssuerService>,
-        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         let handler = Arc::new(match issuer {
             Some(issuer) => OnboardingHandler::with_issuer(options.request_timeout, issuer),
             None => OnboardingHandler::new(options.request_timeout),
         });
+        let mut registrations: Vec<crate::network::ProtocolRegistration> = vec![(
+            ONBOARDING_ALPN.to_vec(),
+            Box::new(Arc::clone(&handler)) as Box<dyn iroh::protocol::DynProtocolHandler>,
+        )];
+        registrations.extend(protocols);
         let network = Network::bind(
             secret_key,
             options.relay_mode,
             options.loopback_only,
-            Arc::clone(&handler),
-            receiver,
+            registrations,
         )
-        .await?;
+        .await
+        .map_err(map_network_error)?;
         Ok(Arc::new(Self {
             network,
             handler,
@@ -143,9 +160,9 @@ impl Transport {
             Readiness::EndpointOnline(duration) => {
                 timeout(duration, self.network.endpoint().online())
                     .await
-                    .map_err(|_| OnboardingError::Readiness)?
+                    .map_err(fault!(OnboardingError::Readiness))?
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             Readiness::Immediate => {}
         }
         self.lifecycle.ensure_running()?;
@@ -184,8 +201,8 @@ impl Transport {
             self.network.endpoint().connect(address, ONBOARDING_ALPN),
         )
         .await
-        .map_err(|_| OnboardingError::Timeout)?
-        .map_err(|_| OnboardingError::Authentication)
+        .map_err(fault!(OnboardingError::Timeout))?
+        .map_err(fault!(OnboardingError::Authentication))
     }
 
     #[allow(dead_code)]
@@ -195,7 +212,7 @@ impl Transport {
     ) -> Result<T, OnboardingError> {
         timeout(RESPONSE_IO_TIMEOUT, future)
             .await
-            .map_err(|_| OnboardingError::Timeout)?
+            .map_err(fault!(OnboardingError::Timeout))?
     }
 
     pub(crate) async fn whole_join_until<T>(
@@ -209,28 +226,7 @@ impl Transport {
         }
         timeout_at(Instant::from_std(deadline), future)
             .await
-            .map_err(|_| OnboardingError::Timeout)?
-    }
-
-    pub(crate) async fn send_sync_batch(
-        &self,
-        address: EndpointAddr,
-        batch: &crate::synchronization::SyncBatch,
-    ) -> Result<usize, OnboardingError> {
-        self.network.send_batch(address, batch).await
-    }
-
-    pub(crate) async fn send_log_sync(
-        &self,
-        address: EndpointAddr,
-        receiver: Arc<dyn crate::synchronization::SyncReceiver>,
-        workspace: crate::WorkspaceId,
-        package: String,
-        peer: crate::PublicIdentity,
-    ) -> Result<usize, OnboardingError> {
-        self.network
-            .send_log_sync(address, receiver, workspace, package, peer)
-            .await
+            .map_err(fault!(OnboardingError::Timeout))?
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), OnboardingError> {
@@ -240,7 +236,7 @@ impl Transport {
             .shutdown
             .get_or_init(|| async {
                 self.lifecycle.wait_for_idle().await;
-                let result = self.network.shutdown().await;
+                let result = self.network.shutdown().await.map_err(map_network_error);
                 self.lifecycle.stopped();
                 result
             })
@@ -277,52 +273,41 @@ impl Transport {
         readiness_timeout: Duration,
         ready_immediately: bool,
     ) -> Result<Arc<Self>, OnboardingError> {
-        Self::bind_loopback_inner(secret_key, readiness_timeout, ready_immediately, None, None)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn bind_loopback_with_issuer(
-        secret_key: SecretKey,
-        readiness_timeout: Duration,
-        ready_immediately: bool,
-        issuer: IssuerService,
-    ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind_loopback_inner(
             secret_key,
             readiness_timeout,
             ready_immediately,
-            Some(issuer),
             None,
+            Vec::new(),
         )
         .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn bind_loopback_with_issuer_and_receiver(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) async fn bind_loopback_with_issuer_and_protocols(
         secret_key: SecretKey,
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: IssuerService,
-        receiver: Arc<dyn crate::synchronization::SyncReceiver>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind_loopback_inner(
             secret_key,
             readiness_timeout,
             ready_immediately,
             Some(issuer),
-            Some(receiver),
+            protocols,
         )
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     async fn bind_loopback_inner(
         secret_key: SecretKey,
         readiness_timeout: Duration,
         ready_immediately: bool,
         issuer: Option<IssuerService>,
-        receiver: Option<Arc<dyn crate::synchronization::SyncReceiver>>,
+        protocols: Vec<crate::network::ProtocolRegistration>,
     ) -> Result<Arc<Self>, OnboardingError> {
         Self::bind(
             secret_key,
@@ -338,12 +323,28 @@ impl Transport {
                 request_timeout: REQUEST_READ_TIMEOUT,
             },
             issuer,
-            receiver,
+            protocols,
         )
         .await
     }
 
+    /// The shared Endpoint and Router this Installation runs every protocol on.
+    pub(crate) fn network(&self) -> &Arc<Network> {
+        &self.network
+    }
+
     #[cfg(test)]
+    pub(crate) fn endpoint(&self) -> &iroh::Endpoint {
+        self.network.endpoint()
+    }
+
+    /// Teaches a loopback endpoint how to reach a peer it has never dialled.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn remember_peer_address(&self, address: EndpointAddr) {
+        self.network.remember_peer_address(address);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn endpoint_address(&self) -> EndpointAddr {
         self.network.endpoint().bound_sockets().into_iter().fold(
             EndpointAddr::new(self.network.endpoint().id()),
@@ -683,7 +684,7 @@ mod tests {
         assert_eq!(WHOLE_JOIN_TIMEOUT, Duration::from_secs(60));
         let classified = timeout(Duration::from_millis(1), std::future::pending::<()>())
             .await
-            .map_err(|_| OnboardingError::Timeout);
+            .map_err(fault!(OnboardingError::Timeout));
         assert_eq!(classified.unwrap_err(), OnboardingError::Timeout);
     }
 

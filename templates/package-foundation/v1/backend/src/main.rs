@@ -1,6 +1,8 @@
-use teamarness_generated_package_backend::GeneratedBackend;
+#![forbid(unsafe_code)]
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), teamarness_package_sdk::SdkError> {
-    GeneratedBackend::serve().await
+use std::process::ExitCode;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    teamarness_generated_package_backend::router().run().await
 }

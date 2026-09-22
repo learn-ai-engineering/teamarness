@@ -1,5 +1,5 @@
-{"direction":"host","frame":{"kind":"stream_open","id":"h:stream-1","topic":"ui.changes","mountId":"bW91bnQx","initialCredit":32,"payload":{}}}
-{"direction":"package","frame":{"kind":"event","streamId":"h:stream-1","sequence":"1","payload":{"value":1}}}
-{"direction":"package","frame":{"kind":"event","streamId":"h:stream-1","sequence":"2","payload":{"value":2}}}
-{"direction":"host","frame":{"kind":"credit","streamId":"h:stream-1","amount":2}}
-{"direction":"package","frame":{"kind":"stream_close","streamId":"h:stream-1","code":"complete"}}
+{"direction":"host","frame":{"kind":"stream_open","id":"h:stream-1","topic":"ui.changes","mountId":"bW91bnQx","initialCredit":32,"payload":{}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"event","streamId":"h:stream-1","sequence":"1","payload":{"value":1}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"event","streamId":"h:stream-1","sequence":"2","payload":{"value":2}},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"credit","streamId":"h:stream-1","amount":2},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"stream_close","streamId":"h:stream-1","code":"complete"},"verdict":"deliver"}

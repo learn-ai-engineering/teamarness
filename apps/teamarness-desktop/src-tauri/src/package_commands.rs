@@ -317,6 +317,11 @@ async fn forward_ui_events(
     loop {
         let message = match receiver.changed().await {
             Ok(PackageHostNotification::UiEvent(value)) => UiStreamMessageDto::Event(value.into()),
+            // The Package ended the stream; the Shell reports it and stops, without a fault.
+            Ok(PackageHostNotification::UiStreamCompleted(value)) => {
+                let _ = on_event.send(UiStreamMessageDto::Completed(value.into()));
+                return;
+            }
             Err(error) => {
                 let _ = on_event.send(UiStreamMessageDto::Failure(error.into()));
                 return;
@@ -553,7 +558,7 @@ mod tests {
             let existing = before.instances[0].clone();
             core.create_workspace("Second Workspace").unwrap();
             host.execute(PackageHostCommand::ReconcileWorkspaces(
-                teamarness_package_host::ReconcileWorkspaces { workspaces: vec![] },
+                teamarness_package_host::ReconcileWorkspaces {},
             ))
             .await
             .unwrap();
@@ -644,7 +649,7 @@ mod tests {
         )
         .unwrap();
         let core = Arc::new(
-            CoreRuntime::open(CoreRuntimeConfig::new(root.path().join("core")))
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
                 .await
                 .unwrap(),
         );

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use teamarness_core::{MembershipError, OnboardingError, StorageError, WorkspaceError};
+use teamarness_package_host::{PackageErrorCode, PackageErrorEnvelope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeError {
@@ -21,6 +22,9 @@ pub enum BridgeErrorCode {
     LocalConflict,
     AdmissionNoLongerCurrent,
     UncertainStorageOutcome,
+    /// A Package Instance could not be activated for a Workspace. The Workspace
+    /// itself is usable; some of its Packages are not.
+    PackageReconciliation,
     Shutdown,
 }
 
@@ -35,6 +39,17 @@ impl BridgeError {
 
     pub const fn shutdown() -> Self {
         Self::new(BridgeErrorCode::Shutdown, true)
+    }
+
+    /// Reports a Package reconciliation failure as what it is. Only a Host that
+    /// is shutting down becomes [`BridgeErrorCode::Shutdown`]; every other
+    /// failure says that Package activation failed, and carries the Host's own
+    /// retryability.
+    pub fn reconcile(error: &PackageErrorEnvelope) -> Self {
+        match error.code {
+            PackageErrorCode::ShuttingDown => Self::shutdown(),
+            _ => Self::new(BridgeErrorCode::PackageReconciliation, error.retryable),
+        }
     }
 }
 
@@ -98,6 +113,7 @@ impl From<StorageError> for BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teamarness_package_host::{DiagnosticId, PackageErrorStage, RecoveryAction};
 
     #[test]
     fn maps_every_public_onboarding_error_to_the_shared_fixture() {
@@ -121,6 +137,44 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(actual, fixture["errors"]);
+    }
+
+    /// A reconcile failure that is not a Host shutdown must not tell the person
+    /// that Teamarness is shutting down.
+    #[test]
+    fn a_reconcile_failure_is_reported_as_itself_not_as_shutdown() {
+        let failed = PackageErrorEnvelope::new(
+            PackageErrorCode::CrashLoop,
+            PackageErrorStage::Process,
+            false,
+            RecoveryAction::RecoverBackend,
+            DiagnosticId::new("diag-1").unwrap(),
+        );
+        assert_eq!(
+            BridgeError::reconcile(&failed),
+            BridgeError::new(BridgeErrorCode::PackageReconciliation, false)
+        );
+
+        let retryable = PackageErrorEnvelope::new(
+            PackageErrorCode::DeadlineExceeded,
+            PackageErrorStage::Process,
+            true,
+            RecoveryAction::RecoverBackend,
+            DiagnosticId::new("diag-2").unwrap(),
+        );
+        assert_eq!(
+            BridgeError::reconcile(&retryable),
+            BridgeError::new(BridgeErrorCode::PackageReconciliation, true)
+        );
+
+        let stopping = PackageErrorEnvelope::new(
+            PackageErrorCode::ShuttingDown,
+            PackageErrorStage::Shutdown,
+            true,
+            RecoveryAction::None,
+            DiagnosticId::new("diag-3").unwrap(),
+        );
+        assert_eq!(BridgeError::reconcile(&stopping), BridgeError::shutdown());
     }
 
     #[test]

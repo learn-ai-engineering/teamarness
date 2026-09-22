@@ -1,0 +1,9 @@
+{"direction":"host","frame":{"kind":"request","id":"h:retired-call","operation":"ui.mutate","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740998","payload":{}},"verdict":"deliver"}
+{"retire":{"request":"h:retired-call"}}
+{"direction":"package","frame":{"kind":"error","id":"h:retired-call","code":"cancelled","retryable":true},"verdict":"ignore"}
+{"direction":"host","frame":{"kind":"stream_open","id":"h:retired-ui","topic":"ui.events","mountId":"bW91bnQx","initialCredit":32,"payload":{}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"event","streamId":"h:retired-ui","sequence":"1","payload":{}},"verdict":"deliver"}
+{"retire":{"stream":"h:retired-ui"}}
+{"direction":"package","frame":{"kind":"event","streamId":"h:retired-ui","sequence":"2","payload":{}},"verdict":"ignore"}
+{"direction":"host","frame":{"kind":"credit","streamId":"h:retired-ui","amount":1},"verdict":"ignore"}
+{"direction":"package","frame":{"kind":"stream_close","streamId":"h:retired-ui","code":"completed"},"verdict":"deliver"}

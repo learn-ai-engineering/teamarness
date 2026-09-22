@@ -1,5 +1,3 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
-
 export const TEAMARNESS_THEME_TOKENS = Object.freeze([
   "--teamarness-color-background",
   "--teamarness-color-panel",
@@ -98,8 +96,18 @@ const PACKAGE_UI_KIT_CSS = `
   }
 `;
 
-const installedKits = new WeakMap<ShadowRoot, { readonly sheet: CSSStyleSheet; users: number }>();
-const installedSuppressors = new WeakMap<ShadowRoot, { readonly observer: MutationObserver }>();
+/**
+ * One record per shadow root, owning everything that root's kit installation holds: the adopted
+ * sheet, the input suppressor's teardown, and the number of live installers.
+ *
+ * The suppressor's teardown belongs here rather than to the caller that happened to create it.
+ * Overlapping mounts share one root, so the cleanup that takes `users` to zero is not necessarily
+ * the one that installed the suppressor, and it must still be able to stop it.
+ */
+const installedKits = new WeakMap<
+  ShadowRoot,
+  { readonly sheet: CSSStyleSheet; readonly stopSuppressor: () => void; users: number }
+>();
 
 /**
  * Attributes that suppress WebKit autocorrection / autocapitalisation /
@@ -140,13 +148,14 @@ function suppressInputs(node: Node): void {
 /**
  * Start a MutationObserver that suppresses autocorrect on any
  * input/textarea/contenteditable added to or within this shadow root.
+ *
+ * Returns the idempotent teardown, which the caller is responsible for storing somewhere the last
+ * cleanup of this root can reach.
  */
 function installInputSuppressor(root: ShadowRoot): () => void {
-  if (installedSuppressors.has(root)) return () => undefined;
   if (typeof MutationObserver !== "function") {
-    // Environment (e.g. test runner) lacks MutationObserver.
-    // Suppress any elements already present and bail.
-    suppressInputs(root);
+    // Environment (e.g. test runner) lacks MutationObserver: the per-install sweep below is all
+    // the suppression this root gets, and there is nothing to disconnect.
     return () => undefined;
   }
 
@@ -159,69 +168,93 @@ function installInputSuppressor(root: ShadowRoot): () => void {
   });
   observer.observe(root, { childList: true, subtree: true });
 
-  // Suppress any elements already in the root.
-  suppressInputs(root);
-
-  installedSuppressors.set(root, { observer });
-
   let disconnected = false;
   return () => {
     if (disconnected) return;
     disconnected = true;
     observer.disconnect();
-    installedSuppressors.delete(root);
   };
 }
 
-function currentAdoptedSheets(root: ShadowRoot): readonly CSSStyleSheet[] {
+/**
+ * The leading phrase of every stylesheet failure, so the message names what the caller asked for
+ * rather than the Package that asked for it.
+ */
+const KIT_NEEDS = "The Package UI kit requires";
+const STYLES_NEEDS = "Package styles require";
+
+function currentAdoptedSheets(root: ShadowRoot, needs = KIT_NEEDS): readonly CSSStyleSheet[] {
   if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
-    throw new Error("The Package UI kit requires ShadowRoot.adoptedStyleSheets support");
+    throw new Error(`${needs} ShadowRoot.adoptedStyleSheets support`);
   }
   return root.adoptedStyleSheets;
 }
 
-function createKitSheet(): CSSStyleSheet {
+function createSheet(css: string, needs = KIT_NEEDS): CSSStyleSheet {
   const StyleSheet = globalThis.CSSStyleSheet;
   if (typeof StyleSheet !== "function") {
-    throw new Error("The Package UI kit requires constructed CSSStyleSheet support");
+    throw new Error(`${needs} constructed CSSStyleSheet support`);
   }
   let sheet: CSSStyleSheet;
   try {
     sheet = new StyleSheet();
   } catch (cause) {
-    throw new Error("The Package UI kit requires constructed CSSStyleSheet support", { cause });
+    throw new Error(`${needs} constructed CSSStyleSheet support`, { cause });
   }
   if (typeof sheet.replaceSync !== "function") {
-    throw new Error("The Package UI kit requires CSSStyleSheet.replaceSync support");
+    throw new Error(`${needs} CSSStyleSheet.replaceSync support`);
   }
-  sheet.replaceSync(PACKAGE_UI_KIT_CSS);
+  sheet.replaceSync(css);
   return sheet;
 }
 
-function setAdoptedSheets(root: ShadowRoot, sheets: CSSStyleSheet[]): void {
+function setAdoptedSheets(root: ShadowRoot, sheets: CSSStyleSheet[], needs = KIT_NEEDS): void {
   try {
     root.adoptedStyleSheets = sheets;
   } catch (cause) {
-    throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
+    throw new Error(`${needs} mutable ShadowRoot.adoptedStyleSheets support`, { cause });
   }
+}
+
+/**
+ * Adopts one Package-owned stylesheet into a mount's shadow root.
+ *
+ * The Package keeps its CSS in its own bundle; this only puts it where the mount can use it. The
+ * returned cleanup is idempotent and removes exactly this sheet, never anything else the root has
+ * adopted.
+ */
+export function adoptPackageStyles(root: ShadowRoot, css: string): () => void {
+  const sheet = createSheet(css, STYLES_NEEDS);
+  setAdoptedSheets(root, [...currentAdoptedSheets(root, STYLES_NEEDS), sheet], STYLES_NEEDS);
+  if (!currentAdoptedSheets(root, STYLES_NEEDS).includes(sheet)) {
+    throw new Error(`${STYLES_NEEDS} mutable ShadowRoot.adoptedStyleSheets support`);
+  }
+  let cleaned = false;
+  return () => {
+    if (cleaned) return;
+    cleaned = true;
+    const remaining = currentAdoptedSheets(root, STYLES_NEEDS).filter((entry) => entry !== sheet);
+    setAdoptedSheets(root, remaining, STYLES_NEEDS);
+  };
 }
 
 export function installPackageUiKit(root: ShadowRoot): () => void {
   let installation = installedKits.get(root);
   if (installation === undefined) {
-    const sheet = createKitSheet();
+    const sheet = createSheet(PACKAGE_UI_KIT_CSS);
     setAdoptedSheets(root, [...currentAdoptedSheets(root), sheet]);
     if (!currentAdoptedSheets(root).includes(sheet)) {
       throw new Error("The Package UI kit requires mutable ShadowRoot.adoptedStyleSheets support");
     }
-    installation = { sheet, users: 0 };
+    // The suppressor starts alongside the kit and is torn down by whichever cleanup takes the
+    // last user away, so its teardown is stored on the installation, not captured per caller.
+    installation = { sheet, stopSuppressor: installInputSuppressor(root), users: 0 };
     installedKits.set(root, installation);
   }
   installation.users += 1;
-
-  // Start the input suppressor alongside the kit.  It is torn down when
-  // the last kit user calls their cleanup function.
-  const uninstallSuppressor = installInputSuppressor(root);
+  // Suppress the elements this installer's mount has already put in the root; the observer only
+  // sees what arrives after it starts.
+  suppressInputs(root);
 
   let cleaned = false;
   return () => {
@@ -231,9 +264,11 @@ export function installPackageUiKit(root: ShadowRoot): () => void {
     if (current !== installation) return;
     current.users -= 1;
     if (current.users === 0) {
-      uninstallSuppressor();
-      setAdoptedSheets(root, currentAdoptedSheets(root).filter((sheet) => sheet !== current.sheet));
+      // Release the root before removing the sheet: an environment that refuses the write must
+      // not be able to strand the observer or leave a spent record behind.
       installedKits.delete(root);
+      current.stopSuppressor();
+      setAdoptedSheets(root, currentAdoptedSheets(root).filter((sheet) => sheet !== current.sheet));
     }
   };
 }
@@ -247,47 +282,104 @@ export type PackagePresentation = Readonly<{
   source: "bundled" | "local";
   trust: "application_bundled" | "trusted_native_code_v1";
   lifecycle: "active";
-  processGeneration: number;
+  /** A decimal string, as the Package Process Protocol and the Rust SDK carry it. */
+  processGeneration: string;
 }>;
 export type WorkspacePresentation = Readonly<{ id: string; name: string }>;
 
-export type UiEvent = Readonly<{
-  mount: string;
-  subscription: string;
-  sequence: string;
-  payload: PackageValue;
+/**
+ * The brand on a rejected Package request.
+ *
+ * The Shell builds the frame runtime and each Package bundles its own copy of this module, so
+ * class identity differs between the two. A branded frozen plain object with a structural guard
+ * works across both copies and stays structured-clone safe.
+ */
+export const PACKAGE_REQUEST_ERROR_KIND = "teamarness.package-request-error";
+
+/** A Package Backend's own terminal error, forwarded unchanged within the host's bounds. */
+export type PackageOwnedError = Readonly<{
+  code: string;
+  retryable: boolean;
+  details: { readonly [key: string]: PackageValue };
 }>;
 
-export type RequestInput = Readonly<{
-  mount: string;
-  request: string;
-  operation: string;
-  payload: PackageValue;
+/** What `PackageClient.request` rejects with when the Package Host answers with an error. */
+export type PackageRequestError = Readonly<{
+  kind: typeof PACKAGE_REQUEST_ERROR_KIND;
+  version: number;
+  namespace: string;
+  code: string;
+  stage: string;
+  retryable: boolean;
+  recovery: string;
+  diagnosticId: string;
+  /** The Package's own error, or `null` when the host owns the failure. */
+  packageError: PackageOwnedError | null;
 }>;
 
-export type SubscriptionInput = Readonly<{
-  mount: string;
-  subscription: string;
-  operation: string;
-  payload: PackageValue;
-}>;
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
 
-export interface PackageTransport {
-  request(input: RequestInput): Promise<PackageValue>;
-  cancelRequest(input: Readonly<{ mount: string; request: string }>): Promise<void>;
-  openSubscription(
-    input: SubscriptionInput,
-    deliver: (event: UiEvent) => void,
-    terminate: () => void,
-  ): Promise<void>;
-  acknowledgeEvents(input: Readonly<{ mount: string; subscription: string; throughSequence: string }>): Promise<void>;
-  closeSubscription(input: Readonly<{ mount: string; subscription: string }>): Promise<void>;
-  reportUiFault(input: Readonly<{ mount: string; code: "ui_exception" }>): Promise<void>;
+function isPackageOwnedError(value: unknown): value is PackageOwnedError {
+  if (!isPlainRecord(value)) return false;
+  return typeof value.code === "string"
+    && typeof value.retryable === "boolean"
+    && isPlainRecord(value.details);
+}
+
+/** Whether `value` is a Package request error, whichever bundle built it. */
+export function isPackageRequestError(value: unknown): value is PackageRequestError {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind !== PACKAGE_REQUEST_ERROR_KIND) return false;
+  if (typeof candidate.version !== "number") return false;
+  if (typeof candidate.namespace !== "string" || typeof candidate.code !== "string") return false;
+  if (typeof candidate.stage !== "string" || typeof candidate.recovery !== "string") return false;
+  if (typeof candidate.diagnosticId !== "string" || typeof candidate.retryable !== "boolean") return false;
+  return candidate.packageError === null || isPackageOwnedError(candidate.packageError);
+}
+
+/** The Package Backend's own error code, or `null` when the host owns the failure. */
+export function packageErrorCode(error: unknown): string | null {
+  return isPackageRequestError(error) ? error.packageError?.code ?? null : null;
+}
+
+/** Whether `error` is the cancellation a Package request rejects with. */
+export function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null
+    && (error as { name?: unknown }).name === "AbortError";
+}
+
+/**
+ * A short, presentable description of a failed request.
+ *
+ * It never includes `details`: those are the Package's own data, not display text.
+ */
+export function describePackageError(error: unknown): string {
+  if (isPackageRequestError(error)) {
+    const packageCode = error.packageError?.code;
+    if (packageCode !== undefined) return packageCode;
+    return `${error.code} (${error.stage})`;
+  }
+  if (error instanceof Error && error.message.length > 0) return error.message;
+  return "Request failed";
 }
 
 export interface PackageSubscription {
   close(): Promise<void>;
 }
+
+/** Options for `PackageClient.subscribe`. */
+export type PackageSubscribeOptions = Readonly<{
+  /**
+   * Called once when the stream ends: with the Package's own terminal error, or `null` when the
+   * Package completed the stream normally.
+   */
+  onTerminated?: (error: PackageRequestError | null) => void;
+}>;
 
 export interface PackageClient {
   request<TResponse extends PackageValue = PackageValue>(
@@ -299,6 +391,7 @@ export interface PackageClient {
     operation: string,
     payload: PackageValue,
     listener: (event: TEvent) => void | Promise<void>,
+    options?: PackageSubscribeOptions,
   ): Promise<PackageSubscription>;
 }
 
@@ -316,134 +409,45 @@ export type PackageUiModule = Readonly<{
   mount(context: PackageMountContext): PackageUnmount | Promise<PackageUnmount>;
 }>;
 
-function aborted(): DOMException {
-  return new DOMException("The Package request was cancelled", "AbortError");
+/**
+ * The shape a generated contract type has: every operation with its request and answer.
+ *
+ * `teamarness-contract-types` writes one of these from `ui-contract.json`, so the types a UI
+ * programs against and the shapes the Host validates come from the same file.
+ */
+export type PackageContractShape = {
+  readonly requests: {
+    readonly [operation: string]: { readonly request: PackageValue; readonly response: PackageValue };
+  };
+  readonly subscriptions: {
+    readonly [operation: string]: { readonly request: PackageValue; readonly event: PackageValue };
+  };
+};
+
+/** A [`PackageClient`] whose operation names, payloads and answers come from one contract. */
+export interface TypedPackageClient<C extends PackageContractShape> {
+  request<K extends keyof C["requests"] & string>(
+    operation: K,
+    payload: C["requests"][K]["request"],
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<C["requests"][K]["response"]>;
+  subscribe<K extends keyof C["subscriptions"] & string>(
+    operation: K,
+    payload: C["subscriptions"][K]["request"],
+    listener: (event: C["subscriptions"][K]["event"]) => void | Promise<void>,
+    options?: PackageSubscribeOptions,
+  ): Promise<PackageSubscription>;
 }
 
-export function createPackageClient(
-  mount: string,
-  transport: PackageTransport,
-): Readonly<{ client: PackageClient; dispose: () => Promise<void> }> {
-  let nextRequest = 1;
-  let nextSubscription = 1;
-  let disposed = false;
-  const subscriptions = new Set<() => Promise<void>>();
-
-  const client: PackageClient = {
-    async request<TResponse extends PackageValue>(
-      operation: string,
-      payload: PackageValue,
-      options: Readonly<{ signal?: AbortSignal }> = {},
-    ): Promise<TResponse> {
-      if (disposed) throw new Error("Package UI mount is closed");
-      const request = `request-${nextRequest++}`;
-      if (options.signal?.aborted) throw aborted();
-
-      let removeAbort: () => void = () => {};
-      const cancellation = new Promise<never>((_resolve, reject) => {
-        const onAbort = (): void => {
-          void transport.cancelRequest({ mount, request }).finally(() => reject(aborted()));
-        };
-        options.signal?.addEventListener("abort", onAbort, { once: true });
-        removeAbort = () => options.signal?.removeEventListener("abort", onAbort);
-      });
-      try {
-        return await Promise.race([
-          transport.request({ mount, request, operation, payload }) as Promise<TResponse>,
-          cancellation,
-        ]);
-      } finally {
-        removeAbort();
-      }
-    },
-
-    async subscribe<TEvent extends PackageValue>(
-      operation: string,
-      payload: PackageValue,
-      listener: (event: TEvent) => void | Promise<void>,
-    ): Promise<PackageSubscription> {
-      if (disposed) throw new Error("Package UI mount is closed");
-      const subscription = `subscription-${nextSubscription++}`;
-      let closed = false;
-      let failed = false;
-      let delivery = Promise.resolve();
-
-      const close = async (): Promise<void> => {
-        if (closed) return;
-        closed = true;
-        subscriptions.delete(close);
-        await transport.closeSubscription({ mount, subscription });
-      };
-      subscriptions.add(close);
-
-      const fail = async (): Promise<void> => {
-        if (failed) return;
-        failed = true;
-        try {
-          await close();
-        } catch {
-          // The host may already have closed a terminal stream.
-        }
-        await transport.reportUiFault({ mount, code: "ui_exception" });
-      };
-
-      await transport.openSubscription(
-        { mount, subscription, operation, payload },
-        (event) => {
-          if (closed) return;
-          delivery = delivery.then(async () => {
-            if (closed) return;
-            if (event.mount !== mount || event.subscription !== subscription) {
-              throw new Error("Package event route changed");
-            }
-            await listener(event.payload as TEvent);
-            if (!closed) {
-              await transport.acknowledgeEvents({
-                mount,
-                subscription,
-                throughSequence: event.sequence,
-              });
-            }
-          }).catch(fail);
-        },
-        () => {
-          if (closed) return;
-          delivery = delivery.then(fail, fail);
-        },
-      );
-      return Object.freeze({ close });
-    },
-  };
-
-  const dispose = async (): Promise<void> => {
-    if (disposed) return;
-    disposed = true;
-    await Promise.all([...subscriptions].map((close) => close()));
-  };
-
-  return Object.freeze({ client: Object.freeze(client), dispose });
-}
-
-export function createTauriPackageTransport(
-  call: typeof invoke = invoke,
-  makeChannel: <T>(handler: (message: T) => void) => Channel<T> = (handler) => new Channel(handler),
-): PackageTransport {
-  const transport: PackageTransport = {
-    request: async (input) => call<PackageValue>("package_request", input),
-    cancelRequest: async (input) => { await call("package_cancel_request", input); },
-    openSubscription: async (input, deliver, terminate) => {
-      type StreamMessage =
-        | Readonly<{ kind: "event"; value: UiEvent }>
-        | Readonly<{ kind: "failure"; value: unknown }>;
-      const onEvent = makeChannel<StreamMessage>((message) => {
-        if (message.kind === "event") deliver(message.value);
-        else terminate();
-      });
-      await call("package_open_stream", { ...input, onEvent });
-    },
-    acknowledgeEvents: async (input) => { await call("package_acknowledge_events", input); },
-    closeSubscription: async (input) => { await call("package_close_stream", input); },
-    reportUiFault: async (input) => { await call("package_report_ui_fault", input); },
-  };
-  return Object.freeze(transport);
+/**
+ * Views the mount's client through one contract's types.
+ *
+ * It is the same object: nothing is validated here, because the Host already validates every
+ * request, response and event against the contract it admitted. What this adds is that a UI
+ * cannot name an operation, or build a payload, the contract does not describe.
+ */
+export function typedPackageClient<C extends PackageContractShape>(
+  client: PackageClient,
+): TypedPackageClient<C> {
+  return client as TypedPackageClient<C>;
 }

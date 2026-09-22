@@ -8,12 +8,12 @@ The system SHALL keep product-domain Package behavior separate from Core Runtime
 
 ## TEAM.SYS-R02 — Technology Stack
 
-The Core Runtime and Shell SHALL be written in Rust. The desktop Shell SHALL use Tauri v2. Phase 3 SHALL provide a Rust Package Backend SDK and Rust reference Package, but the Package Process Protocol SHALL be language-neutral. Package UIs SHALL use TypeScript. Iroh SHALL be the Core Runtime's P2P transport layer. The Phase 3 development stack SHALL require Rust through rustup and Node.js.
+The Core Runtime and Shell SHALL be written in Rust. The desktop Shell SHALL use Tauri v2. Teamarness SHALL provide a Rust Package Backend SDK; the Package Process Protocol SHALL be language-neutral. Package UIs SHALL use TypeScript. Iroh SHALL be the Core Runtime's P2P transport layer.
 
 ## TEAM.SYS-R03 — Local-First
 
-All user data SHALL be stored locally. The system SHALL work without network connectivity. Data SHALL synchronize when peers become reachable via Iroh. No operation SHALL require a central server.
+Owned by `TEAM-R10`. This ID is retained and not reused.
 
 ## TEAM.SYS-R04 — P2P Communication
 
-Peers SHALL exchange data over Iroh's encrypted QUIC channels. Iroh relays MAY assist with NAT traversal but SHALL carry no content authority and SHALL NOT have access to plaintext content. The system SHALL use Iroh's default public relays initially, with custom relay configuration as an option.
+Owned by `TEAM-R11` and `TEAM.SYS.TRANS-R02`. This ID is retained and not reused.

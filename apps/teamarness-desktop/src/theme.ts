@@ -14,6 +14,7 @@ export interface ThemeRoot {
 export interface InstallationThemeController {
   getPreference(): ThemePreference;
   selectPreference(preference: ThemePreference): void;
+  subscribe(listener: (preference: ThemePreference) => void): () => void;
 }
 
 type InstallationThemeOptions = Readonly<{
@@ -47,6 +48,7 @@ export function createInstallationThemeController(
     preference = "system";
   }
   root.setAttribute("data-theme", preference);
+  const listeners = new Set<(preference: ThemePreference) => void>();
 
   return Object.freeze({
     getPreference: () => preference,
@@ -59,6 +61,11 @@ export function createInstallationThemeController(
         preference = "system";
       }
       root.setAttribute("data-theme", preference);
+      for (const listener of [...listeners]) listener(preference);
+    },
+    subscribe(listener: (preference: ThemePreference) => void): () => void {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
     },
   });
 }

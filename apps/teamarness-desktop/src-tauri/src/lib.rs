@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{Manager, RunEvent};
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+use teamarness_core::{CoreError, CoreRuntime, CoreRuntimeConfig, StorageError};
 use teamarness_package_host::{
     InstallationPublicIdentity, PackageHost, PackageHostCommand, PackageHostConfig,
     PackageInstanceKey, ShutdownHost, UiMountId,
@@ -173,7 +173,22 @@ async fn open_runtime_modules(
     let runtime = Arc::new(
         CoreRuntime::open(CoreRuntimeConfig::new(data_directory.clone()))
             .await
-            .map_err(|_| "Core Runtime startup failed")?,
+            .map_err(|error| {
+                // The user-facing text stays deliberately vague; the cause is
+                // written once to stderr so a developer can see what failed.
+                // Every Core error's `Display` is already redacted.
+                eprintln!("teamarness-desktop startup failed stage=core error={error}");
+                error
+            })
+            .map_err(|error| match error {
+                CoreError::Storage(StorageError::LegacyProtectionState) => {
+                    "This data directory was created by an older development build whose key grants are no longer supported. Delete it to start fresh."
+                }
+                CoreError::Storage(StorageError::InvalidDataDirectory) => {
+                    "The data directory is not a private Teamarness directory (symlink, other owner, or unrelated contents)"
+                }
+                _ => "Core Runtime startup failed",
+            })?,
     );
     let installation = InstallationPublicIdentity::new(runtime.public_identity().to_string())
         .map_err(|_| "Installation identity is incompatible with Package Host")?;
@@ -189,7 +204,8 @@ async fn open_runtime_modules(
     .await
     {
         Ok(packages) => Arc::new(packages),
-        Err(_) => {
+        Err(error) => {
+            eprintln!("teamarness-desktop startup failed stage=host error={error}");
             let _ = runtime.shutdown().await;
             return Err("Package Host startup failed");
         }
@@ -299,6 +315,30 @@ mod tests {
         }
     }
 
+    /// Verifies: TEAM.SYS.SHELL-R05
+    #[test]
+    fn shell_capability_targets_the_main_webview_not_windows() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(capability["webviews"], serde_json::json!(["main"]));
+        assert!(
+            capability.get("windows").is_none(),
+            "a window-scoped capability also reaches child webviews inside that window"
+        );
+        let permissions = capability["permissions"].as_array().unwrap();
+        assert!(permissions.iter().any(|value| value == "core:default"));
+        assert_eq!(
+            permissions
+                .iter()
+                .filter(|value| value
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("allow-")))
+                .count(),
+            19
+        );
+    }
+
+    /// Verifies: TEAM.SYS-R01, TEAM.SYS.SHELL-R05
     #[test]
     fn bridge_and_registry_source_deny_internal_and_product_concepts() {
         let reviewed = [
@@ -355,40 +395,50 @@ mod tests {
 
     #[test]
     fn bundle_configuration_uses_all_generated_application_packages() {
+        // packages/bundled-packages.json is the one bundled Package list; the Tauri
+        // bundle configuration and the application index are derived from it.
+        let bundled: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../packages/bundled-packages.json"))
+                .unwrap();
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut expected_resources = serde_json::Map::new();
+        expected_resources.insert(
+            "../../../packages/application-packages.v1.json".into(),
+            "packages/application-packages.v1.json".into(),
+        );
+        let mut expected_external_bin = Vec::new();
+        let mut expected_index = Vec::new();
+        let entries = bundled["packages"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            let source = entry["sourceDirectory"].as_str().unwrap();
+            let cargo_package = entry["cargoPackage"].as_str().unwrap();
+            let manifest_path = repository.join(source).join("teamarness.package.json");
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&manifest_path)
+                    .unwrap_or_else(|error| panic!("bundled Package manifest {source}: {error}")),
+            )
+            .unwrap();
+            let identity = manifest["identity"].as_str().unwrap();
+            let staged = format!("../../../target/teamarness-packages/{identity}");
+            expected_resources.insert(format!("{staged}/"), format!("packages/{identity}/").into());
+            expected_external_bin.push(serde_json::Value::String(format!(
+                "{staged}/backend/{cargo_package}"
+            )));
+            expected_index.push(serde_json::json!({ "directory": format!("packages/{identity}") }));
+        }
+
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let resources = config["bundle"]["resources"].as_object().unwrap();
         assert_eq!(
-            resources.get("../../../packages/application-packages.v1.json"),
-            Some(&serde_json::Value::String(
-                "packages/application-packages.v1.json".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.reference/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.reference/".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.tutorial/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.tutorial/".into()
-            ))
-        );
-        assert_eq!(
-            resources.get("../../../target/teamarness-packages/dev.teamarness.repo-aware/"),
-            Some(&serde_json::Value::String(
-                "packages/dev.teamarness.repo-aware/".into()
-            ))
+            config["bundle"]["resources"].as_object().unwrap(),
+            &expected_resources,
+            "run `node scripts/bundled-packages.mjs --write`"
         );
         assert_eq!(
             config["bundle"]["externalBin"].as_array().unwrap(),
-            &[
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package".into()),
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package".into()),
-                serde_json::Value::String("../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package".into()),
-            ]
+            &expected_external_bin,
+            "run `node scripts/bundled-packages.mjs --write`"
         );
         let index: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../packages/application-packages.v1.json"
@@ -396,11 +446,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             index["packages"],
-            serde_json::json!([
-                { "directory": "packages/dev.teamarness.reference" },
-                { "directory": "packages/dev.teamarness.tutorial" },
-                { "directory": "packages/dev.teamarness.repo-aware" },
-            ])
+            serde_json::Value::Array(expected_index),
+            "run `npm run build:application-packages`"
         );
     }
 

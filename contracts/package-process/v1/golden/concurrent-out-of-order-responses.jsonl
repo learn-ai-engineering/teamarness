@@ -1,4 +1,4 @@
-{"direction":"host","frame":{"kind":"request","id":"h:req-1","operation":"ui.read","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740995","payload":{}}}
-{"direction":"host","frame":{"kind":"request","id":"h:req-2","operation":"ui.read","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740996","payload":{}}}
-{"direction":"package","frame":{"kind":"response","id":"h:req-2","payload":{"order":2}}}
-{"direction":"package","frame":{"kind":"response","id":"h:req-1","payload":{"order":1}}}
+{"direction":"host","frame":{"kind":"request","id":"h:req-1","operation":"ui.read","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740995","payload":{}},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"request","id":"h:req-2","operation":"ui.read","mountId":"bW91bnQx","deadlineUnixMs":"9007199254740996","payload":{}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"response","id":"h:req-2","payload":{"order":2}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"response","id":"h:req-1","payload":{"order":1}},"verdict":"deliver"}

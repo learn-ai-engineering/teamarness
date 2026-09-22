@@ -10,11 +10,11 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 | `TEAM.PROD` | `01-product/` | Product requirements, vision, roadmap, success criteria |
 | `TEAM.SYS.ID` | `02-system/01-identity/` | Installation identity, Iroh endpoint binding, key custody, public identity |
 | `TEAM.SYS.MEM` | `02-system/02-membership/` | Canonical membership log, intervals, invitations, revocation, epochs |
-| `TEAM.SYS.TRANS` | `02-system/03-transport/` | Iroh endpoint management, relay configuration, package transport access |
-| `TEAM.SYS.CONV` | `02-system/04-conversations/` | Channels, messages, channel membership, conversation keys, Iroh message delivery |
-| `TEAM.SYS.PKG` | `02-system/05-packages/` | Package Manifests, Sources, Registrations, Admission, Package Host, Process Protocol, lifecycle, Semantic Capabilities, SDKs, local data, and trust |
-| `TEAM.SYS.REPO` | `02-system/06-repos/` | Repository registration, local Git integration |
-| `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package webview mounting, workspace controls, theming |
+| `TEAM.SYS.TRANS` | `02-system/03-transport/` | Iroh endpoint management, relay configuration, Core synchronization transport (LogSync sessions, durable wakes), and Package access to transport |
+| `TEAM.SYS.CONV` | `02-system/04-conversations/` | The Conversations Package: Channels, Messages, Channel participation policy, record validation and projections, local read state, and its UI. Consumes the immutable-record Synchronization Capability |
+| `TEAM.SYS.PKG` | `02-system/05-packages/` | Package Manifests, Sources, Registrations, Admission, Package Host, Process Protocol, lifecycle, Semantic Capabilities, SDKs, local data, trust, Synchronization Capability contracts, and the reference and tutorial example Packages |
+| `TEAM.SYS.REPO` | `02-system/06-repos/` | The Repo-aware Package: repository registration, local read-only Git inspection, and repository views. No repository replication |
+| `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package frame mounting, workspace controls, theming |
 | `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
 | `TEAM.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
 | `TEAM.CONTRIB` | `04-contributing/` | Development setup, contribution workflow, code standards |

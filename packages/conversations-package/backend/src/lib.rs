@@ -5,15 +5,10 @@
 
 mod backend;
 pub(crate) mod domain;
-pub(crate) mod immutable_log;
 pub(crate) mod store;
 
-pub use backend::ConversationsBackend;
+pub use backend::{ConversationsActive, router};
 pub use domain::{DomainError, DomainRecord, GENERAL_ID, PAGE_SIZE, decode_id};
-pub use immutable_log::{
-    AppendOutput, ImmutableRecordLog, LogError, LogEvent, LogSubscription, OpenResult,
-    OpenResultStatus, SyncStatus,
-};
 pub use store::{
     ChannelView, ConversationStore, IngestResult, MessageView, StoreError, StoredRecord,
 };
@@ -25,8 +20,6 @@ mod tests {
     use crate::store::StoreError;
     use rusqlite::Connection;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use tokio::sync::watch;
 
     #[test]
     fn canonical_roundtrip_and_bounds() {
@@ -146,6 +139,55 @@ mod tests {
                 .iter()
                 .any(|slug| slug.len() == 48 && slug.ends_with("-05050505"))
         );
+    }
+
+    /// Every slug the duplicate-slug path synthesizes travels in the Package's own
+    /// `conversations.snapshot` response, and a response the Package UI contract refuses fails the
+    /// Mount for good. So the projection's slugs obey the contract grammar even when truncating to
+    /// fit the length bound lands on a hyphen.
+    // Verifies: TEAM.SYS.CONV-R05
+    #[test]
+    fn duplicate_slug_suffix_obeys_the_contract_grammar() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
+        // 40 characters, contract-valid, whose 39th character is the hyphen the eight-character
+        // channel-id suffix truncates onto.
+        let base = format!("{}-b", "a".repeat(38));
+        let first = DomainRecord::channel_create_with_id([4; 16], "author", &base).unwrap();
+        let second = DomainRecord::channel_create_with_id([5; 16], "author", &base).unwrap();
+        for (record, order_key) in [(&first, "01"), (&second, "02")] {
+            assert_eq!(
+                store
+                    .ingest(
+                        &hex_id(record.id()),
+                        order_key,
+                        "author",
+                        record.kind(),
+                        "signature",
+                        &record.encode(),
+                        b"sealed",
+                        None,
+                    )
+                    .unwrap(),
+                IngestResult::Applied
+            );
+        }
+
+        let slugs = store
+            .channels()
+            .unwrap()
+            .into_iter()
+            .map(|channel| channel.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(slugs.len(), 3);
+        for slug in &slugs {
+            assert!(
+                crate::domain::validate_slug(slug).is_ok(),
+                "the projection presented {slug:?}, which its own decoder and the UI contract \
+                 pattern ^[a-z0-9]+(-[a-z0-9]+)*$ both refuse"
+            );
+        }
+        assert_eq!(slugs.iter().filter(|slug| **slug == base).count(), 1);
     }
 
     #[test]
@@ -512,35 +554,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn lifecycle_deactivation_cancels_and_awaits_the_owned_task() {
-        let directory = tempfile::tempdir().unwrap();
-        let backend = ConversationsBackend::default();
-        let store = ConversationStore::open(directory.path().join("x.sqlite")).unwrap();
-        let (cancel, mut cancelled) = watch::channel(false);
-        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task_exited = Arc::clone(&exited);
-        let task = tokio::spawn(async move {
-            let _ = cancelled.changed().await;
-            task_exited.store(true, std::sync::atomic::Ordering::Release);
-        });
-        *backend.active.lock().await = Some(crate::backend::Running {
-            active: crate::backend::Active {
-                store,
-                record_grant: "grant".into(),
-                sync_status: Arc::new(tokio::sync::Mutex::new(SyncStatus::Current)),
-            },
-            cancel,
-            task,
-        });
-
-        backend.deactivate().await.unwrap();
-
-        assert!(backend.active.lock().await.is_none());
-        assert!(exited.load(std::sync::atomic::Ordering::Acquire));
-        backend.deactivate().await.unwrap();
-    }
-
     #[test]
     fn unread_uses_ingestion_not_sort_order() {
         let d = tempfile::tempdir().unwrap();
@@ -645,237 +658,5 @@ mod tests {
             StoreError::LegacyValidation(_) => {}
             other => panic!("expected LegacyValidation, got {other:?}"),
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Phase 4: session loop integration tests
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn session_ingests_real_record_and_transitions_to_current() {
-        let d = tempfile::tempdir().unwrap();
-        let store = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
-        // Pre-create a channel so records aren't deferred.
-        let ch = DomainRecord::channel_create_with_id([1; 16], "alice", "test").unwrap();
-        store
-            .ingest(
-                &hex_id(ch.id()),
-                "ch-order",
-                "alice",
-                ch.kind(),
-                "s",
-                &ch.encode(),
-                b"ch-sealed",
-                None,
-            )
-            .unwrap();
-
-        let log = crate::immutable_log::scripted::ScriptedLog::new();
-
-        // Push a real DomainRecord through the scripted log.
-        let msg = DomainRecord::message_post([1; 16], "alice", "hello").unwrap();
-        let canonical = msg.encode();
-        log.push_event(Some(Ok(crate::immutable_log::LogEvent::Record {
-            record_id: "msg-1".into(),
-            order_key: "order-1".into(),
-            author: "alice".into(),
-            purpose: "message.post".into(),
-            signature: "sig".into(),
-            canonical,
-            sealed_record: b"sealed".to_vec(),
-            cursor: Some("order-1".into()),
-        })));
-
-        let sync_status = Arc::new(tokio::sync::Mutex::new(SyncStatus::CatchingUp));
-        let mut sub = log.subscribe(None).await.unwrap();
-
-        // Manually simulate what receive_loop does.
-        let event = sub.recv().await.unwrap().unwrap();
-        if let crate::immutable_log::LogEvent::Record {
-            record_id,
-            order_key,
-            author,
-            purpose,
-            signature,
-            canonical,
-            sealed_record,
-            cursor,
-        } = event
-        {
-            store
-                .ingest(
-                    &record_id,
-                    &order_key,
-                    &author,
-                    &purpose,
-                    &signature,
-                    &canonical,
-                    &sealed_record,
-                    cursor.as_deref(),
-                )
-                .unwrap();
-            // simulate quiescence transition
-            let mut status = sync_status.lock().await;
-            if *status == SyncStatus::CatchingUp {
-                *status = SyncStatus::Current;
-            }
-        }
-
-        assert_eq!(*sync_status.lock().await, SyncStatus::Current);
-        assert_eq!(
-            store
-                .message_rows(&hex_id([1; 16]), None, crate::domain::PAGE_SIZE)
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn state_event_updates_sync_status_explicitly() {
-        let log = crate::immutable_log::scripted::ScriptedLog::new();
-        log.push_state("catching_up");
-
-        let mut sub = log.subscribe(None).await.unwrap();
-        let event = sub.recv().await.unwrap().unwrap();
-        assert!(matches!(
-            event,
-            crate::immutable_log::LogEvent::State {
-                availability: Some(a)
-            } if a == "catching_up"
-        ));
-    }
-
-    #[tokio::test]
-    async fn warning_event_does_not_affect_record_count() {
-        let d = tempfile::tempdir().unwrap();
-        let store = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
-        let count_before = store.record_count().unwrap();
-
-        let log = crate::immutable_log::scripted::ScriptedLog::new();
-        log.push_warning("congestion");
-
-        let mut sub = log.subscribe(None).await.unwrap();
-        let event = sub.recv().await.unwrap().unwrap();
-        assert!(matches!(
-            event,
-            crate::immutable_log::LogEvent::Warning { code, .. } if code == "congestion"
-        ));
-
-        // Record count must not change — warnings are never ingested.
-        assert_eq!(store.record_count().unwrap(), count_before);
-    }
-
-    #[tokio::test]
-    async fn reconnection_after_stream_close_uses_committed_cursor() {
-        let d = tempfile::tempdir().unwrap();
-        let store = ConversationStore::open(d.path().join("x.sqlite")).unwrap();
-
-        let log = crate::immutable_log::scripted::ScriptedLog::new();
-
-        // First subscription: deliver one record with cursor, then close.
-        let ch = DomainRecord::channel_create_with_id([1; 16], "alice", "test").unwrap();
-        let canonical = ch.encode();
-        log.push_event(Some(Ok(crate::immutable_log::LogEvent::Record {
-            record_id: "ch-1".into(),
-            order_key: "ch-order".into(),
-            author: "alice".into(),
-            purpose: "channel.create".into(),
-            signature: "sig".into(),
-            canonical,
-            sealed_record: b"sealed".to_vec(),
-            cursor: Some("ch-order".into()),
-        })));
-        log.push_close();
-
-        // Ingest the record so cursor advances.
-        let mut sub = log.subscribe(None).await.unwrap();
-        if let Some(Ok(crate::immutable_log::LogEvent::Record {
-            record_id,
-            order_key,
-            author,
-            purpose,
-            signature,
-            canonical,
-            sealed_record,
-            cursor,
-        })) = sub.recv().await
-        {
-            store
-                .ingest(
-                    &record_id,
-                    &order_key,
-                    &author,
-                    &purpose,
-                    &signature,
-                    &canonical,
-                    &sealed_record,
-                    cursor.as_deref(),
-                )
-                .unwrap();
-        }
-        assert!(sub.recv().await.is_none()); // closed
-        sub.close().await;
-
-        // After stream close, cursor should have advanced.
-        let committed_cursor = store.cursor().unwrap();
-        assert_eq!(committed_cursor.as_deref(), Some("ch-order"));
-
-        // Reconnect with the committed cursor.
-        log.push_record("rec-2", "order-2");
-        log.push_close();
-
-        let mut sub2 = log.subscribe(committed_cursor).await.unwrap();
-        assert!(sub2.recv().await.unwrap().is_ok());
-        assert!(sub2.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn cancellation_stops_reconnect_backoff() {
-        let log = crate::immutable_log::scripted::ScriptedLog::new();
-        // Stream closes immediately.
-        log.push_close();
-
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        let log_clone = log.clone();
-
-        let handle = tokio::spawn(async move {
-            let backoff = std::time::Duration::from_millis(10);
-            // First subscribe gets the close.
-            let mut sub = log_clone.subscribe(None).await.unwrap();
-            let closed = sub.recv().await.is_none();
-            sub.close().await;
-            if closed {
-                // Wait for backoff or cancellation.
-                tokio::select! {
-                    _ = cancel_rx.changed() => {},
-                    _ = tokio::time::sleep(backoff) => {},
-                }
-            }
-        });
-
-        // Cancel during the backoff.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let _ = cancel_tx.send(true);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(result.is_ok(), "session did not stop after cancellation");
-    }
-
-    #[tokio::test]
-    async fn subscribe_failure_sets_degraded_status() {
-        let log = crate::immutable_log::scripted::ScriptedLog::new();
-        log.subscribe_errors
-            .lock()
-            .unwrap()
-            .push_back(crate::immutable_log::LogError::Transport("fatal".into()));
-
-        let sync_status = Arc::new(tokio::sync::Mutex::new(SyncStatus::CatchingUp));
-
-        let result = log.subscribe(None).await;
-        assert!(result.is_err());
-
-        // Set degraded (as run_session would).
-        *sync_status.lock().await = SyncStatus::Degraded("subscribe_failed".into());
-        assert_eq!(sync_status.lock().await.availability(), "degraded");
     }
 }

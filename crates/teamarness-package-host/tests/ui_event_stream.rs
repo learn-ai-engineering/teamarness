@@ -132,7 +132,28 @@ async fn thirty_two_credit_window_replenishes_only_the_acknowledged_delta() {
     .unwrap();
     assert_eq!(sequence(events.changed().await.unwrap()), "33");
 
-    for through in [1, 0, 34, 65] {
+    // Repeats are the ignore verdict, not violations: the acknowledgement
+    // names events the route has already credited, so it releases nothing
+    // and answers `UiEventsAcknowledged` (CF-002). Still unservable are an
+    // acknowledgement past what was delivered (34) and one that reaches
+    // past the window (65).
+    for through in [1, 0] {
+        let answer = host
+            .execute(PackageHostCommand::AcknowledgeUiEvents(
+                AcknowledgeUiEvents {
+                    mount: mount.clone(),
+                    subscription: UiSubscriptionId::new("saturation").unwrap(),
+                    through_sequence: through,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, PackageHostOutcome::UiEventsAcknowledged),
+            "{through}"
+        );
+    }
+    for through in [34, 65] {
         let error = host
             .execute(PackageHostCommand::AcknowledgeUiEvents(
                 AcknowledgeUiEvents {
@@ -145,6 +166,82 @@ async fn thirty_two_credit_window_replenishes_only_the_acknowledged_delta() {
             .unwrap_err();
         assert_eq!(error.code, PackageErrorCode::ProtocolViolation, "{through}");
     }
+}
+
+/// CF-002: an acknowledgement the route has already recorded is ignored.
+///
+/// The Shell fires each acknowledgement without awaiting it, and each one is
+/// its own Tauri task, so two for the same subscription are routinely in
+/// flight together and the later one can take the route's lock first. The
+/// earlier one then names events the route has already credited. The contract
+/// calls that ordinary in-flight traffic rather than a violation — "credit
+/// released for events already accepted ... are not protocol violations" — and
+/// the verdict table ignores a frame whose state the receiver has moved past.
+///
+/// Ignoring it must release no credit: a no-op that credited again would carry
+/// the stream past the window the contract grants, which is the one thing the
+/// credit section does make fatal.
+#[tokio::test]
+async fn an_acknowledgement_the_route_has_already_recorded_releases_no_credit() {
+    let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let generation = host.snapshot().await.instances[0].process_generation;
+    let mount = mount(&host, 0).await;
+    let subscription = UiSubscriptionId::new("saturation").unwrap();
+    let mut events = open(&host, &mount, "saturation", "fixture.saturation").await;
+    let acknowledge = async |through: u64| {
+        host.execute(PackageHostCommand::AcknowledgeUiEvents(
+            AcknowledgeUiEvents {
+                mount: mount.clone(),
+                subscription: subscription.clone(),
+                through_sequence: through,
+            },
+        ))
+        .await
+    };
+
+    for expected in 1..=32 {
+        assert_eq!(
+            sequence(events.changed().await.unwrap()),
+            expected.to_string()
+        );
+    }
+    acknowledge(2).await.unwrap();
+    assert_eq!(sequence(events.changed().await.unwrap()), "33");
+    assert_eq!(sequence(events.changed().await.unwrap()), "34");
+
+    // The acknowledgement for event 1, which lost the race to the one for
+    // event 2 and arrives behind it.
+    assert!(matches!(
+        acknowledge(1).await.unwrap(),
+        PackageHostOutcome::UiEventsAcknowledged
+    ));
+    // Acknowledging nothing at all is the same answer.
+    assert!(matches!(
+        acknowledge(0).await.unwrap(),
+        PackageHostOutcome::UiEventsAcknowledged
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), events.changed())
+            .await
+            .is_err(),
+        "an already-recorded acknowledgement released credit a second time"
+    );
+
+    // The window is exactly where the recorded acknowledgement left it.
+    acknowledge(3).await.unwrap();
+    assert_eq!(sequence(events.changed().await.unwrap()), "35");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), events.changed())
+            .await
+            .is_err()
+    );
+
+    let after = host.snapshot().await.instances[0].clone();
+    assert_eq!(after.lifecycle, LifecycleState::Active);
+    assert_eq!(after.process_generation, generation);
 }
 
 #[tokio::test]
@@ -176,13 +273,19 @@ async fn one_mount_accepts_at_most_eight_event_routes() {
     assert_eq!(error.code, PackageErrorCode::Overloaded);
 }
 
+/// A UI event is classified by the one shared classifier, like every other
+/// frame.
+///
+/// A duplicate sequence, a gap, and a 33rd event against the 32-event window
+/// are `event_sequence` and `credit_violation`: out of contract, and fatal to
+/// the process generation. A route that decided them itself reported its own
+/// codes, kept the generation alive and failed only the mount, which is the
+/// divergence this asserts is gone. Events the Package sent before the
+/// violation still reach the subscriber in order, so nothing is dropped in
+/// silence.
 #[tokio::test]
-async fn sequence_violations_and_route_overflow_are_terminal_without_silent_drop() {
-    for (operation, expected) in [
-        ("fixture.duplicate", PackageErrorCode::ProtocolViolation),
-        ("fixture.gap", PackageErrorCode::ProtocolViolation),
-        ("fixture.overflow", PackageErrorCode::EventLagged),
-    ] {
+async fn events_the_contract_forbids_fail_the_generation_and_not_only_the_mount() {
+    for operation in ["fixture.duplicate", "fixture.gap", "fixture.overflow"] {
         let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
         let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
             .await
@@ -199,17 +302,25 @@ async fn sequence_violations_and_route_overflow_are_terminal_without_silent_drop
                 Err(error) => break error,
             }
         };
-        assert_eq!(error.code, expected, "{operation}");
+        assert_eq!(
+            error.code,
+            PackageErrorCode::ProtocolViolation,
+            "{operation}"
+        );
         for (index, actual) in delivered.iter().enumerate() {
             assert_eq!(actual, &(index + 1).to_string(), "{operation}");
         }
         assert_eq!(
             host.snapshot().await.instances[0].lifecycle,
-            LifecycleState::Active
+            LifecycleState::Failed,
+            "{operation}"
         );
+        // The generation failed, so its mounts went with it: a protocol
+        // violation is not restartable and clears the process state.
         assert_eq!(
             host.snapshot().await.instances[0].mount_state,
-            Some(MountState::Failed)
+            None,
+            "{operation}"
         );
     }
 }
@@ -306,7 +417,7 @@ async fn request_contract_rejects_both_sides_and_backend_violation_fails_only_th
 }
 
 #[tokio::test]
-async fn stream_close_is_terminal_without_stopping_the_backend() {
+async fn package_closed_stream_completes_without_stopping_the_backend() {
     let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
@@ -314,13 +425,89 @@ async fn stream_close_is_terminal_without_stopping_the_backend() {
     let generation = host.snapshot().await.instances[0].process_generation;
     let mount = mount(&host, 0).await;
     let mut events = open(&host, &mount, "closed", "fixture.close").await;
-    assert_eq!(
-        events.changed().await.unwrap_err().code,
-        PackageErrorCode::BackendError
-    );
+    assert!(matches!(
+        events.changed().await.unwrap(),
+        PackageHostNotification::UiStreamCompleted(_)
+    ));
     assert_eq!(
         host.snapshot().await.instances[0].process_generation,
         generation
+    );
+}
+
+/// V-01: a stream that completes normally is acknowledged for its last event.
+///
+/// The subscriber's acknowledgement is routinely still in flight when the
+/// stream ends, so it names a subscription the contract has already closed.
+/// That released credit for a closed stream and killed the generation, which
+/// `ProtocolViolation` does not even restart.
+#[tokio::test]
+async fn acknowledging_the_last_event_of_a_completed_stream_keeps_the_generation() {
+    let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let generation = host.snapshot().await.instances[0].process_generation;
+    let mount = mount(&host, 0).await;
+    let subscription = UiSubscriptionId::new("completing").unwrap();
+    host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+        mount: mount.clone(),
+        subscription: subscription.clone(),
+        operation: "fixture.complete".into(),
+        payload: empty(),
+    }))
+    .await
+    .unwrap();
+    let mut events = host
+        .subscribe(PackageHostSubscriptionSelector::UiEvents {
+            mount: mount.clone(),
+            subscription: subscription.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(sequence(events.changed().await.unwrap()), "1");
+    assert_eq!(sequence(events.changed().await.unwrap()), "2");
+    assert!(matches!(
+        events.changed().await.unwrap(),
+        PackageHostNotification::UiStreamCompleted(_)
+    ));
+
+    // The acknowledgement the subscriber had already queued for event 2.
+    let _ = host
+        .execute(PackageHostCommand::AcknowledgeUiEvents(
+            AcknowledgeUiEvents {
+                mount: mount.clone(),
+                subscription,
+                through_sequence: 2,
+            },
+        ))
+        .await;
+
+    let after = host.snapshot().await.instances[0].clone();
+    assert_eq!(after.lifecycle, LifecycleState::Active);
+    assert_eq!(after.process_generation, generation);
+    assert_eq!(after.mount_state, Some(MountState::Mounted));
+}
+
+/// A Package that rejects a subscription reports its own code to its own UI, and the mount
+/// stays healthy: only a host-owned stream failure is a mount fault.
+#[tokio::test]
+async fn package_rejected_stream_carries_its_code_without_failing_the_mount() {
+    let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let mut events = open(&host, &mount, "rejected", "fixture.rejected_stream").await;
+    let error = events.changed().await.unwrap_err();
+    assert_eq!(error.code, PackageErrorCode::BackendError);
+    let package_error = error.package_error.as_ref().expect("Package-owned error");
+    assert_eq!(package_error.code, "fixture.stream_rejected");
+    assert!(!package_error.retryable);
+    assert!(package_error.details.is_empty());
+    assert_eq!(
+        host.snapshot().await.instances[0].mount_state,
+        Some(MountState::Mounted)
     );
 }
 
@@ -414,6 +601,7 @@ async fn mount_scoped_client_ids_do_not_collide_or_cross_cancel() {
             }))
             .await
     });
+    // settle: lets both requests reach the Backend before one is cancelled.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     host.execute(PackageHostCommand::CancelUiRequest(CancelUiRequest {
         mount: first.clone(),

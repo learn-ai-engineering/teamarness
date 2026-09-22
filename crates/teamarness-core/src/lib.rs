@@ -2,11 +2,15 @@
 //!
 //! # Dependency boundary
 //!
-//! Iroh endpoint and ticket crates are isolated behind the private onboarding
-//! boundary. `p2panda-auth` and `p2panda-core` are isolated behind the private
-//! membership adapter, and `rusqlite` is isolated behind private storage
-//! modules. Canonical membership bytes do not depend on serde-derived p2panda
-//! representations.
+//! Iroh types appear in the private `network`, `onboarding`, `membership_sync`
+//! and `synchronization` modules, and in `runtime` internals. The p2panda
+//! crates are used by `membership` and `synchronization`. `rusqlite` stays
+//! behind `storage` and the private `RuntimeState`. The two Ed25519 stacks
+//! those dependencies carry meet only in `synchronization::key_bridge`.
+//!
+//! No dependency type appears in a public signature, which
+//! `tests/public_api.rs` enforces with compile-fail fixtures. Canonical
+//! membership bytes do not depend on serde-derived p2panda representations.
 //!
 //! # Visibility boundary
 //!
@@ -18,41 +22,62 @@
 
 #![forbid(unsafe_code)]
 
+mod blocking;
+mod diag;
+mod encoding;
 mod error;
 mod runtime;
 
-// These boundaries are intentionally private. Later phases deepen them without
-// changing which implementation details callers can name.
+// These boundaries are intentionally private: nothing outside the crate can
+// name what is behind them.
 mod identity;
-// These authenticated private values are constructed by the workspace and
-// redemption workflows in later phases.
-#[allow(dead_code)]
 mod invitation;
-#[allow(dead_code)]
 mod membership;
-#[allow(dead_code)]
+mod membership_sync;
 mod network;
-#[allow(dead_code)]
 mod onboarding;
 mod storage;
 mod subscription;
-#[allow(dead_code)]
 mod synchronization;
 mod workspace;
 
 pub use error::{
-    ConfigurationError, CoreError, IdentityError, InvitationError, MembershipError,
-    OnboardingError, StorageError, SubscriptionError, ValueParseError, WorkspaceError,
+    CoreError, IdentityError, InvitationError, MembershipError, OnboardingError, ShutdownError,
+    StorageError, SubscriptionError, ValueParseError, WorkspaceError,
 };
 pub use membership::MembershipOperationId;
 pub use onboarding::WorkspaceInvitation;
+/// Test observation hooks. See the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use runtime::RuntimeStateHold;
 pub use runtime::{
-    CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipEpoch, MembershipRole,
-    MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription, MembershipTransition,
-    MembershipVersion, PublicIdentity, PublicSignature, SigningContext, WorkspaceId,
-    WorkspaceSummary,
+    CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipChange, MembershipEpoch,
+    MembershipRole, MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription,
+    MembershipTransition, MembershipVersion, PublicIdentity, PublicSignature, SigningContext,
+    WorkspaceId, WorkspaceSummary,
 };
+/// How many records subscriptions have decoded for one scope since the process
+/// began. See the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn records_decoded_for_tests(workspace: WorkspaceId, package: &str) -> usize {
+    synchronization::record_subscription::records_decoded_for_test(synchronization::scope_digest(
+        package, workspace,
+    ))
+}
+
+/// How many membership subscriptions have been opened for one Workspace since
+/// the process began. See the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn membership_subscriptions_opened_for_tests(workspace: WorkspaceId) -> usize {
+    runtime::membership_subscriptions_opened(workspace)
+}
+
 pub use synchronization::{
-    Cursor, ImmutableRecord, OpenedRecord, OrderKey, RecordEvent, RecordId, RecordSubscription,
-    SynchronizationError,
+    Cursor, ImmutableRecord, OpenedRecord, OrderKey, RecordAvailability, RecordEvent, RecordId,
+    RecordPage, RecordSubscription, SyncAvailability, SyncWarning, SynchronizationError,
 };

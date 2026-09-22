@@ -41,9 +41,10 @@ struct LocalCandidate {
     result: Result<Candidate, PackageErrorCode>,
 }
 
-pub(crate) fn admit(config: &PackageHostConfig) -> Result<AdmissionReport, AdmissionFailure> {
-    let store = HostStore::open(config.private_data_directory())
-        .map_err(|error| AdmissionFailure { code: error.code })?;
+pub(crate) fn admit(
+    config: &PackageHostConfig,
+    store: &HostStore,
+) -> Result<AdmissionReport, AdmissionFailure> {
     let mut diagnostics = Vec::new();
     let applications = match catalog::application_registrations(config) {
         Ok(registrations) => registrations,
@@ -152,7 +153,7 @@ pub(crate) fn admit(config: &PackageHostConfig) -> Result<AdmissionReport, Admis
     let mut packages = Vec::new();
     let mut admissions = Vec::new();
     for candidate in selected {
-        match finalize(config, &store, candidate) {
+        match finalize(config, store, candidate) {
             Ok((catalog, admission)) => {
                 packages.push(catalog);
                 admissions.push(admission);

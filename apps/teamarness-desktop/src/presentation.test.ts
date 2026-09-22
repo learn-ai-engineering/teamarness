@@ -56,6 +56,7 @@ const snapshot: PackageHostSnapshot = {
     retryable: true,
     recovery: "secret_protocol_recovery",
     diagnosticId,
+    packageError: null,
   }],
 };
 

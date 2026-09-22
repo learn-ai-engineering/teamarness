@@ -47,13 +47,17 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
     let invitee_a_directory = private_data_directory("transitions-a");
     let invitee_b_directory = private_data_directory("transitions-b");
     let config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(config.clone()).await.unwrap();
-    let invitee_a = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_a_directory))
+    let issuer = CoreRuntime::open_loopback_for_tests(config.clone())
         .await
         .unwrap();
-    let invitee_b = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_b_directory))
-        .await
-        .unwrap();
+    let invitee_a =
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_a_directory))
+            .await
+            .unwrap();
+    let invitee_b =
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_b_directory))
+            .await
+            .unwrap();
     let workspace = issuer.create_workspace("Transitions").unwrap();
     let mut live = issuer
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
@@ -122,7 +126,9 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
     issuer.shutdown().await.unwrap();
     drop(issuer);
 
-    let reopened = CoreRuntime::open(config.clone()).await.unwrap();
+    let reopened = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     let mut from_zero = reopened
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
         .unwrap();
@@ -158,11 +164,11 @@ async fn listener_registration_racing_a_commit_is_gap_free_and_slow_delivery_is_
     let issuer_directory = private_data_directory("transition-race-issuer");
     let invitee_directory = private_data_directory("transition-race-invitee");
     let issuer = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(&issuer_directory))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&issuer_directory))
             .await
             .unwrap(),
     );
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let workspace = issuer.create_workspace("Transition race").unwrap();
@@ -196,8 +202,10 @@ async fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_
     let issuer_directory = private_data_directory("transition-recovery-issuer");
     let invitee_directory = private_data_directory("transition-recovery-invitee");
     let config = CoreRuntimeConfig::new(&issuer_directory);
-    let issuer = CoreRuntime::open(config.clone()).await.unwrap();
-    let invitee = CoreRuntime::open(CoreRuntimeConfig::new(&invitee_directory))
+    let issuer = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
     let workspace = issuer.create_workspace("Transition recovery").unwrap();
@@ -214,7 +222,9 @@ async fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_
         .execute("DELETE FROM workspace_membership_state", [])
         .unwrap();
     drop(connection);
-    let repaired = CoreRuntime::open(config.clone()).await.unwrap();
+    let repaired = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
     assert_eq!(
         repaired.membership_snapshot(workspace.id()).unwrap(),
         expected
@@ -239,7 +249,7 @@ async fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_
         .unwrap();
     drop(connection);
     assert!(matches!(
-        CoreRuntime::open(config.clone()).await,
+        CoreRuntime::open_loopback_for_tests(config.clone()).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 
@@ -266,7 +276,7 @@ async fn replay_repairs_derived_rows_but_rejects_missing_or_contradictory_event_
         .unwrap();
     drop(connection);
     assert!(matches!(
-        CoreRuntime::open(config).await,
+        CoreRuntime::open_loopback_for_tests(config).await,
         Err(CoreError::Storage(StorageError::CorruptWorkspace))
     ));
 

@@ -12,6 +12,8 @@ use tempfile::TempDir;
 
 #[path = "../src/data_directory.rs"]
 mod data_directory;
+#[path = "../src/diag.rs"]
+mod diag;
 #[path = "../src/host_store.rs"]
 mod host_store;
 #[path = "../src/manifest.rs"]
@@ -50,6 +52,7 @@ fn restart_source_and_version_changes_reuse_the_persisted_mapping() {
     assert!(temp.path().join("packages/package-host.sqlite3").is_file());
 }
 
+/// Verifies: TEAM.SYS.PKG-R05
 #[test]
 fn workspaces_packages_and_installations_receive_isolated_directories() {
     let temp = tempfile::tempdir().unwrap();

@@ -1,9 +1,11 @@
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::diag::fault;
 use crate::{PackageErrorCode, PackageErrorEnvelope, PackageSourceKind};
 
 #[derive(Debug)]
@@ -13,6 +15,50 @@ pub(crate) struct HostStoreFailure {
 
 pub(crate) struct HostStore {
     connection: Connection,
+}
+
+/// The one Package Host store, shared by every Package in a Host.
+///
+/// Opening runs directory checks, permission changes and the migration batch,
+/// so it happens once per Host. Every later use crosses to a blocking thread:
+/// SQLite is synchronous and must not run on an asynchronous worker.
+#[derive(Clone)]
+pub(crate) struct HostStoreHandle {
+    store: Arc<std::sync::Mutex<HostStore>>,
+    #[cfg(test)]
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HostStoreHandle {
+    pub(crate) async fn open(private_data_directory: PathBuf) -> Result<Self, HostStoreFailure> {
+        let store = tokio::task::spawn_blocking(move || HostStore::open(&private_data_directory))
+            .await
+            .map_err(fault!(storage_failure()))??;
+        Ok(Self {
+            store: Arc::new(std::sync::Mutex::new(store)),
+            #[cfg(test)]
+            opens: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        })
+    }
+
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&HostStore) -> T + Send + 'static,
+    ) -> Result<T, HostStoreFailure> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(fault!(storage_failure()))?;
+            Ok(f(&store))
+        })
+        .await
+        .map_err(fault!(storage_failure()))?
+    }
+
+    /// How many times this Host opened its store. Always one.
+    #[cfg(test)]
+    pub(crate) fn opens(&self) -> usize {
+        self.opens.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,12 +94,12 @@ impl HostStore {
         {
             return Err(storage_failure());
         }
-        let connection = Connection::open(&database).map_err(|_| storage_failure())?;
+        let connection = Connection::open(&database).map_err(fault!(storage_failure()))?;
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600))
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         connection
             .execute_batch(include_str!("../migrations/0001_package_host.sql"))
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         Ok(Self { connection })
     }
 
@@ -71,7 +117,7 @@ impl HostStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|_| storage_failure())
+            .map_err(fault!(storage_failure()))
     }
 
     pub(crate) fn record_data_directory(
@@ -97,7 +143,7 @@ impl HostStore {
                     continuity_id
                 ],
             )
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         Ok(())
     }
 
@@ -125,7 +171,7 @@ impl HostStore {
                     admission.ui_contract_digest
                 ],
             )
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         Ok(())
     }
 
@@ -137,7 +183,7 @@ impl HostStore {
                         start_time, canonical_executable, executable_digest, launch_token
                  FROM process_leases ORDER BY package_identity, workspace_id",
             )
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         let rows = statement
             .query_map([], |row| {
                 Ok(ProcessLease {
@@ -152,9 +198,9 @@ impl HostStore {
                     launch_token: row.get(8)?,
                 })
             })
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|_| storage_failure())
+            .map_err(fault!(storage_failure()))
     }
 
     pub(crate) fn record_process_lease(
@@ -179,7 +225,7 @@ impl HostStore {
                     lease.launch_token,
                 ],
             )
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         Ok(())
     }
 
@@ -193,7 +239,7 @@ impl HostStore {
                 "DELETE FROM process_leases WHERE package_identity = ?1 AND workspace_id = ?2",
                 params![package, workspace],
             )
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         Ok(())
     }
 
@@ -213,7 +259,7 @@ impl HostStore {
                     error.affected_package.as_ref().map(ToString::to_string),
                 ],
             )
-            .map_err(|_| storage_failure())?;
+            .map_err(fault!(storage_failure()))?;
         Ok(())
     }
 }
@@ -224,7 +270,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), HostStoreFailure> {
         .and_then(|parent| fs::metadata(parent).ok())
         .map(|metadata| metadata.uid());
     if path.exists() {
-        let metadata = fs::symlink_metadata(path).map_err(|_| storage_failure())?;
+        let metadata = fs::symlink_metadata(path).map_err(fault!(storage_failure()))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
             || expected_owner.is_some_and(|owner| metadata.uid() != owner)
@@ -232,9 +278,9 @@ fn ensure_private_directory(path: &Path) -> Result<(), HostStoreFailure> {
             return Err(storage_failure());
         }
     } else {
-        fs::create_dir_all(path).map_err(|_| storage_failure())?;
+        fs::create_dir_all(path).map_err(fault!(storage_failure()))?;
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| storage_failure())
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(fault!(storage_failure()))
 }
 
 const fn storage_failure() -> HostStoreFailure {

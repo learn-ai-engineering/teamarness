@@ -76,7 +76,9 @@ Keep these three paths separate:
 - The application builder assembles bundled Tutorial as `dev.teamarness.tutorial` at `packages/dev.teamarness.tutorial/` in the application distribution. The Shell presents its Package Source as `Team`.
 - Learner-owned local Emojart lives in its own project outside the Teamarness repository. The Shell presents the registered Package Source as `Personal`.
 
-Package Source values `bundled` and `local` remain the technical source kinds. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or grant Workspace enablement, synchronization, sharing, networking, or collaboration.
+<a id="source-and-trust"></a>
+
+> **Source and trust.** Package Source values `bundled` and `local` remain the technical source kinds. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope, Workspace enablement, synchronization, sharing, networking, or collaboration. A Package Backend runs as native code with the current user's filesystem, network, and process authority: it is not a sandbox. Only the Package UI is sandboxed — it runs in a sandboxed frame with an opaque origin, reaching neither the Shell's DOM nor any Tauri command, and a sandboxed frame does not contain a UI that blocks its thread. Review the code you register.
 
 ## How a local Package reaches Teamarness
 
@@ -124,15 +126,26 @@ The files you will work with are:
 
 ```text
 AGENTS.md                    Architecture and working rules for coding agents
+README.md                    How to build, check and register this project
+LICENSE                      The project's own license
 teamarness.package.json     Package identity and built artifacts
 ui-contract.json            Requests shared by the UI and Backend
-backend/src/                Rust behavior and local data
+backend/src/                Rust behavior and local data; main.rs only starts the router
+backend/tests/              The Backend driven through the SDK test harness
 ui/src/                     TypeScript UI
+ui/src/contract.generated.ts
+                            Request types generated from ui-contract.json
 scripts/assemble-package.mjs
                             Builds the final Package Directory
+scripts/assemble-package.test.mjs
+                            Proves the assembled directory's shape and modes
+scripts/validate-dist.mjs   Validates and smoke-launches the built directory
+scripts/verify-vendor.mjs   Reports an edited vendored SDK file
 vendor/teamarness/          Generated copies of the current SDK sources
-teamarness-authoring.json   Generator and protocol provenance
+teamarness-authoring.json   Generator, protocol and vendoring provenance
 ```
+
+`backend/src/main.rs` stays thin — it starts the router and nothing else — so the product rules live in `backend/src/lib.rs` where the tests can reach them.
 
 The project also owns `Cargo.lock` and `package-lock.json`. Commit both lockfiles in the Emojart repository.
 
@@ -210,9 +223,11 @@ The Backend also owns saved records because its lifetime and data do not depend 
 >
 > Map each continuous wave value evenly into the five palette positions. For every pattern, let the seed change coherent parameters such as phase, frequency, rotation, or control-point positions. Do not add independent random noise to each cell. Per-cell noise hides the pattern instead of producing a new version of it.
 >
-> Store a closed schema-version-1 document named `emojart.v1.json` in the data directory supplied during lifecycle activation. Give saved pieces stable IDs. On save, use the submitted canonical recipe and render its cells again. Do not create a new seed during save. Replace the state file through a temporary file. Do not add browser storage, networking, synchronization, direct Tauri commands, or Workspace logic.
+> Keep `main.rs` thin. Register the three requests as typed handlers on the foundation's `Router`, and build the activation state from the data directory supplied at initialization (`Activation::data_directory()`).
 >
-> Add focused Rust tests for valid and invalid choices, deterministic recipes, seed variation, 192-cell output, palette membership, exact save regeneration, and reopening from a real temporary directory. Test rendering with fixed seeds through a pure or injected seam. For every pattern, prove that seed 7 is reproducible and that seed 91 produces different cells. A changed seed field with identical cells does not pass. Also prove that saving a generated recipe stores the same cells that were shown in its draft. Run the locked Backend tests, formatter, and Clippy with warnings denied. Report what the tests prove.
+> Store a closed schema-version-1 document named `emojart.v1.json` in that directory through the SDK's `storage::JsonDocumentStore`, which writes through a temporary file and fsyncs before adopting the new value. Give saved pieces stable IDs. On save, use the submitted canonical recipe and render its cells again. Do not create a new seed during save. Name a failed read or write `emojart.storage_failed` and mark it retryable only if repeating the same request may succeed. Do the file work inside `ctx.blocking(...)` so it stays off the async runtime. Do not add browser storage, networking, synchronization, direct Tauri commands, or Workspace logic.
+>
+> Add focused Rust tests for valid and invalid choices, deterministic recipes, seed variation, 192-cell output, palette membership, exact save regeneration, and reopening from a real temporary directory. Drive the whole Backend through `teamarness_package_sdk::testing` — activate, request, dispose — against a real temporary Package Data Directory rather than hand-built frames, and keep `assert_router_matches_contract` passing so the router and `ui-contract.json` cannot drift. Test rendering with fixed seeds through a pure or injected seam. For every pattern, prove that seed 7 is reproducible and that seed 91 produces different cells. A changed seed field with identical cells does not pass. Also prove that saving a generated recipe stores the same cells that were shown in its draft. Run `npm run validate`, then the locked Backend tests, formatter, and Clippy with warnings denied. Report what the tests prove.
 
 ### Human checkpoint 2
 
@@ -240,13 +255,15 @@ The UI owns interaction and presentation. It keeps the selected controls, asks t
 
 > Implement the Emojart UI against `ui-contract.json` and the mount-scoped `PackageClient`. Work only in this generated project.
 >
+> Regenerate `ui/src/contract.generated.ts` from `ui-contract.json` with `teamarness-contract-types`, commit it, and call the Backend through `typedPackageClient<PackageContract>(context.client)` so an operation name or payload the contract does not describe fails `npm run typecheck`.
+>
 > Export `mount(context)` and return an idempotent unmount function. On mount, call `emojart.read`, select the first palette and pattern, and request an initial draft. Put the palette dropdown first and the pattern dropdown second so the controls read naturally as combinations such as "Ocean Spiral" or "Garden Patchwork". Keep the dropdowns, but show no visible labels above or beside them. Give them the accessible names `Palette` and `Pattern` with `aria-label`.
 >
-> Add Generate and Save buttons, a fixed 16 by 12 artwork grid, a saved-art list, and visible request errors. Name artwork and saved-art choices in palette-then-pattern order.
+> Add Generate and Save buttons, a fixed 16 by 12 artwork grid, a saved-art list, and visible request errors. Show the Package's own error code — `packageErrorCode(error)` returns `emojart.storage_failed` when the Backend refused, and `null` when Teamarness owned the failure — and use `describePackageError(error)` for the sentence. Ignore an abort with `isAbortError(error)`; never render raw `details`. Name artwork and saved-art choices in palette-then-pattern order.
 >
 > Generate must preserve the selected controls and send only algorithm and palette IDs. Keep the complete draft returned by the Backend. Save must send that draft's canonical recipe, including its seed, so Save stores the artwork currently on screen. Selecting saved art must display it without generating a replacement. Expose the artwork as `role="img"`, give it a useful accessible label, and mark the 192 decorative cells `aria-hidden="true"`.
 >
-> Use only `context.client` for Package requests. Do not add direct Tauri commands, browser persistence, remote imports, networking, or rendering formulas. Add focused UI tests for dropdown order and accessible names, absence of visible dropdown labels, the initial read, generation, saving the visible recipe, saved-art selection, errors, and idempotent unmount. Run the UI typecheck, lint, and tests.
+> Use only `context.client` for Package requests. A sandboxed frame has no Tauri commands, no browser storage, and no network, so do not attempt them; do not add remote imports or rendering formulas. Add focused UI tests for dropdown order and accessible names, absence of visible dropdown labels, the initial read, generation, saving the visible recipe, saved-art selection, errors, and idempotent unmount. Run the UI typecheck, lint, and tests.
 
 ### Human checkpoint 3
 
@@ -270,7 +287,7 @@ The generated build script already knows how to assemble that directory. It calc
 
 ### Agent brief 4
 
-> Run `npm run typecheck`, `npm run lint`, `npm test`, `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` from the generated project. Fix failures without weakening tests or changing the product boundary. Then run `npm run build`.
+> Run `npm run validate`, `npm run typecheck`, `npm run lint`, and `npm test` from the generated project. `npm run lint` already runs the formatter and Clippy with warnings denied, and `npm test` already runs the validator and the vendored-SDK check, so do not repeat them. Fix failures without weakening tests or changing the product boundary. Then run `npm run build`.
 >
 > Inspect `dist/dev.teamarness.emojart/`. Verify that it contains the manifest, Backend executable, ESM UI, and UI contract. Confirm that every manifest size and lowercase SHA-256 digest matches the final file, the Backend has mode `0700`, and the manifest, UI, and contract have mode `0600`. Confirm that the manifest identity remains `dev.teamarness.emojart` and declares no capabilities or assets. Report the exact directory Teamarness should register.
 
@@ -279,13 +296,14 @@ The generated build script already knows how to assemble that directory. It calc
 Run the checks yourself from the Emojart project:
 
 ```sh
+npm run validate
 npm run typecheck
 npm run lint
 npm test
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 npm run build
 ```
+
+`npm run validate` gives the Package Host's own verdict on this project without starting Teamarness; `npm run build` assembles `dist/dev.teamarness.emojart/` and then validates and smoke-launches it.
 
 Inspect `dist/dev.teamarness.emojart/teamarness.package.json`. Its Backend and UI sizes should be nonzero, and its digests should be lowercase hexadecimal. Register the `dist/dev.teamarness.emojart/` directory, not the project root.
 
@@ -295,7 +313,7 @@ This distinction matters. Your project is where you author Emojart. The Package 
 
 A local registration tells one Teamarness Installation where to find your built Package Directory. It does not add Emojart to the application bundle or make it available to anyone else.
 
-Review the code before registering it. A Package Backend runs as native code with the current user's filesystem, network, and process authority. It is not a sandbox. The Package UI runs in the same-webview UI host as the Shell. Its Shadow Root separates styles, not DOM or known Tauri-command authority.
+Review the code before registering it. The [Source and trust](#source-and-trust) callout above states what registering native Package code means.
 
 ### Agent brief 5
 
@@ -337,7 +355,7 @@ npm run dev -- first-package
 
 Teamarness reads `registrations.v1.json` only at startup. There is no hot reload.
 
-Confirm the Shell presents bundled Tutorial as `Team` and registered local Emojart as `Personal`. These UI aliases do not change the technical Package Source values `bundled` and `local`, trust, registration scope, Workspace enablement, synchronization, sharing, networking, or collaboration. If either is missing, record the badge observation as unresolved instead of marking it complete.
+Confirm the Shell presents bundled Tutorial as `Team` and registered local Emojart as `Personal`; the [Source and trust](#source-and-trust) callout says what those aliases do and do not mean. If either is missing, record the badge observation as unresolved instead of marking it complete.
 
 In the Shell, confirm that Tutorial still opens and that Emojart now appears alongside it. Open Emojart and work through the feature:
 
@@ -370,9 +388,9 @@ Emojart is still installation-local. A later guide can cover application distrib
 
 - **Emojart does not appear.** Check the absolute `directory`, `expectedIdentity`, trust record, file permissions, and restart. The registration path for this guide is `.teamarness-dev/first-package/packages/registrations.v1.json` under the Teamarness checkout.
 - **Digest mismatch or `artifact_changed`.** Quit Teamarness, run `npm run build` in the Emojart project, and restart. Do not modify assembled files after the build.
-- **Invalid UI contract.** Keep request names and payloads aligned across `ui-contract.json`, the Backend, and the UI. Preserve an empty `subscriptions` object.
+- **Invalid UI contract.** Run `npm run validate`: it applies the same rules Package Admission does and names the rule and the JSON pointer that failed. Keep request names and payloads aligned across `ui-contract.json`, the Backend, `ui/src/contract.generated.ts`, and the UI. Preserve an empty `subscriptions` object.
 - **Unsupported target.** This guide supports `aarch64-apple-darwin` only.
 - **Saved art is missing in another Workspace.** That is expected. Package data is scoped to one Installation, Workspace, and Package identity.
-- **A vendored SDK fix is missing.** Generated SDK copies do not update automatically. There is no supported in-place upgrade policy yet.
+- **A vendored SDK fix is missing.** Generated SDK copies do not update automatically. `teamarness-authoring.json` records the checkout revision and a digest per vendored tree, `npm run check:vendor` fails when a vendored file has been edited, and `npm run create:package -- --vendor-report <project>` run from a Teamarness checkout compares that project with the current checkout without changing it. There is no supported in-place upgrade policy yet.
 
 For the detailed manifest, UI host, capability, and promotion rules, continue with the [Package author guide](package-author-guide.md). For other registration layouts and bundled overrides, see [Local Package registration](local-package-registration.md).

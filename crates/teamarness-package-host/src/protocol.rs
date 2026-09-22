@@ -1,23 +1,161 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use teamarness_package_protocol::{
-    ContractState, Direction, Frame, FrameKind, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION,
-    MAX_WRITER_BYTES, decode_frame, encode_frame,
+    ContractState, Direction, Frame, FrameKind, INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES,
+    MAX_ID_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES, MAX_WRITER_FRAMES, Verdict,
+    decode_frame, encode_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::ui::{AdmittedUi, MAX_UI_PAYLOAD_BYTES};
-use crate::{PackageErrorCode, PackageValue};
+use crate::{
+    MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH,
+    MAX_UI_SUBSCRIPTIONS_PER_MOUNT, PackageErrorCode, PackageOwnedError, PackageValue,
+};
 
 type PendingRequests = Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<Value, WireFailure>>>>>;
 type UiEventRoutes = Arc<Mutex<BTreeMap<String, Arc<UiEventRoute>>>>;
+type SharedState = Arc<Mutex<ContractState>>;
 
-const UI_EVENT_CAPACITY: usize = 32;
-const UI_EVENT_BYTES: usize = 8 * 1024 * 1024;
+/// One UI event route holds the credit window the contract grants the stream.
+const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
+/// The route's byte budget.
+///
+/// Worst case: every event the credit window admits, each at the largest UI
+/// payload the UI contract allows, queued at once. The classifier is what
+/// bounds the count, so a budget derived from anything else would refuse an
+/// event the classifier had already admitted.
+const UI_EVENT_BYTES: usize = INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES;
+
+/// Events the Shell acknowledges with one `ack`.
+///
+/// `apps/teamarness-desktop/src/package-frame/port-client.ts` posts one `ack`
+/// for every event it hands its listener, and
+/// `apps/teamarness-desktop/src/package-frame/protocol.ts` publishes that
+/// granularity as `EVENTS_PER_ACKNOWLEDGEMENT`.
+/// `scripts/check-protocol-bounds.mjs` reads both, so a Shell that started
+/// batching acknowledgements would have to move this constant with it.
+///
+/// This is the behaviour the control lane's worst case is measured in, and
+/// until this round it existed only in TypeScript. A bound derived from the
+/// protocol's vocabulary instead — "one `credit` per subscription" — was wrong
+/// by a factor of 32 and no floor could say so.
+pub(crate) const EVENTS_PER_ACKNOWLEDGEMENT: usize = 1;
+
+/// `credit` frames one subscription can owe at once.
+///
+/// Not one. A subscription does not hold one `credit` outstanding; it holds as
+/// many as its window has events the subscriber has read and not yet had
+/// credited, which is the whole window when the Shell acknowledges one event
+/// at a time.
+const CREDIT_FRAMES_PER_SUBSCRIPTION: usize =
+    INITIAL_STREAM_CREDIT.div_ceil(EVENTS_PER_ACKNOWLEDGEMENT);
+
+/// Every control frame the Host can owe at once, counted from the behaviour
+/// that produces them rather than from the protocol's vocabulary.
+///
+/// `initialize`, `ping` and `shutdown` are one frame each; every subscription
+/// one mount may hold open can owe a `stream_open`, a `stream_close` and a
+/// whole window of `credit`.
+const CONTROL_WORST_CASE: usize =
+    3 + MAX_UI_SUBSCRIPTIONS_PER_MOUNT * (2 + CREDIT_FRAMES_PER_SUBSCRIPTION);
+
+/// Whether `ProcessClient::credit` waits for a control slot instead of
+/// refusing when the lane is full.
+///
+/// `CONTROL_WORST_CASE` is 275 against the 64 queued frames the contract
+/// publishes for the whole writer, so no split of that budget admits it and
+/// the lane cannot be widened to satisfy the floor below. Waiting is the only
+/// way the worst case is served at all.
+/// `a_full_control_lane_never_destroys_acknowledged_credit` is what proves
+/// this claim is true of the code rather than of this comment.
+const CREDIT_WAITS_FOR_A_SLOT: bool = true;
+
+/// Control frames a *refusing* send may have outstanding.
+///
+/// `initialize`, `ping` and `shutdown` are one frame each, and one
+/// `stream_open` and one `stream_close` may be queued for each subscription a
+/// mount may hold open. `credit` is not counted here: it waits, because the
+/// window it releases does not fit any lane.
+const CONTROL_RESERVE: usize = 3 + 2 * MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
+
+/// Slots on the data lane.
+///
+/// Worst case: every in-flight request the contract permits, queued at once.
+/// The one `cancel` that may follow a request is sent after that request's
+/// deadline expires, by which time its frame has left the lane.
+const DATA_QUEUE: usize = MAX_IN_FLIGHT_EACH_DIRECTION;
+
+/// Slots on the control lane: the rest of the writer's published frame budget.
+///
+/// The two lanes share the one writer budget the contract publishes and the
+/// handshake transmits, so their depths are a split of `MAX_WRITER_FRAMES`,
+/// exactly as their byte budgets are a split of `MAX_WRITER_BYTES`. The data
+/// lane takes its own worst case and the control lane keeps the rest, which
+/// must still cover `CONTROL_RESERVE` — the frames a refusing send queues, and
+/// a lane shallower than them turns legal traffic into a refused frame. A
+/// capability answer needs no slot of its own here, and neither does `credit`:
+/// both wait, because the tasks that write them own their work.
+const CONTROL_QUEUE: usize = MAX_WRITER_FRAMES - DATA_QUEUE;
+
+/// The control lane's shared byte budget: two contract-maximum frames, so one
+/// maximum answer never waits on another that is already queued.
+const CONTROL_BYTES: usize = 2 * MAX_FRAME_BYTES;
+
+/// One typed terminal error frame: `error`, an id of the schema's maximum
+/// length, a stable code, `retryable`, and an empty details object, plus the
+/// length prefix. `an_overloaded_answer_fits_its_reserve` is the floor.
+const TERMINAL_ERROR_BYTES: usize = MAX_ID_BYTES + 128;
+
+/// Control-lane bytes only a request's typed terminal answer may use.
+///
+/// Rule 1's third verdict has to be deliverable under exactly the saturation
+/// that produces it. An `overloaded` answer that competed for the budget whose
+/// exhaustion triggered it would be refused precisely when it is owed, so one
+/// frame is reserved for each in-flight request the contract permits.
+const TERMINAL_RESERVE_BYTES: usize = MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES;
+
+/// The data lane keeps the rest of the writer budget the contract publishes.
+pub(crate) const DATA_BYTES: usize = MAX_WRITER_BYTES - CONTROL_BYTES - TERMINAL_RESERVE_BYTES;
+
+// Rule 2's floors for this crate, asserted beside the bounds they guard so a
+// bound that stops admitting its worst case fails the build rather than a
+// suite. ADR 0019 §3 names them.
+//
+// Each left-hand side is written from the traffic, independently of the bound
+// it guards. A floor that restates its own bound's definition cannot fail on a
+// change to any input, and that is how the control lane came to be sized for
+// one `credit` per subscription while the Shell acknowledged one event at a
+// time: the floor re-read the same wrong worst case and agreed with it.
+const _: () = {
+    // The anchor. Its left-hand side names `INITIAL_STREAM_CREDIT` through
+    // `CREDIT_FRAMES_PER_SUBSCRIPTION`, so a change to the credit window moves
+    // it, and it cannot be satisfied by widening the lane: 275 does not fit
+    // the 64 frames the contract publishes for the whole writer. The only way
+    // to meet it is the waiting send, which
+    // `a_full_control_lane_never_destroys_acknowledged_credit` proves is what
+    // the code does.
+    assert!(CONTROL_QUEUE >= CONTROL_WORST_CASE || CREDIT_WAITS_FOR_A_SLOT);
+    // The frames a refusing send queues must fit the lane they refuse on.
+    // `CONTROL_RESERVE` is counted from those senders, not from
+    // `CONTROL_QUEUE`, so a ninth subscription per mount fails here.
+    assert!(CONTROL_QUEUE >= CONTROL_RESERVE);
+    assert!(DATA_QUEUE >= MAX_IN_FLIGHT_EACH_DIRECTION);
+    // Both lanes' independently counted worst cases must fit the one budget
+    // the handshake publishes. This is the assertion an SF2-001 recurrence
+    // breaks: each lane sized against the contract's concurrency on its own,
+    // together past the budget.
+    assert!(DATA_QUEUE + CONTROL_RESERVE <= MAX_WRITER_FRAMES);
+    assert!(CONTROL_QUEUE + DATA_QUEUE == MAX_WRITER_FRAMES);
+    assert!(CONTROL_BYTES >= 2 * MAX_FRAME_BYTES);
+    assert!(DATA_BYTES >= 2 * MAX_FRAME_BYTES);
+    assert!(TERMINAL_RESERVE_BYTES == MAX_IN_FLIGHT_EACH_DIRECTION * TERMINAL_ERROR_BYTES);
+    assert!(CONTROL_BYTES + TERMINAL_RESERVE_BYTES + DATA_BYTES == MAX_WRITER_BYTES);
+};
 
 pub(crate) struct UiEvent {
     pub(crate) sequence: u64,
@@ -27,39 +165,54 @@ pub(crate) struct UiEvent {
 
 pub(crate) struct UiEventReceiver {
     events: mpsc::Receiver<UiEvent>,
-    terminal: watch::Receiver<Option<PackageErrorCode>>,
+    terminal: watch::Receiver<Option<StreamEnd>>,
     route: Arc<UiEventRoute>,
+}
+
+/// How a Package UI event stream ended.
+///
+/// A Package-owned end is the Package's own terminal error and reaches its subscriber; only a
+/// host-owned end can fail the mount.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StreamEnd {
+    Completed,
+    Package(PackageOwnedError),
+    Host(PackageErrorCode),
 }
 
 pub(crate) struct UiEventRoute {
     events: mpsc::Sender<UiEvent>,
-    terminal: watch::Sender<Option<PackageErrorCode>>,
+    terminal: watch::Sender<Option<StreamEnd>>,
     bytes: Arc<Semaphore>,
     state: Mutex<UiEventRouteState>,
     contract: Arc<AdmittedUi>,
     operation: String,
 }
 
+/// What the route owes its subscriber, and nothing about the wire.
+///
+/// Sequence and credit are the classifier's decisions. These two counters
+/// answer the one question the classifier cannot: how far the subscriber has
+/// read, which is what an acknowledgement is measured against.
 struct UiEventRouteState {
-    next_expected: u64,
-    highest_received: u64,
     highest_delivered: u64,
     highest_acknowledged: u64,
 }
 
 impl UiEventReceiver {
-    pub(crate) fn terminal(&self) -> watch::Receiver<Option<PackageErrorCode>> {
+    pub(crate) fn terminal(&self) -> watch::Receiver<Option<StreamEnd>> {
         self.terminal.clone()
     }
 
-    pub(crate) async fn changed(&mut self) -> Result<UiEvent, PackageErrorCode> {
+    pub(crate) async fn changed(&mut self) -> Result<UiEvent, StreamEnd> {
         loop {
-            let terminal_code = *self.terminal.borrow();
-            if let Some(code) = terminal_code {
-                if code == PackageErrorCode::BackendError {
+            let terminal = self.terminal.borrow().clone();
+            if let Some(end) = terminal {
+                // A Package-owned end, like a completion, drains what the Package already sent.
+                if matches!(end, StreamEnd::Completed | StreamEnd::Package(_)) {
                     match self.events.try_recv() {
                         Ok(event) => {
-                            self.route.mark_delivered(event.sequence).await?;
+                            self.route.mark_delivered(event.sequence).await;
                             return Ok(event);
                         }
                         Err(
@@ -68,18 +221,18 @@ impl UiEventReceiver {
                         ) => {}
                     }
                 }
-                return Err(code);
+                return Err(end);
             }
             tokio::select! {
                 biased;
                 result = self.terminal.changed() => {
                     if result.is_err() {
-                        return Err(PackageErrorCode::ProcessExited);
+                        return Err(StreamEnd::Host(PackageErrorCode::ProcessExited));
                     }
                 }
                 event = self.events.recv() => {
-                    let event = event.ok_or(PackageErrorCode::ProcessExited)?;
-                    self.route.mark_delivered(event.sequence).await?;
+                    let event = event.ok_or(StreamEnd::Host(PackageErrorCode::ProcessExited))?;
+                    self.route.mark_delivered(event.sequence).await;
                     return Ok(event);
                 }
             }
@@ -96,8 +249,6 @@ impl UiEventRoute {
             terminal,
             bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES)),
             state: Mutex::new(UiEventRouteState {
-                next_expected: 1,
-                highest_received: 0,
                 highest_delivered: 0,
                 highest_acknowledged: 0,
             }),
@@ -112,7 +263,18 @@ impl UiEventRoute {
         (route, event_receiver)
     }
 
-    async fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
+    /// Hands the classifier's next event to the subscriber.
+    ///
+    /// The route decides nothing about the wire. The classifier has already
+    /// ruled that this event names a live stream, carries the next sequence and
+    /// sits inside the window the contract grants; what is left is the UI
+    /// contract the payload must satisfy and the bounds this queue holds, both
+    /// of which end this one stream rather than the generation.
+    ///
+    /// The bounds cannot be reached by a conforming Package: the queue and its
+    /// byte budget both hold the whole credit window, and credit returns only
+    /// for an event the subscriber has acknowledged.
+    fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
         let payload: PackageValue =
             serde_json::from_value(value).map_err(|_| PackageErrorCode::UiContractViolation)?;
         self.contract
@@ -123,17 +285,6 @@ impl UiEventRoute {
             serde_json::to_vec(&payload).map_err(|_| PackageErrorCode::UiContractViolation)?;
         if encoded.len() > MAX_UI_PAYLOAD_BYTES {
             return Err(PackageErrorCode::UiContractViolation);
-        }
-        let mut state = self.state.lock().await;
-        if sequence != state.next_expected {
-            return Err(PackageErrorCode::ProtocolViolation);
-        }
-        if state
-            .highest_received
-            .saturating_sub(state.highest_acknowledged)
-            >= UI_EVENT_CAPACITY as u64
-        {
-            return Err(PackageErrorCode::EventLagged);
         }
         let permits =
             u32::try_from(encoded.len()).map_err(|_| PackageErrorCode::UiContractViolation)?;
@@ -149,35 +300,96 @@ impl UiEventRoute {
                 _bytes: bytes,
             })
             .map_err(|_| PackageErrorCode::EventLagged)?;
-        state.next_expected = state.next_expected.saturating_add(1);
-        state.highest_received = sequence;
         Ok(())
     }
 
-    async fn mark_delivered(&self, sequence: u64) -> Result<(), PackageErrorCode> {
-        let mut state = self.state.lock().await;
-        if sequence != state.highest_delivered.saturating_add(1) {
-            return Err(PackageErrorCode::ProtocolViolation);
-        }
-        state.highest_delivered = sequence;
-        Ok(())
+    /// Records how far the subscriber has read.
+    ///
+    /// The queue is first in, first out and the classifier admits one sequence
+    /// at a time, so this is a record, not a check.
+    async fn mark_delivered(&self, sequence: u64) {
+        self.state.lock().await.highest_delivered = sequence;
     }
 
-    pub(crate) async fn acknowledge(&self, through: u64) -> Result<u64, WireFailure> {
-        let mut state = self.state.lock().await;
-        if through <= state.highest_acknowledged
-            || through > state.highest_delivered
+    /// Counts the credit an acknowledgement releases, without recording it.
+    ///
+    /// The record only moves when the `credit` frame that accounts for it is
+    /// on the wire. Advancing first is what made a refused frame permanent:
+    /// the Host believed it had released credit the Package never received, a
+    /// repeat was refused by this method's own first guard, and the only other
+    /// producer of `credit` is this one path. The window stayed shut and
+    /// nothing said so.
+    ///
+    /// The guard holds the route's state for the length of the send, so one
+    /// stream's acknowledgements reach the wire in the order they were counted.
+    /// That wait is unbounded from this method's side — the health probe, not
+    /// the writer, bounds it — which widens the window in which a second
+    /// acknowledgement for the same subscription takes the lock first.
+    ///
+    /// `None` is the ignore verdict: this acknowledgement names events the
+    /// route has already credited. Each acknowledgement is its own Tauri task
+    /// and the Shell does not await them, so two are routinely in flight and
+    /// the earlier one can arrive behind the later. The contract calls that
+    /// ordinary in-flight traffic — credit for events already accepted is not a
+    /// violation — and the verdict table ignores a frame whose state the
+    /// receiver has moved past. It releases no credit, because crediting the
+    /// same events twice is what would carry the stream past its window.
+    ///
+    /// Fatality stays where the contract puts it: an acknowledgement for events
+    /// this route never delivered names state that never existed, and one
+    /// reaching past the window is a budget violation.
+    pub(crate) async fn acknowledge(
+        &self,
+        through: u64,
+    ) -> Result<Option<PendingAcknowledgement<'_>>, WireFailure> {
+        let state = self.state.lock().await;
+        if through > state.highest_delivered
             || through.saturating_sub(state.highest_acknowledged) > UI_EVENT_CAPACITY as u64
         {
             return Err(WireFailure::new(PackageErrorCode::ProtocolViolation));
         }
+        if through <= state.highest_acknowledged {
+            return Ok(None);
+        }
         let amount = through - state.highest_acknowledged;
-        state.highest_acknowledged = through;
-        Ok(amount)
+        Ok(Some(PendingAcknowledgement {
+            state,
+            through,
+            amount,
+        }))
     }
 
-    fn terminate(&self, code: PackageErrorCode) {
-        self.terminal.send_replace(Some(code));
+    fn terminate(&self, end: StreamEnd) {
+        self.terminal.send_replace(Some(end));
+    }
+}
+
+/// Credit an acknowledgement has released but whose frame is not yet queued.
+///
+/// Dropping it without [`PendingAcknowledgement::commit`] leaves the route
+/// exactly where it was, so the next acknowledgement covers the same events
+/// again and the credit is not lost.
+pub(crate) struct PendingAcknowledgement<'route> {
+    state: MutexGuard<'route, UiEventRouteState>,
+    through: u64,
+    amount: u64,
+}
+
+impl PendingAcknowledgement<'_> {
+    /// Queues this acknowledgement's `credit` frame, then records it.
+    ///
+    /// The send is taken rather than the amount handed out, so the order
+    /// cannot be got wrong at a call site: there is no way to reach the amount
+    /// without giving this method the send it accounts for, and the record
+    /// moves only after that send has returned `Ok`.
+    pub(crate) async fn commit<Send, Sent>(mut self, send: Send) -> Result<(), WireFailure>
+    where
+        Send: FnOnce(u64) -> Sent,
+        Sent: Future<Output = Result<(), WireFailure>>,
+    {
+        send(self.amount).await?;
+        self.state.highest_acknowledged = self.through;
+        Ok(())
     }
 }
 
@@ -185,6 +397,8 @@ impl UiEventRoute {
 pub(crate) struct WireFailure {
     pub(crate) code: PackageErrorCode,
     pub(crate) outcome_uncertain: bool,
+    /// The Package's own terminal error, when the Package owns the failure.
+    pub(crate) package_error: Option<PackageOwnedError>,
 }
 
 impl WireFailure {
@@ -192,7 +406,49 @@ impl WireFailure {
         Self {
             code,
             outcome_uncertain: false,
+            package_error: None,
         }
+    }
+}
+
+/// Rebuilds a Package-owned error from an `error` frame, within the host's bounds.
+///
+/// The code and `retryable` always survive; `details` become `{}` when they exceed either bound,
+/// which is lossy on purpose so one Package cannot push unbounded data at the Shell.
+fn package_owned_error(frame: &Frame) -> PackageOwnedError {
+    let code = frame
+        .field("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let retryable = frame
+        .field("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let details = frame
+        .field("details")
+        .and_then(Value::as_object)
+        .cloned()
+        .filter(|details| {
+            let value = Value::Object(details.clone());
+            serde_json::to_vec(&value).is_ok_and(|bytes| {
+                bytes.len() <= MAX_PACKAGE_ERROR_DETAILS_BYTES
+                    && value_depth(&value) <= MAX_PACKAGE_ERROR_DETAILS_DEPTH
+            })
+        })
+        .unwrap_or_default();
+    PackageOwnedError {
+        code,
+        retryable,
+        details,
+    }
+}
+
+fn value_depth(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => 1 + values.iter().map(value_depth).max().unwrap_or(0),
+        Value::Object(values) => 1 + values.values().map(value_depth).max().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -200,8 +456,7 @@ impl WireFailure {
 pub(crate) struct ProcessClient {
     writer: Writer,
     pending: PendingRequests,
-    tombstones: Arc<Mutex<BTreeSet<String>>>,
-    closed_streams: Arc<Mutex<BTreeSet<String>>>,
+    state: SharedState,
     ui_event_routes: UiEventRoutes,
     initialized: Arc<Mutex<Option<oneshot::Receiver<Frame>>>>,
     shutdown_ack: watch::Receiver<bool>,
@@ -216,10 +471,20 @@ struct Writer {
     data: mpsc::Sender<QueuedFrame>,
     control_bytes: Arc<Semaphore>,
     data_bytes: Arc<Semaphore>,
+    terminal_bytes: Arc<Semaphore>,
 }
 
+/// The writing half of one Host-owned capability stream.
+///
+/// Every method runs on the stream's own task, so all three wait for writer
+/// capacity rather than refusing a frame: a slow reader is backpressure, and
+/// reporting it as a stream failure is what made ordinary congestion look like
+/// a permanent capability outage.
 #[derive(Clone)]
-pub(crate) struct HostStreamSender(Writer);
+pub(crate) struct HostStreamSender {
+    writer: Writer,
+    state: SharedState,
+}
 
 impl HostStreamSender {
     pub(crate) async fn event(
@@ -228,18 +493,38 @@ impl HostStreamSender {
         sequence: u64,
         payload: Value,
     ) -> Result<(), WireFailure> {
-        self.0
-            .data(json!({
-                "kind":"event", "streamId":stream_id,
-                "sequence":sequence.to_string(), "payload":payload
-            }))
+        self.writer
+            .send_waiting(
+                json!({
+                    "kind":"event", "streamId":stream_id,
+                    "sequence":sequence.to_string(), "payload":payload
+                }),
+                false,
+            )
             .await
     }
 
+    /// Ends the stream, behind every event it has already written.
+    ///
+    /// The close travels the data lane with those events. On the control lane
+    /// it would overtake them, and the Package would be told the stream ended
+    /// before the last events of it arrived.
     pub(crate) async fn close(&self, stream_id: &str, code: &str) -> Result<(), WireFailure> {
-        self.0
-            .control(json!({"kind":"stream_close","streamId":stream_id,"code":code}))
+        self.writer
+            .send_waiting(
+                json!({"kind":"stream_close","streamId":stream_id,"code":code}),
+                false,
+            )
             .await
+    }
+
+    /// Records that this stream stops being served now.
+    ///
+    /// Credit the Package released for events it had already accepted is still
+    /// in flight and arrives after the close; from here it is ignored instead
+    /// of read as the Package crediting a stream that does not exist.
+    pub(crate) async fn retire(&self, stream_id: &str) {
+        self.state.lock().await.retire_stream(stream_id);
     }
 }
 
@@ -285,6 +570,99 @@ impl Writer {
             }
         })
     }
+
+    /// Queues one request's typed terminal error on its own reserve.
+    ///
+    /// The shared control budget is what the answer this replaces could not
+    /// get, so this frame never asks for it. The reserve holds one such frame
+    /// for every in-flight request the contract permits, which is the most
+    /// that can be owed at once.
+    async fn send_terminal_error(&self, value: Value) -> Result<(), WireFailure> {
+        let frame =
+            Frame::try_from(value).map_err(|error| WireFailure::new(protocol_code(error)))?;
+        let size = encode_frame(&frame)
+            .map_err(|error| WireFailure::new(protocol_code(error)))?
+            .len();
+        let permits =
+            u32::try_from(size).map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        let permit = self
+            .terminal_bytes
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))?;
+        self.control
+            .send(QueuedFrame {
+                frame,
+                _bytes: permit,
+            })
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))
+    }
+
+    /// Queues a frame, waiting for lane capacity instead of refusing it.
+    ///
+    /// A full lane behind a slow reader is ordinary backpressure, not a
+    /// failure: `writer_task` drains it as the child accepts bytes, and a peer
+    /// that has stopped reading altogether is caught by the health probe, which
+    /// fails the generation and closes these channels. Only a task that owns
+    /// its own work may call this; the reader loop must never block on the peer
+    /// for longer than one frame it is already answering.
+    async fn send_waiting(&self, value: Value, control: bool) -> Result<(), WireFailure> {
+        let frame =
+            Frame::try_from(value).map_err(|error| WireFailure::new(protocol_code(error)))?;
+        let size = encode_frame(&frame)
+            .map_err(|error| WireFailure::new(protocol_code(error)))?
+            .len();
+        let permits =
+            u32::try_from(size).map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        let semaphore = if control {
+            self.control_bytes.clone()
+        } else {
+            self.data_bytes.clone()
+        };
+        let permit = semaphore
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))?;
+        let queued = QueuedFrame {
+            frame,
+            _bytes: permit,
+        };
+        let sender = if control { &self.control } else { &self.data };
+        sender
+            .send(queued)
+            .await
+            .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))
+    }
+}
+
+/// A failed capability call, and whether its state change may still land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapabilityFailure {
+    pub(crate) code: PackageErrorCode,
+    pub(crate) outcome_uncertain: bool,
+}
+
+impl CapabilityFailure {
+    pub(crate) const fn certain(code: PackageErrorCode) -> Self {
+        Self {
+            code,
+            outcome_uncertain: false,
+        }
+    }
+}
+
+/// Injectable protocol bounds. Production uses [`ProtocolLimits::CURRENT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtocolLimits {
+    pub(crate) capability_call: Duration,
+}
+
+impl ProtocolLimits {
+    pub(crate) const CURRENT: Self = Self {
+        capability_call: Duration::from_secs(10),
+    };
 }
 
 pub(crate) trait CapabilityHandler: Send + Sync {
@@ -292,8 +670,9 @@ pub(crate) trait CapabilityHandler: Send + Sync {
         &'a self,
         grant: Option<&'a str>,
         payload: &'a Value,
+        started: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     >;
 
     fn open_stream<'a>(
@@ -307,13 +686,16 @@ pub(crate) trait CapabilityHandler: Send + Sync {
         Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
     >;
 
+    /// Routes one already-classified `credit` frame to its stream.
+    ///
+    /// It returns nothing: `ContractState` decides whether a credit frame is
+    /// legal, late or fatal, and an adapter that answered that question again
+    /// is how the two peers came to disagree about the same race.
     fn add_credit<'a>(
         &'a self,
         stream_id: &'a str,
         amount: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
     fn close_stream<'a>(
         &'a self,
@@ -329,10 +711,15 @@ impl CapabilityHandler for RejectCapabilities {
         &'a self,
         _grant: Option<&'a str>,
         _payload: &'a Value,
+        _started: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
-        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+        Box::pin(async {
+            Err(CapabilityFailure::certain(
+                PackageErrorCode::CapabilityRequestInvalid,
+            ))
+        })
     }
 
     fn open_stream<'a>(
@@ -352,10 +739,8 @@ impl CapabilityHandler for RejectCapabilities {
         &'a self,
         _stream_id: &'a str,
         _amount: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    > {
-        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
     }
 
     fn close_stream<'a>(
@@ -372,29 +757,34 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    start_with_capabilities(reader, output, Arc::new(RejectCapabilities))
+    start_with_capabilities(
+        reader,
+        output,
+        Arc::new(RejectCapabilities),
+        ProtocolLimits::CURRENT,
+    )
 }
 
 pub(crate) fn start_with_capabilities<R, W>(
     reader: R,
     output: W,
     capabilities: Arc<dyn CapabilityHandler>,
+    limits: ProtocolLimits,
 ) -> ProcessClient
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let (data_tx, data_rx) = mpsc::channel(48);
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
+    let (data_tx, data_rx) = mpsc::channel(DATA_QUEUE);
     let writer = Writer {
         control: control_tx,
         data: data_tx,
-        control_bytes: Arc::new(Semaphore::new(MAX_WRITER_BYTES / 8)),
-        data_bytes: Arc::new(Semaphore::new(MAX_WRITER_BYTES * 7 / 8)),
+        control_bytes: Arc::new(Semaphore::new(CONTROL_BYTES)),
+        data_bytes: Arc::new(Semaphore::new(DATA_BYTES)),
+        terminal_bytes: Arc::new(Semaphore::new(TERMINAL_RESERVE_BYTES)),
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
-    let tombstones = Arc::new(Mutex::new(BTreeSet::new()));
-    let closed_streams = Arc::new(Mutex::new(BTreeSet::new()));
     let ui_event_routes = Arc::new(Mutex::new(BTreeMap::new()));
     let state = Arc::new(Mutex::new(ContractState::default()));
     let (initialized_tx, initialized_rx) = oneshot::channel();
@@ -412,21 +802,19 @@ where
         reader,
         writer.clone(),
         pending.clone(),
-        tombstones.clone(),
-        closed_streams.clone(),
         ui_event_routes.clone(),
-        state,
+        state.clone(),
         initialized_tx,
         shutdown_tx,
         pong_tx,
         failure_tx.clone(),
         capabilities,
+        limits,
     ));
     ProcessClient {
         writer,
         pending,
-        tombstones,
-        closed_streams,
+        state,
         ui_event_routes,
         initialized: Arc::new(Mutex::new(Some(initialized_rx))),
         shutdown_ack: shutdown_rx,
@@ -454,6 +842,12 @@ async fn writer_task<W>(
             return;
         };
         let result = async {
+            // The Host's own frames go through the same classifier as the
+            // Package's, for the state they carry and for the one question it
+            // asks. A `credit` or a `cancel` that crossed the state it names is
+            // in contract and is written; the Package runs the same classifier
+            // and ignores it. Only an out-of-contract frame fails the
+            // generation the Host is serving.
             state
                 .lock()
                 .await
@@ -482,15 +876,14 @@ async fn reader_task<R>(
     mut input: R,
     writer: Writer,
     pending: PendingRequests,
-    tombstones: Arc<Mutex<BTreeSet<String>>>,
-    closed_streams: Arc<Mutex<BTreeSet<String>>>,
     ui_event_routes: UiEventRoutes,
-    state: Arc<Mutex<ContractState>>,
+    state: SharedState,
     initialized: oneshot::Sender<Frame>,
     shutdown: watch::Sender<bool>,
     pongs: watch::Sender<Option<String>>,
     failure: watch::Sender<Option<PackageErrorCode>>,
     capabilities: Arc<dyn CapabilityHandler>,
+    limits: ProtocolLimits,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -505,55 +898,21 @@ async fn reader_task<R>(
                 return;
             }
         };
-        if frame.kind() == FrameKind::Event {
-            let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
-                let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
-                fail_ui_routes(&ui_event_routes, PackageErrorCode::MalformedFrame).await;
+        // One classifier, before every branch. There is no side of `observe` on
+        // which an adapter can hold its own idea of which races are tolerable,
+        // and no frame kind that reaches its adapter without being classified.
+        let verdict = match state.lock().await.observe(Direction::PackageToHost, &frame) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                let code = protocol_code(error);
+                let _ = failure.send(Some(code));
+                fail_pending(&pending, code).await;
+                fail_ui_routes(&ui_event_routes, code).await;
                 return;
-            };
-            let ui_route = {
-                let routes = ui_event_routes.lock().await;
-                routes.get(stream_id).cloned()
-            };
-            if let Some(route) = ui_route {
-                let sequence = frame
-                    .field("sequence")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse::<u64>().ok());
-                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
-                let result = match sequence {
-                    Some(sequence) => route.event(sequence, payload).await,
-                    None => Err(PackageErrorCode::ProtocolViolation),
-                };
-                if let Err(code) = result {
-                    route.terminate(code);
-                    ui_event_routes.lock().await.remove(stream_id);
-                    closed_streams.lock().await.insert(stream_id.to_owned());
-                    let _ = writer
-                        .control(json!({"kind":"stream_close","streamId":stream_id,"code":ui_stream_code(code)}))
-                        .await;
-                }
-                continue;
             }
-        }
-        let is_late_stream_frame =
-            if matches!(frame.kind(), FrameKind::Event | FrameKind::StreamClose) {
-                match frame.field("streamId").and_then(Value::as_str) {
-                    Some(id) => closed_streams.lock().await.contains(id),
-                    None => false,
-                }
-            } else {
-                false
-            };
-        if is_late_stream_frame {
+        };
+        if verdict == Verdict::Ignore {
             continue;
-        }
-        if let Err(error) = state.lock().await.observe(Direction::PackageToHost, &frame) {
-            let code = protocol_code(error);
-            let _ = failure.send(Some(code));
-            fail_pending(&pending, code).await;
-            fail_ui_routes(&ui_event_routes, code).await;
-            return;
         }
         match frame.kind() {
             FrameKind::Initialized => {
@@ -569,9 +928,6 @@ async fn reader_task<R>(
                     let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
                     return;
                 };
-                if tombstones.lock().await.remove(&id) {
-                    continue;
-                }
                 let Some(sender) = pending.lock().await.remove(&id) else {
                     let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                     return;
@@ -579,12 +935,15 @@ async fn reader_task<R>(
                 let result = if frame.kind() == FrameKind::Response {
                     Ok(frame.field("payload").cloned().unwrap_or_else(empty_object))
                 } else {
-                    let code = match frame.field("code").and_then(Value::as_str) {
-                        Some("cancelled") => PackageErrorCode::Cancelled,
-                        Some("overloaded") => PackageErrorCode::Overloaded,
-                        _ => PackageErrorCode::BackendError,
+                    let mut failure = match frame.field("code").and_then(Value::as_str) {
+                        Some("cancelled") => WireFailure::new(PackageErrorCode::Cancelled),
+                        Some("overloaded") => WireFailure::new(PackageErrorCode::Overloaded),
+                        _ => {
+                            let mut failure = WireFailure::new(PackageErrorCode::BackendError);
+                            failure.package_error = Some(package_owned_error(&frame));
+                            failure
+                        }
                     };
-                    let mut failure = WireFailure::new(code);
                     failure.outcome_uncertain = frame
                         .field("outcomeUncertain")
                         .and_then(Value::as_bool)
@@ -610,23 +969,87 @@ async fn reader_task<R>(
                 let writer = writer.clone();
                 let capabilities = capabilities.clone();
                 let failure = failure.clone();
+                let answered = id.clone();
+                // The method is read before the call, so a call that never
+                // returns can still be classified.
+                let method = payload
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
                 tokio::spawn(async move {
+                    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let result = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        capabilities.call(grant.as_deref(), &payload),
+                        limits.capability_call,
+                        capabilities.call(grant.as_deref(), &payload, started.clone()),
                     )
                     .await
-                    .unwrap_or(Err(PackageErrorCode::DeadlineExceeded));
+                    .unwrap_or_else(|_| {
+                        Err(CapabilityFailure {
+                            code: PackageErrorCode::DeadlineExceeded,
+                            // A state-changing call whose Core work had already
+                            // begun may still commit. `append` is content
+                            // idempotent, so the Package can retry it.
+                            outcome_uncertain: method == "append"
+                                && started.load(std::sync::atomic::Ordering::Acquire),
+                        })
+                    });
                     let response = match result {
                         Ok(payload) => json!({"kind":"response","id":id,"payload":payload}),
-                        Err(code) => json!({
-                            "kind":"error", "id":id,
-                            "code":capability_code(code), "retryable":false,
-                            "details":{}
-                        }),
+                        Err(failure) => {
+                            let mut details = json!({
+                                "kind":"error", "id":id,
+                                "code":capability_code(failure.code),
+                                "retryable":matches!(
+                                    failure.code,
+                                    PackageErrorCode::Overloaded
+                                        | PackageErrorCode::DeadlineExceeded
+                                ),
+                                "details":{}
+                            });
+                            if failure.outcome_uncertain
+                                && let Some(object) = details.as_object_mut()
+                            {
+                                object.insert("outcomeUncertain".to_owned(), Value::Bool(true));
+                            }
+                            details
+                        }
                     };
-                    if writer.control(response).await.is_err() {
-                        let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                    // The answer waits for control-lane capacity: a congested
+                    // lane is backpressure, and dropping the answer would leave
+                    // this request with no terminal frame at all. Congestion
+                    // that outlasts the call deadline is answered for that one
+                    // request id with a typed retryable error, never by tearing
+                    // the generation down.
+                    let delivered = match tokio::time::timeout(
+                        limits.capability_call,
+                        writer.send_waiting(response, true),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(WireFailure::new(PackageErrorCode::Overloaded)),
+                    };
+                    if let Err(wire) = delivered {
+                        if wire.code == PackageErrorCode::Overloaded {
+                            let overloaded = json!({
+                                "kind":"error", "id":answered, "code":"overloaded",
+                                "retryable":true, "details":{}
+                            });
+                            // The typed error is still this request's one
+                            // terminal frame, so it is owed. It goes on the
+                            // reserve rather than on the budget the answer it
+                            // replaces could not get: a refusing send, or a
+                            // second wait for the same exhausted budget, drops
+                            // the answer under exactly the saturation that
+                            // produced it, which is the outcome this whole
+                            // path exists to replace.
+                            if writer.send_terminal_error(overloaded).await.is_err() {
+                                let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                            }
+                        } else {
+                            let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                        }
                     }
                 });
             }
@@ -650,7 +1073,10 @@ async fn reader_task<R>(
                         topic,
                         initial_credit,
                         &payload,
-                        HostStreamSender(writer.clone()),
+                        HostStreamSender {
+                            writer: writer.clone(),
+                            state: state.clone(),
+                        },
                     )
                     .await
                 {
@@ -658,7 +1084,10 @@ async fn reader_task<R>(
                         "kind":"stream_close", "streamId":id,
                         "code":capability_code(code)
                     });
-                    if writer.control(response).await.is_err() {
+                    // The Package is waiting for this stream to end, so the
+                    // rejection waits for lane capacity rather than being
+                    // dropped with the generation reported as exited.
+                    if writer.send_waiting(response, true).await.is_err() {
                         let _ = failure.send(Some(PackageErrorCode::ProcessExited));
                         return;
                     }
@@ -673,10 +1102,10 @@ async fn reader_task<R>(
                     .field("amount")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
-                if capabilities.add_credit(stream_id, amount).await.is_err() {
-                    let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
-                    return;
-                }
+                // The classifier has already decided this frame: it names a
+                // live stream and sits inside the window the contract grants.
+                // What is left is routing it to the stream's own task.
+                capabilities.add_credit(stream_id, amount).await;
             }
             FrameKind::StreamClose => {
                 let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
@@ -684,8 +1113,7 @@ async fn reader_task<R>(
                     return;
                 };
                 if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
-                    route.terminate(PackageErrorCode::BackendError);
-                    closed_streams.lock().await.insert(stream_id.to_owned());
+                    route.terminate(stream_end(&frame));
                 } else {
                     capabilities.close_stream(stream_id).await;
                 }
@@ -700,7 +1128,47 @@ async fn reader_task<R>(
                     .map(str::to_owned);
                 let _ = pongs.send(nonce);
             }
-            FrameKind::Event => {}
+            FrameKind::Event => {
+                let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
+                    let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
+                    return;
+                };
+                let route = {
+                    let routes = ui_event_routes.lock().await;
+                    routes.get(stream_id).cloned()
+                };
+                // A live stream whose route has gone is the subscriber having
+                // left; the stream ends on its own path and the classifier
+                // ignores what follows the close.
+                let Some(route) = route else { continue };
+                let Some(sequence) = frame
+                    .field("sequence")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<u64>().ok())
+                else {
+                    // Unreachable: the classifier read this field as a decimal.
+                    let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
+                    return;
+                };
+                let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
+                if let Err(code) = route.event(sequence, payload) {
+                    // The UI contract and the route's own bounds end this one
+                    // stream. The frame was in contract, so the generation
+                    // lives and the Package is told the stream is over.
+                    // Retire in the classifier before the adapter forgets the
+                    // route, so the two can never disagree about whether this
+                    // stream is still served.
+                    state.lock().await.retire_stream(stream_id);
+                    ui_event_routes.lock().await.remove(stream_id);
+                    route.terminate(StreamEnd::Host(code));
+                    let _ = writer
+                        .control(json!({
+                            "kind":"stream_close", "streamId":stream_id,
+                            "code":ui_stream_code(code)
+                        }))
+                        .await;
+                }
+            }
             _ => {
                 let _ = failure.send(Some(PackageErrorCode::ProtocolViolation));
                 return;
@@ -709,10 +1177,27 @@ async fn reader_task<R>(
     }
 }
 
+/// Classifies a Package `stream_close`.
+///
+/// No code, `completed` or `closed` is an ordinary completion; `cancelled` and `overloaded` stay
+/// host codes; every other code is the Package's own termination code.
+fn stream_end(frame: &Frame) -> StreamEnd {
+    match frame.field("code").and_then(Value::as_str) {
+        None | Some("completed") | Some("closed") => StreamEnd::Completed,
+        Some("cancelled") => StreamEnd::Host(PackageErrorCode::Cancelled),
+        Some("overloaded") => StreamEnd::Host(PackageErrorCode::Overloaded),
+        Some(code) => StreamEnd::Package(PackageOwnedError {
+            code: code.to_owned(),
+            retryable: false,
+            details: serde_json::Map::new(),
+        }),
+    }
+}
+
 async fn fail_ui_routes(routes: &UiEventRoutes, code: PackageErrorCode) {
     let mut routes = routes.lock().await;
     for (_, route) in std::mem::take(&mut *routes) {
-        route.terminate(code);
+        route.terminate(StreamEnd::Host(code));
     }
 }
 
@@ -830,8 +1315,12 @@ impl ProcessClient {
                 match tokio::time::timeout(Duration::from_millis(500), &mut receiver).await {
                     Ok(Ok(result)) => result,
                     _ => {
+                        // Retire before the adapter entry goes, in that order
+                        // and for the same reason as `cancel`: between the two
+                        // the classifier and the adapter must never disagree
+                        // about whether this request is still live.
+                        self.state.lock().await.retire_request(&id);
                         self.pending.lock().await.remove(&id);
-                        self.tombstones.lock().await.insert(id);
                         let mut failure = WireFailure::new(if state_changing {
                             PackageErrorCode::OutcomeUncertain
                         } else {
@@ -845,14 +1334,24 @@ impl ProcessClient {
         }
     }
 
+    /// Cancels one in-flight request.
+    ///
+    /// The Host stops waiting here, so the request is retired here too: a first
+    /// terminal frame that crossed the cancel is ignored, and a second is still
+    /// fatal. A repeated cancel, or one for a request the answer already
+    /// retired, is ignored by the same classifier when the writer observes it.
     pub(crate) async fn cancel(&self, target: &str) -> Result<(), WireFailure> {
+        // Retire in the classifier before the adapter forgets the request. The
+        // `cancel` frame is only queued here, and the writer may be blocked on
+        // a slow pipe for as long as it takes to drain one; until it observes
+        // the frame the classifier still calls the request live, so an answer
+        // arriving in that window would be delivered to an adapter that no
+        // longer holds it and read as a violation.
+        self.state.lock().await.retire_request(target);
         let removed = self.pending.lock().await.remove(target);
         if let Some(sender) = removed {
             let _ = sender.send(Err(WireFailure::new(PackageErrorCode::Cancelled)));
-        } else if self.tombstones.lock().await.contains(target) {
-            return Ok(());
         }
-        self.tombstones.lock().await.insert(target.to_owned());
         self.send_cancel(target).await
     }
 
@@ -873,7 +1372,6 @@ impl ProcessClient {
         payload: PackageValue,
         contract: Arc<AdmittedUi>,
     ) -> Result<(UiEventReceiver, Arc<UiEventRoute>), WireFailure> {
-        self.closed_streams.lock().await.remove(&id);
         let (route, receiver) = UiEventRoute::new(contract, topic.to_owned());
         self.ui_event_routes
             .lock()
@@ -888,29 +1386,45 @@ impl ProcessClient {
             .await
         {
             self.ui_event_routes.lock().await.remove(&id);
-            route.terminate(error.code);
+            route.terminate(StreamEnd::Host(error.code));
             return Err(error);
         }
         Ok((receiver, route))
     }
 
+    /// Releases credit for events the subscriber has acknowledged.
+    ///
+    /// The amount is the acknowledged delta and nothing else. Clamping it here
+    /// would put a frame on the wire that says something the Host did not
+    /// account for; the classifier reads the frame the adapter asked for and
+    /// fails the generation if the Host ever asks for one out of contract.
+    ///
+    /// A stream that ended while the acknowledgement was in flight makes this
+    /// frame late, not wrong: the writer's classifier ignores it.
+    ///
+    /// This send waits for a control slot rather than refusing one
+    /// (`CREDIT_WAITS_FOR_A_SLOT`). A subscription at a full window owes a
+    /// whole window of `credit` frames, which is more than the writer's whole
+    /// published frame budget, so a refusing send here destroys credit on
+    /// ordinary legal traffic. The wait is bounded: the caller is the UI
+    /// command's own task, never the reader or the writer loop, and a Package
+    /// that has stopped reading is failed by the five-second health probe,
+    /// which closes these channels.
     pub(crate) async fn credit(&self, stream_id: &str, amount: u64) -> Result<(), WireFailure> {
         self.writer
-            .control(json!({"kind":"credit","streamId":stream_id,"amount":amount.min(32)}))
+            .send_waiting(
+                json!({"kind":"credit", "streamId":stream_id, "amount":amount}),
+                true,
+            )
             .await
     }
 
     pub(crate) async fn stream_close(&self, stream_id: &str) -> Result<(), WireFailure> {
-        let mut closed = self.closed_streams.lock().await;
-        if !closed.insert(stream_id.to_owned()) {
-            return Ok(());
-        }
-        while closed.len() > 64 {
-            closed.pop_first();
-        }
-        drop(closed);
+        // The Host stops serving the stream here, so credit the Package
+        // released for events it had already accepted is ignored from now on.
+        self.state.lock().await.retire_stream(stream_id);
         if let Some(route) = self.ui_event_routes.lock().await.remove(stream_id) {
-            route.terminate(PackageErrorCode::Cancelled);
+            route.terminate(StreamEnd::Host(PackageErrorCode::Cancelled));
         }
         self.writer
             .control(json!({"kind":"stream_close","streamId":stream_id,"code":"closed"}))
@@ -982,4 +1496,263 @@ fn package_value_to_json(value: PackageValue) -> Value {
 
 fn empty_object() -> Value {
     Value::Object(Default::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Duration, MAX_ID_BYTES, MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES, WireFailure,
+        package_owned_error, start, stream_end,
+    };
+    use crate::{MAX_UI_SUBSCRIPTIONS_PER_MOUNT, PackageErrorCode};
+    use serde_json::{Value, json};
+    use teamarness_package_protocol::{Direction, Frame, INITIAL_STREAM_CREDIT};
+    use tokio::io::AsyncReadExt;
+
+    /// One route admits every event the credit window grants, at the largest
+    /// payload the UI contract allows, without refusing one.
+    ///
+    /// This replaces `UI_EVENT_CAPACITY == INITIAL_STREAM_CREDIT` and
+    /// `UI_EVENT_BYTES >= INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES`, which
+    /// restated the definitions two lines above them. The route is what the
+    /// classifier hands events to, so a capacity or a byte budget that stopped
+    /// holding the window fails here — with `EventLagged`, the code a
+    /// subscriber would actually see — instead of agreeing with itself.
+    #[tokio::test]
+    async fn a_route_admits_a_full_window_of_largest_events() {
+        let (route, _receiver) = super::UiEventRoute::new(ui_contract(), "fixture.events".into());
+        // `{"text":"` and `"}` are the eleven bytes around the filler.
+        let filler = "a".repeat(MAX_UI_PAYLOAD_BYTES - 11);
+        for sequence in 1..=INITIAL_STREAM_CREDIT as u64 {
+            let admitted = route.event(sequence, json!({ "text": filler }));
+            assert!(
+                admitted.is_ok(),
+                "the route refused event {sequence} of the {INITIAL_STREAM_CREDIT} the window grants: {admitted:?}"
+            );
+        }
+    }
+
+    /// A `credit` frame that never reached the writer leaves the
+    /// acknowledgement unrecorded, so the next one covers the same events.
+    ///
+    /// The route advanced first and the Host had no way back: `acknowledge`'s
+    /// own first guard refuses a repeat, and this path is the only producer of
+    /// `credit` there is. `commit` takes the send rather than handing out the
+    /// amount, so a call site cannot put the record first.
+    #[tokio::test]
+    async fn an_uncommitted_acknowledgement_leaves_its_credit_to_claim_again() {
+        let (route, _receiver) = super::UiEventRoute::new(ui_contract(), "fixture.events".into());
+        route.mark_delivered(2).await;
+        let refused = route
+            .acknowledge(2)
+            .await
+            .expect("acknowledge to be servable")
+            .expect("two events to credit")
+            .commit(|amount| {
+                assert_eq!(amount, 2);
+                std::future::ready(Err(WireFailure::new(PackageErrorCode::ProcessExited)))
+            })
+            .await;
+        assert!(refused.is_err(), "the frame never reached the writer");
+
+        let mut credited = None;
+        route
+            .acknowledge(2)
+            .await
+            .expect("acknowledge to be servable")
+            .expect("the same two events are still owed credit")
+            .commit(|amount| {
+                credited = Some(amount);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .expect("the second attempt is queued");
+        assert_eq!(credited, Some(2));
+        assert!(
+            matches!(route.acknowledge(2).await, Ok(None)),
+            "a committed acknowledgement is not owed twice: the repeat takes \
+             the ignore verdict (CF-002), releasing no credit"
+        );
+    }
+
+    fn ui_contract() -> std::sync::Arc<crate::ui::AdmittedUi> {
+        std::sync::Arc::new(crate::ui::AdmittedUi {
+            cache: crate::ui::UiCacheRecord {
+                admitted_root: std::path::PathBuf::new(),
+                entrypoint: String::new(),
+                resources: std::collections::BTreeMap::new(),
+                contract_digest: String::new(),
+            },
+            contract: crate::ui::compile_contract(
+                br#"{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{"fixture.events":{"request":{"type":"object","additionalProperties":false},"event":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}}}}"#,
+            )
+            .expect("a compiled UI contract"),
+        })
+    }
+
+    /// A mount's legal acknowledgement traffic never loses a `credit` frame,
+    /// however full the control lane is.
+    ///
+    /// The Shell acknowledges one event at a time, so the eight subscriptions
+    /// one mount may hold, each at a full window, owe
+    /// `MAX_UI_SUBSCRIPTIONS_PER_MOUNT * INITIAL_STREAM_CREDIT` = 256 `credit`
+    /// frames at once — more than any split of the 64 frames the contract
+    /// publishes for the whole writer can hold. A refusing send destroys the
+    /// ones that do not fit, and the Host has no second producer of `credit`:
+    /// the window stays shut, a conforming Package stops sending, and the
+    /// instance is still reported `Active`.
+    #[tokio::test]
+    async fn a_full_control_lane_never_destroys_acknowledged_credit() {
+        // A child that has taken the pipe and stopped reading, which is the
+        // congestion the lane exists to absorb.
+        let (child, mut pipe) = tokio::io::duplex(1);
+        let client = start(tokio::io::empty(), child);
+        let streams = (1..=MAX_UI_SUBSCRIPTIONS_PER_MOUNT)
+            .map(|index| format!("h:ui-{index}"))
+            .collect::<Vec<_>>();
+        {
+            let mut state = client.state.lock().await;
+            for id in &streams {
+                state
+                    .observe(
+                        Direction::HostToPackage,
+                        &frame(json!({
+                            "kind":"stream_open", "id":id, "topic":"t", "mountId":"bW91bnQ",
+                            "initialCredit":INITIAL_STREAM_CREDIT, "payload":{}
+                        })),
+                    )
+                    .expect("the UI stream opens");
+                for sequence in 1..=INITIAL_STREAM_CREDIT {
+                    state
+                        .observe(
+                            Direction::PackageToHost,
+                            &frame(json!({
+                                "kind":"event", "streamId":id,
+                                "sequence":sequence.to_string(), "payload":{}
+                            })),
+                        )
+                        .expect("the window admits the event");
+                }
+            }
+        }
+
+        let acknowledgements = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let mut outcomes = Vec::new();
+                for id in &streams {
+                    for _ in 0..INITIAL_STREAM_CREDIT {
+                        outcomes.push(client.credit(id, 1).await);
+                    }
+                }
+                outcomes
+            }
+        });
+        // Long enough for the lane to fill behind the stalled child.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let drain = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            while matches!(pipe.read(&mut buffer).await, Ok(count) if count > 0) {}
+        });
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(20), acknowledgements)
+            .await
+            .expect("every acknowledgement settles")
+            .expect("the acknowledging task");
+        drain.abort();
+        let refused = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .map(|failure| failure.code)
+            .collect::<Vec<_>>();
+        assert!(
+            refused.is_empty(),
+            "{} of {} acknowledgements were destroyed by the control lane, first {:?}",
+            refused.len(),
+            outcomes.len(),
+            refused.first()
+        );
+    }
+
+    /// The reserve holds the frame it exists for: a typed terminal `error` for
+    /// an id of the contract's maximum length.
+    #[test]
+    fn an_overloaded_answer_fits_its_reserve() {
+        let longest = format!("p:{}", "a".repeat(MAX_ID_BYTES - 2));
+        assert_eq!(longest.len(), MAX_ID_BYTES);
+        let overloaded = frame(json!({
+            "kind":"error", "id":longest, "code":"overloaded",
+            "retryable":true, "details":{}
+        }));
+        let encoded = teamarness_package_protocol::encode_frame(&overloaded)
+            .expect("encoded frame")
+            .len();
+        assert!(
+            encoded <= TERMINAL_ERROR_BYTES,
+            "the reserve holds {TERMINAL_ERROR_BYTES} bytes per answer, the frame needs {encoded}"
+        );
+    }
+
+    fn frame(value: Value) -> Frame {
+        Frame::try_from(value).expect("valid frame")
+    }
+
+    fn error_frame(details: Value) -> Frame {
+        frame(json!({
+            "kind": "error",
+            "id": "h:error-1",
+            "code": "fixture.rejected",
+            "retryable": true,
+            "details": details,
+        }))
+    }
+
+    #[test]
+    fn package_error_details_over_bound_are_dropped() {
+        let error = package_owned_error(&error_frame(json!({"big": "x".repeat(5 * 1024)})));
+        assert_eq!(error.code, "fixture.rejected");
+        assert!(error.retryable);
+        assert!(error.details.is_empty());
+    }
+
+    #[test]
+    fn package_error_details_too_deep_are_dropped() {
+        let mut nested = json!("leaf");
+        for _ in 0..9 {
+            nested = json!({ "next": nested });
+        }
+        let error = package_owned_error(&error_frame(nested));
+        assert_eq!(error.code, "fixture.rejected");
+        assert!(error.details.is_empty());
+    }
+
+    #[test]
+    fn package_error_details_within_bounds_survive() {
+        let error = package_owned_error(&error_frame(json!({"field": "value"})));
+        assert_eq!(error.details["field"], json!("value"));
+    }
+
+    #[test]
+    fn cancelled_and_overloaded_stay_host_codes() {
+        for (code, expected) in [
+            ("cancelled", PackageErrorCode::Cancelled),
+            ("overloaded", PackageErrorCode::Overloaded),
+        ] {
+            let closed = frame(json!({"kind": "stream_close", "streamId": "h:s-1", "code": code}));
+            assert_eq!(stream_end(&closed), StreamEnd::Host(expected));
+        }
+        for code in ["completed", "closed"] {
+            let closed = frame(json!({"kind": "stream_close", "streamId": "h:s-1", "code": code}));
+            assert_eq!(stream_end(&closed), StreamEnd::Completed);
+        }
+        let closed = frame(json!({"kind": "stream_close", "streamId": "h:s-1"}));
+        assert_eq!(stream_end(&closed), StreamEnd::Completed);
+        let closed =
+            frame(json!({"kind": "stream_close", "streamId": "h:s-1", "code": "fixture.rejected"}));
+        let StreamEnd::Package(error) = stream_end(&closed) else {
+            panic!("a Package code is Package-owned");
+        };
+        assert_eq!(error.code, "fixture.rejected");
+        assert!(!error.retryable);
+    }
 }

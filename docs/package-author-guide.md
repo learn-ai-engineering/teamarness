@@ -2,7 +2,7 @@
 
 A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as an installation-local Package, then give the same declared bytes to the Teamarness application build. For a supported starter project, run `npm run create:package -- --output <directory> --identity <reverse-dns-id> --display-name <name>` from a Teamarness checkout. The generator creates a foundation outside the Teamarness workspaces and vendors the current Rust and TypeScript SDK source with exact lockfiles. Generated SDK copies have no supported in-place upgrade yet.
 
-Phase 3 supports `aarch64-apple-darwin`. It ships a Rust Backend SDK and a TypeScript UI SDK. The Package Process Protocol is language-neutral, but no other production Backend SDK is supported yet.
+Teamarness supports `aarch64-apple-darwin`, and ships a Rust Backend SDK and a TypeScript UI SDK. The Package Process Protocol is language-neutral, but no other production Backend SDK exists yet.
 
 ## Package Directory
 
@@ -70,11 +70,24 @@ The contract file may use at most 1 MiB. Each generic request, response, subscri
 
 Build one UTF-8 ESM entrypoint of at most 8 MiB. Declare at most 64 static assets, each at most 8 MiB. The entrypoint, assets, and contract may total at most 32 MiB. Do not emit undeclared chunks or remote imports.
 
-Export `mount(context)`. The context provides a fresh Shadow Root, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. Use `@teamarness/package-ui-sdk` for requests, cancellation, ordered subscriptions, and post-listener acknowledgement.
+Export `mount(context)`. The context provides a fresh Shadow Root inside the Package UI Frame, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. `context.client` gives requests, cancellation, ordered subscriptions, and post-listener acknowledgement; `@teamarness/package-ui-sdk` supplies the types and the optional CSS kit.
+
+### Package UI frame restrictions
+
+The Shell runs each Package UI Mount in its own sandboxed frame with an opaque origin. Inside it:
+
+- `localStorage`, `sessionStorage`, IndexedDB, and cookies are unavailable.
+- `fetch`, XHR, and WebSocket are denied by the frame's policy. All data goes through `context.client`.
+- Tauri commands, Tauri globals, the Shell's DOM, and other Packages are unreachable.
+- There are no popups, no `window.open`, and no `alert`, `confirm`, or `prompt`.
+- A `position: fixed` overlay covers the Package pane, not the window.
+- Navigating the frame away faults the mount.
+- Any uncaught error or unhandled rejection anywhere in the frame is a UI fault, not only one attributed to your module.
+- The `__teamarness/` path of the resource URL is reserved for the Shell-owned frame document, stylesheet, and runtime. A declared asset under that path is shadowed.
 
 ### Theme and Package-owned composition
 
-The UI SDK's [Package UI theme and CSS kit guide](../packages/teamarness-package-ui-sdk/README.md) is authoritative for the exact 12 semantic token names and the optional class-based kit. The Shell defines token values on the mount ancestor. Use the tokens inside your Shadow Root so System, Light, and Dark changes inherit without a Package event.
+The UI SDK's [Package UI theme and CSS kit guide](../packages/teamarness-package-ui-sdk/README.md) is authoritative for the exact 12 semantic token names and the optional class-based kit. The Shell sends token values across the frame bridge and the frame runtime defines them on the frame document root. Use the tokens inside your Shadow Root so System, Light, and Dark changes apply without a Package event.
 
 A Package owns its complete internal composition, including its Package-owned header, secondary navigation, forms, state feedback, and domain content. The Shell owns Workspace and Package selection, the mount, inherited token values, and generic recovery; do not copy Shell navigation into a Package. The optional `installPackageUiKit(root)` helper supplies only common controls, fields, validation, notices, panels, flow, and visible focus. It uses a constructed stylesheet in the Shadow Root's `adoptedStyleSheets`. Retain its cleanup callback and invoke it from your idempotent unmount function.
 
@@ -92,21 +105,91 @@ The kit also includes opt-in page-structure classes whose values mirror the Shel
 </main>
 ```
 
-The host's `style-src` rejects runtime inline `<style>` elements and `style` attributes. Package-owned styling must respect that policy too. Use a separate constructed `CSSStyleSheet` in the Package Shadow Root, and remove only that sheet during unmount. Do not fall back to inline styles, nonces, hashes, `data:` styles, or `blob:` styles if constructed stylesheets are unavailable.
+The frame document policy rejects runtime inline `<style>` elements and `style` attributes. Package-owned styling must respect that policy too. Use a separate constructed `CSSStyleSheet` in the Package Shadow Root, and remove only that sheet during unmount. Do not fall back to inline styles, nonces, hashes, `data:` styles, or `blob:` styles if constructed stylesheets are unavailable.
 
-The Shell loads admitted resources through `teamarness-package://`. The loader accepts only `GET` and `HEAD` for exact admitted paths. It rejects traversal, encoded separators, query selectors, stale tokens, undeclared files, changed cache bytes, and MIME changes. Responses disable sniffing and storage. Package code never receives the mount token or a source, cache, or data path.
+The Package UI Frame loads admitted resources through `teamarness-package://`. The loader accepts only `GET` and `HEAD` for exact admitted paths. It rejects traversal, encoded separators, query selectors, stale tokens, undeclared files, changed cache bytes, and MIME changes. Responses disable sniffing and storage. Package code never receives the mount token or a source, cache, or data path.
+
+## Validate without the GUI
+
+`teamarness-package-validate` applies Package Admission's Package Manifest and UI contract rules, and answers with the same verdict the Package Host reaches. A generated project runs it as `npm run validate` for the project it is in, and `npm run validate:dist` for the assembled Package Directory, where `--smoke` also launches the Backend through handshake, a ping, activation and disposal.
+
+```sh
+# The project you are editing: placeholders and unbuilt artifacts are tolerated.
+cargo run -p teamarness-package-contract --bin teamarness-package-validate -- source .
+# An assembled Package Directory: exact bytes, sizes, digests, and a Backend smoke launch.
+cargo run -p teamarness-package-contract --bin teamarness-package-validate -- directory dist/<identity> --smoke
+```
+
+A failure names the rule that failed and where, for example `error[ui_contract_violation/ui_contract.reference_not_local] ui-contract.json#/requests/...`. `--json` prints the same verdict as data. Exit 0 is admitted, 1 is refused, 2 is a usage error. In this repository, `npm run validate:packages` validates every bundled Package's source and staged directory.
+
+## Package conventions
+
+A Rust Backend registers typed handlers on a `Router` and lets the SDK own the protocol:
+
+| Hook | When it runs | What it owns |
+|---|---|---|
+| activation | `lifecycle.activate`, and `lifecycle.recover` for a replacement generation | builds the state every handler shares |
+| `on_suspend` | before the Instance is suspended | stops background work; the state is kept |
+| `on_resume` | when a suspended Instance is recovered in the same process | restarts what suspend stopped |
+| `on_dispose` | when the state is discarded | releases what the state holds |
+
+`main.rs` stays thin: `#[tokio::main] async fn main() -> ExitCode { my_package::router().run().await }`.
+
+Name a Package error code after your Package — `emojart.storage_failed` — and mark it `retryable` only when repeating the same request may succeed. The SDK owns the codes that are not about your product: `package.not_active`, `package.unknown_operation`, `package.unknown_subscription`, `package.invalid_payload`, `package.blocking_task_failed`, `package.capability_not_granted`, and `cancelled`.
+
+Anything that blocks — files, SQLite, hashing, a directory walk — belongs in `ctx.blocking(...)`, which moves it off the async runtime and hands the closure a cancellation token. The token fires when the caller cancels, when the request deadline passes, and when the Instance is suspended or disposed. A handler that blocks the runtime stalls every other request, including the host's health probe.
+
+`backend/tests/` drives the Backend through `teamarness_package_sdk::testing`: activate, request, subscribe, suspend, recover, dispose and shutdown against a real temporary Package Data Directory, with no hand-built frames. `assert_router_matches_contract` proves the router and `ui-contract.json` declare the same operations.
+
+In the UI, `adoptPackageStyles(context.root, css)` adopts one Package-owned stylesheet and returns the cleanup your unmount calls.
+
+## Package errors in the UI
+
+A Package Backend's error reaches the Package UI unchanged: its stable code, its retryability, and up to 4 KiB of bounded `details`, beside the Teamarness code that says what Teamarness did with the failure.
+
+```ts
+import { describePackageError, isAbortError, packageErrorCode } from "@teamarness/package-ui-sdk";
+
+try {
+  await client.request("emojart.save", { recipe });
+} catch (error) {
+  if (isAbortError(error)) return;                  // the mount went away
+  if (packageErrorCode(error) === "emojart.storage_failed") retryLater();
+  else show(describePackageError(error));           // never includes details
+}
+```
+
+`isPackageRequestError(error)` narrows an unknown rejection; `error.packageError` is `null` when Teamarness owns the failure. A subscription's `onTerminated` is called once with the Package's terminal error, or `null` when the Package completed the stream; neither recovers the mount by itself. Show a code, not raw `details`: details are your data, not display text.
+
+Generate the UI's request types from the contract with `teamarness-contract-types --contract ui-contract.json --out ui/src/contract.generated.ts --type-name PackageContract`, commit the result, and call through `typedPackageClient<PackageContract>(context.client)`. The UI then cannot name an operation, or build a payload, the contract does not describe, and a stale generated module fails `npm run typecheck`.
 
 ## Capabilities and local data
 
-Declare only the capabilities you call. Phase 3 provides Workspace context, canonical membership, historical membership, membership transitions, and domain-separated signing. Grants bind one Package Identity, Workspace, Installation, and process generation. A Package cannot select another scope. Private keys, Core database handles, Core types, raw secret bytes, and Iroh handles never cross this interface.
+Declare only the capabilities you call. Teamarness provides Workspace context, canonical membership with membership transitions and historical membership checks, domain-separated signing, and the immutable record log for Package-defined synchronized records. Each is a capability **family** with a version: a Package declares a family and the versions it accepts, and the Host grants one. Grants bind one Package Identity, Workspace, Installation, and process generation. A Package cannot select another scope. Private keys, Core database handles, Core types, raw secret bytes, and Iroh handles never cross this interface.
 
-The initialization frame grants an absolute Package Data Directory. Your Backend owns that directory's files, schema, and migration policy. The directory remains bound to Installation, Workspace, and Package Identity across Package source changes, versions, process generations, disposal, and application restarts. Teamarness does not inspect, migrate, back up, or delete Package-owned data.
+The `initialize` frame grants an absolute Package Data Directory, which the SDK gives an activation hook as `Activation::data_directory()`. Your Backend owns that directory's files, schema, and migration policy. The directory remains bound to Installation, Workspace, and Package Identity across Package source changes, versions, process generations, disposal, and application restarts. Teamarness does not inspect, migrate, back up, or delete Package-owned data.
+
+## What can change under you
+
+Three things cross the Package boundary, and each carries its own version.
+
+| Line | Version today | What it covers |
+|---|---|---|
+| Package Process Protocol | 1.0 | the frame set, the lifecycle operations, the `initialize` handshake |
+| Semantic Capability family | one per family, for example the record log's | that family's request and event shapes, bounds, vocabularies, and error codes |
+| Package UI bridge | `uiHostVersion` 1 | the mount contract your `mount(context)` is given |
+
+A capability is negotiated at activation: you declare a family and the versions of it you accept, the Host offers a major and a range of minors, and the highest minor both accept is granted. Within a major, a minor only adds — new optional request fields, new event kinds you may ignore, wider bounds. Nothing is removed or narrowed, and a value added to a closed vocabulary such as the record log's `availability` states is a new major, not a minor, so your Package never has to interpret a state it does not know.
+
+A capability family the Host does not provide is an unavailable capability, not a version error. A **new** family — document-oriented synchronization, say — is added beside the existing ones. It changes no existing family, no lifecycle operation, no protocol version, and no UI contract, so a Package that does not declare it is unaffected.
+
+When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. No such window exists yet, because nothing has broken yet. See ADR 0018, Package seam versioning.
 
 ## Trust limits
 
 A Package Backend is trusted native code. It has the current user's ambient filesystem, network, and process authority. Process supervision handles ordinary exits, deadlines, graceful shutdown, and conservative orphan cleanup. It is not a sandbox and does not contain hostile code or deliberately evasive descendants.
 
-A same-webview Package UI can access the Shell DOM and any Tauri command it knows. A Shadow Root limits style collisions only. It does not reduce DOM, JavaScript, network, or Tauri-command authority. Review both Backend and UI code before trusting a Package.
+A Package UI runs in a sandboxed frame with an opaque origin, so it reaches neither the Shell's DOM nor any Tauri command, and it has no storage and no network. Frame isolation separates realms, DOM, storage, and Tauri access; it does not separate threads, so a Package UI that blocks its thread freezes the Shell, and it places no limit on what the Package Backend can do. Review both Backend and UI code before trusting a Package.
 
 ## Bundled and local Package Source kinds
 
@@ -114,15 +197,15 @@ A same-webview Package UI can access the Shell DOM and any Tauri command it know
 
 ## Local development loop
 
-1. Build the final Backend executable, ESM entrypoint, declared assets, and UI contract in the Package repository.
-2. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`.
-3. Copy the directory outside the Teamarness repository if you want to test the real separate-source path.
+1. Run `npm run validate` after every contract or manifest change.
+2. Build the final Backend executable, ESM entrypoint, declared assets, and UI contract in the Package repository.
+3. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`. `npm run build` does both and validates the result.
 4. Follow [Local Package registration](local-package-registration.md). Use the manifest identity as `expectedIdentity`, accept the native-code risks, and restart Teamarness.
 5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. Workspace settings offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
 6. Rebuild in place when needed, then restart. There is no source watch or hot reload for Backend bytes.
 
 ## Promotion to application distribution
 
-Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds a reviewed declaration to the application Package builder and updates the matching Tauri resource and external-binary configuration. The builder remains the only writer of `packages/application-packages.v1.json`; it stages and verifies every declared byte, size, and digest. Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages`, then remove the installation override and restart to confirm the bundled source uses the same Package Data Directory.
+Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds one reviewed entry (source directory and Cargo Backend package) to `packages/bundled-packages.json`, the single list of bundled Packages, and runs `node scripts/bundled-packages.mjs --write` to regenerate the matching Tauri resource and external-binary configuration; `npm test` fails if they diverge. The builder remains the only writer of `packages/application-packages.v1.json`; it stages and verifies every declared byte, size, and digest. Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages`, then remove the installation override and restart to confirm the bundled source uses the same Package Data Directory.
 
 Signing and notarization, Gatekeeper remediation, other operating systems, remote Package fetching, Package updates, hot reload, enablement policy, and synchronization engines remain outside the current delivery claims.

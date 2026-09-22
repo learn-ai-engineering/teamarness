@@ -2,9 +2,43 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use teamarness_core::{
-    CoreRuntimeConfig, IdentityError, MembershipEpoch, MembershipOperationId, MembershipVersion,
-    OnboardingError, SigningContext, WorkspaceId,
+    CoreRuntime, CoreRuntimeConfig, IdentityError, MembershipChange, MembershipEpoch,
+    MembershipOperationId, MembershipVersion, OnboardingError, SigningContext, WorkspaceId,
 };
+
+/// Opens a real Installation whose Iroh endpoint is bound to loopback.
+///
+/// Addressing is not the behaviour any test in this file is about, and an
+/// integration test is compiled out of crate, so the production binding would
+/// put a required check behind the public relays (SF-002). Storage, the
+/// endpoint and the onboarding protocol are the real ones either way.
+async fn open(directory: std::path::PathBuf) -> CoreRuntime {
+    CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(directory))
+        .await
+        .expect("an Installation opens on its private data directory")
+}
+
+/// Issues an invitation, waiting out the endpoint readiness this machine needs
+/// under load.
+///
+/// Readiness is a real-network condition, not the behaviour under test, and the
+/// deadline only bounds failure.
+async fn invite(
+    runtime: &CoreRuntime,
+    workspace: WorkspaceId,
+) -> teamarness_core::WorkspaceInvitation {
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match runtime.create_workspace_invitation(workspace).await {
+            Ok(invitation) => return invitation,
+            Err(OnboardingError::Readiness) if std::time::Instant::now() < expiry => {
+                // negative-wait: backoff between retries; the endpoint offers no readiness event.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("the invitation could not be issued: {error}"),
+        }
+    }
+}
 
 #[test]
 fn runtime_config_preserves_the_private_data_directory() {
@@ -74,4 +108,83 @@ fn onboarding_errors_have_a_stable_retryability_contract() {
         assert_eq!(error.is_retryable(), expected, "{error:?}");
         assert!(!error.to_string().is_empty());
     }
+}
+
+// Verifies: TEAM.SYS.MEM-R05
+#[tokio::test]
+async fn durable_and_live_transitions_report_the_same_change_and_author() {
+    let root = std::env::temp_dir().join(format!(
+        "teamarness-transition-change-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let alice = open(root.join("alice")).await;
+    let workspace = alice.create_workspace("Transition change").unwrap();
+    let mut live = alice
+        .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
+        .unwrap();
+
+    let bob_invitation = invite(&alice, workspace.id()).await;
+    let bob = open(root.join("bob")).await;
+    alice.remember_loopback_peer_for_tests(&bob);
+    bob.remember_loopback_peer_for_tests(&alice);
+    bob.join_workspace(&bob_invitation).await.unwrap();
+    let carol_invitation = invite(&alice, workspace.id()).await;
+    let carol = open(root.join("carol")).await;
+    alice.remember_loopback_peer_for_tests(&carol);
+    carol.remember_loopback_peer_for_tests(&alice);
+    carol.join_workspace(&carol_invitation).await.unwrap();
+    alice
+        .revoke_member(workspace.id(), bob.public_identity())
+        .unwrap();
+
+    let expected = vec![
+        MembershipChange::Admitted {
+            member: bob.public_identity(),
+        },
+        MembershipChange::Admitted {
+            member: carol.public_identity(),
+        },
+        MembershipChange::Revoked {
+            member: bob.public_identity(),
+        },
+    ];
+
+    let mut live_seen = Vec::new();
+    while live_seen.len() < expected.len() {
+        let transition = live
+            .next_transition_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .expect("live transition");
+        assert_eq!(transition.author(), alice.public_identity());
+        live_seen.push(transition.change());
+    }
+    assert_eq!(live_seen, expected);
+
+    let mut durable = alice
+        .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
+        .unwrap();
+    let mut durable_seen = Vec::new();
+    while durable_seen.len() < expected.len() {
+        let transition = durable
+            .next_transition_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .expect("durable transition");
+        assert_eq!(transition.author(), alice.public_identity());
+        durable_seen.push(transition.change());
+    }
+    assert_eq!(durable_seen, expected);
+
+    drop(live);
+    drop(durable);
+    carol.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+    alice.shutdown().await.unwrap();
+    drop(carol);
+    drop(bob);
+    drop(alice);
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. External Package authoring remains foundation-only while SDK publication policy is deferred. Current work runs in two parallel workstreams (see **Current work**); Phase 5 follows them.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Current work runs in two parallel workstreams (see **Current work**); Phase 5 follows them.
 
 ## Phases
 
@@ -52,9 +52,9 @@ Started on 2026-09-14. Core now owns the first generic Package-scoped Synchroniz
 
 ### Phase 5 - Membership Management and Hardening
 
-Workspace leave, manager assignment and transfer, member removal controls, revocation-driven key rotation, epoch transitions visible to packages, package-scoped membership with core eligibility checks, and forward-only history for newly admitted members. Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. Recognizable member names are a planned follow-up workstream (see **Planned follow-up workstreams** and `TEAM-DQ8`); this phase extends that model to multiple devices per human identity.
+Workspace leave, manager assignment and transfer, member removal controls, revocation-driven Content Key rotation (a new Content Key Generation per revocation), epoch transitions visible to packages, package-scoped membership with core eligibility checks. Content Key rotation SHALL grant a newly admitted Member the earlier Content Key Generations of each Package scope, so they read the existing history (`TEAM.SYS.CONV-R12`). Phase 5 introduces multiple Workspace administrators — a small group (for example three or four Members) who can admit and revoke Members and perform other Workspace administration. Version 1's single Manager, the Workspace creator, is a scope limit, not the intended model (ADR 0013). Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. Recognizable member names are a planned follow-up workstream (see **Planned follow-up workstreams** and `TEAM-DQ8`); this phase extends that model to multiple devices per human identity. Membership replication and synchronization peer authorization are delivered by ADR 0013; adding a membership action tag requires a new membership-sync protocol version, not a new envelope version. Package Instance lifecycle on leave and revocation (`TEAM-DQ9`) is decided in this phase: today the Package Host never disposes an Instance.
 
-**Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member sees only post-admission content, and packages rotate keys after membership transitions.
+**Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member reads the existing history, and packages rotate keys after membership transitions.
 
 **Depends on:** Phase 4.
 
@@ -64,25 +64,42 @@ Repository registration, local Git reading, and repository-backed package views.
 
 **Outcome:** A user registers a local clone and a package renders repository-derived context.
 
-Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) registers local Git checkouts, validates and deduplicates their paths, and renders a refreshable snapshot showing path, origin, GitHub URL, branch, commit, and working-tree state. Registrations persist across restarts. It reads Git locally through `gix` and does not synchronize registrations between peers. `02-system/06-repos/requirements.md` still contains only a placeholder summary.
+Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) registers local Git checkouts, validates and deduplicates their paths, and renders a refreshable snapshot showing path, origin, GitHub URL, branch, commit, and working-tree state. Registrations persist across restarts. It reads Git locally through `gix` and does not synchronize registrations between peers.
 
 **Depends on:** Phase 3.
 
 ## Current work
 
-These two workstreams run in parallel on separate branches and worktrees. Phase 5 starts after them.
+The architecture review workstream is closing; the Shell and Package UI polish workstream continues on its branch and merges after the review lands. Phase 5 starts after them.
 
 ### Shell and Package UI polish
 
-Branch `ui-polish-member-names`. Polish the Shell's Add Workspace screen, Installation controls, Workspace screens, and theme selector, and give every Package UI the same page structure as the Shell's Workspace screens through the Package UI SDK. Member names were split out on 2026-09-17 (see **Planned follow-up workstreams**); the branch name predates that change.
+Branch `ui-polish-member-names`. Polish the Shell's Add Workspace screen, Installation controls, Workspace screens, and theme selector, and give every Package UI the same page structure as the Shell's Workspace screens through the Package UI SDK. Member names were split out on 2026-09-17 (see **Planned follow-up workstreams**); the branch name predates that change. Integration is selective and intentional: `architecture-review` merges to `main` first, then this branch is brought in deliberately — the two cannot merge together. The port also owns the recorded CF-005 follow-up (cross-language bounds guard for the Shell's `MAX_PENDING_REQUESTS`/`MAX_PAYLOAD_BYTES`) and the `createChannel` error-mapping fix.
 
 **Outcome:** The collected Shell defects are fixed and Package UIs share one consistent page structure.
 
-### Comprehensive code and architecture review
+### Comprehensive code and architecture review (closing)
 
-Branch `architecture-review`. Review the whole system now that several Packages exist, covering architecture, code quality, synchronization, security, and how easy it is to author a Package. Findings become recorded decisions, open questions, deltas, or follow-up workstreams.
+Branch `architecture-review`, 2026-09-17 to 2026-09-22. Reviewed the whole system across five parallel lanes — architecture, code quality, synchronization, security, Package authoring — and executed five fix rounds closing every finding at the cause, with ADRs 0013–0018 recorded under `context/.decisions/`. Verification: independent round-4 confirmation (37 executed perturbations, sandbox hermeticity observation) and a consolidated passing review record; full required check green; developer manual smoke 2026-09-22 confirmed the branch's behaviour changes. Carried follow-ups live in the workstream issues log: the content-key stall (Member cannot post until a key holder syncs — Phase 5), two load-dependent test flakes, and the Shell bounds pairing.
 
-**Outcome:** A prioritized, evidence-backed findings report and an agreed remediation sequence.
+## Later (unscheduled)
+
+Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
+
+- Custom relay server configuration for teams (`TEAM-R11`, `TEAM.SYS.TRANS-R02`).
+- System tray, native menus, and auto-updater (`TEAM.SYS.SHELL-R01`, ADR 0002).
+- CI-published updates that reach every Member within one hour (vision success criterion 6), with code signing, notarization, and CI/CD (`TEAM.DEL`).
+- Builds for platforms other than macOS on Apple silicon.
+- Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
+- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (4 bundled Packages × 3 Workspaces = 12 processes); measure before scheduling.
+- Collaborative planning documents (vision success criterion 4).
+- A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
+- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
+
+## Not planned
+
+- A `workspace-files` Package transported as Iroh blobs. ADR 0002 does not adopt Iroh blobs; a future document feature will choose its own mechanism.
+- Commonware transport (rejected by ADR 0002).
 
 ## Planned follow-up workstreams
 

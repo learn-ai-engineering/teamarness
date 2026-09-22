@@ -21,7 +21,27 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
+    let frame_runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../frame-dist/package-frame-runtime.js");
+    println!("cargo:rerun-if-changed={}", frame_runtime.display());
+    if !frame_runtime.is_file() {
+        panic!(
+            "the Package UI frame runtime is missing at {}\n\
+             hint: the Package UI frame runtime is built by npm. \
+             Run `npm ci && npm run build` from the repository root \
+             (or `npm --workspace teamarness-desktop run build:frame-runtime`) \
+             before cargo builds of teamarness-desktop, or use `--exclude teamarness-desktop`.",
+            frame_runtime.display()
+        );
+    }
     let attributes = tauri_build::Attributes::new()
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
-    tauri_build::try_build(attributes).expect("failed to build Tauri application metadata");
+    if let Err(error) = tauri_build::try_build(attributes) {
+        panic!(
+            "failed to build Tauri application metadata: {error:#}\n\
+             hint: the bundled Application Packages under target/teamarness-packages are staged by npm. \
+             Run `npm ci && npm run build` from the repository root before cargo builds of teamarness-desktop, \
+             or use `--exclude teamarness-desktop` for Rust-only workspace checks."
+        );
+    }
 }

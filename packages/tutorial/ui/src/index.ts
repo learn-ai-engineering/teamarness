@@ -1,27 +1,26 @@
 import {
-  installPackageUiKit,
+  adoptPackageStyles,
+  describePackageError,
+  typedPackageClient,
   type PackageClient,
   type PackageMountContext,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
+import type {
+  AlgorithmChoice,
+  AlgorithmId,
+  Draft,
+  PaletteChoice,
+  PaletteId,
+  Recipe,
+  SavedArtwork,
+  TutorialContract,
+} from "./contract.generated";
 
+export type { AlgorithmChoice, AlgorithmId, Draft, PaletteChoice, PaletteId, Recipe, SavedArtwork };
+
+/** What the controls need from any contract choice: something to select and something to show. */
 export type Choice = Readonly<{ id: string; label: string }>;
-export type PaletteChoice = Readonly<{ id: string; label: string; values: readonly string[] }>;
-export type Recipe = Readonly<{
-  generatorVersion: number;
-  algorithm: string;
-  palette: string;
-  seed: number;
-  width: number;
-  height: number;
-}>;
-export type Draft = Readonly<{ recipe: Recipe; cells: readonly string[] }>;
-export type SavedArtwork = Readonly<{ id: string; recipe: Recipe; cells: readonly string[] }>;
-type ReadResponse = Readonly<{
-  algorithms: readonly Choice[];
-  palettes: readonly PaletteChoice[];
-  artworks: readonly SavedArtwork[];
-}>;
 
 const TUTORIAL_PACKAGE_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
@@ -32,47 +31,12 @@ const TUTORIAL_PACKAGE_CSS = `
   .saved button[aria-pressed="true"] { outline: 2px solid currentColor; }
 `;
 
-function installTutorialStyles(root: ShadowRoot): () => void {
-  const StyleSheet = globalThis.CSSStyleSheet;
-  if (typeof StyleSheet !== "function") {
-    throw new Error("The Tutorial Package requires constructed CSSStyleSheet support");
-  }
-  if (!("adoptedStyleSheets" in root) || root.adoptedStyleSheets === undefined) {
-    throw new Error("The Tutorial Package requires ShadowRoot.adoptedStyleSheets support");
-  }
-  let sheet: CSSStyleSheet;
-  try {
-    sheet = new StyleSheet();
-  } catch (cause) {
-    throw new Error("The Tutorial Package requires constructed CSSStyleSheet support", { cause });
-  }
-  if (typeof sheet.replaceSync !== "function") {
-    throw new Error("The Tutorial Package requires CSSStyleSheet.replaceSync support");
-  }
-  sheet.replaceSync(TUTORIAL_PACKAGE_CSS);
-  try {
-    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
-  } catch (cause) {
-    throw new Error("The Tutorial Package requires mutable ShadowRoot.adoptedStyleSheets support", { cause });
-  }
-  if (!root.adoptedStyleSheets.includes(sheet)) {
-    throw new Error("The Tutorial Package requires mutable ShadowRoot.adoptedStyleSheets support");
-  }
-
-  let cleaned = false;
-  return () => {
-    if (cleaned) return;
-    cleaned = true;
-    root.adoptedStyleSheets = root.adoptedStyleSheets.filter((candidate) => candidate !== sheet);
-  };
-}
-
 export type TutorialState = Readonly<{
-  algorithms: readonly Choice[];
+  algorithms: readonly AlgorithmChoice[];
   palettes: readonly PaletteChoice[];
   artworks: readonly SavedArtwork[];
-  algorithm: string;
-  palette: string;
+  algorithm: AlgorithmId | "";
+  palette: PaletteId | "";
   draft?: Draft;
   selectedArtworkId?: string;
   error?: string;
@@ -92,6 +56,7 @@ export function createTutorialController(
   client: PackageClient,
   present: (state: TutorialState) => void,
 ): TutorialController {
+  const typed = typedPackageClient<TutorialContract>(client);
   let disposed = false;
   let state: TutorialState = {
     algorithms: [],
@@ -107,15 +72,13 @@ export function createTutorialController(
     present(state);
   };
   const fail = (error: unknown): void => {
-    update({ error: error instanceof Error ? error.message : "Tutorial request failed" });
+    update({ error: describePackageError(error) });
   };
   const generate = async (): Promise<void> => {
-    if (disposed || !state.algorithm || !state.palette) return;
+    const { algorithm, palette } = state;
+    if (disposed || !algorithm || !palette) return;
     try {
-      const result = await client.request("tutorial.generate", {
-        algorithm: state.algorithm,
-        palette: state.palette,
-      }) as Draft;
+      const result = await typed.request("tutorial.generate", { algorithm, palette });
       update({ draft: result, selectedArtworkId: undefined, error: undefined });
     } catch (error) {
       fail(error);
@@ -126,7 +89,7 @@ export function createTutorialController(
     async start(): Promise<void> {
       if (disposed) return;
       try {
-        const result = await client.request("tutorial.read", {}) as ReadResponse;
+        const result = await typed.request("tutorial.read", {});
         const algorithm = result.algorithms[0]?.id;
         const palette = result.palettes[0]?.id;
         if (!algorithm || !palette) throw new Error("Tutorial returned no generation choices");
@@ -144,20 +107,18 @@ export function createTutorialController(
       }
     },
     setAlgorithm(value: string): void {
-      if (state.algorithms.some(({ id }) => id === value)) {
-        update({ algorithm: value, selectedArtworkId: undefined });
-      }
+      const choice = state.algorithms.find(({ id }) => id === value);
+      if (choice) update({ algorithm: choice.id, selectedArtworkId: undefined });
     },
     setPalette(value: string): void {
-      if (state.palettes.some(({ id }) => id === value)) {
-        update({ palette: value, selectedArtworkId: undefined });
-      }
+      const choice = state.palettes.find(({ id }) => id === value);
+      if (choice) update({ palette: choice.id, selectedArtworkId: undefined });
     },
     generate,
     async save(): Promise<void> {
       if (disposed || !state.draft) return;
       try {
-        const saved = await client.request("tutorial.save", { recipe: state.draft.recipe }) as SavedArtwork;
+        const saved = await typed.request("tutorial.save", { recipe: state.draft.recipe });
         update({
           artworks: [...state.artworks, saved],
           draft: { recipe: saved.recipe, cells: saved.cells },
@@ -186,14 +147,7 @@ export function createTutorialController(
 }
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const cleanupKit = installPackageUiKit(context.root);
-  let cleanupStyles: () => void;
-  try {
-    cleanupStyles = installTutorialStyles(context.root);
-  } catch (error) {
-    cleanupKit();
-    throw error;
-  }
+  const cleanupStyles = adoptPackageStyles(context.root, TUTORIAL_PACKAGE_CSS);
   const article = document.createElement("article");
   article.className = "teamarness-page";
   const header = document.createElement("header");

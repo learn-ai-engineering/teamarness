@@ -2,6 +2,16 @@
 
 The Package Host negotiates each required capability before process spawn and sends an opaque grant in `initialize`. A grant is valid for one Package Identity, Workspace, Installation, selected capability version, and process generation. Calls carry the grant and method. They do not carry scope selectors.
 
+## Families and versions
+
+A capability identity names a **family**: one contract shape, such as the immutable record log. A family evolves by minor version within a major, and a minor may only add — new optional request fields, new event kinds a Package may ignore, wider bounds. Nothing is removed or narrowed within a major.
+
+The Package declares a family and the versions of it it accepts; the Host offers a major and a range of minors and grants the highest minor both accept. A family the Host does not provide is an unavailable capability, not a version error.
+
+A different shape is a **new family**, declared and negotiated beside the existing ones — document-oriented synchronization would be one — never a new version of an existing family. Adding a family changes no lifecycle operation, no Package Process Protocol version, and no Package UI contract, and a Package that does not declare it is unaffected.
+
+See ADR 0018, Package seam versioning, for the policy, including the deprecation window intended for the first breaking change.
+
 ## `teamarness.workspace-context` 1.0
 
 `get` takes no arguments. It returns `workspaceId`, `workspaceName`, `installationIdentity`, and `installationDisplayName`.
@@ -10,7 +20,7 @@ The Package Host negotiates each required capability before process spawn and se
 
 `current` returns the canonical member list, durable decimal-string epoch, and content-derived membership version. `was_member` accepts an installation identity and signed decimal-string Unix millisecond. Its result carries `informational_not_authorization` because historical membership cannot authorize a new write.
 
-A Package opens `capability.stream` with its membership grant, method `subscribe`, and `afterEpoch`. Transition events contain the Core epoch, membership version, cause operation ID, and snapshot digest. Stream credit bounds delivery. The host drops its Core subscription when credit or writer capacity runs out and reopens after the last delivered epoch.
+A Package opens `capability.stream` with its membership grant, method `subscribe`, and `afterEpoch`. Transition events contain the Core epoch, membership version, cause operation ID, and snapshot digest. Stream credit bounds delivery. The host drops its Core subscription when credit or writer capacity runs out and reopens after the last delivered epoch. Core transitions also know the admitted or revoked Installation and the author; the 1.0 event does not carry them. A later minor version will.
 
 ## `teamarness.signing` 1.0
 
@@ -52,10 +62,41 @@ retry returns the original committed result.
 an Installation-local journal checkpoint. The stream is credit-controlled and
 at-least-once. Record events include both canonical bytes and the sealed
 Teamarness envelope so a Package can persist ciphertext and its own indexes.
-State events report `waiting_for_history_access`, `offline`, `catching_up`,
-`current`, or `degraded`; warning events contain only stable non-sensitive
-codes. Every event consumes credit. A Package commits the cursor with its
-projection and may safely deduplicate a replay by `recordId`.
+State events report availability and a pending record count; warning events
+contain only stable non-sensitive codes. Every event consumes credit. A Package
+commits the cursor with its projection and may safely deduplicate a replay by
+`recordId`.
+
+The first event of every stream is a `state` event. Afterwards one is sent when
+availability changes, when `pendingRecordCount` changes while not
+`catching_up`, and at most every 128 records while `catching_up`.
+
+| Availability | Meaning |
+|---|---|
+| `waiting_for_history_access` | No history can be read yet: the Package's record set has no key on this Installation. |
+| `offline` | Nothing is reachable, or this Installation may no longer participate. The warning code says which. |
+| `catching_up` | Records are known to be outstanding and peers are reachable. |
+| `current` | Everything known to this Installation has been delivered. |
+
+`pendingRecordCount` is the number of records this subscription still owes the
+Package: records already committed but not delivered, records held back waiting
+for their author or key, and records a running session has announced but not yet
+applied.
+
+Warning codes are `record_quarantined` (a record failed authentication and was
+skipped), `scope_quarantined` (the whole record set is isolated after a local
+integrity failure), and `membership_revoked` (this Installation is no longer a
+current Member). `record_quarantined` is sent once per page that skipped a
+record; the others are sent once per stream.
+
+A synchronization session exchanges at most 2,048 records or 8 MiB in each
+direction; larger backlogs continue in later sessions and are reported as
+`catching_up`.
+
+If `afterCursor` belongs to another delivery journal or is ahead of the journal,
+the Host closes the stream with code `cursor_invalid`. The Package must clear its
+stored cursor and subscribe again from `null`; replayed records are deduplicated
+by `recordId`.
 
 ### `open`
 

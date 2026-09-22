@@ -15,6 +15,8 @@ A Package Instance is one Package Identity and Workspace in the opened Installat
 
 The host validates UI requests, responses, subscription requests, and events against validators compiled during admission. It resolves only exact admitted files through mount-scoped opaque tokens. Package event routes hold at most 32 events and 8 MiB, and credit returns only after the desktop acknowledges delivered events. The generic `teamarness.synchronization.immutable-record-log` capability routes Core's committed `append`, cursor-safe `subscribe`, and bounded `open` methods without exposing Core, transport, or key-custody types. Base64 inputs are decoded and bounded before Core calls; streams reopen from the last delivered cursor.
 
+Capability calls run off the asynchronous executor on blocking threads, through a Host-wide pool of eight permits, so the ten-second call deadline takes effect while Core is busy. A capability error with code `overloaded` or `deadline_exceeded` is retryable, and a state-changing call that exceeded its deadline after starting reports `outcomeUncertain`. An immutable-record stream emits `state` and `warning` events beside its records, reporting `waiting_for_history_access`, `offline`, `catching_up`, or `current` with a pending record count, and closes with `cursor_invalid` when the Package's cursor does not match the local journal.
+
 Package Processes remain trusted native code with the current user's ambient filesystem, network, and process authority. Supervision is a recovery boundary, not a sandbox. It handles ordinary exits, deadlines, bounded restart, graceful shutdown, process-group reaping, and conservative startup orphan reconciliation.
 
 Run the host and full failure matrices from the repository root:

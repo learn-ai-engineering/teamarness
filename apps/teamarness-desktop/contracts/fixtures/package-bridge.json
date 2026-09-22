@@ -49,5 +49,25 @@
   "hostState": {
     "revision": 8,
     "revisionGap": false
+  },
+  "packageErrorEnvelope": {
+    "version": 2,
+    "namespace": "teamarness.package-host",
+    "code": "backend_error",
+    "stage": "ui",
+    "affectedPackage": null,
+    "affectedInstance": null,
+    "retryable": false,
+    "recovery": "none",
+    "diagnosticId": "diag-fixture",
+    "packageError": {
+      "code": "fixture.rejected",
+      "retryable": false,
+      "details": { "field": "value" }
+    }
+  },
+  "streamCompleted": {
+    "kind": "completed",
+    "value": { "mount": "mount-1", "subscription": "subscription-1" }
   }
 }

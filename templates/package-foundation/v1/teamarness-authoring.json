@@ -1,8 +1,16 @@
 {
-  "templateVersion": 1,
+  "templateVersion": 2,
   "packageProcessProtocol": "1.0",
   "uiHostVersion": 1,
   "sdkSource": "vendored-from-teamarness-checkout",
   "sdkUpgrade": "unsupported-in-place",
+  "sdkRevision": "__SDK_REVISION__",
+  "sdkRevisionDirty": false,
+  "vendorDigests": {
+    "package-contract": "",
+    "package-protocol": "",
+    "package-sdk": "",
+    "package-ui-sdk": ""
+  },
   "requestNamespace": "__REQUEST_NAMESPACE__"
 }

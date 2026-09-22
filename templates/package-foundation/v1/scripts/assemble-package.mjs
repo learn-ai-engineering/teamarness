@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile, cp } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -6,10 +7,10 @@ import { fileURLToPath } from "node:url";
 const scriptPath = fileURLToPath(import.meta.url);
 const root = dirname(dirname(scriptPath));
 
-export async function assemblePackage({ projectRoot = root } = {}) {
+export async function assemblePackage({ projectRoot = root, env = process.env } = {}) {
   const manifestFile = join(projectRoot, "teamarness.package.json");
   const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
-  const backendSource = join(projectRoot, "target/release/teamarness-generated-package-backend");
+  const backendSource = join(cargoTargetDirectory(projectRoot, env), "release/teamarness-generated-package-backend");
   const uiSource = join(projectRoot, "ui/dist/index.js");
   const contractSource = join(projectRoot, "ui-contract.json");
   const destination = join(projectRoot, "dist", manifest.identity);
@@ -32,6 +33,19 @@ export async function assemblePackage({ projectRoot = root } = {}) {
   await writeFile(join(destination, manifest.ui.contract.path), contract, { mode: 0o600 });
   await writeFile(join(destination, "teamarness.package.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
   return destination;
+}
+
+// Ask Cargo so CARGO_TARGET_DIR and build.target-dir are honoured.
+function cargoTargetDirectory(projectRoot, env) {
+  const result = spawnSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+    cwd: projectRoot,
+    env,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    shell: false,
+  });
+  if (result.status !== 0) throw new Error(`cargo metadata failed with status ${result.status ?? "unknown"}`);
+  return JSON.parse(result.stdout).target_directory;
 }
 
 function digest(bytes) {

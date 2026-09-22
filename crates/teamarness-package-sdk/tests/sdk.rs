@@ -2,11 +2,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use teamarness_package_protocol::{Frame, FrameKind, JsonValue, decode_frame};
+use teamarness_package_protocol::{FrameKind, JsonValue};
 use teamarness_package_sdk::{
     Backend, BackendError, BackendRequest, EventSubscription, Package, event_channel,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+mod support;
+
+use support::{read_frame, write_json};
 
 struct Echo;
 
@@ -63,6 +66,7 @@ impl Backend for Echo {
                 return Ok(event);
             }
             if request.operation == "fixture.slow" {
+                // simulated-delay: the fixture's own slow operation, which is what the test is about.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             if request.operation == "fixture.error" {
@@ -100,26 +104,6 @@ impl Backend for Echo {
             Ok(subscription)
         })
     }
-}
-
-async fn write_json(stream: &mut tokio::io::DuplexStream, value: &str) {
-    let payload = value.as_bytes();
-    stream
-        .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
-        .await
-        .unwrap();
-    stream.write_all(payload).await.unwrap();
-}
-
-async fn read_frame(stream: &mut tokio::io::DuplexStream) -> Frame {
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix).await.unwrap();
-    let length = u32::from_be_bytes(prefix) as usize;
-    let mut payload = vec![0; length];
-    stream.read_exact(&mut payload).await.unwrap();
-    let mut bytes = prefix.to_vec();
-    bytes.extend(payload);
-    decode_frame(&bytes).unwrap()
 }
 
 #[tokio::test]
@@ -265,6 +249,80 @@ async fn sdk_hides_framing_dispatches_work_and_honors_shutdown() {
     service.await.unwrap().unwrap();
 }
 
+/// Keeps a `CapabilityClient` alive in Package-owned background work that never
+/// finishes, like a long-lived synchronization session.
+struct RetainsCapabilities;
+
+impl Backend for RetainsCapabilities {
+    fn handle(
+        &self,
+        request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+        Box::pin(async move {
+            let capabilities = request.capabilities;
+            tokio::spawn(async move {
+                let _retained = capabilities;
+                std::future::pending::<()>().await;
+            });
+            Ok(JsonValue::Object(Default::default()))
+        })
+    }
+}
+
+const FIXTURE_INITIALIZE: &str = r#"{"kind":"initialize","nonce":"bm9uY2U","package":{"identity":"dev.teamarness.fixture","version":"1.0.0","manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","processGeneration":"1","workspace":{"id":"workspace1","name":"Workspace"},"installation":{"identity":"installation1","displayName":"Installation"},"dataDirectory":{"path":"/tmp/package","continuityId":"Y29udGludWl0eQ"},"protocol":{"major":1,"minor":0},"capabilities":[],"limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,"maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}}"#;
+
+async fn start_retaining_session() -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<(), teamarness_package_sdk::SdkError>>,
+) {
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service =
+        tokio::spawn(Package::builder(Arc::new(RetainsCapabilities)).serve_io(sdk_read, sdk_write));
+    write_json(&mut host_write, FIXTURE_INITIALIZE).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"request","id":"h:activate","operation":"lifecycle.activate","deadlineUnixMs":"9999999999999","payload":{}}"#).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Response);
+    (host_read, host_write, service)
+}
+
+#[tokio::test]
+async fn sdk_session_ends_on_shutdown_while_package_tasks_retain_capabilities() {
+    let (mut host_read, mut host_write, service) = start_retaining_session().await;
+    write_json(
+        &mut host_write,
+        r#"{"kind":"shutdown","reason":"application_shutdown"}"#,
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    // The host keeps its end open; the session must not wait for Package tasks.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), service)
+        .await
+        .expect("serve_io returned after shutdown_ack");
+    result.unwrap().unwrap();
+    drop(host_write);
+}
+
+#[tokio::test]
+async fn sdk_session_ends_on_parent_closure_while_package_tasks_retain_capabilities() {
+    let (_host_read, host_write, service) = start_retaining_session().await;
+    drop(host_write);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), service)
+        .await
+        .expect("serve_io returned after parent closure");
+    assert_eq!(
+        result.unwrap(),
+        Err(teamarness_package_sdk::SdkError::ParentClosed)
+    );
+}
+
 #[test]
 fn sdk_dependency_boundary_excludes_host_and_runtime_internals() {
     let manifest =
@@ -289,4 +347,140 @@ fn sdk_dependency_boundary_excludes_host_and_runtime_internals() {
     ] {
         assert!(!source.contains(forbidden), "SDK source names {forbidden}");
     }
+}
+
+/// Calls a capability from Package-owned background work and reports what the
+/// call returned, so a test can observe a call that the Host never answers.
+struct ReportsCapabilityOutcome {
+    outcome: tokio::sync::mpsc::Sender<Result<JsonValue, BackendError>>,
+}
+
+impl Backend for ReportsCapabilityOutcome {
+    fn handle(
+        &self,
+        request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+        let outcome = self.outcome.clone();
+        Box::pin(async move {
+            let capabilities = request.capabilities;
+            tokio::spawn(async move {
+                let result = capabilities
+                    .call("Z3JhbnQx", "get", JsonValue::Object(Default::default()))
+                    .await;
+                let _ = outcome.send(result).await;
+            });
+            Ok(JsonValue::Object(Default::default()))
+        })
+    }
+}
+
+async fn start_reporting_session(
+    outcome: tokio::sync::mpsc::Sender<Result<JsonValue, BackendError>>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<(), teamarness_package_sdk::SdkError>>,
+) {
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service = tokio::spawn(
+        Package::builder(Arc::new(ReportsCapabilityOutcome { outcome }))
+            .serve_io(sdk_read, sdk_write),
+    );
+    write_json(&mut host_write, FIXTURE_INITIALIZE).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"request","id":"h:call","operation":"fixture.capability","deadlineUnixMs":"9999999999999","payload":{}}"#).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Response);
+    // The capability request reaches the host, which deliberately never answers.
+    let request = read_frame(&mut host_read).await;
+    assert_eq!(request.kind(), FrameKind::Request);
+    assert_eq!(request.field("operation").unwrap(), "capability.call");
+    (host_read, host_write, service)
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test(start_paused = true)]
+async fn capability_call_times_out_when_host_never_answers() {
+    let (outcome, mut outcomes) = tokio::sync::mpsc::channel(1);
+    let (_host_read, host_write, service) = start_reporting_session(outcome).await;
+    tokio::time::advance(std::time::Duration::from_millis(11_001)).await;
+    let result = outcomes.recv().await.expect("the call reported an outcome");
+    let error = result.expect_err("an unanswered call gives up");
+    assert_eq!(error.code(), "deadline_exceeded");
+    assert!(error.retryable(), "a call that timed out may be retried");
+    drop(host_write);
+    let _ = service.await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R10
+#[tokio::test]
+async fn pending_capability_calls_fail_when_the_session_ends() {
+    let (outcome, mut outcomes) = tokio::sync::mpsc::channel(1);
+    let (host_read, host_write, service) = start_reporting_session(outcome).await;
+    drop(host_write);
+    drop(host_read);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), outcomes.recv())
+        .await
+        .expect("the pending call was answered when the session ended")
+        .expect("the call reported an outcome");
+    let error = result.expect_err("nothing can answer the call now");
+    assert_eq!(error.code(), "host_unavailable");
+    let _ = service.await;
+}
+
+/// A Backend that refuses every subscription with its own code.
+struct RefusesSubscriptions;
+
+impl Backend for RefusesSubscriptions {
+    fn handle(
+        &self,
+        request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+        Box::pin(async move { Ok(request.payload) })
+    }
+
+    fn subscribe(
+        &self,
+        _request: BackendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>> {
+        Box::pin(async {
+            Err(BackendError::new(
+                "fixture.not_found",
+                false,
+                JsonValue::Object(Default::default()),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn sdk_forwards_the_package_code_when_subscribe_fails() {
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service = tokio::spawn(
+        Package::builder(Arc::new(RefusesSubscriptions)).serve_io(sdk_read, sdk_write),
+    );
+    write_json(&mut host_write, r#"{"kind":"initialize","nonce":"bm9uY2U","package":{"identity":"dev.teamarness.fixture","version":"1.0.0","manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","processGeneration":"1","workspace":{"id":"workspace1","name":"Workspace"},"installation":{"identity":"installation1","displayName":"Installation"},"dataDirectory":{"path":"/tmp/package","continuityId":"Y29udGludWl0eQ"},"protocol":{"major":1,"minor":0},"capabilities":[],"limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,"maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}}"#).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"stream_open","id":"h:stream-1","topic":"fixture.events","mountId":"bW91bnQx","initialCredit":32,"payload":{}}"#).await;
+    let closed = read_frame(&mut host_read).await;
+    assert_eq!(closed.kind(), FrameKind::StreamClose);
+    assert_eq!(closed.field("code").unwrap(), "fixture.not_found");
+    write_json(
+        &mut host_write,
+        r#"{"kind":"shutdown","reason":"application_shutdown"}"#,
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    drop(host_write);
+    service.await.unwrap().unwrap();
 }

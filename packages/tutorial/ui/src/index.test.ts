@@ -1,9 +1,17 @@
-import type { PackageClient, PackageValue } from "@teamarness/package-ui-sdk";
+import { createFakePackageClient, type FakePackageClient } from "@teamarness/package-ui-sdk/testing";
 import { describe, expect, it } from "vitest";
 
-import { createTutorialController, type Draft, type TutorialState, type Recipe, type SavedArtwork } from "./index";
+import {
+  createTutorialController,
+  type AlgorithmId,
+  type Draft,
+  type PaletteId,
+  type Recipe,
+  type SavedArtwork,
+  type TutorialState,
+} from "./index";
 
-const recipe = (seed: number, algorithm = "waves", palette = "garden"): Recipe => ({
+const recipe = (seed: number, algorithm: AlgorithmId = "waves", palette: PaletteId = "garden"): Recipe => ({
   generatorVersion: 1,
   algorithm,
   palette,
@@ -11,25 +19,33 @@ const recipe = (seed: number, algorithm = "waves", palette = "garden"): Recipe =
   width: 16,
   height: 12,
 });
-const draft = (seed: number, algorithm = "waves", palette = "garden"): Draft => ({
+const draft = (seed: number, algorithm: AlgorithmId = "waves", palette: PaletteId = "garden"): Draft => ({
   recipe: recipe(seed, algorithm, palette),
-  cells: Array.from({ length: 192 }, () => "🌱"),
+  cells: Array.from({ length: 192 }, () => "🌱") as unknown as Draft["cells"],
 });
 
-class FakeClient implements PackageClient {
-  readonly requests: Array<{ operation: string; payload: PackageValue }> = [];
-  readonly generatedSeeds = [11, 12, 13];
-  failNext = false;
+type TutorialFake = FakePackageClient & { failNext(): void };
 
-  async request<TResponse extends PackageValue>(operation: string, payload: PackageValue): Promise<TResponse> {
-    this.requests.push({ operation, payload });
-    if (this.failNext) {
-      this.failNext = false;
+/** The Backend as the contract describes it, so the controller is tested against real shapes. */
+function tutorialBackend(): TutorialFake {
+  const seeds = [11, 12, 13];
+  let failing = false;
+  const guard = <T>(answer: () => T): T => {
+    if (failing) {
+      failing = false;
       throw new Error("Backend unavailable");
     }
-    if (operation === "tutorial.read") {
-      return {
-        algorithms: [{ id: "waves", label: "Waves" }, { id: "ripples", label: "Ripples" }, { id: "spiral", label: "Spiral" }, { id: "patchwork", label: "Patchwork" }],
+    return answer();
+  };
+  const fake = createFakePackageClient({
+    requests: {
+      "tutorial.read": () => guard(() => ({
+        algorithms: [
+          { id: "waves", label: "Waves" },
+          { id: "ripples", label: "Ripples" },
+          { id: "spiral", label: "Spiral" },
+          { id: "patchwork", label: "Patchwork" },
+        ],
         palettes: [
           { id: "garden", label: "Garden", values: ["🌱", "🌿", "🍀", "🌸", "🌻"] },
           { id: "ocean", label: "Ocean", values: ["💧", "🐚", "🐠", "🐬", "🌊"] },
@@ -37,32 +53,26 @@ class FakeClient implements PackageClient {
           { id: "fruit", label: "Fruit", values: ["🍓", "🍊", "🍋", "🍏", "🫐"] },
         ],
         artworks: [],
-      } as unknown as TResponse;
-    }
-    if (operation === "tutorial.generate") {
-      const selection = payload as { algorithm: string; palette: string };
-      return draft(this.generatedSeeds.shift()!, selection.algorithm, selection.palette) as unknown as TResponse;
-    }
-    if (operation === "tutorial.save") {
-      return { id: "artwork-1", ...draft(11) } as unknown as TResponse;
-    }
-    throw new Error(`Unexpected operation ${operation}`);
-  }
-
-  async subscribe(): Promise<never> {
-    throw new Error("Tutorial has no subscriptions");
-  }
+      })),
+      "tutorial.generate": (payload) => guard(() => {
+        const selection = payload as { algorithm: AlgorithmId; palette: PaletteId };
+        return draft(seeds.shift()!, selection.algorithm, selection.palette);
+      }),
+      "tutorial.save": () => guard(() => ({ id: "artwork-1", ...draft(11) })),
+    },
+  });
+  return Object.freeze({ ...fake, failNext: () => { failing = true; } });
 }
 
 describe("Tutorial UI client flow", () => {
   it("reads choices, selects their first values, and generates the initial draft", async () => {
-    const client = new FakeClient();
+    const client = tutorialBackend();
     let state: TutorialState | undefined;
-    const controller = createTutorialController(client, (next) => { state = next; });
+    const controller = createTutorialController(client.client, (next) => { state = next; });
 
     await controller.start();
 
-    expect(client.requests).toEqual([
+    expect(client.calls).toEqual([
       { operation: "tutorial.read", payload: {} },
       { operation: "tutorial.generate", payload: { algorithm: "waves", palette: "garden" } },
     ]);
@@ -70,8 +80,8 @@ describe("Tutorial UI client flow", () => {
   });
 
   it("generates again without changing the selected algorithm or palette", async () => {
-    const client = new FakeClient();
-    const controller = createTutorialController(client, () => {});
+    const client = tutorialBackend();
+    const controller = createTutorialController(client.client, () => {});
     await controller.start();
     controller.setAlgorithm("ripples");
     controller.setPalette("ocean");
@@ -79,15 +89,15 @@ describe("Tutorial UI client flow", () => {
     await controller.generate();
     await controller.generate();
 
-    expect(client.requests.slice(-2)).toEqual([
+    expect(client.calls.slice(-2)).toEqual([
       { operation: "tutorial.generate", payload: { algorithm: "ripples", palette: "ocean" } },
       { operation: "tutorial.generate", payload: { algorithm: "ripples", palette: "ocean" } },
     ]);
   });
 
   it("supports every Backend-owned pattern and palette choice", async () => {
-    const client = new FakeClient();
-    const controller = createTutorialController(client, () => {});
+    const client = tutorialBackend();
+    const controller = createTutorialController(client.client, () => {});
     await controller.start();
     const choices: Array<readonly [string, string]> = [["waves", "garden"], ["ripples", "ocean"], ["spiral", "moon"], ["patchwork", "fruit"]];
     for (const [algorithm, palette] of choices) {
@@ -95,7 +105,7 @@ describe("Tutorial UI client flow", () => {
       controller.setPalette(palette);
       await controller.generate();
     }
-    expect(client.requests.slice(-4).map(({ payload }) => payload)).toEqual([
+    expect(client.calls.slice(-4).map(({ payload }) => payload)).toEqual([
       { algorithm: "waves", palette: "garden" },
       { algorithm: "ripples", palette: "ocean" },
       { algorithm: "spiral", palette: "moon" },
@@ -104,28 +114,28 @@ describe("Tutorial UI client flow", () => {
   });
 
   it("saves the visible recipe and restores a saved piece without generating", async () => {
-    const client = new FakeClient();
+    const client = tutorialBackend();
     let state: TutorialState | undefined;
-    const controller = createTutorialController(client, (next) => { state = next; });
+    const controller = createTutorialController(client.client, (next) => { state = next; });
     await controller.start();
 
     await controller.save();
     const saved = state?.artworks[0] as SavedArtwork;
-    const requestCount = client.requests.length;
+    const requestCount = client.calls.length;
     controller.selectArtwork(saved.id);
 
-    expect(client.requests.at(-1)).toEqual({ operation: "tutorial.save", payload: { recipe: recipe(11) } });
-    expect(client.requests).toHaveLength(requestCount);
+    expect(client.calls.at(-1)).toEqual({ operation: "tutorial.save", payload: { recipe: recipe(11) } });
+    expect(client.calls).toHaveLength(requestCount);
     expect(state?.draft).toEqual({ recipe: saved.recipe, cells: saved.cells });
     expect(state?.selectedArtworkId).toBe("artwork-1");
   });
 
   it("presents request errors and cleanup is idempotent", async () => {
-    const client = new FakeClient();
+    const client = tutorialBackend();
     const states: TutorialState[] = [];
-    const controller = createTutorialController(client, (state) => { states.push(state); });
+    const controller = createTutorialController(client.client, (state) => { states.push(state); });
     await controller.start();
-    client.failNext = true;
+    client.failNext();
 
     await controller.generate();
     controller.dispose();

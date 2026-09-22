@@ -68,7 +68,7 @@ async fn public_identity_has_a_stable_validated_string_serde_contract() {
     assert_serde_traits::<PublicIdentity>();
 
     let directory = temporary_directory();
-    let runtime = CoreRuntime::open(CoreRuntimeConfig::new(&directory))
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
     let identity = runtime.public_identity();
@@ -87,6 +87,7 @@ async fn public_identity_has_a_stable_validated_string_serde_contract() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Verifies: TEAM.SYS.ID-R01, TEAM.SYS.TRANS-R03
 #[tokio::test]
 async fn external_consumers_cannot_cross_the_runtime_boundary() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui");
@@ -111,6 +112,12 @@ async fn external_consumers_cannot_cross_the_runtime_boundary() {
         ("issue_invitation.rs", "issue_invitation"),
         ("create_invitation_claim.rs", "create_invitation_claim"),
         ("redeem_invitation.rs", "redeem_invitation"),
+        ("configuration_error.rs", "unresolved import"),
+        ("replicate_records_to.rs", "replicate_records_to"),
+        (
+            "authenticate_membership_operation.rs",
+            "authenticate_membership_operation",
+        ),
     ];
 
     for (fixture, marker) in cases {

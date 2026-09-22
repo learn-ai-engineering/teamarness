@@ -231,6 +231,10 @@ pub(crate) fn validate_identity(v: &str) -> Result<(), DomainError> {
         Ok(())
     }
 }
+/// The Channel slug grammar, which is the UI contract's `^[a-z0-9]+(-[a-z0-9]+)*$`.
+///
+/// A remote record carries a slug this Installation did not write, so the decoder holds the same
+/// rule the contract does: a slug it accepted but the contract refused would fail every snapshot.
 pub(crate) fn validate_slug(v: &str) -> Result<(), DomainError> {
     if !(1..=MAX_SLUG_LEN).contains(&v.len())
         || !v.is_ascii()
@@ -238,17 +242,35 @@ pub(crate) fn validate_slug(v: &str) -> Result<(), DomainError> {
             .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
         || v.starts_with('-')
         || v.ends_with('-')
+        || v.contains("--")
     {
         Err(DomainError::InvalidSlug)
     } else {
         Ok(())
     }
 }
+/// Synthesizes a unique slug by joining a truncated `base` to `suffix`.
+///
+/// The result satisfies [`validate_slug`], which is the UI contract's
+/// `^[a-z0-9]+(-[a-z0-9]+)*$`, for any contract-valid `base` and `suffix`. That is not a
+/// convenience: the slug goes into the Package's own `conversations.snapshot` response, and a
+/// response the contract refuses fails the Mount for good, so a slug the generator invents must
+/// obey the grammar the decoder and the contract both publish.
+///
+/// Truncating to fit the length bound can land on a hyphen, and the joining hyphen would then
+/// make a `--` that the grammar forbids, so the truncated head is trimmed back to a character
+/// that may sit before the join. When nothing is left of the head, the suffix alone is the slug —
+/// it is unique on its own, which is the only thing the caller needs from it.
 pub(crate) fn slug_with_suffix(base: &str, suffix: &str) -> String {
     let base_len = base
         .len()
         .min(MAX_SLUG_LEN.saturating_sub(suffix.len() + 1));
-    format!("{}-{suffix}", &base[..base_len])
+    let head = base[..base_len].trim_end_matches('-');
+    if head.is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{head}-{suffix}")
+    }
 }
 
 fn validate_markdown(v: &str) -> Result<(), DomainError> {
@@ -322,4 +344,108 @@ pub fn row_message(r: &rusqlite::Row<'_>) -> Result<store::MessageRow, rusqlite:
         r.get(4)?,
         r.get::<_, i64>(5)? as u64,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SLUG_LEN, slug_with_suffix, validate_slug};
+
+    /// The decoder's grammar is the UI contract's, for a locally created Channel and for a
+    /// remote record alike.
+    // Verifies: TEAM.SYS.CONV-R05
+    #[test]
+    fn slug_grammar_matches_the_ui_contract_pattern() {
+        let pattern = regex_like();
+        for candidate in [
+            "general",
+            "a",
+            "a-b",
+            "team-1",
+            "0",
+            &"a".repeat(48),
+            "",
+            "-a",
+            "a-",
+            "a--b",
+            "A",
+            "a_b",
+            "a b",
+            &"a".repeat(49),
+        ] {
+            assert_eq!(
+                validate_slug(candidate).is_ok(),
+                pattern(candidate),
+                "{candidate:?} must be judged the same way by the decoder and the contract"
+            );
+        }
+    }
+
+    /// Every slug the uniquifier synthesizes is judged by the same grammar the contract
+    /// publishes, so the Package can never write a record its own decoder and the Package UI
+    /// contract would both refuse.
+    ///
+    /// The bases below cover the whole truncation surface: every base length up to and past the
+    /// limit, crossed with a hyphen at every interior position, so the truncation lands on a
+    /// hyphen, just before one, and just after one.
+    // Verifies: TEAM.SYS.CONV-R05
+    #[test]
+    fn every_synthesized_slug_satisfies_the_contract_grammar() {
+        let pattern = regex_like();
+        let channel_id = "0123abcd4567ef89aabbccddeeff0011";
+        let suffixes = [
+            channel_id[..8].to_owned(),
+            channel_id[..16].to_owned(),
+            channel_id[..24].to_owned(),
+            channel_id.to_owned(),
+            format!("{channel_id}-2"),
+            format!("{channel_id}-1000"),
+        ];
+
+        for base in colliding_bases() {
+            assert!(
+                validate_slug(&base).is_ok(),
+                "the fixture base {base:?} must itself be a stored, contract-valid slug"
+            );
+            for suffix in &suffixes {
+                let generated = slug_with_suffix(&base, suffix);
+                assert!(
+                    validate_slug(&generated).is_ok() && pattern(&generated),
+                    "slug_with_suffix({base:?}, {suffix:?}) produced {generated:?}, which the \
+                     decoder or the UI contract pattern ^[a-z0-9]+(-[a-z0-9]+)*$ refuses"
+                );
+            }
+        }
+    }
+
+    /// Contract-valid base slugs spanning every length and every interior hyphen position, which
+    /// is the whole input surface the duplicate-slug path can truncate.
+    fn colliding_bases() -> Vec<String> {
+        let mut bases = Vec::new();
+        for len in 1..=MAX_SLUG_LEN + 4 {
+            bases.push("a".repeat(len));
+            for hyphen in 1..len.saturating_sub(1) {
+                bases.push(format!(
+                    "{}-{}",
+                    "a".repeat(hyphen),
+                    "b".repeat(len - hyphen - 1)
+                ));
+            }
+        }
+        bases.retain(|base| validate_slug(base).is_ok());
+        bases
+    }
+
+    /// `^[a-z0-9]+(-[a-z0-9]+)*$` with the contract's length bounds, without a regex dependency.
+    fn regex_like() -> impl Fn(&str) -> bool {
+        |value: &str| {
+            !value.is_empty()
+                && value.len() <= 48
+                && value.split('-').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                })
+        }
+    }
 }

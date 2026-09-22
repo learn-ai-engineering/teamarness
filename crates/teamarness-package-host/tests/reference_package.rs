@@ -17,6 +17,25 @@ use teamarness_package_host::{
     UiRequestId, UiSubscriptionId, WorkspaceId,
 };
 
+/// Waits for a condition instead of guessing how long it takes.
+async fn eventually<F, Fut>(timeout: Duration, what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let expiry = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bundled_local_and_version_restarts_preserve_reference_state_and_processes() {
     let root = tempfile::tempdir().unwrap();
@@ -47,7 +66,7 @@ async fn bundled_local_and_version_restarts_preserve_reference_state_and_process
     .unwrap();
 
     let core = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(core_path))
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(core_path))
             .await
             .unwrap(),
     );
@@ -126,15 +145,22 @@ async fn bundled_local_and_version_restarts_preserve_reference_state_and_process
     .await
     .unwrap();
     assert_eq!(instance_generation(&host, &key).await, generation);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let baseline = integer(&first, "backgroundMarker");
+    eventually(
+        Duration::from_secs(5),
+        "background activity advances",
+        || async { integer(&read_reference(&host, &key).await, "backgroundMarker") > baseline },
+    )
+    .await;
     let active_marker = integer(&read_reference(&host, &key).await, "backgroundMarker");
-    assert!(active_marker > integer(&first, "backgroundMarker"));
+    assert!(active_marker > baseline);
 
     host.execute(PackageHostCommand::Suspend(SuspendPackage {
         instance: key.clone(),
     }))
     .await
     .unwrap();
+    // negative-wait: a bounded window proving a suspended Backend's marker stays put.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(persisted_marker(&private, &key), active_marker);
     host.execute(PackageHostCommand::Recover(RecoverPackage {
@@ -143,8 +169,14 @@ async fn bundled_local_and_version_restarts_preserve_reference_state_and_process
     .await
     .unwrap();
     assert_eq!(instance_generation(&host, &key).await, generation);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(integer(&read_reference(&host, &key).await, "backgroundMarker") > active_marker);
+    eventually(
+        Duration::from_secs(5),
+        "a recovered Backend advances its marker again",
+        || async {
+            integer(&read_reference(&host, &key).await, "backgroundMarker") > active_marker
+        },
+    )
+    .await;
     host.execute(PackageHostCommand::Dispose(DisposePackage {
         instance: other_key.clone(),
     }))
@@ -483,4 +515,76 @@ fn digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// The Reference Package's declared failure is the live fixture for Package error fidelity: its
+/// code, retryability and bounded details reach the Host beside the host's own code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reference_fail_reaches_the_host_as_a_package_owned_error() {
+    let root = tempfile::tempdir().unwrap();
+    let application = root.path().join("application");
+    let private = root.path().join("private");
+    fs::create_dir_all(&application).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = reference_backend(root.path());
+    write_package(
+        &application.join("reference"),
+        "dev.teamarness.reference",
+        "1.0.0",
+        &backend,
+    );
+    let index = application.join("application-packages.v1.json");
+    fs::write(
+        &index,
+        br#"{"schemaVersion":1,"packages":[{"directory":"reference"}]}"#,
+    )
+    .unwrap();
+
+    let core = Arc::new(
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
+            .await
+            .unwrap(),
+    );
+    core.create_workspace("Workspace One").unwrap();
+    let workspace = WorkspaceId::new(core.list_workspaces().unwrap()[0].id().to_string()).unwrap();
+    let installation = InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap();
+    let host = PackageHost::open(
+        PackageHostConfig::new(&application, &index, &private, installation),
+        core.clone(),
+    )
+    .await
+    .unwrap();
+
+    let key = instance_key("dev.teamarness.reference", &workspace);
+    let (mount, _) = open_mount(&host, &key).await;
+    let error = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new("failing").unwrap(),
+            operation: "reference.fail".into(),
+            payload: PackageValue::Object(Default::default()),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code,
+        teamarness_package_host::PackageErrorCode::BackendError
+    );
+    assert!(!error.retryable);
+    let package_error = error.package_error.as_ref().expect("Package-owned error");
+    assert_eq!(package_error.code, "reference.requested_failure");
+    assert!(!package_error.retryable);
+    assert_eq!(
+        package_error.details["reason"],
+        serde_json::json!("requested")
+    );
+
+    host.execute(PackageHostCommand::CloseUiMount(CloseUiMount { mount }))
+        .await
+        .unwrap();
+    host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
 }

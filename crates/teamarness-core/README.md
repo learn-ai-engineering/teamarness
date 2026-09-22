@@ -30,11 +30,11 @@ The public API supports:
 - requesting a finite bounded immutable-record reconciliation with a current peer through the shared Core network; the production path uses a private P2Panda operation projection and LogSync, while the public capability remains semantic and package-neutral;
 - revoking an admitted member;
 - querying declared-time membership history; and
-- catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor.
+- catching up and following durable post-genesis transitions after a local `MembershipEpoch` cursor. Each transition reports the `MembershipChange` it made — the admitted or revoked Installation — and the Installation that authored it, identically for durable catch-up and live delivery.
 
 Invitation creation waits at most five seconds for production default-relay readiness and starts the fixed 15-minute invitation lifetime only after readiness succeeds. The returned `WorkspaceInvitation` is an opaque, sensitive bearer value: applications may parse, display, copy, and submit its text, but must not interpret its private wire representation.
 
-A successful onboarding response contains the issuer's complete accepted membership state at one consistency boundary. Version 1 limits that bootstrap to 8 MiB and 1,024 canonical operations. The same Installation can recover its one committed admission after interrupted response delivery, including after the invitation expires, provided it is still a current member. Another Installation cannot reuse the invitation. This is bounded one-shot onboarding, not continuous synchronization.
+A successful onboarding response contains the issuer's complete accepted membership state at one consistency boundary. Version 1 limits that bootstrap to 8 MiB and 1,024 canonical operations. The same Installation can recover its one committed admission after interrupted response delivery, including after the invitation expires, provided it is still a current member. Another Installation cannot reuse the invitation. Onboarding is bounded and one-shot; continuous membership replication is a separate protocol.
 
 Runtime shutdown rejects new onboarding transport work, leaves local identity, Workspace, and membership commands available, and must be awaited. `Drop` is an abnormal best-effort cleanup fallback only.
 
@@ -49,6 +49,10 @@ Low-level token issuance, claim creation, and redemption were intentionally remo
 The immutable-record capability is generic: Packages provide bounded canonical bytes and purposes, while Core owns signing, sealed persistence, membership gates, duplicate handling, ordering, cursors, peer reconciliation, and secret custody. Each accepted sealed record has a private authenticated P2Panda projection for production LogSync. Teamarness semantic rows and the projection commit together; an invalid or out-of-order remote operation is rejected before it can leave a partial journal row. Duplicate delivery is idempotent.
 
 Synchronization wakes are durable and coalesced. A private Core worker schedules at most four finite sessions, resumes work after restart, and is awaited before the shared Router and Endpoint shut down. No P2Panda, Iroh, SQLite, endpoint, or raw key type crosses the Package boundary.
+
+Every synchronization resource is bounded, and `synchronization/limits.rs` is the single place that names a bound. A responder accepts at most eight concurrent sessions and two per peer, before it reads anything, and waits at most five seconds for the opening message. After the handshake a frame is at most 1 MiB, and one session exchanges at most 2,048 operations, 8 MiB of operation bytes, and 64 other frames in each direction. Outgoing operations are read from storage in pages within a send budget and written with transport backpressure; a session that stops at its bound says so, and a later session continues. A record subscription holds no queue in Core: every commit advances a per-scope journal head, and a subscriber reads pages of at most 32 committed records after its own position. Scheduling is per peer and durable per (scope, peer): backoff starts only after a failure and only for that peer, at most four sessions run and one per peer, and shutdown waits at most two seconds. A record or scope that fails authentication is quarantined and skipped instead of failing `CoreRuntime::open`, and restart validates only what was committed since the previous validated start. A subscription reports `waiting_for_history_access`, `offline`, `catching_up`, or `current` with a pending record count and stable warning codes.
+
+Canonical membership replicates over `teamarness/membership-sync/1`, independent of whether any Package has records to synchronize: one finite session per Workspace and peer reconciles sorted operation-ID sets and exchanges the canonical envelopes each side lacks, in causal order. Package synchronization uses `teamarness/package-sync/2` and serves nothing — not even the Workspace author list — until both this Installation and the authenticated remote peer are current Members, and accepting a revocation cancels live sessions with the revoked Installation. A received operation whose author is not yet known, or whose scope has no Content Key yet, is parked within fixed per-scope and per-peer bounds and applied when that state arrives. A scope's first Content Key is accepted only with the Workspace creator's signed origin. Protection controls are sealed to their recipient Installation and signed through the domain-separated signing interface.
 
 ## Database ownership and recovery
 
@@ -65,7 +69,7 @@ The Core Runtime does not provide:
 - a second-manager path, promotion, demotion, arbitrary access levels, nested groups, or re-admission after revocation;
 - multi-manager conflict fixtures (mutual manager removal and dependent transitive invalidation are deferred until a supported second-manager path exists);
 - human-scoped identity behavior;
-- package lifecycle, package storage, package transport, package keys, revocation-driven package-key rotation, or enforcement over future package content;
+- package lifecycle, package storage, package transport, package keys, revocation-driven package-key rotation, or cryptographic protection of future package content from revoked Installations (version 1 gates synchronization only);
 - a Tauri shell, package UI, or product-domain packages; or
 - authorization based on declared historical timestamps.
 

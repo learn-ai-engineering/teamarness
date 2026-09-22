@@ -48,6 +48,7 @@ const packages: PackageHostSnapshot = {
     retryable: true,
     recovery: "secret-diagnostic-recovery",
     diagnosticId: "secret-diagnostic-id",
+    packageError: null,
   }],
 };
 
@@ -199,6 +200,7 @@ function harness(
     theme: {
       getPreference: () => "system",
       selectPreference: (preference) => { calls.push(`theme:${preference}`); },
+      subscribe: () => () => undefined,
     },
     workspaceActions: {
       selectWorkspace: (workspaceId) => { calls.push(`workspace:${workspaceId}`); },

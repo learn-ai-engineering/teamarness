@@ -4,13 +4,12 @@ pub(crate) mod projection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::domain::{
-    DomainError, DomainRecord, GENERAL_ID, hex_id, quarantine, row_message, slug_with_suffix,
-};
+use crate::domain::{DomainRecord, GENERAL_ID, hex_id, quarantine, row_message, slug_with_suffix};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -70,6 +69,8 @@ pub enum IngestResult {
 #[derive(Debug, Clone)]
 pub struct ConversationStore {
     pub(crate) inner: Arc<Mutex<StoreInner>>,
+    /// A one-shot ingest failure, armed only by a test.
+    fail_next_ingest: Arc<AtomicBool>,
 }
 #[derive(Debug)]
 pub(crate) struct StoreInner {
@@ -100,6 +101,7 @@ impl ConversationStore {
                 markdown: HashMap::new(),
                 deferred: HashMap::new(),
             })),
+            fail_next_ingest: Arc::new(AtomicBool::new(false)),
         };
         s.ensure_general()?;
         Ok(s)
@@ -122,6 +124,23 @@ impl ConversationStore {
             })
             .map_err(rerr)
     }
+    /// Clears the committed delivery cursor.
+    ///
+    /// The Host refuses a cursor that does not belong to this journal; the
+    /// Package then replays from the beginning, and ingestion deduplicates by
+    /// record identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the metadata row cannot be written.
+    pub fn reset_cursor(&self) -> Result<(), StoreError> {
+        let x = lock(&self.inner)?;
+        x.conn
+            .execute("UPDATE metadata SET cursor = NULL WHERE singleton = 1", [])
+            .map(|_| ())
+            .map_err(rerr)
+    }
+
     pub fn record_count(&self) -> Result<u64, StoreError> {
         let x = lock(&self.inner)?;
         x.conn
@@ -130,6 +149,14 @@ impl ConversationStore {
             })
             .map_err(rerr)
     }
+    /// Fails the next `ingest` once, and only once.
+    ///
+    /// The redelivery decision belongs to the SDK's record log session and can only be observed
+    /// through a real one, so the failure is injected here rather than simulated.
+    pub fn fail_next_ingest_for_test(&self) {
+        self.fail_next_ingest.store(true, Ordering::SeqCst);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn ingest(
         &self,
@@ -142,6 +169,9 @@ impl ConversationStore {
         sealed: &[u8],
         cursor: Option<&str>,
     ) -> Result<IngestResult, StoreError> {
+        if self.fail_next_ingest.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Storage);
+        }
         let parsed = DomainRecord::decode(canonical);
         let mut inner = lock(&self.inner)?;
         let transaction = inner.conn.transaction().map_err(rerr)?;
@@ -542,9 +572,9 @@ impl ConversationStore {
     }
 
     /// Rehydrates non-secret display data after restart. The bytes are never stored.
-    pub fn remember_opened(&self, canonical: &[u8]) -> Result<(), DomainError> {
-        let domain = DomainRecord::decode(canonical)?;
-        let mut x = lock(&self.inner).expect("store lock");
+    pub fn remember_opened(&self, canonical: &[u8]) -> Result<(), StoreError> {
+        let domain = DomainRecord::decode(canonical).map_err(|_| StoreError::Storage)?;
+        let mut x = lock(&self.inner)?;
         match domain {
             DomainRecord::ChannelCreate { id, slug, .. } => {
                 x.slugs.insert(hex_id(id), slug);

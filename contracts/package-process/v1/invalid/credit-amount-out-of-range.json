@@ -1,0 +1,37 @@
+{
+  "mode": "sequence",
+  "frames": [
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "stream_open",
+        "id": "h:out-of-range",
+        "topic": "ui.events",
+        "mountId": "bW91bnQx",
+        "initialCredit": 32,
+        "payload": {}
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "package",
+      "frame": {
+        "kind": "event",
+        "streamId": "h:out-of-range",
+        "sequence": "1",
+        "payload": {}
+      },
+      "verdict": "deliver"
+    },
+    {
+      "direction": "host",
+      "frame": {
+        "kind": "credit",
+        "streamId": "h:out-of-range",
+        "amount": 33
+      }
+    }
+  ],
+  "expectedError": "credit_violation",
+  "description": "credit amount outside the window the contract grants"
+}

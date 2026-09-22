@@ -1,13 +1,16 @@
-import type { Channel } from "@tauri-apps/api/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createPackageClient,
-  createTauriPackageTransport,
-  installPackageUiKit,
+  PACKAGE_REQUEST_ERROR_KIND,
   TEAMARNESS_THEME_TOKENS,
-  type PackageTransport,
+  adoptPackageStyles,
+  describePackageError,
+  installPackageUiKit,
+  isAbortError,
+  isPackageRequestError,
+  packageErrorCode,
+  typedPackageClient,
+  type PackageClient,
   type TeamarnessThemeToken,
-  type UiEvent,
 } from "./index";
 
 const EXPECTED_THEME_TOKENS = [
@@ -35,34 +38,6 @@ class FakeCSSStyleSheet {
 
 function fakeShadowRoot(initialSheets: CSSStyleSheet[] = []): ShadowRoot {
   return { adoptedStyleSheets: initialSheets } as unknown as ShadowRoot;
-}
-
-function deferred(): { promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } {
-  let resolve: () => void = () => {};
-  let reject: (reason: Error) => void = () => {};
-  const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
-  return { promise, resolve, reject };
-}
-
-function fakeTransport(log: string[]): PackageTransport & {
-  deliver?: (event: UiEvent) => void;
-  terminate?: () => void;
-} {
-  const transport: PackageTransport & {
-    deliver?: (event: UiEvent) => void;
-    terminate?: () => void;
-  } = {
-    request: async () => ({ ok: true }),
-    cancelRequest: async () => { log.push("cancel"); },
-    openSubscription: async (_input, deliver, terminate) => {
-      transport.deliver = deliver;
-      transport.terminate = terminate;
-    },
-    acknowledgeEvents: async ({ throughSequence }) => { log.push(`ack:${throughSequence}`); },
-    closeSubscription: async () => { log.push("close"); },
-    reportUiFault: async () => { log.push("fault"); },
-  };
-  return transport;
 }
 
 afterEach(() => {
@@ -144,90 +119,211 @@ describe("Package presentation contract", () => {
   });
 });
 
-describe("mount-scoped Package client", () => {
-  it("cancels a request through its mount without exposing another selector", async () => {
-    const log: string[] = [];
-    const transport = fakeTransport(log);
-    transport.request = async () => new Promise(() => undefined);
-    const { client } = createPackageClient("mount-1", transport);
-    const abort = new AbortController();
-    const request = client.request("fixture.read", {}, { signal: abort.signal });
-    abort.abort();
-    await expect(request).rejects.toMatchObject({ name: "AbortError" });
-    expect(log).toEqual(["cancel"]);
+/**
+ * The input suppressor's MutationObserver holds the mount's shadow root, so a cleanup that does
+ * not disconnect it leaks for as long as the Shell lives. The default `node` environment has no
+ * `MutationObserver`, so these tests install a counting stub: without it the suppressor bails out
+ * and every assertion below is vacuous.
+ */
+describe("Package UI kit input suppressor", () => {
+  function stubObservers(): { constructed: number; live: number; disconnected: number } {
+    const tally = { constructed: 0, live: 0, disconnected: 0 };
+    class CountingMutationObserver {
+      private connected = false;
+      constructor() {
+        tally.constructed += 1;
+      }
+      observe(): void {
+        if (this.connected) return;
+        this.connected = true;
+        tally.live += 1;
+      }
+      disconnect(): void {
+        tally.disconnected += 1;
+        if (!this.connected) return;
+        this.connected = false;
+        tally.live -= 1;
+      }
+      takeRecords(): readonly never[] {
+        return [];
+      }
+    }
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    vi.stubGlobal("MutationObserver", CountingMutationObserver);
+    return tally;
+  }
+
+  it("leaves no live observer once the single installer cleans up", () => {
+    const tally = stubObservers();
+    const root = fakeShadowRoot();
+
+    const cleanup = installPackageUiKit(root);
+    expect(tally.live).toBe(1);
+
+    cleanup();
+    cleanup();
+    expect(tally.live).toBe(0);
+    expect(tally.disconnected).toBe(1);
   });
 
-  it("delivers events serially and acknowledges only after each listener resolves", async () => {
-    const log: string[] = [];
-    const first = deferred();
-    const transport = fakeTransport(log);
-    const { client } = createPackageClient("mount-1", transport);
-    await client.subscribe("fixture.changes", {}, async (payload) => {
-      log.push(`listen:${String((payload as { order: number }).order)}`);
-      if ((payload as { order: number }).order === 1) await first.promise;
-      log.push(`done:${String((payload as { order: number }).order)}`);
-    });
+  it("leaves no live observer when overlapping mounts clean up in either order", () => {
+    for (const order of ["first-then-second", "second-then-first"] as const) {
+      const tally = stubObservers();
+      const root = fakeShadowRoot();
 
-    transport.deliver?.({ mount: "mount-1", subscription: "subscription-1", sequence: "1", payload: { order: 1 } });
-    transport.deliver?.({ mount: "mount-1", subscription: "subscription-1", sequence: "2", payload: { order: 2 } });
-    await Promise.resolve();
-    expect(log).toEqual(["listen:1"]);
-    first.resolve();
-    await first.promise;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(log).toEqual(["listen:1", "done:1", "ack:1", "listen:2", "done:2", "ack:2"]);
+      const cleanupFirst = installPackageUiKit(root);
+      const cleanupSecond = installPackageUiKit(root);
+      expect(tally.constructed, `${order}: one root needs one observer`).toBe(1);
+      expect(tally.live).toBe(1);
+
+      const [earlier, later] =
+        order === "first-then-second" ? [cleanupFirst, cleanupSecond] : [cleanupSecond, cleanupFirst];
+      earlier();
+      expect(tally.live, `${order}: the surviving mount still needs the suppressor`).toBe(1);
+      later();
+      later();
+      expect(tally.live, `${order}: the last cleanup must disconnect the observer`).toBe(0);
+
+      // A leaked observer also poisons the root: the record that stops it is never removed, so a
+      // later mount silently gets no suppressor at all.
+      const cleanupThird = installPackageUiKit(root);
+      expect(tally.constructed, `${order}: a fresh mount gets a fresh observer`).toBe(2);
+      expect(tally.live).toBe(1);
+      cleanupThird();
+      expect(tally.live).toBe(0);
+    }
   });
 
-  it("closes without acknowledgement and reports a rejected listener once", async () => {
-    const log: string[] = [];
-    const transport = fakeTransport(log);
-    const { client } = createPackageClient("mount-1", transport);
-    await client.subscribe("fixture.changes", {}, async () => { throw new Error("listener failed"); });
-    transport.deliver?.({ mount: "mount-1", subscription: "subscription-1", sequence: "1", payload: {} });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(log).toEqual(["close", "fault"]);
-  });
-
-  it("turns a terminal Backend stream failure into mount failure without acknowledgement", async () => {
-    const log: string[] = [];
-    const transport = fakeTransport(log);
-    const { client } = createPackageClient("mount-1", transport);
-    await client.subscribe("fixture.changes", {}, async () => { log.push("listen"); });
-    transport.terminate?.();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(log).toEqual(["close", "fault"]);
-  });
-
-  it("maps a terminal Tauri stream message to termination rather than delivery", async () => {
-    let receive: ((message: unknown) => void) | undefined;
-    const transport = createTauriPackageTransport(
-      async () => undefined as never,
-      <T>(handler: (message: T) => void): Channel<T> => {
-        receive = (message) => { handler(message as T); };
-        return {} as Channel<T>;
+  it("leaves no live observer when the last cleanup cannot restore the stylesheets", () => {
+    const tally = stubObservers();
+    let sheets: readonly CSSStyleSheet[] = [];
+    let sealed = false;
+    const root = Object.defineProperty({}, "adoptedStyleSheets", {
+      get: () => sheets,
+      set: (next: readonly CSSStyleSheet[]) => {
+        if (sealed) throw new Error("read only");
+        sheets = next;
       },
-    );
-    const log: string[] = [];
+    }) as ShadowRoot;
 
-    await transport.openSubscription(
-      { mount: "mount-1", subscription: "subscription-1", operation: "fixture.changes", payload: {} },
-      () => { log.push("deliver"); },
-      () => { log.push("terminate"); },
-    );
-    receive?.({ kind: "failure", value: { code: "event_lagged" } });
+    const cleanup = installPackageUiKit(root);
+    expect(tally.live).toBe(1);
 
-    expect(log).toEqual(["terminate"]);
+    sealed = true;
+    expect(cleanup).toThrow(/mutable ShadowRoot\.adoptedStyleSheets support/);
+    expect(tally.live, "a failed sheet removal must not strand the observer").toBe(0);
+
+    // And the root is still installable, rather than stuck on a spent installation record.
+    sealed = false;
+    const reinstalled = installPackageUiKit(root);
+    expect(tally.constructed).toBe(2);
+    reinstalled();
+    expect(tally.live).toBe(0);
+  });
+});
+
+describe("Package styles", () => {
+  it("adopts one Package stylesheet and removes only it on idempotent cleanup", () => {
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    const unrelated = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    const root = fakeShadowRoot([unrelated]);
+
+    const cleanup = adoptPackageStyles(root, ".package { color: red; }");
+    expect(root.adoptedStyleSheets).toHaveLength(2);
+    const adopted = root.adoptedStyleSheets[1] as unknown as FakeCSSStyleSheet;
+    expect(adopted.cssText).toBe(".package { color: red; }");
+
+    cleanup();
+    cleanup();
+    expect(root.adoptedStyleSheets).toEqual([unrelated]);
   });
 
-  it("makes subscription and mount cleanup idempotent", async () => {
-    const log: string[] = [];
-    const transport = fakeTransport(log);
-    const { client, dispose } = createPackageClient("mount-1", transport);
-    const subscription = await client.subscribe("fixture.changes", {}, async () => undefined);
-    await subscription.close();
-    await subscription.close();
-    await dispose();
-    await dispose();
-    expect(log).toEqual(["close"]);
+  it("fails with a Package-neutral message when constructed stylesheets are unavailable", () => {
+    vi.stubGlobal("CSSStyleSheet", undefined);
+    expect(() => adoptPackageStyles(fakeShadowRoot(), "")).toThrow(
+      "Package styles require constructed CSSStyleSheet support",
+    );
+
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    expect(() => adoptPackageStyles({} as ShadowRoot, "")).toThrow(
+      "Package styles require ShadowRoot.adoptedStyleSheets support",
+    );
+  });
+});
+
+describe("typed client", () => {
+  it("typed client is the same object as the untyped client", () => {
+    const client = { request: async () => ({}), subscribe: async () => ({ close: async () => {} }) } as unknown as PackageClient;
+    expect(typedPackageClient(client)).toBe(client);
+  });
+});
+
+describe("author surface", () => {
+  it("exports only the author contract and no transport or Tauri host pieces", async () => {
+    const surface = await import("./index");
+    expect(Object.keys(surface).sort()).toEqual([
+      "PACKAGE_REQUEST_ERROR_KIND",
+      "TEAMARNESS_THEME_TOKENS",
+      "adoptPackageStyles",
+      "describePackageError",
+      "installPackageUiKit",
+      "isAbortError",
+      "isPackageRequestError",
+      "packageErrorCode",
+      "typedPackageClient",
+    ]);
+  });
+});
+
+describe("Package request errors", () => {
+  const hostError = {
+    kind: PACKAGE_REQUEST_ERROR_KIND,
+    version: 2,
+    namespace: "teamarness.package-host",
+    code: "backend_error",
+    stage: "ui",
+    retryable: false,
+    recovery: "none",
+    diagnosticId: "diag-1",
+    packageError: null,
+  };
+  const packageError = {
+    ...hostError,
+    packageError: { code: "reference.requested_failure", retryable: false, details: { reason: "a private detail" } },
+  };
+
+  it("recognises only complete branded Package request errors", () => {
+    expect(isPackageRequestError(hostError)).toBe(true);
+    expect(isPackageRequestError(packageError)).toBe(true);
+    for (const invalid of [
+      { ...hostError, kind: "other" },
+      { ...hostError, retryable: "no" },
+      { ...hostError, version: "2" },
+      { ...hostError, packageError: { code: "a", retryable: false, details: [] } },
+      { ...hostError, packageError: { code: 1, retryable: false, details: {} } },
+      new Error("boom"),
+      null,
+      "backend_error",
+    ]) {
+      expect(isPackageRequestError(invalid)).toBe(false);
+    }
+  });
+
+  it("describes Package codes before host codes and never includes details", () => {
+    expect(describePackageError(packageError)).toBe("reference.requested_failure");
+    expect(describePackageError(hostError)).toBe("backend_error (ui)");
+    expect(describePackageError(new Error("the mount closed"))).toBe("the mount closed");
+    expect(describePackageError(undefined)).toBe("Request failed");
+    expect(describePackageError(packageError)).not.toContain("a private detail");
+    expect(packageErrorCode(packageError)).toBe("reference.requested_failure");
+    expect(packageErrorCode(hostError)).toBeNull();
+    expect(packageErrorCode(new Error("boom"))).toBeNull();
+  });
+
+  it("recognises abort errors by name", () => {
+    expect(isAbortError(new DOMException("cancelled", "AbortError"))).toBe(true);
+    expect(isAbortError({ name: "AbortError" })).toBe(true);
+    expect(isAbortError(new Error("boom"))).toBe(false);
+    expect(isAbortError(null)).toBe(false);
   });
 });

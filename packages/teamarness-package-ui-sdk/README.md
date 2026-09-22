@@ -1,12 +1,12 @@
 # Teamarness Package UI SDK
 
-`@teamarness/package-ui-sdk` is the TypeScript contract for a Package UI mounted by the Teamarness Shell. It provides the mount-scoped Package client, the authoritative theme-token names, and an optional framework-neutral CSS kit.
+`@teamarness/package-ui-sdk` is the TypeScript contract for a Package UI mounted by the Teamarness Shell. It provides the mount, client, and presentation types, the typed Package error, contract-typed requests, Package-owned style adoption, the authoritative theme-token names, an optional framework-neutral CSS kit, and a testing entry point. The client implementation is Shell-owned and lives in the Package UI Frame; the SDK carries no Shell or Tauri code.
 
 A Package owns everything it renders inside its Shadow Root. The Shell supplies the mount and inherited semantic values; it does not own a Package-owned header, secondary navigation, content hierarchy, dialogs, tables, or domain patterns. The CSS kit styles only classes a Package explicitly applies.
 
 ## Theme tokens
 
-`TEAMARNESS_THEME_TOKENS` is the exact frozen token-name authority. `TeamarnessThemeToken` is derived from that constant, and `PackageMountContext.themeTokens` is typed with it. The Shell defines values on the Package mount ancestor, so changes inherit into the Shadow Root without a theme event.
+`TEAMARNESS_THEME_TOKENS` is the exact frozen token-name authority. `TeamarnessThemeToken` is derived from that constant, and `PackageMountContext.themeTokens` is typed with it. The Shell sends values across the frame bridge and the frame runtime defines them on the Package UI Frame's document root, so changes reach the Shadow Root without a theme event.
 
 | Token | Intended use |
 |---|---|
@@ -106,7 +106,53 @@ The installer adds only local box sizing outside those classes. It does not sele
 
 The host's `style-src` rejects runtime inline `<style>` elements and `style` attributes. The installer does not bypass that policy. It fails the Package mount if constructed stylesheets or mutable `ShadowRoot.adoptedStyleSheets` are unavailable. Do not add an inline fallback, nonce, hash, `data:` style, or `blob:` style.
 
-Package-owned CSS must follow the same `style-src` policy. Construct a separate `CSSStyleSheet`, call `replaceSync()`, add it to the Package Shadow Root's `adoptedStyleSheets`, and remove only that sheet during unmount. Keep Package rules separate from the optional kit so ownership and cleanup remain clear.
+## Package-owned styles
+
+Package-owned CSS follows the same `style-src` policy. `adoptPackageStyles(root, css)` constructs one `CSSStyleSheet`, adds it to that Shadow Root's `adoptedStyleSheets`, and returns the idempotent cleanup that removes only that sheet:
+
+```ts
+import { adoptPackageStyles } from "@teamarness/package-ui-sdk";
+
+const cleanupStyles = adoptPackageStyles(context.root, PACKAGE_STYLES);
+// ... and in the unmount:
+cleanupStyles();
+```
+
+Keep Package rules in their own sheet, separate from the optional kit, so ownership and cleanup remain clear.
+
+## Package errors
+
+`PackageClient.request` rejects with a `PackageRequestError`: the Teamarness `code`, `namespace`, `stage`, `retryable`, `recovery` and `diagnosticId` that say what Teamarness did with the failure, plus `packageError` — the Package Backend's own `code`, `retryable` and bounded `details`, forwarded unchanged — or `null` when Teamarness owns the failure.
+
+```ts
+import { describePackageError, isAbortError, isPackageRequestError, packageErrorCode } from "@teamarness/package-ui-sdk";
+
+try {
+  await client.request("example.save", payload);
+} catch (error) {
+  if (isAbortError(error)) return;                       // the mount went away
+  if (packageErrorCode(error) === "example.storage_failed") retryLater();
+  else if (isPackageRequestError(error)) show(describePackageError(error));
+}
+```
+
+`packageErrorCode` returns the Package's own code or `null`; `describePackageError` returns a display sentence and never includes `details`. Treat `details` as the Package's data, not display text.
+
+`subscribe`'s `onTerminated` is called once when a stream ends: with the Package's terminal `PackageRequestError`, or `null` when the Package completed the stream. Neither recovers the Package UI Mount by itself; a Teamarness-owned terminal stream error still does.
+
+## Contract-typed requests
+
+`teamarness-contract-types` generates a `PackageContractShape` from `ui-contract.json`, so the types the UI programs against and the shapes the Host validates come from one file:
+
+```sh
+teamarness-contract-types --contract ui-contract.json --out ui/src/contract.generated.ts --type-name PackageContract
+```
+
+Commit the generated module and run the same command with `--check` from `typecheck`, so a stale module fails the build. `typedPackageClient<PackageContract>(context.client)` then views the mount's client through those types. It is the same object and adds no runtime work: the Host already validates every request, response and event against the contract it admitted. What it adds is that a UI cannot name an operation, or build a payload, the contract does not describe.
+
+## Testing a Package UI
+
+`@teamarness/package-ui-sdk/testing` is a second entry point, outside the main export list, for a Package UI's own tests: `createTestMountContext` builds a `PackageMountContext` over a real Shadow Root, `createFakePackageClient` answers requests and subscriptions from handlers and records every call as a `RecordedCall`, and `createPackageRequestError` builds the rejection a Host would send, including a `packageError`. The fake client's `emit` delivers one event to every open subscription on an operation, and `terminate` ends them with a Package error or normally, so a UI's `onTerminated` path is testable without a Host.
 
 ## Package-owned composition
 
@@ -129,4 +175,4 @@ Build the Package's information architecture in Package markup. For example, thi
 </article>
 ```
 
-The Shell continues to own Workspace and Package selection, the right-pane mount, inherited token values, and generic mount recovery. Hiding or unmounting this UI does not suspend its Package Backend. A Shadow Root provides style locality, not a security boundary; Package UI code shares the webview's DOM and known Tauri-command authority.
+The Shell continues to own Workspace and Package selection, the right-pane mount, the Package UI Frame and its runtime, delivered token values, and generic mount recovery. Hiding or unmounting this UI does not suspend its Package Backend. Package UI code runs in a sandboxed frame with an opaque origin: the Shell's DOM, Tauri, browser storage, and the network are all unreachable, and `context.client` is the only way out. A Shadow Root still provides style locality, not a security boundary.
