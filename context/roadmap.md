@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Current work runs in two parallel workstreams (see **Current work**); Phase 5 follows them.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next.
 
 ## Phases
 
@@ -70,17 +70,17 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-The architecture review workstream is closing; the Shell and Package UI polish workstream continues on its branch and merges after the review lands. Phase 5 starts after them.
+The architecture review and the Shell and Package UI polish workstream are both closed and merged; Phase 5 starts next.
 
-### Shell and Package UI polish
+### Shell and Package UI polish (complete)
 
-Branch `ui-polish-member-names`. Polish the Shell's Add Workspace screen, Installation controls, Workspace screens, and theme selector, and give every Package UI the same page structure as the Shell's Workspace screens through the Package UI SDK. Member names were split out on 2026-09-17 (see **Planned follow-up workstreams**); the branch name predates that change. Integration is selective and intentional: `architecture-review` merges to `main` first, then this branch is brought in deliberately — the two cannot merge together. The port also owns the recorded CF-005 follow-up (cross-language bounds guard for the Shell's `MAX_PENDING_REQUESTS`/`MAX_PAYLOAD_BYTES`) and the `createChannel` error-mapping fix.
+Branch `ui-polish-member-names`, merged to `main` on 2026-09-22. Polished the Shell's Add Workspace screen, Installation controls, Workspace screens, and theme selector, and gave every Package UI the same page structure as the Shell's Workspace screens through the Package UI SDK. The branch was ported onto the reviewed tree deliberately: `main` (129 commits of the architecture review) merged into the branch first, with the reviewed implementations kept where the two touched (`adoptPackageStyles`, the typed package client, the error-fidelity fixture) and the branch's page structure kept everywhere else. The port also fixed what the merge silently broke — the Tutorial and Repo-aware UIs rendered their kit page structure without the kit installed — and delivered the two adopted follow-ups: the `createChannel` error-mapping fix (a valid channel name no longer reports the slug-grammar message when the real failure is something else) and the `MAX_PAYLOAD_BYTES` cross-language pairing in `check-protocol-bounds.mjs`. `MAX_PENDING_REQUESTS` was recorded as unpairable in the architecture-review issues log: the Host bounds no per-mount in-flight request count, so no Rust constant exists to pair it with.
 
 **Outcome:** The collected Shell defects are fixed and Package UIs share one consistent page structure.
 
-### Comprehensive code and architecture review (closing)
+### Comprehensive code and architecture review (complete)
 
-Branch `architecture-review`, 2026-09-17 to 2026-09-22. Reviewed the whole system across five parallel lanes — architecture, code quality, synchronization, security, Package authoring — and executed five fix rounds closing every finding at the cause, with ADRs 0013–0018 recorded under `context/.decisions/`. Verification: independent round-4 confirmation (37 executed perturbations, sandbox hermeticity observation) and a consolidated passing review record; full required check green; developer manual smoke 2026-09-22 confirmed the branch's behaviour changes. Carried follow-ups live in the workstream issues log: the content-key stall (Member cannot post until a key holder syncs — Phase 5), two load-dependent test flakes, and the Shell bounds pairing.
+Branch `architecture-review`, merged to `main` on 2026-09-22. Reviewed the whole system across five parallel lanes — architecture, code quality, synchronization, security, Package authoring — and executed five fix rounds closing every finding at the cause, with ADRs 0013–0018 recorded under `context/.decisions/`. Verification: independent round-4 confirmation (37 executed perturbations, sandbox hermeticity observation) and a consolidated passing review record; full required check green; developer manual smoke 2026-09-22 confirmed the branch's behaviour changes. Carried follow-ups live in the workstream issues log: the content-key stall (Member cannot post until a key holder syncs — Phase 5), two load-dependent test flakes, and the Shell bounds pairing.
 
 ## Later (unscheduled)
 
