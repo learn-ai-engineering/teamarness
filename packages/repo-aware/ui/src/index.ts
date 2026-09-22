@@ -1,6 +1,7 @@
 import {
   adoptPackageStyles,
   describePackageError,
+  installPackageUiKit,
   typedPackageClient,
   type PackageClient,
   type PackageMountContext,
@@ -226,7 +227,14 @@ function abbreviateCommit(hash: string): string {
 // ─── Mount ───────────────────────────────────────────────────────────────────
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const cleanupStyles = adoptPackageStyles(context.root, REPO_AWARE_CSS);
+  const cleanupKit = installPackageUiKit(context.root);
+  let cleanupStyles: () => void;
+  try {
+    cleanupStyles = adoptPackageStyles(context.root, REPO_AWARE_CSS);
+  } catch (error) {
+    cleanupKit();
+    throw error;
+  }
   const article = document.createElement("article");
   article.className = "teamarness-page";
   const header = document.createElement("header");

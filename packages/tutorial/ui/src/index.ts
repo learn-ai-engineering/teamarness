@@ -1,6 +1,7 @@
 import {
   adoptPackageStyles,
   describePackageError,
+  installPackageUiKit,
   typedPackageClient,
   type PackageClient,
   type PackageMountContext,
@@ -147,7 +148,14 @@ export function createTutorialController(
 }
 
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
-  const cleanupStyles = adoptPackageStyles(context.root, TUTORIAL_PACKAGE_CSS);
+  const cleanupKit = installPackageUiKit(context.root);
+  let cleanupStyles: () => void;
+  try {
+    cleanupStyles = adoptPackageStyles(context.root, TUTORIAL_PACKAGE_CSS);
+  } catch (error) {
+    cleanupKit();
+    throw error;
+  }
   const article = document.createElement("article");
   article.className = "teamarness-page";
   const header = document.createElement("header");
