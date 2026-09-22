@@ -17,7 +17,7 @@ mod operation_store;
 pub(crate) mod p2panda_adapter;
 pub(crate) mod parking;
 pub(crate) mod peer_sessions;
-mod protection_control;
+pub(crate) mod protection_control;
 pub(crate) mod quarantine;
 pub(crate) mod record_subscription;
 pub(crate) mod scheduler;
@@ -862,10 +862,10 @@ fn public_signature(value: Vec<u8>) -> Result<PublicSignature, SynchronizationEr
 
 fn ensure_scope(
     conn: &rusqlite::Transaction<'_>,
+    secret: &SecretKey,
     package: &str,
     workspace: WorkspaceId,
-    creator: PublicIdentity,
-) -> Result<ScopeState, SynchronizationError> {
+) -> Result<(ScopeState, bool), SynchronizationError> {
     let digest = scope_digest(package, workspace);
     let found: Option<(Vec<u8>, Vec<u8>)> = conn
         .query_row(
@@ -876,8 +876,13 @@ fn ensure_scope(
         .optional()
         .map_err(fault!(storage_error()))?;
     if let Some((journal, key)) = found {
-        return Ok((fixed(journal)?, ContentKey::from_column(key)?, digest));
+        return Ok((
+            (fixed(journal)?, ContentKey::from_column(key)?, digest),
+            false,
+        ));
     }
+    let creator = PublicIdentity::from_bytes(*secret.public().as_bytes())
+        .map_err(|_| SynchronizationError::CorruptRecord)?;
     let mut journal = [0_u8; 16];
     getrandom::fill(&mut journal).map_err(fault!(storage_error()))?;
     let key = ContentKey::generate()?;
@@ -892,7 +897,34 @@ fn ensure_scope(
         [digest.as_slice()],
     )
     .map_err(fault!(storage_error()))?;
-    Ok((journal, key, digest))
+    let control = protection_control::create(secret, digest, workspace, creator, [0; 32], &key)
+        .map_err(fault!(storage_error()))?;
+    let parsed = protection_control::decode(&control).map_err(fault!(storage_error()))?;
+    protection_control::insert(
+        conn,
+        digest,
+        RecordId::digest(&control).as_bytes(),
+        "create",
+        &parsed,
+        &control,
+    )?;
+    Ok(((journal, key, digest), true))
+}
+
+/// Only a current local creator's subscription can initialize an empty scope.
+pub(crate) fn declare_creator_scope(
+    conn: &mut rusqlite::Connection,
+    secret: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+) -> Result<bool, SynchronizationError> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(fault!(storage_error()))?;
+    let (_, created) = ensure_scope(&tx, secret, package, workspace)?;
+    tx.commit()
+        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
+    Ok(created)
 }
 
 pub(crate) fn export_protection_grant(
@@ -1321,7 +1353,7 @@ pub(crate) fn append(
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(fault!(storage_error()))?;
-    let (journal, key, scope) = ensure_scope(&tx, package, workspace, signed.author)?;
+    let ((journal, key, scope), _) = ensure_scope(&tx, secret, package, workspace)?;
     let protection = P2pandaRecordProtection {
         package_identity: package.to_owned(),
         workspace_id: workspace,
@@ -1383,7 +1415,7 @@ pub(crate) fn append(
         created_at_unix_ms: now_unix_ms,
     };
     journal_sql::insert_operation(&tx, &row).map_err(fault!(storage_error()))?;
-    let projection_operation_id = operation_store::insert(
+    operation_store::insert(
         &tx,
         secret,
         scope,
@@ -1399,29 +1431,6 @@ pub(crate) fn append(
         key.id(),
     )
     .map_err(fault!(storage_error()))?;
-    if tx
-        .query_row::<i64, _, _>(
-            "SELECT COUNT(*) FROM protection_control_operations WHERE scope_id=?1",
-            [scope.as_slice()],
-            |row| row.get(0),
-        )
-        .map_err(fault!(storage_error()))?
-        == 0
-    {
-        let control =
-            protection_control::create(secret, scope, workspace, signed.author, [0; 32], &key)
-                .map_err(fault!(storage_error()))?;
-        let parsed = protection_control::decode(&control).map_err(fault!(storage_error()))?;
-        protection_control::insert(
-            &tx,
-            scope,
-            RecordId::digest(&control).as_bytes(),
-            "create",
-            &parsed,
-            &control,
-        )?;
-        let _ = projection_operation_id;
-    }
     let delivery_sequence =
         journal_sql::insert_record_rows(&tx, &row).map_err(fault!(storage_error()))?;
     tx.commit()

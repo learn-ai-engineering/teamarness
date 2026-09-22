@@ -128,8 +128,8 @@ impl CoreRuntime {
     /// Replays the installation-local immutable-record journal from an optional cursor.
     ///
     /// The subscription holds no queue: it remembers a position and reads pages
-    /// of committed records. Subscribing before the scope exists is allowed; the
-    /// subscription waits for the content key to arrive.
+    /// of committed records. A current creator's subscription initializes an
+    /// empty scope; a Member without its key waits for history access.
     ///
     /// # Errors
     ///
@@ -144,7 +144,7 @@ impl CoreRuntime {
         after: Option<crate::Cursor>,
     ) -> Result<crate::RecordSubscription, crate::SynchronizationError> {
         use crate::synchronization::record_subscription as records;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| crate::SynchronizationError::RuntimeUnavailable)?;
@@ -154,6 +154,26 @@ impl CoreRuntime {
         let scope = crate::synchronization::scope_digest(package_identity, workspace_id);
         let journal = records::journal_of(&state.connection, scope)?;
         let position = records::validate_cursor(&state.connection, scope, journal, after)?;
+        let is_current_creator = state
+            .memberships
+            .get(&workspace_id)
+            .is_some_and(|projection| {
+                projection.creator() == self.public_identity
+                    && projection.contains_member(self.public_identity)
+            });
+        if is_current_creator {
+            let secret = state.secret_key.clone();
+            if crate::synchronization::declare_creator_scope(
+                &mut state.connection,
+                &secret,
+                workspace_id,
+                package_identity,
+            )? {
+                records::publish_scope_exists(&state, workspace_id, package_identity);
+                self.sync_worker.wake();
+            }
+        }
+        let journal = records::journal_of(&state.connection, scope)?;
         let head = records::scope_head(&state, scope);
         Ok(records::RecordSubscription::new(
             Arc::downgrade(&self.state),

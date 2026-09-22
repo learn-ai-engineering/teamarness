@@ -16,6 +16,115 @@ const PACKAGE: &str = "teamarness.test";
 /// Only bounds failure: a wake that works arrives in microseconds.
 const WAKE_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Verifies: TEAM.SYS.TRANS-R06 (creator origin); subscription-driven bootstrap (ADR 0020).
+#[tokio::test]
+async fn creator_subscription_bootstraps_scope_and_signed_origin_without_records() {
+    use crate::synchronization::protection_control::{self, KIND_CREATE};
+
+    let cluster = SyncCluster::start("creator-subscription", &["a"]).await;
+    let workspace = cluster.node("a").create_workspace("Empty scope").unwrap();
+    let id = workspace.id();
+    let scope = scope_digest(PACKAGE, id);
+    let inspect = || {
+        let state = cluster.node("a").state.lock().unwrap();
+        let connection = &state.connection;
+        let scopes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+            let mut statement = connection.prepare(
+                "SELECT scope_id, journal_id, content_key_id FROM sync_scopes WHERE scope_id=?1",
+            ).unwrap();
+            statement
+                .query_map([scope.as_slice()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let controls: Vec<Vec<u8>> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT control_bytes FROM protection_control_operations WHERE scope_id=?1",
+                )
+                .unwrap();
+            statement
+                .query_map([scope.as_slice()], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let count = |table: &str| -> i64 {
+            connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE scope_id=?1"),
+                    [scope.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("immutable_records"), count("immutable_operations"));
+        assert_eq!(count("protection_state"), scopes.len() as i64);
+        if let Some((_, _, key_id)) = scopes.first() {
+            let stored: (Vec<u8>, Vec<u8>) = connection.query_row(
+                "SELECT content_key_id, creator_public_identity FROM protection_state WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(&stored.0, key_id);
+            assert_eq!(stored.1.as_slice(), cluster.identity("a").as_bytes());
+        }
+        (
+            scopes,
+            controls,
+            count("immutable_operations"),
+            count("record_delivery"),
+            count("durable_wakes"),
+        )
+    };
+
+    let mut subscription = cluster
+        .node("a")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    assert!(subscription.next_page(1).unwrap().events.is_empty());
+    let (scopes, controls, operations, deliveries, wakes) = inspect();
+    assert_eq!(scopes.len(), 1, "the creator owns a real scope");
+    assert_eq!(scopes[0].0, scope);
+    assert_eq!(scopes[0].1.len(), 16);
+    assert_eq!(scopes[0].2.len(), 32);
+    assert_eq!(controls.len(), 1, "the first key has exactly one origin");
+    let origin = protection_control::decode(&controls[0]).expect("signed origin verifies");
+    assert_eq!(origin.kind, KIND_CREATE);
+    assert_eq!(origin.scope, scope);
+    assert_eq!(origin.workspace, id);
+    assert_eq!(origin.author, cluster.identity("a"));
+    assert_eq!(origin.recipient, cluster.identity("a"));
+    assert_eq!(origin.content_key_id.as_slice(), scopes[0].2);
+    assert_eq!((operations, deliveries, wakes), (0, 0, 1));
+
+    cluster
+        .node("a")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    assert_eq!(
+        inspect(),
+        (scopes.clone(), controls.clone(), 0, 0, 1),
+        "reopening must not mint another key or origin"
+    );
+
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"first")
+        .unwrap();
+    let (after_scopes, after_controls, operations, deliveries, wakes) = inspect();
+    assert_eq!(
+        after_scopes, scopes,
+        "append reuses the declared key and journal"
+    );
+    assert_eq!(after_controls, controls, "append reuses the creator origin");
+    assert_eq!((operations, deliveries, wakes), (1, 1, 1));
+    cluster.finish().await;
+}
+
 /// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test]
 async fn subscribe_loads_no_backlog() {
@@ -181,14 +290,17 @@ async fn subscribe_rejects_a_cursor_from_another_journal() {
 /// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test]
 async fn subscribe_before_the_scope_exists_waits_for_it() {
-    let cluster = SyncCluster::start("subscribe-before-scope", &["a"]).await;
+    let cluster = SyncCluster::start("subscribe-before-scope", &["a", "b"]).await;
+    cluster.node("a").pause_sync_scheduler_for_test(true);
+    cluster.node("b").pause_sync_scheduler_for_test(true);
     let workspace = cluster.node("a").create_workspace("Waiting").unwrap();
     let id = workspace.id();
+    cluster.admit("a", "b", id).await;
 
     let mut subscription = cluster
-        .node("a")
+        .node("b")
         .subscribe_records(id, PACKAGE, None)
-        .expect("a subscription opens before the scope has a content key");
+        .expect("a Member subscription opens before it has a content key");
     assert!(subscription.next_page(32).unwrap().events.is_empty());
 
     let waiter = tokio::spawn(async move {
@@ -199,9 +311,19 @@ async fn subscribe_before_the_scope_exists_waits_for_it() {
         .node("a")
         .append_record(id, PACKAGE, "message.post", b"first")
         .unwrap();
+    cluster
+        .node("b")
+        .replicate_records_to_address_for_test(
+            id,
+            PACKAGE,
+            cluster.address("a"),
+            cluster.identity("a"),
+        )
+        .await
+        .unwrap();
     let mut subscription = tokio::time::timeout(WAKE_DEADLINE, waiter)
         .await
-        .expect("the first append wakes the waiter")
+        .expect("the imported key wakes the Member waiter")
         .expect("the waiting task did not panic");
     let page = subscription.next_page(32).unwrap();
     assert_eq!(page.events.len(), 1);

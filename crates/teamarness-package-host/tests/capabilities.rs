@@ -1336,7 +1336,7 @@ async fn immutable_record_stream_reports_catching_up_then_current() {
 
 /// Verifies: TEAM.SYS.PKG-R10
 #[tokio::test]
-async fn immutable_record_stream_waits_for_history_access_before_the_scope_exists() {
+async fn immutable_record_stream_is_current_for_creator_before_first_record() {
     let requirements = [serde_json::json!({
         "identity":"teamarness.synchronization.immutable-record-log",
         "major":1,"minMinor":0,"maxMinor":0
@@ -1364,7 +1364,12 @@ async fn immutable_record_stream_waits_for_history_access_before_the_scope_exist
         !events_of(response).is_empty()
     })
     .await;
-    assert_eq!(described(&first)[0], "state waiting_for_history_access 0");
+    assert_eq!(described(&first), ["state current 0"]);
+    assert_eq!(
+        record_events(&first),
+        0,
+        "creator bootstrap creates no records"
+    );
 
     for index in 0..3_u8 {
         fixture
@@ -1390,7 +1395,7 @@ async fn immutable_record_stream_waits_for_history_access_before_the_scope_exist
             .filter(|event| event.starts_with("state "))
             .all(|event| event.starts_with("state catching_up")
                 || event.starts_with("state current")),
-        "after history access the stream only reports catching up or current: {events:?}"
+        "after the creator's first append the stream only reports catching up or current: {events:?}"
     );
 }
 
