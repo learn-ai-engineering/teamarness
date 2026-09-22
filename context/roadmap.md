@@ -70,19 +70,17 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-These two workstreams run in parallel on separate branches and worktrees. Phase 5 starts after them.
+The architecture review workstream is closing; the Shell and Package UI polish workstream continues on its branch and merges after the review lands. Phase 5 starts after them.
 
 ### Shell and Package UI polish, with member names
 
-Branch `ui-polish-member-names`. Fix UI defects and polish the Shell, the Conversations and Repo-aware Package UIs, the Package UI SDK, and theming. It also lets each person give a first name when they create or join a Workspace, and shows that name to every other Member. Names replace the temporary adjective-animal aliases. This work resolves `TEAM-DQ8` for one Installation per person.
+Branch `ui-polish-member-names`. Fix UI defects and polish the Shell, the Conversations and Repo-aware Package UIs, the Package UI SDK, and theming. It also lets each person give a first name when they create or join a Workspace, and shows that name to every other Member. Names replace the temporary adjective-animal aliases. This work resolves `TEAM-DQ8` for one Installation per person. Integration is selective and intentional: `architecture-review` merges to `main` first, then this branch is brought in deliberately — the two cannot merge together. The port also owns the recorded CF-005 follow-up (cross-language bounds guard for the Shell's `MAX_PENDING_REQUESTS`/`MAX_PAYLOAD_BYTES`) and the `createChannel` error-mapping fix.
 
 **Outcome:** Members recognize each other by name across the Shell and Packages, invitation acceptance is reliably reachable, and the collected UI defects are fixed.
 
-### Comprehensive code and architecture review
+### Comprehensive code and architecture review (closing)
 
-Branch `architecture-review`. Review the whole system now that several Packages exist, covering architecture, code quality, synchronization, security, and how easy it is to author a Package. Findings become recorded decisions, open questions, deltas, or follow-up workstreams.
-
-**Outcome:** A prioritized, evidence-backed findings report and an agreed remediation sequence.
+Branch `architecture-review`, 2026-09-17 to 2026-09-22. Reviewed the whole system across five parallel lanes — architecture, code quality, synchronization, security, Package authoring — and executed five fix rounds closing every finding at the cause, with ADRs 0013–0018 recorded under `context/.decisions/`. Verification: independent round-4 confirmation (37 executed perturbations, sandbox hermeticity observation) and a consolidated passing review record; full required check green; developer manual smoke 2026-09-22 confirmed the branch's behaviour changes. Carried follow-ups live in the workstream issues log: the content-key stall (Member cannot post until a key holder syncs — Phase 5), two load-dependent test flakes, and the Shell bounds pairing.
 
 ## Later (unscheduled)
 
