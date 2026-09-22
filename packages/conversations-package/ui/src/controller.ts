@@ -53,6 +53,20 @@ interface ErrorInfo {
   retryable: boolean;
 }
 
+/** The slug grammar the Backend's `validate_slug` enforces, mirrored so an invalid name fails without a round trip. */
+const MAX_SLUG_LEN = 48;
+
+function isValidSlug(slug: string): boolean {
+  return (
+    slug.length >= 1
+    && slug.length <= MAX_SLUG_LEN
+    && /^[a-z0-9-]*$/.test(slug)
+    && !slug.startsWith("-")
+    && !slug.endsWith("-")
+    && !slug.includes("--")
+  );
+}
+
 function classify(error: unknown): ErrorInfo {
   // The Package's own code, when it has one; otherwise the host's code and retryability.
   const packageCode = packageErrorCode(error);
@@ -316,6 +330,15 @@ export class ConversationsController {
   /** Create a new channel. */
   async createChannel(slug: string): Promise<void> {
     if (this.disposed) return;
+    if (!isValidSlug(slug)) {
+      // The Backend would refuse this slug; fail locally so a valid name is the only thing that can reach it.
+      this._state = {
+        ...this._state,
+        warning: "Channel names use lowercase letters, numbers, and hyphens.",
+      };
+      this.notify();
+      return;
+    }
     this._state = { ...this._state, loading: true, warning: null };
     this.notify();
 
@@ -326,13 +349,13 @@ export class ConversationsController {
       if (this.disposed) return;
       this._state = { ...this._state, loading: false, creating: false };
       this.applySnapshot(snapshot);
-    } catch {
+    } catch (error) {
       if (this.disposed) return;
+      const info = classify(error);
       this._state = {
         ...this._state,
         loading: false,
-        warning:
-          "Channel names use lowercase letters, numbers, and hyphens.",
+        warning: errorMessage("channel.create", info, this._state.availability),
       };
       this.notify();
     }
