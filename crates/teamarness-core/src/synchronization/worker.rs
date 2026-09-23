@@ -1,6 +1,6 @@
 //! The asynchronous driver around the synchronization scheduler.
 //!
-//! The driver owns no policy: it loads what is durably due, asks
+//! The driver selects durably due work under the job cap, asks
 //! [`SchedulerCore`] what to run next, runs it, and applies the actions the
 //! scheduler returns. Everything it does with the runtime state crosses to a
 //! blocking thread, so nothing is silently skipped because a lock was busy.
@@ -369,6 +369,7 @@ impl SyncWorker {
             limits,
             wake: Arc::clone(&worker.wake),
             paused: Arc::clone(&worker.paused),
+            selection: Arc::new(Mutex::new(SelectionCursor::default())),
             stop: stop_rx,
             #[cfg(test)]
             sweep: Arc::clone(&worker.sweep),
@@ -454,6 +455,14 @@ impl Drop for SyncWorker {
     }
 }
 
+#[derive(Default)]
+struct SelectionCursor {
+    record_offset: usize,
+    demand_offset: usize,
+    record_served: usize,
+    demand_served: usize,
+}
+
 struct Driver {
     state: Weak<Mutex<RuntimeState>>,
     local: PublicIdentity,
@@ -462,6 +471,7 @@ struct Driver {
     limits: SchedulerLimits,
     wake: Arc<Notify>,
     paused: Arc<AtomicBool>,
+    selection: Arc<Mutex<SelectionCursor>>,
     stop: watch::Receiver<bool>,
     #[cfg(test)]
     sweep: Arc<AtomicBool>,
@@ -602,8 +612,21 @@ impl Driver {
         let limits = self.limits;
         let now = Instant::now();
         let forced = self.demand.take_ready(|_| true);
+        let selection = Arc::clone(&self.selection);
         crate::blocking::run_with_state(&self.state, move |state| {
-            load_due_jobs(state, local, kind, limits, &attempts, now, &forced)
+            let mut cursor = selection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            load_due_jobs(
+                state,
+                local,
+                kind,
+                limits,
+                &attempts,
+                now,
+                &forced,
+                &mut cursor,
+            )
         })
         .await
     }
@@ -619,6 +642,10 @@ async fn sleep_until(deadline: Option<Instant>) {
 
 /// Everything that is durably due right now, for every peer this Installation
 /// shares a Workspace with.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "selection adds worker-owned state to the durable-load seam"
+)]
 fn load_due_jobs(
     state: &mut RuntimeState,
     local: PublicIdentity,
@@ -627,6 +654,7 @@ fn load_due_jobs(
     attempts: &BTreeMap<JobKey, Instant>,
     now: Instant,
     forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
+    selection: &mut SelectionCursor,
 ) -> Vec<DueJob> {
     let mut jobs = Vec::new();
     #[cfg(test)]
@@ -673,61 +701,134 @@ fn load_due_jobs(
             }
         }
     }
+    if jobs.len() >= limits.max_scheduled_jobs {
+        return jobs;
+    }
     // A membership-idle reload may follow a record-idle reload before its
     // record jobs dispatch. Keep elapsed record jobs due on either idle tick.
     let record_progress = peer_progress(
         state,
         "SELECT scope_id, peer_public_identity, consumed_generation FROM sync_peer_progress",
     );
-    for (scope, workspace, package, generation) in record_wakes(state) {
-        for peer in peers_of(state, local, workspace) {
-            let key = JobKey::Records {
-                scope,
-                workspace,
-                package: package.clone(),
-                peer,
-            };
-            let consumed = record_progress
-                .get(&(scope.to_vec(), peer))
-                .copied()
-                .unwrap_or(0);
-            if generation > consumed
-                || ((sweeping || kind != ReloadKind::Wake) && idle_due(&key, limits.record_idle))
-            {
-                jobs.push(DueJob { key, generation });
-            }
-            if jobs.len() >= limits.max_scheduled_jobs {
-                return jobs;
-            }
-        }
-    }
     let demand_progress = peer_progress(
         state,
         "SELECT scope_id, peer_public_identity, consumed_generation FROM sync_scope_key_demand_peer_progress",
     );
-    for (scope, workspace, package, generation) in key_demands(state) {
-        for peer in peers_of(state, local, workspace) {
-            let key = JobKey::ScopeKeyDemand {
-                scope,
-                workspace,
-                package: package.clone(),
-                peer,
-            };
-            let consumed = demand_progress
-                .get(&(scope.to_vec(), peer))
-                .copied()
-                .unwrap_or(0);
-            if generation > consumed
-                || ((sweeping || kind != ReloadKind::Wake) && idle_due(&key, limits.record_idle))
-            {
-                if jobs.len() >= limits.max_scheduled_jobs {
-                    return jobs;
-                }
-                jobs.push(DueJob { key, generation });
-            }
+    let record_wakes = record_wakes(state);
+    let key_demands = key_demands(state);
+    let filter = DueScopeFilter {
+        state,
+        local,
+        attempts,
+        now,
+        kind,
+        sweeping,
+        limits,
+    };
+    let records = filter.jobs(&record_wakes, &record_progress, false);
+    let demands = filter.jobs(&key_demands, &demand_progress, true);
+    let record_count = records.clone().count();
+    let demand_count = demands.clone().count();
+    let mut records = records
+        .cycle()
+        .skip(selection.record_offset % record_count.max(1));
+    let mut demands = demands
+        .cycle()
+        .skip(selection.demand_offset % demand_count.max(1));
+    let mut selected = BTreeSet::new();
+    let mut record_taken = 0;
+    let mut demand_taken = 0;
+    // TRANS-R08 and ADR 0020 require prompt demand even when held records
+    // saturate the cap; ADR 0021 interleaves both classes without changing dispatch.
+    while jobs.len() < limits.max_scheduled_jobs
+        && (record_taken < record_count || demand_taken < demand_count)
+    {
+        let take_record = record_taken < record_count
+            && (demand_taken == demand_count || selection.record_served <= selection.demand_served);
+        let job = if take_record {
+            record_taken += 1;
+            selection.record_offset = (selection.record_offset % record_count + 1) % record_count;
+            selection.record_served += 1;
+            records.next()
+        } else {
+            demand_taken += 1;
+            selection.demand_offset = (selection.demand_offset % demand_count + 1) % demand_count;
+            selection.demand_served += 1;
+            demands.next()
+        };
+        if let Some(job) = job
+            && selected.insert(job.key.clone())
+        {
+            jobs.push(job);
         }
     }
+    // An exhausted class cannot accumulate debt while the other works alone.
+    if record_taken == record_count || demand_taken == demand_count {
+        selection.record_served = 0;
+        selection.demand_served = 0;
+    } else {
+        let baseline = selection.record_served.min(selection.demand_served);
+        selection.record_served -= baseline;
+        selection.demand_served -= baseline;
+    }
     jobs
+}
+
+struct DueScopeFilter<'a> {
+    state: &'a RuntimeState,
+    local: PublicIdentity,
+    attempts: &'a BTreeMap<JobKey, Instant>,
+    now: Instant,
+    kind: ReloadKind,
+    sweeping: bool,
+    limits: SchedulerLimits,
+}
+
+impl DueScopeFilter<'_> {
+    fn jobs<'a>(
+        &'a self,
+        wakes: &'a [RecordWake],
+        progress: &'a BTreeMap<ProgressKey, i64>,
+        demand: bool,
+    ) -> impl Iterator<Item = DueJob> + Clone + 'a {
+        wakes
+            .iter()
+            .flat_map(move |(scope, workspace, package, generation)| {
+                peers_of(self.state, self.local, *workspace)
+                    .into_iter()
+                    .filter_map(move |peer| {
+                        let key = if demand {
+                            JobKey::ScopeKeyDemand {
+                                scope: *scope,
+                                workspace: *workspace,
+                                package: package.clone(),
+                                peer,
+                            }
+                        } else {
+                            JobKey::Records {
+                                scope: *scope,
+                                workspace: *workspace,
+                                package: package.clone(),
+                                peer,
+                            }
+                        };
+                        let consumed = progress.get(&(scope.to_vec(), peer)).copied().unwrap_or(0);
+                        let idle_due = self.kind != ReloadKind::Wake
+                            && (self.sweeping
+                                || self.attempts.get(&key).is_none_or(|attempt| {
+                                    self.now.duration_since(*attempt) >= self.limits.record_idle
+                                }));
+                        if *generation > consumed || idle_due {
+                            Some(DueJob {
+                                key,
+                                generation: *generation,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+            })
+    }
 }
 
 type ProgressKey = (Vec<u8>, PublicIdentity);
@@ -1078,6 +1179,60 @@ mod tests {
             fixture
         }
 
+        /// Creates distinct, persistently due held scopes and missing-key demands.
+        /// The first held scope is the one already created by `open`.
+        fn with_saturated_jobs(name: &str, records: usize, demands: usize) -> Self {
+            assert!(records > 0 && demands > 0);
+            let fixture = Self::open(name);
+            {
+                let stored =
+                    crate::storage::open(&fixture.root, 0).expect("existing storage opens");
+                let mut connection = stored.connection;
+                for index in 1..records {
+                    let package = format!("teamarness.record.{index}");
+                    crate::synchronization::append(
+                        &mut connection,
+                        &stored.secret_key,
+                        fixture.workspace,
+                        &package,
+                        "message.post",
+                        b"seed",
+                        crate::synchronization::MembershipStanding::Current,
+                        true,
+                        0,
+                    )
+                    .expect("the held record scope exists");
+                }
+                for index in 0..demands {
+                    let package = format!("teamarness.keyless.{index}");
+                    assert!(
+                        crate::synchronization::declare_member_key_demand(
+                            &connection,
+                            fixture.workspace,
+                            &package,
+                        )
+                        .expect("the missing-key demand is durable")
+                    );
+                }
+            }
+            {
+                let mut state = fixture.state.lock().unwrap();
+                // Membership is already synchronized in this fixture; reserve
+                // the cap's one slot for the two non-membership classes.
+                for (workspace, generation) in membership_wakes(&state) {
+                    consume_locked(
+                        &mut state,
+                        &JobKey::Membership {
+                            workspace,
+                            peer: fixture.peer,
+                        },
+                        generation,
+                    );
+                }
+            }
+            fixture
+        }
+
         fn finish(self) {
             drop(self.state);
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1115,6 +1270,147 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("timed out waiting until {what}");
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R08
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fair_selection_delivers_every_demand_under_saturated_records() {
+        const RECORDS: usize = 3;
+        const DEMANDS: usize = 2;
+        const RELOAD_BOUND: usize = 2 * RECORDS;
+        let fixture = Fixture::with_saturated_jobs("fair-selection", RECORDS, DEMANDS);
+        let limits = SchedulerLimits {
+            max_scheduled_jobs: 1,
+            retry_base: Duration::from_millis(1),
+            retry_cap: Duration::from_millis(1),
+            ..SchedulerLimits::CURRENT
+        };
+        // Forced membership must precede either non-membership class, even
+        // when those classes together saturate the remaining slot.
+        {
+            let mut state = fixture.state.lock().unwrap();
+            let forced = BTreeSet::from([(fixture.workspace, fixture.peer)]);
+            let loaded = load_due_jobs(
+                &mut state,
+                fixture.local,
+                ReloadKind::Wake,
+                SchedulerLimits {
+                    max_scheduled_jobs: 2,
+                    ..limits
+                },
+                &BTreeMap::new(),
+                Instant::now(),
+                &forced,
+                &mut SelectionCursor::default(),
+            );
+            assert!(loaded.len() <= 2, "forced membership respects the cap");
+            assert!(matches!(loaded[0].key, JobKey::Membership { .. }));
+        }
+
+        let runner = FakeRunner::new(SessionOutcome::Failed);
+        let worker = start(&fixture, Arc::clone(&runner), limits);
+        let mut seen_loads = 0;
+        for _ in 0..RELOAD_BOUND {
+            if seen_loads != 0 {
+                tokio::time::advance(Duration::from_millis(2)).await;
+                worker.sweep_for_test();
+            }
+            until("one saturated reload completes", || {
+                worker.loads_for_test() > seen_loads
+            })
+            .await;
+            seen_loads = worker.loads_for_test();
+            assert!(seen_loads <= RELOAD_BOUND, "bounded reload count");
+            until("the selected job is dispatched", || {
+                runner.dispatches().len() >= seen_loads
+            })
+            .await;
+            until(
+                "the failed session completes before the next reload",
+                || {
+                    worker
+                        .snapshot_for_test()
+                        .iter()
+                        .all(|peer| !peer.in_flight)
+                        && !worker.snapshot_for_test().is_empty()
+                },
+            )
+            .await;
+            assert!(
+                worker
+                    .snapshot_for_test()
+                    .iter()
+                    .map(|peer| peer.jobs)
+                    .sum::<usize>()
+                    <= limits.max_scheduled_jobs,
+                "the scheduled set never exceeds the cap"
+            );
+        }
+        let dispatched = runner.dispatches();
+        assert!(
+            dispatched
+                .iter()
+                .any(|(key, _)| matches!(key, JobKey::Records { .. })),
+            "held-record work still dispatches"
+        );
+        for index in 0..DEMANDS {
+            let package = format!("teamarness.keyless.{index}");
+            assert!(
+                dispatched.iter().any(|(key, _)| matches!(
+                    key,
+                    JobKey::ScopeKeyDemand { package: selected, .. } if selected == &package
+                )),
+                "demand {index} must dispatch within {RELOAD_BOUND} reloads despite failing held records"
+            );
+        }
+
+        worker.shutdown().await;
+        drop(worker);
+        // A new driver starts with fresh volatile selection state, but the
+        // missing-key rows are still durable and dispatchable.
+        let restarted_runner = FakeRunner::new(SessionOutcome::Failed);
+        let restarted = start(&fixture, Arc::clone(&restarted_runner), limits);
+        until("restart dispatches durable work", || {
+            !restarted_runner.dispatches().is_empty()
+        })
+        .await;
+        for _ in 1..RELOAD_BOUND {
+            if restarted_runner
+                .dispatches()
+                .iter()
+                .any(|(key, _)| matches!(key, JobKey::ScopeKeyDemand { .. }))
+            {
+                break;
+            }
+            until("restart session completes before the next reload", || {
+                restarted
+                    .snapshot_for_test()
+                    .iter()
+                    .all(|peer| !peer.in_flight)
+            })
+            .await;
+            tokio::time::advance(Duration::from_millis(2)).await;
+            let before = restarted.loads_for_test();
+            restarted.sweep_for_test();
+            until("restart reload completes", || {
+                restarted.loads_for_test() > before
+            })
+            .await;
+            until("restart selected job dispatches", || {
+                restarted_runner.dispatches().len() >= restarted.loads_for_test()
+            })
+            .await;
+        }
+        assert!(
+            restarted_runner
+                .dispatches()
+                .iter()
+                .any(|(key, _)| { matches!(key, JobKey::ScopeKeyDemand { .. }) }),
+            "demand remains dispatchable after restart"
+        );
+        restarted.shutdown().await;
+        drop(restarted);
+        fixture.finish();
     }
 
     // Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
@@ -1195,6 +1491,7 @@ mod tests {
         let now = Instant::now();
         let mut state = fixture.state.lock().unwrap();
         let limits = SchedulerLimits::CURRENT;
+        let mut selection = SelectionCursor::default();
         let jobs = load_due_jobs(
             &mut state,
             fixture.local,
@@ -1203,6 +1500,7 @@ mod tests {
             &BTreeMap::new(),
             now,
             &BTreeSet::new(),
+            &mut selection,
         );
         let demand = jobs
             .iter()
@@ -1219,7 +1517,8 @@ mod tests {
                 limits,
                 &BTreeMap::new(),
                 now,
-                &BTreeSet::new()
+                &BTreeSet::new(),
+                &mut selection
             )
             .iter()
             .any(|job| job.key == demand.key)
@@ -1232,6 +1531,7 @@ mod tests {
             &BTreeMap::from([(demand.key.clone(), now - limits.record_idle)]),
             now,
             &BTreeSet::new(),
+            &mut selection,
         );
         assert!(idle.iter().any(|job| job.key == demand.key));
         let new_peer = PublicIdentity::from_bytes(
@@ -1258,7 +1558,8 @@ mod tests {
                 limits,
                 &BTreeMap::new(),
                 now,
-                &BTreeSet::new()
+                &BTreeSet::new(),
+                &mut selection
             )
             .iter()
             .any(
@@ -1276,6 +1577,7 @@ mod tests {
             &BTreeMap::new(),
             now,
             &BTreeSet::new(),
+            &mut selection,
         );
         assert_eq!(bounded.len(), 1);
         assert!(
@@ -1298,7 +1600,8 @@ mod tests {
                 limits,
                 &BTreeMap::new(),
                 now,
-                &BTreeSet::new()
+                &BTreeSet::new(),
+                &mut selection
             )
             .iter()
             .any(|job| matches!(job.key, JobKey::ScopeKeyDemand { .. }))
