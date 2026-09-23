@@ -31,18 +31,28 @@ pub(crate) enum JobKey {
         package: String,
         peer: PublicIdentity,
     },
+    ScopeKeyDemand {
+        scope: [u8; 32],
+        workspace: WorkspaceId,
+        package: String,
+        peer: PublicIdentity,
+    },
 }
 
 impl JobKey {
     pub(crate) const fn peer(&self) -> PublicIdentity {
         match self {
-            Self::Membership { peer, .. } | Self::Records { peer, .. } => *peer,
+            Self::Membership { peer, .. }
+            | Self::Records { peer, .. }
+            | Self::ScopeKeyDemand { peer, .. } => *peer,
         }
     }
 
     pub(crate) const fn workspace(&self) -> WorkspaceId {
         match self {
-            Self::Membership { workspace, .. } | Self::Records { workspace, .. } => *workspace,
+            Self::Membership { workspace, .. }
+            | Self::Records { workspace, .. }
+            | Self::ScopeKeyDemand { workspace, .. } => *workspace,
         }
     }
 
@@ -481,6 +491,15 @@ mod tests {
         }
     }
 
+    fn demand(peer: u8) -> JobKey {
+        JobKey::ScopeKeyDemand {
+            scope: [peer; 32],
+            workspace: workspace(),
+            package: "teamarness.keyless".to_owned(),
+            peer: identity(peer),
+        }
+    }
+
     fn membership(peer: u8) -> JobKey {
         JobKey::Membership {
             workspace: workspace(),
@@ -494,6 +513,54 @@ mod tests {
 
     fn core() -> SchedulerCore {
         SchedulerCore::new(SchedulerLimits::CURRENT, no_jitter)
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+    #[test]
+    fn scope_key_demand_preserves_membership_priority_per_peer_backoff_and_completion() {
+        let now = Instant::now();
+        let mut core = core();
+        core.replace_due(
+            vec![due(demand(1), 1), due(membership(1), 1), due(demand(2), 1)],
+            now,
+        );
+        let first = core.next_dispatch(now).unwrap();
+        let second = core.next_dispatch(now).unwrap();
+        assert_eq!(
+            BTreeSet::from([first.key.clone(), second.key.clone()]),
+            BTreeSet::from([membership(1), demand(2)]),
+            "membership precedes demand for its peer while another peer runs"
+        );
+        let failed = core.complete(&demand(2), SessionOutcome::Unreachable, now);
+        assert!(
+            !failed
+                .iter()
+                .any(|action| matches!(action, SchedulerAction::Consume { .. })),
+            "failed demand cannot be consumed"
+        );
+        core.complete(
+            &membership(1),
+            SessionOutcome::Completed { truncated: false },
+            now,
+        );
+        let third = core.next_dispatch(now).unwrap();
+        assert_eq!(third.key, demand(1));
+        let truncated = core.complete(
+            &third.key,
+            SessionOutcome::Completed { truncated: true },
+            now,
+        );
+        assert!(
+            !truncated
+                .iter()
+                .any(|action| matches!(action, SchedulerAction::Consume { .. }))
+        );
+        assert_eq!(
+            core.next_dispatch(now).unwrap().key,
+            demand(1),
+            "truncated demand stays due"
+        );
+        assert_eq!(core.next_dispatch(now), None, "peer two remains in backoff");
     }
 
     #[test]

@@ -157,6 +157,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         crate::synchronization::record_subscription::publish_scope_exists(
             &state, workspace, package,
         );
+        state.sync_wake.notify_one();
         // Records that arrived before the key can now be applied.
         replication::promote_scope(&mut state, workspace, package)
             .map_err(fault!(SyncRejection::Storage))

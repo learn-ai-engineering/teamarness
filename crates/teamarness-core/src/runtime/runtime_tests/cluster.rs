@@ -271,6 +271,25 @@ impl SyncCluster {
         }
     }
 
+    /// Observes production work without requesting a sweep or replication.
+    /// Polling is limited to 50 ms because scope availability has no public
+    /// async notification until the subscription is opened.
+    pub(super) async fn observe_until(
+        &self,
+        what: &str,
+        deadline: Duration,
+        mut check: impl FnMut(&Self) -> bool,
+    ) {
+        let expiry = Instant::now() + deadline;
+        loop {
+            if check(self) {
+                return;
+            }
+            assert!(Instant::now() < expiry, "timed out observing {what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     pub(super) async fn finish(mut self) {
         for index in 0..self.nodes.len() {
             if let Some(node) = self.nodes[index].take() {

@@ -110,6 +110,7 @@ impl CoreRuntime {
             workspace_id,
             package_identity,
         );
+        self.sync_worker.wake();
         Ok(imported)
     }
 

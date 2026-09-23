@@ -1303,6 +1303,13 @@ pub(crate) fn import_protection_grant(
         bytes,
     )
     .map_err(fault!(storage_error()))?;
+    // A completed session is not proof of access. Only this verified import
+    // retires the pending demand, including a repeated grant for a held scope.
+    tx.execute(
+        "DELETE FROM sync_scope_key_demands WHERE scope_id=?1",
+        [scope.as_slice()],
+    )
+    .map_err(fault!(storage_error()))?;
     tx.commit()
         .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
     // Records that arrived before the key are parked, not pending: plan phase 3

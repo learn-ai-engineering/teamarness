@@ -12,6 +12,238 @@ use crate::synchronization::{LogSessionError, Refusal};
 
 const PACKAGE: &str = "teamarness.test";
 
+/// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_scope_key_acquisition_without_holder_sweep() {
+    const SCOPE: &str = "teamarness.example.empty-scope";
+    let cluster = SyncCluster::start("prompt-scope-key-demand", &["holder", "member"]).await;
+    let workspace = cluster
+        .node("holder")
+        .create_workspace("Empty scope")
+        .unwrap();
+    let id = workspace.id();
+    let _creator = cluster
+        .node("holder")
+        .subscribe_records(id, SCOPE, None)
+        .unwrap();
+    assert_eq!(cluster.record_count("holder", id, SCOPE), 0);
+    // Only the requester can initiate after admission; the holder's outbound
+    // scheduler cannot accidentally mask a missing demand wake.
+    cluster.node("holder").pause_sync_scheduler_for_test(true);
+    cluster.admit("holder", "member", id).await;
+    let mut member = cluster
+        .node("member")
+        .subscribe_records(id, SCOPE, None)
+        .unwrap();
+    {
+        let state = cluster.node("member").state.lock().unwrap();
+        let pending: i64 = state.connection.query_row(
+            "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1 AND package_identity=?2",
+            rusqlite::params![id.as_bytes().as_slice(), SCOPE], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(pending, 1, "subscription declares genuine pending demand");
+    }
+    cluster
+        .observe_until(
+            "the member receives a verified key before record idle",
+            Duration::from_secs(20),
+            |_| member.availability().unwrap().availability == crate::SyncAvailability::Current,
+        )
+        .await;
+    {
+        let state = cluster.node("member").state.lock().unwrap();
+        let scope = crate::synchronization::scope_digest(SCOPE, id);
+        let held: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scopes WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pending: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (held, pending),
+            (1, 0),
+            "only verified import replaces demand with a genuine scope"
+        );
+    }
+    let first = cluster
+        .node("member")
+        .append_record(id, SCOPE, "message.post", b"first")
+        .unwrap();
+    assert!(
+        cluster
+            .record_ids("member", id, SCOPE)
+            .contains(&first.record_id())
+    );
+    assert_eq!(
+        cluster.record_count("holder", id, SCOPE),
+        0,
+        "the holder authored no Package record"
+    );
+    cluster.finish().await;
+}
+
+// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_key_demand_restart_load_acquires_without_new_subscription() {
+    const SCOPE: &str = "teamarness.example.restart-key";
+    let mut cluster = SyncCluster::start("demand-restart-load", &["a", "b"]).await;
+    let workspace = cluster
+        .node("a")
+        .create_workspace("Restart demand")
+        .unwrap();
+    let id = workspace.id();
+    cluster.node("a").pause_sync_scheduler_for_test(true);
+    cluster.admit("a", "b", id).await;
+    cluster.node("b").pause_sync_scheduler_for_test(true);
+    let _waiting = cluster
+        .node("b")
+        .subscribe_records(id, SCOPE, None)
+        .unwrap();
+    cluster.stop("b").await;
+    let _creator = cluster
+        .node("a")
+        .subscribe_records(id, SCOPE, None)
+        .unwrap();
+    cluster.restart("b").await;
+    // No second subscription, explicit replication, or forced sweep: startup
+    // must load the durable pending row, and the paused holder cannot dial.
+    cluster
+        .observe_until(
+            "restarted requester acquires key",
+            Duration::from_secs(20),
+            |c| {
+                let state = c.node("b").state.lock().unwrap();
+                let scope = crate::synchronization::scope_digest(SCOPE, id);
+                let held: i64 = state
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sync_scopes WHERE scope_id=?1",
+                        [scope.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                held == 1
+            },
+        )
+        .await;
+    cluster.finish().await;
+}
+
+// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_key_demand_only_verified_matching_grant_retires_pending() {
+    const OTHER: &str = "teamarness.example.other";
+    let cluster = SyncCluster::start("verified-demand", &["a", "b", "c"]).await;
+    for name in ["a", "b", "c"] {
+        cluster.node(name).pause_sync_scheduler_for_test(true);
+    }
+    let workspace = cluster
+        .node("a")
+        .create_workspace("Verified grants")
+        .unwrap();
+    let id = workspace.id();
+    let _creator = cluster
+        .node("a")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    let _other = cluster
+        .node("a")
+        .subscribe_records(id, OTHER, None)
+        .unwrap();
+    cluster.admit("a", "b", id).await;
+    cluster.admit("a", "c", id).await;
+    let _waiting = cluster
+        .node("b")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    let scope = crate::synchronization::scope_digest(PACKAGE, id);
+    let pending = || {
+        let state = cluster.node("b").state.lock().unwrap();
+        state
+            .connection
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(pending(), 1);
+    let (origin, grant) = cluster
+        .node("a")
+        .export_protection_bundle_for_test(id, PACKAGE, cluster.identity("b"))
+        .unwrap();
+    let (_, other_grant) = cluster
+        .node("a")
+        .export_protection_bundle_for_test(id, OTHER, cluster.identity("b"))
+        .unwrap();
+    assert!(
+        cluster
+            .node("b")
+            .import_protection_grant(id, PACKAGE, &origin, &other_grant)
+            .is_err()
+    );
+    assert_eq!(pending(), 1, "wrong-scope grant retains demand");
+    let (_, wrong_recipient) = cluster
+        .node("a")
+        .export_protection_bundle_for_test(id, PACKAGE, cluster.identity("c"))
+        .unwrap();
+    assert!(
+        cluster
+            .node("b")
+            .import_protection_grant(id, PACKAGE, &origin, &wrong_recipient)
+            .is_err()
+    );
+    assert_eq!(pending(), 1, "wrong-recipient grant retains demand");
+    let b_secret = cluster.node("b").state.lock().unwrap().secret_key.clone();
+    let (forged_origin, forged_grant) = crate::synchronization::forge_protection_bundle_for_test(
+        &b_secret,
+        id,
+        PACKAGE,
+        cluster.identity("b"),
+    );
+    assert_eq!(
+        cluster
+            .node("b")
+            .import_protection_grant(id, PACKAGE, &forged_origin, &forged_grant)
+            .unwrap_err(),
+        crate::SynchronizationError::KeyOriginRejected
+    );
+    assert_eq!(pending(), 1, "wrong-origin grant retains demand");
+    cluster
+        .node("b")
+        .import_protection_grant(id, PACKAGE, &origin, &grant)
+        .unwrap();
+    assert_eq!(pending(), 0, "verified grant retires demand at commit");
+    {
+        let state = cluster.node("b").state.lock().unwrap();
+        state.connection.execute(
+            "INSERT INTO sync_scope_key_demands(scope_id,workspace_id,package_identity,demand_generation) VALUES(?1,?2,?3,1)",
+            rusqlite::params![scope.as_slice(), id.as_bytes().as_slice(), PACKAGE],
+        ).unwrap();
+    }
+    cluster
+        .node("b")
+        .import_protection_grant(id, PACKAGE, &origin, &grant)
+        .unwrap();
+    assert_eq!(
+        pending(),
+        0,
+        "verified reimport cleans an already-held scope demand"
+    );
+    cluster.finish().await;
+}
+
 /// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.MEM-R10
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_member_is_refused_on_every_sync_alpn() {

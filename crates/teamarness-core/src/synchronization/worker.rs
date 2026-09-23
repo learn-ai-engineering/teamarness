@@ -164,6 +164,12 @@ impl SessionRunner for NetworkSessionRunner {
                     package,
                     peer,
                     ..
+                }
+                | JobKey::ScopeKeyDemand {
+                    workspace,
+                    package,
+                    peer,
+                    ..
                 } => {
                     let session = crate::synchronization::client::send_log_sync(
                         &runner.network,
@@ -192,6 +198,9 @@ impl SessionRunner for NetworkSessionRunner {
             // Only record sessions say anything about a scope's availability;
             // membership sessions belong to the Workspace, not to one scope.
             if let JobKey::Records {
+                workspace, package, ..
+            }
+            | JobKey::ScopeKeyDemand {
                 workspace, package, ..
             } = &job.key
             {
@@ -631,6 +640,9 @@ fn load_due_jobs(
                 .is_none_or(|attempt| now.duration_since(*attempt) >= interval)
     };
     for (workspace, peer) in forced {
+        if jobs.len() >= limits.max_scheduled_jobs {
+            return jobs;
+        }
         jobs.push(DueJob {
             key: JobKey::Membership {
                 workspace: *workspace,
@@ -654,10 +666,15 @@ fn load_due_jobs(
             if generation > consumed
                 || (kind == ReloadKind::MembershipIdle && idle_due(&key, limits.membership_idle))
             {
+                if jobs.len() >= limits.max_scheduled_jobs {
+                    return jobs;
+                }
                 jobs.push(DueJob { key, generation });
             }
         }
     }
+    // A membership-idle reload may follow a record-idle reload before its
+    // record jobs dispatch. Keep elapsed record jobs due on either idle tick.
     let record_progress = peer_progress(
         state,
         "SELECT scope_id, peer_public_identity, consumed_generation FROM sync_peer_progress",
@@ -675,13 +692,38 @@ fn load_due_jobs(
                 .copied()
                 .unwrap_or(0);
             if generation > consumed
-                || ((sweeping || kind == ReloadKind::RecordIdle)
-                    && idle_due(&key, limits.record_idle))
+                || ((sweeping || kind != ReloadKind::Wake) && idle_due(&key, limits.record_idle))
             {
                 jobs.push(DueJob { key, generation });
             }
             if jobs.len() >= limits.max_scheduled_jobs {
                 return jobs;
+            }
+        }
+    }
+    let demand_progress = peer_progress(
+        state,
+        "SELECT scope_id, peer_public_identity, consumed_generation FROM sync_scope_key_demand_peer_progress",
+    );
+    for (scope, workspace, package, generation) in key_demands(state) {
+        for peer in peers_of(state, local, workspace) {
+            let key = JobKey::ScopeKeyDemand {
+                scope,
+                workspace,
+                package: package.clone(),
+                peer,
+            };
+            let consumed = demand_progress
+                .get(&(scope.to_vec(), peer))
+                .copied()
+                .unwrap_or(0);
+            if generation > consumed
+                || ((sweeping || kind != ReloadKind::Wake) && idle_due(&key, limits.record_idle))
+            {
+                if jobs.len() >= limits.max_scheduled_jobs {
+                    return jobs;
+                }
+                jobs.push(DueJob { key, generation });
             }
         }
     }
@@ -771,6 +813,35 @@ fn record_wakes(state: &RuntimeState) -> Vec<RecordWake> {
         .collect()
 }
 
+fn key_demands(state: &RuntimeState) -> Vec<RecordWake> {
+    let Ok(mut statement) = state.connection.prepare(
+        "SELECT scope_id, workspace_id, package_identity, demand_generation
+         FROM sync_scope_key_demands ORDER BY workspace_id, package_identity",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|(scope, workspace, package, generation)| {
+            Some((
+                <[u8; 32]>::try_from(scope).ok()?,
+                WorkspaceId::from_bytes(<[u8; 16]>::try_from(workspace).ok()?),
+                package,
+                generation,
+            ))
+        })
+        .collect()
+}
+
 /// The current Members of a Workspace this Installation is still a Member of.
 fn peers_of(
     state: &RuntimeState,
@@ -818,6 +889,14 @@ fn consume_locked(state: &mut RuntimeState, key: &JobKey, generation: i64) {
                 generation
             ],
         ),
+        JobKey::ScopeKeyDemand { scope, peer, .. } => state.connection.execute(
+            "INSERT INTO sync_scope_key_demand_peer_progress
+                 (scope_id, peer_public_identity, consumed_generation)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT DO UPDATE SET
+                 consumed_generation = MAX(consumed_generation, excluded.consumed_generation)",
+            rusqlite::params![scope.as_slice(), peer.as_bytes().as_slice(), generation],
+        ),
         JobKey::Records { scope, peer, .. } => state.connection.execute(
             "INSERT INTO sync_peer_progress
                  (scope_id, peer_public_identity, consumed_generation)
@@ -841,6 +920,7 @@ mod tests {
     use crate::synchronization::scheduler::no_jitter;
 
     const PACKAGE: &str = "teamarness.test";
+    const DEMAND_PACKAGE: &str = "teamarness.keyless";
 
     /// A scripted runner. Only the session is scripted: the scheduler, the
     /// driver, the durable loads and the real storage under them are real.
@@ -982,6 +1062,22 @@ mod tests {
             }
         }
 
+        fn with_demand(name: &str) -> Self {
+            let fixture = Self::open(name);
+            {
+                let state = fixture.state.lock().unwrap();
+                assert!(
+                    crate::synchronization::declare_member_key_demand(
+                        &state.connection,
+                        fixture.workspace,
+                        DEMAND_PACKAGE
+                    )
+                    .unwrap()
+                );
+            }
+            fixture
+        }
+
         fn finish(self) {
             drop(self.state);
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1019,6 +1115,196 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("timed out waiting until {what}");
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scope_key_demand_startup_empty_session_consumes_until_idle_without_retiring() {
+        let fixture = Fixture::with_demand("demand-empty");
+        let runner = FakeRunner::new(SessionOutcome::Completed { truncated: false });
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        let demand_calls = || {
+            runner
+                .dispatches()
+                .iter()
+                .filter(|(key, _)| matches!(key, JobKey::ScopeKeyDemand { .. }))
+                .count()
+        };
+        until("initial startup load dispatches demand", || {
+            demand_calls() == 1
+        })
+        .await;
+        let scope = crate::synchronization::scope_digest(DEMAND_PACKAGE, fixture.workspace);
+        until("completed empty demand stores its per-peer progress", || {
+            let state = fixture.state.lock().unwrap();
+            state.connection.query_row::<i64, _, _>(
+                "SELECT consumed_generation FROM sync_scope_key_demand_peer_progress WHERE scope_id=?1",
+                [scope.as_slice()], |row| row.get(0),
+            ).ok() == Some(1)
+        }).await;
+        for _ in 0..10 {
+            worker.wake();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(demand_calls(), 1, "empty sessions cannot redial on wake");
+        {
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .connection
+                    .query_row::<i64, _, _>(
+                        "SELECT COUNT(*) FROM sync_scope_key_demands WHERE scope_id=?1",
+                        [scope.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                1,
+                "empty session retains demand"
+            );
+        }
+        let loaded = worker.loads_for_test();
+        tokio::time::advance(SchedulerLimits::CURRENT.record_idle + Duration::from_millis(1)).await;
+        until("the first idle reload completes", || {
+            worker.loads_for_test() > loaded
+        })
+        .await;
+        tokio::time::advance(SchedulerLimits::CURRENT.record_idle + Duration::from_millis(1)).await;
+        // The first record-idle tick may precede the session's last attempt;
+        // subsequent ticks must reoffer the consumed demand.
+        for _ in 0..3 {
+            if demand_calls() >= 2 {
+                break;
+            }
+            tokio::time::advance(SchedulerLimits::CURRENT.record_idle + Duration::from_millis(1))
+                .await;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(demand_calls() >= 2, "idle reconciliation reoffers demand");
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+    #[test]
+    fn scope_key_demand_load_respects_progress_peers_membership_and_bounds() {
+        let fixture = Fixture::with_demand("demand-load");
+        let scope = crate::synchronization::scope_digest(DEMAND_PACKAGE, fixture.workspace);
+        let now = Instant::now();
+        let mut state = fixture.state.lock().unwrap();
+        let limits = SchedulerLimits::CURRENT;
+        let jobs = load_due_jobs(
+            &mut state,
+            fixture.local,
+            ReloadKind::Wake,
+            limits,
+            &BTreeMap::new(),
+            now,
+            &BTreeSet::new(),
+        );
+        let demand = jobs
+            .iter()
+            .find(|job| matches!(job.key, JobKey::ScopeKeyDemand { .. }))
+            .expect("a peer without progress is due")
+            .clone();
+        assert_eq!(demand.generation, 1);
+        consume_locked(&mut state, &demand.key, 1);
+        assert!(
+            !load_due_jobs(
+                &mut state,
+                fixture.local,
+                ReloadKind::Wake,
+                limits,
+                &BTreeMap::new(),
+                now,
+                &BTreeSet::new()
+            )
+            .iter()
+            .any(|job| job.key == demand.key)
+        );
+        let idle = load_due_jobs(
+            &mut state,
+            fixture.local,
+            ReloadKind::RecordIdle,
+            limits,
+            &BTreeMap::from([(demand.key.clone(), now - limits.record_idle)]),
+            now,
+            &BTreeSet::new(),
+        );
+        assert!(idle.iter().any(|job| job.key == demand.key));
+        let new_peer = PublicIdentity::from_bytes(
+            *iroh_base::SecretKey::from_bytes(&[8; 32])
+                .public()
+                .as_bytes(),
+        )
+        .unwrap();
+        state.memberships.insert(
+            fixture.workspace,
+            crate::membership::WorkspaceProjection::for_replication_test(
+                fixture.workspace,
+                fixture.local,
+                crate::MembershipOperationId::digest([1]),
+                BTreeMap::new(),
+                vec![fixture.local, fixture.peer, new_peer],
+            ),
+        );
+        assert!(
+            load_due_jobs(
+                &mut state,
+                fixture.local,
+                ReloadKind::Wake,
+                limits,
+                &BTreeMap::new(),
+                now,
+                &BTreeSet::new()
+            )
+            .iter()
+            .any(
+                |job| matches!(&job.key, JobKey::ScopeKeyDemand { peer, .. } if *peer == new_peer)
+            )
+        );
+        let bounded = load_due_jobs(
+            &mut state,
+            fixture.local,
+            ReloadKind::RecordIdle,
+            SchedulerLimits {
+                max_scheduled_jobs: 1,
+                ..limits
+            },
+            &BTreeMap::new(),
+            now,
+            &BTreeSet::new(),
+        );
+        assert_eq!(bounded.len(), 1);
+        assert!(
+            state
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sync_scope_key_demands WHERE scope_id=?1",
+                    [scope.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+                == 1
+        );
+        state.memberships.clear();
+        assert!(
+            !load_due_jobs(
+                &mut state,
+                fixture.local,
+                ReloadKind::Wake,
+                limits,
+                &BTreeMap::new(),
+                now,
+                &BTreeSet::new()
+            )
+            .iter()
+            .any(|job| matches!(job.key, JobKey::ScopeKeyDemand { .. }))
+        );
+        drop(state);
+        fixture.finish();
     }
 
     /// Verifies: TEAM.SYS.TRANS-R07
