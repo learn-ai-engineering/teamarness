@@ -500,29 +500,43 @@ async fn commits_from_every_path_wake_a_waiting_subscriber() {
         .subscribe_records(id, PACKAGE, None)
         .unwrap();
     drain(&mut promoted);
+    let (health_observed, health_wake) = tokio::sync::oneshot::channel();
     let waiter = tokio::spawn(async move {
+        // A health wake is not a delivery. Observe one while admission is
+        // paused, so this ordering is covered regardless of scheduler timing.
         promoted.changed().await.expect("the runtime is alive");
-        promoted
+        assert!(promoted.next_page(32).unwrap().events.is_empty());
+        health_observed.send(()).expect("the test is still waiting");
+        loop {
+            // Never block this single-threaded executor on a condvar: the
+            // membership session that promotes the record must run here too.
+            promoted.changed().await.expect("the runtime is alive");
+            let page = promoted.next_page(32).unwrap();
+            if page
+                .events
+                .iter()
+                .any(|event| event.record_id() == parked_record.record_id())
+            {
+                return;
+            }
+        }
     });
+    cluster
+        .node("b")
+        .health
+        .scope_changed(scope_digest(PACKAGE, id));
+    tokio::time::timeout(WAKE_DEADLINE, health_wake)
+        .await
+        .expect("the subscriber observes health without a delivery")
+        .expect("the waiting task did not panic");
     cluster.node("b").pause_sync_scheduler_for_test(false);
     cluster
         .node("b")
         .pause_membership_replication_for_test(false);
-    let mut promoted = tokio::time::timeout(DEFAULT_DEADLINE, waiter)
+    tokio::time::timeout(DEFAULT_DEADLINE, waiter)
         .await
-        .expect("a promoted parked record wakes a waiting subscriber")
+        .expect("the promoted record is delivered by re-reading the journal")
         .expect("the waiting task did not panic");
-    let mut seen = BTreeSet::new();
-    while let Ok(Some(event)) = promoted.next_event_timeout(Duration::from_secs(1)) {
-        seen.insert(event.record_id());
-        if seen.contains(&parked_record.record_id()) {
-            break;
-        }
-    }
-    assert!(
-        seen.contains(&parked_record.record_id()),
-        "the promoted record is delivered by re-reading the journal"
-    );
     cluster.finish().await;
 }
 
