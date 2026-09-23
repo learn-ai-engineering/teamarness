@@ -738,22 +738,31 @@ fn load_due_jobs(
     let mut selected = BTreeSet::new();
     let mut record_taken = 0;
     let mut demand_taken = 0;
+    if record_count == 0 || demand_count == 0 {
+        selection.record_served = 0;
+        selection.demand_served = 0;
+    }
     // TRANS-R08 and ADR 0020 require prompt demand even when held records
     // saturate the cap; ADR 0021 interleaves both classes without changing dispatch.
     while jobs.len() < limits.max_scheduled_jobs
         && (record_taken < record_count || demand_taken < demand_count)
     {
+        let both_available = record_taken < record_count && demand_taken < demand_count;
         let take_record = record_taken < record_count
             && (demand_taken == demand_count || selection.record_served <= selection.demand_served);
         let job = if take_record {
             record_taken += 1;
             selection.record_offset = (selection.record_offset % record_count + 1) % record_count;
-            selection.record_served += 1;
+            if both_available {
+                selection.record_served += 1;
+            }
             records.next()
         } else {
             demand_taken += 1;
             selection.demand_offset = (selection.demand_offset % demand_count + 1) % demand_count;
-            selection.demand_served += 1;
+            if both_available {
+                selection.demand_served += 1;
+            }
             demands.next()
         };
         if let Some(job) = job
@@ -762,15 +771,12 @@ fn load_due_jobs(
             jobs.push(job);
         }
     }
-    // An exhausted class cannot accumulate debt while the other works alone.
-    if record_taken == record_count || demand_taken == demand_count {
-        selection.record_served = 0;
-        selection.demand_served = 0;
-    } else {
-        let baseline = selection.record_served.min(selection.demand_served);
-        selection.record_served -= baseline;
-        selection.demand_served -= baseline;
-    }
+    // Exhaustion is local to this load: both classes may be due again on the
+    // next reload. Only shared slots earn service credit; solo slots do not
+    // create debt for a class that had no remaining eligible unit.
+    let baseline = selection.record_served.min(selection.demand_served);
+    selection.record_served -= baseline;
+    selection.demand_served -= baseline;
     jobs
 }
 
@@ -1410,6 +1416,195 @@ mod tests {
         );
         restarted.shutdown().await;
         drop(restarted);
+        fixture.finish();
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R08
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fair_selection_dispatches_single_demand_with_single_record() {
+        let fixture = Fixture::with_saturated_jobs("fair-single", 1, 1);
+        let limits = SchedulerLimits {
+            max_scheduled_jobs: 1,
+            retry_base: Duration::from_millis(1),
+            retry_cap: Duration::from_millis(1),
+            ..SchedulerLimits::CURRENT
+        };
+        let runner = FakeRunner::new(SessionOutcome::Failed);
+        let worker = start(&fixture, Arc::clone(&runner), limits);
+        let mut loads = 0;
+        for _ in 0..2 {
+            if loads != 0 {
+                tokio::time::advance(Duration::from_millis(2)).await;
+                worker.sweep_for_test();
+            }
+            until("single-slot load", || worker.loads_for_test() > loads).await;
+            loads = worker.loads_for_test();
+            until("single-slot dispatch", || {
+                runner.dispatches().len() >= loads
+            })
+            .await;
+            until("failed single-slot session finishes", || {
+                worker
+                    .snapshot_for_test()
+                    .iter()
+                    .all(|peer| !peer.in_flight)
+            })
+            .await;
+            assert!(
+                worker
+                    .snapshot_for_test()
+                    .iter()
+                    .map(|peer| peer.jobs)
+                    .sum::<usize>()
+                    <= 1,
+                "single-slot cap is preserved"
+            );
+        }
+        assert!(
+            runner.dispatches().iter().any(|(key, _)| matches!(
+                key,
+                JobKey::ScopeKeyDemand { package, .. } if package == "teamarness.keyless.0"
+            )),
+            "single demand must dispatch within 2 reloads"
+        );
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R08
+    #[test]
+    fn fair_selection_bounds_each_record_and_demand_with_multiple_slots() {
+        for (name, records, demands) in [("fair-multiple", 2, 4), ("fair-reciprocal", 4, 2)] {
+            let fixture = Fixture::with_saturated_jobs(name, records, demands);
+            let mut state = fixture.state.lock().unwrap();
+            let mut selection = SelectionCursor::default();
+            let slots = 3;
+            let bound = (2 * records.max(demands)).div_ceil(slots);
+            let mut record_keys = BTreeSet::new();
+            let mut demand_keys = BTreeSet::new();
+            for _ in 0..bound {
+                let loaded = load_due_jobs(
+                    &mut state,
+                    fixture.local,
+                    ReloadKind::Wake,
+                    SchedulerLimits {
+                        max_scheduled_jobs: slots,
+                        ..SchedulerLimits::CURRENT
+                    },
+                    &BTreeMap::new(),
+                    Instant::now(),
+                    &BTreeSet::new(),
+                    &mut selection,
+                );
+                assert_eq!(loaded.len(), slots, "load is work-conserving under the cap");
+                let unique: BTreeSet<_> = loaded.iter().map(|job| job.key.clone()).collect();
+                assert_eq!(
+                    unique.len(),
+                    loaded.len(),
+                    "each unit appears at most once per load"
+                );
+                for job in loaded {
+                    match job.key {
+                        JobKey::Records { .. } => {
+                            record_keys.insert(job.key);
+                        }
+                        JobKey::ScopeKeyDemand { .. } => {
+                            demand_keys.insert(job.key);
+                        }
+                        JobKey::Membership { .. } => panic!("membership was already consumed"),
+                    }
+                }
+            }
+            assert_eq!(
+                record_keys.len(),
+                records,
+                "each record must be selected within {bound} reloads"
+            );
+            assert_eq!(
+                demand_keys.len(),
+                demands,
+                "each demand must be selected within {bound} reloads"
+            );
+            drop(state);
+            fixture.finish();
+        }
+    }
+
+    // Verifies: TEAM.SYS.TRANS-R08
+    #[test]
+    fn fair_selection_does_not_accrue_debt_while_demand_is_empty() {
+        let fixture = Fixture::with_saturated_jobs("fair-empty", 1, 1);
+        let mut state = fixture.state.lock().unwrap();
+        let mut selection = SelectionCursor::default();
+        let limits = SchedulerLimits {
+            max_scheduled_jobs: 1,
+            ..SchedulerLimits::CURRENT
+        };
+        let all = load_due_jobs(
+            &mut state,
+            fixture.local,
+            ReloadKind::Wake,
+            SchedulerLimits {
+                max_scheduled_jobs: 2,
+                ..limits
+            },
+            &BTreeMap::new(),
+            Instant::now(),
+            &BTreeSet::new(),
+            &mut selection,
+        );
+        let demand = all
+            .iter()
+            .find(|job| matches!(job.key, JobKey::ScopeKeyDemand { .. }))
+            .unwrap();
+        consume_locked(&mut state, &demand.key, demand.generation);
+        for _ in 0..8 {
+            let loaded = load_due_jobs(
+                &mut state,
+                fixture.local,
+                ReloadKind::Wake,
+                limits,
+                &BTreeMap::new(),
+                Instant::now(),
+                &BTreeSet::new(),
+                &mut selection,
+            );
+            assert_eq!(loaded.len(), 1);
+            assert!(matches!(loaded[0].key, JobKey::Records { .. }));
+        }
+        state
+            .connection
+            .execute("DELETE FROM sync_scope_key_demand_peer_progress", [])
+            .unwrap();
+        let first = load_due_jobs(
+            &mut state,
+            fixture.local,
+            ReloadKind::Wake,
+            limits,
+            &BTreeMap::new(),
+            Instant::now(),
+            &BTreeSet::new(),
+            &mut selection,
+        );
+        let second = load_due_jobs(
+            &mut state,
+            fixture.local,
+            ReloadKind::Wake,
+            limits,
+            &BTreeMap::new(),
+            Instant::now(),
+            &BTreeSet::new(),
+            &mut selection,
+        );
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .any(|job| matches!(job.key, JobKey::ScopeKeyDemand { .. })),
+            "returning demand is selected within its two-reload bound"
+        );
+        drop(state);
         fixture.finish();
     }
 
