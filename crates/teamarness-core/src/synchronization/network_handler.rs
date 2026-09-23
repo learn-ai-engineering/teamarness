@@ -942,7 +942,8 @@ async fn run_log_session_body(
         _ => return Err(LogSessionError::Protocol("expected ready".to_owned())),
     }
     reader.set_phase(FramePhase::Session);
-    exchange_and_acknowledge(
+    let scope = scope_digest(&package, workspace);
+    let report = exchange_and_acknowledge(
         connection,
         &mut reader,
         &mut sink,
@@ -956,8 +957,16 @@ async fn run_log_session_body(
         },
         limits,
     )
-    .await
-    .map(|_| ())
+    .await?;
+    // An authenticated inbound session completed its exchange and application
+    // acknowledgement. A grant import alone does not establish reachability.
+    services.health.record_outcome(
+        scope,
+        peer,
+        Some(crate::synchronization::PeerOutcome::Reachable),
+        Some(report.sent_truncated || report.peer_truncated),
+    );
+    Ok(())
 }
 
 /// Sends the refusal frame and closes with the matching code.

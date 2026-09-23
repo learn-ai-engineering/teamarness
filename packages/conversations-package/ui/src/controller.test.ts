@@ -84,6 +84,30 @@ describe("Conversations error classification", () => {
   });
 });
 
+describe("history access failure wording", () => {
+  // Verifies: TEAM.SYS.TRANS-R08, TEAM.SYS.CONV-R14
+  it("does not promise to send an uncommitted Message while waiting for a key holder", async () => {
+    const controller = await failingOpen(packageRequestError("conversations.capability_unavailable", true));
+    controller.applySnapshot({
+      availability: "waiting_for_history_access",
+      channels: [{ id: CHANNEL, slug: "general", canHide: false, unreadCount: 0 }],
+    });
+    await controller.selectChannel(OTHER_CHANNEL);
+    expect(controller.state.warning).toBe("Posting is unavailable until a current key holder shares history access.");
+    expect(controller.state.warning).not.toMatch(/will be sent|sent soon/i);
+  });
+
+  it("preserves the committed offline Message wording", async () => {
+    const controller = await failingOpen(packageRequestError("conversations.capability_unavailable", true));
+    controller.applySnapshot({
+      availability: "offline",
+      channels: [{ id: CHANNEL, slug: "general", canHide: false, unreadCount: 0 }],
+    });
+    await controller.selectChannel(OTHER_CHANNEL);
+    expect(controller.state.warning).toBe("You are offline. Your message is saved and will sync when a member is reachable.");
+  });
+});
+
 describe("createChannel error mapping", () => {
   it("fails an invalid slug locally without a round trip", async () => {
     const { instance, calls } = creatingClient(new Error("must not be reached"));

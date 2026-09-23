@@ -50,7 +50,7 @@ Conversations records SHALL be sealed by the Core Runtime, which retains raw con
 
 ## TEAM.SYS.CONV-R12 — History for Newly Admitted Members
 
-A newly admitted Member SHALL receive the existing Conversations history once a current key holder has granted access.
+A newly admitted Member SHALL receive the existing Conversations history once a current key holder has granted access. Subscription-driven acquisition of missing history access, including an empty `#general`, is owned by TEAM.SYS.TRANS-R08.
 
 ## TEAM.SYS.CONV-R13 — Local Read State
 

@@ -882,7 +882,7 @@ fn ensure_scope(
         ));
     }
     let creator = PublicIdentity::from_bytes(*secret.public().as_bytes())
-        .map_err(|_| SynchronizationError::CorruptRecord)?;
+        .map_err(fault!(SynchronizationError::CorruptRecord))?;
     let mut journal = [0_u8; 16];
     getrandom::fill(&mut journal).map_err(fault!(storage_error()))?;
     let key = ContentKey::generate()?;
@@ -922,8 +922,9 @@ pub(crate) fn declare_creator_scope(
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(fault!(storage_error()))?;
     let (_, created) = ensure_scope(&tx, secret, package, workspace)?;
-    tx.commit()
-        .map_err(|_| SynchronizationError::Storage(StorageError::UncertainOutcome))?;
+    tx.commit().map_err(fault!(SynchronizationError::Storage(
+        StorageError::UncertainOutcome
+    )))?;
     Ok(created)
 }
 

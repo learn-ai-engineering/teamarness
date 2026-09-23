@@ -94,8 +94,11 @@ function errorMessage(
     retryable: info.retryable,
   });
 
-  if (availability === "catching_up" || availability === "waiting_for_history_access") {
-    return "Conversations is catching up. Your message will be sent soon.";
+  if (availability === "waiting_for_history_access") {
+    return "Posting is unavailable until a current key holder shares history access.";
+  }
+  if (availability === "catching_up") {
+    return "Posting is unavailable while Conversations catches up. Please try again.";
   }
   if (availability === "offline" && info.retryable) {
     return "You are offline. Your message is saved and will sync when a member is reachable.";

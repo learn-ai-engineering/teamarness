@@ -16,7 +16,7 @@ const PACKAGE: &str = "teamarness.test";
 /// Only bounds failure: a wake that works arrives in microseconds.
 const WAKE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Verifies: TEAM.SYS.TRANS-R06 (creator origin); subscription-driven bootstrap (ADR 0020).
+/// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08 (creator origin and subscription bootstrap).
 #[tokio::test]
 async fn creator_subscription_bootstraps_scope_and_signed_origin_without_records() {
     use crate::synchronization::protection_control::{self, KIND_CREATE};

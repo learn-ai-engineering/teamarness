@@ -1334,7 +1334,7 @@ async fn immutable_record_stream_reports_catching_up_then_current() {
     );
 }
 
-/// Verifies: TEAM.SYS.PKG-R10
+/// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R08
 #[tokio::test]
 async fn immutable_record_stream_is_current_for_creator_before_first_record() {
     let requirements = [serde_json::json!({
@@ -1365,10 +1365,32 @@ async fn immutable_record_stream_is_current_for_creator_before_first_record() {
     })
     .await;
     assert_eq!(described(&first), ["state current 0"]);
+    let database = rusqlite::Connection::open_with_flags(
+        fixture._root.path().join("core/core.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let declared: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM sync_scopes WHERE package_identity=?1",
+            ["dev.teamarness.fixture"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let operations: i64 = database
+        .query_row("SELECT COUNT(*) FROM immutable_operations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        (declared, operations),
+        (1, 0),
+        "the Host activation's ordinary capability stream declares an empty generic scope"
+    );
     assert_eq!(
         record_events(&first),
         0,
-        "creator bootstrap creates no records"
+        "an ordinary Host capability stream bootstraps the creator without a Package record"
     );
 
     for index in 0..3_u8 {

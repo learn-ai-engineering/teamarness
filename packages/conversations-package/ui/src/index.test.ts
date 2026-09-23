@@ -287,6 +287,7 @@ describe("composer availability", () => {
     await unmount();
   });
 
+  // Verifies: TEAM.SYS.TRANS-R08, TEAM.SYS.CONV-R14
   it("composer is disabled while waiting for history access", async () => {
     const { sendButton, unmount } = await mountWith("waiting_for_history_access");
     expect(sendButton?.disabled).toBe(true);

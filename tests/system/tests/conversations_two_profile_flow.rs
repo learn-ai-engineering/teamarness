@@ -23,6 +23,118 @@ use support::harness::{
 use teamarness_core::CoreRuntime;
 use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
 
+/// Verifies: TEAM.SYS.TRANS-R08, TEAM.SYS.CONV-R04, TEAM.SYS.CONV-R12
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn empty_general_member_posts_without_creator_record() {
+    empty_general_first_post(true).await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R08, TEAM.SYS.CONV-R12
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn empty_general_member_posts_with_both_schedulers_running() {
+    empty_general_first_post(false).await;
+}
+
+async fn empty_general_first_post(pause_holder: bool) {
+    let application = support::harness::StagedApplication::new();
+    let alice_core = open_core(
+        Addressing::Loopback,
+        &application.root.path().join("alice-core"),
+    )
+    .await;
+    let workspace = alice_core.create_workspace("Empty general").unwrap();
+    let workspace_id = workspace.id();
+    let key = PackageInstanceKey::new(
+        PackageIdentity::from_str(PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace_id.to_string()).unwrap(),
+    );
+    let alice_host = open_host(
+        &application.application_path,
+        application.root.path().join("alice-private"),
+        alice_core.clone(),
+    )
+    .await;
+    let alice_mount = open_mount(&alice_host, &key).await;
+    let alice = ConversationClient {
+        host: &alice_host,
+        mount: &alice_mount,
+    };
+    let initial = alice.snapshot("alice-empty-general").await;
+    assert!(has_channel(&initial, "general"));
+    assert!(
+        message_projection(&alice_host, &alice_mount)
+            .await
+            .is_empty()
+    );
+
+    if pause_holder {
+        // Prevent a holder-initiated session from masking the requester wake.
+        alice_core.pause_sync_scheduler_for_tests(true);
+    }
+    let invitation = create_invitation(&alice_core, workspace_id).await;
+    let bob_core = open_core(
+        Addressing::Loopback,
+        &application.root.path().join("bob-core"),
+    )
+    .await;
+    introduce(Addressing::Loopback, &[&alice_core, &bob_core]);
+    bob_core.join_workspace(&invitation).await.unwrap();
+    drop(invitation);
+    let bob_host = open_host(
+        &application.application_path,
+        application.root.path().join("bob-private"),
+        bob_core.clone(),
+    )
+    .await;
+    let bob_mount = open_mount(&bob_host, &key).await;
+    let bob = ConversationClient {
+        host: &bob_host,
+        mount: &bob_mount,
+    };
+    assert!(
+        poll_until(Duration::from_secs(20), || async {
+            let PackageValue::Object(fields) = bob.snapshot("bob-empty-availability").await else {
+                return false;
+            };
+            fields.get("availability") == Some(&PackageValue::String("current".into()))
+        })
+        .await,
+        "Bob did not acquire empty #general history access before record idle: backend={:?} core={:?}",
+        match bob.snapshot("bob-empty-final-state").await {
+            PackageValue::Object(fields) => fields.get("availability").cloned(),
+            _ => None,
+        },
+        bob_core
+            .subscribe_records(workspace_id, PACKAGE_ID, None)
+            .unwrap()
+            .availability()
+            .unwrap()
+            .availability,
+    );
+    assert!(
+        message_projection(&alice_host, &alice_mount)
+            .await
+            .is_empty(),
+        "Alice authored no Package record"
+    );
+    bob.post_message("bob-first-post", GENERAL_ID, "first Member Message")
+        .await;
+    assert!(
+        poll_short(|| async {
+            has_message_on_page(
+                &alice.channel_open("alice-first-post", GENERAL_ID, 50).await,
+                "first Member Message",
+            )
+        })
+        .await,
+        "Bob's first Message did not reach Alice"
+    );
+    shutdown(alice_host).await;
+    shutdown(bob_host).await;
+    alice_core.shutdown().await.unwrap();
+    bob_core.shutdown().await.unwrap();
+}
+
 /// Verifies: TEAM.SYS.CONV-R06, TEAM.SYS.CONV-R10, TEAM.SYS.CONV-R11, TEAM.SYS.CONV-R12
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn complete_two_profile_recovery_matrix() {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { Installation, Membership, Workspace } from "./contracts";
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
@@ -431,9 +431,8 @@ describe("persistent Shell frame", () => {
     expect(nav.innerHTML).not.toMatch(/class="workspace-settings-link"[^>]*aria-current/);
 
     nav.settings.click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(nav.innerHTML).toMatch(/class="workspace-settings-link"[^>]*aria-current="page"/), { timeout: 5_000 });
     expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id });
-    expect(nav.innerHTML).toMatch(/class="workspace-settings-link"[^>]*aria-current="page"/);
     expect(test.frame.shellScreen.innerHTML).toContain("Workspace details");
     expect(test.frame.shellScreen.innerHTML).toContain("Members");
     expect(test.frame.shellScreen.innerHTML).toContain("Workspace Invitations");

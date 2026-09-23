@@ -12,7 +12,7 @@ use crate::synchronization::{LogSessionError, Refusal};
 
 const PACKAGE: &str = "teamarness.test";
 
-/// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+/// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_scope_key_acquisition_without_holder_sweep() {
     const SCOPE: &str = "teamarness.example.empty-scope";
@@ -75,6 +75,11 @@ async fn prompt_scope_key_acquisition_without_holder_sweep() {
             "only verified import replaces demand with a genuine scope"
         );
     }
+    assert_eq!(
+        cluster.record_count("holder", id, SCOPE),
+        0,
+        "the holder authored no Package record before the Member's first append"
+    );
     let first = cluster
         .node("member")
         .append_record(id, SCOPE, "message.post", b"first")
@@ -84,15 +89,72 @@ async fn prompt_scope_key_acquisition_without_holder_sweep() {
             .record_ids("member", id, SCOPE)
             .contains(&first.record_id())
     );
-    assert_eq!(
-        cluster.record_count("holder", id, SCOPE),
-        0,
-        "the holder authored no Package record"
-    );
     cluster.finish().await;
 }
 
-// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+/// Verifies: TEAM.SYS.TRANS-R08, TEAM.SYS.CONV-R12
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_scope_key_acquisition_holder_push_reaches_current() {
+    const SCOPE: &str = "teamarness.example.holder-push";
+    let cluster = SyncCluster::start("holder-push-health", &["holder", "member"]).await;
+    let id = cluster
+        .node("holder")
+        .create_workspace("Empty scope")
+        .unwrap()
+        .id();
+    let _creator = cluster
+        .node("holder")
+        .subscribe_records(id, SCOPE, None)
+        .unwrap();
+    cluster.node("member").pause_sync_scheduler_for_test(true);
+    cluster.admit("holder", "member", id).await;
+    let mut member = cluster
+        .node("member")
+        .subscribe_records(id, SCOPE, None)
+        .unwrap();
+    cluster
+        .observe_until(
+            "the holder grants the key in an authenticated outbound session",
+            Duration::from_secs(10),
+            |c| {
+                let state = c.node("member").state.lock().unwrap();
+                let scope = crate::synchronization::scope_digest(SCOPE, id);
+                let held: i64 = state
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sync_scopes WHERE scope_id=?1",
+                        [scope.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                held == 1 && !c.node("holder").session_reports_for_test().is_empty()
+            },
+        )
+        .await;
+    cluster
+        .observe_until(
+            "the completed authenticated inbound session reports reachable and current",
+            Duration::from_secs(10),
+            |c| {
+                let scope = crate::synchronization::scope_digest(SCOPE, id);
+                let reachable = c
+                    .node("member")
+                    .health
+                    .snapshot(scope)
+                    .last_outcome
+                    .get(&c.identity("holder"))
+                    == Some(&crate::synchronization::PeerOutcome::Reachable);
+                reachable
+                    && member.availability().unwrap().availability
+                        == crate::SyncAvailability::Current
+            },
+        )
+        .await;
+    assert_eq!(cluster.record_count("holder", id, SCOPE), 0);
+    cluster.finish().await;
+}
+
+// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scope_key_demand_restart_load_acquires_without_new_subscription() {
     const SCOPE: &str = "teamarness.example.restart-key";
@@ -139,7 +201,7 @@ async fn scope_key_demand_restart_load_acquires_without_new_subscription() {
     cluster.finish().await;
 }
 
-// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scope_key_demand_only_verified_matching_grant_retires_pending() {
     const OTHER: &str = "teamarness.example.other";
@@ -634,7 +696,7 @@ async fn non_creator_holder_welcomes_a_new_member() {
     cluster.finish().await;
 }
 
-// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_key_demand_subscription_and_append_coalesce_across_restart() {
     let mut cluster = SyncCluster::start("member-key-demand-restart", &["a", "b"]).await;
@@ -698,7 +760,7 @@ async fn member_key_demand_subscription_and_append_coalesce_across_restart() {
     cluster.finish().await;
 }
 
-// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_key_demand_append_fallback_does_not_depend_on_subscription() {
     let mut cluster = SyncCluster::start("member-key-demand-fallback", &["a", "b", "x"]).await;
@@ -767,7 +829,7 @@ async fn member_key_demand_append_fallback_does_not_depend_on_subscription() {
     cluster.finish().await;
 }
 
-// Verifies: TEAM.SYS.TRANS-R06 (pending TEAM.SYS.TRANS-R08 in phase 4)
+// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_key_demand_local_revocation_clears_pending_and_prevents_recreation() {
     let cluster = SyncCluster::start("member-key-demand-revoke", &["a", "b"]).await;
