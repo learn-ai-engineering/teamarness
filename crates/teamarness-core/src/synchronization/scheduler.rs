@@ -244,7 +244,7 @@ impl SchedulerCore {
     ///
     /// At most one session per peer, at most `outbound_sessions` in all, and at
     /// most `failing_peer_slots` of those for peers that keep failing. Peers are
-    /// served round-robin; for one peer, membership goes before records.
+    /// served round-robin; for one peer, membership goes before other jobs.
     pub(crate) fn next_dispatch(&mut self, now: Instant) -> Option<DueJob> {
         if self.in_flight >= self.limits.outbound_sessions {
             return None;
@@ -289,19 +289,21 @@ impl SchedulerCore {
     }
 
     fn next_job_for(&self, peer: PublicIdentity) -> Option<JobKey> {
-        let mut records = None;
-        for key in self.jobs.keys() {
-            if key.peer() != peer || self.jobs.get(key).is_some_and(|state| state.in_flight) {
+        let mut non_membership: Option<&JobKey> = None;
+        for (key, state) in &self.jobs {
+            if key.peer() != peer || state.in_flight {
                 continue;
             }
             if key.is_membership() {
                 return Some(key.clone());
             }
-            if records.is_none() {
-                records = Some(key.clone());
+            if non_membership
+                .is_none_or(|chosen| self.last_attempt.get(key) < self.last_attempt.get(chosen))
+            {
+                non_membership = Some(key);
             }
         }
-        records
+        non_membership.cloned()
     }
 
     /// Records one session's outcome and reports what the driver must do.
@@ -561,6 +563,44 @@ mod tests {
             "truncated demand stays due"
         );
         assert_eq!(core.next_dispatch(now), None, "peer two remains in backoff");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_records_and_scope_key_demand_take_turns_after_peer_backoff() {
+        let mut core = SchedulerCore::new(
+            SchedulerLimits {
+                max_scheduled_jobs: 2,
+                ..SchedulerLimits::CURRENT
+            },
+            no_jitter,
+        );
+        let jobs = vec![due(records(1, "teamarness.test"), 1), due(demand(1), 1)];
+        let mut now = Instant::now();
+        // Membership progress is already satisfied; both non-membership jobs
+        // fit in the cap and remain due after each failed session and reload.
+        core.replace_due(jobs.clone(), now);
+        assert_eq!(core.snapshot()[0].jobs, 2);
+        for expected in [
+            records(1, "teamarness.test"),
+            demand(1),
+            records(1, "teamarness.test"),
+            demand(1),
+        ] {
+            let dispatched = core.next_dispatch(now).expect("one eligible session");
+            assert_eq!(dispatched.key, expected);
+            assert_eq!(
+                core.next_dispatch(now),
+                None,
+                "one in-flight session per peer"
+            );
+            core.complete(&dispatched.key, SessionOutcome::Failed, now);
+            core.replace_due(jobs.clone(), now);
+            let deadline = core.next_deadline().expect("failed peer has backoff");
+            assert!(deadline > now);
+            assert_eq!(core.next_dispatch(now), None, "no tight-loop retry");
+            tokio::time::sleep_until(deadline).await;
+            now = Instant::now();
+        }
     }
 
     #[test]
