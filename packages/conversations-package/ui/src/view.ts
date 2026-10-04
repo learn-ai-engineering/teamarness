@@ -1,6 +1,5 @@
 import { authorLabel, renderMarkdown } from "./markdown";
 import type { ConversationsController, ControllerState } from "./controller";
-import "./styles.css";
 
 const KIT_CLASS = {
   control: "teamarness-control",

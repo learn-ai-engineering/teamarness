@@ -1,4 +1,7 @@
-import { installPackageUiKit, typedPackageClient } from "@teamarness/package-ui-sdk";
+import { adoptPackageStyles, installPackageUiKit, typedPackageClient } from "@teamarness/package-ui-sdk";
+import conversationsCss from "./styles.css?raw";
+// Retain the CSS asset declared by the Package manifest; the Frame adopts the raw CSS below.
+import "./styles.css";
 import type { PackageMountContext, PackageUnmount } from "@teamarness/package-ui-sdk";
 import type {
   Availability,
@@ -22,6 +25,13 @@ export async function mount(
 ): Promise<PackageUnmount> {
   const client = typedPackageClient<ConversationsContract>(context.client);
   const cleanupKit = installPackageUiKit(context.root);
+  let cleanupStyles: () => void;
+  try {
+    cleanupStyles = adoptPackageStyles(context.root, conversationsCss);
+  } catch (error) {
+    cleanupKit();
+    throw error;
+  }
   let disposed = false;
 
   const controller = new ConversationsController(client, () => {
@@ -49,6 +59,7 @@ export async function mount(
     controller.dispose();
     view.dispose();
     await subscription.close();
+    cleanupStyles();
     cleanupKit();
   };
 }

@@ -332,31 +332,46 @@ describe("package UI kit integration", () => {
       client,
     } satisfies PackageMountContext;
 
-    const unmount = await mount(context);
+    // happy-dom does not expose parsed cssRules for constructed stylesheets.
+    const cssBySheet = new WeakMap<CSSStyleSheet, string>();
+    const replaceSync = CSSStyleSheet.prototype.replaceSync;
+    const replaceSpy = vi.spyOn(CSSStyleSheet.prototype, "replaceSync").mockImplementation(function (this: CSSStyleSheet, css) {
+      cssBySheet.set(this, css);
+      replaceSync.call(this, css);
+    });
+    try {
+      const unmount = await mount(context);
 
-    // Kit should have added at least one stylesheet to adoptedStyleSheets.
-    expect(root.adoptedStyleSheets.length).toBeGreaterThan(initialSheetCount);
+      // Both the UI kit and Conversations layout must be adopted into this ShadowRoot.
+      expect(root.adoptedStyleSheets.length).toBe(initialSheetCount + 2);
+      const layoutSheet = root.adoptedStyleSheets.at(-1)!;
+      expect(cssBySheet.get(layoutSheet)).toMatch(/\.conversations-shell\s*\{[^}]*display:\s*grid/);
+      expect(root.querySelector("style,link[rel=stylesheet]")).toBeNull();
 
-    // The page header names the Package.
-    const title = root.querySelector("h1");
-    expect(title?.textContent).toBe("Conversations");
-    expect(title?.className).toContain("teamarness-page-title");
-    expect(root.querySelector(".teamarness-page")?.lastElementChild?.className).toContain("conversations-shell");
+      // The page header names the Package.
+      const title = root.querySelector("h1");
+      expect(title?.textContent).toBe("Conversations");
+      expect(title?.className).toContain("teamarness-page-title");
+      expect(root.querySelector(".teamarness-page")?.lastElementChild?.className).toContain("conversations-shell");
 
-    // The Package Page fills the frame without an enclosing kit panel.
-    const section = root.querySelector("section");
-    expect(root.querySelector(".teamarness-page")).not.toBeNull();
-    expect(section?.classList.contains("teamarness-panel")).toBe(false);
-    expect(section?.classList.contains("teamarness-stack")).toBe(false);
+      // The Package Page fills the frame without an enclosing kit panel.
+      const section = root.querySelector("section");
+      expect(root.querySelector(".teamarness-page")).not.toBeNull();
+      expect(section?.classList.contains("teamarness-panel")).toBe(false);
+      expect(section?.classList.contains("teamarness-stack")).toBe(false);
 
-    // The send button should have the kit primary class.
-    const sendBtn = root.querySelector<HTMLButtonElement>("button[type=submit]");
-    expect(sendBtn?.className).toContain("teamarness-control--primary");
+      // The send button should have the kit primary class.
+      const sendBtn = root.querySelector<HTMLButtonElement>("button[type=submit]");
+      expect(sendBtn?.className).toContain("teamarness-control--primary");
 
-    await unmount();
+      await unmount();
 
-    // After unmount, the root should be empty and kit sheets should be removed.
-    expect(root.children.length).toBe(0);
+      // Unmount removes the layout and kit sheets, not only the DOM.
+      expect(root.children.length).toBe(0);
+      expect(root.adoptedStyleSheets).toHaveLength(initialSheetCount);
+    } finally {
+      replaceSpy.mockRestore();
+    }
   });
 
   it("receives theme tokens from the Shell", async () => {
