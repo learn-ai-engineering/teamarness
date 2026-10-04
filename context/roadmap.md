@@ -70,7 +70,7 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-The architecture review and the Shell and Package UI polish workstream are both closed and merged; Phase 5 starts next.
+The architecture review and the Shell and Package UI polish workstream are both closed and merged. Phase 5 remains next for the core roadmap. The separate Conversations UI overhaul workstream has started its Package-local UI phase on the isolated `conversations-ui-overhaul` branch; automatic older-history loading waits for developer approval of the implemented UI. No merge or push is authorized yet.
 
 ### Shell and Package UI polish (complete)
 
@@ -119,9 +119,9 @@ Replace the persistent status and error messages at the top of the selected-cont
 
 Let a person hide a Package from contextual navigation and show it again from Workspace settings, for example to hide the Tutorial and Reference Packages after first use.
 
-### Conversations UI overhaul
+### Conversations UI overhaul (in progress)
 
-Redesign the Conversations Package UI beyond the shared Package page structure.
+Redesign the Conversations Package UI beyond the shared Package page structure. The UI treatment phase is underway; the developer must approve its implemented UI before the separate automatic older-history phase starts.
 
 ## Maintenance rule
 

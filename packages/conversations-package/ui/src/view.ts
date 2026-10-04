@@ -3,7 +3,6 @@ import type { ConversationsController, ControllerState } from "./controller";
 import "./styles.css";
 
 const KIT_CLASS = {
-  panel: "teamarness-panel teamarness-stack",
   control: "teamarness-control",
   primary: "teamarness-control teamarness-control--primary",
   secondary: "teamarness-control teamarness-control--secondary",
@@ -25,6 +24,10 @@ export class ConversationsView {
   private readonly rail: HTMLElement;
   private readonly panel: HTMLElement;
   private readonly headerSlot: HTMLElement;
+  private readonly status: HTMLElement;
+  private readonly channelList: HTMLUListElement;
+  private readonly createButton: HTMLButtonElement;
+  private readonly createArea: HTMLElement;
   private readonly history: HTMLElement;
   private readonly olderButton: HTMLButtonElement;
   private readonly composer: HTMLFormElement;
@@ -49,28 +52,49 @@ export class ConversationsView {
     const pageTitle = document.createElement("h1");
     pageTitle.className = "teamarness-page-title";
     pageTitle.textContent = title;
-    pageHeader.append(pageTitle);
+    this.status = document.createElement("p");
+    this.status.className = "availability";
+    this.status.setAttribute("role", "status");
+    pageHeader.append(pageTitle, this.status);
 
     // --- shell ---
     this.shell = document.createElement("div");
     this.shell.className = "conversations-shell";
-    this.shell.dataset.narrowLayout = "true";
 
     // --- channel rail ---
     this.rail = document.createElement("aside");
     this.rail.className = "channel-rail";
     this.rail.setAttribute("aria-label", "Channels");
+    const channelHeading = document.createElement("div");
+    channelHeading.className = "channel-heading";
+    const heading = document.createElement("h2");
+    heading.textContent = "Channels";
+    this.createArea = document.createElement("div");
+    this.createArea.className = "channel-create";
+    this.createButton = document.createElement("button");
+    this.createButton.type = "button";
+    this.createButton.className = KIT_CLASS.secondary;
+    this.createButton.textContent = "+";
+    this.createButton.setAttribute("aria-label", "Create Channel");
+    this.createButton.setAttribute("aria-expanded", "false");
+    this.createButton.addEventListener("click", () => this.controller.toggleCreate());
+    this.createArea.append(this.createButton);
+    channelHeading.append(heading, this.createArea);
+    this.channelList = document.createElement("ul");
+    this.channelList.className = "channel-list";
+    this.channelList.setAttribute("aria-label", "Conversation channels");
+    this.rail.append(channelHeading, this.channelList);
 
     // --- conversation panel ---
     this.panel = document.createElement("section");
-    this.panel.className = `conversation-panel ${KIT_CLASS.panel}`;
+    this.panel.className = "conversation-panel";
 
     // --- header slot (replaced on every render) ---
     this.headerSlot = document.createElement("div");
     this.panel.append(this.headerSlot);
 
     // --- message history ---
-    this.history = document.createElement("ol");
+    this.history = document.createElement("ul");
     this.history.className = "message-history";
     this.history.setAttribute("aria-label", "Messages");
     this.panel.append(this.history);
@@ -146,6 +170,18 @@ export class ConversationsView {
 
     // --- rail ---
     this.renderRail(state);
+    const labels = {
+      waiting_for_history_access: "Waiting for history access",
+      offline: "Sync unavailable",
+      catching_up: "Checking for updates",
+      current: "Up to date here",
+    } as const;
+    this.status.textContent = labels[state.availability];
+    if (state.availability === "current") {
+      this.status.setAttribute("aria-description", "Local known state; not a peer delivery receipt.");
+    } else {
+      this.status.removeAttribute("aria-description");
+    }
 
     // --- header region ---
     this.renderHeader(state, selected);
@@ -187,45 +223,32 @@ export class ConversationsView {
   // ------------------------------------------------------------------
 
   private renderRail(state: ControllerState): void {
-    this.rail.replaceChildren();
-
-    const heading = document.createElement("h2");
-    heading.textContent = "Channels";
-    this.rail.append(heading);
-
-    const list = document.createElement("ul");
-    list.className = "channel-list";
-    list.setAttribute("aria-label", "Conversation channels");
-
+    const activeElement = this.root instanceof ShadowRoot
+      ? this.root.activeElement
+      : document.activeElement;
+    const focusedChannel = this.channelList.contains(activeElement)
+      ? (activeElement as HTMLElement).dataset.channelId
+      : undefined;
+    this.channelList.replaceChildren();
     for (const channel of state.channels) {
       const item = document.createElement("li");
       const button = document.createElement("button");
       button.type = "button";
       button.className = "channel-button";
       button.dataset.channelId = channel.id;
-      button.setAttribute(
-        "aria-pressed",
-        String(channel.id === state.selectedChannelId),
-      );
+      button.setAttribute("aria-pressed", String(channel.id === state.selectedChannelId));
+      if (channel.id === state.selectedChannelId) button.setAttribute("aria-current", "page");
       button.textContent = `#${channel.slug}`;
       button.addEventListener("click", () => {
         void this.controller.selectChannel(channel.id);
       });
       item.append(button);
-      list.append(item);
+      this.channelList.append(item);
+      if (channel.id === focusedChannel) button.focus();
     }
-    this.rail.append(list);
 
-    const createBtn = document.createElement("button");
-    createBtn.type = "button";
-    createBtn.className = KIT_CLASS.secondary;
-    createBtn.textContent = "Create Channel";
-    createBtn.addEventListener("click", () => {
-      this.controller.toggleCreate();
-    });
-    this.rail.append(createBtn);
-
-    if (state.creating) {
+    this.createButton.setAttribute("aria-expanded", String(state.creating));
+    if (state.creating && !this.createArea.querySelector("form")) {
       const form = document.createElement("form");
       form.className = `channel-create-form ${KIT_CLASS.field}`;
       const input = document.createElement("input");
@@ -245,9 +268,18 @@ export class ConversationsView {
         event.preventDefault();
         void this.controller.createChannel(input.value);
       });
+      form.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          this.controller.toggleCreate();
+          this.createButton.focus();
+        }
+      });
       form.append(input, submit);
-      this.rail.append(form);
-      queueMicrotask(() => input.focus());
+      this.createArea.append(form);
+      queueMicrotask(() => { if (form.isConnected) input.focus(); });
+    } else if (!state.creating) {
+      this.createArea.querySelector("form")?.remove();
     }
   }
 
@@ -271,24 +303,24 @@ export class ConversationsView {
       const hideBtn = document.createElement("button");
       hideBtn.type = "button";
       hideBtn.className = `${KIT_CLASS.secondary} teamarness-danger`;
-      hideBtn.textContent = "Hide Channel";
+      hideBtn.textContent = "Hide Channel…";
       hideBtn.addEventListener("click", () => {
         this.controller.showConfirmHide();
       });
       header.append(hideBtn);
     }
 
-    const status = document.createElement("p");
-    status.className = "availability";
-    status.setAttribute("role", "status");
-    status.textContent = `Status: ${state.availability}`;
-    header.append(status);
-
     this.headerSlot.append(header);
   }
 
   /** Renders warnings and the hide-confirmation dialog above the history. */
   private renderWarnings(state: ControllerState): void {
+    const dialog = this.panel.querySelector(".hide-confirmation");
+    const focusedDialogButton = dialog?.contains(document.activeElement)
+      ? (document.activeElement as HTMLButtonElement).textContent
+      : this.root instanceof ShadowRoot && dialog?.contains(this.root.activeElement)
+        ? (this.root.activeElement as HTMLButtonElement).textContent
+        : null;
     // Remove any existing warning / confirmation injected by a prior render.
     for (const el of this.panel.querySelectorAll(
       ".warning,.hide-confirmation",
@@ -321,10 +353,13 @@ export class ConversationsView {
       cancelBtn.textContent = "Cancel";
       cancelBtn.addEventListener("click", () => {
         this.controller.cancelConfirm();
+        this.headerSlot.querySelector<HTMLButtonElement>("button")?.focus();
       });
 
       div.append(text, confirmBtn, cancelBtn);
       this.panel.insertBefore(div, this.history);
+      if (focusedDialogButton === "Cancel") cancelBtn.focus();
+      else if (!dialog || focusedDialogButton) confirmBtn.focus();
     }
 
     // Warning message.
@@ -354,9 +389,13 @@ export class ConversationsView {
       previousHeight - previousTop - this.history.clientHeight < 40;
 
     this.history.replaceChildren();
+    let previousLocal = false;
     for (const message of state.messages) {
       const row = document.createElement("li");
       row.className = "message";
+      if (message.isLocal) row.classList.add("message--local");
+      if (message.isLocal && previousLocal) row.classList.add("message--local-continuation");
+      previousLocal = message.isLocal;
 
       const author = document.createElement("button");
       author.type = "button";
