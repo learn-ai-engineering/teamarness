@@ -34,6 +34,14 @@ export interface ControllerState {
 export const PAGE_SIZE = 32;
 const MAX_HISTORY_PAGES = 32;
 
+interface HeadBackfill {
+  channelId: string;
+  newest: ConversationMessage[];
+  nextBefore: string;
+  cursors: Set<string>;
+  revision: number;
+}
+
 /**
  * The Backend pages a Channel newest Message first; the view reads top to bottom.
  *
@@ -140,6 +148,7 @@ export class ConversationsController {
   private headQueued = false;
   private headRevision = 0;
   private headFailed = false;
+  private headBackfill: HeadBackfill | null = null;
   private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
@@ -249,6 +258,7 @@ export class ConversationsController {
   /** Dispose all pending work. Safe to call multiple times. */
   dispose(): void {
     this.disposed = true;
+    this.headBackfill = null;
     ++this.generation;
   }
 
@@ -266,6 +276,7 @@ export class ConversationsController {
 
     const gen = ++this.generation;
     this.headFailed = false;
+    this.headBackfill = null;
     this._state = {
       ...this._state,
       selectedChannelId: channelId,
@@ -368,10 +379,11 @@ export class ConversationsController {
   /** A failed request is retried only by an explicit action, never by scrolling. */
   async retryOlder(): Promise<void> {
     if (!this._state.olderError || this.disposed) return;
-    this._state = { ...this._state, olderError: false, warning: null };
+    const retryHead = this.headFailed;
+    this._state = { ...this._state, olderError: false, warning: null,
+      loading: retryHead && this._state.messages.length === 0 ? true : this._state.loading };
     this.notify();
-    if (this.headFailed) {
-      this.headFailed = false;
+    if (retryHead) {
       await this.reloadCurrentChannel();
     } else {
       await this.loadOlder();
@@ -506,6 +518,7 @@ export class ConversationsController {
       if (selectedId) return this.selectChannel(selectedId);
       ++this.generation;
       this.headFailed = false;
+      this.headBackfill = null;
       this._state = { ...this._state, selectedChannelId: null, messages: [], hasMore: false,
         nextBefore: null, loading: false, loadingOlder: false, olderError: false };
       this.notify();
@@ -520,13 +533,19 @@ export class ConversationsController {
       warnings: snapshot.warnings ?? [],
     };
     this.notify();
+    // Failed bounded backfill resumes only on explicit retry, not on each live event.
+    if (this.headFailed && this.headBackfill) {
+      ++this.headRevision;
+      this.headQueued = true;
+      return;
+    }
     // Return the promise so callers can await the reload.
     return this.reloadCurrentChannel();
   }
 
   private reloadCurrentChannel(): Promise<void> {
     if (!this._state.selectedChannelId || this.disposed) return Promise.resolve();
-    ++this.headRevision;
+    if (!(this.headFailed && this.headBackfill)) ++this.headRevision;
     if (this.headRequest) {
       this.headQueued = true;
       return this.headRequest;
@@ -537,7 +556,7 @@ export class ConversationsController {
       if (this.headRequest === request) {
         this.headRequest = null;
         // A stale Channel's request can settle before its queued replacement runs.
-        if (this.headQueued && !this.disposed) void this.reloadCurrentChannel();
+        if (this.headQueued && !this.headFailed && !this.disposed) void this.reloadCurrentChannel();
       }
     });
     return request;
@@ -547,49 +566,64 @@ export class ConversationsController {
     do {
       this.headQueued = false;
       const gen = this.generation;
-      const revision = this.headRevision;
       const channelId = this._state.selectedChannelId;
       if (!channelId) return;
       try {
-        let page = await this.client.request("conversations.channel.open", { channelId, limit: PAGE_SIZE });
-        if (this.disposed || this.generation !== gen) return;
-        const newest = [...oldestFirst(page.messages)];
+        let backfill = this.headBackfill;
+        let firstCursor: string | null = null;
+        if (!backfill || backfill.channelId !== channelId) {
+          const head = await this.client.request("conversations.channel.open", { channelId, limit: PAGE_SIZE });
+          if (this.disposed || this.generation !== gen) return;
+          firstCursor = head.nextBefore ?? null;
+          backfill = { channelId, newest: [...oldestFirst(head.messages)],
+            nextBefore: head.nextBefore ?? "", cursors: new Set<string>(), revision: this.headRevision };
+        }
         const known = new Set(this._state.messages.map((m) => m.id));
-        const cursors = new Set<string>();
-        while (known.size > 0 && !newest.some((m) => known.has(m.id)) && page.nextBefore) {
-          if (this.disposed || this.generation !== gen || revision !== this.headRevision) break;
-          if (cursors.size >= MAX_HISTORY_PAGES || cursors.has(page.nextBefore)) throw new Error("History cursor limit reached");
-          cursors.add(page.nextBefore);
-          page = await this.client.request("conversations.channel.page", {
-            channelId, before: page.nextBefore, limit: PAGE_SIZE,
+        let count = 0;
+        while (known.size > 0 && !backfill.newest.some((m) => known.has(m.id)) && backfill.nextBefore) {
+          const cursor = backfill.nextBefore;
+          if (backfill.cursors.has(cursor)) throw new Error("Non-advancing history cursor");
+          if (count >= MAX_HISTORY_PAGES) {
+            this.headBackfill = backfill;
+            throw new Error("History page limit reached");
+          }
+          this.headBackfill = backfill;
+          const page = await this.client.request("conversations.channel.page", {
+            channelId, before: cursor, limit: PAGE_SIZE,
           });
           if (this.disposed || this.generation !== gen) return;
-          newest.unshift(...oldestFirst(page.messages));
+          backfill.cursors.add(cursor);
+          backfill.newest.unshift(...oldestFirst(page.messages));
+          backfill.nextBefore = page.nextBefore ?? "";
+          count++;
         }
-        if (revision !== this.headRevision) continue;
         const current = this._state.messages;
-        const overlap = newest.findIndex((m) => known.has(m.id));
-        const retained = overlap < 0 ? current : current.slice(0, current.findIndex((m) => m.id === newest[overlap]!.id));
+        const currentIds = new Set(current.map((message) => message.id));
+        const overlap = backfill.newest.findIndex((message) => currentIds.has(message.id));
+        const retained = overlap < 0 ? current : current.slice(0, current.findIndex((m) => m.id === backfill.newest[overlap]!.id));
         const ids = new Set(retained.map((m) => m.id));
-        const messages = [...retained, ...newest.filter((message) => {
+        const messages = [...retained, ...backfill.newest.filter((message) => {
           if (ids.has(message.id)) return false;
           ids.add(message.id);
           return true;
         })];
         this._state = {
           ...this._state, messages,
-          hasMore: current.length ? this._state.hasMore : page.nextBefore !== undefined,
-          nextBefore: current.length ? this._state.nextBefore : page.nextBefore ?? null,
+          hasMore: current.length ? this._state.hasMore : firstCursor !== null,
+          nextBefore: current.length ? this._state.nextBefore : firstCursor,
+          loading: false,
           olderError: this.headFailed ? false : this._state.olderError,
           warning: this.headFailed ? null : this._state.warning,
         };
         this.headFailed = false;
+        this.headBackfill = null;
+        if (backfill.revision !== this.headRevision) this.headQueued = true;
         this.notify();
       } catch {
         if (this.disposed || this.generation !== gen) return;
-        if (revision !== this.headRevision) continue;
         this.headFailed = true;
-        this._state = { ...this._state, olderError: true, warning: "Conversation history could not be refreshed." };
+        this.headQueued = false;
+        this._state = { ...this._state, loading: false, olderError: true, warning: "Conversation history could not be refreshed." };
         this.notify();
       }
     } while (this.headQueued && !this.disposed);

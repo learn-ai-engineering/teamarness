@@ -430,6 +430,34 @@ describe("package UI kit integration", () => {
   });
 });
 describe("composer acknowledgement ownership", () => {
+  it("keeps a retyped identical draft after an earlier success, but clears unchanged submissions", async () => {
+    const replies: Array<(value: PackageValue) => void> = [];
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve(page("fixture")) as unknown as Promise<T>;
+        if (operation === "conversations.message.post") return new Promise((resolve) => {
+          replies.push((value) => resolve(value as T));
+        });
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async () => ({ close: async () => undefined }),
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const textarea = root.querySelector<HTMLTextAreaElement>("textarea")!;
+    const type = (value: string) => { textarea.value = value; textarea.dispatchEvent(new Event("input", { bubbles: true })); };
+    const send = () => textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    type("draft A"); send();
+    type("draft B"); type("draft A");
+    replies[0]!({ ok: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(textarea.value).toBe("draft A");
+    send(); replies[1]!({ ok: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(textarea.value).toBe("");
+    await unmount();
+  });
   it.each(["failure", "success"])("preserves B's draft after a late A post %s", async (outcome) => {
     const channels = [snapshot().channels[0]!, { id: "second", slug: "second", canHide: false, unreadCount: 0 }];
     let resolvePost!: (value: PackageValue) => void;
@@ -547,6 +575,49 @@ describe("composer availability", () => {
 });
 
 describe("automatic older history in the Message container", () => {
+  it("shows pending initial-open retry rather than falsely declaring exhaustion", async () => {
+    let retryResolve!: (value: ConversationPage) => void;
+    let retryReject!: (error: Error) => void;
+    let attempts = 0;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") {
+          if (attempts++ === 0) return Promise.reject(new Error("open failed"));
+          return new Promise((resolve, reject) => {
+            retryResolve = (value) => resolve(value as unknown as T);
+            retryReject = reject;
+          });
+        }
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async () => ({ close: async () => undefined }),
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const retry = root.querySelector<HTMLButtonElement>(".retry-older")!;
+    expect(retry.hidden).toBe(false);
+    retry.click();
+    expect(retry.hidden || retry.disabled).toBe(true);
+    expect(root.querySelector(".history-status")?.textContent).toMatch(/loading|retrying/i);
+    expect(root.querySelector(".history-status")?.textContent).not.toContain("Beginning");
+    expect(root.querySelector(".warning")).toBeNull();
+    expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(true);
+    retryReject(new Error("still unavailable"));
+    await vi.waitFor(() => expect(retry.hidden).toBe(false));
+    expect(retry.disabled).toBe(false);
+    expect(root.querySelector(".warning")?.textContent).toContain("history");
+    expect(root.querySelector(".history-status")?.textContent).not.toContain("Beginning");
+    retry.click();
+    expect(retry.hidden || retry.disabled).toBe(true);
+    retryResolve({ messages: [] });
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
+    expect(retry.hidden).toBe(true);
+    expect(root.querySelector(".warning")).toBeNull();
+    expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false);
+    await unmount();
+  });
+
   it("continues past an empty advancing page while already at the top of scrollable history", async () => {
     const replies: Array<(page: ConversationPage) => void> = [];
     const calls: PackageValue[] = [];

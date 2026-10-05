@@ -33,6 +33,7 @@ export class ConversationsView {
   private readonly composer: HTMLFormElement;
   private readonly textarea: HTMLTextAreaElement;
   private readonly sendButton: HTMLButtonElement;
+  private inputRevision = 0;
   private renderedChannelId: string | null = null;
   private renderedOldestId: string | null = null;
   private fillTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,6 +130,7 @@ export class ConversationsView {
     this.textarea.maxLength = 32768;
     this.textarea.placeholder = "Write a message…";
     this.textarea.addEventListener("input", () => {
+      ++this.inputRevision;
       controller.draft = this.textarea.value;
     });
     this.composer.append(this.textarea);
@@ -143,9 +145,10 @@ export class ConversationsView {
       event.preventDefault();
       const markdown = this.textarea.value;
       const channelId = controller.state.selectedChannelId;
+      const revision = this.inputRevision;
       void controller.postMessage(markdown).then((acknowledged) => {
         if (this.disposed || !acknowledged || controller.state.selectedChannelId !== channelId
-          || this.textarea.value !== markdown) return;
+          || this.inputRevision !== revision || this.textarea.value !== markdown) return;
         this.textarea.value = "";
         controller.draft = "";
       });
@@ -203,6 +206,8 @@ export class ConversationsView {
       ? "Retry Channel history" : "Retry older history";
     this.historyStatus.textContent = state.loadingOlder
       ? "Loading older messages…"
+      : state.loading && state.selectedChannelId
+        ? "Loading Channel history…"
       : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError
         ? "Beginning of Channel history"
         : "";
