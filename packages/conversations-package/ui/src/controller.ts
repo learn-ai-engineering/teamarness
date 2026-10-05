@@ -23,6 +23,8 @@ export interface ControllerState {
   readonly nextBefore: string | null;
   readonly loading: boolean;
   readonly loadingOlder: boolean;
+  readonly posting: boolean;
+  readonly retryingHead: boolean;
   readonly olderError: boolean;
   readonly availability: Availability;
   readonly warning: string | null;
@@ -168,6 +170,8 @@ export class ConversationsController {
       nextBefore: null,
       loading: true,
       loadingOlder: false,
+      posting: false,
+      retryingHead: false,
       olderError: false,
       availability: "catching_up",
       warning: null,
@@ -285,6 +289,8 @@ export class ConversationsController {
       nextBefore: null,
       loading: true,
       loadingOlder: false,
+      posting: false,
+      retryingHead: false,
       olderError: false,
       warning: null,
       confirmingHide: false,
@@ -381,6 +387,7 @@ export class ConversationsController {
     if (!this._state.olderError || this.disposed) return;
     const retryHead = this.headFailed;
     this._state = { ...this._state, olderError: false, warning: null,
+      retryingHead: retryHead,
       loading: retryHead && this._state.messages.length === 0 ? true : this._state.loading };
     this.notify();
     if (retryHead) {
@@ -465,9 +472,9 @@ export class ConversationsController {
   async postMessage(markdown: string): Promise<boolean> {
     if (this.disposed) return false;
     const channelId = this._state.selectedChannelId;
-    if (!channelId || !markdown.trim()) return false;
+    if (!channelId || !markdown.trim() || this._state.posting) return false;
     const gen = this.generation;
-    this._state = { ...this._state, loading: true, warning: null };
+    this._state = { ...this._state, posting: true, warning: null };
     this.notify();
 
     try {
@@ -475,15 +482,22 @@ export class ConversationsController {
       if (this.disposed || this.generation !== gen) return false;
       // A committed post can complete while a bounded head backfill continues.
       // Keep the composer responsive instead of awaiting every intervening page.
-      this._state = { ...this._state, loading: false };
-      void this.reloadCurrentChannel();
+      this._state = { ...this._state, posting: false };
+      if (this.headFailed && this.headBackfill) {
+        // Do not resume a known-failing page on send. Explicit retry bridges
+        // the gap, then fetches the head again to include the post.
+        ++this.headRevision;
+        this.headQueued = true;
+      } else {
+        void this.reloadCurrentChannel();
+      }
       return true;
     } catch (error) {
       if (this.disposed || this.generation !== gen) return false;
       const info = classify(error);
       this._state = {
         ...this._state,
-        loading: false,
+        posting: false,
         warning: errorMessage("message.post", info, this._state.availability),
       };
       return false;
@@ -520,7 +534,7 @@ export class ConversationsController {
       this.headFailed = false;
       this.headBackfill = null;
       this._state = { ...this._state, selectedChannelId: null, messages: [], hasMore: false,
-        nextBefore: null, loading: false, loadingOlder: false, olderError: false };
+        nextBefore: null, loading: false, loadingOlder: false, posting: false, retryingHead: false, olderError: false };
       this.notify();
       return;
     }
@@ -580,7 +594,13 @@ export class ConversationsController {
         }
         const known = new Set(this._state.messages.map((m) => m.id));
         let count = 0;
-        while (known.size > 0 && !backfill.newest.some((m) => known.has(m.id)) && backfill.nextBefore) {
+        // A fresh head cursor may still be above the retained oldest Message.
+        // When locally exhausted, walk Backend order until we reach that ID.
+        const oldestId = this._state.hasMore ? null : this._state.messages[0]?.id;
+        while (known.size > 0 && backfill.nextBefore
+          && (!backfill.newest.some((m) => known.has(m.id))
+            || (oldestId !== undefined && oldestId !== null
+              && !backfill.newest.some((m) => m.id === oldestId)))) {
           const cursor = backfill.nextBefore;
           if (backfill.cursors.has(cursor)) throw new Error("Non-advancing history cursor");
           if (count >= MAX_HISTORY_PAGES) {
@@ -607,11 +627,14 @@ export class ConversationsController {
           ids.add(message.id);
           return true;
         })];
+        const olderCursor = current.length === 0 ? firstCursor
+          : this._state.hasMore ? this._state.nextBefore : backfill.nextBefore || null;
         this._state = {
           ...this._state, messages,
-          hasMore: current.length ? this._state.hasMore : firstCursor !== null,
-          nextBefore: current.length ? this._state.nextBefore : firstCursor,
+          hasMore: olderCursor !== null,
+          nextBefore: olderCursor,
           loading: false,
+          retryingHead: false,
           olderError: this.headFailed ? false : this._state.olderError,
           warning: this.headFailed ? null : this._state.warning,
         };
@@ -623,7 +646,7 @@ export class ConversationsController {
         if (this.disposed || this.generation !== gen) return;
         this.headFailed = true;
         this.headQueued = false;
-        this._state = { ...this._state, loading: false, olderError: true, warning: "Conversation history could not be refreshed." };
+        this._state = { ...this._state, loading: false, retryingHead: false, olderError: true, warning: "Conversation history could not be refreshed." };
         this.notify();
       }
     } while (this.headQueued && !this.disposed);

@@ -291,7 +291,7 @@ describe("bounded history reconciliation", () => {
     const older = controller.loadOlder();
     const posting = controller.postMessage("fixture post");
     const refresh = controller.applySnapshot(historySnapshot());
-    fake.pending[1]!.reply.resolve(fake.page(32, 1)); await older;
+    fake.pending[1]!.reply.resolve(fake.page(32, 1, "c1")); await older;
     const postCall = fake.pending.find((p) => p.operation === "conversations.message.post");
     postCall!.reply.resolve({ ok: true }); await fake.flush();
     const open = fake.pending.find((p) => p.operation === "conversations.channel.open" && p !== fake.pending[0]);
@@ -310,7 +310,7 @@ describe("bounded history reconciliation", () => {
     }
     await fake.flush(); await posting; await refresh;
     expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 140 }, (_, i) => i + 1));
-    expect(controller.state.nextBefore).toBeNull();
+    expect(controller.state.nextBefore).toBe("c1");
   });
 });
 
@@ -344,7 +344,7 @@ describe("resumable head reconciliation", () => {
     const fake = historyClient();
     const controller = new ConversationsController(fake.instance, () => undefined);
     const initial = controller.initialize(); await fake.flush();
-    fake.pending[0]!.reply.resolve(fake.page(32, 1)); await initial;
+    fake.pending[0]!.reply.resolve(fake.page(32, 1, "c1")); await initial;
     const refresh = controller.applySnapshot(historySnapshot());
     fake.pending[1]!.reply.resolve(fake.page(1120, 1089, "c1089")); await fake.flush();
     for (let i = 0; i < 32; i++) {
@@ -515,11 +515,11 @@ describe("live history request ownership", () => {
     const initial = controller.initialize(); await fake.flush();
     fake.pending[0]!.reply.resolve(fake.page(64, 33, "c33")); await initial;
     const older = controller.loadOlder();
-    fake.pending[1]!.reply.resolve(fake.page(32, 1)); await older;
+    fake.pending[1]!.reply.resolve(fake.page(32, 1, "c1")); await older;
     const refresh = controller.applySnapshot(historySnapshot());
     fake.pending[2]!.reply.resolve(fake.page(66, 35, "c35")); await refresh;
     expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 66 }, (_, i) => i + 1));
-    expect(controller.state.hasMore).toBe(false);
+    expect(controller.state.hasMore).toBe(true);
   });
 
   it("keeps visible history and offers retry when head backfill fails", async () => {
@@ -559,7 +559,7 @@ describe("posting while a head backfill is pending", () => {
     const fake = historyClient();
     const controller = new ConversationsController(fake.instance, () => undefined);
     const initial = controller.initialize(); await fake.flush();
-    fake.pending[0]!.reply.resolve(fake.page(32, 1)); await initial;
+    fake.pending[0]!.reply.resolve(fake.page(32, 1, "c1")); await initial;
     const refresh = controller.applySnapshot(historySnapshot());
     fake.pending[1]!.reply.resolve(fake.page(96, 65, "c65")); await fake.flush();
     const post = controller.postMessage("fixture post");
@@ -571,6 +571,79 @@ describe("posting while a head backfill is pending", () => {
     const queued = fake.pending.find((p, i) => i > 4 && p.operation === "conversations.channel.open");
     if (queued) queued.reply.resolve(fake.page(96, 65, "c65"));
     await refresh;
+  });
+});
+
+describe("corrective history and posting races", () => {
+  it("reopens terminal history only after locating the retained oldest in Backend page order", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(64, 33, "c33")); await initial;
+    const older = controller.loadOlder(); fake.pending[1]!.reply.resolve(fake.page(32, 1, "c1")); await older;
+    const terminal = controller.loadOlder(); fake.pending[2]!.reply.resolve({ messages: [] }); await terminal;
+    expect(controller.state.hasMore).toBe(false);
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[3]!.reply.resolve(fake.page(80, 49, "c49")); await fake.flush();
+    expect(fake.pending[4]?.payload).toEqual({ channelId: CHANNEL, before: "c49", limit: 32 });
+    fake.pending[4]!.reply.resolve(fake.page(48, 17, "c17")); await fake.flush();
+    expect(fake.pending[5]?.payload).toEqual({ channelId: CHANNEL, before: "c17", limit: 32 });
+    fake.pending[5]!.reply.resolve(fake.page(16, -15, "c-15")); await refresh;
+    expect(controller.state.hasMore).toBe(true);
+    expect(controller.state.nextBefore).toBe("c-15");
+    const newlyOlder = controller.loadOlder();
+    expect(fake.pending[6]?.payload).toEqual({ channelId: CHANNEL, before: "c-15", limit: 32 });
+    fake.pending[6]!.reply.resolve(fake.page(-16, -33)); await newlyOlder;
+    expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 114 }, (_, i) => i - 33));
+    expect(new Set(controller.state.messages.map((m) => m.id)).size).toBe(114);
+  });
+
+  it("keeps post ownership during a live refresh and releases it on failure or stale Channel switch", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(1, 1)); await initial;
+    const post = controller.postMessage("draft");
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[2]!.reply.resolve(fake.page(2, 1)); await refresh;
+    expect(controller.state.posting).toBe(true);
+    expect(await controller.postMessage("draft")).toBe(false);
+    expect(fake.pending.filter((r) => r.operation === "conversations.message.post")).toHaveLength(1);
+    fake.pending[1]!.reply.reject(new Error("ack failed")); expect(await post).toBe(false);
+    expect(controller.state.posting).toBe(false);
+    const stale = controller.postMessage("draft");
+    const switched = controller.selectChannel(OTHER_CHANNEL);
+    fake.pending[4]!.reply.resolve(fake.page(3, 3)); await switched;
+    fake.pending[3]!.reply.resolve({ ok: true }); expect(await stale).toBe(false);
+    expect(controller.state.posting).toBe(false);
+    const next = controller.postMessage("other draft");
+    fake.pending[5]!.reply.resolve({ ok: true }); expect(await next).toBe(true);
+    // The successful post queues a fresh head request; disposal prevents its late reply changing state.
+    controller.dispose();
+    fake.pending[6]!.reply.resolve(fake.page(4, 4)); await fake.flush();
+  });
+
+  it("posts without retrying a failed head gap and resumes it only on explicit retry", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(1, 1, "c1")); await initial;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve(fake.page(96, 65, "c65")); await fake.flush();
+    fake.pending[2]!.reply.reject(new Error("gap failed")); await refresh;
+    const post = controller.postMessage("draft");
+    fake.pending[3]!.reply.resolve({ ok: true }); expect(await post).toBe(true);
+    await fake.flush();
+    expect(fake.pending).toHaveLength(4);
+    expect(controller.state.olderError).toBe(true);
+    expect(controller.state.messages.map((m) => m.id)).toEqual(["1"]);
+    const retry = controller.retryOlder();
+    expect(fake.pending[4]?.payload).toEqual({ channelId: CHANNEL, before: "c65", limit: 32 });
+    fake.pending[4]!.reply.resolve(fake.page(64, 33, "c33")); await fake.flush();
+    fake.pending[5]!.reply.resolve(fake.page(32, 1)); await fake.flush();
+    expect(fake.pending[6]?.operation).toBe("conversations.channel.open");
+    fake.pending[6]!.reply.resolve(fake.page(97, 66, "c66")); await retry;
+    expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 97 }, (_, i) => i + 1));
   });
 });
 

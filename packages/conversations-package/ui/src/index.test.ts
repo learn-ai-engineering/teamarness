@@ -521,6 +521,52 @@ describe("composer acknowledgement ownership", () => {
   });
 });
 
+describe("pending post and live refresh", () => {
+  it("keeps Send disabled and the draft intact until acknowledgement despite a live refresh", async () => {
+    let deliver!: (value: ConversationSnapshot) => void | Promise<void>;
+    let resolvePost!: (value: PackageValue) => void;
+    let rejectPost!: (error: Error) => void;
+    let posts = 0;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve(page("fixture")) as unknown as Promise<T>;
+        if (operation === "conversations.message.post") {
+          posts++;
+          return new Promise((resolve, reject) => {
+            resolvePost = (value) => resolve(value as T);
+            rejectPost = reject;
+          });
+        }
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async (_operation, _payload, listener) => {
+        deliver = listener as unknown as typeof deliver;
+        return { close: async () => undefined };
+      },
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const textarea = root.querySelector<HTMLTextAreaElement>("textarea")!;
+    const button = root.querySelector<HTMLButtonElement>(".composer button")!;
+    const send = () => textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    textarea.value = "draft"; textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    send();
+    await deliver(snapshot());
+    expect(button.disabled).toBe(true);
+    send();
+    expect(posts).toBe(1);
+    rejectPost(new Error("ack failed"));
+    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    expect(textarea.value).toBe("draft");
+    send(); expect(posts).toBe(2);
+    resolvePost({ ok: true });
+    await vi.waitFor(() => expect(textarea.value).toBe(""));
+    expect(button.disabled).toBe(false);
+    await unmount();
+  });
+});
+
 describe("composer availability", () => {
   async function mountWith(availability: string) {
     const close = vi.fn(async () => undefined);
@@ -615,6 +661,127 @@ describe("automatic older history in the Message container", () => {
     expect(retry.hidden).toBe(true);
     expect(root.querySelector(".warning")).toBeNull();
     expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false);
+    await unmount();
+  });
+
+  it("reopens exhausted history on live projection and pages from the retained oldest", async () => {
+    const numbered = (high: number, low: number) => Array.from({ length: high - low + 1 }, (_, i) =>
+      ({ ...message(String(high - i)), id: String(high - i) }));
+    let head = false;
+    const calls: string[] = [];
+    const source = createFakePackageClient({
+      requests: {
+        "conversations.snapshot": () => snapshot(),
+        "conversations.channel.open": () => head
+          ? { messages: numbered(64, 33), nextBefore: "c33" }
+          : { messages: numbered(32, 1), nextBefore: "c1" },
+        "conversations.channel.page": (payload): PackageValue => {
+          const before = (payload as { before: string }).before;
+          calls.push(before);
+          if (before === "c1" && !head) return { messages: [] };
+          if (before === "c33") return { messages: numbered(32, 1), nextBefore: "c1" };
+          if (before === "c1") return { messages: numbered(0, -31) };
+          throw new Error(`Unexpected cursor: ${before}`);
+        },
+      },
+      subscriptions: { "conversations.changes": () => undefined },
+    });
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const history = root.querySelector<HTMLElement>(".message-history")!;
+    Object.defineProperty(history, "clientHeight", { get: () => 100 });
+    Object.defineProperty(history, "scrollHeight", { get: () => history.querySelectorAll(".message").length * 30 });
+    history.scrollTop = 0; history.dispatchEvent(new Event("scroll"));
+    await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
+    head = true;
+    await source.emit("conversations.changes", snapshot());
+    expect(calls).toEqual(["c1", "c33"]);
+    expect(root.querySelector(".history-exhausted")).toBeNull();
+    history.scrollTop = 0; history.dispatchEvent(new Event("scroll"));
+    await vi.waitFor(() => expect(history.querySelectorAll(".message")).toHaveLength(96));
+    expect(calls).toEqual(["c1", "c33", "c1"]);
+    expect([...history.querySelectorAll(".message-markdown")].map((row) => Number(row.textContent?.trim())))
+      .toEqual(Array.from({ length: 96 }, (_, i) => i - 31));
+    await unmount();
+  });
+
+  it("keeps sending and the explicit Retry usable after a failed head gap", async () => {
+    let deliver!: (value: ConversationSnapshot) => void | Promise<void>;
+    let pageAttempts = 0;
+    let openAttempts = 0;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve(openAttempts++ === 0
+          ? { messages: [message("known")] }
+          : { messages: [message("new")], nextBefore: "gap" }) as unknown as Promise<T>;
+        if (operation === "conversations.channel.page") {
+          pageAttempts++;
+          return pageAttempts === 1 ? Promise.reject(new Error("failed gap"))
+            : Promise.resolve({ messages: [message("known")] }) as unknown as Promise<T>;
+        }
+        if (operation === "conversations.message.post") return Promise.resolve({ ok: true }) as unknown as Promise<T>;
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async (_operation, _payload, listener) => {
+        deliver = listener as unknown as typeof deliver;
+        return { close: async () => undefined };
+      },
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    await deliver(snapshot());
+    const retry = root.querySelector<HTMLButtonElement>(".retry-older")!;
+    expect(retry.hidden).toBe(false);
+    const textarea = root.querySelector<HTMLTextAreaElement>("textarea")!;
+    textarea.value = "draft";
+    textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(textarea.value).toBe(""));
+    expect(pageAttempts).toBe(1);
+    expect(retry.hidden).toBe(false);
+    retry.click();
+    await vi.waitFor(() => expect(retry.hidden).toBe(true));
+    expect(pageAttempts).toBe(2);
+    await unmount();
+  });
+
+  it("announces progress during a nonempty failed head retry without blocking Send", async () => {
+    let deliver!: (value: ConversationSnapshot) => void | Promise<void>;
+    let rejectGap!: (error: Error) => void;
+    let resolveRetry!: (value: ConversationPage) => void;
+    let opens = 0;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string, payload: PackageValue): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve(opens++ === 0
+          ? { messages: [message("known")] }
+          : { messages: [message("new")], nextBefore: "gap" }) as unknown as Promise<T>;
+        if (operation === "conversations.channel.page") {
+          expect(payload).toEqual({ channelId: snapshot().channels[0]!.id, before: "gap", limit: 32 });
+          if (!rejectGap) return new Promise((_, reject) => { rejectGap = reject; });
+          return new Promise((resolve) => { resolveRetry = (value) => resolve(value as unknown as T); });
+        }
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async (_operation, _payload, listener) => {
+        deliver = listener as unknown as typeof deliver;
+        return { close: async () => undefined };
+      },
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const refresh = deliver(snapshot());
+    await vi.waitFor(() => expect(rejectGap).toBeDefined());
+    rejectGap(new Error("failed gap")); await refresh;
+    const retry = root.querySelector<HTMLButtonElement>(".retry-older")!;
+    expect(retry.hidden).toBe(false);
+    retry.click();
+    expect(root.querySelector(".history-status")?.textContent).toContain("Retrying Channel history");
+    expect(root.querySelector(".history-status")?.textContent).not.toContain("Beginning");
+    expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false);
+    expect(retry.hidden).toBe(true);
+    resolveRetry({ messages: [message("known")] });
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
     await unmount();
   });
 

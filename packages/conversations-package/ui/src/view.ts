@@ -201,17 +201,18 @@ export class ConversationsView {
 
     // --- paging feedback ---
     this.retryButton.hidden = !state.olderError;
-    this.retryButton.disabled = state.loadingOlder;
+    this.retryButton.disabled = state.loadingOlder || state.retryingHead;
     this.retryButton.textContent = !state.hasMore && state.messages.length === 0
       ? "Retry Channel history" : "Retry older history";
     this.historyStatus.textContent = state.loadingOlder
       ? "Loading older messages…"
+      : state.retryingHead ? "Retrying Channel history…"
       : state.loading && state.selectedChannelId
         ? "Loading Channel history…"
       : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError
         ? "Beginning of Channel history"
         : "";
-    this.historyStatus.classList.toggle("history-exhausted", !state.hasMore && !state.olderError && !state.loading);
+    this.historyStatus.classList.toggle("history-exhausted", !state.hasMore && !state.olderError && !state.loading && !state.retryingHead);
 
     // --- composer (patch only; never recreate) ---
     this.patchComposer(state);
@@ -474,6 +475,7 @@ export class ConversationsView {
     const canSend =
       state.selectedChannelId !== null &&
       !state.loading &&
+      !state.posting &&
       state.availability !== "waiting_for_history_access";
     this.sendButton.disabled = !canSend;
     this.textarea.placeholder = state.selectedChannelId
