@@ -182,6 +182,44 @@ function historySnapshot() {
 }
 
 describe("bounded history reconciliation", () => {
+  it("crosses advancing empty older pages to reach readable history without concurrent requests", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(64, 33, "c33")); await initial;
+    const older = controller.loadOlder();
+    void controller.loadOlder();
+    fake.pending[1]!.reply.resolve({ messages: [], nextBefore: "c1" }); await fake.flush();
+    expect(fake.pending[2]?.payload).toEqual({ channelId: CHANNEL, before: "c1", limit: 32 });
+    expect(controller.state.loadingOlder).toBe(true);
+    fake.pending[2]!.reply.resolve(fake.page(1, 1)); await older;
+    expect(controller.state.messages.map((m) => m.id)).toEqual(["1", ...fake.page(64, 33).messages.map((m) => m.id).reverse()]);
+    expect(controller.state.hasMore).toBe(false);
+    expect(fake.pending).toHaveLength(3);
+  });
+
+  it("stops an advancing empty-page run at a bounded retry instead of spinning", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1, "c0")); await initial;
+    const older = controller.loadOlder();
+    for (let i = 1; i <= 32; i++) {
+      fake.pending[i]!.reply.resolve({ messages: [], nextBefore: `c${i}` });
+      await fake.flush();
+    }
+    await older;
+    expect(fake.pending).toHaveLength(33);
+    expect(controller.state.olderError).toBe(true);
+    expect(controller.state.messages).toHaveLength(32);
+    await controller.loadOlder();
+    expect(fake.pending).toHaveLength(33);
+    const retry = controller.retryOlder();
+    expect(fake.pending[33]?.payload).toEqual({ channelId: CHANNEL, before: "c32", limit: 32 });
+    fake.pending[33]!.reply.resolve(fake.page(0, 0)); await retry;
+    expect(controller.state.olderError).toBe(false);
+  });
+
   it("chains strict older cursors, deduplicates, and stops after a terminal empty page", async () => {
     const fake = historyClient();
     const controller = new ConversationsController(fake.instance, () => undefined);
@@ -277,6 +315,61 @@ describe("bounded history reconciliation", () => {
 });
 
 describe("live history request ownership", () => {
+  it("bounds an empty advancing head run and leaves explicit retry", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1)); await initial;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve({ messages: [], nextBefore: "c1" }); await fake.flush();
+    for (let i = 2; i <= 33; i++) {
+      fake.pending[i]!.reply.resolve({ messages: [], nextBefore: `c${i}` });
+      await fake.flush();
+    }
+    await refresh;
+    expect(fake.pending).toHaveLength(34);
+    expect(controller.state.olderError).toBe(true);
+    expect(controller.state.messages).toHaveLength(32);
+  });
+
+  it("bridges empty advancing head pages before finding overlap", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1)); await initial;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve({ messages: [], nextBefore: "gap" }); await fake.flush();
+    expect(fake.pending[2]?.payload).toEqual({ channelId: CHANNEL, before: "gap", limit: 32 });
+    fake.pending[2]!.reply.resolve(fake.page(96, 65, "overlap")); await fake.flush();
+    expect(fake.pending[3]?.payload).toEqual({ channelId: CHANNEL, before: "overlap", limit: 32 });
+    fake.pending[3]!.reply.resolve(fake.page(64, 33, "known")); await fake.flush();
+    fake.pending[4]!.reply.resolve(fake.page(32, 1)); await refresh;
+    expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 96 }, (_, i) => i + 1));
+  });
+
+  it.each(["initial", "switch"])("offers explicit open retry after %s Channel failure, then recognizes successful exhaustion", async (mode) => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    if (mode === "switch") {
+      fake.pending[0]!.reply.resolve(fake.page(1, 1)); await initial;
+      const selected = controller.selectChannel(OTHER_CHANNEL);
+      fake.pending[1]!.reply.reject(new Error("open failed")); await selected;
+    } else {
+      fake.pending[0]!.reply.reject(new Error("open failed")); await initial;
+    }
+    expect(controller.state.olderError).toBe(true);
+    expect(controller.state.hasMore).toBe(false);
+    const count = fake.pending.length;
+    await controller.loadOlder();
+    expect(fake.pending).toHaveLength(count);
+    const retry = controller.retryOlder();
+    expect(fake.pending[count]?.operation).toBe("conversations.channel.open");
+    fake.pending[count]!.reply.resolve({ messages: [] }); await retry;
+    expect(controller.state.olderError).toBe(false);
+    expect(controller.state.hasMore).toBe(false);
+  });
+
   it("drains B's queued refresh after A's stale head request settles", async () => {
     const fake = historyClient();
     const controller = new ConversationsController(fake.instance, () => undefined);

@@ -32,6 +32,7 @@ export interface ControllerState {
 }
 
 export const PAGE_SIZE = 32;
+const MAX_HISTORY_PAGES = 32;
 
 /**
  * The Backend pages a Channel newest Message first; the view reads top to bottom.
@@ -214,9 +215,11 @@ export class ConversationsController {
         };
       } catch {
         if (this.disposed || this.generation !== gen) return;
+        this.headFailed = true;
         this._state = {
           ...this._state,
           loading: false,
+          olderError: true,
           warning: "Conversation history is temporarily unavailable.",
         };
       } finally {
@@ -293,9 +296,11 @@ export class ConversationsController {
     } catch (error) {
       if (this.disposed || this.generation !== gen) return;
       const info = classify(error);
+      this.headFailed = true;
       this._state = {
         ...this._state,
         loading: false,
+        olderError: true,
         warning: errorMessage("channel.open", info, this._state.availability),
       };
     } finally {
@@ -315,12 +320,24 @@ export class ConversationsController {
     this.notify();
 
     try {
-      const page = await this.client.request(
-        "conversations.channel.page",
-        { channelId: selectedChannelId, before: nextBefore, limit: PAGE_SIZE },
-      );
-      if (this.disposed || this.generation !== gen) return;
-      if (page.nextBefore === nextBefore) throw new Error("Non-advancing history cursor");
+      let cursor = nextBefore;
+      const cursors = new Set([cursor]);
+      let page;
+      for (let count = 0; count < MAX_HISTORY_PAGES; count++) {
+        page = await this.client.request(
+          "conversations.channel.page",
+          { channelId: selectedChannelId, before: cursor, limit: PAGE_SIZE },
+        );
+        if (this.disposed || this.generation !== gen) return;
+        if (page.nextBefore && cursors.has(page.nextBefore)) throw new Error("Non-advancing history cursor");
+        if (page.messages.length || !page.nextBefore) break;
+        cursor = page.nextBefore;
+        cursors.add(cursor);
+        // Retain progress even when the bounded run or a subsequent request fails.
+        this._state = { ...this._state, nextBefore: cursor };
+        if (count === MAX_HISTORY_PAGES - 1) throw new Error("History page limit reached");
+      }
+      if (!page) return;
       // Deduplicate by message id. Older Messages belong above the ones already shown.
       const existing = new Set(this._state.messages.map((m) => m.id));
       const fresh = page.messages.filter((message) => {
@@ -539,9 +556,9 @@ export class ConversationsController {
         const newest = [...oldestFirst(page.messages)];
         const known = new Set(this._state.messages.map((m) => m.id));
         const cursors = new Set<string>();
-        while (known.size > 0 && newest.length > 0 && !newest.some((m) => known.has(m.id)) && page.nextBefore) {
+        while (known.size > 0 && !newest.some((m) => known.has(m.id)) && page.nextBefore) {
           if (this.disposed || this.generation !== gen || revision !== this.headRevision) break;
-          if (cursors.has(page.nextBefore)) throw new Error("Non-advancing history cursor");
+          if (cursors.size >= MAX_HISTORY_PAGES || cursors.has(page.nextBefore)) throw new Error("History cursor limit reached");
           cursors.add(page.nextBefore);
           page = await this.client.request("conversations.channel.page", {
             channelId, before: page.nextBefore, limit: PAGE_SIZE,

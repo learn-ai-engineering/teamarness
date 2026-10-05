@@ -547,6 +547,75 @@ describe("composer availability", () => {
 });
 
 describe("automatic older history in the Message container", () => {
+  it("continues past an empty advancing page while already at the top of scrollable history", async () => {
+    const replies: Array<(page: ConversationPage) => void> = [];
+    const calls: PackageValue[] = [];
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string, payload: PackageValue): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve({ messages: [message("newest")], nextBefore: "first" }) as unknown as Promise<T>;
+        if (operation === "conversations.channel.page") {
+          calls.push(payload);
+          return new Promise((resolve) => { replies.push((page) => resolve(page as unknown as T)); });
+        }
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async () => ({ close: async () => undefined }),
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const history = root.querySelector<HTMLElement>(".message-history")!;
+    Object.defineProperty(history, "clientHeight", { get: () => 100 });
+    Object.defineProperty(history, "scrollHeight", { get: () => 900 });
+    history.scrollTop = 0;
+    history.dispatchEvent(new Event("scroll"));
+    expect(calls).toHaveLength(1);
+    replies[0]!({ messages: [], nextBefore: "second" });
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toEqual({ channelId: snapshot().channels[0]!.id, before: "second", limit: 32 });
+    replies[1]!({ messages: [message("older")] });
+    await vi.waitFor(() => expect(history.querySelectorAll(".message")).toHaveLength(2));
+    expect(root.querySelector(".history-exhausted")?.textContent).toContain("Beginning");
+    await unmount();
+  });
+
+  it.each(["initial", "switch"])("shows a keyboard-operable retry, not exhaustion, after %s open failure", async (mode) => {
+    const channels = [snapshot().channels[0]!, { id: "second", slug: "second", canHide: false, unreadCount: 0 }];
+    let failures = 1;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string, payload: PackageValue): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve({ ...snapshot(), channels }) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") {
+          if ((mode === "initial" || (payload as { channelId: string }).channelId === "second") && failures-- > 0) return Promise.reject(new Error("open failed"));
+          return Promise.resolve({ messages: [] }) as unknown as Promise<T>;
+        }
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async () => ({ close: async () => undefined }),
+    };
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ root, client }));
+    if (mode === "switch") {
+      root.querySelector<HTMLButtonElement>('[data-channel-id="second"]')!.click();
+      await vi.waitFor(() => expect(root.querySelector('[data-channel-id="second"]')?.getAttribute("aria-current")).toBe("page"));
+      await vi.waitFor(() => expect(root.querySelector(".warning")).not.toBeNull());
+    }
+    expect(root.querySelector(".history-status")?.textContent).not.toContain("Beginning");
+    const retry = root.querySelector<HTMLButtonElement>(".retry-older")!;
+    expect(retry.hidden).toBe(false);
+    expect(retry.disabled).toBe(false);
+    expect(retry.textContent).toBe("Retry Channel history");
+    retry.focus();
+    expect(root.activeElement).toBe(retry);
+    retry.click();
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
+    expect(retry.hidden).toBe(true);
+    await unmount();
+    host.remove();
+  });
+
   function scrollBackend() {
     let resolvePage!: (page: ConversationPage) => void;
     let rejectPage!: (error: Error) => void;

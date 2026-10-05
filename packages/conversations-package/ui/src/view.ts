@@ -199,6 +199,8 @@ export class ConversationsView {
     // --- paging feedback ---
     this.retryButton.hidden = !state.olderError;
     this.retryButton.disabled = state.loadingOlder;
+    this.retryButton.textContent = !state.hasMore && state.messages.length === 0
+      ? "Retry Channel history" : "Retry older history";
     this.historyStatus.textContent = state.loadingOlder
       ? "Loading older messages…"
       : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError
