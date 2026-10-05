@@ -23,6 +23,7 @@ export interface ControllerState {
   readonly nextBefore: string | null;
   readonly loading: boolean;
   readonly loadingOlder: boolean;
+  readonly olderError: boolean;
   readonly availability: Availability;
   readonly warning: string | null;
   readonly warnings: readonly string[];
@@ -134,6 +135,10 @@ export class ConversationsController {
   private _state: ControllerState;
   private generation = 0;
   private disposed = false;
+  private headRequest: Promise<void> | null = null;
+  private headQueued = false;
+  private headRevision = 0;
+  private headFailed = false;
   private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
@@ -153,6 +158,7 @@ export class ConversationsController {
       nextBefore: null,
       loading: true,
       loadingOlder: false,
+      olderError: false,
       availability: "catching_up",
       warning: null,
       warnings: [],
@@ -176,8 +182,10 @@ export class ConversationsController {
     // Fetch snapshot first, then load messages for the default channel.
     try {
       const snapshot = await this.client.request("conversations.snapshot", {});
+      if (this.disposed) return;
       this.applySnapshotSync(snapshot);
     } catch {
+      if (this.disposed) return;
       this._state = {
         ...this._state,
         loading: false,
@@ -189,13 +197,14 @@ export class ConversationsController {
     }
 
     const selectedId = this._state.selectedChannelId;
+    const gen = this.generation;
     if (selectedId) {
       try {
         const page = await this.client.request(
           "conversations.channel.open",
           { channelId: selectedId, limit: PAGE_SIZE },
         );
-        if (this.disposed) return;
+        if (this.disposed || this.generation !== gen) return;
         this._state = {
           ...this._state,
           messages: oldestFirst(page.messages),
@@ -204,14 +213,14 @@ export class ConversationsController {
           loading: false,
         };
       } catch {
-        if (this.disposed) return;
+        if (this.disposed || this.generation !== gen) return;
         this._state = {
           ...this._state,
           loading: false,
           warning: "Conversation history is temporarily unavailable.",
         };
       } finally {
-        if (!this.disposed) this.notify();
+        if (!this.disposed && this.generation === gen) this.notify();
       }
     }
   }
@@ -237,7 +246,7 @@ export class ConversationsController {
   /** Dispose all pending work. Safe to call multiple times. */
   dispose(): void {
     this.disposed = true;
-    this.generation = 0;
+    ++this.generation;
   }
 
   // ------------------------------------------------------------------
@@ -253,6 +262,7 @@ export class ConversationsController {
     if (this._state.selectedChannelId === channelId) return;
 
     const gen = ++this.generation;
+    this.headFailed = false;
     this._state = {
       ...this._state,
       selectedChannelId: channelId,
@@ -261,6 +271,7 @@ export class ConversationsController {
       nextBefore: null,
       loading: true,
       loadingOlder: false,
+      olderError: false,
       warning: null,
       confirmingHide: false,
     };
@@ -295,9 +306,10 @@ export class ConversationsController {
   /** Load the next page of older messages. */
   async loadOlder(): Promise<void> {
     if (this.disposed) return;
-    const { hasMore, nextBefore, loadingOlder, selectedChannelId } =
+    const { hasMore, nextBefore, loadingOlder, selectedChannelId, olderError } =
       this._state;
-    if (!hasMore || !nextBefore || loadingOlder || !selectedChannelId) return;
+    if (!hasMore || !nextBefore || loadingOlder || !selectedChannelId || olderError) return;
+    const gen = this.generation;
 
     this._state = { ...this._state, loadingOlder: true, warning: null };
     this.notify();
@@ -307,10 +319,15 @@ export class ConversationsController {
         "conversations.channel.page",
         { channelId: selectedChannelId, before: nextBefore, limit: PAGE_SIZE },
       );
-      if (this.disposed) return;
+      if (this.disposed || this.generation !== gen) return;
+      if (page.nextBefore === nextBefore) throw new Error("Non-advancing history cursor");
       // Deduplicate by message id. Older Messages belong above the ones already shown.
       const existing = new Set(this._state.messages.map((m) => m.id));
-      const fresh = page.messages.filter((m) => !existing.has(m.id));
+      const fresh = page.messages.filter((message) => {
+        if (existing.has(message.id)) return false;
+        existing.add(message.id);
+        return true;
+      });
       this._state = {
         ...this._state,
         messages: [...oldestFirst(fresh), ...this._state.messages],
@@ -319,14 +336,28 @@ export class ConversationsController {
         loadingOlder: false,
       };
     } catch {
-      if (this.disposed) return;
+      if (this.disposed || this.generation !== gen) return;
       this._state = {
         ...this._state,
         loadingOlder: false,
+        olderError: true,
         warning: "Older history could not be loaded.",
       };
     } finally {
-      if (!this.disposed) this.notify();
+      if (!this.disposed && this.generation === gen) this.notify();
+    }
+  }
+
+  /** A failed request is retried only by an explicit action, never by scrolling. */
+  async retryOlder(): Promise<void> {
+    if (!this._state.olderError || this.disposed) return;
+    this._state = { ...this._state, olderError: false, warning: null };
+    this.notify();
+    if (this.headFailed) {
+      this.headFailed = false;
+      await this.reloadCurrentChannel();
+    } else {
+      await this.loadOlder();
     }
   }
 
@@ -406,29 +437,19 @@ export class ConversationsController {
     if (this.disposed) return;
     const channelId = this._state.selectedChannelId;
     if (!channelId || !markdown.trim()) return;
+    const gen = this.generation;
     this._state = { ...this._state, loading: true, warning: null };
     this.notify();
 
     try {
-      await this.client.request("conversations.message.post", {
-        channelId,
-        markdown,
-      });
-      if (this.disposed) return;
-      const page = await this.client.request(
-        "conversations.channel.open",
-        { channelId, limit: PAGE_SIZE },
-      );
-      if (this.disposed) return;
-      this._state = {
-        ...this._state,
-        messages: oldestFirst(page.messages),
-        hasMore: page.nextBefore !== undefined,
-        nextBefore: page.nextBefore ?? null,
-        loading: false,
-      };
+      await this.client.request("conversations.message.post", { channelId, markdown });
+      if (this.disposed || this.generation !== gen) return;
+      // A committed post can complete while a bounded head backfill continues.
+      // Keep the composer responsive instead of awaiting every intervening page.
+      this._state = { ...this._state, loading: false };
+      void this.reloadCurrentChannel();
     } catch (error) {
-      if (this.disposed) return;
+      if (this.disposed || this.generation !== gen) return;
       const info = classify(error);
       this._state = {
         ...this._state,
@@ -436,7 +457,7 @@ export class ConversationsController {
         warning: errorMessage("message.post", info, this._state.availability),
       };
     } finally {
-      if (!this.disposed) this.notify();
+      if (!this.disposed && this.generation === gen) this.notify();
     }
   }
 
@@ -462,21 +483,13 @@ export class ConversationsController {
       : (general?.id ?? channels[0]?.id ?? null);
 
     if (selectedId !== this._state.selectedChannelId) {
-      // Channel was removed — switch to fallback and reload.
-      this._state = {
-        ...this._state,
-        channels,
-        availability,
-        warnings: snapshot.warnings ?? [],
-        selectedChannelId: selectedId,
-        messages: [],
-        hasMore: false,
-        nextBefore: null,
-        loading: true,
-        warning: null,
-      };
+      this._state = { ...this._state, channels, availability, warnings: snapshot.warnings ?? [] };
+      if (selectedId) return this.selectChannel(selectedId);
+      ++this.generation;
+      this.headFailed = false;
+      this._state = { ...this._state, selectedChannelId: null, messages: [], hasMore: false,
+        nextBefore: null, loading: false, loadingOlder: false, olderError: false };
       this.notify();
-      if (selectedId) void this.selectChannel(selectedId);
       return;
     }
 
@@ -492,27 +505,71 @@ export class ConversationsController {
     return this.reloadCurrentChannel();
   }
 
-  private async reloadCurrentChannel(): Promise<void> {
-    const channelId = this._state.selectedChannelId;
-    if (!channelId) return;
-    try {
-      const page = await this.client.request(
-        "conversations.channel.open",
-        { channelId, limit: PAGE_SIZE },
-      );
-      if (this.disposed) return;
-      this._state = {
-        ...this._state,
-        messages: oldestFirst(page.messages),
-        hasMore: page.nextBefore !== undefined,
-        nextBefore: page.nextBefore ?? null,
-      };
-    } catch {
-      // Silently ignore reload failures during live updates — the
-      // warning state is already managed by the store.
-    } finally {
-      if (!this.disposed) this.notify();
+  private reloadCurrentChannel(): Promise<void> {
+    if (!this._state.selectedChannelId || this.disposed) return Promise.resolve();
+    ++this.headRevision;
+    if (this.headRequest) {
+      this.headQueued = true;
+      return this.headRequest;
     }
+    const request = this.reconcileHead();
+    this.headRequest = request;
+    void request.finally(() => {
+      if (this.headRequest === request) this.headRequest = null;
+    });
+    return request;
+  }
+
+  private async reconcileHead(): Promise<void> {
+    do {
+      this.headQueued = false;
+      const gen = this.generation;
+      const revision = this.headRevision;
+      const channelId = this._state.selectedChannelId;
+      if (!channelId) return;
+      try {
+        let page = await this.client.request("conversations.channel.open", { channelId, limit: PAGE_SIZE });
+        if (this.disposed || this.generation !== gen) return;
+        const newest = [...oldestFirst(page.messages)];
+        const known = new Set(this._state.messages.map((m) => m.id));
+        const cursors = new Set<string>();
+        while (newest.length > 0 && !newest.some((m) => known.has(m.id)) && page.nextBefore) {
+          if (this.disposed || this.generation !== gen || revision !== this.headRevision) break;
+          if (cursors.has(page.nextBefore)) throw new Error("Non-advancing history cursor");
+          cursors.add(page.nextBefore);
+          page = await this.client.request("conversations.channel.page", {
+            channelId, before: page.nextBefore, limit: PAGE_SIZE,
+          });
+          if (this.disposed || this.generation !== gen) return;
+          newest.unshift(...oldestFirst(page.messages));
+        }
+        if (revision !== this.headRevision) continue;
+        const current = this._state.messages;
+        const overlap = newest.findIndex((m) => known.has(m.id));
+        const retained = overlap < 0 ? current : current.slice(0, current.findIndex((m) => m.id === newest[overlap]!.id));
+        const ids = new Set(retained.map((m) => m.id));
+        const messages = [...retained, ...newest.filter((message) => {
+          if (ids.has(message.id)) return false;
+          ids.add(message.id);
+          return true;
+        })];
+        this._state = {
+          ...this._state, messages,
+          hasMore: current.length ? this._state.hasMore : page.nextBefore !== undefined,
+          nextBefore: current.length ? this._state.nextBefore : page.nextBefore ?? null,
+          olderError: this.headFailed ? false : this._state.olderError,
+          warning: this.headFailed ? null : this._state.warning,
+        };
+        this.headFailed = false;
+        this.notify();
+      } catch {
+        if (this.disposed || this.generation !== gen) return;
+        if (revision !== this.headRevision) continue;
+        this.headFailed = true;
+        this._state = { ...this._state, olderError: true, warning: "Conversation history could not be refreshed." };
+        this.notify();
+      }
+    } while (this.headQueued && !this.disposed);
   }
 
   // ------------------------------------------------------------------

@@ -35,7 +35,10 @@ button, input, textarea { font: inherit; }
 .message-markdown pre { max-width: 100%; overflow: auto; padding: .6rem; background: var(--teamarness-color-panel); }
 .message-markdown code { font-family: ui-monospace, monospace; }
 .message-markdown a { color: var(--teamarness-color-accent); }
-.older-messages { flex: none; align-self: flex-start; margin: .25rem clamp(1rem, 4vw, 3rem) .65rem; }
+.history-status { flex: none; padding: 0 clamp(1rem, 4vw, 3rem); color: var(--teamarness-color-text-muted); font-size: .8rem; }
+.history-status:empty { display: none; }
+.retry-older { flex: none; align-self: flex-start; margin: .25rem clamp(1rem, 4vw, 3rem) .65rem; }
+.retry-older[hidden] { display: none; }
 .composer { flex: none; display: grid; gap: .5rem; margin: 0; padding: .85rem clamp(1rem, 4vw, 3rem); border: 0; border-top: 1px solid var(--teamarness-color-border); border-radius: 0; background: var(--teamarness-color-panel); }
 .composer label { color: var(--teamarness-color-text-muted); font-size: .8rem; font-weight: 650; }
 .composer textarea { width: 100%; min-height: 3rem; max-height: 8rem; resize: vertical; }

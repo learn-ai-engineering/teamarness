@@ -28,11 +28,14 @@ export class ConversationsView {
   private readonly createButton: HTMLButtonElement;
   private readonly createArea: HTMLElement;
   private readonly history: HTMLElement;
-  private readonly olderButton: HTMLButtonElement;
+  private readonly historyStatus: HTMLElement;
+  private readonly retryButton: HTMLButtonElement;
   private readonly composer: HTMLFormElement;
   private readonly textarea: HTMLTextAreaElement;
   private readonly sendButton: HTMLButtonElement;
   private renderedChannelId: string | null = null;
+  private renderedOldestId: string | null = null;
+  private fillTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
 
   constructor(
@@ -97,15 +100,17 @@ export class ConversationsView {
     this.history.className = "message-history";
     this.history.setAttribute("aria-label", "Messages");
     this.panel.append(this.history);
+    this.history.addEventListener("scroll", this.onHistoryScroll);
 
-    // --- load-older button ---
-    this.olderButton = document.createElement("button");
-    this.olderButton.type = "button";
-    this.olderButton.className = `${KIT_CLASS.secondary} older-messages`;
-    this.olderButton.addEventListener("click", () => {
-      void controller.loadOlder();
-    });
-    this.panel.append(this.olderButton);
+    this.historyStatus = document.createElement("div");
+    this.historyStatus.className = "history-status";
+    this.historyStatus.setAttribute("aria-live", "polite");
+    this.retryButton = document.createElement("button");
+    this.retryButton.type = "button";
+    this.retryButton.className = `${KIT_CLASS.secondary} retry-older`;
+    this.retryButton.textContent = "Retry older history";
+    this.retryButton.addEventListener("click", () => { void controller.retryOlder(); });
+    this.panel.append(this.historyStatus, this.retryButton);
 
     // --- composer (built once, never replaced) ---
     this.composer = document.createElement("form");
@@ -190,13 +195,17 @@ export class ConversationsView {
 
     // --- history ---
     this.renderHistory(state);
+    this.scheduleShortHistoryFill();
 
-    // --- older button ---
-    this.olderButton.textContent = state.loadingOlder
+    // --- paging feedback ---
+    this.retryButton.hidden = !state.olderError;
+    this.retryButton.disabled = state.loadingOlder;
+    this.historyStatus.textContent = state.loadingOlder
       ? "Loading older messages…"
-      : "Load older messages";
-    this.olderButton.disabled =
-      !state.hasMore || state.loadingOlder || state.loading;
+      : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError
+        ? "Beginning of Channel history"
+        : "";
+    this.historyStatus.classList.toggle("history-exhausted", !state.hasMore && !state.olderError && !state.loading);
 
     // --- composer (patch only; never recreate) ---
     this.patchComposer(state);
@@ -214,8 +223,32 @@ export class ConversationsView {
 
   dispose(): void {
     this.disposed = true;
+    this.history.removeEventListener("scroll", this.onHistoryScroll);
+    if (this.fillTimer !== null) clearTimeout(this.fillTimer);
     this.root.replaceChildren();
   }
+
+  private scheduleShortHistoryFill(): void {
+    if (this.fillTimer !== null || this.disposed) return;
+    this.fillTimer = setTimeout(() => {
+      this.fillTimer = null;
+      const state = this.controller.state;
+      if (!this.disposed && state.hasMore && !state.loading && !state.loadingOlder
+        && !state.olderError && this.history.clientHeight > 0
+        && this.history.scrollHeight <= this.history.clientHeight) {
+        void this.controller.loadOlder();
+      }
+    }, 0);
+  }
+
+  private readonly onHistoryScroll = (): void => {
+    const state = this.controller.state;
+    if (!this.disposed && this.renderedChannelId === state.selectedChannelId
+      && !state.loading && !state.loadingOlder && !state.olderError && state.hasMore
+      && this.history.scrollTop <= 80) {
+      void this.controller.loadOlder();
+    }
+  };
 
   // ------------------------------------------------------------------
   // region renderers
@@ -384,6 +417,10 @@ export class ConversationsView {
     this.renderedChannelId = state.selectedChannelId;
     const previousTop = this.history.scrollTop;
     const previousHeight = this.history.scrollHeight;
+    const prepended = !openedChannel && this.renderedOldestId !== null
+      && state.messages[0]?.id !== this.renderedOldestId
+      && state.messages.some((message) => message.id === this.renderedOldestId);
+    this.renderedOldestId = state.messages[0]?.id ?? null;
     const wasAtBottom =
       previousHeight - previousTop - this.history.clientHeight < 40;
 
@@ -417,11 +454,11 @@ export class ConversationsView {
       this.history.append(row);
     }
 
-    if (openedChannel || wasAtBottom) {
+    if (openedChannel || (wasAtBottom && !prepended)) {
       this.history.scrollTop = this.history.scrollHeight;
     } else {
-      // Older Messages were added above: keep the Messages that were visible in place.
-      this.history.scrollTop = previousTop + (this.history.scrollHeight - previousHeight);
+      // Only a prepend moves the reading anchor; a live append must not shift it.
+      this.history.scrollTop = previousTop + (prepended ? this.history.scrollHeight - previousHeight : 0);
     }
   }
 

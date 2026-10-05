@@ -138,3 +138,221 @@ describe("createChannel error mapping", () => {
     expect(controller.state.warning).toBe("Channel names use lowercase letters, numbers, and hyphens.");
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function historyClient() {
+  type Response = PackageValue;
+  const pending: { operation: string; payload: PackageValue; reply: ReturnType<typeof deferred<Response>> }[] = [];
+  const untyped: PackageClient = {
+    request: <T extends PackageValue>(operation: string, payload: PackageValue) => {
+      if (operation === "conversations.snapshot") return Promise.resolve({
+        availability: "current",
+        channels: [
+          { id: CHANNEL, slug: "general", canHide: false, unreadCount: 0 },
+          { id: OTHER_CHANNEL, slug: "other", canHide: false, unreadCount: 0 },
+        ],
+      }) as unknown as Promise<T>;
+      const reply = deferred<Response>();
+      pending.push({ operation, payload, reply });
+      return reply.promise as Promise<T>;
+    },
+    subscribe: async () => ({ close: async () => undefined }),
+  };
+  const batch = (start: number, end: number) => Array.from({ length: start - end + 1 }, (_, i) => ({
+    id: String(start - i), markdown: `fixture-${start - i}`, author: "fixture", isLocal: false,
+  }));
+  const page = (start: number, end: number, nextBefore?: string) => ({
+    messages: batch(start, end), ...(nextBefore ? { nextBefore } : {}),
+  });
+  const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+  return { instance: typedPackageClient<ConversationsContract>(untyped), pending, page, flush };
+}
+
+function historySnapshot() {
+  return { availability: "current" as const, channels: [
+    { id: CHANNEL, slug: "general", canHide: false, unreadCount: 0 },
+    { id: OTHER_CHANNEL, slug: "other", canHide: false, unreadCount: 0 },
+  ] };
+}
+
+describe("bounded history reconciliation", () => {
+  it("chains strict older cursors, deduplicates, and stops after a terminal empty page", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize();
+    await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(64, 33, "cursor-33"));
+    await initial;
+    const first = controller.loadOlder();
+    void controller.loadOlder();
+    expect(fake.pending).toHaveLength(2);
+    expect(fake.pending[1]!.payload).toEqual({ channelId: CHANNEL, before: "cursor-33", limit: 32 });
+    fake.pending[1]!.reply.resolve({ messages: [fake.page(33, 33).messages[0]!, ...fake.page(32, 2).messages], nextBefore: "cursor-2" });
+    await first;
+    expect(new Set(controller.state.messages.map((m) => m.id)).size).toBe(63);
+    const last = controller.loadOlder();
+    expect(fake.pending[2]!.payload).toEqual({ channelId: CHANNEL, before: "cursor-2", limit: 32 });
+    fake.pending[2]!.reply.resolve({ messages: fake.page(1, 1).messages, nextBefore: "cursor-1" });
+    await last;
+    const terminal = controller.loadOlder();
+    expect(fake.pending[3]!.payload).toEqual({ channelId: CHANNEL, before: "cursor-1", limit: 32 });
+    fake.pending[3]!.reply.resolve({ messages: [] });
+    await terminal;
+    await controller.loadOlder();
+    expect(fake.pending).toHaveLength(4);
+    expect(new Set(controller.state.messages.map((m) => m.id)).size).toBe(64);
+    expect(controller.state.hasMore).toBe(false);
+  });
+
+  it("keeps history and requires explicit retry after a failed page", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1, "older")); await initial;
+    const failed = controller.loadOlder(); fake.pending[1]!.reply.reject(new Error("fixture failure")); await failed;
+    expect(controller.state.messages).toHaveLength(32);
+    expect(controller.state.olderError).toBe(true);
+    await controller.loadOlder();
+    expect(fake.pending).toHaveLength(2);
+    const retry = controller.retryOlder();
+    expect(fake.pending[2]!.payload).toEqual({ channelId: CHANNEL, before: "older", limit: 32 });
+    fake.pending[2]!.reply.resolve({ messages: [] }); await retry;
+    expect(controller.state.olderError).toBe(false);
+  });
+
+  it("discards pending older and head replies after switching or disposal", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1, "older")); await initial;
+    const older = controller.loadOlder();
+    const refresh = controller.applySnapshot(historySnapshot());
+    const switchRequest = controller.selectChannel(OTHER_CHANNEL);
+    fake.pending[1]!.reply.resolve(fake.page(0, 0));
+    fake.pending[2]!.reply.resolve(fake.page(99, 99));
+    await older; await refresh;
+    fake.pending[3]!.reply.resolve(fake.page(100, 100)); await switchRequest;
+    expect(controller.state.messages.map((m) => m.id)).toEqual(["100"]);
+    const back = controller.selectChannel(CHANNEL);
+    controller.dispose();
+    fake.pending[4]!.reply.resolve(fake.page(200, 200)); await back;
+    expect(controller.state.messages).toEqual([]);
+  });
+
+  it("reconciles a >32 new-Message burst through bounded pages while older paging and posting overlap", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(64, 33, "c33")); await initial;
+    const older = controller.loadOlder();
+    const posting = controller.postMessage("fixture post");
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve(fake.page(32, 1)); await older;
+    const postCall = fake.pending.find((p) => p.operation === "conversations.message.post");
+    postCall!.reply.resolve({ ok: true }); await fake.flush();
+    const open = fake.pending.find((p) => p.operation === "conversations.channel.open" && p !== fake.pending[0]);
+    open!.reply.resolve(fake.page(140, 109, "c109")); await fake.flush();
+    const latestOpen = fake.pending.find((p) => p.operation === "conversations.channel.open" && p !== fake.pending[0] && p !== open);
+    if (latestOpen) { latestOpen.reply.resolve(fake.page(140, 109, "c109")); await fake.flush(); }
+    const next = fake.pending.find((p) => p.operation === "conversations.channel.page" && (p.payload as { before: string }).before === "c109");
+    expect(next).toBeDefined();
+    next!.reply.resolve(fake.page(108, 77, "c77")); await fake.flush();
+    const overlap = fake.pending.find((p) => p.operation === "conversations.channel.page" && (p.payload as { before: string }).before === "c77");
+    expect(overlap).toBeDefined();
+    overlap!.reply.resolve(fake.page(76, 45, "c45")); await fake.flush();
+    // A coalesced refresh may request the head again after the post.
+    for (const request of fake.pending.filter((p) => p.operation === "conversations.channel.open" && p !== fake.pending[0] && p !== open)) {
+      request.reply.resolve(fake.page(140, 109, "c109"));
+    }
+    await fake.flush(); await posting; await refresh;
+    expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 140 }, (_, i) => i + 1));
+    expect(controller.state.nextBefore).toBeNull();
+  });
+});
+
+describe("live history request ownership", () => {
+  it("preserves paged history on an overlapping refresh and follows Backend order", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(64, 33, "c33")); await initial;
+    const older = controller.loadOlder();
+    fake.pending[1]!.reply.resolve(fake.page(32, 1)); await older;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[2]!.reply.resolve(fake.page(66, 35, "c35")); await refresh;
+    expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 66 }, (_, i) => i + 1));
+    expect(controller.state.hasMore).toBe(false);
+  });
+
+  it("keeps visible history and offers retry when head backfill fails", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1)); await initial;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve(fake.page(96, 65, "c65")); await fake.flush();
+    fake.pending[2]!.reply.reject(new Error("fixture failure")); await refresh;
+    expect(controller.state.messages).toHaveLength(32);
+    expect(controller.state.olderError).toBe(true);
+    const retry = controller.retryOlder();
+    fake.pending[3]!.reply.resolve(fake.page(96, 65, "c65")); await fake.flush();
+    fake.pending[4]!.reply.resolve(fake.page(64, 33, "c33")); await fake.flush();
+    fake.pending[5]!.reply.resolve(fake.page(32, 1)); await retry;
+    expect(controller.state.messages).toHaveLength(96);
+    expect(controller.state.olderError).toBe(false);
+  });
+
+  it("does not apply an old post acknowledgement after switching Channels", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(1, 1)); await initial;
+    const post = controller.postMessage("fixture post");
+    const switched = controller.selectChannel(OTHER_CHANNEL);
+    fake.pending[1]!.reply.resolve({ ok: true }); await post;
+    fake.pending[2]!.reply.resolve(fake.page(2, 2)); await switched;
+    expect(controller.state.messages.map((m) => m.id)).toEqual(["2"]);
+    expect(fake.pending.filter((p) => p.operation === "conversations.channel.open")).toHaveLength(2);
+  });
+});
+
+describe("posting while a head backfill is pending", () => {
+  it("releases the composer after commit without waiting for history pages", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1)); await initial;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve(fake.page(96, 65, "c65")); await fake.flush();
+    const post = controller.postMessage("fixture post");
+    fake.pending[3]!.reply.resolve({ ok: true }); await post;
+    expect(controller.state.loading).toBe(false);
+    expect(fake.pending[2]!.operation).toBe("conversations.channel.page");
+    fake.pending[2]!.reply.resolve(fake.page(64, 33, "c33")); await fake.flush();
+    fake.pending[4]!.reply.resolve(fake.page(32, 1)); await fake.flush();
+    const queued = fake.pending.find((p, i) => i > 4 && p.operation === "conversations.channel.open");
+    if (queued) queued.reply.resolve(fake.page(96, 65, "c65"));
+    await refresh;
+  });
+});
+
+describe("invalid cursor protection", () => {
+  it("stops automatic repeats when a page does not advance its cursor", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(32, 1, "same")); await initial;
+    const older = controller.loadOlder();
+    fake.pending[1]!.reply.resolve({ messages: [], nextBefore: "same" }); await older;
+    await controller.loadOlder();
+    expect(fake.pending).toHaveLength(2);
+    expect(controller.state.olderError).toBe(true);
+    expect(controller.state.messages).toHaveLength(32);
+  });
+});
