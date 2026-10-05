@@ -296,6 +296,23 @@ describe("conversation change delivery", () => {
 });
 
 describe("package UI kit integration", () => {
+  it("removes both adopted sheets and the view if subscription fails", async () => {
+    const root = shadowRoot();
+    const initialSheets = root.adoptedStyleSheets.length;
+    const source = conversationsBackend();
+    const client: PackageClient = {
+      request: source.client.request,
+      subscribe: async () => { throw new Error("subscription unavailable"); },
+    };
+    await expect(mount(createTestMountContext({ root, client }))).rejects.toThrow("subscription unavailable");
+    expect(root.adoptedStyleSheets).toHaveLength(initialSheets);
+    expect(root.children).toHaveLength(0);
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    expect(root.adoptedStyleSheets).toHaveLength(initialSheets + 2);
+    await unmount();
+    expect(root.adoptedStyleSheets).toHaveLength(initialSheets);
+  });
+
   it("installs the shared UI kit on mount and cleans it up on unmount", async () => {
     const close = vi.fn(async () => undefined);
     const request = vi.fn(async (operation: string): Promise<PackageValue> => {
@@ -412,6 +429,70 @@ describe("package UI kit integration", () => {
     await unmount();
   });
 });
+describe("composer acknowledgement ownership", () => {
+  it.each(["failure", "success"])("preserves B's draft after a late A post %s", async (outcome) => {
+    const channels = [snapshot().channels[0]!, { id: "second", slug: "second", canHide: false, unreadCount: 0 }];
+    let resolvePost!: (value: PackageValue) => void;
+    let rejectPost!: (error: Error) => void;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve({ ...snapshot(), channels }) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve(page("fixture")) as unknown as Promise<T>;
+        if (operation === "conversations.message.post") return new Promise((resolve, reject) => {
+          resolvePost = (value) => resolve(value as T);
+          rejectPost = reject;
+        });
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async () => ({ close: async () => undefined }),
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const textarea = root.querySelector<HTMLTextAreaElement>("textarea")!;
+    textarea.value = "draft A";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    root.querySelector<HTMLButtonElement>('[data-channel-id="second"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector('[data-channel-id="second"]')?.getAttribute("aria-current")).toBe("page"));
+    textarea.value = "draft B";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    if (outcome === "failure") rejectPost(new Error("post failed"));
+    else resolvePost({ ok: true });
+    await vi.waitFor(() => expect(textarea.value).toBe("draft B"));
+    // Let the submit continuation run before asserting its effect.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(textarea.value).toBe("draft B");
+    await unmount();
+  });
+
+  it.each([false, true])("clears a successful post only when its draft has not been edited (edited: %s)", async (edited) => {
+    let resolvePost!: (value: PackageValue) => void;
+    const client: PackageClient = {
+      request: <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve(page("fixture")) as unknown as Promise<T>;
+        if (operation === "conversations.message.post") return new Promise((resolve) => { resolvePost = (value) => resolve(value as T); });
+        throw new Error(`Unexpected operation: ${operation}`);
+      },
+      subscribe: async () => ({ close: async () => undefined }),
+    };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    const textarea = root.querySelector<HTMLTextAreaElement>("textarea")!;
+    textarea.value = "submitted";
+    textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    if (edited) {
+      textarea.value = "edited while pending";
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    resolvePost({ ok: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(textarea.value).toBe(edited ? "edited while pending" : "");
+    expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false);
+    await unmount();
+  });
+});
+
 describe("composer availability", () => {
   async function mountWith(availability: string) {
     const close = vi.fn(async () => undefined);

@@ -33,33 +33,44 @@ export async function mount(
     throw error;
   }
   let disposed = false;
-
+  let view: ConversationsView | undefined;
   const controller = new ConversationsController(client, () => {
-    if (!disposed) view.render();
+    if (!disposed) view?.render();
   });
-  const view = new ConversationsView(context.root, controller, context.package.displayName);
+  try {
+    view = new ConversationsView(context.root, controller, context.package.displayName);
+    await controller.initialize();
+    view.render();
 
-  await controller.initialize();
-  view.render();
+    // Subscribe to live snapshot updates.
+    const subscription = await client.subscribe(
+      "conversations.changes",
+      {},
+      async (snapshot) => {
+        if (disposed) return;
+        await controller.applySnapshot(snapshot);
+        view?.render();
+      },
+    );
 
-  // Subscribe to live snapshot updates.
-  const subscription = await client.subscribe(
-    "conversations.changes",
-    {},
-    async (snapshot) => {
+    return async () => {
       if (disposed) return;
-      await controller.applySnapshot(snapshot);
-      view.render();
-    },
-  );
-
-  return async () => {
-    if (disposed) return;
+      disposed = true;
+      controller.dispose();
+      view?.dispose();
+      try {
+        await subscription.close();
+      } finally {
+        cleanupStyles();
+        cleanupKit();
+      }
+    };
+  } catch (error) {
     disposed = true;
     controller.dispose();
-    view.dispose();
-    await subscription.close();
+    view?.dispose();
     cleanupStyles();
     cleanupKit();
-  };
+    throw error;
+  }
 }

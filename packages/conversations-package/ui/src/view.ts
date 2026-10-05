@@ -142,13 +142,12 @@ export class ConversationsView {
     this.composer.addEventListener("submit", (event) => {
       event.preventDefault();
       const markdown = this.textarea.value;
-      void controller.postMessage(markdown).then(() => {
-        if (this.disposed) return;
-        // Clear only on success (loading done + no warning).
-        if (!controller.state.loading && !controller.state.warning) {
-          this.textarea.value = "";
-          controller.draft = "";
-        }
+      const channelId = controller.state.selectedChannelId;
+      void controller.postMessage(markdown).then((acknowledged) => {
+        if (this.disposed || !acknowledged || controller.state.selectedChannelId !== channelId
+          || this.textarea.value !== markdown) return;
+        this.textarea.value = "";
+        controller.draft = "";
       });
     });
 

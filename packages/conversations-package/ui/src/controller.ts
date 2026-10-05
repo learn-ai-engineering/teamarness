@@ -433,29 +433,31 @@ export class ConversationsController {
    * Post a message to the selected channel. The draft is cleared only by
    * the view after a successful acknowledgement.
    */
-  async postMessage(markdown: string): Promise<void> {
-    if (this.disposed) return;
+  async postMessage(markdown: string): Promise<boolean> {
+    if (this.disposed) return false;
     const channelId = this._state.selectedChannelId;
-    if (!channelId || !markdown.trim()) return;
+    if (!channelId || !markdown.trim()) return false;
     const gen = this.generation;
     this._state = { ...this._state, loading: true, warning: null };
     this.notify();
 
     try {
       await this.client.request("conversations.message.post", { channelId, markdown });
-      if (this.disposed || this.generation !== gen) return;
+      if (this.disposed || this.generation !== gen) return false;
       // A committed post can complete while a bounded head backfill continues.
       // Keep the composer responsive instead of awaiting every intervening page.
       this._state = { ...this._state, loading: false };
       void this.reloadCurrentChannel();
+      return true;
     } catch (error) {
-      if (this.disposed || this.generation !== gen) return;
+      if (this.disposed || this.generation !== gen) return false;
       const info = classify(error);
       this._state = {
         ...this._state,
         loading: false,
         warning: errorMessage("message.post", info, this._state.availability),
       };
+      return false;
     } finally {
       if (!this.disposed && this.generation === gen) this.notify();
     }
@@ -515,7 +517,11 @@ export class ConversationsController {
     const request = this.reconcileHead();
     this.headRequest = request;
     void request.finally(() => {
-      if (this.headRequest === request) this.headRequest = null;
+      if (this.headRequest === request) {
+        this.headRequest = null;
+        // A stale Channel's request can settle before its queued replacement runs.
+        if (this.headQueued && !this.disposed) void this.reloadCurrentChannel();
+      }
     });
     return request;
   }
@@ -533,7 +539,7 @@ export class ConversationsController {
         const newest = [...oldestFirst(page.messages)];
         const known = new Set(this._state.messages.map((m) => m.id));
         const cursors = new Set<string>();
-        while (newest.length > 0 && !newest.some((m) => known.has(m.id)) && page.nextBefore) {
+        while (known.size > 0 && newest.length > 0 && !newest.some((m) => known.has(m.id)) && page.nextBefore) {
           if (this.disposed || this.generation !== gen || revision !== this.headRevision) break;
           if (cursors.has(page.nextBefore)) throw new Error("Non-advancing history cursor");
           cursors.add(page.nextBefore);

@@ -277,6 +277,50 @@ describe("bounded history reconciliation", () => {
 });
 
 describe("live history request ownership", () => {
+  it("drains B's queued refresh after A's stale head request settles", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(1, 1)); await initial;
+    const stale = controller.applySnapshot(historySnapshot());
+    const switched = controller.selectChannel(OTHER_CHANNEL);
+    fake.pending[2]!.reply.resolve(fake.page(2, 2)); await switched;
+    const queued = controller.applySnapshot(historySnapshot());
+    expect(fake.pending).toHaveLength(3);
+    fake.pending[1]!.reply.resolve(fake.page(99, 99)); await stale; await fake.flush();
+    expect(fake.pending[3]?.payload).toEqual({ channelId: OTHER_CHANNEL, limit: 32 });
+    fake.pending[3]!.reply.resolve(fake.page(3, 3)); await queued; await fake.flush();
+    expect(controller.state.messages.map((m) => m.id)).toEqual(["2", "3"]);
+  });
+
+  it("uses only the first head page when no Message IDs are known", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.reject(new Error("initial open failed")); await initial;
+    const refresh = controller.applySnapshot(historySnapshot());
+    fake.pending[1]!.reply.resolve(fake.page(96, 65, "older")); await refresh;
+    expect(fake.pending).toHaveLength(2);
+    expect(controller.state.messages.map((m) => Number(m.id))).toEqual(Array.from({ length: 32 }, (_, i) => i + 65));
+    expect(controller.state.nextBefore).toBe("older");
+    expect(controller.state.hasMore).toBe(true);
+  });
+
+  it("acknowledges only a successful post for its selected Channel", async () => {
+    const fake = historyClient();
+    const controller = new ConversationsController(fake.instance, () => undefined);
+    const initial = controller.initialize(); await fake.flush();
+    fake.pending[0]!.reply.resolve(fake.page(1, 1)); await initial;
+    const failed = controller.postMessage("fixture post");
+    fake.pending[1]!.reply.reject(new Error("post failed"));
+    expect(await failed).toBe(false);
+    const stale = controller.postMessage("fixture post");
+    const switched = controller.selectChannel(OTHER_CHANNEL);
+    fake.pending[3]!.reply.resolve(fake.page(2, 2)); await switched;
+    fake.pending[2]!.reply.resolve({ ok: true });
+    expect(await stale).toBe(false);
+    expect(controller.state.messages.map((m) => m.id)).toEqual(["2"]);
+  });
   it("preserves paged history on an overlapping refresh and follows Backend order", async () => {
     const fake = historyClient();
     const controller = new ConversationsController(fake.instance, () => undefined);
