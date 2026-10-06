@@ -755,7 +755,7 @@ impl RecordLogSink for ConversationsSink {
 
     fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
         self.store
-            .ingest(
+            .ingest_with_commit(
                 record.record_id.as_str(),
                 record.order_key.as_str(),
                 &record.author,
@@ -764,9 +764,9 @@ impl RecordLogSink for ConversationsSink {
                 &record.canonical,
                 &record.sealed_record,
                 Some(record.cursor.as_str()),
+                &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
             )
             .map_err(|_| storage_failed())?;
-        self.changes.send_modify(|x| *x = x.saturating_add(1));
         Ok(())
     }
 
@@ -947,6 +947,66 @@ mod session_tests {
             "the Package opened {} streams, expected {count}",
             scripted.recorded_opens().len()
         );
+    }
+
+    #[test]
+    fn partial_deferred_replay_notifies_after_a_later_journal_failure() {
+        use teamarness_package_sdk::capabilities::record_log::{OrderKey, RecordId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("partial.sqlite")).unwrap();
+        let (changes, mut observer) = watch::channel(0);
+        let sink = ConversationsSink {
+            store: store.clone(),
+            changes,
+            sync: Arc::new(Mutex::new(SyncReport::catching_up())),
+        };
+        let event = |seed: u64, record: &DomainRecord| RecordEvent {
+            cursor: Cursor::parse(hex(50, seed)).unwrap(),
+            record_id: RecordId::parse(hex(64, seed)).unwrap(),
+            order_key: OrderKey::parse(hex(82, seed)).unwrap(),
+            author: ALICE.to_owned(),
+            purpose: record.kind().to_owned(),
+            signature: "signature".to_owned(),
+            canonical: record.encode(),
+            sealed_record: b"sealed".to_vec(),
+        };
+        for seed in 1..=2 {
+            let message =
+                DomainRecord::message_post(CHANNEL, ALICE, format!("deferred {seed}")).unwrap();
+            sink.ingest(&event(seed, &message)).unwrap();
+        }
+        observer.borrow_and_update();
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_second_history BEFORE INSERT ON history_changes \
+             WHEN (SELECT COUNT(*) FROM history_changes) = 1 \
+             BEGIN SELECT RAISE(ABORT, 'second deferred write failed'); END;",
+            )
+            .unwrap();
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, ALICE, "team").unwrap();
+        let channel_event = event(3, &channel);
+        assert!(sink.ingest(&channel_event).is_err());
+        assert_eq!(store.history_head().unwrap().1, 1);
+        assert_eq!(
+            store
+                .message_rows(&hex_id(CHANNEL), None, PAGE_SIZE)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.deferred_records().unwrap().len(), 1);
+        assert!(
+            observer.has_changed().unwrap(),
+            "a committed projection must wake subscribers"
+        );
+        assert_eq!(*observer.borrow_and_update(), 4); // Two deferred ingests, Channel, first replay.
+        sink.ingest(&channel_event).unwrap(); // Duplicate cannot replay the remaining deferred row.
+        assert_eq!(store.history_head().unwrap().1, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

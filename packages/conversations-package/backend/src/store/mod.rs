@@ -185,6 +185,34 @@ impl ConversationStore {
         sealed: &[u8],
         cursor: Option<&str>,
     ) -> Result<IngestResult, StoreError> {
+        self.ingest_with_commit(
+            record_id,
+            order_key,
+            author,
+            purpose,
+            signature,
+            canonical,
+            sealed,
+            cursor,
+            &|| {},
+        )
+    }
+
+    /// Publish after each committed transaction, including a deferred replay that precedes
+    /// a later failure. The caller still receives that failure and does not credit delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ingest_with_commit(
+        &self,
+        record_id: &str,
+        order_key: &str,
+        author: &str,
+        purpose: &str,
+        signature: &str,
+        canonical: &[u8],
+        sealed: &[u8],
+        cursor: Option<&str>,
+        on_commit: &dyn Fn(),
+    ) -> Result<IngestResult, StoreError> {
         if self.fail_next_ingest.swap(false, Ordering::SeqCst) {
             return Err(StoreError::Storage);
         }
@@ -218,10 +246,12 @@ impl ConversationStore {
                         .map_err(rerr)?;
                 }
                 transaction.commit().map_err(rerr)?;
+                on_commit();
                 return Ok(IngestResult::Duplicate);
             }
             quarantine(&transaction, record_id, "immutable_field_mismatch").map_err(rerr)?;
             transaction.commit().map_err(rerr)?;
+            on_commit();
             return Ok(IngestResult::Quarantined("immutable_field_mismatch".into()));
         }
         let ordinal: i64 = transaction
@@ -261,6 +291,7 @@ impl ConversationStore {
             }
         };
         transaction.commit().map_err(rerr)?;
+        on_commit();
         if let Some((id, slug)) = outcome.slug {
             inner.slugs.insert(id, slug);
         }
@@ -277,12 +308,16 @@ impl ConversationStore {
         let result = outcome.result;
         drop(inner);
         if let Some(channel_id) = retry_channel {
-            self.retry_cached_for_channel(&channel_id)?;
+            self.retry_cached_for_channel(&channel_id, on_commit)?;
         }
         Ok(result)
     }
 
-    fn retry_cached_for_channel(&self, channel_id: &str) -> Result<(), StoreError> {
+    fn retry_cached_for_channel(
+        &self,
+        channel_id: &str,
+        on_commit: &dyn Fn(),
+    ) -> Result<(), StoreError> {
         let mut inner = lock(&self.inner)?;
         let mut deferred = inner
             .deferred
@@ -329,6 +364,7 @@ impl ConversationStore {
             )
             .map_err(rerr)?;
             transaction.commit().map_err(rerr)?;
+            on_commit();
             if let Some((id, markdown)) = outcome.markdown {
                 inner.markdown.insert(id, markdown);
             }
@@ -382,7 +418,7 @@ impl ConversationStore {
             let mut inner = lock(&self.inner)?;
             inner.deferred.insert(record_id.to_owned(), domain);
         }
-        self.retry_cached_for_channel(&channel_id)?;
+        self.retry_cached_for_channel(&channel_id, &|| {})?;
         let inner = lock(&self.inner)?;
         let code: Option<String> = inner
             .conn

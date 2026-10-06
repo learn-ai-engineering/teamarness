@@ -784,8 +784,9 @@ describe("automatic older history in the Message container", () => {
         if (operation === "conversations.snapshot") return Promise.resolve({ ...snapshot(), channels }) as unknown as Promise<T>;
         if (operation === "conversations.channel.open") {
           if ((mode === "initial" || (payload as { channelId: string }).channelId === "second") && failures-- > 0) return Promise.reject(new Error("open failed"));
-          return Promise.resolve({ messages: [] }) as unknown as Promise<T>;
+          return Promise.resolve(emptyPage()) as unknown as Promise<T>;
         }
+        if (operation === "conversations.channel.changes") return Promise.resolve({ events: [], continuation: "0", highWater: "0" }) as unknown as Promise<T>;
         throw new Error(`Unexpected operation: ${operation}`);
       },
       subscribe: async () => ({ close: async () => undefined }),
@@ -1160,7 +1161,8 @@ describe("Channel scroll reset", () => {
     const source = createFakePackageClient({
       requests: {
         "conversations.snapshot": () => ({ ...snapshot(), channels }),
-        "conversations.channel.open": (payload) => ({ messages: [message((payload as { channelId: string }).channelId)] }),
+        "conversations.channel.open": (payload) => ({ ...emptyPage(), messages: [message((payload as { channelId: string }).channelId)] }),
+        "conversations.channel.changes": () => ({ events: [], continuation: "0", highWater: "0" }),
       },
       subscriptions: { "conversations.changes": () => undefined },
     });
