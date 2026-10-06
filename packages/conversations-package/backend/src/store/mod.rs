@@ -592,7 +592,26 @@ impl ConversationStore {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MessageRow>, StoreError> {
+        self.message_rows_with_head(channel, before, limit)
+            .map(|(_, rows)| rows)
+    }
+
+    /// Capture raw rows and projection watermark atomically before asynchronous `open`.
+    pub fn message_rows_with_head(
+        &self,
+        channel: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<((String, u64), Vec<MessageRow>), StoreError> {
         let x = lock(&self.inner)?;
+        let head: (String, i64) = x
+            .conn
+            .query_row(
+                "SELECT epoch,revision FROM history_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(rerr)?;
         let sql = if before.is_some() {
             "SELECT m.message_id,m.order_key,m.author,m.record_id,r.sealed_record,m.ingestion_ordinal FROM messages m JOIN records r ON r.record_id=m.record_id WHERE m.channel_id=?1 AND m.order_key<?2 ORDER BY m.order_key DESC LIMIT ?3"
         } else {
@@ -615,8 +634,21 @@ impl ConversationStore {
                 out.push(r.map_err(rerr)?)
             }
         }
-        Ok(out)
+        Ok(((head.0, head.1 as u64), out))
     }
+
+    pub fn message_row_by_id(
+        &self,
+        channel: &str,
+        id: &str,
+    ) -> Result<Option<MessageRow>, StoreError> {
+        let x = lock(&self.inner)?;
+        x.conn.query_row(
+            "SELECT m.message_id,m.order_key,m.author,m.record_id,r.sealed_record,m.ingestion_ordinal FROM messages m JOIN records r ON r.record_id=m.record_id WHERE m.channel_id=?1 AND m.message_id=?2",
+            params![channel, id], row_message,
+        ).optional().map_err(rerr)
+    }
+
     pub fn mark_read(&self, channel: &str) -> Result<(), StoreError> {
         let x = lock(&self.inner)?;
         let n: i64 = x

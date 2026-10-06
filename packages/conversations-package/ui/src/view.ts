@@ -30,13 +30,19 @@ export class ConversationsView {
   private readonly history: HTMLElement;
   private readonly historyStatus: HTMLElement;
   private readonly retryButton: HTMLButtonElement;
+  private readonly feedRetryButton: HTMLButtonElement;
+  private readonly pendingRetryButton: HTMLButtonElement;
   private readonly composer: HTMLFormElement;
   private readonly textarea: HTMLTextAreaElement;
   private readonly sendButton: HTMLButtonElement;
   private inputRevision = 0;
   private renderedChannelId: string | null = null;
+  private renderedMessages: ControllerState["messages"] | null = null;
   private renderedOldestId: string | null = null;
   private fillTimer: ReturnType<typeof setTimeout> | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  private observedWidth: number | null = null;
+  private readingAnchor: { id: string; offset: number; atBottom: boolean } | null = null;
   private disposed = false;
 
   constructor(
@@ -111,7 +117,17 @@ export class ConversationsView {
     this.retryButton.className = `${KIT_CLASS.secondary} retry-older`;
     this.retryButton.textContent = "Retry older history";
     this.retryButton.addEventListener("click", () => { void controller.retryOlder(); });
-    this.panel.append(this.historyStatus, this.retryButton);
+    this.feedRetryButton = document.createElement("button");
+    this.feedRetryButton.type = "button";
+    this.feedRetryButton.className = `${KIT_CLASS.secondary} retry-changes`;
+    this.feedRetryButton.textContent = "Retry history updates";
+    this.feedRetryButton.addEventListener("click", () => { void controller.retryFeed(); });
+    this.pendingRetryButton = document.createElement("button");
+    this.pendingRetryButton.type = "button";
+    this.pendingRetryButton.className = `${KIT_CLASS.secondary} retry-pending`;
+    this.pendingRetryButton.textContent = "Retry unavailable history";
+    this.pendingRetryButton.addEventListener("click", () => { void controller.retryPending(); });
+    this.panel.append(this.historyStatus, this.retryButton, this.feedRetryButton, this.pendingRetryButton);
 
     // --- composer (built once, never replaced) ---
     this.composer = document.createElement("form");
@@ -158,6 +174,17 @@ export class ConversationsView {
     this.shell.append(this.rail, this.panel);
     page.append(pageHeader, this.shell);
     root.replaceChildren(page);
+    if (typeof ResizeObserver !== "undefined") {
+      this.resizeObserver = new ResizeObserver(entries => {
+        if (this.disposed) return;
+        const width = entries[0]?.contentRect.width;
+        if (width === undefined) return;
+        if (this.observedWidth !== null && width !== this.observedWidth) this.restoreReadingAnchor();
+        this.observedWidth = width;
+        this.captureReadingAnchor();
+      });
+      this.resizeObserver.observe(this.history);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -202,6 +229,10 @@ export class ConversationsView {
     // --- paging feedback ---
     this.retryButton.hidden = !state.olderError;
     this.retryButton.disabled = state.loadingOlder || state.retryingHead;
+    this.feedRetryButton.hidden = !state.feedError;
+    this.pendingRetryButton.hidden = state.pendingHistory === 0;
+    this.pendingRetryButton.textContent = state.resolveError
+      ? "Retry failed history access" : "Retry unavailable history";
     this.retryButton.textContent = !state.hasMore && state.messages.length === 0
       ? "Retry Channel history" : "Retry older history";
     this.historyStatus.textContent = state.loadingOlder
@@ -209,10 +240,14 @@ export class ConversationsView {
       : state.retryingHead ? "Retrying Channel history…"
       : state.loading && state.selectedChannelId
         ? "Loading Channel history…"
-      : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError
+      : state.feedError ? "History updates paused. Retry to resume."
+      : state.resolveError ? "History access retry failed. Try again."
+      : state.pendingHistory > 0 ? `${state.pendingHistory} Messages awaiting history access`
+      : state.unavailableHistory > 0 ? `${state.unavailableHistory} Messages could not be opened`
+      : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError && !state.feedError && !state.resolveError
         ? "Beginning of Channel history"
         : "";
-    this.historyStatus.classList.toggle("history-exhausted", !state.hasMore && !state.olderError && !state.loading && !state.retryingHead);
+    this.historyStatus.classList.toggle("history-exhausted", !state.hasMore && !state.olderError && !state.feedError && !state.resolveError && state.pendingHistory === 0 && state.unavailableHistory === 0 && !state.loading && !state.retryingHead);
 
     // --- composer (patch only; never recreate) ---
     this.patchComposer(state);
@@ -231,6 +266,7 @@ export class ConversationsView {
   dispose(): void {
     this.disposed = true;
     this.history.removeEventListener("scroll", this.onHistoryScroll);
+    this.resizeObserver?.disconnect();
     if (this.fillTimer !== null) clearTimeout(this.fillTimer);
     this.root.replaceChildren();
   }
@@ -249,6 +285,7 @@ export class ConversationsView {
   }
 
   private readonly onHistoryScroll = (): void => {
+    this.captureReadingAnchor();
     const state = this.controller.state;
     if (!this.disposed && this.renderedChannelId === state.selectedChannelId
       && !state.loading && !state.loadingOlder && !state.olderError && state.hasMore
@@ -256,6 +293,31 @@ export class ConversationsView {
       void this.controller.loadOlder();
     }
   };
+
+  private captureReadingAnchor(): void {
+    const viewportTop = this.history.getBoundingClientRect().top;
+    const first = [...this.history.querySelectorAll<HTMLElement>(".message")].find(row => {
+      const rect = row.getBoundingClientRect();
+      return rect.height > 0 && rect.bottom > viewportTop;
+    });
+    if (!first?.dataset.messageId) { this.readingAnchor = null; return; }
+    this.readingAnchor = { id: first.dataset.messageId,
+      offset: first.getBoundingClientRect().top - viewportTop,
+      atBottom: this.history.scrollHeight - this.history.scrollTop - this.history.clientHeight < 40 };
+  }
+
+  private restoreReadingAnchor(): void {
+    const anchor = this.readingAnchor;
+    if (!anchor) return;
+    if (anchor.atBottom) {
+      this.history.scrollTop = this.history.scrollHeight;
+      return;
+    }
+    const row = [...this.history.querySelectorAll<HTMLElement>(".message")]
+      .find(candidate => candidate.dataset.messageId === anchor.id);
+    if (row) this.history.scrollTop += row.getBoundingClientRect().top
+      - this.history.getBoundingClientRect().top - anchor.offset;
+  }
 
   // ------------------------------------------------------------------
   // region renderers
@@ -418,24 +480,45 @@ export class ConversationsView {
   }
 
   private renderHistory(state: ControllerState): void {
+    if (this.renderedChannelId === state.selectedChannelId && this.renderedMessages === state.messages) return;
+    this.renderedMessages = state.messages;
     // Messages read oldest at the top, newest at the bottom, and a Channel opens at the newest
     // one (TEAM.SYS.CONV-R08). Once a Member scrolls up, their position is kept.
     const openedChannel = state.selectedChannelId !== this.renderedChannelId;
     this.renderedChannelId = state.selectedChannelId;
     const previousTop = this.history.scrollTop;
     const previousHeight = this.history.scrollHeight;
+    const previousRows = [...this.history.querySelectorAll<HTMLElement>(".message")];
+    const viewportTop = this.history.getBoundingClientRect().top;
+    const visibleIndex = previousRows.findIndex(row => {
+      const rect = row.getBoundingClientRect();
+      return rect.height > 0 && rect.bottom > viewportTop;
+    });
+    const nextIds = new Set(state.messages.map(message => message.id));
+    const survives = (row: HTMLElement): boolean =>
+      row.dataset.messageId !== undefined && nextIds.has(row.dataset.messageId);
+    const visibleSuccessor = visibleIndex < 0 ? null : previousRows.slice(visibleIndex)
+      .find(row => survives(row) && row.getBoundingClientRect().top < viewportTop + this.history.clientHeight);
+    const anchor = visibleSuccessor
+      ?? (visibleIndex < 0 ? null : [...previousRows.slice(0, visibleIndex)].reverse().find(survives))
+      ?? (visibleIndex < 0 ? null : previousRows.slice(visibleIndex).find(survives));
+    const anchorTop = anchor?.getBoundingClientRect().top;
     const prepended = !openedChannel && this.renderedOldestId !== null
       && state.messages[0]?.id !== this.renderedOldestId
       && state.messages.some((message) => message.id === this.renderedOldestId);
     this.renderedOldestId = state.messages[0]?.id ?? null;
     const wasAtBottom =
       previousHeight - previousTop - this.history.clientHeight < 40;
+    const newTailId = state.messages.at(-1)?.id;
+    const tailAdvanced = newTailId !== undefined
+      && !previousRows.some(row => row.dataset.messageId === newTailId);
 
     this.history.replaceChildren();
     let previousLocal = false;
     for (const message of state.messages) {
       const row = document.createElement("li");
       row.className = "message";
+      row.dataset.messageId = message.id;
       if (message.isLocal) row.classList.add("message--local");
       if (message.isLocal && previousLocal) row.classList.add("message--local-continuation");
       previousLocal = message.isLocal;
@@ -461,12 +544,19 @@ export class ConversationsView {
       this.history.append(row);
     }
 
-    if (openedChannel || (wasAtBottom && !prepended)) {
+    if (openedChannel || (wasAtBottom && tailAdvanced)) {
       this.history.scrollTop = this.history.scrollHeight;
+    } else if (anchor && anchorTop !== undefined) {
+      const replacement = [...this.history.querySelectorAll<HTMLElement>(".message")]
+        .find(row => row.dataset.messageId === anchor.dataset.messageId);
+      this.history.scrollTop = replacement
+        ? previousTop + replacement.getBoundingClientRect().top - anchorTop
+        : previousTop;
     } else {
-      // Only a prepend moves the reading anchor; a live append must not shift it.
+      // Geometry is unavailable in some test environments; preserve the old prepend fallback.
       this.history.scrollTop = previousTop + (prepended ? this.history.scrollHeight - previousHeight : 0);
     }
+    this.captureReadingAnchor();
   }
 
   private patchComposer(state: ControllerState): void {

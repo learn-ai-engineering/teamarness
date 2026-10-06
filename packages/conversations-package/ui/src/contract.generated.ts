@@ -8,6 +8,22 @@ export type Availability = "waiting_for_history_access" | "offline" | "catching_
 
 export type Before = string;
 
+export type Change = {
+  readonly "id": string;
+  readonly "kind": "insert" | "remove";
+  readonly "message"?: Message;
+  readonly "position": Position;
+  readonly "revision": Revision;
+  readonly "status"?: "ready" | "pending" | "unavailable";
+};
+
+export type Changes = {
+  readonly "continuation": Revision;
+  readonly "events": readonly Change[];
+  readonly "highWater": Revision;
+  readonly "resyncRequired"?: boolean;
+};
+
 export type Channel = {
   readonly "canHide": boolean;
   readonly "id": ChannelId;
@@ -17,17 +33,39 @@ export type Channel = {
 
 export type ChannelId = string;
 
+export type Epoch = string;
+
 export type Message = {
   readonly "author": string;
   readonly "id": string;
   readonly "isLocal": boolean;
   readonly "markdown": string;
+  readonly "position": Position;
 };
 
 export type Page = {
+  readonly "epoch": Epoch;
   readonly "messages": readonly Message[];
   readonly "nextBefore"?: Before;
+  readonly "pending"?: readonly PendingRow[];
+  readonly "revision": Revision;
 };
+
+export type PendingRow = {
+  readonly "id": string;
+  readonly "position": Position;
+  readonly "status": "pending" | "unavailable";
+};
+
+export type Position = string;
+
+export type Resolved = {
+  readonly "messages": readonly Message[];
+  readonly "missing": readonly string[];
+  readonly "pending": readonly PendingRow[];
+};
+
+export type Revision = string;
 
 export type Slug = string;
 
@@ -39,6 +77,12 @@ export type Snapshot = {
 
 export type ConversationsContract = {
   readonly requests: {
+    readonly "conversations.channel.changes": { readonly request: {
+        readonly "after": Revision;
+        readonly "channelId": ChannelId;
+        readonly "epoch": Epoch;
+        readonly "limit"?: number;
+      }; readonly response: Changes };
     readonly "conversations.channel.create": { readonly request: {
         readonly "slug": Slug;
       }; readonly response: Acknowledgement };
@@ -55,6 +99,10 @@ export type ConversationsContract = {
         readonly "channelId": ChannelId;
         readonly "limit"?: number;
       }; readonly response: Page };
+    readonly "conversations.channel.resolve": { readonly request: {
+        readonly "channelId": ChannelId;
+        readonly "ids": readonly string[];
+      }; readonly response: Resolved };
     readonly "conversations.message.post": { readonly request: {
         readonly "channelId": ChannelId;
         readonly "markdown": string;

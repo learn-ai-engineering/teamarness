@@ -5,7 +5,7 @@ import { createFakePackageClient, createTestMountContext } from "@teamarness/pac
 import type {
   PackageClient,
   PackageMountContext,
-  PackageSubscription,
+  PackageUnmount,
   PackageValue,
 } from "@teamarness/package-ui-sdk";
 import { describe, expect, it, vi } from "vitest";
@@ -24,17 +24,21 @@ function snapshot(): ConversationSnapshot {
   };
 }
 
+const testEpoch = "a".repeat(32);
+function emptyPage(): ConversationPage { return { messages: [], epoch: testEpoch, revision: "0" }; }
 function page(markdown: string): ConversationPage {
-  return { messages: [message(markdown)] };
+  return { ...emptyPage(), messages: [message(markdown)] };
 }
 
 function message(markdown: string): ConversationPage["messages"][number] {
-  return { id: markdown, author: "bob", markdown, isLocal: false };
+  return { id: markdown, position: /^\d+(?:\.\d+)?$/.test(markdown)
+    ? String(Math.round(Number(markdown) * 100)).padStart(8, "0") : markdown,
+  author: "bob", markdown, isLocal: false };
 }
 
 /** A page as the Backend returns one: newest Message first. */
 function newestFirstPage(): ConversationPage {
-  return { messages: [message("newest"), message("middle"), message("oldest")] };
+  return { ...emptyPage(), messages: [message("newest"), message("middle"), message("oldest")] };
 }
 
 function conversationsBackend() {
@@ -49,6 +53,44 @@ function conversationsBackend() {
 
 function shadowRoot(): ShadowRoot {
   return document.createElement("div").attachShadow({ mode: "open" });
+}
+
+/** A live Package projection adapter: changes are derived from independent current row truth. */
+function liveHistorySource(current: () => ConversationPage["messages"]) {
+  const epoch = "a".repeat(32);
+  const known = new Map<string, ConversationPage["messages"][number]>();
+  let revision = 0;
+  const positioned = (rows: ConversationPage["messages"]) => rows.map((row, index) => ({
+    ...row, position: /^\d+(?:\.\d+)?$/.test(row.id)
+      ? String(Math.round(Number(row.id) * 100)).padStart(8, "0")
+      : String(rows.length - index + revision * 100).padStart(8, "0"),
+  }));
+  return createFakePackageClient({
+    requests: {
+      "conversations.snapshot": () => snapshot(),
+      "conversations.channel.open": () => {
+        const messages = positioned(current());
+        for (const row of messages) known.set(row.id, row);
+        return { messages, epoch, revision: String(revision) };
+      },
+      "conversations.channel.changes": () => {
+        const next = positioned(current());
+        const nextIds = new Set(next.map(row => row.id));
+        const events: PackageValue[] = [];
+        for (const row of known.values()) {
+          if (!nextIds.has(row.id)) events.push({ revision: String(++revision), kind: "remove", id: row.id, position: row.position! });
+        }
+        for (const row of next) {
+          if (!known.has(row.id)) events.push({ revision: String(++revision), kind: "insert", id: row.id,
+            position: row.position, status: "ready", message: row });
+        }
+        known.clear();
+        for (const row of next) known.set(row.id, row);
+        return { events, continuation: String(revision), highWater: String(revision) };
+      },
+    },
+    subscriptions: { "conversations.changes": () => undefined },
+  });
 }
 
 describe("Conversations Package surface", () => {
@@ -243,55 +285,18 @@ describe("channel message order", () => {
 });
 
 describe("conversation change delivery", () => {
-  it("reloads the selected channel and does not render unread counters", async () => {
-    let currentPage = page("initial message");
-    let deliverChange: ((value: ConversationSnapshot) => void | Promise<void>) | undefined;
-    const close = vi.fn(async () => undefined);
-    const request = vi.fn(async (operation: string): Promise<PackageValue> => {
-      if (operation === "conversations.snapshot") return snapshot();
-      if (operation === "conversations.channel.open") return currentPage;
-      throw new Error(`Unexpected operation: ${operation}`);
-    });
-    const client: PackageClient = {
-      request: async <TResponse extends PackageValue>(operation: string) => (
-        request(operation) as Promise<TResponse>
-      ),
-      subscribe: vi.fn(async (_operation, _payload, listener) => {
-        deliverChange = listener as (value: ConversationSnapshot) => void | Promise<void>;
-        return { close } satisfies PackageSubscription;
-      }),
-    };
-    const host = document.createElement("div");
-    const root = host.attachShadow({ mode: "open" });
-    const context = {
-      root,
-      package: {
-        identity: "dev.teamarness.conversations",
-        version: "1.0.0",
-        displayName: "Conversations",
-        source: "bundled",
-        trust: "application_bundled",
-        lifecycle: "active",
-        processGeneration: "1",
-      },
-      workspace: { id: "workspace", name: "Workspace" },
-      uiHostVersion: 1,
-      themeTokens: [],
-      client,
-    } satisfies PackageMountContext;
-
-    const unmount = await mount(context);
+  it("replays a delivered Message without reopening the Channel or showing unread counters", async () => {
+    let messages = [message("initial message")];
+    const source = liveHistorySource(() => messages);
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
     expect(root.textContent).toContain("initial message");
-
-    currentPage = page("message delivered while general is open");
-    await deliverChange?.(snapshot());
-
+    messages = [message("message delivered while general is open"), ...messages];
+    await source.emit("conversations.changes", snapshot());
     expect(root.textContent).toContain("message delivered while general is open");
     expect(root.querySelector(".unread-count")).toBeNull();
-    expect(request.mock.calls.filter(([operation]) => operation === "conversations.channel.open")).toHaveLength(2);
-
+    expect(source.calls.filter(call => call.operation === "conversations.channel.open")).toHaveLength(1);
     await unmount();
-    expect(close).toHaveBeenCalledOnce();
   });
 });
 
@@ -635,6 +640,7 @@ describe("automatic older history in the Message container", () => {
             retryReject = reject;
           });
         }
+        if (operation === "conversations.channel.changes") return Promise.resolve({ events: [], continuation: "0", highWater: "0" }) as unknown as Promise<T>;
         throw new Error(`Unexpected operation: ${operation}`);
       },
       subscribe: async () => ({ close: async () => undefined }),
@@ -656,7 +662,7 @@ describe("automatic older history in the Message container", () => {
     expect(root.querySelector(".history-status")?.textContent).not.toContain("Beginning");
     retry.click();
     expect(retry.hidden || retry.disabled).toBe(true);
-    retryResolve({ messages: [] });
+    retryResolve(emptyPage());
     await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
     expect(retry.hidden).toBe(true);
     expect(root.querySelector(".warning")).toBeNull();
@@ -664,63 +670,32 @@ describe("automatic older history in the Message container", () => {
     await unmount();
   });
 
-  it("reopens exhausted history on live projection and pages from the retained oldest", async () => {
-    const numbered = (high: number, low: number) => Array.from({ length: high - low + 1 }, (_, i) =>
-      ({ ...message(String(high - i)), id: String(high - i) }));
-    let head = false;
-    const calls: string[] = [];
-    const source = createFakePackageClient({
-      requests: {
-        "conversations.snapshot": () => snapshot(),
-        "conversations.channel.open": () => head
-          ? { messages: numbered(64, 33), nextBefore: "c33" }
-          : { messages: numbered(32, 1), nextBefore: "c1" },
-        "conversations.channel.page": (payload): PackageValue => {
-          const before = (payload as { before: string }).before;
-          calls.push(before);
-          if (before === "c1" && !head) return { messages: [] };
-          if (before === "c33") return { messages: numbered(32, 1), nextBefore: "c1" };
-          if (before === "c1") return { messages: numbered(0, -31) };
-          throw new Error(`Unexpected cursor: ${before}`);
-        },
-      },
-      subscriptions: { "conversations.changes": () => undefined },
-    });
+  it("reconciles an interior Message after exhaustion without reopening history", async () => {
+    let messages = [message("3"), message("2"), message("1")];
+    const source = liveHistorySource(() => messages);
     const root = shadowRoot();
     const unmount = await mount(createTestMountContext({ root, client: source.client }));
-    const history = root.querySelector<HTMLElement>(".message-history")!;
-    Object.defineProperty(history, "clientHeight", { get: () => 100 });
-    Object.defineProperty(history, "scrollHeight", { get: () => history.querySelectorAll(".message").length * 30 });
-    history.scrollTop = 0; history.dispatchEvent(new Event("scroll"));
-    await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
-    head = true;
+    messages = [message("3"), message("2"), message("1.5"), message("1")];
     await source.emit("conversations.changes", snapshot());
-    expect(calls).toEqual(["c1", "c33"]);
-    expect(root.querySelector(".history-exhausted")).toBeNull();
-    history.scrollTop = 0; history.dispatchEvent(new Event("scroll"));
-    await vi.waitFor(() => expect(history.querySelectorAll(".message")).toHaveLength(96));
-    expect(calls).toEqual(["c1", "c33", "c1"]);
-    expect([...history.querySelectorAll(".message-markdown")].map((row) => Number(row.textContent?.trim())))
-      .toEqual(Array.from({ length: 96 }, (_, i) => i - 31));
+    expect([...root.querySelectorAll(".message-markdown")].map(row => row.textContent?.trim()))
+      .toEqual(["1", "1.5", "2", "3"]);
+    expect(source.calls.filter(call => call.operation === "conversations.channel.open")).toHaveLength(1);
     await unmount();
   });
 
-  it("keeps sending and the explicit Retry usable after a failed head gap", async () => {
+  it("keeps Send usable while change replay has failed and offers an independent Retry", async () => {
     let deliver!: (value: ConversationSnapshot) => void | Promise<void>;
-    let pageAttempts = 0;
-    let openAttempts = 0;
+    let feedCalls = 0;
     const client: PackageClient = {
-      request: <T extends PackageValue>(operation: string): Promise<T> => {
-        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
-        if (operation === "conversations.channel.open") return Promise.resolve(openAttempts++ === 0
-          ? { messages: [message("known")] }
-          : { messages: [message("new")], nextBefore: "gap" }) as unknown as Promise<T>;
-        if (operation === "conversations.channel.page") {
-          pageAttempts++;
-          return pageAttempts === 1 ? Promise.reject(new Error("failed gap"))
-            : Promise.resolve({ messages: [message("known")] }) as unknown as Promise<T>;
+      request: async <T extends PackageValue>(operation: string): Promise<T> => {
+        if (operation === "conversations.snapshot") return snapshot() as unknown as T;
+        if (operation === "conversations.channel.open") return { messages: [
+          { ...message("known"), position: "000001" }], epoch: "a".repeat(32), revision: "0" } as unknown as T;
+        if (operation === "conversations.channel.changes") {
+          if (++feedCalls === 2) throw new Error("failed feed");
+          return { events: [], continuation: "0", highWater: "0" } as unknown as T;
         }
-        if (operation === "conversations.message.post") return Promise.resolve({ ok: true }) as unknown as Promise<T>;
+        if (operation === "conversations.message.post") return { ok: true } as unknown as T;
         throw new Error(`Unexpected operation: ${operation}`);
       },
       subscribe: async (_operation, _payload, listener) => {
@@ -731,59 +706,22 @@ describe("automatic older history in the Message container", () => {
     const root = shadowRoot();
     const unmount = await mount(createTestMountContext({ root, client }));
     await deliver(snapshot());
-    const retry = root.querySelector<HTMLButtonElement>(".retry-older")!;
+    const retry = root.querySelector<HTMLButtonElement>(".retry-changes")!;
     expect(retry.hidden).toBe(false);
     const textarea = root.querySelector<HTMLTextAreaElement>("textarea")!;
     textarea.value = "draft";
     textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     await vi.waitFor(() => expect(textarea.value).toBe(""));
-    expect(pageAttempts).toBe(1);
+    expect(feedCalls).toBe(2);
     expect(retry.hidden).toBe(false);
+    expect(retry.tabIndex).toBe(0);
     retry.click();
     await vi.waitFor(() => expect(retry.hidden).toBe(true));
-    expect(pageAttempts).toBe(2);
+    expect(feedCalls).toBe(3);
     await unmount();
   });
 
-  it("announces progress during a nonempty failed head retry without blocking Send", async () => {
-    let deliver!: (value: ConversationSnapshot) => void | Promise<void>;
-    let rejectGap!: (error: Error) => void;
-    let resolveRetry!: (value: ConversationPage) => void;
-    let opens = 0;
-    const client: PackageClient = {
-      request: <T extends PackageValue>(operation: string, payload: PackageValue): Promise<T> => {
-        if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
-        if (operation === "conversations.channel.open") return Promise.resolve(opens++ === 0
-          ? { messages: [message("known")] }
-          : { messages: [message("new")], nextBefore: "gap" }) as unknown as Promise<T>;
-        if (operation === "conversations.channel.page") {
-          expect(payload).toEqual({ channelId: snapshot().channels[0]!.id, before: "gap", limit: 32 });
-          if (!rejectGap) return new Promise((_, reject) => { rejectGap = reject; });
-          return new Promise((resolve) => { resolveRetry = (value) => resolve(value as unknown as T); });
-        }
-        throw new Error(`Unexpected operation: ${operation}`);
-      },
-      subscribe: async (_operation, _payload, listener) => {
-        deliver = listener as unknown as typeof deliver;
-        return { close: async () => undefined };
-      },
-    };
-    const root = shadowRoot();
-    const unmount = await mount(createTestMountContext({ root, client }));
-    const refresh = deliver(snapshot());
-    await vi.waitFor(() => expect(rejectGap).toBeDefined());
-    rejectGap(new Error("failed gap")); await refresh;
-    const retry = root.querySelector<HTMLButtonElement>(".retry-older")!;
-    expect(retry.hidden).toBe(false);
-    retry.click();
-    expect(root.querySelector(".history-status")?.textContent).toContain("Retrying Channel history");
-    expect(root.querySelector(".history-status")?.textContent).not.toContain("Beginning");
-    expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false);
-    expect(retry.hidden).toBe(true);
-    resolveRetry({ messages: [message("known")] });
-    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
-    await unmount();
-  });
+
 
   it("continues past an empty advancing page while already at the top of scrollable history", async () => {
     const replies: Array<(page: ConversationPage) => void> = [];
@@ -808,10 +746,10 @@ describe("automatic older history in the Message container", () => {
     history.scrollTop = 0;
     history.dispatchEvent(new Event("scroll"));
     expect(calls).toHaveLength(1);
-    replies[0]!({ messages: [], nextBefore: "second" });
+    replies[0]!({ ...emptyPage(), nextBefore: "second" });
     await vi.waitFor(() => expect(calls).toHaveLength(2));
     expect(calls[1]).toEqual({ channelId: snapshot().channels[0]!.id, before: "second", limit: 32 });
-    replies[1]!({ messages: [message("older")] });
+    replies[1]!(page("older"));
     await vi.waitFor(() => expect(history.querySelectorAll(".message")).toHaveLength(2));
     expect(root.querySelector(".history-exhausted")?.textContent).toContain("Beginning");
     await unmount();
@@ -862,11 +800,14 @@ describe("automatic older history in the Message container", () => {
       request: <T extends PackageValue>(operation: string, payload: PackageValue): Promise<T> => {
         requests.push({ operation, payload });
         if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
-        if (operation === "conversations.channel.open") return Promise.resolve({ messages: [message("newest"), message("oldest")], nextBefore: "cursor" }) as unknown as Promise<T>;
+        if (operation === "conversations.channel.open") return Promise.resolve({ ...emptyPage(), messages: [
+          { ...message("newest"), position: "00000003" }, { ...message("oldest"), position: "00000002" }],
+          nextBefore: "cursor" }) as unknown as Promise<T>;
         if (operation === "conversations.channel.page") return new Promise((resolve, reject) => {
           resolvePage = (page) => resolve(page as unknown as T);
           rejectPage = reject;
         });
+        if (operation === "conversations.channel.changes") return Promise.resolve({ events: [], continuation: "0", highWater: "0" }) as unknown as Promise<T>;
         throw new Error(`Unexpected operation: ${operation}`);
       },
       subscribe: async () => ({ close: async () => undefined }),
@@ -891,13 +832,13 @@ describe("automatic older history in the Message container", () => {
     history.dispatchEvent(new Event("scroll"));
     expect(source.requests.filter((r) => r.operation === "conversations.channel.page")).toHaveLength(1);
     expect(root.querySelector(".older-messages")).toBeNull();
-    source.resolve({ messages: [message("older")], nextBefore: "end" });
+    source.resolve({ ...emptyPage(), messages: [{ ...message("older"), position: "00000001" }], nextBefore: "end" });
     await vi.waitFor(() => expect(history.querySelectorAll(".message")).toHaveLength(3));
     expect(history.scrollTop).toBe(112);
     heightPerRow = 120;
     history.scrollTop = 5;
     history.dispatchEvent(new Event("scroll"));
-    source.resolve({ messages: [] });
+    source.resolve(emptyPage());
     await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
     history.dispatchEvent(new Event("scroll"));
     expect(source.requests.filter((r) => r.operation === "conversations.channel.page")).toHaveLength(2);
@@ -921,7 +862,7 @@ describe("automatic older history in the Message container", () => {
     expect(retry.textContent).toMatch(/retry older history/i);
     retry.click();
     expect(source.requests.filter((r) => r.operation === "conversations.channel.page")).toHaveLength(2);
-    source.resolve({ messages: [] });
+    source.resolve(emptyPage());
     await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
     await unmount();
     history.dispatchEvent(new Event("scroll"));
@@ -932,13 +873,7 @@ describe("automatic older history in the Message container", () => {
 describe("live Message scroll position", () => {
   it("follows a new Message only from the bottom, preserving draft and a reader above it", async () => {
     let messages = [message("second"), message("first")];
-    const source = createFakePackageClient({
-      requests: {
-        "conversations.snapshot": () => snapshot(),
-        "conversations.channel.open": () => ({ messages }),
-      },
-      subscriptions: { "conversations.changes": () => undefined },
-    });
+    const source = liveHistorySource(() => messages);
     const root = shadowRoot();
     const unmount = await mount(createTestMountContext({ root, client: source.client }));
     const history = root.querySelector<HTMLElement>(".message-history")!;
@@ -961,6 +896,160 @@ describe("live Message scroll position", () => {
   });
 });
 
+describe("history feed recovery", () => {
+  it("keeps a non-ready row visible as a retryable history state", async () => {
+    const channel = snapshot().channels[0]!;
+    const source = createFakePackageClient({
+      requests: {
+        "conversations.snapshot": () => snapshot(),
+        "conversations.channel.open": () => ({ messages: [], epoch: "a".repeat(32), revision: "0",
+          pending: [{ id: "pending-id", position: "000001", status: "pending" }] }),
+        "conversations.channel.resolve": () => ({ messages: [{ ...message("now-ready"), id: "pending-id", position: "000001" }], pending: [], missing: [] }),
+        "conversations.channel.changes": () => ({ events: [], continuation: "0", highWater: "0" }),
+      },
+      subscriptions: { "conversations.changes": () => undefined },
+    });
+    expect(channel).toBeDefined();
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const retry = root.querySelector<HTMLButtonElement>(".retry-pending")!;
+    expect(retry.hidden).toBe(false);
+    expect(root.querySelector(".history-status")?.textContent).toContain("awaiting history access");
+    retry.click();
+    await vi.waitFor(() => expect(root.querySelector(".message-markdown")?.textContent?.trim()).toBe("now-ready"));
+    expect(retry.hidden).toBe(true);
+    await unmount();
+  });
+});
+
+describe("row-anchored live history", () => {
+  it("restores the visible row offset after a width resize rewraps an earlier row", async () => {
+    let observerCallback: ResizeObserverCallback | undefined;
+    let disconnected = false;
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) { observerCallback = callback; }
+      observe() { /* called when mounted */ }
+      disconnect() { disconnected = true; }
+    }
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    const heights: Record<string, number> = { "1": 20, "2": 55, "3": 30, "4": 60 };
+    const messages = [message("4"), message("3"), message("2"), message("1")];
+    const source = liveHistorySource(() => messages);
+    const root = shadowRoot();
+    let unmount: PackageUnmount | undefined;
+    try {
+      unmount = await mount(createTestMountContext({ root, client: source.client }));
+      const history = root.querySelector<HTMLElement>(".message-history")!;
+      Object.defineProperty(history, "clientHeight", { get: () => 25 });
+      Object.defineProperty(history, "scrollHeight", { get: () =>
+        [...history.querySelectorAll<HTMLElement>(".message")].reduce((sum, row) => sum + heights[row.dataset.messageId!]!, 0) });
+      HTMLElement.prototype.getBoundingClientRect = function () {
+        if (this === history) return { top: 10, bottom: 35, height: 25 } as DOMRect;
+        const rows = [...history.querySelectorAll<HTMLElement>(".message")];
+        const index = rows.indexOf(this);
+        const height = index < 0 ? 0 : heights[this.dataset.messageId!]!;
+        const top = 10 + rows.slice(0, Math.max(index, 0))
+          .reduce((sum, row) => sum + heights[row.dataset.messageId!]!, 0) - history.scrollTop;
+        return { top, bottom: top + height, height } as DOMRect;
+      };
+      const resized = (width: number) => observerCallback!([
+        { contentRect: { width } as DOMRect } as ResizeObserverEntry,
+      ], {} as ResizeObserver);
+      history.scrollTop = 35;
+      history.dispatchEvent(new Event("scroll"));
+      resized(400);
+      heights["1"] = 90;
+      resized(300);
+      expect(history.scrollTop).toBe(105);
+      expect(root.querySelector<HTMLElement>(".message[data-message-id='2']")?.getBoundingClientRect().top).toBe(-5);
+      await unmount!(); unmount = undefined;
+      expect(disconnected).toBe(true);
+    } finally {
+      if (unmount) await unmount();
+      HTMLElement.prototype.getBoundingClientRect = original;
+      vi.unstubAllGlobals();
+    }
+  });
+  it("anchors variable-height inserts and keeps the nearest surviving row after removal", async () => {
+    let messages = [message("4"), message("3"), message("2"), message("1")];
+    const heights: Record<string, number> = { "1": 20, "1.5": 90, "2": 55, "3": 30, "4": 60, "5": 40 };
+    const source = liveHistorySource(() => messages);
+    const root = shadowRoot();
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    try {
+      const history = root.querySelector<HTMLElement>(".message-history")!;
+      Object.defineProperty(history, "clientHeight", { get: () => 25 });
+      Object.defineProperty(history, "scrollHeight", { get: () =>
+        [...history.querySelectorAll<HTMLElement>(".message")].reduce((height, row) => height + heights[row.dataset.messageId!]!, 0) });
+      HTMLElement.prototype.getBoundingClientRect = function () {
+        if (this === history) return { top: 10, bottom: 35, height: 25 } as DOMRect;
+        const rows = [...history.querySelectorAll<HTMLElement>(".message")];
+        const index = rows.indexOf(this);
+        const height = index < 0 ? 0 : heights[this.dataset.messageId!]!;
+        const top = 10 + rows.slice(0, Math.max(index, 0))
+          .reduce((sum, row) => sum + heights[row.dataset.messageId!]!, 0) - history.scrollTop;
+        return { top, bottom: top + height, height } as DOMRect;
+      };
+      history.scrollTop = 35;
+      messages = [message("4"), message("3"), message("2"), message("1.5"), message("1")];
+      await source.emit("conversations.changes", snapshot());
+      expect(history.scrollTop).toBe(125);
+      messages = [message("4"), message("3"), message("1.5"), message("1")];
+      await source.emit("conversations.changes", snapshot());
+      expect(history.scrollTop).toBe(125);
+      expect(root.querySelector<HTMLElement>(".message[data-message-id='3']")?.getBoundingClientRect().top).toBe(-5);
+      messages = [message("5"), ...messages];
+      await source.emit("conversations.changes", snapshot());
+      expect(history.scrollTop).toBe(125);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = original;
+      await unmount();
+    }
+  });
+  it("follows a new tail from the bottom even when the batch also removes an earlier row", async () => {
+    let messages = [message("3"), message("2"), message("1")];
+    const source = liveHistorySource(() => messages);
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const history = root.querySelector<HTMLElement>(".message-history")!;
+    Object.defineProperty(history, "clientHeight", { get: () => 10 });
+    Object.defineProperty(history, "scrollHeight", { get: () => history.querySelectorAll(".message").length * 40 });
+    history.scrollTop = 110;
+    messages = [message("4"), message("3"), message("2")];
+    await source.emit("conversations.changes", snapshot());
+    expect(history.scrollTop).toBe(history.scrollHeight);
+    await unmount();
+  });
+  it("preserves the visible row and offset when an interior Message appears above it", async () => {
+    let messages = [message("3"), message("2"), message("1")];
+    const source = liveHistorySource(() => messages);
+    const root = shadowRoot();
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    try {
+      const unmount = await mount(createTestMountContext({ root, client: source.client }));
+      const history = root.querySelector<HTMLElement>(".message-history")!;
+      Object.defineProperty(history, "clientHeight", { get: () => 10 });
+      Object.defineProperty(history, "scrollHeight", { get: () => history.querySelectorAll(".message").length * 40 });
+      HTMLElement.prototype.getBoundingClientRect = function () {
+        const index = [...history.querySelectorAll(".message")].indexOf(this);
+        const top = index < 0 ? 0 : index * 40 - history.scrollTop;
+        return { top, bottom: top + 40, left: 0, right: 100, width: 100, height: 40,
+          x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+      };
+      history.scrollTop = 45;
+      messages = [message("3"), message("2"), message("1.5"), message("1")];
+      await source.emit("conversations.changes", snapshot());
+      expect(history.scrollTop).toBe(85);
+      expect([...history.querySelectorAll(".message-markdown")].map(node => node.textContent?.trim())).toEqual(["1", "1.5", "2", "3"]);
+      await unmount();
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = original;
+    }
+  });
+});
+
 describe("short initial history", () => {
   it("fills a non-scrollable history without looping on a pending page", async () => {
     const originalHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
@@ -976,7 +1065,8 @@ describe("short initial history", () => {
         request: <T extends PackageValue>(operation: string): Promise<T> => {
           calls.push(operation);
           if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
-          if (operation === "conversations.channel.open") return Promise.resolve({ messages: [message("newest")], nextBefore: "older" }) as unknown as Promise<T>;
+          if (operation === "conversations.channel.open") return Promise.resolve({ ...emptyPage(), messages: [message("newest")], nextBefore: "older" }) as unknown as Promise<T>;
+          if (operation === "conversations.channel.changes") return Promise.resolve({ events: [], continuation: "0", highWater: "0" }) as unknown as Promise<T>;
           return new Promise((resolve) => { resolvePage = (page) => resolve(page as unknown as T); });
         },
         subscribe: async () => ({ close: async () => undefined }),
@@ -989,7 +1079,7 @@ describe("short initial history", () => {
       await vi.waitFor(() => expect(calls.filter((call) => call === "conversations.channel.page")).toHaveLength(1));
       await new Promise((resolve) => setTimeout(resolve, 40));
       expect(calls.filter((call) => call === "conversations.channel.page")).toHaveLength(1);
-      resolvePage({ messages: [message("older"), message("oldest")] });
+      resolvePage({ ...emptyPage(), messages: [message("older"), message("oldest")] });
       await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
       await unmount();
     } finally {

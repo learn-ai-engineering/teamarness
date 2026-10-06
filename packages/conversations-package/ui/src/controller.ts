@@ -3,6 +3,7 @@ import type { Availability, ConversationsContract } from "./contract.generated";
 import type {
   ConversationChannel,
   ConversationMessage,
+  ConversationPage,
   ConversationSnapshot,
 } from "./index";
 
@@ -26,6 +27,10 @@ export interface ControllerState {
   readonly posting: boolean;
   readonly retryingHead: boolean;
   readonly olderError: boolean;
+  readonly feedError: boolean;
+  readonly resolveError: boolean;
+  readonly pendingHistory: number;
+  readonly unavailableHistory: number;
   readonly availability: Availability;
   readonly warning: string | null;
   readonly warnings: readonly string[];
@@ -36,12 +41,30 @@ export interface ControllerState {
 export const PAGE_SIZE = 32;
 const MAX_HISTORY_PAGES = 32;
 
-interface HeadBackfill {
-  channelId: string;
-  newest: ConversationMessage[];
-  nextBefore: string;
-  cursors: Set<string>;
-  revision: number;
+interface HistoryRebuild {
+  messages: ConversationMessage[];
+  pending: NonNullable<ConversationPage["pending"]>[number][];
+  cursor: string | null;
+  targetCursor: string | null;
+  exhausted: boolean;
+  epoch: string;
+  revision: string;
+  seen: Set<string>;
+}
+
+interface ChangeFeed {
+  epoch: string;
+  after: string;
+  status: "idle" | "pending" | "failed";
+  pending: Map<string, string>;
+  unavailable: Map<string, string>;
+  positions: Map<string, string>;
+  running: Promise<void> | null;
+  dirty: boolean;
+  resolveStatus: "idle" | "failed";
+  resolveRunning: Promise<void> | null;
+  resolveOffset: number;
+  rebuild: "start" | HistoryRebuild | null;
 }
 
 /**
@@ -146,11 +169,13 @@ export class ConversationsController {
   private _state: ControllerState;
   private generation = 0;
   private disposed = false;
-  private headRequest: Promise<void> | null = null;
-  private headQueued = false;
-  private headRevision = 0;
   private headFailed = false;
-  private headBackfill: HeadBackfill | null = null;
+  private feed: ChangeFeed | null = null;
+  private removedDuringOlder: Set<string> | null = null;
+  private openingChannel: number | null = null;
+  private openDirty = false;
+  private historyGeneration = 0;
+  private historyRebuilding = false;
   private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
@@ -173,6 +198,10 @@ export class ConversationsController {
       posting: false,
       retryingHead: false,
       olderError: false,
+      feedError: false,
+      resolveError: false,
+      pendingHistory: 0,
+      unavailableHistory: 0,
       availability: "catching_up",
       warning: null,
       warnings: [],
@@ -226,6 +255,7 @@ export class ConversationsController {
           nextBefore: page.nextBefore ?? null,
           loading: false,
         };
+        this.installFeed(page);
       } catch {
         if (this.disposed || this.generation !== gen) return;
         this.headFailed = true;
@@ -262,7 +292,9 @@ export class ConversationsController {
   /** Dispose all pending work. Safe to call multiple times. */
   dispose(): void {
     this.disposed = true;
-    this.headBackfill = null;
+    this.feed = null;
+    this.removedDuringOlder = null;
+    ++this.historyGeneration;
     ++this.generation;
   }
 
@@ -280,7 +312,12 @@ export class ConversationsController {
 
     const gen = ++this.generation;
     this.headFailed = false;
-    this.headBackfill = null;
+    this.feed = null;
+    this.removedDuringOlder = null;
+    ++this.historyGeneration;
+    this.historyRebuilding = false;
+    this.openingChannel = gen;
+    this.openDirty = false;
     this._state = {
       ...this._state,
       selectedChannelId: channelId,
@@ -292,6 +329,10 @@ export class ConversationsController {
       posting: false,
       retryingHead: false,
       olderError: false,
+      feedError: false,
+      resolveError: false,
+      pendingHistory: 0,
+      unavailableHistory: 0,
       warning: null,
       confirmingHide: false,
     };
@@ -310,6 +351,9 @@ export class ConversationsController {
         nextBefore: page.nextBefore ?? null,
         loading: false,
       };
+      this.installFeed(page);
+      this.openingChannel = null;
+      if (this.openDirty) await this.reconcileSignal();
     } catch (error) {
       if (this.disposed || this.generation !== gen) return;
       const info = classify(error);
@@ -321,6 +365,7 @@ export class ConversationsController {
         warning: errorMessage("channel.open", info, this._state.availability),
       };
     } finally {
+      if (this.openingChannel === gen) this.openingChannel = null;
       if (!this.disposed && this.generation === gen) this.notify();
     }
   }
@@ -330,8 +375,11 @@ export class ConversationsController {
     if (this.disposed) return;
     const { hasMore, nextBefore, loadingOlder, selectedChannelId, olderError } =
       this._state;
-    if (!hasMore || !nextBefore || loadingOlder || !selectedChannelId || olderError) return;
+    if (!hasMore || !nextBefore || loadingOlder || !selectedChannelId || olderError || this.historyRebuilding) return;
     const gen = this.generation;
+    const historyGen = this.historyGeneration;
+    const removed = new Set<string>();
+    this.removedDuringOlder = removed;
 
     this._state = { ...this._state, loadingOlder: true, warning: null };
     this.notify();
@@ -345,8 +393,9 @@ export class ConversationsController {
           "conversations.channel.page",
           { channelId: selectedChannelId, before: cursor, limit: PAGE_SIZE },
         );
-        if (this.disposed || this.generation !== gen) return;
+        if (this.disposed || this.generation !== gen || this.historyGeneration !== historyGen) return;
         if (page.nextBefore && cursors.has(page.nextBefore)) throw new Error("Non-advancing history cursor");
+        this.trackPending(page.pending ?? []);
         if (page.messages.length || !page.nextBefore) break;
         cursor = page.nextBefore;
         cursors.add(cursor);
@@ -358,19 +407,22 @@ export class ConversationsController {
       // Deduplicate by message id. Older Messages belong above the ones already shown.
       const existing = new Set(this._state.messages.map((m) => m.id));
       const fresh = page.messages.filter((message) => {
-        if (existing.has(message.id)) return false;
+        if (existing.has(message.id) || removed.has(message.id)) return false;
         existing.add(message.id);
         return true;
       });
       this._state = {
         ...this._state,
-        messages: [...oldestFirst(fresh), ...this._state.messages],
+        messages: this.ordered([...oldestFirst(fresh), ...this._state.messages]),
         hasMore: page.nextBefore !== undefined,
         nextBefore: page.nextBefore ?? null,
         loadingOlder: false,
       };
+      for (const message of fresh) {
+        if (message.position !== undefined) this.feed?.positions.set(message.id, message.position);
+      }
     } catch {
-      if (this.disposed || this.generation !== gen) return;
+      if (this.disposed || this.generation !== gen || this.historyGeneration !== historyGen) return;
       this._state = {
         ...this._state,
         loadingOlder: false,
@@ -378,22 +430,51 @@ export class ConversationsController {
         warning: "Older history could not be loaded.",
       };
     } finally {
+      if (this.removedDuringOlder === removed) this.removedDuringOlder = null;
       if (!this.disposed && this.generation === gen) this.notify();
     }
   }
 
+  /** Close the gap between initial page selection and live subscription installation. */
+  async catchUpAfterSubscribe(): Promise<void> { if (this.feed) await this.refreshFeed(false); }
+
+  /** Change replay and non-ready row resolution have independent retry ownership. */
+  async retryFeed(): Promise<void> { await this.refreshFeed(true); }
+  async retryPending(): Promise<void> { await this.resolvePending(true); }
+
   /** A failed request is retried only by an explicit action, never by scrolling. */
   async retryOlder(): Promise<void> {
-    if (!this._state.olderError || this.disposed) return;
+    if (this.disposed) return;
+    if (!this._state.olderError) return;
     const retryHead = this.headFailed;
     this._state = { ...this._state, olderError: false, warning: null,
       retryingHead: retryHead,
       loading: retryHead && this._state.messages.length === 0 ? true : this._state.loading };
     this.notify();
-    if (retryHead) {
-      await this.reloadCurrentChannel();
-    } else {
-      await this.loadOlder();
+    if (retryHead) await this.retryHead();
+    else await this.loadOlder();
+  }
+
+  private async retryHead(): Promise<void> {
+    const gen = this.generation;
+    const channelId = this._state.selectedChannelId;
+    if (!channelId) return;
+    try {
+      const page = await this.client.request("conversations.channel.open", { channelId, limit: PAGE_SIZE });
+      if (this.disposed || this.generation !== gen) return;
+      this._state = { ...this._state, messages: oldestFirst(page.messages),
+        hasMore: page.nextBefore !== undefined, nextBefore: page.nextBefore ?? null,
+        loading: false, retryingHead: false, olderError: false, warning: null };
+      this.installFeed(page);
+      this.headFailed = false;
+      this.notify();
+      if (this.feed) await this.refreshFeed(false);
+    } catch {
+      if (this.disposed || this.generation !== gen) return;
+      this.headFailed = true;
+      this._state = { ...this._state, loading: false, retryingHead: false, olderError: true,
+        warning: "Conversation history could not be refreshed." };
+      this.notify();
     }
   }
 
@@ -480,17 +561,9 @@ export class ConversationsController {
     try {
       await this.client.request("conversations.message.post", { channelId, markdown });
       if (this.disposed || this.generation !== gen) return false;
-      // A committed post can complete while a bounded head backfill continues.
-      // Keep the composer responsive instead of awaiting every intervening page.
+      // A committed post does not wait for change replay or resume a failed history request.
       this._state = { ...this._state, posting: false };
-      if (this.headFailed && this.headBackfill) {
-        // Do not resume a known-failing page on send. Explicit retry bridges
-        // the gap, then fetches the head again to include the post.
-        ++this.headRevision;
-        this.headQueued = true;
-      } else {
-        void this.reloadCurrentChannel();
-      }
+      if (this.feed) void this.refreshFeed(false);
       return true;
     } catch (error) {
       if (this.disposed || this.generation !== gen) return false;
@@ -531,15 +604,18 @@ export class ConversationsController {
       this._state = { ...this._state, channels, availability, warnings: snapshot.warnings ?? [] };
       if (selectedId) return this.selectChannel(selectedId);
       ++this.generation;
+      ++this.historyGeneration;
+      this.historyRebuilding = false;
       this.headFailed = false;
-      this.headBackfill = null;
+      this.feed = null;
       this._state = { ...this._state, selectedChannelId: null, messages: [], hasMore: false,
-        nextBefore: null, loading: false, loadingOlder: false, posting: false, retryingHead: false, olderError: false };
+        nextBefore: null, loading: false, loadingOlder: false, posting: false, retryingHead: false, olderError: false,
+        feedError: false, resolveError: false, pendingHistory: 0, unavailableHistory: 0 };
       this.notify();
       return;
     }
 
-    // Same channel — reload messages to catch live delivery.
+    // Same Channel: replay from the captured projection watermark.
     this._state = {
       ...this._state,
       channels,
@@ -547,109 +623,263 @@ export class ConversationsController {
       warnings: snapshot.warnings ?? [],
     };
     this.notify();
-    // Failed bounded backfill resumes only on explicit retry, not on each live event.
-    if (this.headFailed && this.headBackfill) {
-      ++this.headRevision;
-      this.headQueued = true;
+    if (this.feed) return this.reconcileSignal();
+    if (this.openingChannel === this.generation) {
+      this.openDirty = true;
       return;
     }
-    // Return the promise so callers can await the reload.
-    return this.reloadCurrentChannel();
+    // A failed open resumes only on explicit retry, never on another snapshot.
+    return;
   }
 
-  private reloadCurrentChannel(): Promise<void> {
-    if (!this._state.selectedChannelId || this.disposed) return Promise.resolve();
-    if (!(this.headFailed && this.headBackfill)) ++this.headRevision;
-    if (this.headRequest) {
-      this.headQueued = true;
-      return this.headRequest;
+  /** A response watermark belongs to the raw row selection, not to `open` completion. */
+  private installFeed(page: ConversationPage): void {
+    if (!page.epoch || page.revision === undefined) return;
+    this.feed = { epoch: page.epoch, after: page.revision, status: "idle",
+      pending: new Map(), unavailable: new Map(),
+      positions: new Map(this._state.messages.filter(m => m.position !== undefined).map(m => [m.id, m.position!])),
+      running: null, dirty: false,
+      resolveStatus: "idle", resolveRunning: null, resolveOffset: 0, rebuild: null };
+    this.trackPending(page.pending ?? []);
+  }
+
+  private trackPending(rows: readonly { id: string; position: string; status: string }[]): void {
+    if (!this.feed) return;
+    const ready = new Set(this._state.messages.map(message => message.id));
+    for (const row of rows) {
+      if (ready.has(row.id) || this.removedDuringOlder?.has(row.id)) continue;
+      if (row.status === "pending") this.feed.pending.set(row.id, row.position);
+      else if (row.status === "unavailable") this.feed.unavailable.set(row.id, row.position);
     }
-    const request = this.reconcileHead();
-    this.headRequest = request;
-    void request.finally(() => {
-      if (this.headRequest === request) {
-        this.headRequest = null;
-        // A stale Channel's request can settle before its queued replacement runs.
-        if (this.headQueued && !this.headFailed && !this.disposed) void this.reloadCurrentChannel();
+    this._state = { ...this._state, pendingHistory: this.feed.pending.size,
+      unavailableHistory: this.feed.unavailable.size };
+  }
+
+  private insertionIndex(items: readonly ConversationMessage[], position: string): number {
+    let lo = 0; let hi = items.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((items[mid]!.position ?? "") < position) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  private ordered(messages: readonly ConversationMessage[]): readonly ConversationMessage[] {
+    // The Package guarantees that position uses the same bytewise order as SQLite's Order Key.
+    if (!messages.every(message => message.position !== undefined)) return messages;
+    return [...messages].sort((a, b) => a.position! < b.position! ? -1 : a.position! > b.position! ? 1 : 0);
+  }
+
+  private async reconcileSignal(): Promise<void> {
+    const feed = this.feed;
+    await this.refreshFeed(false);
+    if (feed && feed === this.feed && feed.status === "idle") await this.resolvePending(false);
+  }
+
+  private refreshFeed(explicit: boolean): Promise<void> {
+    const feed = this.feed;
+    if (!feed || this.disposed || (feed.status === "failed" && !explicit)) return Promise.resolve();
+    if (feed.running) { feed.dirty = true; return feed.running; }
+    const gen = this.generation;
+    const channelId = this._state.selectedChannelId;
+    if (!channelId) return Promise.resolve();
+    if (explicit) { feed.status = "idle"; this._state = { ...this._state, feedError: false }; this.notify(); }
+    feed.dirty = true;
+    const run = async () => {
+      let batches = 0;
+      while (feed.dirty && batches < MAX_HISTORY_PAGES && !this.disposed && this.generation === gen) {
+        feed.dirty = false;
+        feed.status = "pending";
+        try {
+          if (feed.rebuild) {
+            await this.rebuildHistory(feed, channelId, gen);
+            return;
+          }
+          const response = await this.client.request("conversations.channel.changes", {
+            channelId, epoch: feed.epoch, after: feed.after, limit: PAGE_SIZE,
+          });
+          if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+          if (response.resyncRequired) {
+            feed.rebuild = "start";
+            ++this.historyGeneration;
+            this.historyRebuilding = true;
+            this.removedDuringOlder = null;
+            this._state = { ...this._state, loadingOlder: false };
+            await this.rebuildHistory(feed, channelId, gen);
+            return;
+          }
+          if (response.continuation === feed.after && response.events.length > 0) throw new Error("Non-advancing change cursor");
+          let messages: ConversationMessage[] | null = null;
+          const removeLoaded = (id: string): void => {
+            const position = feed.positions.get(id);
+            if (position === undefined) return;
+            feed.positions.delete(id);
+            const items = messages ?? this._state.messages;
+            const candidate = this.insertionIndex(items, position);
+            const index = items[candidate]?.id === id ? candidate : items.findIndex(item => item.id === id);
+            if (index >= 0) {
+              messages ??= [...this._state.messages];
+              messages.splice(index, 1);
+            }
+          };
+          for (const event of response.events) {
+            if (event.kind === "remove") {
+              this.removedDuringOlder?.add(event.id);
+              removeLoaded(event.id);
+              feed.pending.delete(event.id); feed.unavailable.delete(event.id);
+            } else if (!this._state.hasMore || !this._state.nextBefore || event.position >= this._state.nextBefore) {
+              if (event.message) {
+                removeLoaded(event.id);
+                messages ??= [...this._state.messages];
+                messages.splice(this.insertionIndex(messages, event.position), 0,
+                  { ...event.message, position: event.position });
+                feed.positions.set(event.id, event.position);
+                feed.pending.delete(event.id); feed.unavailable.delete(event.id);
+              } else if (event.status === "pending" && !feed.positions.has(event.id)) {
+                feed.pending.set(event.id, event.position);
+              } else if (event.status === "unavailable" && !feed.positions.has(event.id)) {
+                feed.unavailable.set(event.id, event.position);
+              }
+            }
+          }
+          this._state = { ...this._state, messages: messages ?? this._state.messages,
+            feedError: false, pendingHistory: feed.pending.size,
+            unavailableHistory: feed.unavailable.size };
+          feed.after = response.continuation;
+          feed.status = "idle";
+          if (response.continuation !== response.highWater) feed.dirty = true;
+          this.notify();
+          batches++;
+        } catch {
+          if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+          feed.status = "failed";
+          feed.dirty = false;
+          this._state = { ...this._state, feedError: true };
+          this.notify();
+          return;
+        }
+      }
+      if (feed.dirty && !this.disposed && this.generation === gen) {
+        // Resume on the next notification or explicit action; never discard the continuation.
+        this._state = { ...this._state, feedError: true };
+        feed.status = "failed";
+        this.notify();
+      }
+    };
+    feed.running = run().finally(() => {
+      feed.running = null;
+      if (feed.dirty && feed.status === "idle" && this.feed === feed && !this.disposed) {
+        return this.refreshFeed(false);
       }
     });
-    return request;
+    return feed.running;
   }
 
-  private async reconcileHead(): Promise<void> {
-    do {
-      this.headQueued = false;
-      const gen = this.generation;
-      const channelId = this._state.selectedChannelId;
-      if (!channelId) return;
+  /** Rebuild the previously loaded raw range before changing epochs. Keep the old view until complete. */
+  private async rebuildHistory(feed: ChangeFeed, channelId: string, gen: number): Promise<void> {
+    let rebuild = feed.rebuild;
+    if (rebuild === "start") {
+      const targetCursor = this._state.nextBefore;
+      const exhausted = !this._state.hasMore
+        && (this._state.messages.length > 0 || this._state.pendingHistory > 0 || this._state.unavailableHistory > 0);
+      const head = await this.client.request("conversations.channel.open", { channelId, limit: PAGE_SIZE });
+      if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+      if (!head.epoch || head.revision === undefined) throw new Error("History resync omitted its watermark");
+      rebuild = { messages: [...oldestFirst(head.messages)], pending: [...(head.pending ?? [])],
+        cursor: head.nextBefore ?? null, targetCursor, exhausted,
+        epoch: head.epoch, revision: head.revision,
+        seen: new Set<string>() };
+      feed.rebuild = rebuild;
+    }
+    if (!rebuild) return;
+    let count = 0;
+    while (rebuild.cursor && (rebuild.exhausted
+      || (rebuild.targetCursor !== null && rebuild.cursor > rebuild.targetCursor))) {
+      if (count++ >= MAX_HISTORY_PAGES) throw new Error("History rebuild continuation required");
+      const cursor = rebuild.cursor;
+      if (rebuild.seen.has(cursor)) throw new Error("Non-advancing history cursor");
+      rebuild.seen.add(cursor);
+      const page = await this.client.request("conversations.channel.page", {
+        channelId, before: cursor, limit: PAGE_SIZE,
+      });
+      if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+      rebuild.messages.unshift(...oldestFirst(page.messages));
+      rebuild.pending.push(...(page.pending ?? []));
+      rebuild.cursor = page.nextBefore ?? null;
+    }
+    if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+    this.headFailed = false;
+    const preserveResolveFailure = feed.resolveStatus === "failed"
+      && rebuild.pending.some(row => row.status === "pending" && feed.pending.has(row.id));
+    this._state = { ...this._state, messages: this.ordered([...new Map(rebuild.messages.map(m => [m.id, m])).values()]),
+      hasMore: rebuild.cursor !== null, nextBefore: rebuild.cursor,
+      feedError: false, resolveError: preserveResolveFailure,
+      pendingHistory: 0, unavailableHistory: 0 };
+    this.installFeed({ messages: [], pending: rebuild.pending, epoch: rebuild.epoch, revision: rebuild.revision });
+    if (preserveResolveFailure && this.feed) this.feed.resolveStatus = "failed";
+    this.historyRebuilding = false;
+    this.notify();
+    // The open watermark precedes asynchronous page reads. Always replay after installing it,
+    // including when a notification arrived during the rebuild.
+    await this.refreshFeed(false);
+  }
+
+  /** A snapshot signals one bounded readiness probe; explicit retries rotate through all pending IDs. */
+  private resolvePending(explicit: boolean): Promise<void> {
+    const feed = this.feed;
+    const channelId = this._state.selectedChannelId;
+    if (!feed || !channelId || feed.pending.size === 0 || (feed.resolveStatus === "failed" && !explicit)) {
+      return Promise.resolve();
+    }
+    if (feed.resolveRunning) return feed.resolveRunning;
+    const gen = this.generation;
+    const candidates = [...feed.pending.keys()];
+    const start = feed.resolveOffset % candidates.length;
+    const requested = [...candidates.slice(start), ...candidates.slice(0, start)].slice(0, PAGE_SIZE);
+    const requestedIds = new Set(requested);
+    if (explicit) {
+      feed.resolveStatus = "idle";
+      this._state = { ...this._state, resolveError: false };
+      this.notify();
+    }
+    const run = async () => {
       try {
-        let backfill = this.headBackfill;
-        let firstCursor: string | null = null;
-        if (!backfill || backfill.channelId !== channelId) {
-          const head = await this.client.request("conversations.channel.open", { channelId, limit: PAGE_SIZE });
-          if (this.disposed || this.generation !== gen) return;
-          firstCursor = head.nextBefore ?? null;
-          backfill = { channelId, newest: [...oldestFirst(head.messages)],
-            nextBefore: head.nextBefore ?? "", cursors: new Set<string>(), revision: this.headRevision };
-        }
-        const known = new Set(this._state.messages.map((m) => m.id));
-        let count = 0;
-        // A fresh head cursor may still be above the retained oldest Message.
-        // When locally exhausted, walk Backend order until we reach that ID.
-        const oldestId = this._state.hasMore ? null : this._state.messages[0]?.id;
-        while (known.size > 0 && backfill.nextBefore
-          && (!backfill.newest.some((m) => known.has(m.id))
-            || (oldestId !== undefined && oldestId !== null
-              && !backfill.newest.some((m) => m.id === oldestId)))) {
-          const cursor = backfill.nextBefore;
-          if (backfill.cursors.has(cursor)) throw new Error("Non-advancing history cursor");
-          if (count >= MAX_HISTORY_PAGES) {
-            this.headBackfill = backfill;
-            throw new Error("History page limit reached");
+        const response = await this.client.request("conversations.channel.resolve", {
+          channelId, ids: requested,
+        });
+        if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+        let messages: ConversationMessage[] | null = null;
+        for (const message of response.messages) {
+          if (!requestedIds.has(message.id) || !feed.pending.has(message.id)) continue;
+          messages ??= [...this._state.messages];
+          if (message.position !== undefined) {
+            messages.splice(this.insertionIndex(messages, message.position), 0, message);
+            feed.positions.set(message.id, message.position);
           }
-          this.headBackfill = backfill;
-          const page = await this.client.request("conversations.channel.page", {
-            channelId, before: cursor, limit: PAGE_SIZE,
-          });
-          if (this.disposed || this.generation !== gen) return;
-          backfill.cursors.add(cursor);
-          backfill.newest.unshift(...oldestFirst(page.messages));
-          backfill.nextBefore = page.nextBefore ?? "";
-          count++;
+          feed.pending.delete(message.id);
         }
-        const current = this._state.messages;
-        const currentIds = new Set(current.map((message) => message.id));
-        const overlap = backfill.newest.findIndex((message) => currentIds.has(message.id));
-        const retained = overlap < 0 ? current : current.slice(0, current.findIndex((m) => m.id === backfill.newest[overlap]!.id));
-        const ids = new Set(retained.map((m) => m.id));
-        const messages = [...retained, ...backfill.newest.filter((message) => {
-          if (ids.has(message.id)) return false;
-          ids.add(message.id);
-          return true;
-        })];
-        const olderCursor = current.length === 0 ? firstCursor
-          : this._state.hasMore ? this._state.nextBefore : backfill.nextBefore || null;
-        this._state = {
-          ...this._state, messages,
-          hasMore: olderCursor !== null,
-          nextBefore: olderCursor,
-          loading: false,
-          retryingHead: false,
-          olderError: this.headFailed ? false : this._state.olderError,
-          warning: this.headFailed ? null : this._state.warning,
-        };
-        this.headFailed = false;
-        this.headBackfill = null;
-        if (backfill.revision !== this.headRevision) this.headQueued = true;
+        for (const row of response.pending) {
+          if (!requestedIds.has(row.id) || !feed.pending.has(row.id)) continue;
+          if (row.status === "unavailable") { feed.pending.delete(row.id); feed.unavailable.set(row.id, row.position); }
+        }
+        for (const id of response.missing) {
+          if (requestedIds.has(id)) { feed.pending.delete(id); feed.unavailable.delete(id); }
+        }
+        feed.resolveOffset = (start + requested.length) % Math.max(feed.pending.size, 1);
+        this._state = { ...this._state, messages: messages ?? this._state.messages,
+          pendingHistory: feed.pending.size, unavailableHistory: feed.unavailable.size,
+          resolveError: false };
         this.notify();
       } catch {
-        if (this.disposed || this.generation !== gen) return;
-        this.headFailed = true;
-        this.headQueued = false;
-        this._state = { ...this._state, loading: false, retryingHead: false, olderError: true, warning: "Conversation history could not be refreshed." };
+        if (this.disposed || this.generation !== gen || this.feed !== feed) return;
+        feed.resolveStatus = "failed";
+        this._state = { ...this._state, resolveError: true };
         this.notify();
       }
-    } while (this.headQueued && !this.disposed);
+    };
+    feed.resolveRunning = run().finally(() => { feed.resolveRunning = null; });
+    return feed.resolveRunning;
   }
 
   // ------------------------------------------------------------------

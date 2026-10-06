@@ -12,7 +12,7 @@ use teamarness_package_sdk::{
 use tokio::sync::watch;
 
 use crate::domain::{DomainRecord, PAGE_SIZE, decode_id, hex_id};
-use crate::store::{ConversationStore, IngestResult};
+use crate::store::{ConversationStore, IngestResult, MessageRow};
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -115,6 +115,23 @@ struct PageRequest {
     before: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChangesRequest {
+    channel_id: String,
+    epoch: String,
+    after: String,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveRequest {
+    channel_id: String,
+    ids: Vec<String>,
 }
 
 /// The Conversations Backend.
@@ -261,6 +278,18 @@ pub(crate) fn router_observing(
             page(&context, request).await
         },
     )
+    .request(
+        "conversations.channel.changes",
+        |context: Context<ConversationsActive>, request: ChangesRequest| async move {
+            changes(&context, request).await
+        },
+    )
+    .request(
+        "conversations.channel.resolve",
+        |context: Context<ConversationsActive>, request: ResolveRequest| async move {
+            resolve(&context, request).await
+        },
+    )
     .subscription(
         "conversations.changes",
         |context: Context<ConversationsActive>, _: Empty| async move {
@@ -391,18 +420,70 @@ async fn page(
     let state = context.state().clone();
     let channel = request.channel_id.clone();
     let before = request.before.clone();
-    let rows = context
+    let ((epoch, revision), rows) = context
         .blocking(move |_| {
             state
                 .store
-                .message_rows(&channel, before.as_deref(), limit)
+                .message_rows_with_head(&channel, before.as_deref(), limit)
                 .map_err(|_| storage_failed())
         })
         .await?;
-    if rows.is_empty() {
-        return Ok(json!({ "messages": [] }));
+    let full_page = rows.len() == limit;
+    let mut messages = Vec::new();
+    let mut pending = Vec::new();
+    let mut last_order = None;
+    let mut shortened = false;
+    for row in rows {
+        let order = row.1.clone();
+        let (ready, waiting) = render_rows(context, vec![row]).await?;
+        if !fits_history_reply(&messages, &pending, &ready, &waiting) {
+            if last_order.is_none() {
+                return Err(error("conversations.response_limit", true));
+            }
+            shortened = true;
+            break;
+        }
+        messages.extend(ready);
+        pending.extend(waiting);
+        last_order = Some(order);
     }
-    let has_more = rows.len() == limit;
+    let mut page = json!({ "messages": messages, "pending": pending, "epoch": epoch, "revision": revision.to_string() });
+    if (full_page || shortened)
+        && let Some(next) = last_order
+        && let JsonValue::Object(ref mut fields) = page
+    {
+        fields.insert("nextBefore".into(), JsonValue::String(next));
+    }
+    Ok(page)
+}
+
+// Leave room for the envelope, cursor, and worst-case JSON escaping in the 256 KiB UI bridge.
+const HISTORY_REPLY_BUDGET: usize = 216 * 1024;
+
+fn fits_history_reply(
+    messages: &[JsonValue],
+    pending: &[JsonValue],
+    next_messages: &[JsonValue],
+    next_pending: &[JsonValue],
+) -> bool {
+    let size = messages
+        .iter()
+        .chain(next_messages)
+        .chain(pending)
+        .chain(next_pending)
+        .map(|item| serde_json::to_vec(item).map_or(usize::MAX, |bytes| bytes.len() + 1))
+        .fold(0usize, usize::saturating_add);
+    size <= HISTORY_REPLY_BUDGET
+}
+
+/// Returns every raw projected row as either ready content or a retryable/permanent slot.
+async fn render_rows(
+    context: &Context<ConversationsActive>,
+    rows: Vec<MessageRow>,
+) -> Result<(Vec<JsonValue>, Vec<JsonValue>), BackendError> {
+    if rows.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let sealed: Vec<Vec<u8>> = rows.iter().map(|row| row.4.clone()).collect();
     let results = context
         .state()
@@ -410,34 +491,155 @@ async fn page(
         .open(&sealed)
         .await
         .map_err(|cause| capability_error("open-message-page", cause))?;
-    let local_identity = context.state().installation.clone();
-    let last_order = rows.last().map(|row| row.1.clone());
+    if rows.len() != results.len() {
+        return Err(error("conversations.invalid_open_result", true));
+    }
     let mut messages = Vec::new();
-    for ((id, _order, author, _record, _sealed, _ordinal), result) in
-        rows.into_iter().zip(results.iter())
-    {
-        let OpenResult::Ready(opened) = result else {
-            continue;
-        };
-        if let Ok(DomainRecord::MessagePost { markdown, .. }) =
-            DomainRecord::decode(&opened.canonical)
+    let mut pending = Vec::new();
+    for ((id, position, author, _, _, _), result) in rows.into_iter().zip(results) {
+        if let OpenResult::Ready(ref opened) = result
+            && let Ok(DomainRecord::MessagePost { markdown, .. }) =
+                DomainRecord::decode(&opened.canonical)
         {
-            messages.push(json!({
-                "id": id,
-                "author": author,
-                "isLocal": author == local_identity,
-                "markdown": markdown,
-            }));
+            messages.push(json!({ "id": id, "position": position, "author": author,
+                "isLocal": author == context.state().installation, "markdown": markdown }));
+        } else {
+            let status = if matches!(result, OpenResult::WrongScope | OpenResult::Corrupt) {
+                "unavailable"
+            } else {
+                "pending"
+            };
+            pending.push(json!({ "id": id, "position": position, "status": status }));
         }
     }
-    let mut page = json!({ "messages": messages });
-    if has_more
-        && let Some(next) = last_order
-        && let JsonValue::Object(ref mut fields) = page
-    {
-        fields.insert("nextBefore".into(), JsonValue::String(next));
+    Ok((messages, pending))
+}
+
+async fn changes(
+    context: &Context<ConversationsActive>,
+    request: ChangesRequest,
+) -> Result<JsonValue, BackendError> {
+    if decode_id(&request.channel_id).is_none() {
+        return Err(error("conversations.invalid_request", false));
     }
-    Ok(page)
+    let after: u64 = request
+        .after
+        .parse()
+        .map_err(|_| error("conversations.invalid_request", false))?;
+    let limit = request
+        .limit
+        .map_or(PAGE_SIZE, |value| (value as usize).min(PAGE_SIZE));
+    let state = context.state().clone();
+    let channel = request.channel_id;
+    let epoch = request.epoch;
+    let batch = context
+        .blocking(move |_| {
+            state
+                .store
+                .history_changes(&channel, &epoch, after, limit)
+                .map_err(|_| storage_failed())
+        })
+        .await?;
+    let Some(batch) = batch else {
+        return Ok(
+            json!({ "events": [], "continuation": request.after, "highWater": request.after, "resyncRequired": true }),
+        );
+    };
+    let mut events = Vec::with_capacity(batch.changes.len());
+    let mut continuation = batch.continuation;
+    for event in batch.changes {
+        let event_revision = event.revision;
+        let mut response = json!({ "kind": event.kind, "id": event.message_id,
+            "position": event.order_key, "revision": event.revision.to_string() });
+        if event.kind == "insert" {
+            let state = context.state().clone();
+            let channel_id = event.channel_id;
+            let message_id = event.message_id;
+            let row = context
+                .blocking(move |_| {
+                    state
+                        .store
+                        .message_row_by_id(&channel_id, &message_id)
+                        .map_err(|_| storage_failed())
+                })
+                .await?;
+            if let Some(row) = row {
+                let (messages, pending) = render_rows(context, vec![row]).await?;
+                response["status"] = json!(if messages.is_empty() {
+                    pending[0]["status"].as_str().unwrap_or("pending")
+                } else {
+                    "ready"
+                });
+                if let Some(message) = messages.into_iter().next() {
+                    response["message"] = message;
+                }
+            } else {
+                response["status"] = json!("unavailable");
+            }
+        }
+        if !fits_history_reply(&events, &[], std::slice::from_ref(&response), &[]) {
+            if events.is_empty() {
+                return Err(error("conversations.response_limit", true));
+            }
+            break;
+        }
+        events.push(response);
+        continuation = event_revision;
+    }
+    Ok(
+        json!({ "events": events, "continuation": continuation.to_string(),
+        "highWater": batch.high_water.to_string() }),
+    )
+}
+
+async fn resolve(
+    context: &Context<ConversationsActive>,
+    request: ResolveRequest,
+) -> Result<JsonValue, BackendError> {
+    if decode_id(&request.channel_id).is_none() || request.ids.is_empty() || request.ids.len() > 32
+    {
+        return Err(error("conversations.invalid_request", false));
+    }
+    let state = context.state().clone();
+    let channel = request.channel_id;
+    let ids = request.ids;
+    let (rows, missing) = context
+        .blocking(move |_| {
+            let mut rows = Vec::new();
+            let mut missing = Vec::new();
+            for id in ids {
+                match state
+                    .store
+                    .message_row_by_id(&channel, &id)
+                    .map_err(|_| storage_failed())?
+                {
+                    Some(row) => rows.push(row),
+                    None => missing.push(id),
+                }
+            }
+            Ok::<_, BackendError>((rows, missing))
+        })
+        .await?;
+    let mut messages = Vec::new();
+    let mut pending = Vec::new();
+    let mut truncated = false;
+    for row in rows {
+        let id = row.0.clone();
+        let position = row.1.clone();
+        if truncated {
+            pending.push(json!({ "id": id, "position": position, "status": "pending" }));
+            continue;
+        }
+        let (ready, waiting) = render_rows(context, vec![row]).await?;
+        if !fits_history_reply(&messages, &pending, &ready, &waiting) {
+            truncated = true;
+            pending.push(json!({ "id": id, "position": position, "status": "pending" }));
+        } else {
+            messages.extend(ready);
+            pending.extend(waiting);
+        }
+    }
+    Ok(json!({ "messages": messages, "pending": pending, "missing": missing }))
 }
 
 /// Re-opens the sealed records the projection needs to render, and retries deferred ones.
@@ -803,6 +1005,137 @@ mod session_tests {
             2
         );
         assert_eq!(store.cursor().unwrap(), Some(hex(50, 3)));
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn history_response_budget_limits_worst_case_escaped_markdown() {
+        let row = json!({ "id": "a".repeat(64), "position": "0".repeat(82),
+            "markdown": "\u{0000}".repeat(32 * 1024), "author": "a".repeat(64), "isLocal": false });
+        assert!(fits_history_reply(
+            &[],
+            &[],
+            std::slice::from_ref(&row),
+            &[]
+        ));
+        assert!(!fits_history_reply(
+            std::slice::from_ref(&row),
+            &[],
+            std::slice::from_ref(&row),
+            &[]
+        ));
+        assert!(
+            serde_json::to_vec(&json!({ "messages": [row] }))
+                .unwrap()
+                .len()
+                < 256 * 1024
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_ready_messages_page_with_a_raw_cursor_under_the_ui_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let message =
+            DomainRecord::message_post(GENERAL_ID, ALICE, "\u{0000}".repeat(32 * 1024)).unwrap();
+        let canonical = URL_SAFE_NO_PAD.encode(message.encode());
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => {
+                let count = payload["sealedRecords"].as_array().map_or(0, Vec::len);
+                Ok(json!({ "results": (0..count).map(|_| json!({
+                    "status": "ready", "recordId": hex(64, 1), "orderKey": hex(82, 1),
+                    "author": ALICE, "purpose": "message.post", "signature": "c2ln",
+                    "canonical": canonical,
+                })).collect::<Vec<_>>() }))
+            }
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        });
+        let mut session = start(directory.path(), scripted).await;
+        for n in 1..=2 {
+            let domain = DomainRecord::message_post(GENERAL_ID, ALICE, "stored").unwrap();
+            session
+                .store()
+                .ingest(
+                    &hex(64, n),
+                    &hex(82, n),
+                    ALICE,
+                    domain.kind(),
+                    "c2ln",
+                    &domain.encode(),
+                    b"sealed",
+                    None,
+                )
+                .unwrap();
+        }
+        let first = session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({ "channelId": hex_id(GENERAL_ID), "limit": 32 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+        let cursor = first["nextBefore"].as_str().unwrap();
+        let second = session
+            .harness
+            .request(
+                "conversations.channel.page",
+                json!({ "channelId": hex_id(GENERAL_ID), "before": cursor }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["messages"].as_array().unwrap().len(), 1);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn change_feed_replays_projected_message_with_bounded_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let head = session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({ "channelId": hex_id(GENERAL_ID) }),
+            )
+            .await
+            .unwrap();
+        let epoch = head["epoch"].as_str().expect("page has projection epoch");
+        let revision = head["revision"]
+            .as_str()
+            .expect("page has projection revision");
+        let message = DomainRecord::message_post(GENERAL_ID, ALICE, "private").unwrap();
+        session
+            .store()
+            .ingest(
+                "late",
+                "01",
+                ALICE,
+                message.kind(),
+                "s",
+                &message.encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        let changes = session
+            .harness
+            .request(
+                "conversations.channel.changes",
+                json!({
+                    "channelId": hex_id(GENERAL_ID), "epoch": epoch, "after": revision, "limit": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changes["events"][0]["id"], hex_id(message.id()));
+        assert_eq!(changes["events"][0]["kind"], "insert");
+        assert_eq!(changes["events"][0]["status"], "pending");
+        assert_eq!(changes["continuation"], "1");
         session.harness.shutdown().await.unwrap();
     }
 

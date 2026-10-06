@@ -53,6 +53,8 @@ export async function mount(
       },
     );
 
+    await controller.catchUpAfterSubscribe();
+
     return async () => {
       if (disposed) return;
       disposed = true;

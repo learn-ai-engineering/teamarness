@@ -4,6 +4,32 @@
     "channelId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
     "slug": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 },
     "before": { "type": "string", "minLength": 1 },
+    "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "position": { "type": "string", "minLength": 1 },
+    "pendingRow": {
+      "type": "object", "additionalProperties": false, "required": ["id", "position", "status"],
+      "properties": { "id": { "type": "string" }, "position": { "$ref": "#/$defs/position" }, "status": { "type": "string", "enum": ["pending", "unavailable"] } }
+    },
+    "change": {
+      "type": "object", "additionalProperties": false, "required": ["revision", "id", "position", "kind"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/revision" }, "id": { "type": "string" }, "position": { "$ref": "#/$defs/position" },
+        "kind": { "type": "string", "enum": ["insert", "remove"] },
+        "message": { "$ref": "#/$defs/message" }, "status": { "type": "string", "enum": ["ready", "pending", "unavailable"] }
+      }
+    },
+    "changes": {
+      "type": "object", "additionalProperties": false, "required": ["events", "continuation", "highWater"],
+      "properties": { "events": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/change" } },
+        "continuation": { "$ref": "#/$defs/revision" }, "highWater": { "$ref": "#/$defs/revision" }, "resyncRequired": { "type": "boolean" } }
+    },
+    "resolved": {
+      "type": "object", "additionalProperties": false, "required": ["messages", "pending", "missing"],
+      "properties": { "messages": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/message" } },
+        "pending": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/pendingRow" } },
+        "missing": { "type": "array", "maxItems": 32, "items": { "type": "string" } } }
+    },
     "availability": { "type": "string", "enum": ["waiting_for_history_access", "offline", "catching_up", "current"] },
     "channel": {
       "type": "object",
@@ -19,12 +45,13 @@
     "message": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "author", "markdown", "isLocal"],
+      "required": ["id", "position", "author", "markdown", "isLocal"],
       "properties": {
         "id": { "type": "string" },
         "author": { "type": "string" },
         "markdown": { "type": "string" },
-        "isLocal": { "type": "boolean" }
+        "isLocal": { "type": "boolean" },
+        "position": { "$ref": "#/$defs/position" }
       }
     },
     "acknowledgement": {
@@ -48,10 +75,12 @@
     "page": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["messages"],
+      "required": ["messages", "epoch", "revision"],
       "properties": {
         "messages": { "type": "array", "items": { "$ref": "#/$defs/message" } },
-        "nextBefore": { "$ref": "#/$defs/before" }
+        "nextBefore": { "$ref": "#/$defs/before" },
+        "epoch": { "$ref": "#/$defs/epoch" }, "revision": { "$ref": "#/$defs/revision" },
+        "pending": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/pendingRow" } }
       }
     }
   },
@@ -79,6 +108,16 @@
     "conversations.channel.page": {
       "request": { "type": "object", "required": ["channelId", "before"], "properties": { "channelId": { "$ref": "#/$defs/channelId" }, "before": { "$ref": "#/$defs/before" }, "limit": { "type": "integer", "minimum": 1, "maximum": 64 } }, "additionalProperties": false },
       "response": { "$ref": "#/$defs/page" }
+    },
+    "conversations.channel.changes": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "epoch", "after"],
+        "properties": { "channelId": { "$ref": "#/$defs/channelId" }, "epoch": { "$ref": "#/$defs/epoch" }, "after": { "$ref": "#/$defs/revision" }, "limit": { "type": "integer", "minimum": 1, "maximum": 32 } } },
+      "response": { "$ref": "#/$defs/changes" }
+    },
+    "conversations.channel.resolve": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "ids"],
+        "properties": { "channelId": { "$ref": "#/$defs/channelId" }, "ids": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string" } } } },
+      "response": { "$ref": "#/$defs/resolved" }
     }
   },
   "subscriptions": {
