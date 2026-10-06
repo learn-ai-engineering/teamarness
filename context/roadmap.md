@@ -70,7 +70,7 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-The architecture review and the Shell and Package UI polish workstream are both closed and merged. Phase 5 remains next for the core roadmap. The separate Conversations UI overhaul workstream has completed its Package-local UI phase on the isolated `conversations-ui-overhaul` branch. The developer approved the implemented UI after the styling correction; automatic older-history loading has been implemented on the isolated branch. Repeated failed Verify reviews exposed a late-interior Message loss in the Package UI-only history contract. The developer accepted a replacement Package Backend/UI-contract Design and Plan, including a local projection-change journal and explicit retry for rare unannounced history access. The Package-local projection journal (`4f1681b`), Backend/UI contract reconciliation, and view anchoring have been implemented on the isolated branch. Exact-range reviews prompted additional deferred-replay notification and cursor-recovery corrections on that branch; lifecycle recovery, full re-Verify, and developer real-window checks remain pending. No merge or push is authorized yet.
+The architecture review and the Shell and Package UI polish workstream are closed and merged. Phase 5 remains next for the core roadmap. The Conversations UI overhaul is complete and verified locally on the isolated `conversations-ui-overhaul` branch at `793b42f`. It adds automatic older history, Package-local projection replay, explicit history-access retry, and stable reading position. Full Cargo and npm checks and exact-range independent review pass with no P0/P1; three P2 follow-ups remain. The developer accepted a limited two-instance desktop check because long-history and other fixtures were unavailable. Those checks are not recorded as passed. An earlier blocked lifecycle journal attempt remains audit debt, not a product defect. The developer approved integration into local `main`; no push is authorized.
 
 ### Shell and Package UI polish (complete)
 
@@ -119,9 +119,13 @@ Replace the persistent status and error messages at the top of the selected-cont
 
 Let a person hide a Package from contextual navigation and show it again from Workspace settings, for example to hide the Tutorial and Reference Packages after first use.
 
-### Conversations UI overhaul (in progress)
+### Conversations UI overhaul (verified; remote delivery pending)
 
-Redesign the Conversations Package UI beyond the shared Package page structure. The developer approved the implemented UI and the separate automatic older-history phase is implemented on the isolated branch. Failed re-Verify found further history-state defects; the accepted replacement plan now includes a Package-local migration/change feed, coherent UI request ownership and row anchoring. Implementation proceeds under a documented developer-authorized lifecycle exception; passing re-Verify and developer Phase 2 browser checks remain pending, so this workstream is not delivered.
+The Conversations Package UI redesign and history-continuity replacement are complete on the isolated `conversations-ui-overhaul` branch. The Package owns its projection journal, bounded change feed, independent history retries, and reading-position anchor. Automated checks and exact-range review pass. The developer accepted limited two-instance desktop coverage; long-history and other unavailable fixtures remain untested. The developer approved a local merge into `main`. Remote delivery needs a separate decision.
+
+### Conversations history maintenance (unscheduled)
+
+If prioritized, start a separate Scope for these nonblocking review findings: make the advancing-page mount fixture supply a valid open watermark (`SM-007`); avoid one redundant terminal delta request (`SF-006`); and restore the no-request assertion for malformed Channel slugs (`SM-008`). Retest the accepted but unavailable long-history, theme, resize, keyboard-error, and pending-access desktop cases when safe fixtures exist. If an issue appears, open a new workstream rather than rewriting the accepted manual result. Real Message time provenance also needs a separate Scope before dates or times can be shown; no timestamp was fabricated in this workstream.
 
 ## Maintenance rule
 
