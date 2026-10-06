@@ -497,6 +497,13 @@ export class ConversationsView {
     const focusedAuthorId = !openedChannel && focusedElement instanceof HTMLElement
       && focusedElement.classList.contains("message-author")
       ? focusedElement.closest<HTMLElement>(".message")?.dataset.messageId : undefined;
+    const focusedLinkRow = !openedChannel && focusedElement instanceof HTMLAnchorElement
+      && this.history.contains(focusedElement)
+      ? focusedElement.closest<HTMLElement>(".message") : null;
+    const focusedLinkId = focusedLinkRow?.dataset.messageId;
+    const focusedLinkIndex = focusedLinkRow
+      ? [...focusedLinkRow.querySelectorAll<HTMLAnchorElement>(".message-markdown a")].indexOf(focusedElement as HTMLAnchorElement)
+      : -1;
     const viewportTop = this.history.getBoundingClientRect().top;
     const visibleIndex = previousRows.findIndex(row => {
       const rect = row.getBoundingClientRect();
@@ -551,6 +558,10 @@ export class ConversationsView {
       row.append(author, body);
       this.history.append(row);
       if (message.id === focusedAuthorId) author.focus({ preventScroll: true });
+      if (message.id === focusedLinkId && focusedLinkIndex >= 0) {
+        row.querySelectorAll<HTMLAnchorElement>(".message-markdown a")[focusedLinkIndex]
+          ?.focus({ preventScroll: true });
+      }
     }
 
     if (openedChannel || (wasAtBottom && tailAdvanced)) {

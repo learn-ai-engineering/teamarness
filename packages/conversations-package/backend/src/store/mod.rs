@@ -85,6 +85,8 @@ pub enum IngestResult {
 #[derive(Debug, Clone)]
 pub struct ConversationStore {
     pub(crate) inner: Arc<Mutex<StoreInner>>,
+    /// Keep delivery cursor advancement and deferred replay one serialized operation.
+    ingest_gate: Arc<Mutex<()>>,
     /// A one-shot ingest failure, armed only by a test.
     fail_next_ingest: Arc<AtomicBool>,
 }
@@ -117,6 +119,7 @@ impl ConversationStore {
                 markdown: HashMap::new(),
                 deferred: HashMap::new(),
             })),
+            ingest_gate: Arc::new(Mutex::new(())),
             fail_next_ingest: Arc::new(AtomicBool::new(false)),
         };
         s.ensure_general()?;
@@ -213,6 +216,7 @@ impl ConversationStore {
         cursor: Option<&str>,
         on_commit: &dyn Fn(),
     ) -> Result<IngestResult, StoreError> {
+        let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
         if self.fail_next_ingest.swap(false, Ordering::SeqCst) {
             return Err(StoreError::Storage);
         }
@@ -240,13 +244,24 @@ impl ConversationStore {
                 && stored_signature == signature
                 && stored_sealed == sealed
             {
-                if let Some(cursor) = cursor {
+                let retry_channel = match &parsed {
+                    Ok(DomainRecord::ChannelCreate { id, .. }) => Some(hex_id(*id)),
+                    _ => None,
+                };
+                if retry_channel.is_none()
+                    && let Some(cursor) = cursor
+                {
                     transaction
                         .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])
                         .map_err(rerr)?;
                 }
                 transaction.commit().map_err(rerr)?;
                 on_commit();
+                drop(inner);
+                if let Some(channel_id) = retry_channel {
+                    self.retry_cached_for_channel(&channel_id, on_commit)?;
+                    self.commit_delivery_cursor(cursor)?;
+                }
                 return Ok(IngestResult::Duplicate);
             }
             quarantine(&transaction, record_id, "immutable_field_mismatch").map_err(rerr)?;
@@ -266,12 +281,6 @@ impl ConversationStore {
             "INSERT INTO records(record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,quarantine_code) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
             params![record_id, order_key, author, purpose, signature, sealed, cursor, ordinal],
         ).map_err(rerr)?;
-        transaction
-            .execute(
-                "UPDATE metadata SET cursor=?1,next_ingestion_ordinal=?2 WHERE singleton=1",
-                params![cursor, ordinal],
-            )
-            .map_err(rerr)?;
         let outcome = match parsed {
             Ok(domain) => projection::project_domain(
                 &transaction,
@@ -290,6 +299,23 @@ impl ConversationStore {
                 }
             }
         };
+        // A Channel may commit before several separately transacted deferred rows.
+        // Keep its delivery cursor at the predecessor until all replay succeeds.
+        if outcome.retry_channel.is_some() {
+            transaction
+                .execute(
+                    "UPDATE metadata SET next_ingestion_ordinal=?1 WHERE singleton=1",
+                    [ordinal],
+                )
+                .map_err(rerr)?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE metadata SET cursor=?1,next_ingestion_ordinal=?2 WHERE singleton=1",
+                    params![cursor, ordinal],
+                )
+                .map_err(rerr)?;
+        }
         transaction.commit().map_err(rerr)?;
         on_commit();
         if let Some((id, slug)) = outcome.slug {
@@ -309,8 +335,20 @@ impl ConversationStore {
         drop(inner);
         if let Some(channel_id) = retry_channel {
             self.retry_cached_for_channel(&channel_id, on_commit)?;
+            self.commit_delivery_cursor(cursor)?;
         }
         Ok(result)
+    }
+
+    fn commit_delivery_cursor(&self, cursor: Option<&str>) -> Result<(), StoreError> {
+        if let Some(cursor) = cursor {
+            let inner = lock(&self.inner)?;
+            inner
+                .conn
+                .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])
+                .map_err(rerr)?;
+        }
+        Ok(())
     }
 
     fn retry_cached_for_channel(
@@ -405,6 +443,7 @@ impl ConversationStore {
         record_id: &str,
         canonical: &[u8],
     ) -> Result<IngestResult, StoreError> {
+        let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
         let domain = match DomainRecord::decode(canonical) {
             Ok(domain) => domain,
             Err(_) => return Ok(IngestResult::Quarantined("malformed_record".into())),

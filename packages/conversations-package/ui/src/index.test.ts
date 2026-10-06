@@ -252,6 +252,24 @@ describe("Conversations Package surface", () => {
   });
 });
 
+it("retains keyboard focus on a Markdown link when a live insert rerenders history", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = host.attachShadow({ mode: "open" });
+  const linked = { ...message("first"), markdown: "[one](https://example.com) [two](https://example.org)" };
+  let rows = [linked];
+  const source = liveHistorySource(() => rows);
+  const unmount = await mount(createTestMountContext({ root, client: source.client }));
+  const second = root.querySelectorAll<HTMLAnchorElement>('.message[data-message-id="first"] .message-markdown a')[1]!;
+  second.focus();
+  rows = [message("second"), linked];
+  await source.emit("conversations.changes", snapshot());
+  await vi.waitFor(() => expect(root.querySelectorAll(".message")).toHaveLength(2));
+  expect(root.activeElement).toBe(root.querySelectorAll('.message[data-message-id="first"] .message-markdown a')[1]);
+  await unmount();
+  host.remove();
+});
+
 it("retains keyboard focus on a Message author when a live insert rerenders history", async () => {
   const host = document.createElement("div");
   document.body.append(host);

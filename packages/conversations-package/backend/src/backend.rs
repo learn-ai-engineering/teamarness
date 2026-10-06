@@ -381,7 +381,7 @@ async fn append(
         .blocking(move |_| {
             state
                 .store
-                .ingest(
+                .ingest_with_commit(
                     appended.record_id.as_str(),
                     appended.order_key.as_str(),
                     &appended.author,
@@ -390,6 +390,11 @@ async fn append(
                     &canonical,
                     &appended.sealed_record,
                     None,
+                    &|| {
+                        state
+                            .changes
+                            .send_modify(|revision| *revision = revision.saturating_add(1))
+                    },
                 )
                 .map_err(|_| storage_failed())
         })
@@ -399,10 +404,6 @@ async fn append(
         IngestResult::Deferred(_) => return Err(error("conversations.deferred", true)),
         IngestResult::Quarantined(_) => return Err(error("conversations.rejected", false)),
     }
-    context
-        .state()
-        .changes
-        .send_modify(|revision| *revision = revision.saturating_add(1));
     Ok(json!({ "ok": true }))
 }
 
@@ -1000,13 +1001,185 @@ mod session_tests {
             1
         );
         assert_eq!(store.deferred_records().unwrap().len(), 1);
+        assert_eq!(
+            store.cursor().unwrap().as_deref(),
+            Some(hex(50, 2).as_str())
+        );
         assert!(
             observer.has_changed().unwrap(),
             "a committed projection must wake subscribers"
         );
         assert_eq!(*observer.borrow_and_update(), 4); // Two deferred ingests, Channel, first replay.
-        sink.ingest(&channel_event).unwrap(); // Duplicate cannot replay the remaining deferred row.
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER reject_second_history;")
+            .unwrap();
+        sink.ingest(&channel_event).unwrap(); // The resumed Channel must finish deferred replay.
+        assert_eq!(store.history_head().unwrap().1, 2);
+        assert_eq!(store.deferred_records().unwrap().len(), 0);
+        assert_eq!(
+            store.cursor().unwrap().as_deref(),
+            Some(hex(50, 3).as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_local_channel_append_announces_its_committed_deferred_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_slot = Arc::new(Mutex::new(None::<ConversationStore>));
+        let slot = store_slot.clone();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(
+                json!({ "results": (0..payload["sealedRecords"].as_array().unwrap().len())
+                .map(|_| json!({ "status": "waiting_for_history_access" })).collect::<Vec<_>>() }),
+            ),
+            "append" => {
+                let canonical = URL_SAFE_NO_PAD
+                    .decode(payload["canonical"].as_str().unwrap())
+                    .unwrap();
+                let DomainRecord::ChannelCreate { id, .. } =
+                    DomainRecord::decode(&canonical).unwrap()
+                else {
+                    panic!("expected a Channel creation");
+                };
+                let store = slot.lock().unwrap().as_ref().unwrap().clone();
+                for seed in 1..=2 {
+                    let message =
+                        DomainRecord::message_post(id, ALICE, format!("deferred {seed}")).unwrap();
+                    store
+                        .ingest(
+                            &hex(64, seed),
+                            &hex(82, seed),
+                            ALICE,
+                            message.kind(),
+                            "signature",
+                            &message.encode(),
+                            b"sealed",
+                            None,
+                        )
+                        .unwrap();
+                }
+                store
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .conn
+                    .execute_batch(
+                        "CREATE TRIGGER reject_second_history BEFORE INSERT ON history_changes \
+                     WHEN (SELECT COUNT(*) FROM history_changes) = 1 \
+                     BEGIN SELECT RAISE(ABORT, 'second deferred write failed'); END;",
+                    )
+                    .unwrap();
+                Ok(
+                    json!({ "recordId": hex(64, 3), "orderKey": hex(82, 3), "author": ALICE,
+                    "signature": "c2ln", "sealedRecord": "c2VhbGVk", "durability": "committed" }),
+                )
+            }
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        });
+        let mut session = start(directory.path(), scripted).await;
+        *store_slot.lock().unwrap() = Some(session.store());
+        let mut changes = session
+            .harness
+            .subscribe("conversations.changes", empty_payload())
+            .await
+            .unwrap();
+        changes.next_event().await.unwrap().unwrap(); // Initial snapshot, before any local commit.
+        assert!(
+            session
+                .harness
+                .request("conversations.channel.create", json!({ "slug": "team" }))
+                .await
+                .is_err()
+        );
+        assert_eq!(session.store().history_head().unwrap().1, 1);
+        let snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(2), changes.next_event())
+                .await
+                .expect("a committed deferred Message must wake subscribers")
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot["channels"].as_array().unwrap().len(), 2);
+        changes.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partially_replayed_channel_resumes_from_its_predecessor_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        let store = session.store();
+        wait_for_opens(&session.scripted, 1).await;
+        let first = DomainRecord::message_post(CHANNEL, ALICE, "first").unwrap();
+        let second = DomainRecord::message_post(CHANNEL, ALICE, "second").unwrap();
+        let channel = DomainRecord::channel_create_with_id(CHANNEL, ALICE, "team").unwrap();
+        let sender = session.scripted.stream();
+        for (seed, message) in [(1, &first), (2, &second)] {
+            assert!(
+                sender
+                    .send(record_frame(seed, ALICE, "message.post", &message.encode()))
+                    .await
+            );
+        }
+        wait_until(
+            || store.record_count().unwrap_or(0) == 2,
+            "deferred Messages",
+        )
+        .await;
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_second_history BEFORE INSERT ON history_changes \
+             WHEN (SELECT COUNT(*) FROM history_changes) = 1 \
+             BEGIN SELECT RAISE(ABORT, 'second deferred write failed'); END;",
+            )
+            .unwrap();
+        assert!(
+            sender
+                .send(record_frame(3, ALICE, "channel.create", &channel.encode()))
+                .await
+        );
+        wait_for_opens(&session.scripted, 2).await;
+        assert_eq!(
+            session.scripted.recorded_opens()[1]["afterCursor"],
+            hex(50, 2)
+        );
         assert_eq!(store.history_head().unwrap().1, 1);
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER reject_second_history;")
+            .unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(3, ALICE, "channel.create", &channel.encode()))
+                .await
+        );
+        wait_until(
+            || store.history_head().unwrap().1 == 2,
+            "remaining deferred Message",
+        )
+        .await;
+        assert_eq!(store.deferred_records().unwrap().len(), 0);
+        assert_eq!(
+            store.cursor().unwrap().as_deref(),
+            Some(hex(50, 3).as_str())
+        );
+        session.harness.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
