@@ -1325,6 +1325,217 @@ mod session_tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // The scripted open runs on the capability worker. The barrier is entered only after
+    // the Router has selected a sealed row; commits on the test worker remain independent.
+    fn paused_history_log(
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> ScriptedCapability {
+        let release = Mutex::new(release);
+        ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => {
+                let results = payload["sealedRecords"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| {
+                        let marker = URL_SAFE_NO_PAD.decode(item.as_str().unwrap()).unwrap();
+                        let seed: u64 = std::str::from_utf8(&marker).unwrap().parse().unwrap();
+                        if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            entered.send(()).unwrap();
+                            release
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap();
+                        }
+                        let record =
+                            DomainRecord::message_post(GENERAL_ID, ALICE, format!("row {seed}"))
+                                .unwrap();
+                        json!({ "status": "ready", "recordId": hex(64, seed),
+                        "orderKey": hex(82, seed), "author": ALICE, "purpose": "message.post",
+                        "signature": "c2ln", "canonical": URL_SAFE_NO_PAD.encode(record.encode()) })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "results": results }))
+            }
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        })
+    }
+
+    fn commit_history_row(store: &ConversationStore, seed: u64) -> String {
+        let record = DomainRecord::message_post(GENERAL_ID, ALICE, format!("row {seed}")).unwrap();
+        store
+            .ingest(
+                &hex(64, seed),
+                &hex(82, seed),
+                ALICE,
+                record.kind(),
+                "c2ln",
+                &record.encode(),
+                seed.to_string().as_bytes(),
+                None,
+            )
+            .unwrap();
+        hex_id(record.id())
+    }
+
+    async fn release_after_commit(
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        store: ConversationStore,
+        seed: u64,
+    ) -> String {
+        tokio::task::spawn_blocking(move || {
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("capability open reached barrier");
+            let id = commit_history_row(&store, seed);
+            release.send(()).unwrap();
+            id
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_open_replays_commit_after_raw_row_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut session = start(
+            directory.path(),
+            paused_history_log(armed.clone(), entered_tx, release_rx),
+        )
+        .await;
+        let store = session.store();
+        let first_id = commit_history_row(&store, 1);
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (head, second_id) = tokio::join!(
+            session.harness.request(
+                "conversations.channel.open",
+                json!({
+                "channelId": hex_id(GENERAL_ID), "limit": 1 })
+            ),
+            release_after_commit(entered_rx, release_tx, store, 2)
+        );
+        let head = head.unwrap();
+        assert_eq!(head["messages"][0]["id"], first_id);
+        assert_eq!(
+            head["revision"], "1",
+            "open must capture high water with its raw rows"
+        );
+        assert_eq!(head["nextBefore"], hex(82, 1));
+        let delta = session
+            .harness
+            .request(
+                "conversations.channel.changes",
+                json!({
+            "channelId": hex_id(GENERAL_ID), "epoch": head["epoch"],
+            "after": head["revision"], "limit": 1 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delta["events"].as_array().unwrap().len(), 1);
+        assert_eq!(delta["events"][0]["id"], second_id);
+        assert_eq!(delta["events"][0]["message"]["markdown"], "row 2");
+        assert_eq!(delta["continuation"], "2");
+        assert_eq!(delta["highWater"], "2");
+        let terminal = session
+            .harness
+            .request(
+                "conversations.channel.changes",
+                json!({
+            "channelId": hex_id(GENERAL_ID), "epoch": head["epoch"],
+            "after": delta["continuation"], "limit": 1 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal["events"], json!([]));
+        assert_eq!(terminal["continuation"], "2");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_delta_replays_commit_during_in_flight_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut session = start(
+            directory.path(),
+            paused_history_log(armed.clone(), entered_tx, release_rx),
+        )
+        .await;
+        let store = session.store();
+        let ids = (1..=3)
+            .map(|seed| commit_history_row(&store, seed))
+            .collect::<Vec<_>>();
+        let head = session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({
+            "channelId": hex_id(GENERAL_ID), "limit": 1 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head["revision"], "3");
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (batch, last_id) = tokio::join!(
+            session.harness.request(
+                "conversations.channel.changes",
+                json!({
+                "channelId": hex_id(GENERAL_ID), "epoch": head["epoch"],
+                "after": "0", "limit": 1 })
+            ),
+            release_after_commit(entered_rx, release_tx, store, 4)
+        );
+        let batch = batch.unwrap();
+        assert_eq!(batch["events"].as_array().unwrap().len(), 1);
+        assert_eq!(batch["events"][0]["id"], ids[0]);
+        assert_eq!(batch["continuation"], "1");
+        assert_eq!(
+            batch["highWater"], "3",
+            "batch must retain selected high water"
+        );
+        let mut after = batch["continuation"].clone();
+        let mut seen = vec![batch["events"][0]["id"].as_str().unwrap().to_owned()];
+        for _ in 0..3 {
+            let reply = session
+                .harness
+                .request(
+                    "conversations.channel.changes",
+                    json!({
+                "channelId": hex_id(GENERAL_ID), "epoch": head["epoch"],
+                "after": after, "limit": 1 }),
+                )
+                .await
+                .unwrap();
+            assert!(reply["events"].as_array().unwrap().len() <= 1);
+            seen.extend(
+                reply["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|event| event["id"].as_str().unwrap().to_owned()),
+            );
+            after = reply["continuation"].clone();
+        }
+        assert_eq!(
+            seen,
+            [ids[0].clone(), ids[1].clone(), ids[2].clone(), last_id]
+        );
+        assert_eq!(after, "4");
+        session.harness.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn router_pages_and_resolves_every_open_status_with_raw_cursor() {
         let directory = tempfile::tempdir().unwrap();

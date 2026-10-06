@@ -209,6 +209,32 @@ describe("Conversations Package surface", () => {
     await unmount();
   });
 
+  it("omits a normal exhaustion footer while retaining loading and retry controls", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    let release!: (page: ConversationPage) => void;
+    const channels = [snapshot().channels[0]!, { id: "second", slug: "second", canHide: false, unreadCount: 0 }];
+    const source = createFakePackageClient({
+      requests: {
+        "conversations.snapshot": () => ({ ...snapshot(), channels }),
+        "conversations.channel.open": (payload) => (payload as { channelId: string }).channelId === "second"
+          ? new Promise<ConversationPage>((resolve) => { release = resolve; }) : emptyPage(),
+        "conversations.channel.changes": () => ({ events: [], continuation: "0", highWater: "0" }),
+      },
+      subscriptions: { "conversations.changes": () => undefined },
+    });
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    root.querySelector<HTMLButtonElement>('[data-channel-id="second"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Loading Channel history"));
+    release(emptyPage());
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toBe(""));
+    expect(root.textContent).not.toContain("Beginning of Channel history");
+    expect(root.querySelector<HTMLButtonElement>(".retry-older")?.hidden).toBe(true);
+    await unmount();
+    host.remove();
+  });
+
   it("does not show the normal older button in the successful paging state", async () => {
     const root = shadowRoot();
     const unmount = await mount(createTestMountContext({ root, client: backend({ nextBefore: "cursor" }).client }));
@@ -702,7 +728,7 @@ describe("automatic older history in the Message container", () => {
     retry.click();
     expect(retry.hidden || retry.disabled).toBe(true);
     retryResolve(emptyPage());
-    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toBe(""));
     expect(retry.hidden).toBe(true);
     expect(root.querySelector(".warning")).toBeNull();
     expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false);
@@ -790,7 +816,7 @@ describe("automatic older history in the Message container", () => {
     expect(calls[1]).toEqual({ channelId: snapshot().channels[0]!.id, before: "second", limit: 32 });
     replies[1]!(page("older"));
     await vi.waitFor(() => expect(history.querySelectorAll(".message")).toHaveLength(2));
-    expect(root.querySelector(".history-exhausted")?.textContent).toContain("Beginning");
+    expect(root.querySelector(".history-status")?.textContent).toBe("");
     await unmount();
   });
 
@@ -826,7 +852,7 @@ describe("automatic older history in the Message container", () => {
     retry.focus();
     expect(root.activeElement).toBe(retry);
     retry.click();
-    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toContain("Beginning"));
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toBe(""));
     expect(retry.hidden).toBe(true);
     await unmount();
     host.remove();
@@ -879,7 +905,7 @@ describe("automatic older history in the Message container", () => {
     history.scrollTop = 5;
     history.dispatchEvent(new Event("scroll"));
     source.resolve(emptyPage());
-    await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toBe(""));
     history.dispatchEvent(new Event("scroll"));
     expect(source.requests.filter((r) => r.operation === "conversations.channel.page")).toHaveLength(2);
     await unmount();
@@ -903,7 +929,7 @@ describe("automatic older history in the Message container", () => {
     retry.click();
     expect(source.requests.filter((r) => r.operation === "conversations.channel.page")).toHaveLength(2);
     source.resolve(emptyPage());
-    await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
+    await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toBe(""));
     await unmount();
     history.dispatchEvent(new Event("scroll"));
     expect(source.requests.filter((r) => r.operation === "conversations.channel.page")).toHaveLength(2);
@@ -1175,7 +1201,7 @@ describe("short initial history", () => {
       await new Promise((resolve) => setTimeout(resolve, 40));
       expect(calls.filter((call) => call === "conversations.channel.page")).toHaveLength(1);
       resolvePage({ ...emptyPage(), messages: [message("older"), message("oldest")] });
-      await vi.waitFor(() => expect(root.querySelector(".history-exhausted")).not.toBeNull());
+      await vi.waitFor(() => expect(root.querySelector(".history-status")?.textContent).toBe(""));
       await unmount();
     } finally {
       if (originalHeight) Object.defineProperty(HTMLElement.prototype, "scrollHeight", originalHeight);

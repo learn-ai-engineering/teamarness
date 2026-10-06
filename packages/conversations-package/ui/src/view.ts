@@ -259,10 +259,7 @@ export class ConversationsView {
       : state.resolveError ? "History access retry failed. Try again."
       : state.pendingHistory > 0 ? `${state.pendingHistory} Messages awaiting history access`
       : state.unavailableHistory > 0 ? `${state.unavailableHistory} Messages could not be opened`
-      : !state.hasMore && state.selectedChannelId && !state.loading && !state.olderError && !state.feedError && !state.resolveError
-        ? "Beginning of Channel history"
-        : "";
-    this.historyStatus.classList.toggle("history-exhausted", !state.hasMore && !state.olderError && !state.feedError && !state.resolveError && state.pendingHistory === 0 && state.unavailableHistory === 0 && !state.loading && !state.retryingHead);
+      : "";
 
     // --- composer (patch only; never recreate) ---
     this.patchComposer(state);
