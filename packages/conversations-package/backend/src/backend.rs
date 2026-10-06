@@ -1326,6 +1326,176 @@ mod session_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_pages_and_resolves_every_open_status_with_raw_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = DomainRecord::message_post(GENERAL_ID, ALICE, "readable").unwrap();
+        let ready_bytes = URL_SAFE_NO_PAD.encode(ready.encode());
+        let fail_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failing = fail_open.clone();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => {
+                if failing.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(BackendError::new("capability_unavailable", true, json!({})));
+                }
+                let results = payload["sealedRecords"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| {
+                        let marker = URL_SAFE_NO_PAD.decode(item.as_str().unwrap()).unwrap();
+                        match marker.as_slice() {
+                            b"ready" => json!({ "status": "ready", "recordId": hex(64, 1),
+                            "orderKey": hex(82, 1), "author": ALICE, "purpose": "message.post",
+                            "signature": "c2ln", "canonical": ready_bytes }),
+                            b"waiting" => json!({ "status": "waiting_for_history_access" }),
+                            b"wrong" => json!({ "status": "wrong_scope" }),
+                            b"corrupt" => json!({ "status": "corrupt" }),
+                            _ => panic!("unexpected sealed fixture"),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "results": results }))
+            }
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        });
+        let mut session = start(directory.path(), scripted).await;
+        let ids = [
+            ready.id(),
+            DomainRecord::message_post(GENERAL_ID, ALICE, "waiting")
+                .unwrap()
+                .id(),
+            DomainRecord::message_post(GENERAL_ID, ALICE, "wrong")
+                .unwrap()
+                .id(),
+            DomainRecord::message_post(GENERAL_ID, ALICE, "corrupt")
+                .unwrap()
+                .id(),
+        ];
+        for (index, marker) in ["ready", "waiting", "wrong", "corrupt"].iter().enumerate() {
+            let row = DomainRecord::MessagePost {
+                id: ids[index],
+                channel_id: GENERAL_ID,
+                author: ALICE.into(),
+                markdown: (*marker).into(),
+            };
+            session
+                .store()
+                .ingest(
+                    &hex(64, index as u64 + 1),
+                    &hex(82, index as u64 + 1),
+                    ALICE,
+                    row.kind(),
+                    "c2ln",
+                    &row.encode(),
+                    marker.as_bytes(),
+                    None,
+                )
+                .unwrap();
+        }
+        let channel_id = hex_id(GENERAL_ID);
+        let head = session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({ "channelId": channel_id, "limit": 2 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head["messages"].as_array().unwrap().len(), 0);
+        assert_eq!(head["pending"].as_array().unwrap().len(), 2);
+        assert!(
+            head["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["status"] == "unavailable")
+        );
+        assert_eq!(head["nextBefore"], hex(82, 3));
+        let page = session
+            .harness
+            .request(
+                "conversations.channel.page",
+                json!({ "channelId": channel_id, "before": head["nextBefore"], "limit": 2 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["messages"][0]["id"], hex_id(ids[0]));
+        assert_eq!(page["pending"][0]["status"], "pending");
+        assert_eq!(page["nextBefore"], hex(82, 1));
+        let terminal = session
+            .harness
+            .request(
+                "conversations.channel.page",
+                json!({ "channelId": channel_id, "before": page["nextBefore"], "limit": 2 }),
+            )
+            .await
+            .unwrap();
+        assert!(terminal.get("nextBefore").is_none());
+        let resolved = session.harness.request("conversations.channel.resolve", json!({
+            "channelId": channel_id, "ids": ids.iter().map(|id| hex_id(*id)).chain([hex_id([9; 16])]).collect::<Vec<_>>(),
+        })).await.unwrap();
+        assert_eq!(resolved["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(resolved["pending"].as_array().unwrap().len(), 3);
+        assert_eq!(resolved["missing"], json!([hex_id([9; 16])]));
+        let delta = session
+            .harness
+            .request(
+                "conversations.channel.changes",
+                json!({
+                    "channelId": channel_id, "epoch": head["epoch"], "after": "0", "limit": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delta["events"].as_array().unwrap().len(), 2);
+        assert_eq!(delta["events"][0]["status"], "ready");
+        assert_eq!(delta["events"][1]["status"], "pending");
+        assert_eq!(delta["continuation"], "2");
+        assert_eq!(delta["highWater"], "4");
+        let stale = session
+            .harness
+            .request(
+                "conversations.channel.changes",
+                json!({
+                    "channelId": channel_id, "epoch": "0".repeat(32), "after": "0", "limit": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale["resyncRequired"], true);
+        fail_open.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            session
+                .harness
+                .request(
+                    "conversations.channel.page",
+                    json!({
+                        "channelId": channel_id, "before": head["nextBefore"], "limit": 2,
+                    })
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .harness
+                .request(
+                    "conversations.channel.page",
+                    json!({
+                        "channelId": channel_id, "before": head["nextBefore"], "limit": 2,
+                    })
+                )
+                .await
+                .is_ok()
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn change_feed_replays_projected_message_with_bounded_continuation() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), scripted_log()).await;

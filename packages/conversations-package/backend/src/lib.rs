@@ -514,16 +514,17 @@ mod tests {
                 "INSERT INTO messages(message_id,channel_id,order_key,author,record_id,ingestion_ordinal) VALUES(?1,?2,?3,'author',?4,?5)",
                 rusqlite::params![message_id, channel_id, order, record_id, i64::from(message) + 1],
             ).unwrap();
+            tx.execute(
+                "INSERT INTO history_changes(revision,channel_id,message_id,order_key,kind) VALUES(?1,?2,?3,?4,'insert')",
+                rusqlite::params![i64::from(message) + 1, channel_id, message_id, order],
+            ).unwrap();
         }
-        tx.commit().unwrap();
-        inner
-            .conn
-            .execute("UPDATE history_state SET revision=1", [])
+        tx.execute("UPDATE history_state SET revision=100000", [])
             .unwrap();
-        inner.conn.execute("INSERT INTO history_changes(revision,channel_id,message_id,order_key,kind) VALUES(1,'00000000000000000000000000000001','00000000000000000000000000000000','00','insert')", []).unwrap();
+        tx.commit().unwrap();
         let detail: String = inner.conn.query_row(
-            "EXPLAIN QUERY PLAN SELECT revision FROM history_changes WHERE channel_id=?1 AND revision>?2 ORDER BY revision LIMIT 33",
-            rusqlite::params!["00000000000000000000000000000001", 0_i64],
+            "EXPLAIN QUERY PLAN SELECT revision,channel_id,message_id,order_key,kind FROM history_changes WHERE channel_id=?1 AND revision>?2 AND revision<=?3 ORDER BY revision LIMIT ?4",
+            rusqlite::params!["00000000000000000000000000000001", 0_i64, 100_000_i64, 33_i64],
             |row| row.get(3),
         ).unwrap();
         assert!(
@@ -531,15 +532,32 @@ mod tests {
             "{detail}"
         );
         drop(inner);
-        let (epoch, _) = s.history_head().unwrap();
-        assert_eq!(
-            s.history_changes("00000000000000000000000000000001", &epoch, 0, 32)
+        let (epoch, revision) = s.history_head().unwrap();
+        assert_eq!(revision, 100_000);
+        let channel_id = "00000000000000000000000000000001";
+        let mut after = 0;
+        let mut seen = 0;
+        loop {
+            let batch = s
+                .history_changes(channel_id, &epoch, after, 32)
                 .unwrap()
-                .unwrap()
-                .changes
-                .len(),
-            1
-        );
+                .unwrap();
+            assert!(batch.changes.len() <= 32);
+            assert_eq!(batch.high_water, 100_000);
+            if batch.changes.is_empty() {
+                break;
+            }
+            assert!(
+                batch
+                    .changes
+                    .iter()
+                    .all(|change| change.channel_id == channel_id)
+            );
+            assert!(batch.continuation > after);
+            seen += batch.changes.len();
+            after = batch.continuation;
+        }
+        assert_eq!(seen, 1_000);
         assert_eq!(s.channels().unwrap().len(), 101);
         for channel in 1..=100_u32 {
             let rows = s

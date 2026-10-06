@@ -24,6 +24,8 @@ function historyBackend(size = 64) {
   let failOpen = false;
   let failPage = false;
   let epoch = "a".repeat(32);
+  let epochCount = 0;
+  let loadedFrontier: string | null = null;
   let failResolve = false;
   let pageSelected: (() => Promise<void>) | null = null;
   let pageGate: ReturnType<typeof deferred> | null = null;
@@ -45,10 +47,11 @@ function historyBackend(size = 64) {
         const before = (payload as { before?: string }).before;
         const selected = records.filter(n => !before || position(n) < before)
           .sort((a, b) => b - a).slice(0, 32);
+        loadedFrontier = selected.length === 32 ? position(selected[31]!) : null;
         const response = { messages: selected.filter(n => !unreadable.has(n)).map(message),
           pending: selected.filter(n => unreadable.has(n)).map(n => ({ id: String(n), position: position(n), status: "pending" })),
           epoch, revision: String(changes.length),
-          ...(selected.length === 32 ? { nextBefore: position(selected[31]!) } : {}) };
+          ...(loadedFrontier ? { nextBefore: loadedFrontier } : {}) };
         if (operation === "conversations.channel.page" && pageGate) {
           pageRelease = pageGate; pageGate = null;
           await pageRelease.promise;
@@ -105,7 +108,7 @@ function historyBackend(size = 64) {
     failNextFeed() { failFeed = true; },
     failNextOpen() { failOpen = true; },
     failNextPage() { failPage = true; },
-    resetEpoch() { epoch = "b".repeat(32); changes.length = 0; },
+    resetEpoch() { epoch = (++epochCount).toString(16).padStart(32, "0"); changes.length = 0; },
     failNextResolve() { failResolve = true; },
     pausePage() { pageGate = deferred(); },
     releasePage() { pageRelease?.resolve(); pageRelease = null; },
@@ -115,6 +118,10 @@ function historyBackend(size = 64) {
     pauseResolve() { resolveGate = deferred(); },
     releaseResolve() { resolveGate?.resolve(); resolveGate = null; },
     expected(): string[] { return [...records].sort((a, b) => a - b).map(String); },
+    expectedLoadedReadable(): string[] { return records.filter(n => !unreadable.has(n)
+      && (!loadedFrontier || position(n) >= loadedFrontier)).sort((a, b) => a - b).map(String); },
+    loadedFrontier(): string | null { return loadedFrontier; },
+    unreadableIds(): number[] { return records.filter(n => unreadable.has(n)); },
   };
 }
 
@@ -300,6 +307,59 @@ it("leaves the loaded Message array unchanged for an empty change batch", async 
   const messages = controller.state.messages;
   await controller.applySnapshot(snapshot);
   expect(controller.state.messages).toBe(messages);
+});
+
+it("matches independently sorted truth across fixed-seed short history sequences", async () => {
+  const covered = new Set<string>();
+  for (let seed = 1; seed <= 12; seed++) {
+    let randomState = seed;
+    const random = () => {
+      randomState ^= randomState << 13;
+      randomState ^= randomState >>> 17;
+      randomState ^= randomState << 5;
+      return randomState >>> 0;
+    };
+    const backend = historyBackend();
+    const controller = new ConversationsController(backend.client, () => undefined);
+    const interior = Array.from({ length: 63 }, (_, index) => index + 1.5);
+    const operations: string[] = [];
+    let tail = 64;
+    await controller.initialize();
+    for (let step = 0; step < 24; step++) {
+      const choice = random() % 7;
+      if (choice === 0 && interior.length) {
+        backend.insert(interior.splice(random() % interior.length, 1)[0]!);
+        operations.push("interior");
+      } else if (choice === 1 && backend.expected().length) {
+        backend.remove(Number(backend.expected()[random() % backend.expected().length]));
+        operations.push("remove");
+      } else if (choice === 2) {
+        backend.resetEpoch();
+        operations.push("epoch");
+      } else if (choice === 3) {
+        backend.insert(++tail, false);
+        operations.push("deferred-access");
+      } else if (choice === 4 && backend.unreadableIds().length) {
+        backend.makeReadable(backend.unreadableIds()[random() % backend.unreadableIds().length]!);
+        await controller.retryPending();
+        operations.push("access-ready");
+      } else if (choice === 5 && controller.state.hasMore) {
+        await controller.loadOlder();
+        operations.push("page");
+      } else {
+        backend.insert(++tail);
+        operations.push("tail");
+      }
+      covered.add(operations.at(-1)!);
+      await controller.applySnapshot(snapshot);
+      const context = `seed=${seed}, operations=${operations.join(",")}`;
+      expect(controller.state.messages.map(m => m.id), context).toEqual(backend.expectedLoadedReadable());
+      expect(controller.state.nextBefore, context).toBe(backend.loadedFrontier());
+      expect(controller.state.hasMore, context).toBe(backend.loadedFrontier() !== null);
+      expect(controller.state.feedError, context).toBe(false);
+    }
+  }
+  expect(covered).toEqual(new Set(["interior", "remove", "epoch", "deferred-access", "access-ready", "page", "tail"]));
 });
 
 it("replays a burst beyond one bounded change batch without resetting the older cursor", async () => {
