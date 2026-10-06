@@ -2,8 +2,9 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::store::StoreError;
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_conversations.sql");
+const MIGRATION_0002: &str = include_str!("../../migrations/0002_history_changes.sql");
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection
@@ -19,7 +20,8 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
 
     // Version 0 with no Conversations tables is treated as new.
     // Version 0 with existing tables must pass validation before adoption.
-    if current_version < 1 {
+    let mut version = current_version;
+    if version < 1 {
         let has_records: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'",
@@ -32,6 +34,7 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
             transaction
                 .execute_batch(MIGRATION_0001)
                 .map_err(|_| StoreError::Migration)?;
+            version = 1;
         } else {
             // Legacy v0 database — validate before adopting.
             let required_tables = ["records", "channels", "messages", "unread", "metadata"];
@@ -79,16 +82,27 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
                 }
             }
             // Adopt the legacy schema atomically.
-            transaction
-                .pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
-                .map_err(|_| StoreError::Migration)?;
-            transaction
-                .commit()
-                .map_err(|_| StoreError::UncertainOutcome)?;
-            return Ok(());
+            version = 1;
         }
     }
 
+    if version < 2 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|_| StoreError::Migration)?;
+        let epoch = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        transaction
+            .execute_batch(MIGRATION_0002)
+            .map_err(|_| StoreError::Migration)?;
+        transaction
+            .execute(
+                "INSERT INTO history_state(singleton,epoch,revision) VALUES(1,?1,0)",
+                [epoch],
+            )
+            .map_err(|_| StoreError::Migration)?;
+    }
     transaction
         .pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
         .map_err(|_| StoreError::Migration)?;

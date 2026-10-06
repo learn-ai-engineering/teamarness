@@ -12,6 +12,25 @@ pub(crate) struct ProjectionOutcome {
     pub(crate) removed_messages: Vec<String>,
 }
 
+/// Journal only a committed mutation, in the same transaction as the projection.
+fn record_history_change(
+    tx: &rusqlite::Transaction<'_>,
+    channel_id: &str,
+    message_id: &str,
+    order_key: &str,
+    kind: &str,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE history_state SET revision=revision+1 WHERE singleton=1",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO history_changes(revision,channel_id,message_id,order_key,kind) VALUES((SELECT revision FROM history_state WHERE singleton=1),?1,?2,?3,?4)",
+        params![channel_id, message_id, order_key, kind],
+    )?;
+    Ok(())
+}
+
 impl ProjectionOutcome {
     pub(crate) fn applied() -> Self {
         Self {
@@ -130,24 +149,31 @@ pub(crate) fn project_domain(
             )?;
             let removed_messages = {
                 let mut statement = tx.prepare(
-                    "SELECT message_id,record_id FROM messages WHERE channel_id=?1 AND order_key>?2",
+                    "SELECT message_id,record_id,order_key FROM messages WHERE channel_id=?1 AND order_key>?2",
                 )?;
                 let rows = statement.query_map(params![channel_id, hidden_order], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
-            for (_, message_record_id) in &removed_messages {
+            for (_, message_record_id, _) in &removed_messages {
                 quarantine(tx, message_record_id, "channel_hidden")?;
             }
             tx.execute(
                 "DELETE FROM messages WHERE channel_id=?1 AND order_key>?2",
                 params![channel_id, hidden_order],
             )?;
+            for (message_id, _, order_key) in &removed_messages {
+                record_history_change(tx, &channel_id, message_id, order_key, "remove")?;
+            }
             Ok(ProjectionOutcome {
                 removed_messages: removed_messages
                     .into_iter()
-                    .map(|(message_id, _)| message_id)
+                    .map(|(message_id, _, _)| message_id)
                     .collect(),
                 ..ProjectionOutcome::applied()
             })
@@ -185,10 +211,13 @@ pub(crate) fn project_domain(
                 });
             }
             let message_id = hex_id(*id);
-            tx.execute(
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO messages(message_id,channel_id,order_key,author,record_id,ingestion_ordinal) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![message_id, channel_id, order_key, domain_author, record_id, ordinal],
             )?;
+            if inserted > 0 {
+                record_history_change(tx, &channel_id, &message_id, order_key, "insert")?;
+            }
             tx.execute(
                 "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
                 [record_id],

@@ -516,7 +516,30 @@ mod tests {
             ).unwrap();
         }
         tx.commit().unwrap();
+        inner
+            .conn
+            .execute("UPDATE history_state SET revision=1", [])
+            .unwrap();
+        inner.conn.execute("INSERT INTO history_changes(revision,channel_id,message_id,order_key,kind) VALUES(1,'00000000000000000000000000000001','00000000000000000000000000000000','00','insert')", []).unwrap();
+        let detail: String = inner.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT revision FROM history_changes WHERE channel_id=?1 AND revision>?2 ORDER BY revision LIMIT 33",
+            rusqlite::params!["00000000000000000000000000000001", 0_i64],
+            |row| row.get(3),
+        ).unwrap();
+        assert!(
+            detail.contains("history_changes_channel_revision"),
+            "{detail}"
+        );
         drop(inner);
+        let (epoch, _) = s.history_head().unwrap();
+        assert_eq!(
+            s.history_changes("00000000000000000000000000000001", &epoch, 0, 32)
+                .unwrap()
+                .unwrap()
+                .changes
+                .len(),
+            1
+        );
         assert_eq!(s.channels().unwrap().len(), 101);
         for channel in 1..=100_u32 {
             let rows = s
@@ -583,7 +606,221 @@ mod tests {
     }
 
     #[test]
-    fn new_store_applies_schema_v1_and_reopens() {
+    fn projection_changes_track_late_and_deferred_messages_in_projection_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("changes.sqlite")).unwrap();
+        let channel = hex_id([8; 16]);
+        let initial = store.history_head().unwrap();
+        let deferred = DomainRecord::message_post([8; 16], "alice", "private body").unwrap();
+        store
+            .ingest(
+                "deferred",
+                "01",
+                "alice",
+                deferred.kind(),
+                "s",
+                &deferred.encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.history_head().unwrap(), initial);
+        let create = DomainRecord::channel_create_with_id([8; 16], "alice", "known").unwrap();
+        store
+            .ingest(
+                "create",
+                "10",
+                "alice",
+                create.kind(),
+                "s",
+                &create.encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        let late =
+            DomainRecord::message_post([8; 16], "alice", "not stored in the journal").unwrap();
+        store
+            .ingest(
+                "late",
+                "02",
+                "alice",
+                late.kind(),
+                "s",
+                &late.encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        let batch = store
+            .history_changes(&channel, &initial.0, initial.1, 32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            batch
+                .changes
+                .iter()
+                .map(|change| (
+                    &change.message_id,
+                    change.order_key.as_str(),
+                    change.kind.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (&hex_id(deferred.id()), "01", "insert"),
+                (&hex_id(late.id()), "02", "insert")
+            ]
+        );
+        assert_eq!(batch.high_water, 2);
+        assert_eq!(batch.continuation, 2);
+        assert!(
+            store
+                .history_changes(&channel, "wrong epoch", 0, 32)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .history_changes(&channel, &initial.0, 3, 32)
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let reopened = ConversationStore::open(directory.path().join("changes.sqlite")).unwrap();
+        assert_eq!(reopened.history_head().unwrap(), (initial.0.clone(), 2));
+        assert!(
+            reopened
+                .history_changes(&channel, &initial.0, 2, 32)
+                .unwrap()
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hide_replays_removals_without_replaying_duplicate_ingests() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("hide.sqlite")).unwrap();
+        let channel_id = hex_id([8; 16]);
+        let channel = DomainRecord::channel_create_with_id([8; 16], "alice", "known").unwrap();
+        store
+            .ingest(
+                "create",
+                "01",
+                "alice",
+                channel.kind(),
+                "s",
+                &channel.encode(),
+                b"c",
+                None,
+            )
+            .unwrap();
+        let message = DomainRecord::message_post([8; 16], "alice", "sensitive").unwrap();
+        let canonical = message.encode();
+        store
+            .ingest(
+                "message",
+                "04",
+                "alice",
+                message.kind(),
+                "s",
+                &canonical,
+                b"m",
+                None,
+            )
+            .unwrap();
+        let (epoch, revision) = store.history_head().unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(
+            store
+                .ingest(
+                    "message",
+                    "04",
+                    "alice",
+                    message.kind(),
+                    "s",
+                    &canonical,
+                    b"m",
+                    None
+                )
+                .unwrap(),
+            IngestResult::Duplicate
+        );
+        assert_eq!(store.history_head().unwrap().1, revision);
+        let hide = DomainRecord::channel_hide([8; 16], "alice").unwrap();
+        store
+            .ingest(
+                "hide",
+                "03",
+                "alice",
+                hide.kind(),
+                "s",
+                &hide.encode(),
+                b"h",
+                None,
+            )
+            .unwrap();
+        let batch = store
+            .history_changes(&channel_id, &epoch, 0, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.changes[0].kind, "insert");
+        assert_eq!((batch.continuation, batch.high_water), (1, 2));
+        let remaining = store
+            .history_changes(&channel_id, &epoch, batch.continuation, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.changes[0].kind, "remove");
+        assert_eq!(remaining.changes[0].message_id, hex_id(message.id()));
+        assert_eq!(remaining.continuation, 2);
+        assert!(
+            store
+                .message_rows(&channel_id, None, 32)
+                .unwrap()
+                .is_empty()
+        );
+        let raw = std::fs::read(directory.path().join("hide.sqlite")).unwrap();
+        assert!(
+            !raw.windows(b"sensitive".len())
+                .any(|bytes| bytes == b"sensitive")
+        );
+    }
+
+    #[test]
+    fn failed_journal_write_rolls_back_message_and_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(directory.path().join("rollback.sqlite")).unwrap();
+        store.inner.lock().unwrap().conn.execute_batch(
+            "CREATE TRIGGER reject_history BEFORE INSERT ON history_changes BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        let message = DomainRecord::message_post(GENERAL_ID, "alice", "hello").unwrap();
+        assert!(
+            store
+                .ingest(
+                    "failed",
+                    "01",
+                    "alice",
+                    message.kind(),
+                    "s",
+                    &message.encode(),
+                    b"sealed",
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(store.history_head().unwrap().1, 0);
+        assert!(
+            store
+                .message_rows(&hex_id(GENERAL_ID), None, 32)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.record_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn new_store_applies_schema_v2_and_reopens() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("fresh.sqlite");
         {
@@ -593,6 +830,45 @@ mod tests {
         // Reopen, migration is idempotent.
         let s = ConversationStore::open(&path).unwrap();
         assert!(!s.channels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn v1_upgrade_leaves_prior_messages_as_the_new_history_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v1.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_conversations.sql"))
+            .unwrap();
+        conn.execute("INSERT INTO records(record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,quarantine_code) VALUES('old','01','alice','message.post','signature',X'7365616c6564',NULL,1,NULL)", []).unwrap();
+        conn.execute("INSERT INTO messages(message_id,channel_id,order_key,author,record_id,ingestion_ordinal) VALUES('old','00000000000000000000000000000000','01','alice','old',1)", []).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+        let store = ConversationStore::open(&path).unwrap();
+        let (epoch, revision) = store.history_head().unwrap();
+        assert_eq!(revision, 0);
+        assert!(
+            store
+                .history_changes(&hex_id(GENERAL_ID), &epoch, 0, 32)
+                .unwrap()
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .message_rows(&hex_id(GENERAL_ID), None, 32)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        assert_eq!(
+            ConversationStore::open(&path)
+                .unwrap()
+                .history_head()
+                .unwrap(),
+            (epoch, 0)
+        );
     }
 
     #[test]

@@ -49,6 +49,22 @@ pub struct ChannelView {
 pub type MessageRow = (String, String, String, String, Vec<u8>, u64);
 
 #[derive(Debug, Clone)]
+pub struct HistoryChange {
+    pub revision: u64,
+    pub channel_id: String,
+    pub message_id: String,
+    pub order_key: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryBatch {
+    pub changes: Vec<HistoryChange>,
+    pub high_water: u64,
+    pub continuation: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct MessageView {
     pub id: String,
     pub channel_id: String,
@@ -497,6 +513,79 @@ impl ConversationStore {
         }
         Ok(out)
     }
+    pub fn history_head(&self) -> Result<(String, u64), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT epoch,revision FROM history_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .map_err(rerr)
+    }
+
+    /// The epoch and the ordered, bounded changes are sampled under the same store lock.
+    /// `None` means the caller must reopen and rebuild its loaded window.
+    pub fn history_changes(
+        &self,
+        channel: &str,
+        epoch: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<Option<HistoryBatch>, StoreError> {
+        let inner = lock(&self.inner)?;
+        let (current_epoch, head): (String, i64) = inner
+            .conn
+            .query_row(
+                "SELECT epoch,revision FROM history_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(rerr)?;
+        let Ok(after) = i64::try_from(after) else {
+            return Ok(None);
+        };
+        if current_epoch != epoch || after > head {
+            return Ok(None);
+        }
+        let limit = limit.clamp(1, 32);
+        let mut statement = inner
+            .conn
+            .prepare(
+                "SELECT revision,channel_id,message_id,order_key,kind FROM history_changes \
+             WHERE channel_id=?1 AND revision>?2 AND revision<=?3 ORDER BY revision LIMIT ?4",
+            )
+            .map_err(rerr)?;
+        let mut changes = statement
+            .query_map(params![channel, after, head, (limit + 1) as i64], |row| {
+                Ok(HistoryChange {
+                    revision: row.get::<_, i64>(0)? as u64,
+                    channel_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    order_key: row.get(3)?,
+                    kind: row.get(4)?,
+                })
+            })
+            .map_err(rerr)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(rerr)?;
+        let more = changes.len() > limit;
+        changes.truncate(limit);
+        let continuation = if more {
+            changes
+                .last()
+                .map_or(after as u64, |change| change.revision)
+        } else {
+            head as u64
+        };
+        Ok(Some(HistoryBatch {
+            changes,
+            high_water: head as u64,
+            continuation,
+        }))
+    }
+
     pub fn message_rows(
         &self,
         channel: &str,
