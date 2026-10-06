@@ -62,6 +62,7 @@ interface ChangeFeed {
   running: Promise<void> | null;
   dirty: boolean;
   resolveStatus: "idle" | "failed";
+  failedResolveIds: Set<string>;
   resolveRunning: Promise<void> | null;
   resolveOffset: number;
   rebuild: "start" | HistoryRebuild | null;
@@ -654,7 +655,7 @@ export class ConversationsController {
       pending: new Map(), unavailable: new Map(),
       positions: new Map(this._state.messages.filter(m => m.position !== undefined).map(m => [m.id, m.position!])),
       running: null, dirty: false,
-      resolveStatus: "idle", resolveRunning: null, resolveOffset: 0, rebuild: null };
+      resolveStatus: "idle", failedResolveIds: new Set(), resolveRunning: null, resolveOffset: 0, rebuild: null };
     this.trackPending(page.pending ?? []);
   }
 
@@ -763,9 +764,13 @@ export class ConversationsController {
               }
             }
           }
+          for (const id of feed.failedResolveIds) {
+            if (!feed.pending.has(id)) feed.failedResolveIds.delete(id);
+          }
+          if (feed.failedResolveIds.size === 0) feed.resolveStatus = "idle";
           this._state = { ...this._state, messages: messages ?? this._state.messages,
-            feedError: false, pendingHistory: feed.pending.size,
-            unavailableHistory: feed.unavailable.size };
+            feedError: false, resolveError: feed.failedResolveIds.size > 0,
+            pendingHistory: feed.pending.size, unavailableHistory: feed.unavailable.size };
           feed.after = response.continuation;
           feed.status = "idle";
           if (response.continuation !== response.highWater) feed.dirty = true;
@@ -830,14 +835,18 @@ export class ConversationsController {
     }
     if (this.disposed || this.generation !== gen || this.feed !== feed) return;
     this.headFailed = false;
-    const preserveResolveFailure = feed.resolveStatus === "failed"
-      && rebuild.pending.some(row => row.status === "pending" && feed.pending.has(row.id));
+    const survivingFailedIds = rebuild.pending.filter(row => row.status === "pending"
+      && feed.failedResolveIds.has(row.id)).map(row => row.id);
+    const preserveResolveFailure = feed.resolveStatus === "failed" && survivingFailedIds.length > 0;
     this._state = { ...this._state, messages: this.ordered([...new Map(rebuild.messages.map(m => [m.id, m])).values()]),
       hasMore: rebuild.cursor !== null, nextBefore: rebuild.cursor,
       feedError: false, resolveError: preserveResolveFailure,
       pendingHistory: 0, unavailableHistory: 0 };
     this.installFeed({ messages: [], pending: rebuild.pending, epoch: rebuild.epoch, revision: rebuild.revision });
-    if (preserveResolveFailure && this.feed) this.feed.resolveStatus = "failed";
+    if (preserveResolveFailure && this.feed) {
+      this.feed.resolveStatus = "failed";
+      this.feed.failedResolveIds = new Set(survivingFailedIds);
+    }
     this.historyRebuilding = false;
     this.notify();
     // The open watermark precedes asynchronous page reads. Always replay after installing it,
@@ -860,6 +869,7 @@ export class ConversationsController {
     const requestedIds = new Set(requested);
     if (explicit) {
       feed.resolveStatus = "idle";
+      feed.failedResolveIds.clear();
       this._state = { ...this._state, resolveError: false };
       this.notify();
     }
@@ -893,8 +903,11 @@ export class ConversationsController {
         this.notify();
       } catch {
         if (this.disposed || this.generation !== gen || this.feed !== feed) return;
-        feed.resolveStatus = "failed";
-        this._state = { ...this._state, resolveError: true };
+        // Only surviving requested identities own this failure; a new pending
+        // Message must not inherit it from a removed one.
+        feed.failedResolveIds = new Set([...requestedIds].filter(id => feed.pending.has(id)));
+        feed.resolveStatus = feed.failedResolveIds.size === 0 ? "idle" : "failed";
+        this._state = { ...this._state, resolveError: feed.failedResolveIds.size > 0 };
         this.notify();
       }
     };

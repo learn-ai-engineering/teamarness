@@ -27,6 +27,8 @@ function historyBackend(size = 64) {
   let epochCount = 0;
   let loadedFrontier: string | null = null;
   let failResolve = false;
+  let failResolveAfterGate = false;
+  let resolveSelected: ReturnType<typeof deferred> | null = null;
   let pageSelected: (() => Promise<void>) | null = null;
   let pageGate: ReturnType<typeof deferred> | null = null;
   let pageRelease: ReturnType<typeof deferred> | null = null;
@@ -87,7 +89,11 @@ function historyBackend(size = 64) {
         const response = { messages: ids.filter(n => records.includes(n) && !unreadable.has(n)).map(message),
           pending: ids.filter(n => records.includes(n) && unreadable.has(n)).map(n => ({ id: String(n), position: position(n), status: "pending" })),
           missing: ids.filter(n => !records.includes(n)).map(String) };
-        if (resolveGate) await resolveGate.promise;
+        if (resolveGate) {
+          resolveSelected?.resolve(); resolveSelected = null;
+          await resolveGate.promise;
+        }
+        if (failResolveAfterGate) { failResolveAfterGate = false; throw new Error("late resolve failure"); }
         return response as unknown as T;
       }
       throw new Error(`unexpected operation ${operation}`);
@@ -112,12 +118,13 @@ function historyBackend(size = 64) {
     failNextPage() { failPage = true; },
     resetEpoch() { epoch = (++epochCount).toString(16).padStart(32, "0"); changes.length = 0; },
     failNextResolve() { failResolve = true; },
+    failResolveAfterPause() { failResolveAfterGate = true; },
     pausePage() { pageGate = deferred(); },
     releasePage() { pageRelease?.resolve(); pageRelease = null; },
     onPageSelected(callback: (() => Promise<void>) | null) { pageSelected = callback; },
     pauseOpen(): Promise<void> { openGate = deferred(); openSelected = deferred(); return openSelected.promise; },
     releaseOpen() { openRelease?.resolve(); openRelease = null; },
-    pauseResolve() { resolveGate = deferred(); },
+    pauseResolve(): Promise<void> { resolveGate = deferred(); resolveSelected = deferred(); return resolveSelected.promise; },
     releaseResolve() { resolveGate?.resolve(); resolveGate = null; },
     expected(): string[] { return [...records].sort((a, b) => a - b).map(String); },
     expectedLoadedReadable(): string[] { return records.filter(n => !unreadable.has(n)
@@ -218,6 +225,64 @@ it("preserves a failed pending-resolve across resync until explicit retry", asyn
   await controller.retryPending();
   expect(controller.state.resolveError).toBe(false);
   expect(controller.state.messages.at(-1)?.id).toBe("65");
+});
+
+it("clears a failed resolve when a removal retires the last pending identity", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  backend.insert(65, false);
+  backend.failNextResolve();
+  await controller.applySnapshot(snapshot);
+  expect(controller.state.resolveError).toBe(true);
+  expect(controller.state.pendingHistory).toBe(1);
+  backend.remove(65);
+  await controller.applySnapshot(snapshot);
+  expect(controller.state.pendingHistory).toBe(0);
+  expect(controller.state.resolveError).toBe(false);
+  backend.insert(66, false);
+  await controller.applySnapshot(snapshot);
+  expect(controller.state.pendingHistory).toBe(1);
+  expect(controller.state.resolveError).toBe(false);
+});
+
+it("does not transfer a failed resolve to a replacement ID in one change batch", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  backend.insert(65, false);
+  backend.failNextResolve();
+  await controller.applySnapshot(snapshot);
+  expect(controller.state.resolveError).toBe(true);
+  backend.remove(65);
+  backend.insert(66, false);
+  await controller.applySnapshot(snapshot);
+  expect(controller.state.pendingHistory).toBe(1);
+  expect(controller.state.resolveError).toBe(false);
+  backend.makeReadable(66);
+  await controller.retryPending();
+  expect(controller.state.messages.at(-1)?.id).toBe("66");
+});
+
+it("does not transfer an in-flight resolve failure to a replacement ID", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  backend.insert(65, false);
+  const selected = backend.pauseResolve();
+  backend.failResolveAfterPause();
+  const probing = controller.applySnapshot(snapshot);
+  await selected;
+  backend.remove(65);
+  backend.insert(66, false);
+  const replacement = controller.applySnapshot(snapshot);
+  backend.releaseResolve();
+  await probing; await replacement;
+  expect(controller.state.pendingHistory).toBe(1);
+  expect(controller.state.resolveError).toBe(false);
+  backend.makeReadable(66);
+  await controller.retryPending();
+  expect(controller.state.messages.at(-1)?.id).toBe("66");
 });
 
 it("retains loaded pending-only raw rows across epoch rebuild and explicit retry", async () => {
