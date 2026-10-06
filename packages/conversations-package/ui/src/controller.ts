@@ -172,6 +172,7 @@ export class ConversationsController {
   private headFailed = false;
   private feed: ChangeFeed | null = null;
   private removedDuringOlder: Set<string> | null = null;
+  private olderSkippedInFlight: Set<string> | null = null;
   private openingChannel: number | null = null;
   private openDirty = false;
   private historyGeneration = 0;
@@ -387,13 +388,22 @@ export class ConversationsController {
     try {
       let cursor = nextBefore;
       const cursors = new Set([cursor]);
-      let page;
+      let page: ConversationPage | undefined;
       for (let count = 0; count < MAX_HISTORY_PAGES; count++) {
+        this.olderSkippedInFlight = new Set();
         page = await this.client.request(
           "conversations.channel.page",
           { channelId: selectedChannelId, before: cursor, limit: PAGE_SIZE },
         );
         if (this.disposed || this.generation !== gen || this.historyGeneration !== historyGen) return;
+        // A feed insert below the old cursor may have arrived after this page selected
+        // its rows. Refetch the same raw range before advancing past that insert.
+        const returnedBefore = page.nextBefore;
+        if ([...(this.olderSkippedInFlight ?? [])].some(position =>
+          !returnedBefore || position >= returnedBefore)) {
+          if (count === MAX_HISTORY_PAGES - 1) throw new Error("History page changed too often");
+          continue;
+        }
         if (page.nextBefore && cursors.has(page.nextBefore)) throw new Error("Non-advancing history cursor");
         this.trackPending(page.pending ?? []);
         if (page.messages.length || !page.nextBefore) break;
@@ -430,7 +440,10 @@ export class ConversationsController {
         warning: "Older history could not be loaded.",
       };
     } finally {
-      if (this.removedDuringOlder === removed) this.removedDuringOlder = null;
+      if (this.removedDuringOlder === removed) {
+        this.removedDuringOlder = null;
+        this.olderSkippedInFlight = null;
+      }
       if (!this.disposed && this.generation === gen) this.notify();
     }
   }
@@ -705,6 +718,7 @@ export class ConversationsController {
             ++this.historyGeneration;
             this.historyRebuilding = true;
             this.removedDuringOlder = null;
+            this.olderSkippedInFlight = null;
             this._state = { ...this._state, loadingOlder: false };
             await this.rebuildHistory(feed, channelId, gen);
             return;
@@ -728,7 +742,11 @@ export class ConversationsController {
               this.removedDuringOlder?.add(event.id);
               removeLoaded(event.id);
               feed.pending.delete(event.id); feed.unavailable.delete(event.id);
-            } else if (!this._state.hasMore || !this._state.nextBefore || event.position >= this._state.nextBefore) {
+            } else if (this._state.hasMore && this._state.nextBefore && event.position < this._state.nextBefore) {
+              // An in-flight page could have selected its rows before this insert.
+              // Invalidate only that page; a future page will cover the insert otherwise.
+              if (this.removedDuringOlder) this.olderSkippedInFlight?.add(event.position);
+            } else {
               if (event.message) {
                 removeLoaded(event.id);
                 messages ??= [...this._state.messages];

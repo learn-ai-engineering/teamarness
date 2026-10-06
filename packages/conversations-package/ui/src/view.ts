@@ -392,6 +392,9 @@ export class ConversationsView {
       canHide: boolean;
     } | null,
   ): void {
+    const focusedHide = selected?.id === this.renderedChannelId
+      && this.headerSlot.querySelector("button") === (this.root instanceof ShadowRoot
+        ? this.root.activeElement : document.activeElement);
     this.headerSlot.replaceChildren();
     const header = document.createElement("header");
     header.className = "conversation-header";
@@ -412,6 +415,7 @@ export class ConversationsView {
     }
 
     this.headerSlot.append(header);
+    if (focusedHide) header.querySelector("button")?.focus({ preventScroll: true });
   }
 
   /** Renders warnings and the hide-confirmation dialog above the history. */
@@ -489,6 +493,10 @@ export class ConversationsView {
     const previousTop = this.history.scrollTop;
     const previousHeight = this.history.scrollHeight;
     const previousRows = [...this.history.querySelectorAll<HTMLElement>(".message")];
+    const focusedElement = this.root instanceof ShadowRoot ? this.root.activeElement : document.activeElement;
+    const focusedAuthorId = !openedChannel && focusedElement instanceof HTMLElement
+      && focusedElement.classList.contains("message-author")
+      ? focusedElement.closest<HTMLElement>(".message")?.dataset.messageId : undefined;
     const viewportTop = this.history.getBoundingClientRect().top;
     const visibleIndex = previousRows.findIndex(row => {
       const rect = row.getBoundingClientRect();
@@ -542,6 +550,7 @@ export class ConversationsView {
 
       row.append(author, body);
       this.history.append(row);
+      if (message.id === focusedAuthorId) author.focus({ preventScroll: true });
     }
 
     if (openedChannel || (wasAtBottom && tailAdvanced)) {

@@ -25,6 +25,7 @@ function historyBackend(size = 64) {
   let failPage = false;
   let epoch = "a".repeat(32);
   let failResolve = false;
+  let pageSelected: (() => Promise<void>) | null = null;
   let pageGate: ReturnType<typeof deferred> | null = null;
   let pageRelease: ReturnType<typeof deferred> | null = null;
   let openGate: ReturnType<typeof deferred> | null = null;
@@ -52,6 +53,7 @@ function historyBackend(size = 64) {
           pageRelease = pageGate; pageGate = null;
           await pageRelease.promise;
         }
+        if (operation === "conversations.channel.page" && pageSelected) await pageSelected();
         if (operation === "conversations.channel.open" && openGate) {
           openRelease = openGate; openGate = null;
           await openRelease.promise;
@@ -107,6 +109,7 @@ function historyBackend(size = 64) {
     failNextResolve() { failResolve = true; },
     pausePage() { pageGate = deferred(); },
     releasePage() { pageRelease?.resolve(); pageRelease = null; },
+    onPageSelected(callback: (() => Promise<void>) | null) { pageSelected = callback; },
     pauseOpen() { openGate = deferred(); },
     releaseOpen() { openRelease?.resolve(); openRelease = null; },
     pauseResolve() { resolveGate = deferred(); },
@@ -323,6 +326,60 @@ it("finds an insert below the raw lower cursor on older paging, including a full
   expect(controller.state.messages.map(m => m.id)).toEqual(backend.expected());
   expect(controller.state.hasMore).toBe(false);
   expect(backend.calls.filter(operation => operation === "conversations.channel.open")).toHaveLength(1);
+});
+
+it("does not lose an interior insert projected after older rows were selected", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  backend.pausePage();
+  const older = controller.loadOlder();
+  // The adapter captured 32..1 and its revision before suspending the reply.
+  backend.insert(10.5);
+  await controller.applySnapshot(snapshot);
+  backend.releasePage();
+  await older;
+  while (controller.state.hasMore) await controller.loadOlder();
+  expect(controller.state.messages.map(m => m.id)).toEqual(backend.expected());
+  expect(controller.state.olderError).toBe(false);
+});
+
+it("does not refetch a page for an insert below its returned raw cursor", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  backend.pausePage();
+  const older = controller.loadOlder();
+  backend.insert(0.5);
+  await controller.applySnapshot(snapshot);
+  backend.releasePage();
+  await older;
+  expect(backend.calls.filter(operation => operation === "conversations.channel.page")).toHaveLength(1);
+  await controller.loadOlder();
+  expect(controller.state.messages.map(m => m.id)).toEqual(backend.expected());
+  expect(controller.state.olderError).toBe(false);
+});
+
+it("stops invalidated pages at a bounded failure and retries only on request", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  let attempts = 0;
+  backend.onPageSelected(async () => {
+    backend.insert(1 + (2 * ++attempts - 1) / 10);
+    await controller.applySnapshot(snapshot);
+  });
+  await controller.loadOlder();
+  expect(attempts).toBe(32);
+  expect(controller.state.olderError).toBe(true);
+  await controller.applySnapshot(snapshot);
+  await controller.loadOlder();
+  expect(attempts).toBe(32);
+  backend.onPageSelected(null);
+  await controller.retryOlder();
+  while (controller.state.hasMore) await controller.loadOlder();
+  expect(controller.state.messages.map(m => m.id)).toEqual(backend.expected());
+  expect(controller.state.olderError).toBe(false);
 });
 
 it("keeps post and older page ownership while a change replay overlaps them", async () => {

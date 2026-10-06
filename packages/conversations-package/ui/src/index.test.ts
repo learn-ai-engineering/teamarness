@@ -106,12 +106,14 @@ describe("Conversations Package surface", () => {
     const client = createFakePackageClient({
       requests: {
         "conversations.snapshot": () => ({ availability, channels }),
-        "conversations.channel.open": () => ({ messages: options.messages ?? [message("first")], ...(options.nextBefore ? { nextBefore: options.nextBefore } : {}) }),
+        "conversations.channel.open": () => ({ ...emptyPage(), messages: options.messages ?? [message("first")],
+          ...(options.nextBefore ? { nextBefore: options.nextBefore } : {}) }),
         "conversations.channel.create": () => {
           if (options.failCreate) throw new Error("unavailable");
-          return {};
+          return { ok: true };
         },
-        "conversations.channel.page": () => ({ messages: [] }),
+        "conversations.channel.page": () => emptyPage(),
+        "conversations.channel.changes": () => ({ events: [], continuation: "0", highWater: "0" }),
         "conversations.channel.hide": () => ({}),
       },
       subscriptions: { "conversations.changes": () => undefined },
@@ -238,6 +240,9 @@ describe("Conversations Package surface", () => {
     expect(source.calls.some((call) => call.operation === "conversations.channel.hide")).toBe(false);
     await source.update();
     expect(root.querySelector("textarea")).toBe(textarea);
+    root.querySelector<HTMLButtonElement>(".conversation-header button")?.focus();
+    await source.update();
+    expect(root.activeElement).toBe(root.querySelector(".conversation-header button"));
     expect(textarea?.value).toBe("my draft");
     textarea?.focus();
     await source.update();
@@ -245,6 +250,22 @@ describe("Conversations Package surface", () => {
     await unmount();
     host.remove();
   });
+});
+
+it("retains keyboard focus on a Message author when a live insert rerenders history", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = host.attachShadow({ mode: "open" });
+  let rows = [message("first")];
+  const source = liveHistorySource(() => rows);
+  const unmount = await mount(createTestMountContext({ root, client: source.client }));
+  root.querySelector<HTMLButtonElement>('.message[data-message-id="first"] .message-author')?.focus();
+  rows = [message("second"), message("first")];
+  await source.emit("conversations.changes", snapshot());
+  await vi.waitFor(() => expect(root.querySelectorAll(".message")).toHaveLength(2));
+  expect(root.activeElement).toBe(root.querySelector('.message[data-message-id="first"] .message-author'));
+  await unmount();
+  host.remove();
 });
 
 describe("channel message order", () => {
@@ -923,6 +944,48 @@ describe("history feed recovery", () => {
 });
 
 describe("row-anchored live history", () => {
+  it("retains a focused author and its visible offset when an earlier row arrives", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    let rows = [message("3"), message("2")];
+    const source = liveHistorySource(() => rows);
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const history = root.querySelector<HTMLElement>(".message-history")!;
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const originalFocus = HTMLElement.prototype.focus;
+    const options: FocusOptions[] = [];
+    try {
+      Object.defineProperty(history, "clientHeight", { get: () => 30 });
+      Object.defineProperty(history, "scrollHeight", { get: () => history.querySelectorAll(".message").length * 40 });
+      HTMLElement.prototype.getBoundingClientRect = function () {
+        if (this === history) return { top: 10, bottom: 40, height: 30 } as DOMRect;
+        const ordered = [...history.querySelectorAll<HTMLElement>(".message")];
+        const index = ordered.indexOf(this);
+        const top = 10 + Math.max(index, 0) * 40 - history.scrollTop;
+        return { top, bottom: top + 40, height: 40 } as DOMRect;
+      };
+      HTMLElement.prototype.focus = function (focusOptions?: FocusOptions) {
+        if (this.classList.contains("message-author") && focusOptions) options.push(focusOptions);
+        if (this.classList.contains("message-author") && !focusOptions?.preventScroll) history.scrollTop = 100;
+        originalFocus.call(this, focusOptions);
+      };
+      history.scrollTop = 10;
+      root.querySelector<HTMLButtonElement>('.message[data-message-id="2"] .message-author')!.focus({ preventScroll: true });
+      rows = [message("3"), message("2"), message("1")];
+      await source.emit("conversations.changes", snapshot());
+      expect(root.activeElement).toBe(root.querySelector('.message[data-message-id="2"] .message-author'));
+      expect(options.at(-1)).toEqual({ preventScroll: true });
+      expect(history.scrollTop).toBe(50);
+      expect(root.querySelector<HTMLElement>('.message[data-message-id="2"]')?.getBoundingClientRect().top).toBe(0);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+      HTMLElement.prototype.focus = originalFocus;
+      await unmount();
+      host.remove();
+    }
+  });
+
   it("restores the visible row offset after a width resize rewraps an earlier row", async () => {
     let observerCallback: ResizeObserverCallback | undefined;
     let disconnected = false;
