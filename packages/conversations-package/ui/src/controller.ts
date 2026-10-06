@@ -458,7 +458,7 @@ export class ConversationsController {
   /** A failed request is retried only by an explicit action, never by scrolling. */
   async retryOlder(): Promise<void> {
     if (this.disposed) return;
-    if (!this._state.olderError) return;
+    if (!this._state.olderError || this.historyRebuilding) return;
     const retryHead = this.headFailed;
     this._state = { ...this._state, olderError: false, warning: null,
       retryingHead: retryHead,
@@ -599,7 +599,9 @@ export class ConversationsController {
   /**
    * Apply an incoming subscription snapshot. Preserves the current channel
    * selection unless the channel was removed, in which case it falls back
-   * to the first available channel.
+   * to the first available channel. During an in-flight open on the same Channel,
+   * the return is notification-only: openDirty schedules replay after the open
+   * watermark is installed; the caller must await the open to observe it.
    */
   applySnapshot(snapshot: ConversationSnapshot): void | Promise<void> {
     if (this.disposed) return;

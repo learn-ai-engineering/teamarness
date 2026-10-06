@@ -1005,13 +1005,15 @@ describe("row-anchored live history", () => {
     }
   });
 
-  it("restores the visible row offset after a width resize rewraps an earlier row", async () => {
+  it("restores the visible row offset after width and same-width row reflow", async () => {
     let observerCallback: ResizeObserverCallback | undefined;
     let disconnected = false;
+    const observed = new Set<Element>();
     class TestResizeObserver {
       constructor(callback: ResizeObserverCallback) { observerCallback = callback; }
-      observe() { /* called when mounted */ }
-      disconnect() { disconnected = true; }
+      observe(target: Element) { observed.add(target); }
+      unobserve(target: Element) { observed.delete(target); }
+      disconnect() { disconnected = true; observed.clear(); }
     }
     vi.stubGlobal("ResizeObserver", TestResizeObserver);
     const original = HTMLElement.prototype.getBoundingClientRect;
@@ -1044,6 +1046,17 @@ describe("row-anchored live history", () => {
       heights["1"] = 90;
       resized(300);
       expect(history.scrollTop).toBe(105);
+      expect(root.querySelector<HTMLElement>(".message[data-message-id='2']")?.getBoundingClientRect().top).toBe(-5);
+      const earlier = root.querySelector<HTMLElement>(".message[data-message-id='1']")!;
+      expect(observed.has(history)).toBe(true);
+      expect(observed.has(earlier)).toBe(true);
+      const rowResized = (height: number) => observerCallback!([
+        { target: earlier, contentRect: { height } as DOMRect } as unknown as ResizeObserverEntry,
+      ], {} as ResizeObserver);
+      rowResized(90); // Initial observation establishes the row height.
+      heights["1"] = 120;
+      rowResized(120); // No container-width change.
+      expect(history.scrollTop).toBe(135);
       expect(root.querySelector<HTMLElement>(".message[data-message-id='2']")?.getBoundingClientRect().top).toBe(-5);
       await unmount!(); unmount = undefined;
       expect(disconnected).toBe(true);

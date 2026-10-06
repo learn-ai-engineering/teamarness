@@ -42,6 +42,7 @@ export class ConversationsView {
   private fillTimer: ReturnType<typeof setTimeout> | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private observedWidth: number | null = null;
+  private readonly observedRowHeights = new WeakMap<Element, number>();
   private readingAnchor: { id: string; offset: number; atBottom: boolean } | null = null;
   private disposed = false;
 
@@ -177,10 +178,24 @@ export class ConversationsView {
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(entries => {
         if (this.disposed) return;
-        const width = entries[0]?.contentRect.width;
-        if (width === undefined) return;
-        if (this.observedWidth !== null && width !== this.observedWidth) this.restoreReadingAnchor();
-        this.observedWidth = width;
+        let reflowed = false;
+        for (const entry of entries) {
+          // The container changes width; a row can also change height at the same width
+          // when a font finishes loading or its content reflows.
+          const target = entry.target ?? this.history;
+          if (target === this.history) {
+            const width = entry.contentRect.width;
+            if (this.observedWidth !== null && width !== this.observedWidth) reflowed = true;
+            this.observedWidth = width;
+          } else if (target instanceof HTMLElement && target.classList.contains("message")
+            && this.history.contains(target)) {
+            const height = entry.contentRect.height;
+            const previous = this.observedRowHeights.get(target);
+            if (previous !== undefined && height !== previous) reflowed = true;
+            this.observedRowHeights.set(target, height);
+          }
+        }
+        if (reflowed) this.restoreReadingAnchor();
         this.captureReadingAnchor();
       });
       this.resizeObserver.observe(this.history);
@@ -528,6 +543,7 @@ export class ConversationsView {
     const tailAdvanced = newTailId !== undefined
       && !previousRows.some(row => row.dataset.messageId === newTailId);
 
+    for (const row of previousRows) this.resizeObserver?.unobserve(row);
     this.history.replaceChildren();
     let previousLocal = false;
     for (const message of state.messages) {
@@ -557,6 +573,7 @@ export class ConversationsView {
 
       row.append(author, body);
       this.history.append(row);
+      this.resizeObserver?.observe(row);
       if (message.id === focusedAuthorId) author.focus({ preventScroll: true });
       if (message.id === focusedLinkId && focusedLinkIndex >= 0) {
         row.querySelectorAll<HTMLAnchorElement>(".message-markdown a")[focusedLinkIndex]

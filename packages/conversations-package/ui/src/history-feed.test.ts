@@ -31,6 +31,7 @@ function historyBackend(size = 64) {
   let pageGate: ReturnType<typeof deferred> | null = null;
   let pageRelease: ReturnType<typeof deferred> | null = null;
   let openGate: ReturnType<typeof deferred> | null = null;
+  let openSelected: ReturnType<typeof deferred> | null = null;
   let openRelease: ReturnType<typeof deferred> | null = null;
   let resolveGate: ReturnType<typeof deferred> | null = null;
   const raw: PackageClient = {
@@ -59,6 +60,7 @@ function historyBackend(size = 64) {
         if (operation === "conversations.channel.page" && pageSelected) await pageSelected();
         if (operation === "conversations.channel.open" && openGate) {
           openRelease = openGate; openGate = null;
+          openSelected?.resolve(); openSelected = null;
           await openRelease.promise;
         }
         return response as unknown as T;
@@ -113,7 +115,7 @@ function historyBackend(size = 64) {
     pausePage() { pageGate = deferred(); },
     releasePage() { pageRelease?.resolve(); pageRelease = null; },
     onPageSelected(callback: (() => Promise<void>) | null) { pageSelected = callback; },
-    pauseOpen() { openGate = deferred(); },
+    pauseOpen(): Promise<void> { openGate = deferred(); openSelected = deferred(); return openSelected.promise; },
     releaseOpen() { openRelease?.resolve(); openRelease = null; },
     pauseResolve() { resolveGate = deferred(); },
     releaseResolve() { resolveGate?.resolve(); resolveGate = null; },
@@ -171,6 +173,30 @@ it("preserves an independent older-page failure across epoch rebuild until expli
   await controller.retryOlder();
   expect(controller.state.olderError).toBe(false);
   expect(controller.state.messages.some(m => m.id === "1")).toBe(true);
+});
+
+it("keeps a failed older-page retry actionable while epoch reconstruction is opening", async () => {
+  const backend = historyBackend();
+  const controller = new ConversationsController(backend.client, () => undefined);
+  await controller.initialize();
+  backend.failNextPage();
+  await controller.loadOlder();
+  expect(controller.state.olderError).toBe(true);
+  backend.resetEpoch();
+  const selected = backend.pauseOpen();
+  const rebuilding = controller.applySnapshot(snapshot);
+  await selected;
+  const pages = backend.calls.filter(operation => operation === "conversations.channel.page").length;
+  await controller.retryOlder();
+  expect(controller.state.olderError).toBe(true);
+  expect(backend.calls.filter(operation => operation === "conversations.channel.page")).toHaveLength(pages);
+  backend.releaseOpen();
+  await rebuilding;
+  expect(controller.state.olderError).toBe(true);
+  await controller.retryOlder();
+  expect(controller.state.olderError).toBe(false);
+  expect(controller.state.messages.some(m => m.id === "1")).toBe(true);
+  expect(controller.state.messages.map(m => m.id)).toEqual(backend.expected());
 });
 
 it("preserves a failed pending-resolve across resync until explicit retry", async () => {
@@ -293,7 +319,9 @@ it("replays a snapshot delivered during a Channel switch after the switch-open w
   const controller = new ConversationsController(typedPackageClient<ConversationsContract>(raw), () => undefined);
   await controller.initialize();
   const switching = controller.selectChannel(other);
-  await controller.applySnapshot({ ...snapshot, channels });
+  const notification = controller.applySnapshot({ ...snapshot, channels });
+  expect(notification).toBeUndefined(); // In-flight open receives a signal, not a settled replay.
+  expect(controller.state.messages).toEqual([]);
   gate.resolve();
   await switching;
   expect(controller.state.messages.map(m => m.id)).toEqual(["65"]);
