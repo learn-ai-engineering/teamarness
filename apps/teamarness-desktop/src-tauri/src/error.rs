@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use teamarness_core::{MembershipError, OnboardingError, StorageError, WorkspaceError};
+use teamarness_core::{
+    MembershipError, OnboardingError, PersonNameError, StorageError, WorkspaceError,
+};
 use teamarness_package_host::{PackageErrorCode, PackageErrorEnvelope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,17 @@ impl From<OnboardingError> for BridgeError {
             _ => BridgeErrorCode::InvalidInput,
         };
         Self::new(code, retryable)
+    }
+}
+
+impl From<PersonNameError> for BridgeError {
+    fn from(value: PersonNameError) -> Self {
+        match value {
+            PersonNameError::InvalidName
+            | PersonNameError::WorkspaceNotFound
+            | PersonNameError::NotOwnPerson => Self::invalid_input(),
+            PersonNameError::Storage(error) => error.into(),
+        }
     }
 }
 

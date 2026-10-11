@@ -9,6 +9,7 @@ use iroh_base::SecretKey;
 use rusqlite::OptionalExtension;
 
 use crate::MembershipOperationId;
+use crate::diag::fault;
 use crate::error::{
     CoreError, IdentityError, InvitationError, MembershipError, StorageError, SubscriptionError,
     WorkspaceError,
@@ -161,7 +162,7 @@ impl CoreRuntime {
             Ok((connection, secret_key, display_name, memberships, recovery))
         })
         .await
-        .map_err(|_| CoreError::Storage(StorageError::Database))?;
+        .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
         let (connection, secret_key, display_name, memberships, recovery) = opened?;
         #[cfg(not(test))]
         let _ = recovery;
@@ -195,11 +196,11 @@ impl CoreRuntime {
             tokio::task::spawn_blocking(move || -> Result<(), CoreError> {
                 let mut locked = state
                     .lock()
-                    .map_err(|_| CoreError::Storage(StorageError::Database))?;
+                    .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
                 let workspaces: Vec<_> = locked.memberships.keys().copied().collect();
                 for workspace in workspaces {
                     person_name_sync::initialize(&mut locked, workspace)
-                        .map_err(|_| CoreError::Storage(StorageError::Database))?;
+                        .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
                 }
                 Ok(())
             })

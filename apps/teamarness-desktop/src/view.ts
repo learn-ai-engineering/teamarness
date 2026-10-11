@@ -1,6 +1,6 @@
 import type { TeamarnessBridge } from "./bridge";
 import { isBridgeError } from "./contracts";
-import type { BridgeErrorCode, Installation, Membership, Workspace } from "./contracts";
+import type { BridgeErrorCode, Installation, Membership, PersonNameSnapshot, Workspace } from "./contracts";
 import { buildShellPresentation, type ShellPresentation } from "./presentation";
 import type { ShellRoute } from "./shell";
 
@@ -8,6 +8,7 @@ export type ShellModel = Readonly<{
   installation: Installation | null;
   workspaces: readonly Workspace[];
   memberships: Readonly<Record<string, Membership>>;
+  personNames: Readonly<Record<string, PersonNameSnapshot>>;
   activeWorkspaceId: string | null;
   loading: boolean;
   error: BridgeErrorCode | null;
@@ -18,6 +19,7 @@ const initialModel: ShellModel = {
   installation: null,
   workspaces: [],
   memberships: {},
+  personNames: {},
   activeWorkspaceId: null,
   loading: false,
   error: null,
@@ -42,6 +44,7 @@ export class ShellRenderer {
 
 export class ShellController {
   private model: ShellModel = initialModel;
+  private readonly watched = new Set<string>();
 
   public constructor(
     private readonly bridge: TeamarnessBridge,
@@ -67,18 +70,20 @@ export class ShellController {
         ? this.model.activeWorkspaceId
         : workspaces[0]?.id ?? null;
       this.set({ installation, workspaces, memberships, activeWorkspaceId });
+      await Promise.all(workspaces.map(({ id }) => this.loadOptionalNames(id)));
     });
   }
 
-  public async createWorkspace(name: string): Promise<void> {
+  public async createWorkspace(name: string, personName: string): Promise<void> {
     await this.perform(async () => {
-      const created = await this.bridge.createWorkspace(name);
+      const created = await this.bridge.createWorkspace(name, personName);
       this.set({
         workspaces: [...this.model.workspaces, created.workspace],
         memberships: { ...this.model.memberships, [created.workspace.id]: created.membership },
         activeWorkspaceId: created.workspace.id,
         notice: `Created ${created.workspace.name}`,
       });
+      await this.loadOptionalNames(created.workspace.id);
     });
   }
 
@@ -97,12 +102,13 @@ export class ShellController {
         memberships: { ...this.model.memberships, [workspaceId]: membership },
         notice: "Membership refreshed",
       });
+      await this.loadOptionalNames(workspaceId);
     });
   }
 
-  public async joinWorkspace(invitation: string): Promise<void> {
+  public async joinWorkspace(invitation: string, personName: string): Promise<void> {
     await this.perform(async () => {
-      const joined = await this.bridge.joinWorkspace(invitation);
+      const joined = await this.bridge.joinWorkspace(invitation, personName);
       const existing = this.model.workspaces.filter(({ id }) => id !== joined.workspace.id);
       this.set({
         workspaces: [...existing, joined.workspace],
@@ -110,7 +116,47 @@ export class ShellController {
         activeWorkspaceId: joined.workspace.id,
         notice: `Joined ${joined.workspace.name}`,
       });
+      await this.loadOptionalNames(joined.workspace.id);
     });
+  }
+
+  public async rename(workspaceId: string, name: string): Promise<void> {
+    await this.perform(async () => {
+      await this.bridge.setOwnPersonName(workspaceId, name);
+      this.set({ notice: "Name updated" });
+      await this.loadOptionalNames(workspaceId);
+    });
+  }
+
+  private receiveNames(snapshot: PersonNameSnapshot): void {
+    if (!this.model.workspaces.some(({ id }) => id === snapshot.workspaceId)) return;
+    this.set({ personNames: this.mergeNames({ [snapshot.workspaceId]: snapshot }) });
+  }
+
+  private mergeNames(snapshots: Readonly<Record<string, PersonNameSnapshot>>): Record<string, PersonNameSnapshot> {
+    const merged = { ...this.model.personNames };
+    for (const [id, snapshot] of Object.entries(snapshots)) {
+      const previous = merged[id];
+      if (!previous || BigInt(snapshot.cursor) >= BigInt(previous.cursor)) merged[id] = snapshot;
+    }
+    return merged;
+  }
+
+  private async loadOptionalNames(workspaceId: string): Promise<void> {
+    try {
+      this.receiveNames(await this.bridge.personNameSnapshot(workspaceId));
+    } catch {
+      // The Workspace is already durable; subscription can supply its optional presentation later.
+    }
+    this.watchNames(workspaceId);
+  }
+
+  private watchNames(workspaceId: string): void {
+    if (this.watched.has(workspaceId)) return;
+    this.watched.add(workspaceId);
+    const cursor = this.model.personNames[workspaceId]?.cursor ?? "0";
+    void this.bridge.subscribePersonNames(workspaceId, cursor, (snapshot) => this.receiveNames(snapshot))
+      .catch(() => { this.watched.delete(workspaceId); this.set({ error: "readiness" }); });
   }
 
   private async loadMemberships(workspaces: readonly Workspace[]): Promise<Record<string, Membership>> {
@@ -168,20 +214,21 @@ export function renderShell(
     return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Create or join a Workspace</h1><p>Create a new Workspace, or join one with a Workspace Invitation.</p></header>
       ${workspaceListSection}
       <section class="screen-section"><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
-      <input id="workspace-name" required maxlength="64" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
+      <input id="workspace-name" required maxlength="64" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"><label for="create-person-name">Your name in this Workspace</label><input id="create-person-name" required maxlength="256" autocomplete="name"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
       <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Workspace Invitation</label>
-      <textarea id="invitation-value" required maxlength="8192" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"></textarea><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
+      <textarea id="invitation-value" required maxlength="8192" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"></textarea><label for="join-person-name">Your name in this Workspace</label><input id="join-person-name" required maxlength="256" autocomplete="name"><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
   }
 
   const workspace = presentation.workspace;
   if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1><p>Choose another Workspace or retry.</p></section>`;
 
-  const memberRows = workspace.members.map((member) => `<li class="member-row"><span><strong>${escape(member.name)}</strong><small>${escape(member.detail)}</small></span><span class="member-role">${member.role}</span></li>`).join("");
+  const memberRows = workspace.members.map((member) => `<li class="member-row"><span><strong>${escape(member.name)}</strong><small><details><summary>View identity</summary>${escape(member.detail)}</details></small></span><span class="member-role">${member.role}</span></li>`).join("");
   const members = memberRows || (workspace.membershipLoaded
     ? '<li class="empty-state">No Members are listed.</li>'
     : '<li class="empty-state">Membership is loading.</li>');
-  return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">Workspace</p><h1>${escape(workspace.name)}</h1><p>${workspace.memberCount === 1 ? "1 Member" : `${workspace.memberCount} Members`}. Workspace details are read-only in this version.</p></header>
+  return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">Workspace</p><h1>${escape(workspace.name)}</h1><p>${workspace.memberCount === 1 ? "1 Member" : `${workspace.memberCount} Members`}. Workspace details and your name are shown below.</p></header>
     <section class="screen-section settings-panel" aria-labelledby="workspace-details-heading"><h2 id="workspace-details-heading">Workspace details</h2><dl><div><dt>Name</dt><dd>${escape(workspace.name)}</dd></div><div><dt>Members</dt><dd>${workspace.memberCount}</dd></div></dl></section>
+    <section class="screen-section"><h2>Your name</h2><form id="rename-person"><label for="rename-person-name">Name in this Workspace</label><input id="rename-person-name" required maxlength="256" autocomplete="name" value="${escape(workspace.ownPersonName)}"><button ${presentation.loading ? "disabled" : ""}>Save name</button></form></section>
     <section class="screen-section" aria-labelledby="members-heading"><div class="section-heading"><h2 id="members-heading">Members</h2>
       <button type="button" id="refresh-membership" ${presentation.loading ? "disabled" : ""}>Refresh members</button></div><ol class="members">${members}</ol></section>
     <section class="screen-section" aria-labelledby="invitations-heading"><h2 id="invitations-heading">Workspace Invitations</h2><p>Create a one-use Workspace Invitation.</p>

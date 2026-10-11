@@ -142,6 +142,7 @@ async fn invite(
         match runtime.create_workspace_invitation(workspace).await {
             Ok(invitation) => return invitation,
             Err(OnboardingError::Readiness) if std::time::Instant::now() < deadline => {
+                // poll-interval: bounded retry until invitation transport is ready.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await
             }
             Err(error) => panic!("invitation: {error}"),

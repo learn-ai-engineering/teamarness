@@ -1,85 +1,29 @@
-import type { Installation, MemberRole, Membership } from "./contracts";
-
-export const MEMBER_ALIAS_VERSION = "v1" as const;
-
-export const MEMBER_ALIAS_ADJECTIVES_V1 = Object.freeze([
-  "Agile", "Amber", "Bold", "Bright", "Calm", "Clever", "Cool", "Curious",
-  "Daring", "Gentle", "Golden", "Happy", "Kind", "Lively", "Lucky", "Merry",
-  "Nimble", "Patient", "Quiet", "Rapid", "Ready", "Silver", "Steady", "Sunny",
-  "Swift", "Thoughtful", "Tranquil", "Vivid", "Warm", "Wise", "Witty", "Young",
-] as const);
-
-export const MEMBER_ALIAS_ANIMALS_V1 = Object.freeze([
-  "Albatross", "Badger", "Bear", "Beaver", "Bison", "Crane", "Dolphin", "Falcon",
-  "Finch", "Fox", "Gecko", "Heron", "Koala", "Lark", "Lynx", "Marten",
-  "Otter", "Owl", "Panda", "Penguin", "Rabbit", "Raven", "Seal", "Sparrow",
-  "Stag", "Swan", "Tiger", "Turtle", "Whale", "Wolf", "Wren", "Yak",
-] as const);
+import type { Installation, Membership, PersonNameSnapshot } from "./contracts";
 
 export type MemberPresentation = Readonly<{
   name: string;
-  detail: "This Installation" | "Presentation-only member alias" | "Presentation-only member fingerprint";
+  detail: string;
   role: "Manager" | "Member";
 }>;
 
-type DigestedMember = Readonly<{
-  digest: string;
-  alias: string | null;
-  isLocal: boolean;
-  role: MemberRole;
-}>;
-
-export function isCanonicalPublicIdentity(identity: string): boolean {
-  return /^[0-9a-f]{64}$/.test(identity);
-}
-
-export async function presentationDigestHex(identity: string): Promise<string> {
-  const bytes = new TextEncoder().encode(identity);
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 export async function presentMembers(
-  installation: Installation,
+  _installation: Installation,
   membership: Membership,
+  names?: PersonNameSnapshot,
 ): Promise<readonly MemberPresentation[]> {
-  const digested = await Promise.all(membership.members.map(async (member): Promise<DigestedMember> => {
-    const digest = await presentationDigestHex(member.identity);
-    const isLocal = member.identity === installation.identity;
+  const scoped = names?.workspaceId === membership.workspaceId ? names.persons : [];
+  const counts = new Map<string, number>();
+  for (const person of scoped) {
+    if (person.name) counts.set(person.name, (counts.get(person.name) ?? 0) + 1);
+  }
+  return Promise.all(membership.members.map(async (member) => {
+    const person = scoped.find(({ identity }) => identity === member.identity);
+    // Core's unnamed fingerprint is the first 12 characters of the Installation identity.
+    const fingerprint = person?.fingerprint ?? member.identity.slice(0, 12);
     return {
-      digest,
-      alias: !isLocal && isCanonicalPublicIdentity(member.identity) ? aliasFromDigest(digest) : null,
-      isLocal,
-      role: member.role,
+      name: person?.name ?? `Member ${fingerprint}`,
+      detail: `${(counts.get(person?.name ?? "") ?? 0) > 1 ? "Duplicate name · " : ""}Identity: ${member.identity}`,
+      role: member.role === "manager" ? "Manager" : "Member",
     };
   }));
-  const aliasCounts = new Map<string, number>();
-  for (const member of digested) {
-    if (member.alias) aliasCounts.set(member.alias, (aliasCounts.get(member.alias) ?? 0) + 1);
-  }
-  return digested.map((member): MemberPresentation => {
-    if (member.isLocal) {
-      return { name: installation.displayName, detail: "This Installation", role: roleLabel(member.role) };
-    }
-    if (member.alias && aliasCounts.get(member.alias) === 1) {
-      return { name: member.alias, detail: "Presentation-only member alias", role: roleLabel(member.role) };
-    }
-    return {
-      name: `Member ${member.digest.slice(0, 8)}`,
-      detail: "Presentation-only member fingerprint",
-      role: roleLabel(member.role),
-    };
-  });
-}
-
-function aliasFromDigest(digest: string): string {
-  const adjectiveWord = Number.parseInt(digest.slice(0, 8), 16);
-  const animalWord = Number.parseInt(digest.slice(8, 16), 16);
-  const adjective = MEMBER_ALIAS_ADJECTIVES_V1[adjectiveWord % MEMBER_ALIAS_ADJECTIVES_V1.length];
-  const animal = MEMBER_ALIAS_ANIMALS_V1[animalWord % MEMBER_ALIAS_ANIMALS_V1.length];
-  return `${adjective} ${animal}`;
-}
-
-function roleLabel(role: MemberRole): "Manager" | "Member" {
-  return role === "manager" ? "Manager" : "Member";
 }

@@ -24,6 +24,19 @@ export type Membership = Readonly<{
   members: readonly Member[];
 }>;
 
+export type WorkspacePerson = Readonly<{
+  identity: string;
+  personId: string;
+  name: string | null;
+  fingerprint: string;
+}>;
+
+export type PersonNameSnapshot = Readonly<{
+  workspaceId: string;
+  cursor: string;
+  persons: readonly WorkspacePerson[];
+}>;
+
 export type WorkspaceState = Readonly<{
   workspace: Workspace;
   membership: Membership;

@@ -108,7 +108,7 @@ impl CoreRuntime {
         let original = tokio::task::spawn_blocking(move || {
             let mut state = state
                 .lock()
-                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+                .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
             if state.poisoned {
                 return Err(crate::OnboardingError::UncertainStorageOutcome);
             }
@@ -134,7 +134,7 @@ impl CoreRuntime {
                 })
         })
         .await
-        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)??;
+        .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))??;
         // A prior import may have committed before the caller saw its result.
         // Only recover a matching, currently accepted admission.
         if let Some(recovered) = self.recover_named_join(workspace, &token, name, &original)? {
@@ -156,7 +156,7 @@ impl CoreRuntime {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
         if state.poisoned {
             return Err(crate::OnboardingError::UncertainStorageOutcome);
         }
@@ -194,7 +194,7 @@ impl CoreRuntime {
         }
         person_name_sync::publish_generation(&state, workspace);
         person_name_sync::initialize(&mut state, workspace)
-            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
         let summary = crate::workspace::list(&state.connection)
             .map_err(|_| crate::OnboardingError::LocalConflict)?
             .into_iter()
@@ -260,7 +260,7 @@ impl CoreRuntime {
             import_validated_bootstrap_locked(state, &bootstrap, Some(deadline), |_| Ok(()))
         })
         .await
-        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
         drop(permit);
         imported
     }
@@ -317,7 +317,7 @@ impl CoreRuntime {
                 .map_err(map_invitation_onboarding_error)
         })
         .await
-        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)??;
+        .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))??;
         Self::ensure_join_deadline(deadline)?;
 
         let response = crate::onboarding::client::join(
@@ -353,7 +353,7 @@ impl CoreRuntime {
         let state = self
             .state
             .lock()
-            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
         import_validated_bootstrap_locked(state, bootstrap, deadline, fault)
     }
 
@@ -506,7 +506,7 @@ fn import_validated_bootstrap_locked(
                 .insert(snapshot.workspace_id(), imported.projection);
             person_name_sync::publish_generation(&state, snapshot.workspace_id());
             person_name_sync::initialize(&mut state, snapshot.workspace_id())
-                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+                .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 state.poisoned = true;
                 return Err(crate::OnboardingError::UncertainStorageOutcome);

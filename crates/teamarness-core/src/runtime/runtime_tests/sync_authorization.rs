@@ -2085,6 +2085,7 @@ async fn forged_order_key_does_not_end_the_session() {
         {
             Ok(_) => break,
             Err(LogSessionError::PeerBusy) if std::time::Instant::now() < deadline => {
+                // poll-interval: bounded retry while the peer finishes its active session.
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(error) => panic!("two forged order keys must not end the session: {error}"),

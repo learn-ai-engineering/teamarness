@@ -348,6 +348,8 @@ async function serve() {
   const capabilityGrants = new Map();
   const pendingCapabilityCalls = new Map();
   const membershipEvents = [];
+  const personNameEvents = [];
+  let personNameStream;
   let membershipStream;
   // Events consumed on the current membership stream that credit has already
   // been released for. The contract lets a sender release credit only for work
@@ -393,6 +395,8 @@ async function serve() {
         const requestId = pendingCapabilityCalls.get(frame.id);
         pendingCapabilityCalls.delete(frame.id);
         send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code, retryable: frame.retryable ?? false, outcomeUncertain: frame.outcomeUncertain ?? false } });
+      } else if (frame.kind === "event" && frame.streamId === personNameStream) {
+        personNameEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === membershipStream) {
         membershipEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === immutableStream) {
@@ -446,6 +450,18 @@ async function serve() {
         }
       } else if (frame.kind === "stream_close" && uiStreams.has(frame.streamId)) {
         uiStreams.delete(frame.streamId);
+      } else if (frame.kind === "request" && frame.operation === "fixture.person_names_open") {
+        capabilitySequence += 1;
+        personNameStream = `p:person-names-${capabilitySequence}`;
+        send({ kind: "stream_open", id: personNameStream, topic: "capability.stream", initialCredit: 32,
+          payload: { grant: capabilityGrants.get("teamarness.person-names"), method: "subscribe", afterCursor: frame.payload.afterCursor } });
+        send({ kind: "response", id: frame.id, payload: { streamId: personNameStream } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.person_names_close") {
+        if (personNameStream) send({ kind: "stream_close", streamId: personNameStream, code: "closed" });
+        personNameStream = undefined;
+        send({ kind: "response", id: frame.id, payload: { closed: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.person_names_events") {
+        send({ kind: "response", id: frame.id, payload: { events: personNameEvents } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_open") {
         capabilitySequence += 1;
         membershipStream = `p:membership-${capabilitySequence}`;

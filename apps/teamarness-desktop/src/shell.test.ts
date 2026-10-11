@@ -154,6 +154,7 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
     installation,
     workspaces: [workspace, otherWorkspace],
     memberships: { [workspace.id]: membership },
+    personNames: {},
     activeWorkspaceId,
     loading: false,
     error: null,
@@ -206,6 +207,7 @@ function harness(
       selectWorkspace: (workspaceId) => { calls.push(`workspace:${workspaceId}`); },
       createWorkspace: async () => undefined,
       joinWorkspace: async () => undefined,
+      rename: async () => undefined,
       copyInvitation: async () => undefined,
       refreshMembership: async () => undefined,
       retry: async () => { calls.push("retry"); },
@@ -489,13 +491,10 @@ describe("persistent Shell frame", () => {
       await test.shell.navigate(route);
       const html = `${test.frame.workspaceRail.innerHTML}${test.frame.contextualNavigation.innerHTML}${test.frame.shellScreen.innerHTML}`;
       for (const forbidden of [
-        installation.identity,
         workspace.id,
-        workspace.createdBy,
         membership.workspaceId,
         membership.version,
         String(workspace.createdAtUnixMs),
-        ...membership.members.map(({ identity }) => identity),
         packageKey.packageIdentity,
         "1.0.0-secret-version",
         "2.0.0-secret-version",
@@ -517,6 +516,11 @@ describe("persistent Shell frame", () => {
         "secret-diagnostic-recovery",
         "secret-diagnostic-id",
       ]) expect(html).not.toContain(forbidden);
+      if (route.kind === "workspace-settings") {
+        for (const { identity } of membership.members) {
+          expect(html).toContain(`<summary>View identity</summary>Identity: ${identity}`);
+        }
+      }
     }
   });
 });

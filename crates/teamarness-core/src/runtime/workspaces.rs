@@ -26,7 +26,7 @@ impl CoreRuntime {
                     }
                 }
                 person_name_sync::initialize(&mut state, summary.id())
-                    .map_err(|_| WorkspaceError::Storage(StorageError::Database))?;
+                    .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
                 Ok(summary)
             }
             Err(error) => {
@@ -50,10 +50,9 @@ impl CoreRuntime {
     fn lock_workspace_state(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, WorkspaceError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| WorkspaceError::Storage(StorageError::RuntimePoisoned))?;
+        let state = self.state.lock().map_err(fault!(WorkspaceError::Storage(
+            StorageError::RuntimePoisoned
+        )))?;
         if state.poisoned {
             return Err(WorkspaceError::Storage(StorageError::RuntimePoisoned));
         }
@@ -74,7 +73,9 @@ impl CoreRuntime {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
         if state.poisoned {
             return Err(crate::PersonNameError::Storage(
                 StorageError::RuntimePoisoned,
@@ -115,8 +116,9 @@ impl CoreRuntime {
                 return Err(crate::PersonNameError::Storage(error));
             }
         }
-        person_name_sync::initialize(&mut state, workspace.id())
-            .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
+        person_name_sync::initialize(&mut state, workspace.id()).map_err(fault!(
+            crate::PersonNameError::Storage(StorageError::Database)
+        ))?;
         Ok(workspace)
     }
 
@@ -129,7 +131,9 @@ impl CoreRuntime {
         let state = self
             .state
             .lock()
-            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
         if state.poisoned {
             return Err(crate::PersonNameError::Storage(
                 StorageError::RuntimePoisoned,
@@ -151,7 +155,9 @@ impl CoreRuntime {
         let state = self
             .state
             .lock()
-            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
         if state.poisoned {
             return Err(crate::PersonNameError::Storage(
                 StorageError::RuntimePoisoned,
@@ -163,7 +169,9 @@ impl CoreRuntime {
             .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
         let generation =
             crate::person_names::edit::profile_generation(&state.connection, workspace_id)
-                .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
+                .map_err(fault!(crate::PersonNameError::Storage(
+                    StorageError::Database
+                )))?;
         let members = projection
             .snapshot()
             .members()
@@ -186,7 +194,9 @@ impl CoreRuntime {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
         if state.poisoned {
             return Err(crate::PersonNameError::Storage(
                 StorageError::RuntimePoisoned,
@@ -197,7 +207,9 @@ impl CoreRuntime {
         }
         let generation =
             crate::person_names::edit::profile_generation(&state.connection, workspace_id)
-                .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
+                .map_err(fault!(crate::PersonNameError::Storage(
+                    StorageError::Database
+                )))?;
         Ok(state
             .profile_generations
             .entry(workspace_id)
@@ -228,7 +240,9 @@ impl CoreRuntime {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
         if state.poisoned {
             return Err(crate::PersonNameError::Storage(
                 StorageError::RuntimePoisoned,
@@ -250,8 +264,9 @@ impl CoreRuntime {
         if result.is_ok() {
             // The name and generation have committed even if private replay fails.
             person_name_sync::publish_generation(&state, workspace_id);
-            person_name_sync::initialize(&mut state, workspace_id)
-                .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
+            person_name_sync::initialize(&mut state, workspace_id).map_err(fault!(
+                crate::PersonNameError::Storage(StorageError::Database)
+            ))?;
         }
         result
     }

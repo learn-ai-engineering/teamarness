@@ -26,6 +26,10 @@ The system SHALL support an Installation Display Name for the local Installation
 
 The membership log SHALL accommodate both device-scoped and future human-scoped identity. The initial implementation SHALL treat each device as a first-class member. The schema SHALL reserve space for a human identity layer that groups multiple device identities.
 
+## TEAM.SYS.ID-R09 — Workspace Person Names
+
+Each current Member SHALL have a Workspace-local opaque Person ID anchored to its accepted genesis or admission, distinct from its Installation identity. A current Installation may set only its own Workspace Person Name. Names SHALL be non-unique Unicode text (including emoji), nonblank after trimming, without control characters, and at most 64 grapheme clusters and 256 UTF-8 bytes. Missing names SHALL present a fingerprint fallback, not the Installation Display Name. A name change SHALL NOT grant membership authority or advance the membership epoch or version. Current names and a separate durable profile cursor SHALL remain available after restart and peer synchronization without Package activation (ADR 0022).
+
 ## TEAM.SYS.ID-R07 — Private Data Directory
 
 The Core Runtime SHALL refuse a data directory that is a symbolic link, is owned by another user, or contains unrelated files. It SHALL restrict the directory to its owner and SHALL fail closed on platforms where it cannot. It SHALL keep one stored copy of each Content Key and SHALL clear key buffers it owns after use on a best-effort basis.

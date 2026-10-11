@@ -22,6 +22,12 @@ See ADR 0018, Package seam versioning, for the policy, including the deprecation
 
 A Package opens `capability.stream` with its membership grant, method `subscribe`, and `afterEpoch`. Transition events contain the Core epoch, membership version, cause operation ID, and snapshot digest. Stream credit bounds delivery. The host drops its Core subscription when credit or writer capacity runs out and reopens after the last delivered epoch. Core transitions also know the admitted or revoked Installation and the author; the 1.0 event does not carry them. A later minor version will.
 
+## `teamarness.person-names` 1.0
+
+This additive, Package-neutral presentation capability is scoped by its grant to one Workspace. `current` returns `{workspaceId, cursor, persons}`; each Person contains `identity` (source Installation), opaque `personId`, nullable `name`, and an identity fingerprint. `lookup` accepts a current Installation identity and returns `{person}` or `{person:null}` for a nonmember; a missing name is not a membership error. The current roster comes from Core, not from the Package. Names are non-unique, bounded Unicode text; authorization remains in `teamarness.membership` 1.0, which is unchanged.
+
+A `capability.stream` with method `subscribe` and decimal-string `afterCursor` emits the latest bounded snapshot when the independent durable profile generation changes. The cursor is a coalescing invalidation token, **not** a replay ledger, membership epoch or immutable-record cursor: subscribe first, read `current`, and refetch after a gap or restart. A cursor ahead of Core's profile generation closes with `cursor_invalid`. Each event consumes stream credit. The closed schema and limits are in `person-names.schema.json`.
+
 ## `teamarness.signing` 1.0
 
 `sign` and `verify` accept a visible ASCII purpose of 1 to 64 bytes and an unpadded base64url payload of at most 262144 decoded bytes. The host uses the fixed Core signing context `package-signing/v1`.

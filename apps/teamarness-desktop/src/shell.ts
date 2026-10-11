@@ -41,8 +41,9 @@ type PackageLifecycleFeedback = Readonly<{
 
 type WorkspaceActions = Readonly<{
   selectWorkspace(workspaceId: string): void;
-  createWorkspace(name: string): Promise<void>;
-  joinWorkspace(invitation: string): Promise<void>;
+  createWorkspace(name: string, personName: string): Promise<void>;
+  joinWorkspace(invitation: string, personName: string): Promise<void>;
+  rename(workspaceId: string, name: string): Promise<void>;
   copyInvitation(workspaceId: string): Promise<void>;
   refreshMembership(workspaceId: string): Promise<void>;
   retry(): Promise<void>;
@@ -261,12 +262,14 @@ export class Shell {
     this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#create-workspace")?.addEventListener("submit", (event) => {
       event.preventDefault();
       const input = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#workspace-name");
-      if (input) void this.options.workspaceActions.createWorkspace(input.value);
+      const person = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#create-person-name");
+      if (input && person) void this.options.workspaceActions.createWorkspace(input.value, person.value);
     });
     this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#join-workspace")?.addEventListener("submit", (event) => {
       event.preventDefault();
       const input = this.shellFrame.shellScreen.querySelector<HTMLTextAreaElement>("#invitation-value");
-      if (input) void this.options.workspaceActions.joinWorkspace(input.value);
+      const person = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#join-person-name");
+      if (input && person) void this.options.workspaceActions.joinWorkspace(input.value, person.value);
     });
     this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-choose-workspace]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -276,6 +279,11 @@ export class Shell {
     });
     const workspaceId = routeWorkspaceId(this.selectedRoute);
     if (workspaceId) {
+      this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#rename-person")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-person-name");
+        if (name) void this.options.workspaceActions.rename(workspaceId, name.value);
+      });
       this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#copy-invitation")?.addEventListener("click", () => {
         void this.options.workspaceActions.copyInvitation(workspaceId);
       });

@@ -143,6 +143,7 @@ struct Descriptor {
 enum CapabilityKind {
     WorkspaceContext,
     Membership,
+    PersonNames,
     Signing,
     ImmutableRecordLog,
     #[cfg(test)]
@@ -276,6 +277,7 @@ impl GenerationCapabilities {
                 self.workspace_context(method, object, started).await
             }
             CapabilityKind::Membership => self.membership(method, object, started).await,
+            CapabilityKind::PersonNames => self.person_names(method, object, started).await,
             CapabilityKind::Signing => self.signing(method, object, started).await,
             CapabilityKind::ImmutableRecordLog => {
                 self.immutable_record(method, object, started).await
@@ -311,6 +313,13 @@ impl GenerationCapabilities {
             } else {
                 None
             };
+        let after_profile_cursor =
+            if grant.descriptor.kind == CapabilityKind::PersonNames && method == "subscribe" {
+                exact_fields(object, &["grant", "method", "afterCursor"])?;
+                Some(decimal_field(object, "afterCursor")?)
+            } else {
+                None
+            };
         let after_cursor = if grant.descriptor.kind == CapabilityKind::ImmutableRecordLog
             && method == "subscribe"
         {
@@ -319,7 +328,7 @@ impl GenerationCapabilities {
         } else {
             None
         };
-        if after_epoch.is_none() && after_cursor.is_none() {
+        if after_epoch.is_none() && after_cursor.is_none() && after_profile_cursor.is_none() {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
         let (commands, command_receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
@@ -338,6 +347,19 @@ impl GenerationCapabilities {
                     core_workspace,
                     stream_id,
                     after_epoch,
+                    initial_credit,
+                    command_receiver,
+                    output,
+                    all_streams,
+                    self.cancelled.subscribe(),
+                ));
+            }
+            CapabilityKind::PersonNames => {
+                tokio::spawn(run_person_name_stream(
+                    core,
+                    core_workspace,
+                    stream_id,
+                    after_profile_cursor.expect("validated profile cursor"),
                     initial_credit,
                     command_receiver,
                     output,
@@ -491,6 +513,36 @@ impl GenerationCapabilities {
                         }))
                     })
                     .await?
+            }
+            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    }
+
+    async fn person_names(
+        &self,
+        method: &str,
+        object: &Map<String, Value>,
+        started: Arc<AtomicBool>,
+    ) -> Result<Value, PackageErrorCode> {
+        let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+        let core = Arc::clone(&self.core);
+        match method {
+            "current" => {
+                exact_fields(object, &["method"])?;
+                self.limiter
+                    .run(started, move || person_name_snapshot(&core, workspace))
+                    .await?
+            }
+            "lookup" => {
+                exact_fields(object, &["method", "identity"])?;
+                let identity = PublicIdentity::from_str(string_field(object, "identity")?)
+                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                self.limiter.run(started, move || {
+                    let person = core.workspace_person(workspace, identity)
+                        .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
+                    Ok(json!({"person":person.map(|person| person_name_value(identity, &person))}))
+                }).await?
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
@@ -753,6 +805,13 @@ impl Registry {
             kind: CapabilityKind::Membership,
         });
         registry.register(Descriptor {
+            family: CapabilityFamily::new("teamarness.person-names"),
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::PersonNames,
+        });
+        registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.signing"),
             major: 1,
             min_minor: 0,
@@ -843,6 +902,110 @@ async fn await_credit(
         }
     }
     true
+}
+
+fn person_name_value(identity: PublicIdentity, person: &teamarness_core::WorkspacePerson) -> Value {
+    json!({
+        "identity": identity.to_string(),
+        "personId": person.id().to_string(),
+        "name": person.name(),
+        "fingerprint": person.fingerprint(),
+    })
+}
+
+fn person_name_snapshot(
+    core: &CoreRuntime,
+    workspace: teamarness_core::WorkspaceId,
+) -> Result<Value, PackageErrorCode> {
+    let (cursor, persons) = core
+        .person_name_snapshot(workspace)
+        .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
+    if persons.len() > 1024 {
+        return Err(PackageErrorCode::CapabilityUnavailable);
+    }
+    Ok(json!({
+        "workspaceId": workspace.to_string(),
+        "cursor": cursor.to_string(),
+        "persons": persons.iter().map(|(identity, person)| person_name_value(*identity, person)).collect::<Vec<_>>(),
+    }))
+}
+
+// A profile cursor invalidates a snapshot; it is not a replay ledger. A lagging
+// consumer receives the latest bounded snapshot and resumes at its cursor.
+#[allow(clippy::too_many_arguments)]
+async fn run_person_name_stream(
+    core: Arc<CoreRuntime>,
+    workspace: teamarness_core::WorkspaceId,
+    stream_id: String,
+    mut after_cursor: u64,
+    mut credit: u64,
+    mut commands: mpsc::Receiver<StreamCommand>,
+    output: HostStreamSender,
+    streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let watch_core = core.clone();
+    let opened =
+        tokio::task::spawn_blocking(move || watch_core.subscribe_person_names(workspace)).await;
+    let mut changes = match opened {
+        Ok(Ok(receiver)) => receiver,
+        _ => {
+            output.retire(&stream_id).await;
+            streams.lock().await.remove(&stream_id);
+            let _ = output.close(&stream_id, "capability_unavailable").await;
+            return;
+        }
+    };
+    let mut sequence = 0_u64;
+    let mut reason = "capability_unavailable";
+    loop {
+        if *cancelled.borrow()
+            || !drain_commands(&mut commands, &mut credit).await
+            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
+        {
+            break;
+        }
+        if *changes.borrow_and_update() < after_cursor {
+            reason = "cursor_invalid";
+            break;
+        }
+        if *changes.borrow() <= after_cursor {
+            tokio::select! {
+                changed = changes.changed() => if changed.is_err() { break; },
+                command = commands.recv() => match command {
+                    Some(StreamCommand::Credit(amount)) => credit = credit.saturating_add(amount),
+                    Some(StreamCommand::Close) | None => break,
+                },
+                result = cancelled.changed() => if result.is_err() || *cancelled.borrow() { break; },
+            }
+            continue;
+        }
+        let snapshot_core = core.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || person_name_snapshot(&snapshot_core, workspace))
+                .await;
+        let Ok(Ok(snapshot)) = snapshot else {
+            break;
+        };
+        let Some(cursor) = snapshot["cursor"]
+            .as_str()
+            .and_then(|text| text.parse::<u64>().ok())
+        else {
+            break;
+        };
+        if cursor <= after_cursor {
+            continue;
+        }
+        sequence = sequence.saturating_add(1);
+        if output.event(&stream_id, sequence, snapshot).await.is_err() {
+            break;
+        }
+        after_cursor = cursor;
+        credit -= 1;
+    }
+    output.retire(&stream_id).await;
+    streams.lock().await.remove(&stream_id);
+    let _ = output.close(&stream_id, reason).await;
 }
 
 #[allow(clippy::too_many_arguments)]

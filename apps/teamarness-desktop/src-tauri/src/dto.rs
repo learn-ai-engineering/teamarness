@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use teamarness_core::{MemberSnapshot, MembershipRole, MembershipSnapshot, WorkspaceSummary};
+use teamarness_core::{
+    MemberSnapshot, MembershipRole, MembershipSnapshot, PublicIdentity, WorkspacePerson,
+    WorkspaceSummary,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +75,34 @@ impl From<MembershipSnapshot> for MembershipDto {
             members: value.members().iter().map(MemberDto::from).collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePersonDto {
+    pub identity: String,
+    pub person_id: String,
+    pub name: Option<String>,
+    pub fingerprint: String,
+}
+
+impl WorkspacePersonDto {
+    pub fn from_core(identity: PublicIdentity, person: WorkspacePerson) -> Self {
+        Self {
+            identity: identity.to_string(),
+            person_id: person.id().to_string(),
+            name: person.name().map(str::to_owned),
+            fingerprint: person.fingerprint().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonNameSnapshotDto {
+    pub workspace_id: String,
+    pub cursor: String,
+    pub persons: Vec<WorkspacePersonDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

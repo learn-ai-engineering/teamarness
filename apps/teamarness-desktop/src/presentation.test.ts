@@ -65,6 +65,7 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     installation,
     workspaces: [workspace],
     memberships: { [workspace.id]: membership },
+    personNames: {},
     activeWorkspaceId: workspace.id,
     loading: false,
     error: null,
@@ -90,15 +91,13 @@ describe("display-safe Shell presentation", () => {
     });
     const serialized = JSON.stringify(presented);
     for (const forbidden of [
-      installation.identity,
       workspace.id,
-      workspace.createdBy,
       membership.workspaceId,
       unsafeMembership.epoch,
       membership.version,
       String(workspace.createdAtUnixMs),
-      ...membership.members.map(({ identity }) => identity),
     ]) expect(serialized).not.toContain(forbidden);
+    for (const { identity } of membership.members) expect(serialized).toContain(`Identity: ${identity}`);
   });
 
   it("represents loading, no-Workspace, and empty-membership states deliberately", async () => {

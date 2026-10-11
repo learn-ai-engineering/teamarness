@@ -173,7 +173,7 @@ fn create_with_initial_name(
     fault(CreationBoundary::BeforeTransactionOne).map_err(workspace_from_storage)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| WorkspaceError::Storage(StorageError::Database))?;
+        .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
     transaction
         .execute(
             "INSERT INTO workspace_creation_requests (
@@ -193,7 +193,9 @@ fn create_with_initial_name(
         .map_err(|_| WorkspaceError::Conflict)?;
     transaction
         .commit()
-        .map_err(|_| WorkspaceError::Storage(StorageError::UncertainOutcome))?;
+        .map_err(fault!(WorkspaceError::Storage(
+            StorageError::UncertainOutcome
+        )))?;
     fault(CreationBoundary::AfterTransactionOne).map_err(workspace_from_storage)?;
 
     let request = CreationRequest {
@@ -217,7 +219,7 @@ pub(crate) fn list(connection: &Connection) -> Result<Vec<WorkspaceSummary>, Wor
             "SELECT workspace_id, creator_public_identity, name, authored_at_unix_ms
              FROM workspaces ORDER BY authored_at_unix_ms, workspace_id",
         )
-        .map_err(|_| WorkspaceError::Storage(StorageError::Database))?;
+        .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
     let rows = statement
         .query_map([], |row| {
             Ok((

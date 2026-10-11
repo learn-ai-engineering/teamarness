@@ -217,7 +217,7 @@ async fn open_runtime_modules(
 pub fn run() {
     debug_assert_eq!(
         commands::COMMAND_NAMES.len() + package_commands::COMMAND_NAMES.len(),
-        19
+        22
     );
     let app = tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol(
@@ -236,6 +236,9 @@ pub fn run() {
             commands::create_workspace_invitation,
             commands::join_workspace,
             commands::current_membership,
+            commands::person_name_snapshot,
+            commands::subscribe_person_names,
+            commands::set_own_person_name,
             package_commands::package_catalog_snapshot,
             package_commands::package_subscribe_host_state,
             package_commands::package_open_mount,
@@ -334,7 +337,7 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| name.starts_with("allow-")))
                 .count(),
-            19
+            22
         );
     }
 

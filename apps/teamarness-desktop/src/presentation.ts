@@ -8,6 +8,7 @@ export type ShellPresentation = Readonly<{
   activeWorkspaceIndex: number | null;
   workspace: Readonly<{
     name: string;
+    ownPersonName: string;
     members: readonly MemberPresentation[];
     memberCount: number;
     membershipLoaded: boolean;
@@ -39,7 +40,7 @@ export async function buildShellPresentation(
   const workspace = model.workspaces.find(({ id }) => id === selectedWorkspaceId) ?? null;
   const membership = workspace ? model.memberships[workspace.id] : undefined;
   const members = model.installation && membership
-    ? await presentMembers(model.installation, membership)
+    ? await presentMembers(model.installation, membership, model.personNames[workspace!.id])
     : [];
   const activeWorkspaceIndex = model.activeWorkspaceId === null
     ? null
@@ -50,6 +51,7 @@ export async function buildShellPresentation(
     activeWorkspaceIndex: activeWorkspaceIndex === -1 ? null : activeWorkspaceIndex,
     workspace: workspace ? {
       name: workspace.name,
+      ownPersonName: model.personNames[workspace.id]?.persons.find(({ identity }) => identity === model.installation?.identity)?.name ?? "",
       members,
       memberCount: members.length,
       membershipLoaded: membership !== undefined && model.installation !== null,

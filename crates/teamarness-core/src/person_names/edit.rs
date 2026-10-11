@@ -17,6 +17,16 @@ pub(crate) enum EditError {
     Storage(StorageError),
 }
 
+impl std::fmt::Display for EditError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEdit => formatter.write_str("invalid Person name edit"),
+            Self::Unauthorized => formatter.write_str("unauthorized Person name edit"),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
 /// Canonical, independently signed semantic edit; the record transport is not its authority.
 pub(crate) struct PersonNameEdit {
     workspace: WorkspaceId,

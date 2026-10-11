@@ -121,6 +121,188 @@ async fn reserved_person_name_package_cannot_be_admitted_or_granted() {
 }
 
 #[tokio::test]
+async fn person_name_capability_negotiates_only_supported_major_and_minor() {
+    let requirements = [
+        serde_json::json!({"identity":"teamarness.person-names","major":2,"minMinor":0,"maxMinor":0}),
+    ];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("unsupported", "dev.teamarness.unsupported")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    assert!(
+        snapshot
+            .instances
+            .iter()
+            .all(|instance| instance.lifecycle == teamarness_package_host::LifecycleState::Failed)
+    );
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|entry| entry.code == PackageErrorCode::CapabilityVersionUnsupported)
+    );
+}
+
+#[tokio::test]
+async fn independent_fixture_reads_person_names_without_membership_authority() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &[serde_json::json!({"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let result = call(
+        &host,
+        mount.clone(),
+        "names",
+        capability("teamarness.person-names", "current", object([])),
+    )
+    .await;
+    assert_eq!(
+        result.get("workspaceId"),
+        Some(&PackageValue::String(
+            fixture.core.list_workspaces().unwrap()[0].id().to_string()
+        ))
+    );
+    assert!(
+        matches!(result.get("persons"), Some(PackageValue::Array(values)) if values.len() == 1)
+    );
+    assert_eq!(
+        result.get("cursor"),
+        Some(&PackageValue::String("0".into()))
+    );
+    let identity = fixture.core.public_identity().to_string();
+    let lookup = call(
+        &host,
+        mount.clone(),
+        "lookup-name",
+        capability(
+            "teamarness.person-names",
+            "lookup",
+            object([("identity", PackageValue::String(identity.clone()))]),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(lookup.get("person"), Some(PackageValue::Object(person)) if person.get("identity") == Some(&PackageValue::String(identity)))
+    );
+    let invalid = call(
+        &host,
+        mount,
+        "invalid-name-lookup",
+        capability(
+            "teamarness.person-names",
+            "lookup",
+            object([("identity", PackageValue::String("short".into()))]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        invalid.get("error"),
+        Some(&PackageValue::String("capability_request_invalid".into()))
+    );
+}
+
+#[tokio::test]
+async fn independent_fixture_resumes_person_name_stream_after_rename() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &[serde_json::json!({"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let first = fixture_request(
+        &host,
+        &mount,
+        "names-open",
+        "fixture.person_names_open",
+        object([("afterCursor", PackageValue::String("0".into()))]),
+    )
+    .await;
+    assert!(first.contains_key("streamId"));
+    fixture.core.set_own_person_name(workspace, "👩‍💻").unwrap();
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut attempt = 0;
+    let cursor = loop {
+        attempt += 1;
+        let result = fixture_request(
+            &host,
+            &mount,
+            &format!("names-events-{attempt}"),
+            "fixture.person_names_events",
+            object([]),
+        )
+        .await;
+        if let Some(PackageValue::Array(events)) = result.get("events")
+            && let Some(PackageValue::Object(snapshot)) = events.last()
+        {
+            assert!(
+                matches!(snapshot.get("persons"), Some(PackageValue::Array(persons)) if persons.iter().any(|person| matches!(person, PackageValue::Object(value) if value.get("name") == Some(&PackageValue::String("👩‍💻".into())))))
+            );
+            break snapshot.get("cursor").unwrap().clone();
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "renamed snapshot reaches unrelated fixture"
+        );
+        // poll-interval: bounded wait for an asynchronous stream delivery.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    fixture_request(
+        &host,
+        &mount,
+        "names-close",
+        "fixture.person_names_close",
+        object([]),
+    )
+    .await;
+    fixture_request(
+        &host,
+        &mount,
+        "names-resume",
+        "fixture.person_names_open",
+        object([("afterCursor", cursor.clone())]),
+    )
+    .await;
+    fixture
+        .core
+        .set_own_person_name(workspace, "Second")
+        .unwrap();
+    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        attempt += 1;
+        let result = fixture_request(
+            &host,
+            &mount,
+            &format!("names-resumed-{attempt}"),
+            "fixture.person_names_events",
+            object([]),
+        )
+        .await;
+        if matches!(result.get("events"), Some(PackageValue::Array(events)) if events.iter().any(|event| matches!(event, PackageValue::Object(value) if value.get("cursor") != Some(&cursor))))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < expiry,
+            "resumed stream receives next cursor"
+        );
+        // poll-interval: bounded wait for an asynchronous stream delivery.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
 async fn routes_scoped_workspace_membership_and_signing_calls() {
     let requirements = [
         serde_json::json!({"identity":"teamarness.workspace-context","major":1,"minMinor":0,"maxMinor":0}),
@@ -741,6 +923,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
     for name in [
         "workspace-context.schema.json",
         "membership.schema.json",
+        "person-names.schema.json",
         "signing.schema.json",
         "immutable-record-log.schema.json",
         "signing-envelope.golden.json",

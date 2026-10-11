@@ -29,8 +29,9 @@ const shell = new Shell(frame, {
   theme,
   workspaceActions: {
     selectWorkspace: (workspaceId) => { controller.selectWorkspace(workspaceId); },
-    createWorkspace: async (name) => { await controller.createWorkspace(name); },
-    joinWorkspace: async (invitation) => { await controller.joinWorkspace(invitation); },
+    createWorkspace: async (name, personName) => { await controller.createWorkspace(name, personName); },
+    joinWorkspace: async (invitation, personName) => { await controller.joinWorkspace(invitation, personName); },
+    rename: async (workspaceId, name) => { await controller.rename(workspaceId, name); },
     copyInvitation: async (workspaceId) => { await controller.copyInvitation(workspaceId); },
     refreshMembership: async (workspaceId) => { await controller.refreshMembership(workspaceId); },
     retry: async () => { await controller.load(); },
