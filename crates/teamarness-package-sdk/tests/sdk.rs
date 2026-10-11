@@ -402,10 +402,12 @@ async fn start_reporting_session(
 }
 
 /// Verifies: TEAM.SYS.PKG-R10
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn capability_call_times_out_when_host_never_answers() {
     let (outcome, mut outcomes) = tokio::sync::mpsc::channel(1);
     let (_host_read, host_write, service) = start_reporting_session(outcome).await;
+    // Establish the cross-thread SDK session before pausing this test's clock.
+    tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_millis(11_001)).await;
     let result = outcomes.recv().await.expect("the call reported an outcome");
     let error = result.expect_err("an unanswered call gives up");

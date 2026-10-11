@@ -12,6 +12,9 @@ impl CoreRuntime {
         purpose: &str,
         canonical: &[u8],
     ) -> Result<crate::ImmutableRecord, crate::SynchronizationError> {
+        if crate::synchronization::is_reserved_record_scope(package_identity) {
+            return Err(crate::SynchronizationError::InvalidInput);
+        }
         let mut state = self
             .state
             .lock()
@@ -121,6 +124,9 @@ impl CoreRuntime {
         package_identity: &str,
         sealed_records: &[Vec<u8>],
     ) -> Result<Vec<crate::OpenedRecord>, crate::SynchronizationError> {
+        if crate::synchronization::is_reserved_record_scope(package_identity) {
+            return Err(crate::SynchronizationError::InvalidInput);
+        }
         let state = self
             .state
             .lock()
@@ -157,6 +163,9 @@ impl CoreRuntime {
         after: Option<crate::Cursor>,
     ) -> Result<crate::RecordSubscription, crate::SynchronizationError> {
         use crate::synchronization::record_subscription as records;
+        if crate::synchronization::is_reserved_record_scope(package_identity) {
+            return Err(crate::SynchronizationError::InvalidInput);
+        }
         let mut state = self
             .state
             .lock()

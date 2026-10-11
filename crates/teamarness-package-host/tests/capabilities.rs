@@ -89,6 +89,38 @@ fn capability(name: &str, method: &str, arguments: PackageValue) -> PackageValue
 }
 
 #[tokio::test]
+async fn reserved_person_name_package_cannot_be_admitted_or_granted() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("reserved", "internal:teamarness.person-names"),
+            ("previously-valid", "internal.teamarness.person-names"),
+        ],
+        &[serde_json::json!({"identity":"teamarness.immutable-record-log","major":1,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    assert_eq!(snapshot.packages.len(), 1);
+    assert_eq!(
+        snapshot.packages[0].identity.as_str(),
+        "internal.teamarness.person-names"
+    );
+    assert_eq!(snapshot.instances.len(), 1);
+    assert_eq!(
+        snapshot.instances[0].key.package_identity.as_str(),
+        "internal.teamarness.person-names"
+    );
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == PackageErrorCode::InvalidPackageIdentity)
+    );
+}
+
+#[tokio::test]
 async fn routes_scoped_workspace_membership_and_signing_calls() {
     let requirements = [
         serde_json::json!({"identity":"teamarness.workspace-context","major":1,"minMinor":0,"maxMinor":0}),

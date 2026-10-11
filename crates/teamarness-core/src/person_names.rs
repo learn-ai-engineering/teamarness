@@ -1,4 +1,6 @@
 //! Workspace-local identity presentation, derived only from canonical membership anchors.
+pub(crate) mod edit;
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -197,6 +199,12 @@ pub(crate) fn set(
          ON CONFLICT(workspace_id, person_id) DO UPDATE SET name = excluded.name",
         params![projection.workspace_id().as_bytes().as_slice(), id.0.as_slice(), name],
     ).map_err(|_| PersonNameError::Storage(StorageError::Database))?;
+    edit::advance_generation(&transaction, projection.workspace_id()).map_err(
+        |error| match error {
+            edit::EditError::Storage(storage) => PersonNameError::Storage(storage),
+            _ => PersonNameError::Storage(StorageError::CorruptWorkspace),
+        },
+    )?;
     transaction
         .commit()
         .map_err(|_| PersonNameError::Storage(StorageError::UncertainOutcome))

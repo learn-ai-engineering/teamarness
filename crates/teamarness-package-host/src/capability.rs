@@ -202,6 +202,9 @@ impl GenerationCapabilities {
         generation: u64,
         limiter: CoreCallLimiter,
     ) -> Result<Arc<Self>, PackageErrorCode> {
+        if scope.package_identity.as_str() == crate::values::RESERVED_PERSON_NAME_SCOPE {
+            return Err(PackageErrorCode::InvalidPackageIdentity);
+        }
         let registry = Registry::production();
         let mut grants = BTreeMap::new();
         let mut advertised = Vec::with_capacity(requirements.len());

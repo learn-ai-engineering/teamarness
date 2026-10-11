@@ -146,6 +146,47 @@ fn code(temp: &TempDir) -> teamarness_package_host::PackageErrorCode {
 }
 
 #[test]
+fn reserved_person_name_identity_cannot_be_selected_by_manifest() {
+    let temp = valid_package();
+    write_manifest(
+        &temp,
+        serde_json::json!({"identity": "internal:teamarness.person-names"}),
+    );
+    assert_eq!(code(&temp), PackageErrorCode::InvalidPackageIdentity);
+    assert!(
+        !teamarness_package_contract::identity::is_valid_package_identity(
+            "internal:teamarness.person-names"
+        )
+    );
+    assert!(
+        "internal:teamarness.person-names"
+            .parse::<PackageIdentity>()
+            .is_err()
+    );
+    assert!(
+        teamarness_package_contract::identity::is_valid_package_identity(
+            "internal.teamarness.person-names"
+        )
+    );
+    assert!(
+        "internal.teamarness.person-names"
+            .parse::<PackageIdentity>()
+            .is_ok()
+    );
+    write_manifest(
+        &temp,
+        serde_json::json!({"identity": "internal.teamarness.person-names"}),
+    );
+    assert_eq!(
+        manifest::load(temp.path(), "aarch64-apple-darwin")
+            .unwrap()
+            .identity
+            .as_str(),
+        "internal.teamarness.person-names"
+    );
+}
+
+#[test]
 fn valid_manifest_selects_exact_target_and_compiles_contract() {
     let temp = valid_package();
     let loaded = manifest::load(temp.path(), "aarch64-apple-darwin").unwrap();

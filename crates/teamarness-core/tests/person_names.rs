@@ -11,11 +11,13 @@ fn directory() -> std::path::PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
 }
-fn pending_name(path: &std::path::Path, workspace: WorkspaceId) -> String {
+fn durable_name(path: &std::path::Path, workspace: WorkspaceId) -> String {
     rusqlite::Connection::open(path.join("core.sqlite3"))
         .unwrap()
         .query_row(
-            "SELECT name FROM pending_person_name_edits WHERE hex(workspace_id) = ?1",
+            "SELECT name FROM workspace_person_names n WHERE hex(n.workspace_id) = ?1
+             AND (EXISTS (SELECT 1 FROM pending_person_name_edits p WHERE p.workspace_id=n.workspace_id AND p.person_id=n.person_id)
+               OR EXISTS (SELECT 1 FROM workspace_person_name_winners w WHERE w.workspace_id=n.workspace_id AND w.person_id=n.person_id))",
             [workspace.to_string().to_uppercase()],
             |row| row.get(0),
         )
@@ -43,10 +45,10 @@ async fn person_anchor_and_name_are_workspace_scoped_and_durable() {
     let b_person = runtime.workspace_person(b.id(), identity).unwrap().unwrap();
     assert_ne!(a_person.id(), b_person.id());
     assert_eq!(a_person.name(), Some("Alex 🧑‍💻"));
-    assert_eq!(pending_name(&path, a.id()), "Alex 🧑‍💻");
+    assert_eq!(durable_name(&path, a.id()), "Alex 🧑‍💻");
     let before = runtime.membership_snapshot(a.id()).unwrap();
     runtime.set_own_person_name(a.id(), "Another").unwrap();
-    assert_eq!(pending_name(&path, a.id()), "Another");
+    assert_eq!(durable_name(&path, a.id()), "Another");
     assert_eq!(runtime.membership_snapshot(a.id()).unwrap(), before);
     assert_eq!(
         runtime
@@ -177,19 +179,19 @@ async fn named_join_retry_preserves_one_person_and_allows_later_rename() {
         .unwrap()
         .unwrap();
     assert_eq!(person.name(), Some("Shared")); // duplicates allowed
-    assert_eq!(pending_name(&joiner_path, workspace.id()), "Shared");
+    assert_eq!(durable_name(&joiner_path, workspace.id()), "Shared");
     let issuer_person = creator
         .workspace_person(workspace.id(), joiner.public_identity())
         .unwrap()
         .unwrap();
     assert_eq!(issuer_person.id(), person.id());
-    assert_eq!(issuer_person.name(), None); // No peer name distribution in Phase 1.
+    assert!(matches!(issuer_person.name(), None | Some("Shared"))); // Delivery may still be pending.
     let (_, retry) = joiner
         .join_workspace_with_person_name(&invitation, "Renamed")
         .await
         .unwrap();
     assert_eq!(retry, first);
-    assert_eq!(pending_name(&joiner_path, workspace.id()), "Renamed");
+    assert_eq!(durable_name(&joiner_path, workspace.id()), "Renamed");
     assert_eq!(
         joiner
             .workspace_person(workspace.id(), joiner.public_identity())

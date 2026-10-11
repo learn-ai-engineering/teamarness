@@ -130,11 +130,19 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
             [workspace.id().to_string_bytes()],
         )
         .unwrap();
+    // Simulate the pre-recovery creation boundary while retaining the private
+    // scope that automatic name synchronization now initializes after creation.
+    connection
+        .execute_batch("PRAGMA foreign_keys = OFF;")
+        .unwrap();
     connection
         .execute(
             "DELETE FROM workspaces WHERE workspace_id = ?1",
             [workspace.id().to_string_bytes()],
         )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
         .unwrap();
     connection
         .execute(

@@ -159,8 +159,13 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         );
         state.sync_wake.notify_one();
         // Records that arrived before the key can now be applied.
-        replication::promote_scope(&mut state, workspace, package)
-            .map_err(fault!(SyncRejection::Storage))
+        let promoted = replication::promote_scope(&mut state, workspace, package)
+            .map_err(fault!(SyncRejection::Storage))?;
+        if crate::synchronization::is_reserved_record_scope(package) {
+            person_name_sync::reconcile(&mut state, workspace)
+                .map_err(fault!(SyncRejection::Storage))?;
+        }
+        Ok(promoted)
     }
 
     /// Two Installations that disagree about membership are exactly the case a
@@ -494,6 +499,10 @@ fn classify_operation(
                 package,
                 delivery_sequence,
             );
+            if crate::synchronization::is_reserved_record_scope(package) {
+                // Semantic errors are isolated from valid transport and subsequent records.
+                let _ = person_name_sync::reconcile(state, workspace);
+            }
             Ok(OperationOutcome::Applied)
         }
         Ok(crate::synchronization::RemoteInsert::Duplicate(_)) => Ok(OperationOutcome::Duplicate),

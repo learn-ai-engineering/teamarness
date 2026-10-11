@@ -491,6 +491,7 @@ pub(crate) fn import_bootstrap_with_fault(
         .chain(response.post_genesis.iter().map(|envelope| envelope.id))
         .collect::<Vec<_>>();
 
+    let mut imported_member_change = false;
     let (imported_projection, writes_derived_state) =
         if let Some(existing) = local.get(&response.workspace_id) {
             let (name, creator, created_at, genesis_id, genesis_bytes): (
@@ -583,6 +584,10 @@ pub(crate) fn import_bootstrap_with_fault(
                     insert_identity_subject(&transaction, envelope)?;
                     ensure_import_deadline(deadline)?;
                     insert_transition(&transaction, expected, envelope.id)?;
+                    imported_member_change |= matches!(
+                        envelope.action,
+                        MembershipAction::Admit { .. } | MembershipAction::Revoke { .. }
+                    );
                     candidate = expected.clone();
                 }
                 (candidate, true)
@@ -662,6 +667,10 @@ pub(crate) fn import_bootstrap_with_fault(
         import_boundary(&mut fault, ImportBoundary::CurrentState, deadline)?;
         write_member_snapshot(&transaction, &imported_projection, deadline)?;
         import_boundary(&mut fault, ImportBoundary::MemberSnapshot, deadline)?;
+        if imported_member_change {
+            crate::person_names::edit::advance_generation(&transaction, response.workspace_id)
+                .map_err(|_| crate::OnboardingError::LocalConflict)?;
+        }
     }
     // A new joiner advertises itself to every Member it learned about, so the
     // imported set is due for replication immediately.
@@ -1727,6 +1736,21 @@ fn persist_candidate_rows(
     envelope: &MembershipEnvelope,
     candidate: &WorkspaceProjection,
 ) -> Result<(), MembershipError> {
+    // Both direct membership acceptance and invitation redemption use this
+    // transaction. Never commit a roster change without its name invalidation.
+    if matches!(
+        envelope.action,
+        MembershipAction::Admit { .. } | MembershipAction::Revoke { .. }
+    ) {
+        crate::person_names::edit::advance_generation(transaction, envelope.workspace_id).map_err(
+            |error| match error {
+                crate::person_names::edit::EditError::Storage(storage) => {
+                    MembershipError::Storage(storage)
+                }
+                _ => MembershipError::Storage(StorageError::CorruptWorkspace),
+            },
+        )?;
+    }
     transaction
         .execute(
             "INSERT INTO membership_operations (

@@ -192,6 +192,9 @@ impl CoreRuntime {
                 crate::OnboardingError::UncertainStorageOutcome
             })?;
         }
+        person_name_sync::publish_generation(&state, workspace);
+        person_name_sync::initialize(&mut state, workspace)
+            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
         let summary = crate::workspace::list(&state.connection)
             .map_err(|_| crate::OnboardingError::LocalConflict)?
             .into_iter()
@@ -501,6 +504,9 @@ fn import_validated_bootstrap_locked(
             state
                 .memberships
                 .insert(snapshot.workspace_id(), imported.projection);
+            person_name_sync::publish_generation(&state, snapshot.workspace_id());
+            person_name_sync::initialize(&mut state, snapshot.workspace_id())
+                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 state.poisoned = true;
                 return Err(crate::OnboardingError::UncertainStorageOutcome);

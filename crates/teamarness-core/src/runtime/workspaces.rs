@@ -25,6 +25,8 @@ impl CoreRuntime {
                         return Err(WorkspaceError::Storage(error));
                     }
                 }
+                person_name_sync::initialize(&mut state, summary.id())
+                    .map_err(|_| WorkspaceError::Storage(StorageError::Database))?;
                 Ok(summary)
             }
             Err(error) => {
@@ -113,6 +115,8 @@ impl CoreRuntime {
                 return Err(crate::PersonNameError::Storage(error));
             }
         }
+        person_name_sync::initialize(&mut state, workspace.id())
+            .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
         Ok(workspace)
     }
 
@@ -136,6 +140,69 @@ impl CoreRuntime {
             .get(&workspace_id)
             .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
         crate::person_names::lookup(&state.connection, projection, identity)
+    }
+
+    /// Atomically reads the durable name generation and current-member presentation.
+    /// The generation is independent of membership epoch and record cursors.
+    pub fn person_name_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(u64, Vec<(PublicIdentity, crate::WorkspacePerson)>), crate::PersonNameError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        let generation =
+            crate::person_names::edit::profile_generation(&state.connection, workspace_id)
+                .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
+        let members = projection
+            .snapshot()
+            .members()
+            .iter()
+            .map(|member| {
+                let identity = member.identity();
+                crate::person_names::lookup(&state.connection, projection, identity)
+                    .map(|person| (identity, person.expect("current member has an anchor")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((generation, members))
+    }
+
+    /// A separate wake for snapshot invalidation, including membership changes.
+    /// Subscribe first, then read the snapshot; on a gap or restart, refetch it.
+    pub fn subscribe_person_names(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<tokio::sync::watch::Receiver<u64>, crate::PersonNameError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::PersonNameError::Storage(StorageError::RuntimePoisoned))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        if !state.memberships.contains_key(&workspace_id) {
+            return Err(crate::PersonNameError::WorkspaceNotFound);
+        }
+        let generation =
+            crate::person_names::edit::profile_generation(&state.connection, workspace_id)
+                .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
+        Ok(state
+            .profile_generations
+            .entry(workspace_id)
+            .or_insert_with(|| tokio::sync::watch::channel(generation).0)
+            .subscribe())
     }
 
     /// Sets only this Installation's own current Workspace Person name.
@@ -179,6 +246,12 @@ impl CoreRuntime {
             ))
         {
             state.poisoned = true;
+        }
+        if result.is_ok() {
+            // The name and generation have committed even if private replay fails.
+            person_name_sync::publish_generation(&state, workspace_id);
+            person_name_sync::initialize(&mut state, workspace_id)
+                .map_err(|_| crate::PersonNameError::Storage(StorageError::Database))?;
         }
         result
     }

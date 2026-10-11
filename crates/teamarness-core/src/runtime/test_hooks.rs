@@ -330,6 +330,9 @@ impl RuntimeState {
             subscribers: BTreeMap::new(),
             record_heads: Arc::default(),
             membership_epochs: BTreeMap::new(),
+            profile_generations: BTreeMap::new(),
+            #[cfg(test)]
+            person_name_open_error_once: false,
             next_subscriber_id: 0,
             poisoned: false,
         }

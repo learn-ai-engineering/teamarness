@@ -12,6 +12,746 @@ use crate::synchronization::{LogSessionError, Refusal};
 
 const PACKAGE: &str = "teamarness.test";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn names_converge_without_package_instance_after_restart() {
+    let mut cluster = SyncCluster::start("names-three-peers", &["creator", "alice", "bob"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace_with_person_name("Names", "Creator")
+        .unwrap()
+        .id();
+    cluster.admit("creator", "alice", workspace).await;
+    cluster.admit("creator", "bob", workspace).await;
+    let version = cluster
+        .node("creator")
+        .membership_version(workspace)
+        .unwrap();
+    let mut wake = cluster
+        .node("creator")
+        .subscribe_person_names(workspace)
+        .unwrap();
+    cluster.stop("bob").await;
+    cluster
+        .node("alice")
+        .set_own_person_name(workspace, "Alice")
+        .unwrap();
+    cluster
+        .node("alice")
+        .set_own_person_name(workspace, "Alice twice")
+        .unwrap();
+    cluster.stop("alice").await;
+    cluster.restart("alice").await;
+    cluster.restart("bob").await;
+    let identity = cluster.identity("alice");
+    cluster
+        .observe_until("name converges on peers", DEFAULT_DEADLINE, |cluster| {
+            ["creator", "bob"].iter().all(|peer| {
+                cluster
+                    .node(peer)
+                    .workspace_person(workspace, identity)
+                    .unwrap()
+                    .and_then(|person| person.name().map(str::to_owned))
+                    .as_deref()
+                    == Some("Alice twice")
+            })
+        })
+        .await;
+    tokio::time::timeout(DEFAULT_DEADLINE, wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let (generation, people) = cluster.node("bob").person_name_snapshot(workspace).unwrap();
+    assert!(generation > 0);
+    assert_eq!(
+        people
+            .iter()
+            .find(|(id, _)| *id == identity)
+            .unwrap()
+            .1
+            .name(),
+        Some("Alice twice")
+    );
+    assert_eq!(
+        cluster
+            .node("creator")
+            .membership_version(workspace)
+            .unwrap(),
+        version
+    );
+    cluster.stop("creator").await;
+    cluster.stop("alice").await;
+    cluster.stop("bob").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
+    let mut cluster = SyncCluster::start("names-replay-backlog", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let person = crate::person_names::derive(
+            workspace,
+            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+        );
+        let secret = state.secret_key.clone();
+        for counter in 1..=80 {
+            let name = format!("Name {counter}");
+            let edit = crate::person_names::edit::PersonNameEdit::sign(
+                &secret, workspace, person, counter, &name,
+            )
+            .unwrap();
+            crate::synchronization::append(
+                &mut state.connection,
+                &secret,
+                workspace,
+                crate::synchronization::reserved_person_name_scope(),
+                "person-name.edit",
+                edit.canonical_bytes(),
+                crate::synchronization::MembershipStanding::Current,
+                true,
+                creator.clock.now_unix_ms(),
+            )
+            .unwrap();
+        }
+        super::super::person_name_sync::reconcile(&mut state, workspace).unwrap();
+        let consumed: i64 = state.connection.query_row("SELECT delivery_sequence FROM workspace_person_name_consumption WHERE workspace_id=?1", [workspace.as_bytes().as_slice()], |row| row.get(0)).unwrap();
+        assert_eq!(
+            consumed, 32,
+            "one pass must not hold the runtime lock over the backlog"
+        );
+    }
+    cluster.stop("creator").await;
+    cluster.restart("creator").await;
+    cluster
+        .observe_until("bounded replay continues", DEFAULT_DEADLINE, |cluster| {
+            cluster
+                .node("creator")
+                .workspace_person(workspace, cluster.identity("creator"))
+                .unwrap()
+                .and_then(|person| person.name().map(str::to_owned))
+                .as_deref()
+                == Some("Name 80")
+        })
+        .await;
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
+    let cluster = SyncCluster::start("names-open-retry", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    {
+        let mut state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let person = crate::person_names::derive(
+            workspace,
+            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+        );
+        let signed = crate::person_names::edit::PersonNameEdit::sign(
+            &state.secret_key,
+            workspace,
+            person,
+            1,
+            "Recovered",
+        )
+        .unwrap();
+        let secret = state.secret_key.clone();
+        crate::synchronization::append(
+            &mut state.connection,
+            &secret,
+            workspace,
+            crate::synchronization::reserved_person_name_scope(),
+            "person-name.edit",
+            signed.canonical_bytes(),
+            crate::synchronization::MembershipStanding::Current,
+            true,
+            creator.clock.now_unix_ms(),
+        )
+        .unwrap();
+        state.person_name_open_error_once = true;
+        assert!(matches!(
+            super::super::person_name_sync::reconcile(&mut state, workspace),
+            Err(crate::SynchronizationError::Storage(_))
+        ));
+        let count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_person_name_consumption",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a storage error must not consume the valid record"
+        );
+        super::super::person_name_sync::reconcile(&mut state, workspace).unwrap();
+    }
+    assert_eq!(
+        creator
+            .workspace_person(workspace, creator.public_identity())
+            .unwrap()
+            .unwrap()
+            .name(),
+        Some("Recovered")
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn named_join_retry_wakes_subscriber_while_key_is_unavailable() {
+    let cluster = SyncCluster::start("names-retry-wake", &["creator", "joiner"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    cluster.node("creator").sync_worker.shutdown().await;
+    cluster.node("joiner").sync_worker.shutdown().await;
+    let now = crate::runtime::Clock::now_unix_ms(&super::super::SystemClock);
+    let invitation = cluster
+        .node("creator")
+        .create_workspace_invitation_for_test(workspace, now, now + 600_000)
+        .unwrap();
+    cluster
+        .node("joiner")
+        .join_workspace_with_person_name(&invitation, "First")
+        .await
+        .unwrap();
+    let mut wake = cluster
+        .node("joiner")
+        .subscribe_person_names(workspace)
+        .unwrap();
+    let (before, _) = cluster
+        .node("joiner")
+        .person_name_snapshot(workspace)
+        .unwrap();
+    cluster
+        .node("joiner")
+        .join_workspace_with_person_name(&invitation, "Second")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let (after, people) = cluster
+        .node("joiner")
+        .person_name_snapshot(workspace)
+        .unwrap();
+    assert!(after > before);
+    assert_eq!(
+        people
+            .iter()
+            .find(|(id, _)| *id == cluster.identity("joiner"))
+            .unwrap()
+            .1
+            .name(),
+        Some("Second")
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_name_survives_restart_before_private_key_arrives() {
+    let mut cluster = SyncCluster::start("names-delayed-key", &["creator", "joiner"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    // Onboarding transport remains live, but no LogSync session can supply a key yet.
+    cluster.node("creator").sync_worker.shutdown().await;
+    cluster.node("joiner").sync_worker.shutdown().await;
+    cluster.admit("creator", "joiner", workspace).await;
+    cluster
+        .node("joiner")
+        .set_own_person_name(workspace, "Delayed")
+        .unwrap();
+    {
+        let state = cluster.node("joiner").state.lock().unwrap();
+        let scope = crate::synchronization::scope_digest(
+            crate::synchronization::reserved_person_name_scope(),
+            workspace,
+        );
+        let key_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scopes WHERE scope_id=?1",
+                [scope.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pending_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pending_person_name_edits WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((key_count, pending_count), (0, 1));
+    }
+    cluster.stop("joiner").await;
+    cluster.restart("joiner").await;
+    cluster
+        .observe_until(
+            "pending edit flushes after verified key",
+            DEFAULT_DEADLINE,
+            |cluster| {
+                cluster
+                    .node("creator")
+                    .workspace_person(workspace, cluster.identity("joiner"))
+                    .unwrap()
+                    .and_then(|person| person.name().map(str::to_owned))
+                    .as_deref()
+                    == Some("Delayed")
+            },
+        )
+        .await;
+    {
+        let state = cluster.node("joiner").state.lock().unwrap();
+        let pending: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pending_person_name_edits WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_hidden() {
+    let cluster = SyncCluster::start("names-malformed-revoked", &["creator", "member"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    cluster.admit("creator", "member", workspace).await;
+    let malformed = {
+        let creator = cluster.node("creator");
+        let state = creator.state.lock().unwrap();
+        let anchor = crate::person_names::anchor(
+            state.memberships.get(&workspace).unwrap(),
+            creator.public_identity(),
+        )
+        .unwrap();
+        let wrong_workspace = crate::WorkspaceId::from_bytes([99; 16]);
+        crate::person_names::edit::PersonNameEdit::sign(
+            &state.secret_key,
+            wrong_workspace,
+            crate::person_names::derive(workspace, anchor),
+            100,
+            "Forged",
+        )
+        .unwrap()
+        .canonical_bytes()
+        .to_vec()
+    };
+    {
+        let creator = cluster.node("creator");
+        let mut state = creator.state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        let (record, sequence) = crate::synchronization::append(
+            &mut state.connection,
+            &secret,
+            workspace,
+            crate::synchronization::reserved_person_name_scope(),
+            "person-name.edit",
+            &malformed,
+            crate::synchronization::MembershipStanding::Current,
+            true,
+            creator.clock.now_unix_ms(),
+        )
+        .unwrap();
+        assert!(!record.sealed_record().is_empty());
+        crate::synchronization::record_subscription::publish_commit(
+            &state,
+            workspace,
+            crate::synchronization::reserved_person_name_scope(),
+            sequence,
+        );
+        creator.sync_worker.wake();
+    }
+    cluster
+        .node("creator")
+        .set_own_person_name(workspace, "Valid")
+        .unwrap();
+    cluster
+        .observe_until(
+            "valid name after malformed edit",
+            DEFAULT_DEADLINE,
+            |cluster| {
+                cluster
+                    .node("member")
+                    .workspace_person(workspace, cluster.identity("creator"))
+                    .unwrap()
+                    .and_then(|person| person.name().map(str::to_owned))
+                    .as_deref()
+                    == Some("Valid")
+            },
+        )
+        .await;
+    let mut wake = cluster
+        .node("creator")
+        .subscribe_person_names(workspace)
+        .unwrap();
+    let (before, _) = cluster
+        .node("creator")
+        .person_name_snapshot(workspace)
+        .unwrap();
+    cluster
+        .node("creator")
+        .revoke_member(workspace, cluster.identity("member"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let (after, _) = cluster
+        .node("creator")
+        .person_name_snapshot(workspace)
+        .unwrap();
+    assert!(
+        after > before,
+        "revocation invalidates the durable name snapshot cursor"
+    );
+    assert!(
+        cluster
+            .node("creator")
+            .workspace_person(workspace, cluster.identity("member"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !cluster
+            .node("creator")
+            .person_name_snapshot(workspace)
+            .unwrap()
+            .1
+            .iter()
+            .any(|(id, _)| *id == cluster.identity("member"))
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn existing_workspace_bootstrap_import_advances_generation_atomically_and_wakes_subscriber() {
+    let mut cluster =
+        SyncCluster::start("names-bootstrap-retry", &["creator", "joiner", "newcomer"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    cluster.node("creator").sync_worker.shutdown().await;
+    cluster.node("joiner").sync_worker.shutdown().await;
+    cluster.node("newcomer").sync_worker.shutdown().await;
+    let now = crate::runtime::Clock::now_unix_ms(&super::super::SystemClock);
+    let invitation = cluster
+        .node("creator")
+        .create_workspace_invitation_for_test(workspace, now, now + 600_000)
+        .unwrap();
+    cluster
+        .node("joiner")
+        .join_workspace(&invitation)
+        .await
+        .unwrap();
+    let joiner = cluster.node("joiner");
+    let wake = joiner.subscribe_person_names(workspace).unwrap();
+    let (before, members) = joiner.person_name_snapshot(workspace).unwrap();
+    assert!(
+        !members
+            .iter()
+            .any(|(id, _)| *id == cluster.identity("newcomer"))
+    );
+    cluster.admit("creator", "newcomer", workspace).await;
+    {
+        let state = joiner.state.lock().unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
+    }
+    assert!(joiner.join_workspace(&invitation).await.is_err());
+    assert_eq!(joiner.person_name_snapshot(workspace).unwrap().0, before);
+    assert!(!wake.has_changed().unwrap());
+    assert!(
+        !cluster
+            .members("joiner", workspace)
+            .contains(&cluster.identity("newcomer"))
+    );
+    cluster.stop("joiner").await;
+    cluster.restart("joiner").await;
+    let joiner = cluster.node("joiner");
+    assert_eq!(joiner.person_name_snapshot(workspace).unwrap().0, before);
+    assert!(
+        !cluster
+            .members("joiner", workspace)
+            .contains(&cluster.identity("newcomer"))
+    );
+    {
+        let state = joiner.state.lock().unwrap();
+        state.connection.execute_batch("DROP TRIGGER fail_name_generation_insert; DROP TRIGGER fail_name_generation_update;").unwrap();
+    }
+    let mut wake = joiner.subscribe_person_names(workspace).unwrap();
+    joiner.join_workspace(&invitation).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let (after, people) = joiner.person_name_snapshot(workspace).unwrap();
+    assert!(after > before);
+    assert!(
+        people
+            .iter()
+            .any(|(id, _)| *id == cluster.identity("newcomer"))
+    );
+    cluster.stop("joiner").await;
+    cluster.restart("joiner").await;
+    let (durable, people) = cluster
+        .node("joiner")
+        .person_name_snapshot(workspace)
+        .unwrap();
+    assert_eq!(durable, after);
+    assert!(
+        people
+            .iter()
+            .any(|(id, _)| *id == cluster.identity("newcomer"))
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_generation_write_failure_rolls_back_local_and_remote_revocations() {
+    use crate::membership_sync::ReplicaError;
+
+    let mut cluster = SyncCluster::start("names-membership-atomic", &["creator", "member"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    cluster.admit("creator", "member", workspace).await;
+    cluster.node("creator").sync_worker.shutdown().await;
+    cluster.node("member").sync_worker.shutdown().await;
+    let creator = cluster.node("creator");
+    let member = cluster.identity("member");
+    let (before, _) = creator.person_name_snapshot(workspace).unwrap();
+    let version = creator.membership_version(workspace).unwrap();
+    let envelope = {
+        let state = creator.state.lock().unwrap();
+        crate::membership::MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            creator.clock.now_unix_ms(),
+            crate::membership::MembershipAction::Revoke { target: member },
+            state.memberships.get(&workspace).unwrap().heads(),
+        )
+        .unwrap()
+    };
+    {
+        let state = creator.state.lock().unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
+    }
+    assert!(creator.revoke_member(workspace, member).is_err());
+    assert_eq!(creator.person_name_snapshot(workspace).unwrap().0, before);
+    assert_eq!(creator.membership_version(workspace).unwrap(), version);
+    // Exercise the independent remote replica apply entry point with the same failure.
+    let replica = creator.membership_replica.clone();
+    assert_eq!(
+        replica.apply(member, workspace, envelope.canonical_bytes().to_vec()),
+        Err(ReplicaError::Storage)
+    );
+    assert_eq!(creator.membership_version(workspace).unwrap(), version);
+    cluster.stop("creator").await;
+    cluster.restart("creator").await;
+    let creator = cluster.node("creator");
+    assert_eq!(creator.membership_version(workspace).unwrap(), version);
+    assert_eq!(creator.person_name_snapshot(workspace).unwrap().0, before);
+    {
+        let state = creator.state.lock().unwrap();
+        state
+            .connection
+            .execute_batch("DROP TRIGGER fail_name_generation_insert; DROP TRIGGER fail_name_generation_update;")
+            .unwrap();
+    }
+    assert_eq!(
+        replica.apply(member, workspace, envelope.canonical_bytes().to_vec()),
+        Err(ReplicaError::Unavailable)
+    );
+    creator
+        .apply_membership_envelope(envelope.canonical_bytes())
+        .unwrap();
+    let (after, members) = creator.person_name_snapshot(workspace).unwrap();
+    assert!(after > before);
+    assert!(!members.iter().any(|(id, _)| *id == member));
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_self_rename_wakes_subscriber_when_private_initialization_fails() {
+    let cluster = SyncCluster::start("names-rename-init-failure", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    creator.sync_worker.shutdown().await;
+    let mut wake = creator.subscribe_person_names(workspace).unwrap();
+    let (before, _) = creator.person_name_snapshot(workspace).unwrap();
+    {
+        let mut state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let person = crate::person_names::derive(
+            workspace,
+            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+        );
+        let secret = state.secret_key.clone();
+        let signed =
+            crate::person_names::edit::PersonNameEdit::sign(&secret, workspace, person, 1, "Older")
+                .unwrap();
+        crate::synchronization::append(
+            &mut state.connection,
+            &secret,
+            workspace,
+            crate::synchronization::reserved_person_name_scope(),
+            "person-name.edit",
+            signed.canonical_bytes(),
+            crate::synchronization::MembershipStanding::Current,
+            true,
+            creator.clock.now_unix_ms(),
+        )
+        .unwrap();
+        state.person_name_open_error_once = true;
+    }
+    assert!(creator.set_own_person_name(workspace, "Committed").is_err());
+    tokio::time::timeout(Duration::from_secs(1), wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let (after, people) = creator.person_name_snapshot(workspace).unwrap();
+    assert!(after > before);
+    assert_eq!(people[0].1.name(), Some("Committed"));
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reserved_person_name_scope_can_be_initialized_and_demanded_privately() {
+    let cluster = SyncCluster::start("private-person-names-scope", &["creator", "joiner"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    let reserved = crate::synchronization::reserved_person_name_scope();
+    assert_eq!(reserved, "internal:teamarness.person-names");
+    let private_record = {
+        let creator = cluster.node("creator");
+        let mut state = creator.state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        assert!(
+            !crate::synchronization::declare_creator_scope(
+                &mut state.connection,
+                &secret,
+                workspace,
+                reserved,
+            )
+            .unwrap(),
+            "creation already initialized the private scope"
+        );
+        crate::synchronization::append(
+            &mut state.connection,
+            &secret,
+            workspace,
+            reserved,
+            "name.edit",
+            b"private codec probe",
+            crate::synchronization::MembershipStanding::Current,
+            true,
+            creator.clock.now_unix_ms(),
+        )
+        .unwrap()
+        .0
+    };
+    cluster.node("creator").sync_worker.wake();
+    cluster.admit("creator", "joiner", workspace).await;
+    let joiner = cluster.node("joiner");
+    for node in [cluster.node("creator"), joiner] {
+        assert!(matches!(
+            node.append_record(workspace, reserved, "name.edit", b"forged"),
+            Err(crate::SynchronizationError::InvalidInput)
+        ));
+        assert!(matches!(
+            node.subscribe_records(workspace, reserved, None),
+            Err(crate::SynchronizationError::InvalidInput)
+        ));
+        assert!(matches!(
+            node.open_records(workspace, reserved, &[]),
+            Err(crate::SynchronizationError::InvalidInput)
+        ));
+    }
+    {
+        let joiner = cluster.node("joiner");
+        let state = joiner.state.lock().unwrap();
+        assert!(
+            !crate::synchronization::declare_member_key_demand(
+                &state.connection,
+                workspace,
+                reserved,
+            )
+            .unwrap(),
+            "join import already demanded the private key"
+        );
+        joiner.sync_worker.wake();
+    }
+    cluster
+        .observe_until(
+            "the joiner receives the private scope key",
+            Duration::from_secs(20),
+            |cluster| {
+                let state = cluster.node("joiner").state.lock().unwrap();
+                let scope = crate::synchronization::scope_digest(reserved, workspace);
+                state
+                    .connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sync_scopes WHERE scope_id=?1)",
+                        [scope.as_slice()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            },
+        )
+        .await;
+    cluster
+        .observe_until(
+            "the joiner receives the protected private record",
+            Duration::from_secs(20),
+            |cluster| cluster.record_count("joiner", workspace, reserved) == 1,
+        )
+        .await;
+    {
+        let joiner = cluster.node("joiner");
+        let state = joiner.state.lock().unwrap();
+        assert_eq!(
+            crate::synchronization::open_records(
+                &state.connection,
+                workspace,
+                reserved,
+                &[private_record.sealed_record().to_vec()],
+                joiner.clock.now_unix_ms(),
+            )
+            .unwrap()[0]
+                .canonical(),
+            b"private codec probe"
+        );
+    }
+    cluster.finish().await;
+}
+
 /// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R08
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_scope_key_acquisition_without_holder_sweep() {
@@ -710,16 +1450,16 @@ async fn member_key_demand_subscription_and_append_coalesce_across_restart() {
         let demands: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1",
-                [id.as_bytes().as_slice()],
+                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1 AND package_identity=?2",
+                rusqlite::params![id.as_bytes().as_slice(), PACKAGE],
                 |row| row.get(0),
             )
             .unwrap();
         let scopes: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_scopes WHERE workspace_id=?1",
-                [id.as_bytes().as_slice()],
+                "SELECT COUNT(*) FROM sync_scopes WHERE workspace_id=?1 AND package_identity=?2",
+                rusqlite::params![id.as_bytes().as_slice(), PACKAGE],
                 |row| row.get(0),
             )
             .unwrap();
@@ -814,7 +1554,11 @@ async fn member_key_demand_append_fallback_does_not_depend_on_subscription() {
         ).unwrap();
         let scopes: i64 = state
             .connection
-            .query_row("SELECT COUNT(*) FROM sync_scopes", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_scopes WHERE package_identity=?1",
+                [PACKAGE],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(
             demand,
@@ -848,8 +1592,8 @@ async fn member_key_demand_local_revocation_clears_pending_and_prevents_recreati
         state
             .connection
             .query_row::<i64, _, _>(
-                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1",
-                [id.as_bytes().as_slice()],
+                "SELECT COUNT(*) FROM sync_scope_key_demands WHERE workspace_id=?1 AND package_identity=?2",
+                rusqlite::params![id.as_bytes().as_slice(), PACKAGE],
                 |row| row.get(0),
             )
             .unwrap()
@@ -1326,17 +2070,26 @@ async fn forged_order_key_does_not_end_the_session() {
         vec![misbound, too_high]
     };
 
-    cluster
-        .node("m")
-        .deliver_operations_for_test(
-            cluster.address("b"),
-            id,
-            PACKAGE,
-            cluster.identity("b"),
-            forged,
-        )
-        .await
-        .expect("two forged order keys must not end the session");
+    let deadline = std::time::Instant::now() + DEFAULT_DEADLINE;
+    loop {
+        match cluster
+            .node("m")
+            .deliver_operations_for_test(
+                cluster.address("b"),
+                id,
+                PACKAGE,
+                cluster.identity("b"),
+                forged.clone(),
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(LogSessionError::PeerBusy) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("two forged order keys must not end the session: {error}"),
+        }
+    }
 
     let seen = cluster.record_ids("b", id, PACKAGE);
     assert!(

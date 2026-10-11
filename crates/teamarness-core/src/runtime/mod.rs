@@ -79,6 +79,9 @@ pub(crate) struct RuntimeState {
     /// One watch per Workspace carrying the local membership epoch, so a
     /// membership stream waits instead of polling.
     membership_epochs: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
+    profile_generations: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
+    #[cfg(test)]
+    person_name_open_error_once: bool,
     next_subscriber_id: u64,
     pub(crate) poisoned: bool,
 }
@@ -181,9 +184,28 @@ impl CoreRuntime {
             subscribers: BTreeMap::new(),
             record_heads,
             membership_epochs: BTreeMap::new(),
+            profile_generations: BTreeMap::new(),
+            #[cfg(test)]
+            person_name_open_error_once: false,
             next_subscriber_id: 0,
             poisoned: false,
         }));
+        {
+            let state = Arc::clone(&state);
+            tokio::task::spawn_blocking(move || -> Result<(), CoreError> {
+                let mut locked = state
+                    .lock()
+                    .map_err(|_| CoreError::Storage(StorageError::Database))?;
+                let workspaces: Vec<_> = locked.memberships.keys().copied().collect();
+                for workspace in workspaces {
+                    person_name_sync::initialize(&mut locked, workspace)
+                        .map_err(|_| CoreError::Storage(StorageError::Database))?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| CoreError::Storage(StorageError::Database))??;
+        }
         let issuer = crate::onboarding::handler::IssuerService::new(
             Arc::downgrade(&state),
             Arc::clone(&clock),
@@ -329,6 +351,7 @@ impl Drop for CoreRuntime {
 mod identity;
 mod membership;
 mod onboarding;
+pub(crate) mod person_name_sync;
 mod records;
 mod replication;
 mod subscription;
