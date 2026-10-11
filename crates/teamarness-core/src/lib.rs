@@ -36,6 +36,7 @@ mod membership;
 mod membership_sync;
 mod network;
 mod onboarding;
+mod person_names;
 mod storage;
 mod subscription;
 mod synchronization;
@@ -47,6 +48,7 @@ pub use error::{
 };
 pub use membership::MembershipOperationId;
 pub use onboarding::WorkspaceInvitation;
+pub use person_names::{PersonNameError, WorkspacePerson, WorkspacePersonId};
 /// Test observation hooks. See the `test-hooks` feature.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

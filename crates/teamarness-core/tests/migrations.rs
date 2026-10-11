@@ -255,7 +255,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     for column in [
         "scope_id",
         "log_id",
@@ -330,7 +330,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -468,7 +468,10 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE sync_scope_key_demand_peer_progress;
+            "DROP TABLE pending_person_join_names; DROP TABLE pending_person_name_edits;
+             DROP TABLE workspace_person_names;
+             ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name;
+             DROP TABLE sync_scope_key_demand_peer_progress;
              DROP TABLE sync_scope_key_demands;
              DROP TABLE sync_peer_progress;
              DROP TABLE membership_peer_progress;
@@ -646,7 +649,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
         )
         .unwrap();
     assert_eq!(left, 0, "peer progress cascades when demand is cleared");
-    connection.execute_batch("DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
+    connection.execute_batch("DROP TABLE pending_person_join_names; DROP TABLE pending_person_name_edits; DROP TABLE workspace_person_names; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
     drop(connection);
 
     let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
@@ -656,7 +659,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     connection
         .execute(
             insert,
@@ -668,7 +671,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
 }
 
 #[tokio::test]
-async fn migration_0013_rejects_future_schema_versions() {
+async fn migration_0014_rejects_future_schema_versions() {
     let directory = private_data_directory("migration-future-schema");
     let config = CoreRuntimeConfig::new(&directory);
     let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
@@ -677,7 +680,7 @@ async fn migration_0013_rejects_future_schema_versions() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.pragma_update(None, "user_version", 14).unwrap();
+    connection.pragma_update(None, "user_version", 15).unwrap();
     drop(connection);
     assert!(matches!(
         CoreRuntime::open_loopback_for_tests(config).await,
@@ -728,8 +731,43 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn migration_0014_upgrades_existing_unnamed_workspace_without_inventing_a_name() {
+    let directory = private_data_directory("migration-person-names");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Old workspace").unwrap();
+    let identity = runtime.public_identity();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection.execute_batch("DROP TABLE pending_person_join_names; DROP TABLE pending_person_name_edits; DROP TABLE workspace_person_names; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; PRAGMA user_version = 13;").unwrap();
+    drop(connection);
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
+    let old = reopened
+        .workspace_person(workspace.id(), identity)
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.name(), None);
+    reopened
+        .set_own_person_name(workspace.id(), "Chosen")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .workspace_person(workspace.id(), identity)
+            .unwrap()
+            .unwrap()
+            .id(),
+        old.id()
+    );
+    reopened.shutdown().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }

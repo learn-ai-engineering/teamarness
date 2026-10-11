@@ -21,6 +21,8 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Installation Display Name** | User-changeable, validated human-readable metadata for the local Installation. It does not replace the Public Identity and is not currently shared through canonical membership |
 | **Public Identity** | The public half of an installation identity (`EndpointId`), shared with workspaces as a member identifier |
 | **Member** | An installation identity admitted to a workspace. Membership is canonical and interval-based. A human may have multiple device identities; devices are first-class members |
+| **Workspace Person** | A person recognized within one Workspace, with a distinct identity in that Workspace. The same human in another Workspace has a separate Workspace Person identity. A Workspace Person is not, by itself, membership authority |
+| **Workspace Person Name** | A changeable, Workspace-specific name chosen by a Workspace Person for display to other Members and Packages. It need not be unique and does not confer membership or authorization |
 | **Manager** | A Member whose role authorizes admitting and revoking Members and issuing Invitations. In version 1 the Workspace creator is the only Manager (`MembershipRole::Manager`). Manager assignment and transfer are roadmap Phase 5 work |
 | **Membership Interval** | A bounded period `[admitted, revoked?)` during which an identity was a workspace member. Intervals are contiguous; a member cannot have gaps |
 | **Canonical Membership** | The signed, causally ordered, append-only membership operation DAG that is the sole authority for who is a workspace member. Built above Iroh's transport identity. Iroh connects peers; the membership DAG authorizes them |

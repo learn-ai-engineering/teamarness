@@ -33,6 +33,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+unicode-segmentation.workspace = true
+unicode-general-category.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }

@@ -90,6 +90,116 @@ impl CoreRuntime {
         .await
     }
 
+    /// Joins with a durable local name intent. The issuer admission may have
+    /// committed independently; retrying the same invitation recovers it.
+    pub async fn join_workspace_with_person_name(
+        &self,
+        invitation: &crate::WorkspaceInvitation,
+        name: &str,
+    ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
+        crate::person_names::validate(name).map_err(|_| crate::OnboardingError::InvalidInput)?;
+        let verified = invitation
+            .verified()
+            .map_err(|_| crate::OnboardingError::InvalidInput)?;
+        let workspace = verified.token.workspace_id;
+        let token = *verified.token.id.as_bytes();
+        let state = Arc::clone(&self.state);
+        let requested = name.to_owned();
+        let original = tokio::task::spawn_blocking(move || {
+            let mut state = state
+                .lock()
+                .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+            if state.poisoned {
+                return Err(crate::OnboardingError::UncertainStorageOutcome);
+            }
+            if let Some(projection) = state.memberships.get(&workspace)
+                && projection
+                    .has_admission_for_token(PublicIdentity(state.secret_key.public()), &token)
+                && let Ok(Some(person)) = crate::person_names::lookup(
+                    &state.connection,
+                    projection,
+                    PublicIdentity(state.secret_key.public()),
+                )
+                && let Some(current) = person.name()
+            {
+                return Ok(current.to_owned());
+            }
+            crate::person_names::stage_join(&mut state.connection, workspace, &token, &requested)
+                .map_err(|error| match error {
+                    crate::PersonNameError::Storage(StorageError::UncertainOutcome) => {
+                        state.poisoned = true;
+                        crate::OnboardingError::UncertainStorageOutcome
+                    }
+                    _ => crate::OnboardingError::LocalConflict,
+                })
+        })
+        .await
+        .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)??;
+        // A prior import may have committed before the caller saw its result.
+        // Only recover a matching, currently accepted admission.
+        if let Some(recovered) = self.recover_named_join(workspace, &token, name, &original)? {
+            return Ok(recovered);
+        }
+        let joined = self.join_workspace(invitation).await?;
+        self.recover_named_join(workspace, &token, name, &original)?
+            .ok_or(crate::OnboardingError::UncertainStorageOutcome)
+            .map(|_| joined)
+    }
+
+    fn recover_named_join(
+        &self,
+        workspace: WorkspaceId,
+        token: &[u8; 32],
+        requested: &str,
+        original: &str,
+    ) -> Result<Option<(WorkspaceSummary, MembershipSnapshot)>, crate::OnboardingError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
+        if state.poisoned {
+            return Err(crate::OnboardingError::UncertainStorageOutcome);
+        }
+        let Some(projection) = state.memberships.get(&workspace).cloned() else {
+            return Ok(None);
+        };
+        if !projection.has_admission_for_token(self.public_identity, token) {
+            return Ok(None);
+        }
+        crate::person_names::finish_join(
+            &mut state.connection,
+            &projection,
+            self.public_identity,
+            token,
+        )
+        .map_err(|error| {
+            if error == crate::PersonNameError::Storage(StorageError::UncertainOutcome) {
+                state.poisoned = true;
+            }
+            crate::OnboardingError::UncertainStorageOutcome
+        })?;
+        if requested != original {
+            crate::person_names::set(
+                &mut state.connection,
+                &projection,
+                self.public_identity,
+                requested,
+            )
+            .map_err(|error| {
+                if error == crate::PersonNameError::Storage(StorageError::UncertainOutcome) {
+                    state.poisoned = true;
+                }
+                crate::OnboardingError::UncertainStorageOutcome
+            })?;
+        }
+        let summary = crate::workspace::list(&state.connection)
+            .map_err(|_| crate::OnboardingError::LocalConflict)?
+            .into_iter()
+            .find(|summary| summary.id() == workspace)
+            .ok_or(crate::OnboardingError::LocalConflict)?;
+        Ok(Some((summary, projection.snapshot())))
+    }
+
     pub(super) async fn join_workspace_with_budget(
         &self,
         invitation: &crate::WorkspaceInvitation,

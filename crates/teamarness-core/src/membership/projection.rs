@@ -49,6 +49,58 @@ impl WorkspaceProjection {
         self.snapshot.clone()
     }
 
+    pub(crate) fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+    pub(crate) fn genesis_id(&self) -> MembershipOperationId {
+        self.genesis_id
+    }
+    pub(crate) fn first_admission(
+        &self,
+        identity: PublicIdentity,
+    ) -> Option<MembershipOperationId> {
+        let admissions = self.operations.values().filter(|operation| {
+            matches!(&operation.action,
+                MembershipAction::Admit { target, .. } if *target == identity)
+        });
+        // A later accepted admission can have the same authored timestamp and
+        // a smaller content hash. Causal order, not hash order, anchors the
+        // first Person; tie-break only genuinely concurrent first admissions.
+        admissions
+            .min_by_key(|operation| {
+                let mut pending = operation.dependencies.clone();
+                let mut visited = BTreeSet::new();
+                let mut earlier_admissions = 0;
+                while let Some(id) = pending.pop() {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    if let Some(ancestor) = self.operations.get(&id) {
+                        if matches!(&ancestor.action,
+                        MembershipAction::Admit { target, .. } if *target == identity)
+                        {
+                            earlier_admissions += 1;
+                        }
+                        pending.extend_from_slice(&ancestor.dependencies);
+                    }
+                }
+                (
+                    earlier_admissions,
+                    operation.authored_at_unix_ms,
+                    operation.id,
+                )
+            })
+            .map(|operation| operation.id)
+    }
+    pub(crate) fn has_admission_for_token(
+        &self,
+        identity: PublicIdentity,
+        token: &[u8; 32],
+    ) -> bool {
+        self.contains_member(identity) && self.operations.values().any(|operation| matches!(&operation.action,
+            MembershipAction::Admit { target, proof } if *target == identity && proof.claim.token.id.as_bytes() == token))
+    }
+
     pub(crate) fn creator(&self) -> PublicIdentity {
         self.creator
     }

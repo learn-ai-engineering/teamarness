@@ -491,3 +491,58 @@ async fn every_import_write_group_rolls_back_and_uncertain_commit_poisons_until_
         fs::remove_dir_all(joiner_directory).unwrap();
     }
 }
+
+#[tokio::test]
+async fn named_join_intent_survives_import_fault_and_recovers_one_admission() {
+    for boundary in [ImportBoundary::BeforeCommit, ImportBoundary::AfterCommit] {
+        let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
+            response_fixture("named-import-fault").await;
+        let verified = invitation.verified().unwrap();
+        let workspace = verified.token.workspace_id;
+        {
+            let mut connection = Connection::open(joiner_directory.join("core.sqlite3")).unwrap();
+            assert_eq!(
+                crate::person_names::stage_join(
+                    &mut connection,
+                    workspace,
+                    verified.token.id.as_bytes(),
+                    "Original 🧑‍💻"
+                )
+                .unwrap(),
+                "Original 🧑‍💻"
+            );
+        }
+        assert!(
+            joiner
+                .import_response_for_test(&invitation, response, Some(boundary))
+                .is_err()
+        );
+        joiner.shutdown().await.unwrap();
+        drop(joiner);
+        let reopened =
+            CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&joiner_directory))
+                .await
+                .unwrap();
+        let (_, snapshot) = reopened
+            .join_workspace_with_person_name(&invitation, "Original 🧑‍💻")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.members().len(), 2);
+        assert_eq!(
+            reopened
+                .workspace_person(workspace, reopened.public_identity())
+                .unwrap()
+                .unwrap()
+                .name(),
+            Some("Original 🧑‍💻")
+        );
+        let before = reopened.membership_snapshot(workspace).unwrap();
+        reopened.set_own_person_name(workspace, "Changed").unwrap();
+        assert_eq!(reopened.membership_snapshot(workspace).unwrap(), before);
+        reopened.shutdown().await.unwrap();
+        issuer.shutdown().await.unwrap();
+        drop((issuer, reopened));
+        fs::remove_dir_all(issuer_directory).unwrap();
+        fs::remove_dir_all(joiner_directory).unwrap();
+    }
+}

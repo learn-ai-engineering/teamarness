@@ -7576,6 +7576,8 @@ dependencies = [
  "sha2 0.11.0",
  "teamarness-core",
  "tokio",
+ "unicode-general-category",
+ "unicode-segmentation",
  "zeroize",
 ]
 

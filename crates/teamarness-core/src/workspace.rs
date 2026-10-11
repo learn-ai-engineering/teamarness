@@ -19,7 +19,16 @@ const VERSION_DOMAIN: &[u8] = b"teamarness.membership-version/v1";
 type Resolver = StrongRemove<AuthId, Hash, OperationAdapter, ()>;
 type MembershipCrdt = GroupCrdt<AuthId, Hash, OperationAdapter, (), Resolver>;
 type StoredOperationRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>);
-type CreationRequestRow = (Vec<u8>, Vec<u8>, String, i64, Vec<u8>, Vec<u8>, String);
+type CreationRequestRow = (
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    i64,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    Option<String>,
+);
 
 #[derive(Clone)]
 struct CreationRequest {
@@ -30,6 +39,7 @@ struct CreationRequest {
     genesis_id: MembershipOperationId,
     genesis_envelope: Vec<u8>,
     status: String,
+    initial_person_name: Option<String>,
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<(), WorkspaceError> {
@@ -70,6 +80,44 @@ pub(crate) fn create(
     )
 }
 
+pub(crate) fn create_named(
+    connection: &mut Connection,
+    secret_key: &SecretKey,
+    workspace_name: &str,
+    person_name: &str,
+    authored_at_unix_ms: i64,
+) -> Result<WorkspaceSummary, WorkspaceError> {
+    crate::person_names::validate(person_name).map_err(|_| WorkspaceError::InvalidName)?;
+    create_with_initial_name(
+        connection,
+        secret_key,
+        workspace_name,
+        Some(person_name),
+        authored_at_unix_ms,
+        |_| Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn create_named_with_test_fault(
+    connection: &mut Connection,
+    secret_key: &SecretKey,
+    workspace_name: &str,
+    person_name: &str,
+    authored_at_unix_ms: i64,
+    fault: impl FnMut(CreationBoundary) -> Result<(), StorageError>,
+) -> Result<WorkspaceSummary, WorkspaceError> {
+    crate::person_names::validate(person_name).map_err(|_| WorkspaceError::InvalidName)?;
+    create_with_initial_name(
+        connection,
+        secret_key,
+        workspace_name,
+        Some(person_name),
+        authored_at_unix_ms,
+        fault,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn create_with_test_fault(
     connection: &mut Connection,
@@ -85,6 +133,24 @@ fn create_with_fault(
     connection: &mut Connection,
     secret_key: &SecretKey,
     name: &str,
+    authored_at_unix_ms: i64,
+    mut fault: impl FnMut(CreationBoundary) -> Result<(), StorageError>,
+) -> Result<WorkspaceSummary, WorkspaceError> {
+    create_with_initial_name(
+        connection,
+        secret_key,
+        name,
+        None,
+        authored_at_unix_ms,
+        &mut fault,
+    )
+}
+
+fn create_with_initial_name(
+    connection: &mut Connection,
+    secret_key: &SecretKey,
+    name: &str,
+    initial_person_name: Option<&str>,
     authored_at_unix_ms: i64,
     mut fault: impl FnMut(CreationBoundary) -> Result<(), StorageError>,
 ) -> Result<WorkspaceSummary, WorkspaceError> {
@@ -112,8 +178,8 @@ fn create_with_fault(
         .execute(
             "INSERT INTO workspace_creation_requests (
                 workspace_id, creator_public_identity, name, authored_at_unix_ms,
-                genesis_operation_id, genesis_envelope, status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Pending')",
+                genesis_operation_id, genesis_envelope, status, initial_person_name
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Pending', ?7)",
             params![
                 workspace_id.as_bytes().as_slice(),
                 creator.as_bytes().as_slice(),
@@ -121,6 +187,7 @@ fn create_with_fault(
                 authored_at_unix_ms,
                 genesis.id.as_bytes().as_slice(),
                 genesis.canonical_bytes(),
+                initial_person_name,
             ],
         )
         .map_err(|_| WorkspaceError::Conflict)?;
@@ -137,6 +204,7 @@ fn create_with_fault(
         genesis_id: genesis.id,
         genesis_envelope: genesis.canonical_bytes().to_vec(),
         status: "Pending".to_owned(),
+        initial_person_name: initial_person_name.map(str::to_owned),
     };
     finish_request_with_fault(connection, &request, &mut fault).map_err(workspace_from_storage)?;
     Ok(summary(&request))
@@ -263,6 +331,28 @@ fn finish_request_with_fault(
         }
     }
 
+    if let Some(name) = &request.initial_person_name {
+        crate::person_names::validate(name).map_err(|_| StorageError::CorruptWorkspace)?;
+        let person = crate::person_names::derive(request.workspace_id, request.genesis_id);
+        transaction.execute(
+            "INSERT INTO workspace_person_names (workspace_id, person_id, anchor_operation_id, owner_public_identity, name)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(workspace_id, person_id) DO NOTHING",
+            params![request.workspace_id.as_bytes().as_slice(), person.as_bytes(),
+                request.genesis_id.as_bytes().as_slice(), request.creator.as_bytes().as_slice(), name],
+        ).map_err(fault!(StorageError::Database))?;
+        transaction
+            .execute(
+                "INSERT INTO pending_person_name_edits (workspace_id, person_id, name)
+             VALUES (?1, ?2, ?3) ON CONFLICT(workspace_id, person_id) DO NOTHING",
+                params![
+                    request.workspace_id.as_bytes().as_slice(),
+                    person.as_bytes(),
+                    name
+                ],
+            )
+            .map_err(fault!(StorageError::Database))?;
+    }
     insert_or_verify_state(&transaction, request, version)?;
     insert_or_verify_creator(&transaction, request)?;
     let updated = transaction
@@ -461,12 +551,12 @@ fn load_requests(
     let sql = match status {
         Some(_) => {
             "SELECT workspace_id, creator_public_identity, name, authored_at_unix_ms,
-                    genesis_operation_id, genesis_envelope, status
+                    genesis_operation_id, genesis_envelope, status, initial_person_name
              FROM workspace_creation_requests WHERE status = ?1 ORDER BY workspace_id"
         }
         None => {
             "SELECT workspace_id, creator_public_identity, name, authored_at_unix_ms,
-                    genesis_operation_id, genesis_envelope, status
+                    genesis_operation_id, genesis_envelope, status, initial_person_name
              FROM workspace_creation_requests ORDER BY workspace_id"
         }
     };
@@ -482,6 +572,7 @@ fn load_requests(
             row.get::<_, Vec<u8>>(4)?,
             row.get::<_, Vec<u8>>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     };
     let mut requests = Vec::new();
@@ -508,7 +599,16 @@ fn load_requests(
 }
 
 fn request_from_row(row: CreationRequestRow) -> Result<CreationRequest, StorageError> {
-    let (workspace, creator, name, authored_at, genesis_id, genesis_envelope, status) = row;
+    let (
+        workspace,
+        creator,
+        name,
+        authored_at,
+        genesis_id,
+        genesis_envelope,
+        status,
+        initial_person_name,
+    ) = row;
     Ok(CreationRequest {
         workspace_id: WorkspaceId::from_bytes(fixed_bytes(&workspace)?),
         creator: PublicIdentity::from_bytes(fixed_bytes(&creator)?)
@@ -518,6 +618,7 @@ fn request_from_row(row: CreationRequestRow) -> Result<CreationRequest, StorageE
         genesis_id: MembershipOperationId::from_hash(Hash::from_bytes(fixed_bytes(&genesis_id)?)),
         genesis_envelope,
         status,
+        initial_person_name,
     })
 }
 
@@ -554,6 +655,7 @@ fn load_workspace(
                 genesis_id,
                 genesis_envelope,
                 "Complete".to_owned(),
+                None,
             ))
         },
     )
@@ -686,6 +788,50 @@ mod tests {
             dependencies,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn interrupted_named_creation_recovers_original_person_and_name() {
+        let directory = std::env::temp_dir().join(format!(
+            "teamarness-named-creation-boundary-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let runtime = crate::storage::open(&directory, 0).unwrap();
+        let mut connection = runtime.connection;
+        let creator = PublicIdentity::from_bytes(*runtime.secret_key.public().as_bytes()).unwrap();
+        let result = create_named_with_test_fault(
+            &mut connection,
+            &runtime.secret_key,
+            "Named fault",
+            "Initial 🧑‍💻",
+            42,
+            |boundary| {
+                if boundary == CreationBoundary::AfterTransactionOne {
+                    Err(StorageError::Database)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        drop(connection);
+        let mut reopened = crate::storage::open(&directory, 0).unwrap();
+        let workspace = list(&reopened.connection).unwrap().pop().unwrap();
+        let projection = crate::membership::projection::recover(&mut reopened.connection, 0)
+            .unwrap()
+            .remove(&workspace.id())
+            .unwrap();
+        let person = crate::person_names::lookup(&reopened.connection, &projection, creator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(person.name(), Some("Initial 🧑‍💻"));
+        assert_eq!(
+            person.id(),
+            crate::person_names::derive(workspace.id(), projection.genesis_id())
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

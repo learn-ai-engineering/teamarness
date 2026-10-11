@@ -490,3 +490,99 @@ async fn malformed_handler_request_gets_a_stable_error_without_state_change() {
 fn protocol_operation_limit_is_fixed() {
     assert_eq!(MAX_OPERATIONS, 1_024);
 }
+
+#[tokio::test]
+async fn named_join_survives_inviter_admission_fault_and_recovers_one_person() {
+    for boundary in [
+        RedemptionBoundary::BeforeCommit,
+        RedemptionBoundary::AfterCommit,
+    ] {
+        let issuer_directory = directory("named-issuer-fault");
+        let invitee_directory = directory("named-invitee-fault");
+        let issuer =
+            CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&issuer_directory))
+                .await
+                .unwrap();
+        let invitee =
+            CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&invitee_directory))
+                .await
+                .unwrap();
+        let workspace = issuer.create_workspace("Named recovery").unwrap();
+        let invitation = issuer
+            .create_workspace_invitation(workspace.id())
+            .await
+            .unwrap();
+        let token = invitation.verified().unwrap().token;
+        {
+            let mut connection = Connection::open(invitee_directory.join("core.sqlite3")).unwrap();
+            crate::person_names::stage_join(
+                &mut connection,
+                workspace.id(),
+                token.id.as_bytes(),
+                "Original",
+            )
+            .unwrap();
+        }
+        let claim = invitee
+            .create_claim_for_invitation_test(&invitation)
+            .unwrap();
+        assert!(
+            issuer
+                .admit_and_export_for_test(&claim, invitee.public_identity(), Some(boundary))
+                .is_err()
+        );
+        assert_eq!(
+            count_admissions(&issuer_directory),
+            if boundary == RedemptionBoundary::BeforeCommit {
+                (0, 0)
+            } else {
+                (1, 1)
+            }
+        );
+        issuer.shutdown().await.unwrap();
+        drop(issuer);
+        let reopened =
+            CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&issuer_directory))
+                .await
+                .unwrap();
+        let response = reopened
+            .admit_and_export_for_test(&claim, invitee.public_identity(), None)
+            .unwrap();
+        assert_eq!(count_admissions(&issuer_directory), (1, 1));
+        invitee
+            .import_response_for_test(&invitation, decode_success(&response).unwrap(), None)
+            .unwrap();
+        let (_, snapshot) = invitee
+            .join_workspace_with_person_name(&invitation, "Original")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.members().len(), 2);
+        assert_eq!(
+            invitee
+                .workspace_person(workspace.id(), invitee.public_identity())
+                .unwrap()
+                .unwrap()
+                .name(),
+            Some("Original")
+        );
+        let (_, retry) = invitee
+            .join_workspace_with_person_name(&invitation, "Changed")
+            .await
+            .unwrap();
+        assert_eq!(retry, snapshot);
+        assert_eq!(count_admissions(&issuer_directory), (1, 1));
+        assert_eq!(
+            invitee
+                .workspace_person(workspace.id(), invitee.public_identity())
+                .unwrap()
+                .unwrap()
+                .name(),
+            Some("Changed")
+        );
+        invitee.shutdown().await.unwrap();
+        reopened.shutdown().await.unwrap();
+        drop((invitee, reopened));
+        fs::remove_dir_all(issuer_directory).unwrap();
+        fs::remove_dir_all(invitee_directory).unwrap();
+    }
+}
