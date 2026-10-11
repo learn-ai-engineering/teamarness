@@ -46,7 +46,7 @@ After the first command builds the debug executable, start a second Installation
 npm run dev:instance -- bob
 ```
 
-Each profile owns a distinct Installation identity and `core.sqlite3`. Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
+Each profile owns a distinct Installation identity and `core.sqlite3`. When creating or joining a Workspace, choose a Workspace-specific Person name; members can rename themselves in Workspace settings. Conversations shows remote authors' current names, updates already displayed Messages after rename, and retains an inspectable full Installation Public Identity. Duplicate or missing names keep an identity fallback; your own Messages remain `You`. Two-profile manual rename/restart verification for this incremental workstream is still outstanding. Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
 
 An absolute directory is available as an expert override. Arbitrary relative paths are rejected:
 

@@ -71,6 +71,11 @@ impl Backend {
                 "grant": RECORD_GRANT,
                 "major": 1,
                 "minor": 0,
+            }, {
+                "identity": "teamarness.person-names",
+                "grant": "bmFtZS1ncmFudA",
+                "major": 1,
+                "minor": 0,
             }],
             "limits": {},
         }));

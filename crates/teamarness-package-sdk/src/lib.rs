@@ -124,6 +124,11 @@ pub struct EventSender {
 }
 
 impl EventSender {
+    /// Resolves when the Package event receiver has closed (for detached publishers).
+    pub async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
     /// Sends one object event, waiting only on the SDK's bounded Package queue.
     pub async fn send(&self, payload: JsonValue) -> Result<(), SdkError> {
         if !payload.is_object() {

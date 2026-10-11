@@ -60,6 +60,8 @@ export function shortenedIdentity(identity: string): string {
   return `${identity.slice(0, 8)}…${identity.slice(-6)}`;
 }
 
-export function authorLabel(author: string, localIdentity?: string, isLocal?: boolean): string {
-  return isLocal || (localIdentity !== undefined && author === localIdentity) ? "You" : shortenedIdentity(author);
+export function authorLabel(author: string, localIdentity?: string, isLocal?: boolean,
+  name?: string | null, duplicate = false): string {
+  if (isLocal || (localIdentity !== undefined && author === localIdentity)) return "You";
+  return name ? (duplicate ? `${name} · ${shortenedIdentity(author)}` : name) : shortenedIdentity(author);
 }

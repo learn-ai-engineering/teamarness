@@ -1,5 +1,5 @@
 import { isPackageRequestError, packageErrorCode, type TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Availability, ConversationsContract } from "./contract.generated";
+import type { Availability, ConversationsContract, Names } from "./contract.generated";
 import type {
   ConversationChannel,
   ConversationMessage,
@@ -20,6 +20,7 @@ export interface ControllerState {
   readonly selectedSlug: string | null;
   readonly selectedCanHide: boolean;
   readonly messages: readonly ConversationMessage[];
+  readonly names: Names;
   readonly hasMore: boolean;
   readonly nextBefore: string | null;
   readonly loading: boolean;
@@ -193,6 +194,7 @@ export class ConversationsController {
       selectedSlug: null,
       selectedCanHide: false,
       messages: [],
+      names: { available: false, cursor: "0", persons: [] },
       hasMore: false,
       nextBefore: null,
       loading: true,
@@ -215,6 +217,16 @@ export class ConversationsController {
   /** Returns an immutable snapshot of the current state. */
   get state(): ControllerState {
     return this._state;
+  }
+
+  /** A profile cursor invalidates presentation, never Message authorship or history. */
+  applyNames(names: Names): void {
+    if (this.disposed) return;
+    if (names.available && this._state.names.available
+      && BigInt(names.cursor) < BigInt(this._state.names.cursor)) return;
+    this._state = { ...this._state, names: names.available
+      ? names : { available: false, cursor: "0", persons: [] } };
+    this.notify();
   }
 
   // ------------------------------------------------------------------

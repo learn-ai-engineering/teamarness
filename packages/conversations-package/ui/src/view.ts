@@ -38,6 +38,7 @@ export class ConversationsView {
   private inputRevision = 0;
   private renderedChannelId: string | null = null;
   private renderedMessages: ControllerState["messages"] | null = null;
+  private renderedNames: ControllerState["names"] | null = null;
   private renderedOldestId: string | null = null;
   private fillTimer: ReturnType<typeof setTimeout> | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -496,8 +497,10 @@ export class ConversationsView {
   }
 
   private renderHistory(state: ControllerState): void {
-    if (this.renderedChannelId === state.selectedChannelId && this.renderedMessages === state.messages) return;
+    if (this.renderedChannelId === state.selectedChannelId && this.renderedMessages === state.messages
+      && this.renderedNames === state.names) return;
     this.renderedMessages = state.messages;
+    this.renderedNames = state.names;
     // Messages read oldest at the top, newest at the bottom, and a Channel opens at the newest
     // one (TEAM.SYS.CONV-R08). Once a Member scrolls up, their position is kept.
     const openedChannel = state.selectedChannelId !== this.renderedChannelId;
@@ -542,6 +545,11 @@ export class ConversationsView {
 
     for (const row of previousRows) this.resizeObserver?.unobserve(row);
     this.history.replaceChildren();
+    const names = new Map(state.names.persons.map(person => [person.identity, person.name]));
+    const counts = new Map<string, number>();
+    for (const person of state.names.persons) {
+      if (person.name) counts.set(person.name, (counts.get(person.name) ?? 0) + 1);
+    }
     let previousLocal = false;
     for (const message of state.messages) {
       const row = document.createElement("li");
@@ -554,7 +562,9 @@ export class ConversationsView {
       const author = document.createElement("button");
       author.type = "button";
       author.className = "message-author";
-      author.textContent = authorLabel(message.author, undefined, message.isLocal);
+      const name = names.get(message.author);
+      author.textContent = authorLabel(message.author, undefined, message.isLocal,
+        name, name !== null && name !== undefined && (counts.get(name) ?? 0) > 1);
       author.title = message.author;
       author.setAttribute(
         "aria-label",

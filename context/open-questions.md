@@ -76,21 +76,11 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## TEAM-DQ8 - Recognizable remote-member names
 
-**Blocks:** Member presentation in the Shell and Packages; Phase 5 human identity and multi-device design
+**Status:** decided for one Installation per Workspace Person in ADR 0022; delivery on `feature/member-names` awaits independent review and two-instance Verify.
 
-**Question:** When a Workspace displays a remote Member, should its recognizable name be a local alias, a signed Installation Display Name shared with peers, a future human profile name, or a combination with explicit precedence?
+A Member chooses a Unicode Workspace Person Name at create/join and may rename only their own Person. Core signs and synchronizes names separately from Canonical Membership. Shell and Packages consume the same current-name projection through `teamarness.person-names` 1.0; absent, duplicate, or temporarily stale names retain a fingerprint and inspectable full Installation Public Identity. Names do not grant membership and are not Installation Display Names. Conversations relabels existing Messages on rename without modifying their signed author identities. Other Workspace names remain independent.
 
-**Current state:** The Core Runtime stores a validated Installation Display Name as local metadata. Canonical membership identifies Members by Public Identity and does not distribute names. The Shell therefore falls back to long public keys for remote Members.
-
-**What must be resolved:** Define who owns and signs a name, whether it is local or shared, its privacy boundary, rename and conflict behavior, offline convergence, multi-device presentation, and the fallback when no trusted name exists. A display name or alias must never become membership or authorization authority.
-
-**Direction (2026-09-17, developer):** Teams using Teamarness know each other, so each person gives a single name field (typically a first name, with no surname) when creating or joining a Workspace, and every other Member sees that name. Generated adjective-animal aliases are temporary and will be removed. Ownership, signing, rename, conflict, and fallback rules remain to be designed.
-
-**Unresolved: Workspace-scoped or Installation-scoped name (2026-09-17).** The developer considered letting a person use a different name, or an emoji, in each Workspace. That conflicts with `TEAM.SYS.ID-R05`, which defines one Installation Display Name per Installation and does not allow emoji. No decision is made. Before choosing, compare the approaches and their trade-offs: a per-Workspace name, a per-Installation name, or a per-Installation default with per-Workspace overrides. Cover storage, validation, privacy, rename behavior, and multi-device support.
-
-**Sequencing (2026-09-17, developer):** Implementation waits for membership synchronization from the architecture review, which main now carries (merged 2026-09-22).
-
-**Intended destination:** The Member names follow-up workstream in `context/roadmap.md` resolves this for one Installation per person, after the architecture review delivers membership synchronization. Phase 5 extends it to multiple devices.
+**Still open for Phase 5:** Group multiple Installation identities under one stable Workspace Person without changing its ID or name; specify authorized name writers and conflict rules for multiple devices. Historical at-message-time names and cryptographic secrecy after revocation are not delivered by this workstream.
 
 ---
 

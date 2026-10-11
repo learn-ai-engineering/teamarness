@@ -93,6 +93,69 @@ function liveHistorySource(current: () => ConversationPage["messages"]) {
   });
 }
 
+describe("Workspace Person author presentation", () => {
+  it("closes names even when closing changes fails", async () => {
+    const root = shadowRoot();
+    const source = createFakePackageClient({
+      requests: {
+        "conversations.snapshot": () => snapshot(),
+        "conversations.channel.open": () => emptyPage(),
+      },
+      subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined },
+    });
+    let namesClosed = false;
+    const client: PackageClient = {
+      ...source.client,
+      subscribe: async (...args) => {
+        const subscription = await source.client.subscribe(...args);
+        if (args[0] === "conversations.changes") {
+          return { close: async () => { throw new Error("changes close failed"); } };
+        }
+        return { close: async () => { namesClosed = true; await subscription.close(); } };
+      },
+    };
+    const unmount = await mount(createTestMountContext({ root, client }));
+    await expect(unmount()).rejects.toThrow("changes close failed");
+    expect(namesClosed).toBe(true);
+  });
+
+  it("updates already displayed remote Messages on rename and distinguishes duplicate or missing names", async () => {
+    const root = shadowRoot();
+    const alice = "a".repeat(64);
+    const bob = "b".repeat(64);
+    const missing = "c".repeat(64);
+    const source = createFakePackageClient({
+      requests: {
+        "conversations.snapshot": () => snapshot(),
+        "conversations.channel.open": () => ({ ...emptyPage(), messages: [
+          { ...message("self"), id: "4", author: alice, isLocal: true },
+          { ...message("unknown"), id: "3", author: missing },
+          { ...message("bob"), id: "2", author: bob },
+          { ...message("alice"), id: "1", author: alice },
+        ] }),
+      },
+      subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined },
+    });
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const labels = () => [...root.querySelectorAll<HTMLButtonElement>(".message-author")].map(node => node.textContent);
+    const person = (identity: string, name: string | null) => ({ identity, personId: identity,
+      name, fingerprint: identity.slice(0, 12) });
+    expect(labels()).toEqual(["aaaaaaaa…aaaaaa", "bbbbbbbb…bbbbbb", "cccccccc…cccccc", "You"]);
+    await source.emit("conversations.names", { available: true, cursor: "1", persons: [person(alice, "🌿 A"), person(bob, "B")] });
+    expect(labels()).toEqual(["🌿 A", "B", "cccccccc…cccccc", "You"]);
+    await source.emit("conversations.names", { available: true, cursor: "2", persons: [person(alice, "B"), person(bob, "B")] });
+    expect(labels()).toEqual(["B · aaaaaaaa…aaaaaa", "B · bbbbbbbb…bbbbbb", "cccccccc…cccccc", "You"]);
+    await source.emit("conversations.names", { available: true, cursor: "1", persons: [person(alice, "old")] });
+    expect(labels()[0]).toBe("B · aaaaaaaa…aaaaaa");
+    root.querySelector<HTMLButtonElement>(".message-author")!.click();
+    expect(labels()[0]).toBe(alice);
+    await source.emit("conversations.names", { available: false, cursor: "0", persons: [] });
+    expect(labels()[0]).toBe("aaaaaaaa…aaaaaa");
+    expect(labels()[3]).toBe("You");
+    await unmount();
+  });
+});
+
 describe("Conversations Package surface", () => {
   function backend(options: {
     availability?: ConversationSnapshot["availability"];
@@ -610,8 +673,8 @@ describe("pending post and live refresh", () => {
         }
         throw new Error(`Unexpected operation: ${operation}`);
       },
-      subscribe: async (_operation, _payload, listener) => {
-        deliver = listener as unknown as typeof deliver;
+      subscribe: async (operation, _payload, listener) => {
+        if (operation === "conversations.changes") deliver = listener as unknown as typeof deliver;
         return { close: async () => undefined };
       },
     };
@@ -763,8 +826,8 @@ describe("automatic older history in the Message container", () => {
         if (operation === "conversations.message.post") return { ok: true } as unknown as T;
         throw new Error(`Unexpected operation: ${operation}`);
       },
-      subscribe: async (_operation, _payload, listener) => {
-        deliver = listener as unknown as typeof deliver;
+      subscribe: async (operation, _payload, listener) => {
+        if (operation === "conversations.changes") deliver = listener as unknown as typeof deliver;
         return { close: async () => undefined };
       },
     };

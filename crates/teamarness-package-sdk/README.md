@@ -73,7 +73,9 @@ The SDK owns the codes that are not about a product: `package.not_active`, `pack
 
 ## Semantic Capabilities
 
-`capabilities::{workspace_context, membership, signing, record_log}` are typed clients over the granted capabilities; each is built from the `Initialization` and the capability client. They decode the capability's own shapes, and answer `package.invalid_capability_response` rather than guessing when a value is not one the contract describes.
+`capabilities::{workspace_context, membership, person_names, signing, record_log}` are typed clients over the granted capabilities; each is built from the `Initialization` and the capability client. They decode the capability's own shapes, and answer `package.invalid_capability_response` rather than guessing when a value is not one the contract describes.
+
+`person_names::PersonNames` requires a declared `teamarness.person-names` 1.0 grant. `current` returns at most 1,024 current Workspace Persons with Installation identity, opaque Person ID, optional name and fingerprint. `lookup` resolves one current Installation; `subscribe(after_cursor)` yields coalesced snapshots with a separate durable profile cursor. A missing name is not a membership failure. Use the cursor to refetch or resume after reconnection; do not store names in signed Package records or use them for authorization.
 
 `record_log::run_session` drives a synchronized record log for a Package: it subscribes from the cursor the sink has committed, ingests each record, and only then returns credit, so a record whose ingest fails is redelivered rather than skipped. It resets the cursor once on `cursor_invalid`, reports state and warning events to the sink, and backs off on a retryable failure until its cancellation token fires.
 

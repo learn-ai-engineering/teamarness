@@ -55,13 +55,22 @@ export async function mount(
 
     await controller.catchUpAfterSubscribe();
 
+    // Names are optional presentation: a name stream failure must not prevent Messages.
+    const nameSubscription = await client.subscribe("conversations.names", {}, (names) => {
+      if (!disposed) controller.applyNames(names);
+    }).catch(() => null);
+
     return async () => {
       if (disposed) return;
       disposed = true;
       controller.dispose();
       view?.dispose();
       try {
-        await subscription.close();
+        try {
+          await subscription.close();
+        } finally {
+          await nameSubscription?.close();
+        }
       } finally {
         cleanupStyles();
         cleanupKit();

@@ -38,6 +38,24 @@ async function failedSwitch(rejection: unknown): Promise<ConversationsController
   return controller;
 }
 
+describe("Workspace Person names", () => {
+  it("relabels an existing remote Message on rename without changing its signed author", async () => {
+    const fake = delayedClient();
+    const controller = new ConversationsController(fake.client, () => undefined);
+    const initial = controller.initialize();
+    await Promise.resolve();
+    fake.pending[0]!.reply.resolve({ messages: [message(1)], epoch, revision: "0" });
+    await initial;
+    controller.applyNames({ available: true, cursor: "1", persons: [{ identity: "alice", personId: "p1", name: "🌿 Alice", fingerprint: "alice" }] });
+    expect(controller.state.messages[0]?.author).toBe("alice");
+    expect(controller.state.names.persons[0]?.name).toBe("🌿 Alice");
+    controller.applyNames({ available: true, cursor: "2", persons: [{ identity: "alice", personId: "p1", name: "Alice 🌻", fingerprint: "alice" }] });
+    controller.applyNames({ available: true, cursor: "1", persons: [] });
+    expect(controller.state.names.persons[0]?.name).toBe("Alice 🌻");
+    expect(controller.state.messages[0]?.author).toBe("alice");
+  });
+});
+
 describe("Conversations operation errors", () => {
   it("shows the Package code's hidden-Channel message", async () => {
     expect((await failedSwitch(packageRequestError("conversations.channel_hidden", false))).state.warning)

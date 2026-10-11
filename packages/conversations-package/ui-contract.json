@@ -42,6 +42,24 @@
         "unreadCount": { "type": "integer", "minimum": 0 }
       }
     },
+    "personName": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "personId", "name", "fingerprint"],
+      "properties": {
+        "identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "personId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+        "fingerprint": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "names": {
+      "type": "object", "additionalProperties": false, "required": ["available", "cursor", "persons"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "cursor": { "$ref": "#/$defs/revision" },
+        "persons": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/personName" } }
+      }
+    },
     "message": {
       "type": "object",
       "additionalProperties": false,
@@ -121,6 +139,10 @@
     }
   },
   "subscriptions": {
+    "conversations.names": {
+      "request": { "type": "object", "additionalProperties": false },
+      "event": { "$ref": "#/$defs/names" }
+    },
     "conversations.changes": {
       "request": { "type": "object", "additionalProperties": false },
       "event": { "$ref": "#/$defs/snapshot" }

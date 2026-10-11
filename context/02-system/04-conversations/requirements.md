@@ -66,6 +66,10 @@ The Package SHALL report Package-level availability of `waiting_for_history_acce
 
 The Package UI SHALL render only a limited Markdown subset (paragraphs, emphasis, headings, lists, quotations, code, horizontal rules, and links). It SHALL NOT render raw HTML, images, or other fetchable media. Only `http`, `https`, `mailto`, `tel`, and relative links SHALL be allowed, and they SHALL open with no opener or referrer.
 
+## TEAM.SYS.CONV-R17 — Workspace Person Author Presentation
+
+The Conversations Backend SHALL declare and consume the generic `teamarness.person-names` 1.0 capability for current Workspace Person names and bounded, resumable profile updates. The typed Package UI contract SHALL forward name snapshots independently of immutable Message records. The UI SHALL relabel already loaded remote Messages after rename without modifying their signed Installation author identity; own Messages SHALL keep the stable `You` label. Missing, duplicate, or unavailable profile data SHALL retain a visible distinguishing Installation identity fallback, and the full identity SHALL remain inspectable. A profile stream failure SHALL NOT prevent Channel or Message use. The Core Runtime, Host and Shell SHALL contain no Conversations-specific name logic.
+
 ## TEAM.SYS.CONV-R16 — Delivery Qualification
 
 On an ordinary supported development machine, a reachable peer SHALL show a new Message within 5 seconds, and a reconnecting peer SHALL catch up on 1,000 queued records within 30 seconds. Delivery SHALL meet these targets in a Workspace of 25 Members. Channel and history queries SHALL stay bounded with 100 Channels and 100,000 Messages in one Workspace.

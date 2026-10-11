@@ -43,6 +43,12 @@ export type Message = {
   readonly "position": Position;
 };
 
+export type Names = {
+  readonly "available": boolean;
+  readonly "cursor": Revision;
+  readonly "persons": readonly PersonName[];
+};
+
 export type Page = {
   readonly "epoch": Epoch;
   readonly "messages": readonly Message[];
@@ -55,6 +61,13 @@ export type PendingRow = {
   readonly "id": string;
   readonly "position": Position;
   readonly "status": "pending" | "unavailable";
+};
+
+export type PersonName = {
+  readonly "fingerprint": string;
+  readonly "identity": string;
+  readonly "name": string | null;
+  readonly "personId": string;
 };
 
 export type Position = string;
@@ -111,5 +124,6 @@ export type ConversationsContract = {
   };
   readonly subscriptions: {
     readonly "conversations.changes": { readonly request: Record<string, never>; readonly event: Snapshot };
+    readonly "conversations.names": { readonly request: Record<string, never>; readonly event: Names };
   };
 };

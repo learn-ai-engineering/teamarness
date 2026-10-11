@@ -21,7 +21,144 @@ use support::harness::{
     open_core, open_host, open_mount, poll_short, poll_until, shutdown, snapshot_has_warning,
 };
 use teamarness_core::CoreRuntime;
-use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
+use teamarness_package_host::{
+    OpenUiSubscription, PackageHostCommand, PackageHostNotification,
+    PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey, PackageValue,
+    UiSubscriptionId, WorkspaceId,
+};
+
+/// Verifies: TEAM.SYS.CONV-R17 — two independent Core/Host/Backend profiles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn existing_remote_message_keeps_author_while_person_name_changes() {
+    let application = support::harness::StagedApplication::new();
+    let root = application.root.path();
+    let alice_core = open_core(Addressing::Loopback, &root.join("name-alice-core")).await;
+    let workspace = alice_core.create_workspace("Names").unwrap();
+    let workspace_id = workspace.id();
+    alice_core
+        .set_own_person_name(workspace_id, "Alice")
+        .unwrap();
+    let key = PackageInstanceKey::new(
+        PackageIdentity::from_str(PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace_id.to_string()).unwrap(),
+    );
+    let alice_host = open_host(
+        &application.application_path,
+        root.join("name-alice-host"),
+        alice_core.clone(),
+    )
+    .await;
+    let alice_mount = open_mount(&alice_host, &key).await;
+    let alice = ConversationClient {
+        host: &alice_host,
+        mount: &alice_mount,
+    };
+    alice
+        .post_message("names-old-message", GENERAL_ID, "authored before rename")
+        .await;
+
+    let invitation = create_invitation(&alice_core, workspace_id).await;
+    let bob_core = open_core(Addressing::Loopback, &root.join("name-bob-core")).await;
+    introduce(Addressing::Loopback, &[&alice_core, &bob_core]);
+    bob_core.join_workspace(&invitation).await.unwrap();
+    drop(invitation);
+    let bob_host = open_host(
+        &application.application_path,
+        root.join("name-bob-host"),
+        bob_core.clone(),
+    )
+    .await;
+    let bob_mount = open_mount(&bob_host, &key).await;
+    let bob = ConversationClient {
+        host: &bob_host,
+        mount: &bob_mount,
+    };
+    assert!(
+        poll_short(|| async {
+            has_message_on_page(
+                &bob.channel_open("names-before", GENERAL_ID, 32).await,
+                "authored before rename",
+            )
+        })
+        .await
+    );
+
+    let subscription = UiSubscriptionId::new("names-across-peers").unwrap();
+    bob_host
+        .execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+            mount: bob_mount.clone(),
+            subscription: subscription.clone(),
+            operation: "conversations.names".into(),
+            payload: object([]),
+        }))
+        .await
+        .unwrap();
+    let mut events = bob_host
+        .subscribe(PackageHostSubscriptionSelector::UiEvents {
+            mount: bob_mount.clone(),
+            subscription,
+        })
+        .await
+        .unwrap();
+    let author = alice_core.public_identity().to_string();
+    let contains_name = |payload: &PackageValue, expected: &str| {
+        let PackageValue::Object(fields) = payload else {
+            return false;
+        };
+        let Some(PackageValue::Array(persons)) = fields.get("persons") else {
+            return false;
+        };
+        persons.iter().any(|person| {
+            matches!(person, PackageValue::Object(person)
+            if person.get("identity") == Some(&PackageValue::String(author.clone()))
+            && person.get("name") == Some(&PackageValue::String(expected.into())))
+        })
+    };
+    let saw_initial = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let PackageHostNotification::UiEvent(event) = events.changed().await.unwrap()
+                && contains_name(&event.payload, "Alice")
+            {
+                break true;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(saw_initial);
+    alice_core
+        .set_own_person_name(workspace_id, "Alice 🌻")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let PackageHostNotification::UiEvent(event) = events.changed().await.unwrap()
+                && contains_name(&event.payload, "Alice 🌻")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("renamed Person reaches Bob's Conversations UI stream");
+    let page = bob.channel_open("names-after", GENERAL_ID, 32).await;
+    let PackageValue::Object(fields) = page else {
+        panic!("expected history page")
+    };
+    let Some(PackageValue::Array(messages)) = fields.get("messages") else {
+        panic!("expected Messages")
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, PackageValue::Object(row)
+        if row.get("markdown") == Some(&PackageValue::String("authored before rename".into()))
+        && row.get("author") == Some(&PackageValue::String(author.clone()))))
+    );
+    shutdown(bob_host).await;
+    shutdown(alice_host).await;
+    bob_core.shutdown().await.unwrap();
+    alice_core.shutdown().await.unwrap();
+}
 
 /// Verifies: TEAM.SYS.TRANS-R08, TEAM.SYS.CONV-R04, TEAM.SYS.CONV-R12
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
@@ -68,6 +69,7 @@ struct Session {
 pub struct ConversationsActive {
     store: ConversationStore,
     log: RecordLog,
+    names: PersonNames,
     sync: Arc<Mutex<SyncReport>>,
     changes: watch::Sender<u64>,
     /// The Installation this Package Instance belongs to, which decides who may hide a Channel.
@@ -160,6 +162,11 @@ pub(crate) fn router_observing(
             .await?;
             let log = RecordLog::from_initialization(&initialization, capabilities)
                 .map_err(|cause| capability_error("record-log", cause))?;
+            let names = PersonNames::from_initialization(
+                &initialization,
+                activation.capabilities().clone(),
+            )
+            .map_err(|cause| capability_error("person-names", cause))?;
             rehydrate(&store, &log, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
@@ -176,6 +183,7 @@ pub(crate) fn router_observing(
             Ok(ConversationsActive {
                 store,
                 log,
+                names,
                 sync,
                 changes,
                 installation: initialization.installation().identity.clone(),
@@ -291,6 +299,70 @@ pub(crate) fn router_observing(
         },
     )
     .subscription(
+        "conversations.names",
+        |context: Context<ConversationsActive>, _: Empty| async move {
+            let (sender, subscription) = event_channel(4);
+            let names = context.state().names.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut cursor = match names.current().await {
+                        Ok(snapshot) => {
+                            let cursor = snapshot.cursor;
+                            if sender.send(name_snapshot(snapshot)).await.is_err() {
+                                return;
+                            }
+                            cursor
+                        }
+                        Err(_) => {
+                            if sender
+                                .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
+                    if let Ok(mut stream) = names.subscribe(cursor).await {
+                        loop {
+                            let result = tokio::select! {
+                                result = stream.next() => result,
+                                () = sender.closed() => {
+                                    stream.close().await;
+                                    return;
+                                }
+                            };
+                            match result {
+                                Some(Ok(snapshot)) => {
+                                    if snapshot.cursor >= cursor {
+                                        cursor = snapshot.cursor;
+                                        if sender.send(name_snapshot(snapshot)).await.is_err() {
+                                            stream.close().await;
+                                            return;
+                                        }
+                                    }
+                                }
+                                Some(Err(_)) | None => break,
+                            }
+                        }
+                        stream.close().await;
+                    }
+                    if sender
+                        .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
+            Ok(subscription)
+        },
+    )
+    .subscription(
         "conversations.changes",
         |context: Context<ConversationsActive>, _: Empty| async move {
             let (sender, subscription) = event_channel(32);
@@ -313,6 +385,19 @@ pub(crate) fn router_observing(
             Ok(subscription)
         },
     )
+}
+
+fn name_snapshot(snapshot: PersonNameSnapshot) -> JsonValue {
+    let event = json!({ "available": true, "cursor": snapshot.cursor.to_string(),
+        "persons": snapshot.persons.into_iter().map(|person| json!({
+            "identity": person.identity, "personId": person.person_id,
+            "name": person.name, "fingerprint": person.fingerprint,
+        })).collect::<Vec<_>>() });
+    if serde_json::to_vec(&event).is_ok_and(|bytes| bytes.len() <= HISTORY_REPLY_BUDGET) {
+        event
+    } else {
+        json!({ "available": false, "cursor": "0", "persons": [] })
+    }
 }
 
 impl ConversationsActive {
@@ -898,6 +983,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
                 .capability(RECORD_LOG, scripted.clone())
+                .capability("teamarness.person-names", ScriptedCapability::new())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -2110,6 +2196,152 @@ mod session_tests {
         assert_eq!(channels[0]["id"], hex_id(GENERAL_ID));
         assert_eq!(channels[0]["canHide"], false);
         session.harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn oversized_person_name_snapshot_falls_back_before_the_ui_bridge_limit() {
+        use teamarness_package_sdk::capabilities::person_names::PersonName;
+        let snapshot = PersonNameSnapshot {
+            workspace_id: "a".repeat(32),
+            cursor: 1,
+            persons: (0..1024)
+                .map(|n| PersonName {
+                    identity: format!("{n:064x}"),
+                    person_id: format!("{n:064x}"),
+                    name: Some("🌻".repeat(64)),
+                    fingerprint: "a".repeat(12),
+                })
+                .collect(),
+        };
+        let event = name_snapshot(snapshot);
+        assert_eq!(event["available"], false);
+        assert!(serde_json::to_vec(&event).unwrap().len() < HISTORY_REPLY_BUDGET);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn person_name_changes_relabel_without_mutating_signed_message_author() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = ScriptedCapability::new().calls(|method, _| match method {
+            "current" => Ok(
+                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [
+                { "identity": "b".repeat(64), "personId": "c".repeat(64),
+                  "name": "Alice", "fingerprint": "bbbbbbbbbbbb" }
+            ] }),
+            ),
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        });
+        let observer: ActivationObserver = Arc::new(Mutex::new(None));
+        let mut harness =
+            HarnessBuilder::new(router_observing(Some(observer.clone())).into_backend())
+                .package_identity("dev.teamarness.conversations")
+                .installation(ALICE, "Alice")
+                .data_directory(directory.path())
+                .capability(RECORD_LOG, scripted_log())
+                .capability("teamarness.person-names", names.clone())
+                .start()
+                .await;
+        harness.activate().await.unwrap();
+        let store = observer.lock().unwrap().clone().unwrap().store;
+        let signed_author = "b".repeat(64);
+        let message =
+            DomainRecord::message_post(GENERAL_ID, &signed_author, "before rename").unwrap();
+        store
+            .ingest(
+                &hex(64, 1),
+                &hex(82, 1),
+                &signed_author,
+                message.kind(),
+                "sig",
+                &message.encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        let mut changes = harness
+            .subscribe("conversations.names", json!({}))
+            .await
+            .unwrap();
+        let first = changes.next_event().await.unwrap().unwrap();
+        wait_for_opens(&names, 1).await;
+        assert_eq!(first["persons"][0]["name"], "Alice");
+        assert_eq!(first["persons"][0]["identity"], signed_author);
+        assert_eq!(
+            store
+                .message_rows(&hex_id(GENERAL_ID), None, PAGE_SIZE)
+                .unwrap()[0]
+                .2,
+            signed_author
+        );
+        names
+            .stream()
+            .send(
+                json!({"workspaceId": "a".repeat(32), "cursor": "1", "persons": [
+                    { "identity": signed_author, "personId": "c".repeat(64),
+                      "name": "Alice 🌻", "fingerprint": "bbbbbbbbbbbb" }
+                ]}),
+            )
+            .await;
+        let renamed = tokio::time::timeout(Duration::from_secs(2), changes.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed["persons"][0]["name"], "Alice 🌻");
+        assert_eq!(
+            store
+                .message_rows(&hex_id(GENERAL_ID), None, PAGE_SIZE)
+                .unwrap()[0]
+                .2,
+            signed_author
+        );
+        changes.close().await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closing_idle_names_subscription_closes_capability_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = ScriptedCapability::new().calls(|method, _| match method {
+            "current" => Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [] })),
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        });
+        let mut harness = HarnessBuilder::new(router().into_backend())
+            .package_identity("dev.teamarness.conversations")
+            .installation(ALICE, "Alice")
+            .data_directory(directory.path())
+            .capability(RECORD_LOG, scripted_log())
+            .capability("teamarness.person-names", names.clone())
+            .start()
+            .await;
+        harness.activate().await.unwrap();
+        let mut subscription = harness
+            .subscribe("conversations.names", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            subscription.next_event().await.unwrap().unwrap()["cursor"],
+            "0"
+        );
+        let stream = names.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        subscription.close().await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_until(|| !stream.is_open(), "idle person-names stream closure"),
+        )
+        .await
+        .unwrap();
+        harness.shutdown().await.unwrap();
     }
 
     #[test]
