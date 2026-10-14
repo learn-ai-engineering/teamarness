@@ -16,7 +16,7 @@ export interface TeamarnessBridge {
   joinWorkspace(invitation: string, personName: string): Promise<WorkspaceState>;
   setOwnPersonName(workspaceId: string, name: string): Promise<void>;
   personNameSnapshot(workspaceId: string): Promise<PersonNameSnapshot>;
-  subscribePersonNames(workspaceId: string, afterCursor: string, listener: (snapshot: PersonNameSnapshot) => void): Promise<void>;
+  subscribePersonNames(workspaceId: string, afterCursor: string, listener: (snapshot: PersonNameSnapshot) => void, terminated: () => void): Promise<void>;
   currentMembership(workspaceId: string): Promise<Membership>;
 }
 
@@ -29,8 +29,11 @@ export const bridge: TeamarnessBridge = Object.freeze({
   joinWorkspace: (invitation: string, personName: string) => invoke<WorkspaceState>("join_workspace", { invitation, personName }),
   setOwnPersonName: (workspaceId: string, name: string) => invoke<void>("set_own_person_name", { workspaceId, name }),
   personNameSnapshot: (workspaceId: string) => invoke<PersonNameSnapshot>("person_name_snapshot", { workspaceId }),
-  subscribePersonNames: async (workspaceId: string, afterCursor: string, listener: (snapshot: PersonNameSnapshot) => void) => {
-    const onEvent = new Channel<PersonNameSnapshot>(listener);
+  subscribePersonNames: async (workspaceId: string, afterCursor: string, listener: (snapshot: PersonNameSnapshot) => void, terminated: () => void) => {
+    const onEvent = new Channel<{ kind: "snapshot"; snapshot: PersonNameSnapshot } | { kind: "terminated" }>((event) => {
+      if (event.kind === "terminated") terminated();
+      else listener(event.snapshot);
+    });
     await invoke("subscribe_person_names", { workspaceId, afterCursor, onEvent });
   },
   currentMembership: (workspaceId: string) =>

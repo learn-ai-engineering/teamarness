@@ -47,3 +47,4 @@ void packageShell.startSnapshotUpdates({
   fail: () => { shell.updatePackageSnapshotFailure(); },
 }).catch(() => undefined);
 void controller.load();
+window.addEventListener("beforeunload", () => controller.dispose(), { once: true });

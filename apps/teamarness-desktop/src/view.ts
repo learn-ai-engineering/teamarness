@@ -44,7 +44,11 @@ export class ShellRenderer {
 
 export class ShellController {
   private model: ShellModel = initialModel;
-  private readonly watched = new Set<string>();
+  private readonly watched = new Map<string, number>();
+  private readonly nameRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly nameRetryDelays = new Map<string, number>();
+  private nextWatch = 0;
+  private disposed = false;
 
   public constructor(
     private readonly bridge: TeamarnessBridge,
@@ -53,6 +57,13 @@ export class ShellController {
   ) {}
 
   public snapshot(): ShellModel { return this.model; }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.watched.clear();
+    for (const retry of this.nameRetries.values()) clearTimeout(retry);
+    this.nameRetries.clear();
+  }
 
   public selectWorkspace(workspaceId: string): void {
     if (!this.model.workspaces.some(({ id }) => id === workspaceId)) return;
@@ -152,11 +163,25 @@ export class ShellController {
   }
 
   private watchNames(workspaceId: string): void {
-    if (this.watched.has(workspaceId)) return;
-    this.watched.add(workspaceId);
+    if (this.disposed || this.watched.has(workspaceId) || this.nameRetries.has(workspaceId)) return;
+    const attempt = ++this.nextWatch;
+    this.watched.set(workspaceId, attempt);
     const cursor = this.model.personNames[workspaceId]?.cursor ?? "0";
-    void this.bridge.subscribePersonNames(workspaceId, cursor, (snapshot) => this.receiveNames(snapshot))
-      .catch(() => { this.watched.delete(workspaceId); this.set({ error: "readiness" }); });
+    const terminated = () => {
+      if (this.disposed || this.watched.get(workspaceId) !== attempt) return;
+      this.watched.delete(workspaceId);
+      const delay = this.nameRetryDelays.get(workspaceId) ?? 1000;
+      this.nameRetryDelays.set(workspaceId, Math.min(delay * 2, 30_000));
+      this.nameRetries.set(workspaceId, setTimeout(() => {
+        this.nameRetries.delete(workspaceId);
+        this.watchNames(workspaceId);
+      }, delay));
+    };
+    void this.bridge.subscribePersonNames(workspaceId, cursor, (snapshot) => {
+      if (this.disposed || this.watched.get(workspaceId) !== attempt) return;
+      this.nameRetryDelays.delete(workspaceId);
+      this.receiveNames(snapshot);
+    }, terminated).catch(terminated);
   }
 
   private async loadMemberships(workspaces: readonly Workspace[]): Promise<Record<string, Membership>> {

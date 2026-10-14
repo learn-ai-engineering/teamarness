@@ -195,7 +195,7 @@ pub async fn set_own_person_name(
 pub async fn subscribe_person_names(
     workspace_id: String,
     after_cursor: String,
-    on_event: Channel<PersonNameSnapshotDto>,
+    on_event: Channel<PersonNameStreamEvent>,
     state: State<'_, DesktopState>,
 ) -> Result<(), BridgeError> {
     let workspace =
@@ -218,35 +218,71 @@ pub async fn subscribe_person_names(
         return Err(BridgeError::invalid_input());
     }
     tauri::async_runtime::spawn(async move {
-        let mut cursor = after;
-        loop {
-            let generation = *changes.borrow_and_update();
-            if generation < cursor {
-                break;
-            }
-            if generation > cursor {
-                let snapshot_runtime = Arc::clone(&runtime);
-                let read = tauri::async_runtime::spawn_blocking(move || {
-                    snapshot_runtime.person_name_snapshot(workspace)
-                })
-                .await;
-                let Ok(Ok(snapshot)) = read else {
-                    break;
-                };
-                if snapshot.0 > cursor {
-                    cursor = snapshot.0;
-                    if on_event.send(snapshot_dto(workspace, snapshot)).is_err() {
-                        break;
-                    }
+        forward_person_names(
+            &mut changes,
+            after,
+            || {
+                let runtime = Arc::clone(&runtime);
+                async move {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        runtime.person_name_snapshot(workspace)
+                    })
+                    .await
+                    .ok()?
+                    .ok()
+                    .map(|snapshot| snapshot_dto(workspace, snapshot))
                 }
-                continue;
-            }
-            if changes.changed().await.is_err() {
-                break;
-            }
-        }
+            },
+            |event| on_event.send(event).is_ok(),
+        )
+        .await;
     });
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "snapshot", rename_all = "snake_case")]
+pub enum PersonNameStreamEvent {
+    Snapshot(PersonNameSnapshotDto),
+    Terminated,
+}
+
+async fn forward_person_names<F, Read, Send>(
+    changes: &mut tokio::sync::watch::Receiver<u64>,
+    after: u64,
+    mut read: F,
+    mut send: Send,
+) where
+    F: FnMut() -> Read,
+    Read: std::future::Future<Output = Option<PersonNameSnapshotDto>>,
+    Send: FnMut(PersonNameStreamEvent) -> bool,
+{
+    let mut cursor = after;
+    loop {
+        let generation = *changes.borrow_and_update();
+        if generation < cursor {
+            break;
+        }
+        if generation > cursor {
+            let Some(snapshot) = read().await else {
+                break;
+            };
+            let Ok(next) = snapshot.cursor.parse::<u64>() else {
+                break;
+            };
+            if next > cursor {
+                cursor = next;
+                if !send(PersonNameStreamEvent::Snapshot(snapshot)) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if changes.changed().await.is_err() {
+            break;
+        }
+    }
+    let _ = send(PersonNameStreamEvent::Terminated);
 }
 
 async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
@@ -264,6 +300,46 @@ async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn post_start_name_read_failure_signals_termination() {
+        let (wake, mut changes) = tokio::sync::watch::channel(1_u64);
+        let mut reads = 0;
+        let mut events = Vec::new();
+        forward_person_names(
+            &mut changes,
+            0,
+            || {
+                reads += 1;
+                let snapshot = (reads == 1).then(|| PersonNameSnapshotDto {
+                    workspace_id: "a".repeat(32),
+                    cursor: "1".into(),
+                    persons: vec![],
+                });
+                async move { snapshot }
+            },
+            |event| {
+                if matches!(event, PersonNameStreamEvent::Snapshot(_)) {
+                    wake.send(2).unwrap();
+                }
+                events.push(event);
+                true
+            },
+        )
+        .await;
+        assert_eq!(reads, 2);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PersonNameStreamEvent::Snapshot(_),
+                PersonNameStreamEvent::Terminated
+            ]
+        ));
+        assert_eq!(
+            serde_json::to_value(&events[1]).unwrap(),
+            serde_json::json!({"kind": "terminated"})
+        );
+    }
 
     #[test]
     fn command_registry_is_exact_and_domain_neutral() {

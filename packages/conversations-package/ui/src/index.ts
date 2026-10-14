@@ -33,6 +33,9 @@ export async function mount(
     throw error;
   }
   let disposed = false;
+  let nameRetry: ReturnType<typeof setTimeout> | undefined;
+  let nameSubscription: Awaited<ReturnType<typeof client.subscribe>> | null = null;
+  let nameRetryDelay = 1000;
   let view: ConversationsView | undefined;
   const controller = new ConversationsController(client, () => {
     if (!disposed) view?.render();
@@ -56,13 +59,39 @@ export async function mount(
     await controller.catchUpAfterSubscribe();
 
     // Names are optional presentation: a name stream failure must not prevent Messages.
-    const nameSubscription = await client.subscribe("conversations.names", {}, (names) => {
-      if (!disposed) controller.applyNames(names);
-    }).catch(() => null);
+    const scheduleNameRetry = () => {
+      if (disposed || nameRetry !== undefined) return;
+      nameSubscription = null;
+      nameRetry = setTimeout(() => {
+        nameRetry = undefined;
+        void openNames();
+      }, nameRetryDelay);
+      nameRetryDelay = Math.min(nameRetryDelay * 2, 30_000);
+    };
+    const openNames = async (): Promise<void> => {
+      let terminated = false;
+      try {
+        const opened = await client.subscribe("conversations.names", {}, (names) => {
+          if (!disposed) {
+            nameRetryDelay = 1000;
+            controller.applyNames(names);
+          }
+        }, { onTerminated: () => {
+          terminated = true;
+          scheduleNameRetry();
+        } });
+        if (disposed || terminated) await opened.close();
+        else nameSubscription = opened;
+      } catch {
+        scheduleNameRetry();
+      }
+    };
+    await openNames();
 
     return async () => {
       if (disposed) return;
       disposed = true;
+      if (nameRetry) clearTimeout(nameRetry);
       controller.dispose();
       view?.dispose();
       try {
@@ -78,6 +107,7 @@ export async function mount(
     };
   } catch (error) {
     disposed = true;
+    if (nameRetry) clearTimeout(nameRetry);
     controller.dispose();
     view?.dispose();
     cleanupStyles();

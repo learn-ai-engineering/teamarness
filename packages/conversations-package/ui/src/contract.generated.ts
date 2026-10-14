@@ -46,6 +46,8 @@ export type Message = {
 export type Names = {
   readonly "available": boolean;
   readonly "cursor": Revision;
+  readonly "part"?: number;
+  readonly "parts"?: number;
   readonly "persons": readonly PersonName[];
 };
 

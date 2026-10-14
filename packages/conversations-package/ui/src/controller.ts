@@ -179,6 +179,7 @@ export class ConversationsController {
   private openDirty = false;
   private historyGeneration = 0;
   private historyRebuilding = false;
+  private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
   private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
@@ -222,10 +223,26 @@ export class ConversationsController {
   /** A profile cursor invalidates presentation, never Message authorship or history. */
   applyNames(names: Names): void {
     if (this.disposed) return;
-    if (names.available && this._state.names.available
-      && BigInt(names.cursor) < BigInt(this._state.names.cursor)) return;
-    this._state = { ...this._state, names: names.available
-      ? names : { available: false, cursor: "0", persons: [] } };
+    if (!names.available) {
+      this.pendingNames = null;
+      this._state = { ...this._state, names: { available: false, cursor: "0", persons: [] } };
+      this.notify();
+      return;
+    }
+    if (this._state.names.available && BigInt(names.cursor) < BigInt(this._state.names.cursor)) return;
+    if (names.part !== undefined && names.parts !== undefined) {
+      if (names.part === 0) this.pendingNames = { cursor: names.cursor, parts: names.parts, nextPart: 0, persons: [] };
+      const pending = this.pendingNames;
+      if (!pending || pending.cursor !== names.cursor || pending.parts !== names.parts
+        || names.part !== pending.nextPart) return;
+      this.pendingNames = { ...pending, nextPart: pending.nextPart + 1, persons: [...pending.persons, ...names.persons] };
+      if (names.part !== names.parts - 1) return;
+      names = { available: true, cursor: names.cursor, persons: this.pendingNames.persons };
+      this.pendingNames = null;
+    } else {
+      this.pendingNames = null;
+    }
+    this._state = { ...this._state, names };
     this.notify();
   }
 

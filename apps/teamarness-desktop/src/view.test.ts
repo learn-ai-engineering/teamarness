@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { TeamarnessBridge } from "./bridge";
 import type { BridgeError, Installation, Invitation, Membership, PersonNameSnapshot, Workspace, WorkspaceState } from "./contracts";
@@ -46,6 +46,35 @@ async function rendered(source: ShellModel, route: ShellRoute): Promise<string> 
 }
 
 describe("Shell Workspace screens", () => {
+  it("restarts a terminated name stream from the last cursor and cancels retries on disposal", async () => {
+    vi.useFakeTimers();
+    try {
+      const cursors: string[] = [];
+      const terminals: (() => void)[] = [];
+      let listener: ((snapshot: PersonNameSnapshot) => void) | undefined;
+      const controller = new ShellController(fakeBridge({
+        subscribePersonNames: async (_id, cursor, next, terminated) => {
+          cursors.push(cursor);
+          listener = next;
+          terminals.push(terminated);
+        },
+      }), () => undefined);
+      await controller.load();
+      expect(cursors).toEqual(["0"]);
+      listener?.({ workspaceId: workspace.id, cursor: "1", persons: [] });
+      terminals[0]?.();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cursors).toEqual(["0", "1"]);
+      listener?.({ workspaceId: workspace.id, cursor: "2", persons: [
+        { identity: installation.identity, personId: "a".repeat(64), name: "Renamed", fingerprint: "aaaa" },
+      ] });
+      expect(controller.snapshot().personNames[workspace.id]?.persons[0]?.name).toBe("Renamed");
+      terminals[1]?.();
+      controller.dispose();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(cursors).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
   it("uses Workspace-specific Unicode names and a distinct profile cursor for live rename", async () => {
     const createdNames: string[] = [];
     const workspaceB = { ...workspace, id: "f".repeat(32), name: "Second" };

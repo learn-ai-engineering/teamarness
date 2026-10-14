@@ -308,8 +308,10 @@ pub(crate) fn router_observing(
                     let mut cursor = match names.current().await {
                         Ok(snapshot) => {
                             let cursor = snapshot.cursor;
-                            if sender.send(name_snapshot(snapshot)).await.is_err() {
-                                return;
+                            for event in name_snapshots(snapshot) {
+                                if sender.send(event).await.is_err() {
+                                    return;
+                                }
                             }
                             cursor
                         }
@@ -338,9 +340,11 @@ pub(crate) fn router_observing(
                                 Some(Ok(snapshot)) => {
                                     if snapshot.cursor >= cursor {
                                         cursor = snapshot.cursor;
-                                        if sender.send(name_snapshot(snapshot)).await.is_err() {
-                                            stream.close().await;
-                                            return;
+                                        for event in name_snapshots(snapshot) {
+                                            if sender.send(event).await.is_err() {
+                                                stream.close().await;
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -387,17 +391,37 @@ pub(crate) fn router_observing(
     )
 }
 
-fn name_snapshot(snapshot: PersonNameSnapshot) -> JsonValue {
-    let event = json!({ "available": true, "cursor": snapshot.cursor.to_string(),
-        "persons": snapshot.persons.into_iter().map(|person| json!({
-            "identity": person.identity, "personId": person.person_id,
-            "name": person.name, "fingerprint": person.fingerprint,
-        })).collect::<Vec<_>>() });
-    if serde_json::to_vec(&event).is_ok_and(|bytes| bytes.len() <= HISTORY_REPLY_BUDGET) {
-        event
-    } else {
-        json!({ "available": false, "cursor": "0", "persons": [] })
-    }
+fn name_snapshots(snapshot: PersonNameSnapshot) -> Vec<JsonValue> {
+    // The capability bounds the roster to 1,024 Persons and each name to 256 UTF-8 bytes.
+    // 64 entries leave ample room even for JSON-escaped names under both bridge limits.
+    const PERSONS_PER_EVENT: usize = 64;
+    let persons: Vec<_> = snapshot
+        .persons
+        .into_iter()
+        .map(|person| {
+            json!({
+                "identity": person.identity, "personId": person.person_id,
+                "name": person.name, "fingerprint": person.fingerprint,
+            })
+        })
+        .collect();
+    let parts = persons.len().max(1).div_ceil(PERSONS_PER_EVENT);
+    persons
+        .chunks(PERSONS_PER_EVENT)
+        .enumerate()
+        .map(|(part, chunk)| {
+            json!({
+                "available": true, "cursor": snapshot.cursor.to_string(),
+                "persons": chunk, "part": part, "parts": parts,
+            })
+        })
+        .chain((persons.is_empty()).then(|| {
+            json!({
+                "available": true, "cursor": snapshot.cursor.to_string(),
+                "persons": [], "part": 0, "parts": 1,
+            })
+        }))
+        .collect()
 }
 
 impl ConversationsActive {
@@ -2199,7 +2223,7 @@ mod session_tests {
     }
 
     #[test]
-    fn oversized_person_name_snapshot_falls_back_before_the_ui_bridge_limit() {
+    fn large_person_name_snapshot_reaches_every_author_in_bounded_parts() {
         use teamarness_package_sdk::capabilities::person_names::PersonName;
         let snapshot = PersonNameSnapshot {
             workspace_id: "a".repeat(32),
@@ -2213,9 +2237,43 @@ mod session_tests {
                 })
                 .collect(),
         };
-        let event = name_snapshot(snapshot);
-        assert_eq!(event["available"], false);
-        assert!(serde_json::to_vec(&event).unwrap().len() < HISTORY_REPLY_BUDGET);
+        let events = name_snapshots(snapshot);
+        assert!(events.len() > 1);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["persons"].as_array().unwrap().len())
+                .sum::<usize>(),
+            1024
+        );
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["cursor"], "1");
+            assert_eq!(event["part"], index);
+            assert_eq!(event["parts"], events.len());
+            assert!(serde_json::to_vec(event).unwrap().len() <= HISTORY_REPLY_BUDGET);
+        }
+        let escaping = PersonNameSnapshot {
+            workspace_id: "a".repeat(32),
+            cursor: 2,
+            persons: (0..1024)
+                .map(|n| PersonName {
+                    identity: format!("{n:064x}"),
+                    person_id: format!("{n:064x}"),
+                    name: Some("\\\"".repeat(128)),
+                    fingerprint: "f".repeat(64),
+                })
+                .collect(),
+        };
+        let renamed = name_snapshots(escaping);
+        assert_eq!(
+            renamed
+                .iter()
+                .map(|part| part["persons"].as_array().unwrap().len())
+                .sum::<usize>(),
+            1024
+        );
+        assert!(renamed.iter().all(|part| part["cursor"] == "2"
+            && serde_json::to_vec(part).unwrap().len() <= HISTORY_REPLY_BUDGET));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

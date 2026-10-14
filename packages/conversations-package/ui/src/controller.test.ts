@@ -39,6 +39,21 @@ async function failedSwitch(rejection: unknown): Promise<ConversationsController
 }
 
 describe("Workspace Person names", () => {
+  it("assembles a bounded roster at one cursor before relabeling signed authors, then replaces it on rename", () => {
+    const controller = new ConversationsController(classifiedClient(null), () => undefined);
+    const alice = { identity: "alice", personId: "p1", name: "Alice", fingerprint: "alice" };
+    const bob = { identity: "bob", personId: "p2", name: "Bob", fingerprint: "bob" };
+    controller.applyNames({ available: true, cursor: "1", persons: [alice], part: 0, parts: 2 });
+    expect(controller.state.names.available).toBe(false);
+    controller.applyNames({ available: true, cursor: "1", persons: [bob], part: 1, parts: 2 });
+    expect(controller.state.names.persons).toEqual([alice, bob]);
+    controller.applyNames({ available: true, cursor: "2", persons: [{ ...alice, name: "Renamed" }], part: 0, parts: 2 });
+    expect(controller.state.names.persons).toEqual([alice, bob]);
+    controller.applyNames({ available: true, cursor: "1", persons: [bob], part: 1, parts: 2 });
+    expect(controller.state.names.persons).toEqual([alice, bob]);
+    controller.applyNames({ available: true, cursor: "2", persons: [bob], part: 1, parts: 2 });
+    expect(controller.state.names.persons).toEqual([{ ...alice, name: "Renamed" }, bob]);
+  });
   it("relabels an existing remote Message on rename without changing its signed author", async () => {
     const fake = delayedClient();
     const controller = new ConversationsController(fake.client, () => undefined);

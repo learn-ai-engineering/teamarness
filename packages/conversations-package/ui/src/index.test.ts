@@ -94,6 +94,53 @@ function liveHistorySource(current: () => ConversationPage["messages"]) {
 }
 
 describe("Workspace Person author presentation", () => {
+  it("reopens a terminated name stream after part zero and completes a newer roster", async () => {
+    vi.useFakeTimers();
+    try {
+      const root = shadowRoot();
+      const author = "b".repeat(64);
+      const source = createFakePackageClient({ requests: {
+        "conversations.snapshot": () => snapshot(),
+        "conversations.channel.open": () => ({ ...emptyPage(), messages: [{ ...message("old"), author }] }),
+      }, subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined } });
+      const unmount = await mount(createTestMountContext({ root, client: source.client }));
+      const nameCalls = () => source.calls.filter(({ operation }) => operation === "conversations.names").length;
+      const first = { identity: author, personId: author, name: "Old", fingerprint: "bbbbbbbbbbbb" };
+      await source.emit("conversations.names", { available: true, cursor: "1", persons: [first], part: 0, parts: 1 });
+      await source.emit("conversations.names", { available: true, cursor: "2", persons: [{ ...first, name: "Renamed" }], part: 0, parts: 2 });
+      expect(root.querySelector(".message-author")?.textContent).toBe("Old");
+      source.terminate("conversations.names", null);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(nameCalls()).toBe(2);
+      await source.emit("conversations.names", { available: true, cursor: "2", persons: [{ ...first, name: "Renamed" }], part: 0, parts: 2 });
+      await source.emit("conversations.names", { available: true, cursor: "2", persons: [], part: 1, parts: 2 });
+      expect(root.querySelector(".message-author")?.textContent).toBe("Renamed");
+      source.terminate("conversations.names", null);
+      await unmount();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(nameCalls()).toBe(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("retries optional name stream opening while mounted and stops after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const root = shadowRoot();
+      const source = conversationsBackend();
+      let attempts = 0;
+      const client: PackageClient = { ...source.client, subscribe: async (...args) => {
+        if (args[0] === "conversations.names" && ++attempts === 1) throw new Error("temporary");
+        return source.client.subscribe(...args);
+      } };
+      const unmount = await mount(createTestMountContext({ root, client }));
+      expect(attempts).toBe(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(attempts).toBe(2);
+      await unmount();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(2);
+    } finally { vi.useRealTimers(); }
+  });
   it("closes names even when closing changes fails", async () => {
     const root = shadowRoot();
     const source = createFakePackageClient({
@@ -117,6 +164,32 @@ describe("Workspace Person author presentation", () => {
     const unmount = await mount(createTestMountContext({ root, client }));
     await expect(unmount()).rejects.toThrow("changes close failed");
     expect(namesClosed).toBe(true);
+  });
+
+  it("keeps signed authors and relabels an old Message after a budget-crossing roster rename", async () => {
+    const root = shadowRoot();
+    const author = "b".repeat(64);
+    const source = createFakePackageClient({ requests: {
+      "conversations.snapshot": () => snapshot(),
+      "conversations.channel.open": () => ({ ...emptyPage(), messages: [{ ...message("old"), author }] }),
+    }, subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined } });
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const persons = Array.from({ length: 1024 }, (_, n) => ({
+      identity: n === 7 ? author : n.toString(16).padStart(64, "0"),
+      personId: n.toString(16).padStart(64, "0"), name: "🌻".repeat(64), fingerprint: "f".repeat(12),
+    }));
+    const publish = async (cursor: string, name: string) => {
+      persons[7] = { ...persons[7]!, name };
+      for (let part = 0; part < 16; part++) await source.emit("conversations.names", {
+        available: true, cursor, part, parts: 16, persons: persons.slice(part * 64, (part + 1) * 64),
+      });
+    };
+    await publish("1", "Alice");
+    expect(root.querySelector(".message-author")?.textContent).toBe("Alice");
+    await publish("2", "Alice renamed");
+    expect(root.querySelector(".message-author")?.textContent).toBe("Alice renamed");
+    expect(root.querySelector(".message-author")?.getAttribute("title")).toContain(author);
+    await unmount();
   });
 
   it("updates already displayed remote Messages on rename and distinguishes duplicate or missing names", async () => {
