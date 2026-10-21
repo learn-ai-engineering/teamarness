@@ -1,10 +1,10 @@
 //! Private Workspace Person name scope. Only Core may select this record scope.
 use super::*;
-use crate::person_names::{self, edit};
+use crate::principals::{self, edit};
 use crate::synchronization::{self, MembershipStanding};
 
-const SCOPE: &str = synchronization::reserved_person_name_scope();
-const PURPOSE: &str = "person-name.edit";
+const SCOPE: &str = synchronization::reserved_principals_scope();
+const PURPOSE: &str = "principal-name.edit";
 
 pub(super) fn initialize(
     state: &mut RuntimeState,
@@ -57,7 +57,7 @@ fn reconcile_page(
     let position: i64 = state
         .connection
         .query_row(
-            "SELECT delivery_sequence FROM workspace_person_name_consumption WHERE workspace_id=?1",
+            "SELECT delivery_sequence FROM principal_name_consumption WHERE workspace_id=?1",
             [workspace.as_bytes().as_slice()],
             |row| row.get(0),
         )
@@ -100,7 +100,7 @@ fn reconcile_page(
                 Ok(opened) => {
                     let record = &opened[0];
                     if record.purpose() == PURPOSE
-                        && let Ok(edit_bytes) = edit::PersonNameEdit::decode(record.canonical())
+                        && let Ok(edit_bytes) = edit::PrincipalNameEdit::decode(record.canonical())
                         && edit_bytes.author() == record.author()
                     {
                         match edit::accept(&mut state.connection, &projection, record.canonical()) {
@@ -121,7 +121,7 @@ fn reconcile_page(
                 Err(error) => return Err(error),
             }
             state.connection.execute(
-                "INSERT INTO workspace_person_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
+                "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
                 rusqlite::params![workspace.as_bytes().as_slice(), sequence],
             ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
         }
@@ -146,7 +146,7 @@ pub(crate) fn continue_replay(state: &mut RuntimeState) {
     for workspace in workspaces {
         let scope = synchronization::scope_digest(SCOPE, workspace);
         let outstanding: bool = state.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM record_delivery d WHERE d.scope_id=?1 AND d.delivery_sequence > COALESCE((SELECT delivery_sequence FROM workspace_person_name_consumption WHERE workspace_id=?2), 0))",
+            "SELECT EXISTS(SELECT 1 FROM record_delivery d WHERE d.scope_id=?1 AND d.delivery_sequence > COALESCE((SELECT delivery_sequence FROM principal_name_consumption WHERE workspace_id=?2), 0))",
             rusqlite::params![scope.as_slice(), workspace.as_bytes().as_slice()], |row| row.get(0),
         ).unwrap_or(false);
         if outstanding {
@@ -167,10 +167,33 @@ fn flush_pending(
         return Ok(());
     };
     let local = PublicIdentity(state.secret_key.public());
-    let Some(anchor) = person_names::anchor(&projection, local) else {
-        return Ok(());
-    };
-    let person = person_names::derive(workspace, anchor);
+    for (id, _, kind, steward, _) in principals::registry(&projection) {
+        let owned = match kind {
+            principals::PrincipalKind::Person => {
+                principals::lookup_id(&state.connection, &projection, id)
+                    .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?
+                    .is_some_and(|row| row.keys().contains(&local))
+            }
+            principals::PrincipalKind::Agent => steward.is_some_and(|person| {
+                principals::registry(&projection)
+                    .iter()
+                    .any(|(candidate, key, _, _, _)| *candidate == person && *key == local)
+            }),
+        };
+        if owned {
+            flush_principal(state, &projection, workspace, id, local)?;
+        }
+    }
+    Ok(())
+}
+
+fn flush_principal(
+    state: &mut RuntimeState,
+    projection: &crate::membership::WorkspaceProjection,
+    workspace: WorkspaceId,
+    person: principals::PrincipalId,
+    local: PublicIdentity,
+) -> Result<(), crate::SynchronizationError> {
     let Some(intent) =
         edit::pending_intent(&state.connection, workspace, person).map_err(edit_error)?
     else {
@@ -178,7 +201,7 @@ fn flush_pending(
     };
     let counter = edit::next_counter(&state.connection, workspace, person).map_err(edit_error)?;
     let signed =
-        edit::PersonNameEdit::sign(&state.secret_key, workspace, person, counter, &intent.name)
+        edit::PrincipalNameEdit::sign(&state.secret_key, workspace, person, counter, &intent.name)
             .map_err(edit_error)?;
     let secret = state.secret_key.clone();
     match synchronization::append(
@@ -194,10 +217,10 @@ fn flush_pending(
     ) {
         Ok((_, sequence)) => {
             synchronization::record_subscription::publish_commit(state, workspace, SCOPE, sequence);
-            edit::accept(&mut state.connection, &projection, signed.canonical_bytes())
+            edit::accept(&mut state.connection, projection, signed.canonical_bytes())
                 .map_err(edit_error)?;
             // A superseding local intent or higher winner remains pending for the next wake.
-            edit::complete_pending(&mut state.connection, &projection, &signed, intent.revision)
+            edit::complete_pending(&mut state.connection, projection, &signed, intent.revision)
                 .map_err(edit_error)?;
             state.sync_wake.notify_one();
         }

@@ -113,7 +113,7 @@ impl CoreRuntime {
         invitation: &crate::WorkspaceInvitation,
         name: &str,
     ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
-        crate::person_names::validate(name).map_err(|_| crate::OnboardingError::InvalidInput)?;
+        crate::principals::validate(name).map_err(|_| crate::OnboardingError::InvalidInput)?;
         let verified = invitation
             .verified()
             .map_err(|_| crate::OnboardingError::InvalidInput)?;
@@ -131,7 +131,7 @@ impl CoreRuntime {
             if let Some(projection) = state.memberships.get(&workspace)
                 && projection
                     .has_admission_for_token(PublicIdentity(state.secret_key.public()), &token)
-                && let Ok(Some(person)) = crate::person_names::lookup(
+                && let Ok(Some(person)) = crate::principals::lookup(
                     &state.connection,
                     projection,
                     PublicIdentity(state.secret_key.public()),
@@ -140,7 +140,7 @@ impl CoreRuntime {
             {
                 return Ok(current.to_owned());
             }
-            crate::person_names::stage_join(&mut state.connection, workspace, &token, &requested)
+            crate::principals::stage_join(&mut state.connection, workspace, &token, &requested)
                 .map_err(|error| match error {
                     crate::PersonNameError::Storage(StorageError::UncertainOutcome) => {
                         state.poisoned = true;
@@ -182,7 +182,7 @@ impl CoreRuntime {
         if !projection.has_admission_for_token(self.public_identity, token) {
             return Ok(None);
         }
-        crate::person_names::finish_join(
+        crate::principals::finish_join(
             &mut state.connection,
             &projection,
             self.public_identity,
@@ -195,7 +195,7 @@ impl CoreRuntime {
             crate::OnboardingError::UncertainStorageOutcome
         })?;
         if requested != original {
-            crate::person_names::set(
+            crate::principals::set(
                 &mut state.connection,
                 &projection,
                 self.public_identity,
@@ -208,8 +208,8 @@ impl CoreRuntime {
                 crate::OnboardingError::UncertainStorageOutcome
             })?;
         }
-        person_name_sync::publish_generation(&state, workspace);
-        person_name_sync::initialize(&mut state, workspace)
+        principal_sync::publish_generation(&state, workspace);
+        principal_sync::initialize(&mut state, workspace)
             .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
         let summary = crate::workspace::list(&state.connection)
             .map_err(|_| crate::OnboardingError::LocalConflict)?
@@ -523,8 +523,8 @@ fn import_validated_bootstrap_locked(
             state
                 .memberships
                 .insert(snapshot.workspace_id(), imported.projection);
-            person_name_sync::publish_generation(&state, snapshot.workspace_id());
-            person_name_sync::initialize(&mut state, snapshot.workspace_id())
+            principal_sync::publish_generation(&state, snapshot.workspace_id());
+            principal_sync::initialize(&mut state, snapshot.workspace_id())
                 .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 state.poisoned = true;

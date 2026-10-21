@@ -656,7 +656,7 @@ fn load_due_jobs(
     forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
     selection: &mut SelectionCursor,
 ) -> Vec<DueJob> {
-    crate::runtime::person_name_sync::continue_replay(state);
+    crate::runtime::principal_sync::continue_replay(state);
     let mut jobs = Vec::new();
     #[cfg(test)]
     let sweeping = kind == ReloadKind::FullSweep;

@@ -25,7 +25,7 @@ impl CoreRuntime {
                         return Err(WorkspaceError::Storage(error));
                     }
                 }
-                person_name_sync::initialize(&mut state, summary.id())
+                principal_sync::initialize(&mut state, summary.id())
                     .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
                 Ok(summary)
             }
@@ -67,7 +67,7 @@ impl CoreRuntime {
         workspace_name: &str,
         person_name: &str,
     ) -> Result<WorkspaceSummary, crate::PersonNameError> {
-        crate::person_names::validate(person_name)?;
+        crate::principals::validate(person_name)?;
         crate::workspace::validate_name(workspace_name)
             .map_err(|_| crate::PersonNameError::InvalidName)?;
         let mut state = self
@@ -116,7 +116,7 @@ impl CoreRuntime {
                 return Err(crate::PersonNameError::Storage(error));
             }
         }
-        person_name_sync::initialize(&mut state, workspace.id()).map_err(fault!(
+        principal_sync::initialize(&mut state, workspace.id()).map_err(fault!(
             crate::PersonNameError::Storage(StorageError::Database)
         ))?;
         Ok(workspace)
@@ -143,7 +143,7 @@ impl CoreRuntime {
             .memberships
             .get(&workspace_id)
             .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
-        crate::person_names::lookup(&state.connection, projection, identity)
+        crate::principals::lookup(&state.connection, projection, identity)
     }
 
     /// Atomically reads the durable name generation and current-member presentation.
@@ -168,17 +168,16 @@ impl CoreRuntime {
             .get(&workspace_id)
             .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
         let generation =
-            crate::person_names::edit::profile_generation(&state.connection, workspace_id)
-                .map_err(fault!(crate::PersonNameError::Storage(
-                    StorageError::Database
-                )))?;
-        // Agent keys are Members without a Person anchor until the principals
-        // registry replaces this snapshot; they are left out here.
+            crate::principals::edit::profile_generation(&state.connection, workspace_id).map_err(
+                fault!(crate::PersonNameError::Storage(StorageError::Database)),
+            )?;
+        // Keep the Person-only view for existing Host/Shell consumers until
+        // they switch to principals in their assigned phases.
         let members = projection
             .installation_members()
             .into_iter()
             .map(|identity| {
-                crate::person_names::lookup(&state.connection, projection, identity)
+                crate::principals::lookup(&state.connection, projection, identity)
                     .map(|person| (identity, person.expect("current member has an anchor")))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -206,10 +205,9 @@ impl CoreRuntime {
             return Err(crate::PersonNameError::WorkspaceNotFound);
         }
         let generation =
-            crate::person_names::edit::profile_generation(&state.connection, workspace_id)
-                .map_err(fault!(crate::PersonNameError::Storage(
-                    StorageError::Database
-                )))?;
+            crate::principals::edit::profile_generation(&state.connection, workspace_id).map_err(
+                fault!(crate::PersonNameError::Storage(StorageError::Database)),
+            )?;
         Ok(state
             .profile_generations
             .entry(workspace_id)
@@ -233,7 +231,7 @@ impl CoreRuntime {
         identity: PublicIdentity,
         name: &str,
     ) -> Result<(), crate::PersonNameError> {
-        crate::person_names::validate(name)?;
+        crate::principals::validate(name)?;
         if identity != self.public_identity {
             return Err(crate::PersonNameError::NotOwnPerson);
         }
@@ -253,7 +251,7 @@ impl CoreRuntime {
             .get(&workspace_id)
             .ok_or(crate::PersonNameError::WorkspaceNotFound)?
             .clone();
-        let result = crate::person_names::set(&mut state.connection, &projection, identity, name);
+        let result = crate::principals::set(&mut state.connection, &projection, identity, name);
         if result
             == Err(crate::PersonNameError::Storage(
                 StorageError::UncertainOutcome,
@@ -263,11 +261,348 @@ impl CoreRuntime {
         }
         if result.is_ok() {
             // The name and generation have committed even if private replay fails.
-            person_name_sync::publish_generation(&state, workspace_id);
-            person_name_sync::initialize(&mut state, workspace_id).map_err(fault!(
+            principal_sync::publish_generation(&state, workspace_id);
+            principal_sync::initialize(&mut state, workspace_id).map_err(fault!(
                 crate::PersonNameError::Storage(StorageError::Database)
             ))?;
         }
         result
+    }
+}
+
+impl CoreRuntime {
+    /// Adds a locally custodied Agent to the caller's admitted Person group.
+    pub fn add_agent(
+        &self,
+        workspace: WorkspaceId,
+        name: &str,
+    ) -> Result<crate::PrincipalId, crate::PersonNameError> {
+        crate::principals::validate(name)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?
+            .clone();
+        let group = projection
+            .person_group(self.public_identity)
+            .ok_or(crate::PersonNameError::NotOwnPerson)?;
+        let secret = iroh_base::SecretKey::generate();
+        let agent = PublicIdentity::from_bytes(*secret.public().as_bytes()).map_err(fault!(
+            crate::PersonNameError::Storage(StorageError::CorruptIdentity)
+        ))?;
+        let proof =
+            crate::membership::AgentKeyProof::sign(&secret, workspace, group, self.public_identity)
+                .map_err(crate::PersonNameError::Membership)?;
+        let envelope = crate::membership::MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            self.clock.now_unix_ms(),
+            crate::membership::MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof,
+            },
+            projection.heads(),
+        )
+        .map_err(crate::PersonNameError::Membership)?;
+        let id = crate::principals::derive_agent(workspace, envelope.id);
+        crate::principals::agent_keys::store(&state.connection, workspace, id, &secret)
+            .map_err(crate::PersonNameError::Storage)?;
+        let applied = {
+            let RuntimeState {
+                connection,
+                memberships,
+                ..
+            } = &mut *state;
+            crate::membership::projection::apply_canonical(
+                connection,
+                memberships,
+                envelope.canonical_bytes(),
+                self.clock.now_unix_ms(),
+            )
+        };
+        match applied {
+            Ok(applied) if applied.accepted => {
+                if let Some(transition) = Self::transition_from_applied(applied) {
+                    replication::after_membership_accepted(&mut state, &transition);
+                }
+                let current = state
+                    .memberships
+                    .get(&workspace)
+                    .ok_or(crate::PersonNameError::WorkspaceNotFound)?
+                    .clone();
+                crate::principals::set_id(
+                    &mut state.connection,
+                    &current,
+                    self.public_identity,
+                    id,
+                    name,
+                )?;
+                principal_sync::publish_generation(&state, workspace);
+                principal_sync::initialize(&mut state, workspace).map_err(fault!(
+                    crate::PersonNameError::Storage(StorageError::Database)
+                ))?;
+                self.sync_worker.wake();
+                Ok(id)
+            }
+            Ok(_) => Err(crate::PersonNameError::Membership(
+                MembershipError::AuthorizationRejected,
+            )),
+            Err(error) => {
+                if matches!(
+                    error,
+                    MembershipError::Storage(StorageError::UncertainOutcome)
+                ) {
+                    state.poisoned = true;
+                }
+                Err(crate::PersonNameError::Membership(error))
+            }
+        }
+    }
+
+    /// Removes exactly one current Agent. A creator may remove a remote Agent
+    /// without access to the Steward's Installation or Agent secret.
+    pub fn remove_agent(
+        &self,
+        workspace: WorkspaceId,
+        id: crate::PrincipalId,
+    ) -> Result<(), crate::PersonNameError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?
+            .clone();
+        let (_, agent, kind, steward, _) = crate::principals::registry(&projection)
+            .into_iter()
+            .find(|(candidate, _, _, _, _)| *candidate == id)
+            .ok_or(crate::PersonNameError::AgentNotFound)?;
+        if kind != crate::PrincipalKind::Agent {
+            return Err(crate::PersonNameError::AgentNotFound);
+        }
+        let steward_id = steward.ok_or(crate::PersonNameError::AgentNotFound)?;
+        let (group, _, _, _, _) = crate::principals::registry(&projection)
+            .into_iter()
+            .find(|(candidate, _, _, _, _)| *candidate == steward_id)
+            .ok_or(crate::PersonNameError::AgentNotFound)?;
+        let group = projection
+            .principal_anchors()
+            .into_iter()
+            .find(|(anchor, _, _)| crate::principals::derive(workspace, *anchor) == group)
+            .map(|(anchor, _, _)| anchor)
+            .ok_or(crate::PersonNameError::AgentNotFound)?;
+        if self.public_identity != projection.creator()
+            && projection.person_group(self.public_identity) != Some(group)
+        {
+            return Err(crate::PersonNameError::NotOwnPerson);
+        }
+        let envelope = crate::membership::MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            self.clock.now_unix_ms(),
+            crate::membership::MembershipAction::RemoveAgentKey { group, agent },
+            projection.heads(),
+        )
+        .map_err(crate::PersonNameError::Membership)?;
+        let applied = {
+            let RuntimeState {
+                connection,
+                memberships,
+                ..
+            } = &mut *state;
+            crate::membership::projection::apply_canonical(
+                connection,
+                memberships,
+                envelope.canonical_bytes(),
+                self.clock.now_unix_ms(),
+            )
+        };
+        match applied {
+            Ok(applied) if applied.accepted => {
+                if let Some(transition) = Self::transition_from_applied(applied) {
+                    replication::after_membership_accepted(&mut state, &transition);
+                }
+                self.sync_worker.wake();
+                Ok(())
+            }
+            Ok(_) => Err(crate::PersonNameError::Membership(
+                MembershipError::AuthorizationRejected,
+            )),
+            Err(error) => {
+                if matches!(
+                    error,
+                    MembershipError::Storage(StorageError::UncertainOutcome)
+                ) {
+                    state.poisoned = true;
+                }
+                Err(crate::PersonNameError::Membership(error))
+            }
+        }
+    }
+
+    pub fn rename_principal(
+        &self,
+        workspace: WorkspaceId,
+        id: crate::PrincipalId,
+        name: &str,
+    ) -> Result<(), crate::PersonNameError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?
+            .clone();
+        crate::principals::set_id(
+            &mut state.connection,
+            &projection,
+            self.public_identity,
+            id,
+            name,
+        )?;
+        principal_sync::publish_generation(&state, workspace);
+        principal_sync::initialize(&mut state, workspace).map_err(fault!(
+            crate::PersonNameError::Storage(StorageError::Database)
+        ))
+    }
+
+    pub fn principal(
+        &self,
+        workspace: WorkspaceId,
+        id: crate::PrincipalId,
+    ) -> Result<Option<crate::WorkspacePrincipal>, crate::PersonNameError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        crate::principals::lookup_id(&state.connection, projection, id)
+    }
+
+    pub fn principals_snapshot(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<(u64, Vec<crate::WorkspacePrincipal>), crate::PersonNameError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        let generation = crate::principals::edit::profile_generation(&state.connection, workspace)
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::Database
+            )))?;
+        let rows = crate::principals::registry(projection)
+            .into_iter()
+            .map(|(id, _, _, _, _)| {
+                crate::principals::lookup_id(&state.connection, projection, id)
+                    .map(|row| row.expect("current Principal has an anchor"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((generation, rows))
+    }
+
+    pub fn subscribe_principals(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<tokio::sync::watch::Receiver<u64>, crate::PersonNameError> {
+        self.subscribe_person_names(workspace)
+    }
+
+    /// Local-only binding; authorization requires this Installation to steward
+    /// the Agent. The Package Host consumes this in Phase 4.
+    pub fn bind_agent_package(
+        &self,
+        workspace: WorkspaceId,
+        id: crate::PrincipalId,
+        package: &str,
+    ) -> Result<(), crate::PersonNameError> {
+        if package.is_empty()
+            || package.len() > u16::MAX as usize
+            || !package.is_ascii()
+            || crate::synchronization::is_reserved_record_scope(package)
+        {
+            return Err(crate::PersonNameError::InvalidPackageIdentity);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        let row = crate::principals::registry(projection)
+            .into_iter()
+            .find(|(candidate, _, _, _, _)| *candidate == id)
+            .ok_or(crate::PersonNameError::AgentNotFound)?;
+        if row.2 != crate::PrincipalKind::Agent
+            || !crate::principals::registry(projection)
+                .iter()
+                .any(|(person_id, key, _, _, _)| {
+                    Some(*person_id) == row.3 && *key == self.public_identity
+                })
+        {
+            return Err(crate::PersonNameError::NotOwnPerson);
+        }
+        crate::principals::agent_keys::bind(&state.connection, workspace, id, package)
+            .map_err(crate::PersonNameError::Storage)
     }
 }

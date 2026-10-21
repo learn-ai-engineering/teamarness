@@ -36,6 +36,12 @@ type WorkspaceAnchor = (WorkspaceId, PublicIdentity, MembershipOperationId, Vec<
 type FutureRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>);
 type CreationRequestEvidence = (Vec<u8>, String, i64, Vec<u8>, Vec<u8>, String);
 
+pub(crate) type PrincipalAnchor = (
+    MembershipOperationId,
+    PublicIdentity,
+    Option<(MembershipOperationId, PublicIdentity)>,
+);
+
 #[derive(Clone)]
 pub(crate) struct WorkspaceProjection {
     pub(super) workspace_id: WorkspaceId,
@@ -89,48 +95,32 @@ impl WorkspaceProjection {
             .find(|group| !revoked.contains(group))
     }
 
+    pub(crate) fn principal_anchors(&self) -> Vec<PrincipalAnchor> {
+        let mut result = Vec::new();
+        for operation in self.operations.values() {
+            if matches!(operation.action, MembershipAction::CreatePerson { .. })
+                && self.person_group(operation.author) == Some(operation.id)
+                && self.contains_member(operation.author)
+            {
+                result.push((operation.id, operation.author, None));
+            }
+        }
+        for operation in self.operations.values() {
+            if let MembershipAction::AddAgentKey { group, agent, .. } = operation.action
+                && self.contains_member(agent)
+                && let Some((_, steward, _)) = result.iter().find(|(id, _, _)| *id == group)
+            {
+                result.push((operation.id, agent, Some((group, *steward))));
+            }
+        }
+        result
+    }
+
     pub(crate) fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
     }
     pub(crate) fn genesis_id(&self) -> MembershipOperationId {
         self.genesis_id
-    }
-    pub(crate) fn first_admission(
-        &self,
-        identity: PublicIdentity,
-    ) -> Option<MembershipOperationId> {
-        let admissions = self.operations.values().filter(|operation| {
-            matches!(&operation.action,
-                MembershipAction::Admit { target, .. } if *target == identity)
-        });
-        // A later accepted admission can have the same authored timestamp and
-        // a smaller content hash. Causal order, not hash order, anchors the
-        // first Person; tie-break only genuinely concurrent first admissions.
-        admissions
-            .min_by_key(|operation| {
-                let mut pending = operation.dependencies.clone();
-                let mut visited = BTreeSet::new();
-                let mut earlier_admissions = 0;
-                while let Some(id) = pending.pop() {
-                    if !visited.insert(id) {
-                        continue;
-                    }
-                    if let Some(ancestor) = self.operations.get(&id) {
-                        if matches!(&ancestor.action,
-                        MembershipAction::Admit { target, .. } if *target == identity)
-                        {
-                            earlier_admissions += 1;
-                        }
-                        pending.extend_from_slice(&ancestor.dependencies);
-                    }
-                }
-                (
-                    earlier_admissions,
-                    operation.authored_at_unix_ms,
-                    operation.id,
-                )
-            })
-            .map(|operation| operation.id)
     }
     pub(crate) fn has_admission_for_token(
         &self,
@@ -745,7 +735,7 @@ pub(crate) fn import_bootstrap_with_fault(
         write_member_snapshot(&transaction, &imported_projection, deadline)?;
         import_boundary(&mut fault, ImportBoundary::MemberSnapshot, deadline)?;
         if imported_member_change {
-            crate::person_names::edit::advance_generation(&transaction, response.workspace_id)
+            crate::principals::edit::advance_generation(&transaction, response.workspace_id)
                 .map_err(|_| crate::OnboardingError::LocalConflict)?;
         }
     }
@@ -1864,10 +1854,11 @@ pub(crate) fn persist_candidate_rows(
 ) -> Result<(), MembershipError> {
     // Both direct membership acceptance and invitation redemption use this
     // transaction. Never commit a roster change without its name invalidation.
+    crate::principals::refresh(transaction, candidate).map_err(MembershipError::Storage)?;
     if envelope.action.changes_roster() {
-        crate::person_names::edit::advance_generation(transaction, envelope.workspace_id).map_err(
+        crate::principals::edit::advance_generation(transaction, envelope.workspace_id).map_err(
             |error| match error {
-                crate::person_names::edit::EditError::Storage(storage) => {
+                crate::principals::edit::EditError::Storage(storage) => {
                     MembershipError::Storage(storage)
                 }
                 _ => MembershipError::Storage(StorageError::CorruptWorkspace),
@@ -2044,6 +2035,7 @@ fn repair_all_derived(
         .map_err(|_| StorageError::Database)?;
     for projection in projections.values() {
         write_derived(&transaction, projection).map_err(membership_to_storage)?;
+        crate::principals::refresh(&transaction, projection)?;
     }
     transaction
         .commit()

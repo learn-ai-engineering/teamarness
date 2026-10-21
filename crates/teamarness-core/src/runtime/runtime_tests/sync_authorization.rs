@@ -92,14 +92,14 @@ async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
     {
         let mut state = creator.state.lock().unwrap();
         let projection = state.memberships.get(&workspace).unwrap();
-        let person = crate::person_names::derive(
+        let person = crate::principals::derive(
             workspace,
-            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+            crate::principals::anchor(projection, creator.public_identity()).unwrap(),
         );
         let secret = state.secret_key.clone();
         for counter in 1..=80 {
             let name = format!("Name {counter}");
-            let edit = crate::person_names::edit::PersonNameEdit::sign(
+            let edit = crate::principals::edit::PrincipalNameEdit::sign(
                 &secret, workspace, person, counter, &name,
             )
             .unwrap();
@@ -107,8 +107,8 @@ async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
                 &mut state.connection,
                 &secret,
                 workspace,
-                crate::synchronization::reserved_person_name_scope(),
-                "person-name.edit",
+                crate::synchronization::reserved_principals_scope(),
+                "principal-name.edit",
                 edit.canonical_bytes(),
                 crate::synchronization::MembershipStanding::Current,
                 true,
@@ -116,8 +116,15 @@ async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
             )
             .unwrap();
         }
-        super::super::person_name_sync::reconcile(&mut state, workspace).unwrap();
-        let consumed: i64 = state.connection.query_row("SELECT delivery_sequence FROM workspace_person_name_consumption WHERE workspace_id=?1", [workspace.as_bytes().as_slice()], |row| row.get(0)).unwrap();
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        let consumed: i64 = state
+            .connection
+            .query_row(
+                "SELECT delivery_sequence FROM principal_name_consumption WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(
             consumed, 32,
             "one pass must not hold the runtime lock over the backlog"
@@ -147,11 +154,11 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
     {
         let mut state = creator.state.lock().unwrap();
         let projection = state.memberships.get(&workspace).unwrap();
-        let person = crate::person_names::derive(
+        let person = crate::principals::derive(
             workspace,
-            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+            crate::principals::anchor(projection, creator.public_identity()).unwrap(),
         );
-        let signed = crate::person_names::edit::PersonNameEdit::sign(
+        let signed = crate::principals::edit::PrincipalNameEdit::sign(
             &state.secret_key,
             workspace,
             person,
@@ -164,8 +171,8 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
             &mut state.connection,
             &secret,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
-            "person-name.edit",
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
             signed.canonical_bytes(),
             crate::synchronization::MembershipStanding::Current,
             true,
@@ -174,13 +181,13 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
         .unwrap();
         state.person_name_open_error_once = true;
         assert!(matches!(
-            super::super::person_name_sync::reconcile(&mut state, workspace),
+            super::super::principal_sync::reconcile(&mut state, workspace),
             Err(crate::SynchronizationError::Storage(_))
         ));
         let count: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM workspace_person_name_consumption",
+                "SELECT COUNT(*) FROM principal_name_consumption",
                 [],
                 |row| row.get(0),
             )
@@ -189,7 +196,7 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
             count, 0,
             "a storage error must not consume the valid record"
         );
-        super::super::person_name_sync::reconcile(&mut state, workspace).unwrap();
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
     }
     assert_eq!(
         creator
@@ -275,7 +282,7 @@ async fn pending_name_survives_restart_before_private_key_arrives() {
     {
         let state = cluster.node("joiner").state.lock().unwrap();
         let scope = crate::synchronization::scope_digest(
-            crate::synchronization::reserved_person_name_scope(),
+            crate::synchronization::reserved_principals_scope(),
             workspace,
         );
         let key_count: i64 = state
@@ -289,7 +296,7 @@ async fn pending_name_survives_restart_before_private_key_arrives() {
         let pending_count: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM pending_person_name_edits WHERE workspace_id=?1",
+                "SELECT COUNT(*) FROM pending_principal_name_edits WHERE workspace_id=?1",
                 [workspace.as_bytes().as_slice()],
                 |row| row.get(0),
             )
@@ -318,7 +325,7 @@ async fn pending_name_survives_restart_before_private_key_arrives() {
         let pending: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM pending_person_name_edits WHERE workspace_id=?1",
+                "SELECT COUNT(*) FROM pending_principal_name_edits WHERE workspace_id=?1",
                 [workspace.as_bytes().as_slice()],
                 |row| row.get(0),
             )
@@ -340,16 +347,16 @@ async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_
     let malformed = {
         let creator = cluster.node("creator");
         let state = creator.state.lock().unwrap();
-        let anchor = crate::person_names::anchor(
+        let anchor = crate::principals::anchor(
             state.memberships.get(&workspace).unwrap(),
             creator.public_identity(),
         )
         .unwrap();
         let wrong_workspace = crate::WorkspaceId::from_bytes([99; 16]);
-        crate::person_names::edit::PersonNameEdit::sign(
+        crate::principals::edit::PrincipalNameEdit::sign(
             &state.secret_key,
             wrong_workspace,
-            crate::person_names::derive(workspace, anchor),
+            crate::principals::derive(workspace, anchor),
             100,
             "Forged",
         )
@@ -365,8 +372,8 @@ async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_
             &mut state.connection,
             &secret,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
-            "person-name.edit",
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
             &malformed,
             crate::synchronization::MembershipStanding::Current,
             true,
@@ -377,7 +384,7 @@ async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_
         crate::synchronization::record_subscription::publish_commit(
             &state,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
+            crate::synchronization::reserved_principals_scope(),
             sequence,
         );
         creator.sync_worker.wake();
@@ -477,7 +484,7 @@ async fn existing_workspace_bootstrap_import_advances_generation_atomically_and_
     cluster.admit("creator", "newcomer", workspace).await;
     {
         let state = joiner.state.lock().unwrap();
-        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
     }
     assert!(joiner.join_workspace(&invitation).await.is_err());
     assert_eq!(joiner.person_name_snapshot(workspace).unwrap().0, before);
@@ -562,7 +569,7 @@ async fn membership_generation_write_failure_rolls_back_local_and_remote_revocat
     };
     {
         let state = creator.state.lock().unwrap();
-        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
     }
     assert!(creator.revoke_member(workspace, member).is_err());
     assert_eq!(creator.person_name_snapshot(workspace).unwrap().0, before);
@@ -610,20 +617,21 @@ async fn committed_self_rename_wakes_subscriber_when_private_initialization_fail
     {
         let mut state = creator.state.lock().unwrap();
         let projection = state.memberships.get(&workspace).unwrap();
-        let person = crate::person_names::derive(
+        let person = crate::principals::derive(
             workspace,
-            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+            crate::principals::anchor(projection, creator.public_identity()).unwrap(),
         );
         let secret = state.secret_key.clone();
-        let signed =
-            crate::person_names::edit::PersonNameEdit::sign(&secret, workspace, person, 1, "Older")
-                .unwrap();
+        let signed = crate::principals::edit::PrincipalNameEdit::sign(
+            &secret, workspace, person, 1, "Older",
+        )
+        .unwrap();
         crate::synchronization::append(
             &mut state.connection,
             &secret,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
-            "person-name.edit",
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
             signed.canonical_bytes(),
             crate::synchronization::MembershipStanding::Current,
             true,
@@ -644,15 +652,15 @@ async fn committed_self_rename_wakes_subscriber_when_private_initialization_fail
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reserved_person_name_scope_can_be_initialized_and_demanded_privately() {
+async fn reserved_principals_scope_can_be_initialized_and_demanded_privately() {
     let cluster = SyncCluster::start("private-person-names-scope", &["creator", "joiner"]).await;
     let workspace = cluster
         .node("creator")
         .create_workspace("Names")
         .unwrap()
         .id();
-    let reserved = crate::synchronization::reserved_person_name_scope();
-    assert_eq!(reserved, "internal:teamarness.person-names");
+    let reserved = crate::synchronization::reserved_principals_scope();
+    assert_eq!(reserved, "internal:teamarness.principals");
     let private_record = {
         let creator = cluster.node("creator");
         let mut state = creator.state.lock().unwrap();

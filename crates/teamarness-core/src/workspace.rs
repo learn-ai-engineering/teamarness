@@ -86,7 +86,7 @@ pub(crate) fn create_named(
     person_name: &str,
     authored_at_unix_ms: i64,
 ) -> Result<WorkspaceSummary, WorkspaceError> {
-    crate::person_names::validate(person_name).map_err(|_| WorkspaceError::InvalidName)?;
+    crate::principals::validate(person_name).map_err(|_| WorkspaceError::InvalidName)?;
     create_with_initial_name(
         connection,
         secret_key,
@@ -106,7 +106,7 @@ fn create_named_with_test_fault(
     authored_at_unix_ms: i64,
     fault: impl FnMut(CreationBoundary) -> Result<(), StorageError>,
 ) -> Result<WorkspaceSummary, WorkspaceError> {
-    crate::person_names::validate(person_name).map_err(|_| WorkspaceError::InvalidName)?;
+    crate::principals::validate(person_name).map_err(|_| WorkspaceError::InvalidName)?;
     create_with_initial_name(
         connection,
         secret_key,
@@ -416,19 +416,19 @@ fn finish_request_with_fault(
     }
 
     if let Some(name) = &request.initial_person_name {
-        crate::person_names::validate(name).map_err(|_| StorageError::CorruptWorkspace)?;
-        let person = crate::person_names::derive(request.workspace_id, request.genesis_id);
+        crate::principals::validate(name).map_err(|_| StorageError::CorruptWorkspace)?;
+        let person = crate::principals::derive(request.workspace_id, create_person.id);
         transaction.execute(
-            "INSERT INTO workspace_person_names (workspace_id, person_id, anchor_operation_id, owner_public_identity, name)
+            "INSERT INTO principal_names (workspace_id, principal_id, anchor_operation_id, owner_public_identity, name)
              VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(workspace_id, person_id) DO NOTHING",
+             ON CONFLICT(workspace_id, principal_id) DO NOTHING",
             params![request.workspace_id.as_bytes().as_slice(), person.as_bytes(),
-                request.genesis_id.as_bytes().as_slice(), request.creator.as_bytes().as_slice(), name],
+                create_person.id.as_bytes().as_slice(), request.creator.as_bytes().as_slice(), name],
         ).map_err(fault!(StorageError::Database))?;
         transaction
             .execute(
-                "INSERT INTO pending_person_name_edits (workspace_id, person_id, name)
-             VALUES (?1, ?2, ?3) ON CONFLICT(workspace_id, person_id) DO NOTHING",
+                "INSERT INTO pending_principal_name_edits (workspace_id, principal_id, name)
+             VALUES (?1, ?2, ?3) ON CONFLICT(workspace_id, principal_id) DO NOTHING",
                 params![
                     request.workspace_id.as_bytes().as_slice(),
                     person.as_bytes(),
@@ -898,13 +898,13 @@ mod tests {
             .unwrap()
             .remove(&workspace.id())
             .unwrap();
-        let person = crate::person_names::lookup(&reopened.connection, &projection, creator)
+        let person = crate::principals::lookup(&reopened.connection, &projection, creator)
             .unwrap()
             .unwrap();
         assert_eq!(person.name(), Some("Initial 🧑‍💻"));
         assert_eq!(
             person.id(),
-            crate::person_names::derive(workspace.id(), projection.genesis_id())
+            crate::principals::derive(workspace.id(), projection.person_group(creator).unwrap())
         );
         drop(reopened);
         fs::remove_dir_all(directory).unwrap();

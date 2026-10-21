@@ -539,7 +539,7 @@ async fn named_join_survives_inviter_admission_fault_and_recovers_one_person() {
         let token = invitation.verified().unwrap().token;
         {
             let mut connection = Connection::open(invitee_directory.join("core.sqlite3")).unwrap();
-            crate::person_names::stage_join(
+            crate::principals::stage_join(
                 &mut connection,
                 workspace.id(),
                 token.id.as_bytes(),

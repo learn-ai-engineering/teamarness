@@ -162,7 +162,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         let promoted = replication::promote_scope(&mut state, workspace, package)
             .map_err(fault!(SyncRejection::Storage))?;
         if crate::synchronization::is_reserved_record_scope(package) {
-            person_name_sync::reconcile(&mut state, workspace)
+            principal_sync::reconcile(&mut state, workspace)
                 .map_err(fault!(SyncRejection::Storage))?;
         }
         Ok(promoted)
@@ -501,7 +501,7 @@ fn classify_operation(
             );
             if crate::synchronization::is_reserved_record_scope(package) {
                 // Semantic errors are isolated from valid transport and subsequent records.
-                let _ = person_name_sync::reconcile(state, workspace);
+                let _ = principal_sync::reconcile(state, workspace);
             }
             Ok(OperationOutcome::Applied)
         }

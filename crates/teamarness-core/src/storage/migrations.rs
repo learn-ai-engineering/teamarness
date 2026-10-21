@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::diag::fault;
 use crate::error::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 16;
+const LATEST_SCHEMA_VERSION: i64 = 17;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_core.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_workspaces_membership.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_invitations.sql");
@@ -21,6 +21,7 @@ const MIGRATION_0013: &str = include_str!("../../migrations/0013_scope_key_deman
 const MIGRATION_0014: &str = include_str!("../../migrations/0014_person_names.sql");
 const MIGRATION_0015: &str = include_str!("../../migrations/0015_person_name_edits.sql");
 const MIGRATION_0016: &str = include_str!("../../migrations/0016_membership_action_vocabulary.sql");
+const MIGRATION_0017: &str = include_str!("../../migrations/0017_principals.sql");
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
     // A batch may rebuild a table that other tables reference (0016 does), and
@@ -126,6 +127,11 @@ fn apply_batches(connection: &mut Connection) -> Result<(), StorageError> {
     if current_version < 16 {
         transaction
             .execute_batch(MIGRATION_0016)
+            .map_err(fault!(StorageError::Migration))?;
+    }
+    if current_version < 17 {
+        transaction
+            .execute_batch(MIGRATION_0017)
             .map_err(fault!(StorageError::Migration))?;
     }
     transaction

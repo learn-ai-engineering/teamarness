@@ -843,14 +843,14 @@ impl From<StorageError> for SynchronizationError {
 
 // This exact scope is owned by Core, not by a Package Identity. Peer transport
 // must still accept it for current members; only external API entry points deny it.
-const PERSON_NAME_SCOPE: &str = "internal:teamarness.person-names";
+const PRINCIPALS_SCOPE: &str = "internal:teamarness.principals";
 
-pub(crate) const fn reserved_person_name_scope() -> &'static str {
-    PERSON_NAME_SCOPE
+pub(crate) const fn reserved_principals_scope() -> &'static str {
+    PRINCIPALS_SCOPE
 }
 
 pub(crate) fn is_reserved_record_scope(identity: &str) -> bool {
-    identity == reserved_person_name_scope()
+    identity == reserved_principals_scope()
 }
 
 pub(crate) fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) -> [u8; 32] {

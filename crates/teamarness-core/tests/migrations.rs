@@ -110,6 +110,8 @@ async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
          PRAGMA user_version = 15;",
         )
         .unwrap();
+    drop_principal_tables(&connection);
+    restore_legacy_names(&connection, true);
     drop(connection);
 
     let upgraded = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
@@ -123,7 +125,7 @@ async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     let violations: i64 = connection
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -350,7 +352,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     for column in [
         "scope_id",
         "log_id",
@@ -425,7 +427,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -567,11 +569,11 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE workspace_person_name_consumption;
-             DROP TABLE workspace_person_name_generations; DROP TABLE workspace_person_name_winners;
-             DROP TABLE workspace_person_name_intent_revisions;
-             DROP TABLE pending_person_join_names; DROP TABLE pending_person_name_edits;
-             DROP TABLE workspace_person_names;
+            "DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;
+             DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;
+             DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;
+             DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;
+             DROP TABLE principal_names; DROP TABLE workspace_principals; DROP TABLE agent_package_bindings; DROP TABLE agent_keys;
              ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name;
              DROP TABLE sync_scope_key_demand_peer_progress;
              DROP TABLE sync_scope_key_demands;
@@ -751,7 +753,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
         )
         .unwrap();
     assert_eq!(left, 0, "peer progress cascades when demand is cleared");
-    connection.execute_batch("DROP TABLE workspace_person_name_consumption; DROP TABLE workspace_person_name_generations; DROP TABLE workspace_person_name_winners; DROP TABLE workspace_person_name_intent_revisions; DROP TABLE pending_person_join_names; DROP TABLE pending_person_name_edits; DROP TABLE workspace_person_names; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
+    connection.execute_batch("DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;              DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;              DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;              DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;              DROP TABLE principal_names; DROP TABLE workspace_principals; DROP TABLE agent_package_bindings; DROP TABLE agent_keys; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
     drop(connection);
 
     let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
@@ -761,7 +763,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     connection
         .execute(
             insert,
@@ -772,73 +774,57 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Batch 17 starts Principal presentation fresh on schema 16. There is no
+/// pre-production name-data migration; membership anchors remain canonical.
 #[tokio::test]
-async fn migration_0015_preserves_v14_pending_name_and_assigns_intent_revision() {
-    let directory = private_data_directory("migration-v14-pending-intent");
+async fn migration_0017_replaces_names_with_principals_from_v16() {
+    let directory = private_data_directory("migration-v16-principals");
     let config = CoreRuntimeConfig::new(&directory);
     let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
         .await
         .unwrap();
-    let workspace = runtime
-        .create_workspace_with_person_name("Existing", "Chosen")
-        .unwrap();
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection
-        .execute_batch(
-            "DROP TRIGGER person_name_intent_insert;
-         DROP TRIGGER person_name_intent_name_update;
-         DROP TABLE workspace_person_name_winners;
-         DROP TABLE workspace_person_name_generations;
-         DROP TABLE workspace_person_name_consumption;
-         DROP TABLE workspace_person_name_intent_revisions;
-         ALTER TABLE pending_person_name_edits DROP COLUMN intent_revision;
-         INSERT INTO pending_person_name_edits (workspace_id, person_id, name)
-         SELECT workspace_id, person_id, name FROM workspace_person_names;
-         PRAGMA user_version = 14;",
-        )
-        .unwrap();
-    let name: String = connection
-        .query_row("SELECT name FROM pending_person_name_edits", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(name, "Chosen");
+    drop_principal_tables(&connection);
+    restore_legacy_names(&connection, true);
+    connection.pragma_update(None, "user_version", 16).unwrap();
     drop(connection);
     let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
-    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    let (pending, revision): (i64, i64) = connection
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM pending_person_name_edits), last_revision FROM workspace_person_name_intent_revisions",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (pending, revision),
-        (0, 1),
-        "reopen publishes the migrated pending name"
-    );
-    drop(connection);
-    reopened.set_own_person_name(workspace.id(), "New").unwrap();
+    let workspace = reopened.create_workspace("Upgraded").unwrap().id();
+    let agent = reopened.add_agent(workspace, "Agent").unwrap();
+    assert!(reopened.principal(workspace, agent).unwrap().is_some());
     reopened.shutdown().await.unwrap();
     drop(reopened);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    let (name, next): (String, i64) = connection
-        .query_row(
-            "SELECT n.name, r.last_revision FROM workspace_person_names n JOIN workspace_person_name_intent_revisions r USING (workspace_id, person_id)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!((name.as_str(), next), ("New", 2));
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        17
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_keys", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM workspace_principals", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        2
+    );
     drop(connection);
     fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
-async fn migration_0016_rejects_future_schema_versions() {
+async fn migration_0017_rejects_future_schema_versions() {
     let directory = private_data_directory("migration-future-schema");
     let config = CoreRuntimeConfig::new(&directory);
     let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
@@ -847,7 +833,7 @@ async fn migration_0016_rejects_future_schema_versions() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.pragma_update(None, "user_version", 17).unwrap();
+    connection.pragma_update(None, "user_version", 18).unwrap();
     drop(connection);
     assert!(matches!(
         CoreRuntime::open_loopback_for_tests(config).await,
@@ -898,43 +884,48 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
-async fn migration_0014_upgrades_existing_unnamed_workspace_without_inventing_a_name() {
-    let directory = private_data_directory("migration-person-names");
-    let config = CoreRuntimeConfig::new(&directory);
-    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+async fn migration_0017_unnamed_person_is_not_given_a_name() {
+    let directory = private_data_directory("migration-unnamed-principal");
+    let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
-    let workspace = runtime.create_workspace("Old workspace").unwrap();
-    let identity = runtime.public_identity();
-    runtime.shutdown().await.unwrap();
-    drop(runtime);
-    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.execute_batch("DROP TABLE workspace_person_name_consumption; DROP TABLE workspace_person_name_generations; DROP TABLE workspace_person_name_winners; DROP TABLE workspace_person_name_intent_revisions; DROP TABLE pending_person_join_names; DROP TABLE pending_person_name_edits; DROP TABLE workspace_person_names; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; PRAGMA user_version = 13;").unwrap();
-    drop(connection);
-    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
-    let old = reopened
-        .workspace_person(workspace.id(), identity)
-        .unwrap()
-        .unwrap();
-    assert_eq!(old.name(), None);
-    reopened
-        .set_own_person_name(workspace.id(), "Chosen")
-        .unwrap();
+    let workspace = runtime.create_workspace("Unnamed").unwrap();
     assert_eq!(
-        reopened
-            .workspace_person(workspace.id(), identity)
+        runtime
+            .workspace_person(workspace.id(), runtime.public_identity())
             .unwrap()
             .unwrap()
-            .id(),
-        old.id()
+            .name(),
+        None
     );
-    reopened.shutdown().await.unwrap();
-    std::fs::remove_dir_all(directory).unwrap();
+    runtime.shutdown().await.unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn drop_principal_tables(connection: &Connection) {
+    connection.execute_batch("DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;
+        DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;
+        DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;
+        DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;
+        DROP TABLE principal_names; DROP TABLE workspace_principals; DROP TABLE agent_package_bindings; DROP TABLE agent_keys;").unwrap();
+}
+
+fn restore_legacy_names(connection: &Connection, with_edits: bool) {
+    let legacy = include_str!("../migrations/0014_person_names.sql").replace(
+        "ALTER TABLE workspace_creation_requests ADD COLUMN initial_person_name TEXT;",
+        "",
+    );
+    connection.execute_batch(&legacy).unwrap();
+    if with_edits {
+        connection
+            .execute_batch(include_str!("../migrations/0015_person_name_edits.sql"))
+            .unwrap();
+    }
 }

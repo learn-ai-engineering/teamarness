@@ -199,7 +199,7 @@ impl CoreRuntime {
                     .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
                 let workspaces: Vec<_> = locked.memberships.keys().copied().collect();
                 for workspace in workspaces {
-                    person_name_sync::initialize(&mut locked, workspace)
+                    principal_sync::initialize(&mut locked, workspace)
                         .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
                 }
                 Ok(())
@@ -352,7 +352,7 @@ impl Drop for CoreRuntime {
 mod identity;
 mod membership;
 mod onboarding;
-pub(crate) mod person_name_sync;
+pub(crate) mod principal_sync;
 mod records;
 mod replication;
 mod subscription;

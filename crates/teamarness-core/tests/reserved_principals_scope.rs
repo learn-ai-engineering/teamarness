@@ -1,10 +1,10 @@
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, SynchronizationError};
 
-const RESERVED: &str = "internal:teamarness.person-names";
-const LEGACY_VALID_PACKAGE: &str = "internal.teamarness.person-names";
+const RESERVED: &str = "internal:teamarness.principals";
+const LEGACY_VALID_PACKAGE: &str = "internal.teamarness.principals";
 
 #[tokio::test]
-async fn public_record_operations_cannot_use_person_name_scope() {
+async fn public_record_operations_cannot_use_principals_scope() {
     let root = std::env::temp_dir().join(format!(
         "teamarness-reserved-scope-{}-{}",
         std::process::id(),

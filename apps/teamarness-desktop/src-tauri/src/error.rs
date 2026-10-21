@@ -81,8 +81,11 @@ impl From<PersonNameError> for BridgeError {
     fn from(value: PersonNameError) -> Self {
         match value {
             PersonNameError::InvalidName
+            | PersonNameError::InvalidPackageIdentity
             | PersonNameError::WorkspaceNotFound
-            | PersonNameError::NotOwnPerson => Self::invalid_input(),
+            | PersonNameError::NotOwnPerson
+            | PersonNameError::AgentNotFound => Self::invalid_input(),
+            PersonNameError::Membership(error) => error.into(),
             PersonNameError::Storage(error) => error.into(),
         }
     }
@@ -127,6 +130,28 @@ impl From<StorageError> for BridgeError {
 mod tests {
     use super::*;
     use teamarness_package_host::{DiagnosticId, PackageErrorStage, RecoveryAction};
+
+    #[test]
+    fn maps_principal_agent_errors_without_claiming_a_retryable_failure() {
+        assert_eq!(
+            BridgeError::from(PersonNameError::InvalidPackageIdentity),
+            BridgeError::invalid_input()
+        );
+        assert_eq!(
+            BridgeError::from(PersonNameError::AgentNotFound),
+            BridgeError::invalid_input()
+        );
+        assert_eq!(
+            BridgeError::from(PersonNameError::Membership(MembershipError::NotManager)),
+            BridgeError::new(BridgeErrorCode::InvalidBootstrap, false)
+        );
+        assert_eq!(
+            BridgeError::from(PersonNameError::Membership(MembershipError::Storage(
+                StorageError::UncertainOutcome
+            ))),
+            BridgeError::new(BridgeErrorCode::UncertainStorageOutcome, false)
+        );
+    }
 
     #[test]
     fn maps_every_public_onboarding_error_to_the_shared_fixture() {

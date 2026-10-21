@@ -36,7 +36,7 @@ mod membership;
 mod membership_sync;
 mod network;
 mod onboarding;
-mod person_names;
+mod principals;
 mod storage;
 mod subscription;
 mod synchronization;
@@ -51,7 +51,10 @@ pub use membership::MembershipOperationId;
 #[doc(hidden)]
 pub use membership::test_authoring;
 pub use onboarding::WorkspaceInvitation;
-pub use person_names::{PersonNameError, WorkspacePerson, WorkspacePersonId};
+pub use principals::{
+    PersonNameError, PrincipalId, PrincipalKind, WorkspacePerson, WorkspacePersonId,
+    WorkspacePrincipal,
+};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use runtime::MembershipApplyOutcomeForTests;
