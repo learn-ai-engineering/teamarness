@@ -1,5 +1,6 @@
-import type { Collection, Document, TextEvent } from "./contract.generated";
+import type { Collection, Comment, Document, TextEvent } from "./contract.generated";
 import type { DocumentsController } from "./controller";
+import { authorLabel, renderMarkdown } from "./markdown";
 
 const KIT = {
   primary: "teamarness-control teamarness-control--primary",
@@ -80,7 +81,15 @@ export class DocumentsView {
   private readonly editorStatus: HTMLElement;
   private readonly textarea: HTMLTextAreaElement;
   private readonly closeButton: HTMLButtonElement;
+  private readonly commentsPanel: HTMLElement;
+  private readonly commentList: HTMLElement;
+  private readonly commentForm: HTMLFormElement;
+  private readonly commentInput: HTMLTextAreaElement;
+  private readonly commentQuote: HTMLElement;
+  private readonly commentSubmit: HTMLButtonElement;
   private readonly controller: DocumentsController;
+  private draftQuote: string | null = null;
+  private replyTo: string | null = null;
   private renamingDocumentId: string | null = null;
   private renamingCollection = false;
 
@@ -172,6 +181,56 @@ export class DocumentsView {
     this.editorPane.append(editorHeader, this.textarea);
     controller.textListener = (event: TextEvent) => this.onTextEvent(event);
 
+    // --- comments (built once; the list is rebuilt per render, the composer persists) ---
+    this.commentsPanel = document.createElement("section");
+    this.commentsPanel.className = "comments-panel";
+    this.commentsPanel.setAttribute("aria-label", "Comments");
+    const commentsHeading = document.createElement("h3");
+    commentsHeading.textContent = "Comments";
+    this.commentList = document.createElement("ol");
+    this.commentList.className = "comment-list";
+    this.commentForm = document.createElement("form");
+    this.commentForm.className = `comment-compose ${KIT.field}`;
+    this.commentQuote = document.createElement("blockquote");
+    this.commentQuote.className = "comment-quote comment-quote--draft";
+    this.commentQuote.hidden = true;
+    const quoteButton = button("Quote selection", KIT.secondary, () => {
+      const start = this.textarea.selectionStart;
+      const end = this.textarea.selectionEnd;
+      const selected = this.textarea.value.slice(start, end).trim();
+      this.draftQuote = selected ? selected.slice(0, 2048) : null;
+      this.renderComposer();
+    });
+    this.commentInput = document.createElement("textarea");
+    this.commentInput.className = `${KIT.input} comment-input`;
+    this.commentInput.rows = 3;
+    this.commentInput.maxLength = 32768;
+    this.commentInput.placeholder = "Add a comment (Markdown)";
+    this.commentInput.setAttribute("aria-label", "New comment");
+    this.commentSubmit = document.createElement("button");
+    this.commentSubmit.type = "submit";
+    this.commentSubmit.className = KIT.primary;
+    this.commentSubmit.textContent = "Comment";
+    const composeActions = document.createElement("div");
+    composeActions.className = "comment-compose-actions";
+    composeActions.append(quoteButton, this.commentSubmit);
+    this.commentForm.append(this.commentQuote, this.commentInput, composeActions);
+    this.commentForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const markdown = this.commentInput.value.trim();
+      if (!markdown) return;
+      void controller.addComment(markdown, this.draftQuote, this.replyTo).then((ok) => {
+        if (ok) {
+          this.commentInput.value = "";
+          this.draftQuote = null;
+          this.replyTo = null;
+          this.renderComposer();
+        }
+      });
+    });
+    this.commentsPanel.append(commentsHeading, this.commentList, this.commentForm);
+    this.editorPane.append(this.commentsPanel);
+
     shell.append(rail, panel, this.editorPane);
     this.page.append(header, this.warnings, this.error, shell);
     root.append(this.page);
@@ -195,11 +254,117 @@ export class DocumentsView {
     }
   }
 
+  private renderComposer(): void {
+    this.commentQuote.hidden = this.draftQuote === null && this.replyTo === null;
+    this.commentQuote.replaceChildren();
+    if (this.replyTo !== null) {
+      const reply = document.createElement("span");
+      reply.className = "comment-reply-to";
+      reply.textContent = "Replying to a comment";
+      this.commentQuote.append(reply);
+    }
+    if (this.draftQuote !== null) {
+      const quote = document.createElement("span");
+      quote.textContent = this.draftQuote;
+      this.commentQuote.append(quote);
+    }
+    if (!this.commentQuote.hidden) {
+      this.commentQuote.append(button("Clear", KIT.secondary, () => {
+        this.draftQuote = null;
+        this.replyTo = null;
+        this.renderComposer();
+      }));
+    }
+    this.commentSubmit.disabled = this.controller.state.busy;
+  }
+
+  private commentItem(comment: Comment, depth: number): HTMLLIElement {
+    const item = document.createElement("li");
+    item.className = "comment";
+    item.style.setProperty("--comment-depth", String(Math.min(depth, 6)));
+    if (comment.resolved) item.classList.add("is-resolved");
+    const meta = document.createElement("div");
+    meta.className = "comment-meta";
+    const author = document.createElement("span");
+    author.className = "comment-author";
+    author.textContent = authorLabel(comment.author, undefined, comment.isLocal);
+    const state = document.createElement("span");
+    state.className = "comment-state";
+    state.textContent = comment.resolved ? "Resolved" : "";
+    meta.append(author, state);
+    item.append(meta);
+    if (comment.quote !== undefined) {
+      const quote = document.createElement("blockquote");
+      quote.className = "comment-quote";
+      quote.textContent = comment.quote;
+      item.append(quote);
+    }
+    const body = document.createElement("div");
+    body.className = "comment-body";
+    if (comment.markdown !== undefined) body.innerHTML = renderMarkdown(comment.markdown);
+    else {
+      body.classList.add("comment-body--pending");
+      body.textContent = "Waiting for history access";
+    }
+    item.append(body);
+    const actions = document.createElement("div");
+    actions.className = "comment-actions";
+    actions.append(
+      button("Reply", KIT.secondary, () => { this.replyTo = comment.id; this.renderComposer(); this.commentInput.focus(); }),
+      comment.resolved
+        ? button("Reopen", KIT.secondary, () => { void this.controller.reopenComment(comment.id); })
+        : button("Resolve", KIT.secondary, () => { void this.controller.resolveComment(comment.id); }),
+    );
+    for (const control of actions.querySelectorAll("button")) control.disabled = this.controller.state.busy;
+    item.append(actions);
+    return item;
+  }
+
+  private renderComments(): void {
+    const { comments, commentsTruncated } = this.controller.state;
+    const children = new Map<string | null, Comment[]>();
+    for (const comment of comments) {
+      const key = comment.parentId ?? null;
+      const siblings = children.get(key) ?? [];
+      siblings.push(comment);
+      children.set(key, siblings);
+    }
+    const items: HTMLLIElement[] = [];
+    const walk = (parent: string | null, depth: number) => {
+      for (const comment of children.get(parent) ?? []) {
+        items.push(this.commentItem(comment, depth));
+        walk(comment.id, depth + 1);
+      }
+    };
+    walk(null, 0);
+    // A reply whose parent is outside the listed window still appears, at the top level.
+    const placed = new Set<string>();
+    const collect = (parent: string | null) => {
+      for (const comment of children.get(parent) ?? []) {
+        placed.add(comment.id);
+        collect(comment.id);
+      }
+    };
+    collect(null);
+    for (const comment of comments) {
+      if (!placed.has(comment.id)) items.push(this.commentItem(comment, 0));
+    }
+    this.commentList.replaceChildren(...items);
+    if (commentsTruncated) {
+      const note = document.createElement("li");
+      note.className = "documents-empty";
+      note.textContent = "Older comments are not shown.";
+      this.commentList.prepend(note);
+    }
+    this.renderComposer();
+  }
+
   private renderEditor(): void {
     const open = this.controller.openDocument;
     const editor = this.controller.openEditor;
     this.editorPane.hidden = open === null;
     if (open === null) return;
+    this.renderComments();
     this.editorTitle.textContent = open.title;
     if (!editor) {
       this.editorStatus.textContent = "Opening…";

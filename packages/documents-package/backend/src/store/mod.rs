@@ -59,6 +59,19 @@ pub struct DocumentView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentView {
+    pub id: String,
+    pub document_id: String,
+    pub parent_id: Option<String>,
+    pub author: String,
+    pub order_key: String,
+    pub resolved: bool,
+    /// `None` until the add record has been opened.
+    pub markdown: Option<String>,
+    pub quote: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestResult {
     Applied,
     Duplicate,
@@ -87,6 +100,8 @@ pub(crate) struct StoreInner {
     pub(crate) conn: Connection,
     /// Collection name or Document title by id, with the order key that set it.
     pub(crate) texts: HashMap<String, (String, String)>,
+    /// Comment Markdown and optional quote by Comment id; a Comment never changes.
+    pub(crate) comments: HashMap<String, (String, Option<String>)>,
     pub(crate) deferred: HashMap<String, DomainRecord>,
 }
 
@@ -121,6 +136,7 @@ impl DocumentStore {
             inner: Arc::new(Mutex::new(StoreInner {
                 conn,
                 texts: HashMap::new(),
+                comments: HashMap::new(),
                 deferred: HashMap::new(),
             })),
             ingest_gate: Arc::new(Mutex::new(())),
@@ -310,6 +326,9 @@ impl DocumentStore {
         if let Some((id, order, text)) = outcome.text {
             remember_text(&mut inner.texts, id, order, text);
         }
+        if let Some((id, markdown, quote)) = outcome.comment {
+            inner.comments.insert(id, (markdown, quote));
+        }
         if let Some(domain) = outcome.deferred {
             inner.deferred.insert(record_id.to_owned(), domain);
         }
@@ -376,6 +395,9 @@ impl DocumentStore {
             on_commit();
             if let Some((id, order, text)) = outcome.text {
                 remember_text(&mut inner.texts, id, order, text);
+            }
+            if let Some((id, markdown, quote)) = outcome.comment {
+                inner.comments.insert(id, (markdown, quote));
             }
             if let Some(edit) = outcome.edit {
                 edits.push(edit);
@@ -450,6 +472,15 @@ impl DocumentStore {
             DomainRecord::DocumentRename {
                 document, title, ..
             } => (document.clone(), title.clone()),
+            DomainRecord::CommentAdd {
+                markdown, quote, ..
+            } => {
+                let mut inner = lock(&self.inner)?;
+                inner
+                    .comments
+                    .insert(record_id.to_owned(), (markdown.clone(), quote.clone()));
+                return Ok(());
+            }
             _ => return Ok(()),
         };
         let mut inner = lock(&self.inner)?;
@@ -526,6 +557,55 @@ impl DocumentStore {
                 |row| row.get(0),
             )
             .map_err(rerr)
+    }
+
+    pub fn comment_exists(&self, id: &str) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row("SELECT 1 FROM comments WHERE comment_id=?1", [id], |_| {
+                Ok(())
+            })
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(rerr)
+    }
+
+    /// The Comments of one Document in creation order, threads included.
+    pub fn comments(&self, document: &str) -> Result<Vec<CommentView>, StoreError> {
+        let inner = lock(&self.inner)?;
+        let mut statement = inner
+            .conn
+            .prepare("SELECT comment_id,parent_id,author,create_order,resolved FROM comments WHERE document_id=?1 ORDER BY create_order,comment_id")
+            .map_err(rerr)?;
+        let rows = statement
+            .query_map([document], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(rerr)?;
+        rows.map(|row| {
+            row.map(|(id, parent_id, author, order_key, resolved)| {
+                let text = inner.comments.get(&id);
+                CommentView {
+                    markdown: text.map(|(markdown, _)| markdown.clone()),
+                    quote: text.and_then(|(_, quote)| quote.clone()),
+                    id,
+                    document_id: document.to_owned(),
+                    parent_id,
+                    author,
+                    order_key,
+                    resolved,
+                }
+            })
+            .map_err(rerr)
+        })
+        .collect()
     }
 
     pub fn collection_exists(&self, id: &str) -> Result<bool, StoreError> {
@@ -627,4 +707,5 @@ fn validate_sql_identity(id: &str) -> Result<(), StoreError> {
 fn waits_on(domain: &DomainRecord, target: &str) -> bool {
     domain.target() == Some(target)
         || matches!(domain, DomainRecord::DocumentMove { collection, .. } if collection == target)
+        || matches!(domain, DomainRecord::CommentAdd { parent: Some(parent), .. } if parent == target)
 }

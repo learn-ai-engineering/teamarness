@@ -246,6 +246,81 @@
           "$ref": "#/$defs/revision"
         }
       }
+    },
+    "comment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "documentId",
+        "author",
+        "position",
+        "resolved",
+        "isLocal"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/recordId"
+        },
+        "documentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "parentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "author": {
+          "type": "string"
+        },
+        "position": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved": {
+          "type": "boolean"
+        },
+        "isLocal": {
+          "type": "boolean"
+        },
+        "markdown": {
+          "type": "string",
+          "maxLength": 32768
+        },
+        "quote": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      }
+    },
+    "comments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comments"
+      ],
+      "properties": {
+        "comments": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/comment"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "commentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commentId"
+      ],
+      "properties": {
+        "commentId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
     }
   },
   "requests": {
@@ -427,6 +502,61 @@
       },
       "response": {
         "$ref": "#/$defs/edited"
+      }
+    },
+    "documents.comments": {
+      "request": {
+        "$ref": "#/$defs/documentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/comments"
+      }
+    },
+    "documents.comment.add": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "markdown"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "parentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "quote": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "markdown": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.comment.resolve": {
+      "request": {
+        "$ref": "#/$defs/commentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.comment.reopen": {
+      "request": {
+        "$ref": "#/$defs/commentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
       }
     }
   },

@@ -17,6 +17,27 @@ export type CollectionRequest = {
   readonly "collectionId": RecordId;
 };
 
+export type Comment = {
+  readonly "author": string;
+  readonly "documentId": RecordId;
+  readonly "id": RecordId;
+  readonly "isLocal": boolean;
+  readonly "markdown"?: string;
+  readonly "parentId"?: RecordId;
+  readonly "position": string;
+  readonly "quote"?: string;
+  readonly "resolved": boolean;
+};
+
+export type CommentRequest = {
+  readonly "commentId": RecordId;
+};
+
+export type Comments = {
+  readonly "comments": readonly Comment[];
+  readonly "truncated"?: boolean;
+};
+
 export type Document = {
   readonly "archived": boolean;
   readonly "collectionId": RecordId;
@@ -76,6 +97,15 @@ export type DocumentsContract = {
         readonly "name": Name;
       }; readonly response: Appended };
     readonly "documents.collection.restore": { readonly request: CollectionRequest; readonly response: Appended };
+    readonly "documents.comment.add": { readonly request: {
+        readonly "documentId": RecordId;
+        readonly "markdown": string;
+        readonly "parentId"?: RecordId;
+        readonly "quote"?: string;
+      }; readonly response: Appended };
+    readonly "documents.comment.reopen": { readonly request: CommentRequest; readonly response: Appended };
+    readonly "documents.comment.resolve": { readonly request: CommentRequest; readonly response: Appended };
+    readonly "documents.comments": { readonly request: DocumentRequest; readonly response: Comments };
     readonly "documents.document.archive": { readonly request: DocumentRequest; readonly response: Appended };
     readonly "documents.document.create": { readonly request: {
         readonly "collectionId": RecordId;

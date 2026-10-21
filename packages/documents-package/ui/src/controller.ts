@@ -1,12 +1,14 @@
 import { describePackageError, isAbortError } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Collection, Document, DocumentsContract, Snapshot, TextEvent } from "./contract.generated";
+import type { Collection, Comment, Document, DocumentsContract, Snapshot, TextEvent } from "./contract.generated";
 import { DocumentEditor } from "./editor";
 
 export type ControllerState = Readonly<{
   snapshot: Snapshot;
   selectedCollectionId: string | null;
   openDocumentId: string | null;
+  comments: readonly Comment[];
+  commentsTruncated: boolean;
   showArchived: boolean;
   busy: boolean;
   error: string | null;
@@ -25,6 +27,8 @@ export class DocumentsController {
     snapshot: EMPTY,
     selectedCollectionId: null,
     openDocumentId: null,
+    comments: [],
+    commentsTruncated: false,
     showArchived: false,
     busy: false,
     error: null,
@@ -79,6 +83,8 @@ export class DocumentsController {
 
   applySnapshot(snapshot: Snapshot): void {
     if (this.disposed) return;
+    // Any committed record may be a Comment on the open Document; refresh its thread.
+    void this.refreshComments();
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);
     const pending = this.pendingSelectionId;
     if (pending !== null && snapshot.collections.some((c) => c.id === pending)) {
@@ -103,7 +109,8 @@ export class DocumentsController {
     if (this.disposed || this._state.openDocumentId === documentId) return;
     await this.closeDocument();
     const sequence = ++this.openSequence;
-    this.update({ openDocumentId: documentId, error: null });
+    this.update({ openDocumentId: documentId, comments: [], commentsTruncated: false, error: null });
+    void this.refreshComments();
     try {
       const subscription = await this.client.subscribe("documents.document.text", { documentId }, (event) => {
         if (this.disposed || sequence !== this.openSequence) return;
@@ -125,8 +132,44 @@ export class DocumentsController {
     const subscription = this.textSubscription;
     this.textSubscription = null;
     this.editor = null;
-    if (this._state.openDocumentId !== null) this.update({ openDocumentId: null });
+    if (this._state.openDocumentId !== null) this.update({ openDocumentId: null, comments: [], commentsTruncated: false });
     if (subscription) await subscription.close();
+  }
+
+  async refreshComments(): Promise<void> {
+    const documentId = this._state.openDocumentId;
+    if (this.disposed || documentId === null) return;
+    try {
+      const listed = await this.client.request("documents.comments", { documentId });
+      if (this.disposed || this._state.openDocumentId !== documentId) return;
+      this.update({ comments: listed.comments, commentsTruncated: listed.truncated === true });
+    } catch (error) {
+      if (isAbortError(error) || this.disposed) return;
+      this.update({ error: describeError(error) });
+    }
+  }
+
+  async addComment(markdown: string, quote: string | null, parentId: string | null): Promise<boolean> {
+    const documentId = this._state.openDocumentId;
+    if (documentId === null) return false;
+    const payload: { documentId: string; markdown: string; quote?: string; parentId?: string } = { documentId, markdown: markdown.trim() };
+    if (quote) payload.quote = quote;
+    if (parentId) payload.parentId = parentId;
+    const added = (await this.perform(() => this.client.request("documents.comment.add", payload))) !== null;
+    if (added) await this.refreshComments();
+    return added;
+  }
+
+  async resolveComment(commentId: string): Promise<boolean> {
+    const ok = (await this.perform(() => this.client.request("documents.comment.resolve", { commentId }))) !== null;
+    if (ok) await this.refreshComments();
+    return ok;
+  }
+
+  async reopenComment(commentId: string): Promise<boolean> {
+    const ok = (await this.perform(() => this.client.request("documents.comment.reopen", { commentId }))) !== null;
+    if (ok) await this.refreshComments();
+    return ok;
   }
 
   /** Called by the view with the caret so a remote change can move it. */
@@ -235,6 +278,12 @@ function describeError(error: unknown): string {
       return "That Collection is no longer available.";
     case "documents.unknown_document":
       return "That Document is no longer available.";
+    case "documents.unknown_comment":
+      return "That Comment is no longer available.";
+    case "documents.invalid_markdown":
+      return "Comments are 1 byte to 32 KiB of Markdown.";
+    case "documents.invalid_quote":
+      return "A quote is at most 2 KiB.";
     case "documents.deferred":
       return "Saved locally; it will apply once its Collection arrives.";
     default:

@@ -421,4 +421,92 @@ mod store_tests {
         assert_eq!(ingested.edits, vec![(document.clone(), vec![9])]);
         assert_eq!(f.store.edit_records(Some(&document)).unwrap().len(), 2);
     }
+
+    // Verifies: AC5 — comments thread, wait for their parent, resolve last-writer-wins, and
+    // rehydrate their text from opened records after restart.
+    #[test]
+    fn comments_thread_defer_and_rehydrate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let root = hex(64, 3);
+        let reply = DomainRecord::comment_add(BOB, &document, Some(&root), Some("quoted"), "Reply")
+            .unwrap();
+        let add = DomainRecord::comment_add(ALICE, &document, None, None, "Root").unwrap();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            ingest(
+                &store,
+                1,
+                ALICE,
+                &DomainRecord::collection_create(ALICE, "C").unwrap(),
+            );
+            ingest(
+                &store,
+                2,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &collection, "D").unwrap(),
+            );
+            assert!(matches!(
+                ingest(&store, 4, BOB, &reply),
+                IngestResult::Deferred(_)
+            ));
+            assert_eq!(ingest(&store, 3, ALICE, &add), IngestResult::Applied);
+            let comments = store.comments(&document).unwrap();
+            assert_eq!(comments.len(), 2);
+            assert_eq!(comments[0].markdown.as_deref(), Some("Root"));
+            assert_eq!(comments[1].parent_id.as_deref(), Some(root.as_str()));
+            assert_eq!(comments[1].quote.as_deref(), Some("quoted"));
+            ingest(
+                &store,
+                6,
+                BOB,
+                &DomainRecord::comment_resolve(BOB, &root).unwrap(),
+            );
+            ingest(
+                &store,
+                5,
+                ALICE,
+                &DomainRecord::comment_reopen(ALICE, &root).unwrap(),
+            );
+            assert!(
+                store.comments(&document).unwrap()[0].resolved,
+                "the later resolve wins"
+            );
+            let other = hex(64, 9);
+            ingest(
+                &store,
+                9,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &collection, "Other").unwrap(),
+            );
+            let cross =
+                DomainRecord::comment_add(ALICE, &other, Some(&root), None, "wrong").unwrap();
+            assert_eq!(
+                ingest(&store, 10, ALICE, &cross),
+                IngestResult::Quarantined("parent_on_other_document".into())
+            );
+        }
+        let store = DocumentStore::open(&path).unwrap();
+        let comments = store.comments(&document).unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].markdown, None, "text is not persisted");
+        store
+            .remember_opened(&hex(64, 3), &hex(82, 3), &add.encode())
+            .unwrap();
+        store
+            .remember_opened(&hex(64, 4), &hex(82, 4), &reply.encode())
+            .unwrap();
+        let comments = store.comments(&document).unwrap();
+        assert_eq!(comments[0].markdown.as_deref(), Some("Root"));
+        assert_eq!(comments[1].quote.as_deref(), Some("quoted"));
+        assert!(
+            store
+                .control_records()
+                .unwrap()
+                .iter()
+                .any(|r| r.purpose == "comment.add")
+        );
+    }
 }

@@ -16,6 +16,8 @@ pub(crate) struct ProjectionOutcome {
     pub(crate) created: Option<String>,
     /// A body update to import, with the Document it belongs to.
     pub(crate) edit: Option<(String, Vec<u8>)>,
+    /// A Comment's Markdown and optional quote to remember.
+    pub(crate) comment: Option<(String, String, Option<String>)>,
 }
 
 impl ProjectionOutcome {
@@ -26,6 +28,7 @@ impl ProjectionOutcome {
             deferred: None,
             created: None,
             edit: None,
+            comment: None,
         }
     }
     fn quarantined(
@@ -64,6 +67,13 @@ fn collection_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, r
 }
 fn document_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, rusqlite::Error> {
     tx.query_row("SELECT 1 FROM documents WHERE document_id=?1", [id], |_| {
+        Ok(())
+    })
+    .optional()
+    .map(|found| found.is_some())
+}
+fn comment_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, rusqlite::Error> {
+    tx.query_row("SELECT 1 FROM comments WHERE comment_id=?1", [id], |_| {
         Ok(())
     })
     .optional()
@@ -212,6 +222,57 @@ pub(crate) fn project_domain(
                 edit: Some((document.clone(), update.clone())),
                 ..ProjectionOutcome::applied()
             })
+        }
+        DomainRecord::CommentAdd {
+            author,
+            document,
+            parent,
+            quote,
+            markdown,
+        } => {
+            if !document_exists(tx, document)? {
+                return ProjectionOutcome::deferred(tx, record_id, domain);
+            }
+            if let Some(parent) = parent {
+                if !comment_exists(tx, parent)? {
+                    return ProjectionOutcome::deferred(tx, record_id, domain);
+                }
+                let parent_document: String = tx.query_row(
+                    "SELECT document_id FROM comments WHERE comment_id=?1",
+                    [parent],
+                    |row| row.get(0),
+                )?;
+                if parent_document != *document {
+                    return ProjectionOutcome::quarantined(
+                        tx,
+                        record_id,
+                        "parent_on_other_document",
+                    );
+                }
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO comments(comment_id,document_id,parent_id,author,create_order,state_order,resolved) VALUES(?1,?2,?3,?4,?5,?5,0)",
+                params![record_id, document, parent, author, order_key],
+            )?;
+            clear(tx, record_id)?;
+            Ok(ProjectionOutcome {
+                comment: Some((record_id.into(), markdown.clone(), quote.clone())),
+                created: Some(record_id.into()),
+                ..ProjectionOutcome::applied()
+            })
+        }
+        DomainRecord::CommentResolve { comment, .. }
+        | DomainRecord::CommentReopen { comment, .. } => {
+            if !comment_exists(tx, comment)? {
+                return ProjectionOutcome::deferred(tx, record_id, domain);
+            }
+            let resolved = matches!(domain, DomainRecord::CommentResolve { .. });
+            tx.execute(
+                "UPDATE comments SET resolved=?2,state_order=?3 WHERE comment_id=?1 AND state_order<?3",
+                params![comment, resolved, order_key],
+            )?;
+            clear(tx, record_id)?;
+            Ok(ProjectionOutcome::applied())
         }
     }
 }

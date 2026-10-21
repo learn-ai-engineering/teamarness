@@ -12,6 +12,10 @@ pub(crate) const MAX_TITLE: usize = 256;
 /// The largest Loro update one edit record carries, leaving headroom under the 262,144-byte
 /// canonical bound for the envelope, author, and target.
 pub(crate) const MAX_UPDATE: usize = 200 * 1024;
+/// A Comment's Markdown is bounded like a Conversations Message.
+pub(crate) const MAX_MARKDOWN: usize = 32 * 1024;
+/// A quoted excerpt is short context, not a copy of the document.
+pub(crate) const MAX_QUOTE: usize = 2 * 1024;
 const TARGET_LEN: usize = 64;
 
 /// The record vocabulary. Kind numbers are part of the canonical encoding and are never
@@ -64,6 +68,22 @@ pub enum DomainRecord {
         document: String,
         update: Vec<u8>,
     },
+    /// A Comment on a Document, optionally replying to a parent Comment and quoting an excerpt.
+    CommentAdd {
+        author: String,
+        document: String,
+        parent: Option<String>,
+        quote: Option<String>,
+        markdown: String,
+    },
+    CommentResolve {
+        author: String,
+        comment: String,
+    },
+    CommentReopen {
+        author: String,
+        comment: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +96,8 @@ pub enum DomainError {
     InvalidName,
     InvalidTitle,
     InvalidUpdate,
+    InvalidMarkdown,
+    InvalidQuote,
 }
 impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -195,6 +217,51 @@ impl DomainRecord {
         })
     }
 
+    pub fn comment_add(
+        author: &str,
+        document: &str,
+        parent: Option<&str>,
+        quote: Option<&str>,
+        markdown: &str,
+    ) -> Result<Self, DomainError> {
+        validate_identity(author)?;
+        validate_target(document)?;
+        if let Some(parent) = parent {
+            validate_target(parent)?;
+        }
+        if let Some(quote) = quote
+            && (quote.is_empty() || quote.len() > MAX_QUOTE)
+        {
+            return Err(DomainError::InvalidQuote);
+        }
+        if markdown.is_empty() || markdown.len() > MAX_MARKDOWN {
+            return Err(DomainError::InvalidMarkdown);
+        }
+        Ok(Self::CommentAdd {
+            author: author.into(),
+            document: document.into(),
+            parent: parent.map(str::to_owned),
+            quote: quote.map(str::to_owned),
+            markdown: markdown.into(),
+        })
+    }
+    pub fn comment_resolve(author: &str, comment: &str) -> Result<Self, DomainError> {
+        validate_identity(author)?;
+        validate_target(comment)?;
+        Ok(Self::CommentResolve {
+            author: author.into(),
+            comment: comment.into(),
+        })
+    }
+    pub fn comment_reopen(author: &str, comment: &str) -> Result<Self, DomainError> {
+        validate_identity(author)?;
+        validate_target(comment)?;
+        Ok(Self::CommentReopen {
+            author: author.into(),
+            comment: comment.into(),
+        })
+    }
+
     /// The signer every record claims; the projection refuses a record whose log author differs.
     pub fn author(&self) -> &str {
         match self {
@@ -207,7 +274,10 @@ impl DomainRecord {
             | Self::DocumentMove { author, .. }
             | Self::DocumentArchive { author, .. }
             | Self::DocumentRestore { author, .. }
-            | Self::DocumentEdit { author, .. } => author,
+            | Self::DocumentEdit { author, .. }
+            | Self::CommentAdd { author, .. }
+            | Self::CommentResolve { author, .. }
+            | Self::CommentReopen { author, .. } => author,
         }
     }
 
@@ -226,7 +296,11 @@ impl DomainRecord {
             | Self::DocumentMove { document, .. }
             | Self::DocumentArchive { document, .. }
             | Self::DocumentRestore { document, .. }
-            | Self::DocumentEdit { document, .. } => Some(document),
+            | Self::DocumentEdit { document, .. }
+            | Self::CommentAdd { document, .. } => Some(document),
+            Self::CommentResolve { comment, .. } | Self::CommentReopen { comment, .. } => {
+                Some(comment)
+            }
         }
     }
 
@@ -242,14 +316,17 @@ impl DomainRecord {
             Self::DocumentArchive { .. } => "document.archive",
             Self::DocumentRestore { .. } => "document.restore",
             Self::DocumentEdit { .. } => "document.edit",
+            Self::CommentAdd { .. } => "comment.add",
+            Self::CommentResolve { .. } => "comment.resolve",
+            Self::CommentReopen { .. } => "comment.reopen",
         }
     }
 
     /// The purpose of body edit records, which the listing never needs to open.
     pub const EDIT_KIND: &'static str = "document.edit";
 
-    /// Every purpose this crate appends or projects, for the control-record query.
-    pub const METADATA_KINDS: [&'static str; 9] = [
+    /// Every purpose the listing and comments need opened after restart.
+    pub const METADATA_KINDS: [&'static str; 12] = [
         "collection.create",
         "collection.rename",
         "collection.archive",
@@ -259,6 +336,9 @@ impl DomainRecord {
         "document.move",
         "document.archive",
         "document.restore",
+        "comment.add",
+        "comment.resolve",
+        "comment.reopen",
     ];
 
     pub fn encode(&self) -> Vec<u8> {
@@ -339,6 +419,30 @@ impl DomainRecord {
                 put_text(&mut out, document);
                 put_bytes(&mut out, update);
             }
+            Self::CommentAdd {
+                author,
+                document,
+                parent,
+                quote,
+                markdown,
+            } => {
+                out.push(20);
+                put_text(&mut out, author);
+                put_text(&mut out, document);
+                put_text(&mut out, parent.as_deref().unwrap_or(""));
+                put_text(&mut out, quote.as_deref().unwrap_or(""));
+                put_text(&mut out, markdown);
+            }
+            Self::CommentResolve { author, comment } => {
+                out.push(21);
+                put_text(&mut out, author);
+                put_text(&mut out, comment);
+            }
+            Self::CommentReopen { author, comment } => {
+                out.push(22);
+                put_text(&mut out, author);
+                put_text(&mut out, comment);
+            }
         }
         out
     }
@@ -396,6 +500,27 @@ impl DomainRecord {
                 let document = take_text(bytes, &mut p)?;
                 let update = take_bytes(bytes, &mut p)?;
                 Self::document_edit(&author, &document, update)?
+            }
+            20 => {
+                let document = take_text(bytes, &mut p)?;
+                let parent = take_text(bytes, &mut p)?;
+                let quote = take_text(bytes, &mut p)?;
+                let markdown = take_text(bytes, &mut p)?;
+                Self::comment_add(
+                    &author,
+                    &document,
+                    (!parent.is_empty()).then_some(parent.as_str()),
+                    (!quote.is_empty()).then_some(quote.as_str()),
+                    &markdown,
+                )?
+            }
+            21 => {
+                let comment = take_text(bytes, &mut p)?;
+                Self::comment_resolve(&author, &comment)?
+            }
+            22 => {
+                let comment = take_text(bytes, &mut p)?;
+                Self::comment_reopen(&author, &comment)?
             }
             _ => return Err(DomainError::InvalidKind),
         };
@@ -508,6 +633,27 @@ mod tests {
             assert_eq!(DomainRecord::decode(&bytes).unwrap(), record);
             assert!(DomainRecord::METADATA_KINDS.contains(&record.kind()));
         }
+        for record in [
+            DomainRecord::comment_add("alice", TARGET, None, None, "Looks good").unwrap(),
+            DomainRecord::comment_add("alice", TARGET, Some(TARGET), Some("quoted"), "Reply")
+                .unwrap(),
+            DomainRecord::comment_resolve("alice", TARGET).unwrap(),
+            DomainRecord::comment_reopen("alice", TARGET).unwrap(),
+        ] {
+            assert_eq!(DomainRecord::decode(&record.encode()).unwrap(), record);
+            assert!(DomainRecord::METADATA_KINDS.contains(&record.kind()));
+        }
+        assert!(DomainRecord::comment_add("alice", TARGET, None, None, "").is_err());
+        assert!(DomainRecord::comment_add("alice", TARGET, None, Some(""), "x").is_err());
+        assert!(
+            DomainRecord::comment_add("alice", TARGET, None, Some(&"q".repeat(MAX_QUOTE + 1)), "x")
+                .is_err()
+        );
+        assert!(DomainRecord::comment_add("alice", TARGET, Some("bad"), None, "x").is_err());
+        assert!(
+            DomainRecord::comment_add("alice", TARGET, None, None, &"m".repeat(MAX_MARKDOWN + 1))
+                .is_err()
+        );
         let edit = DomainRecord::document_edit("alice", TARGET, vec![0, 255, 7]).unwrap();
         assert_eq!(DomainRecord::decode(&edit.encode()).unwrap(), edit);
         assert_eq!(edit.kind(), DomainRecord::EDIT_KIND);
@@ -545,7 +691,7 @@ mod tests {
             DomainError::InvalidLength
         );
         let mut unknown = MAGIC.to_vec();
-        unknown.push(11);
+        unknown.push(23);
         put_text(&mut unknown, "alice");
         assert_eq!(
             DomainRecord::decode(&unknown).unwrap_err(),

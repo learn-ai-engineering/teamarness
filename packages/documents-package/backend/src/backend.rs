@@ -49,6 +49,8 @@ fn domain_error(cause: DomainError) -> BackendError {
         DomainError::InvalidName => error("documents.invalid_name", false),
         DomainError::InvalidTitle => error("documents.invalid_title", false),
         DomainError::InvalidUpdate => error("documents.invalid_update", false),
+        DomainError::InvalidMarkdown => error("documents.invalid_markdown", false),
+        DomainError::InvalidQuote => error("documents.invalid_quote", false),
         _ => invalid_request(),
     }
 }
@@ -217,6 +219,21 @@ struct DocumentMoveRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DocumentRequest {
     document_id: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommentAddRequest {
+    document_id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    quote: Option<String>,
+    markdown: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommentRequest {
+    comment_id: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -470,6 +487,56 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             Ok(json!({ "ok": true, "revision": revision.to_string() }))
         },
     )
+    .request(
+        "documents.comments",
+        |context: Context<DocumentsActive>, request: DocumentRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            let state = context.state().clone();
+            let document = request.document_id;
+            context
+                .blocking(move |_| state.comments_value(&document))
+                .await
+        },
+    )
+    .request(
+        "documents.comment.add",
+        |context: Context<DocumentsActive>, request: CommentAddRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            if let Some(parent) = &request.parent_id {
+                require_comment(&context, parent).await?;
+            }
+            let author = context.state().installation.clone();
+            let record = DomainRecord::comment_add(
+                &author,
+                &request.document_id,
+                request.parent_id.as_deref(),
+                request.quote.as_deref(),
+                &request.markdown,
+            )
+            .map_err(domain_error)?;
+            append(&context, record).await
+        },
+    )
+    .request(
+        "documents.comment.resolve",
+        |context: Context<DocumentsActive>, request: CommentRequest| async move {
+            require_comment(&context, &request.comment_id).await?;
+            let author = context.state().installation.clone();
+            let record = DomainRecord::comment_resolve(&author, &request.comment_id)
+                .map_err(domain_error)?;
+            append(&context, record).await
+        },
+    )
+    .request(
+        "documents.comment.reopen",
+        |context: Context<DocumentsActive>, request: CommentRequest| async move {
+            require_comment(&context, &request.comment_id).await?;
+            let author = context.state().installation.clone();
+            let record =
+                DomainRecord::comment_reopen(&author, &request.comment_id).map_err(domain_error)?;
+            append(&context, record).await
+        },
+    )
     .subscription(
         "documents.document.text",
         |context: Context<DocumentsActive>, request: DocumentRequest| async move {
@@ -587,6 +654,24 @@ async fn require_document(
     }
 }
 
+async fn require_comment(context: &Context<DocumentsActive>, id: &str) -> Result<(), BackendError> {
+    let state = context.state().clone();
+    let id = id.to_owned();
+    let exists = context
+        .blocking(move |_| {
+            state
+                .store
+                .comment_exists(&id)
+                .map_err(|_| storage_failed())
+        })
+        .await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(error("documents.unknown_comment", false))
+    }
+}
+
 fn revision_of(event: &JsonValue) -> u64 {
     event["revision"]
         .as_str()
@@ -649,6 +734,45 @@ async fn import_edit_rows(
 }
 
 impl DocumentsActive {
+    /// The Comments of one Document, bounded to the newest 256 so the reply fits the UI bridge.
+    fn comments_value(&self, document: &str) -> Result<JsonValue, BackendError> {
+        const MAX_COMMENTS: usize = 256;
+        let all = self
+            .store
+            .comments(document)
+            .map_err(|_| storage_failed())?;
+        let truncated = all.len() > MAX_COMMENTS;
+        let start = all.len().saturating_sub(MAX_COMMENTS);
+        let comments: Vec<JsonValue> = all[start..]
+            .iter()
+            .map(|comment| {
+                let mut value = json!({
+                    "id": comment.id,
+                    "documentId": comment.document_id,
+                    "author": comment.author,
+                    "position": comment.order_key,
+                    "resolved": comment.resolved,
+                    "isLocal": comment.author == self.installation,
+                });
+                if let Some(parent) = &comment.parent_id {
+                    value["parentId"] = json!(parent);
+                }
+                if let Some(markdown) = &comment.markdown {
+                    value["markdown"] = json!(markdown);
+                }
+                if let Some(quote) = &comment.quote {
+                    value["quote"] = json!(quote);
+                }
+                value
+            })
+            .collect();
+        let mut value = json!({ "comments": comments });
+        if truncated {
+            value["truncated"] = json!(true);
+        }
+        Ok(value)
+    }
+
     pub(crate) fn report(&self) -> SyncReport {
         self.sync
             .lock()
@@ -1398,6 +1522,80 @@ mod tests {
             "{merged:?}"
         );
         text.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC5 — a comment with a quote is appended, listed with its author, and resolved.
+    #[tokio::test]
+    async fn comments_are_added_listed_and_resolved() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({ "name": "Plans" }))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({ "collectionId": collection, "title": "Q4" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let root = session
+            .harness
+            .request(
+                "documents.comment.add",
+                json!({ "documentId": document, "quote": "# Q4", "markdown": "Needs dates" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .harness
+            .request(
+                "documents.comment.add",
+                json!({ "documentId": document, "parentId": root, "markdown": "Added" }),
+            )
+            .await
+            .unwrap();
+        let missing = session
+            .harness
+            .request(
+                "documents.comment.add",
+                json!({ "documentId": document, "parentId": hex(64, 5), "markdown": "x" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), "documents.unknown_comment");
+        session
+            .harness
+            .request("documents.comment.resolve", json!({ "commentId": root }))
+            .await
+            .unwrap();
+        let listed = session
+            .harness
+            .request("documents.comments", json!({ "documentId": document }))
+            .await
+            .unwrap();
+        let comments = listed["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["quote"], "# Q4");
+        assert_eq!(comments[0]["markdown"], "Needs dates");
+        assert_eq!(comments[0]["resolved"], true);
+        assert_eq!(comments[0]["author"], ALICE);
+        assert_eq!(comments[0]["isLocal"], true);
+        assert_eq!(comments[1]["parentId"], root);
+        assert_eq!(comments[1]["resolved"], false);
         session.harness.shutdown().await.unwrap();
     }
 }

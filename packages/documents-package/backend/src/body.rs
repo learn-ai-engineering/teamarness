@@ -22,6 +22,8 @@ pub(crate) const MAX_TEXT_BYTES: usize = 192 * 1024;
 /// A single inserted run larger than this is applied in pieces with an export between them,
 /// so no one record approaches the canonical bound.
 const INSERT_CHUNK: usize = 48 * 1024;
+/// Per-operation encoding overhead assumed when estimating a pending export's size.
+const OP_OVERHEAD: usize = 32;
 
 /// One operation the UI sends, in Unicode scalar positions against a base revision.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -59,6 +61,8 @@ pub(crate) struct DocumentBody {
     staged: Vec<Vec<u8>>,
     /// Edit records known locally whose sealed bytes have not been opened yet.
     unopened: usize,
+    /// A conservative estimate of the pending export size, so a keystroke never exports.
+    pending_estimate: usize,
 }
 
 impl DocumentBody {
@@ -74,6 +78,7 @@ impl DocumentBody {
             pending_since: None,
             staged: Vec::new(),
             unopened: 0,
+            pending_estimate: 0,
         }
     }
 
@@ -136,6 +141,7 @@ impl DocumentBody {
                             .insert(position, &insert[offset..end])
                             .map_err(|_| BodyError::Loro)?;
                         position += insert[offset..end].chars().count();
+                        self.pending_estimate += end - offset + OP_OVERHEAD;
                         offset = end;
                         if end < insert.len() {
                             self.stage_if_large();
@@ -146,6 +152,7 @@ impl DocumentBody {
                     container
                         .delete(position, *delete)
                         .map_err(|_| BodyError::Loro)?;
+                    self.pending_estimate += OP_OVERHEAD;
                 }
             }
         }
@@ -195,11 +202,7 @@ impl DocumentBody {
     }
 
     fn stage_if_large(&mut self) {
-        let pending = self
-            .doc
-            .export(ExportMode::updates(&self.appended))
-            .unwrap_or_default();
-        if pending.len() >= EXPORT_BUDGET {
+        if self.pending_estimate >= EXPORT_BUDGET {
             self.stage_pending();
         }
     }
@@ -210,6 +213,7 @@ impl DocumentBody {
             .export(ExportMode::updates(&self.appended))
             .unwrap_or_default();
         self.pending_since = None;
+        self.pending_estimate = 0;
         if update.is_empty() {
             return;
         }

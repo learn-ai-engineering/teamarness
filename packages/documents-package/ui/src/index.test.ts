@@ -181,6 +181,49 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("lists threaded comments for the open Document and adds one with a quote", async () => {
+    const root = "a".repeat(64);
+    const reply = "b".repeat(64);
+    const comments: unknown[] = [
+      { id: root, documentId: doc, author: "c".repeat(64), position: "01", resolved: false, isLocal: false, quote: "# Q4", markdown: "Needs **dates**" },
+      { id: reply, documentId: doc, parentId: root, author: "me", position: "02", resolved: true, isLocal: true, markdown: "Added" },
+    ];
+    const added: unknown[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.comments": () => ({ comments } as never),
+        "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
+        "documents.comment.resolve": () => ({ ok: true as const, id: root }),
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const rootNode = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root: rootNode }));
+    (rootNode.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "# Q4\nbody" });
+    const items = [...rootNode.querySelectorAll(".comment")];
+    expect(items).toHaveLength(2);
+    expect(items[0]?.querySelector(".comment-quote")?.textContent).toBe("# Q4");
+    expect(items[0]?.querySelector(".comment-body strong")?.textContent).toBe("dates");
+    expect(items[1]?.querySelector(".comment-author")?.textContent).toBe("You");
+    expect(items[1]?.classList.contains("is-resolved")).toBe(true);
+    expect((items[1] as HTMLElement).style.getPropertyValue("--comment-depth")).toBe("1");
+
+    const textarea = rootNode.querySelector(".editor-textarea") as HTMLTextAreaElement;
+    textarea.setSelectionRange(0, 4);
+    ([...rootNode.querySelectorAll(".comment-compose-actions button")].find((b) => b.textContent === "Quote selection") as HTMLButtonElement).click();
+    expect(rootNode.querySelector(".comment-quote--draft")?.textContent).toContain("# Q4");
+    const input = rootNode.querySelector(".comment-input") as HTMLTextAreaElement;
+    input.value = "Agree";
+    (rootNode.querySelector(".comment-compose") as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(added).toEqual([{ documentId: doc, markdown: "Agree", quote: "# Q4" }]);
+    expect(input.value).toBe("");
+    await unmount();
+  });
+
   it("surfaces a request error without losing the listing", async () => {
     const fake = createFakePackageClient({
       requests: {
