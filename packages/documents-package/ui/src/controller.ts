@@ -9,7 +9,8 @@ export type ControllerState = Readonly<{
   selectedCollectionId: string | null;
   openDocumentId: string | null;
   comments: readonly Comment[];
-  commentsTruncated: boolean;
+  commentsCursor: string | null;
+  commentsLoading: boolean;
   names: Names;
   /** Document body shown as rendered Markdown instead of the editor. */
   preview: boolean;
@@ -32,7 +33,8 @@ export class DocumentsController {
     selectedCollectionId: null,
     openDocumentId: null,
     comments: [],
-    commentsTruncated: false,
+    commentsCursor: null,
+    commentsLoading: false,
     names: { available: false, cursor: "0", persons: [] },
     preview: false,
     showArchived: false,
@@ -46,6 +48,7 @@ export class DocumentsController {
   private editor: DocumentEditor | null = null;
   private textSubscription: { close(): Promise<void> } | null = null;
   private openSequence = 0;
+  private commentsSequence = 0;
   private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
 
   constructor(client: TypedPackageClient<DocumentsContract>, announce: () => void) {
@@ -120,7 +123,7 @@ export class DocumentsController {
     if (this.disposed || this._state.openDocumentId === documentId) return;
     await this.closeDocument();
     const sequence = ++this.openSequence;
-    this.update({ openDocumentId: documentId, comments: [], commentsTruncated: false, error: null });
+    this.update({ openDocumentId: documentId, comments: [], commentsCursor: null, commentsLoading: false, error: null });
     void this.refreshComments();
     try {
       const subscription = await this.client.subscribe("documents.document.text", { documentId }, (event) => {
@@ -151,23 +154,46 @@ export class DocumentsController {
 
   async closeDocument(): Promise<void> {
     this.openSequence += 1;
+    this.commentsSequence += 1;
     const subscription = this.textSubscription;
     this.textSubscription = null;
     this.editor = null;
-    if (this._state.openDocumentId !== null) this.update({ openDocumentId: null, comments: [], commentsTruncated: false });
+    if (this._state.openDocumentId !== null) this.update({ openDocumentId: null, comments: [], commentsCursor: null, commentsLoading: false });
     if (subscription) await subscription.close();
   }
 
   async refreshComments(): Promise<void> {
     const documentId = this._state.openDocumentId;
     if (this.disposed || documentId === null) return;
+    const sequence = ++this.commentsSequence;
     try {
       const listed = await this.client.request("documents.comments", { documentId });
-      if (this.disposed || this._state.openDocumentId !== documentId) return;
-      this.update({ comments: listed.comments, commentsTruncated: listed.truncated === true });
+      if (this.disposed || this._state.openDocumentId !== documentId || sequence !== this.commentsSequence) return;
+      // Keep previously loaded older pages when a new comment or state change refreshes page one.
+      const ids = new Set(listed.comments.map((comment) => comment.id));
+      const older = this._state.comments.filter((comment) => !ids.has(comment.id));
+      this.update({ comments: [...listed.comments, ...older], commentsCursor: this._state.commentsCursor ?? listed.nextCursor ?? null,
+        commentsLoading: false });
     } catch (error) {
-      if (isAbortError(error) || this.disposed) return;
-      this.update({ error: describeError(error) });
+      if (isAbortError(error) || this.disposed || sequence !== this.commentsSequence) return;
+      this.update({ error: describeError(error), commentsLoading: false });
+    }
+  }
+
+  async loadOlderComments(): Promise<void> {
+    const { openDocumentId: documentId, commentsCursor: cursor, commentsLoading } = this._state;
+    if (this.disposed || documentId === null || cursor === null || commentsLoading) return;
+    const sequence = this.commentsSequence;
+    this.update({ commentsLoading: true });
+    try {
+      const listed = await this.client.request("documents.comments", { documentId, cursor });
+      if (this.disposed || this._state.openDocumentId !== documentId || sequence !== this.commentsSequence) return;
+      const ids = new Set(this._state.comments.map((comment) => comment.id));
+      this.update({ comments: [...this._state.comments, ...listed.comments.filter((comment) => !ids.has(comment.id))],
+        commentsCursor: listed.nextCursor ?? null, commentsLoading: false });
+    } catch (error) {
+      if (isAbortError(error) || this.disposed || sequence !== this.commentsSequence) return;
+      this.update({ commentsLoading: false, error: describeError(error) });
     }
   }
 

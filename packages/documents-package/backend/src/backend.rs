@@ -285,6 +285,13 @@ struct DocumentRequest {
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommentsRequest {
+    document_id: String,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommentAddRequest {
     document_id: String,
     #[serde(default)]
@@ -590,12 +597,12 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
     )
     .request(
         "documents.comments",
-        |context: Context<DocumentsActive>, request: DocumentRequest| async move {
+        |context: Context<DocumentsActive>, request: CommentsRequest| async move {
             require_document(&context, &request.document_id).await?;
             let state = context.state().clone();
             let document = request.document_id;
             context
-                .blocking(move |_| state.comments_value(&document))
+                .blocking(move |_| state.comments_value(&document, request.cursor.as_deref()))
                 .await
         },
     )
@@ -607,12 +614,18 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 require_comment(&context, parent).await?;
             }
             let author = context.state().installation.clone();
-            let record = DomainRecord::comment_add(
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| error("documents.invalid_timestamp", false))?
+                .as_millis()
+                .to_string();
+            let record = DomainRecord::comment_add_at(
                 &author,
                 &request.document_id,
                 request.parent_id.as_deref(),
                 request.quote.as_deref(),
                 &request.markdown,
+                Some(&created_at),
             )
             .map_err(domain_error)?;
             append(&context, record).await
@@ -992,18 +1005,28 @@ async fn import_edit_rows(
 }
 
 impl DocumentsActive {
-    /// The Comments of one Document, bounded to the newest 256 so the reply fits the UI bridge.
-    fn comments_value(&self, document: &str) -> Result<JsonValue, BackendError> {
-        const MAX_COMMENTS: usize = 256;
+    /// Pages newest-first by immutable OrderKey and record identity, measuring serialized JSON.
+    fn comments_value(
+        &self,
+        document: &str,
+        cursor: Option<&str>,
+    ) -> Result<JsonValue, BackendError> {
+        const PAGE_BUDGET: usize = 240 * 1024;
         let all = self
             .store
             .comments(document)
             .map_err(|_| storage_failed())?;
-        let truncated = all.len() > MAX_COMMENTS;
-        let start = all.len().saturating_sub(MAX_COMMENTS);
-        let comments: Vec<JsonValue> = all[start..]
-            .iter()
-            .map(|comment| {
+        let end = match cursor {
+            None => all.len(),
+            Some(cursor) => all
+                .iter()
+                .position(|comment| format!("{}:{}", comment.order_key, comment.id) == cursor)
+                .ok_or_else(|| error("documents.invalid_cursor", false))?,
+        };
+        let mut comments: Vec<JsonValue> = Vec::new();
+        let mut next_cursor = None;
+        for comment in all[..end].iter().rev() {
+            let value = {
                 let mut value = json!({
                     "id": comment.id,
                     "documentId": comment.document_id,
@@ -1021,14 +1044,30 @@ impl DocumentsActive {
                 if let Some(quote) = &comment.quote {
                     value["quote"] = json!(quote);
                 }
+                if let Some(time) = &comment.created_at {
+                    value["createdAt"] = json!(time);
+                }
                 value
-            })
-            .collect();
-        let mut value = json!({ "comments": comments });
-        if truncated {
-            value["truncated"] = json!(true);
+            };
+            // Count the complete wire response, including cursor, JSON escaping and framing.
+            let candidate = json!({
+                "comments": comments.iter().chain(std::iter::once(&value)).collect::<Vec<_>>(),
+                "nextCursor": format!("{}:{}", comment.order_key, comment.id),
+                "hasMore": true,
+            });
+            if candidate.to_string().len() > PAGE_BUDGET || comments.len() == 256 {
+                if comments.is_empty() {
+                    return Err(error("documents.comment_page_too_large", false));
+                }
+                break;
+            }
+            next_cursor = Some(format!("{}:{}", comment.order_key, comment.id));
+            comments.push(value);
         }
-        Ok(value)
+        let has_more = end > comments.len();
+        Ok(
+            json!({ "comments": comments, "nextCursor": if has_more { next_cursor } else { None }, "hasMore": has_more }),
+        )
     }
 
     pub(crate) fn report(&self) -> SyncReport {
@@ -2425,13 +2464,103 @@ mod tests {
             .unwrap();
         let comments = listed["comments"].as_array().unwrap();
         assert_eq!(comments.len(), 2);
-        assert_eq!(comments[0]["quote"], "# Q4");
-        assert_eq!(comments[0]["markdown"], "Needs dates");
-        assert_eq!(comments[0]["resolved"], true);
-        assert_eq!(comments[0]["author"], ALICE);
-        assert_eq!(comments[0]["isLocal"], true);
-        assert_eq!(comments[1]["parentId"], root);
-        assert_eq!(comments[1]["resolved"], false);
+        assert_eq!(comments[1]["quote"], "# Q4");
+        assert_eq!(comments[1]["markdown"], "Needs dates");
+        assert_eq!(comments[1]["resolved"], true);
+        assert_eq!(comments[1]["author"], ALICE);
+        assert_eq!(comments[1]["isLocal"], true);
+        assert!(
+            comments[1]["createdAt"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .is_ok()
+        );
+        assert_eq!(comments[0]["parentId"], root);
+        assert_eq!(comments[0]["resolved"], false);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC5/AC9 — worst-case JSON escaping, quote and Markdown fit; every older
+    // OrderKey page is reachable without skipping a parent on another page.
+    #[tokio::test]
+    async fn comments_cursor_pages_bound_serialized_bytes_and_reach_all_threads() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({ "name": "C" }))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({ "collectionId": collection, "title": "D" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let parent = hex(64, 1000);
+        for seed in 1000..1018 {
+            let record = DomainRecord::comment_add_at(
+                ALICE,
+                &document,
+                (seed > 1000).then_some(parent.as_str()),
+                Some(&"\u{0001}".repeat(crate::domain::MAX_QUOTE)),
+                &"\u{0001}".repeat(crate::domain::MAX_MARKDOWN),
+                Some("1730000000000"),
+            )
+            .unwrap();
+            session
+                .handles
+                .store
+                .ingest(
+                    &hex(64, seed),
+                    &hex(82, seed),
+                    ALICE,
+                    record.kind(),
+                    "sig",
+                    &record.encode(),
+                    b"sealed",
+                    None,
+                )
+                .unwrap();
+        }
+        let mut cursor = None;
+        let mut ids = std::collections::HashSet::new();
+        let mut pages = 0;
+        loop {
+            let mut request = json!({ "documentId": document });
+            if let Some(cursor) = cursor {
+                request["cursor"] = json!(cursor);
+            }
+            let page = session
+                .harness
+                .request("documents.comments", request)
+                .await
+                .unwrap();
+            assert!(page.to_string().len() < 256 * 1024);
+            let comments = page["comments"].as_array().unwrap();
+            assert!(!comments.is_empty());
+            for comment in comments {
+                assert!(ids.insert(comment["id"].as_str().unwrap().to_owned()));
+                assert_eq!(comment["createdAt"], "1730000000000");
+            }
+            pages += 1;
+            if !page["hasMore"].as_bool().unwrap() {
+                break;
+            }
+            cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+        }
+        assert!(pages > 1);
+        assert_eq!(ids.len(), 18);
+        assert!(ids.contains(&parent));
         session.harness.shutdown().await.unwrap();
     }
 

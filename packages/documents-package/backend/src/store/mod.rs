@@ -66,6 +66,7 @@ pub struct CommentView {
     pub author: String,
     pub order_key: String,
     pub resolved: bool,
+    pub created_at: Option<String>,
     /// `None` until the add record has been opened.
     pub markdown: Option<String>,
     pub quote: Option<String>,
@@ -576,7 +577,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT comment_id,parent_id,author,create_order,resolved FROM comments WHERE document_id=?1 ORDER BY create_order,comment_id")
+            .prepare("SELECT comment_id,parent_id,author,create_order,resolved,created_at FROM comments WHERE document_id=?1 ORDER BY create_order,comment_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([document], |row| {
@@ -586,11 +587,12 @@ impl DocumentStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
-            row.map(|(id, parent_id, author, order_key, resolved)| {
+            row.map(|(id, parent_id, author, order_key, resolved, created_at)| {
                 let text = inner.comments.get(&id);
                 CommentView {
                     markdown: text.map(|(markdown, _)| markdown.clone()),
@@ -601,6 +603,7 @@ impl DocumentStore {
                     author,
                     order_key,
                     resolved,
+                    created_at,
                 }
             })
             .map_err(rerr)

@@ -42,7 +42,9 @@ function inlineForm(options: {
   input.className = KIT.input;
   input.type = "text";
   input.required = true;
-  input.maxLength = options.maxLength;
+  // HTML maxLength counts UTF-16 units, while the published limit counts characters.
+  input.maxLength = options.maxLength * 2;
+  input.addEventListener("input", () => input.setCustomValidity(""));
   input.placeholder = options.placeholder;
   input.setAttribute("aria-label", options.label);
   const submit = document.createElement("button");
@@ -54,6 +56,11 @@ function inlineForm(options: {
     event.preventDefault();
     const value = input.value.trim();
     if (!value) return;
+    if ([...value].length > options.maxLength) {
+      input.setCustomValidity(`${options.label} must be at most ${options.maxLength} characters.`);
+      input.reportValidity();
+      return;
+    }
     void options.onSubmit(value).then((ok) => {
       if (ok) input.value = "";
     });
@@ -300,7 +307,15 @@ export class DocumentsView {
     const state = document.createElement("span");
     state.className = "comment-state";
     state.textContent = comment.resolved ? "Resolved" : "";
-    meta.append(author, state);
+    const time = document.createElement("time");
+    time.className = "comment-time";
+    if (comment.createdAt === undefined) time.textContent = "Time unavailable";
+    else {
+      const date = new Date(Number(comment.createdAt));
+      time.dateTime = date.toISOString();
+      time.textContent = date.toLocaleString();
+    }
+    meta.append(author, time, state);
     item.append(meta);
     if (comment.quote !== undefined) {
       const quote = document.createElement("blockquote");
@@ -330,40 +345,35 @@ export class DocumentsView {
   }
 
   private renderComments(): void {
-    const { comments, commentsTruncated } = this.controller.state;
+    const { comments, commentsCursor, commentsLoading } = this.controller.state;
+    const sorted = [...comments].sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id));
     const children = new Map<string | null, Comment[]>();
-    for (const comment of comments) {
+    for (const comment of sorted) {
       const key = comment.parentId ?? null;
       const siblings = children.get(key) ?? [];
       siblings.push(comment);
       children.set(key, siblings);
     }
     const items: HTMLLIElement[] = [];
-    const walk = (parent: string | null, depth: number) => {
-      for (const comment of children.get(parent) ?? []) {
-        items.push(this.commentItem(comment, depth));
-        walk(comment.id, depth + 1);
-      }
-    };
-    walk(null, 0);
-    // A reply whose parent is outside the listed window still appears, at the top level.
     const placed = new Set<string>();
-    const collect = (parent: string | null) => {
-      for (const comment of children.get(parent) ?? []) {
-        placed.add(comment.id);
-        collect(comment.id);
-      }
+    const walk = (comment: Comment, depth: number) => {
+      if (placed.has(comment.id)) return;
+      placed.add(comment.id);
+      items.push(this.commentItem(comment, depth));
+      for (const child of children.get(comment.id) ?? []) walk(child, depth + 1);
     };
-    collect(null);
-    for (const comment of comments) {
-      if (!placed.has(comment.id)) items.push(this.commentItem(comment, 0));
+    for (const comment of sorted) {
+      if (comment.parentId === undefined || !sorted.some((parent) => parent.id === comment.parentId)) walk(comment, 0);
     }
+    for (const comment of sorted) walk(comment, 0);
     this.commentList.replaceChildren(...items);
-    if (commentsTruncated) {
-      const note = document.createElement("li");
-      note.className = "documents-empty";
-      note.textContent = "Older comments are not shown.";
-      this.commentList.prepend(note);
+    if (commentsCursor !== null) {
+      const more = document.createElement("li");
+      const load = button(commentsLoading ? "Loading…" : "Load older comments", "comments-load-older " + KIT.secondary,
+        () => { void this.controller.loadOlderComments(); });
+      load.disabled = commentsLoading;
+      more.append(load);
+      this.commentList.prepend(more);
     }
     this.renderComposer();
   }

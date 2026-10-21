@@ -261,6 +261,37 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("loads older comment pages without stranding replies and displays author time", async () => {
+    const parent = "4".repeat(64);
+    const child = "5".repeat(64);
+    const requests: unknown[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+        "documents.comments": (payload) => {
+          requests.push(payload);
+          return requests.length === 1
+            ? { comments: [{ id: child, documentId: doc, parentId: parent, author: "bob", position: "02", resolved: false, isLocal: false, markdown: "Reply", createdAt: "1730000000000" }], nextCursor: "older", hasMore: true }
+            : { comments: [{ id: parent, documentId: doc, author: "alice", position: "01", resolved: false, isLocal: false, markdown: "Parent" }], nextCursor: null, hasMore: false };
+        },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    expect(texts(root, ".comment-body").map((text) => text.trim())).toEqual(["Reply"]);
+    expect(texts(root, ".comment-time")).toEqual([new Date(1730000000000).toLocaleString()]);
+    (root.querySelector(".comments-load-older") as HTMLButtonElement).click();
+    await tick();
+    expect(requests).toEqual([{ documentId: doc }, { documentId: doc, cursor: "older" }]);
+    expect(texts(root, ".comment-body").map((text) => text.trim())).toEqual(["Parent", "Reply"]);
+    expect(texts(root, ".comment-time")[0]).toBe("Time unavailable");
+    await unmount();
+  });
+
   it("surfaces a request error without losing the listing", async () => {
     const fake = createFakePackageClient({
       requests: {

@@ -304,6 +304,10 @@
         "quote": {
           "type": "string",
           "maxLength": 2048
+        },
+        "createdAt": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,14})$"
         }
       }
     },
@@ -321,8 +325,11 @@
             "$ref": "#/$defs/comment"
           }
         },
-        "truncated": {
+        "hasMore": {
           "type": "boolean"
+        },
+        "nextCursor": {
+          "type": ["string", "null"]
         }
       }
     },
@@ -593,7 +600,13 @@
     },
     "documents.comments": {
       "request": {
-        "$ref": "#/$defs/documentRequest"
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["documentId"],
+        "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "cursor": { "type": "string", "minLength": 1 }
+        }
       },
       "response": {
         "$ref": "#/$defs/comments"

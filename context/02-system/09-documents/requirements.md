@@ -30,7 +30,7 @@ With both Installations online, a body edit SHALL be visible to another Member w
 
 ## TEAM.SYS.DOCS-R07 — Comments
 
-A current Member SHALL be able to add a Comment of 1 byte to 32 KiB of Markdown to a Document, optionally quoting up to 2 KiB of excerpt and optionally replying to a parent Comment on the same Document, and to resolve or reopen any Comment. Comments SHALL be retained with the Document and never deleted. A reply to a Comment on another Document SHALL be rejected.
+A current Member SHALL be able to add a Comment of 1 byte to 32 KiB of Markdown to a Document, optionally quoting up to 2 KiB of excerpt and optionally replying to a parent Comment on the same Document, and to resolve or reopen any Comment. The signed add record SHALL carry an author-clock creation timestamp for display (not ordering); old records without it SHALL show “Time unavailable.” Comments SHALL be retained with the Document and never deleted. A reply to a Comment on another Document SHALL be rejected.
 
 ## TEAM.SYS.DOCS-R08 — Authorship Presentation
 
@@ -38,7 +38,7 @@ Records SHALL store author Installation identities, never names. The UI SHALL la
 
 ## TEAM.SYS.DOCS-R09 — Bounds
 
-Document text is bounded to 192 KiB in version 1; an edit that would exceed it SHALL be refused with a stable error. A Comments listing SHALL carry at most the newest 256 Comments and say when older ones were omitted.
+Local edits SHALL have a 192 KiB growth budget; valid concurrent remote edits beyond this size SHALL remain convergent and visible through bounded full-text chunks. While over budget, local edits SHALL not grow the body further and shrinking edits SHALL remain possible. Comments SHALL be retrievable through serialized-byte-bounded Order Key cursor pages, including older Comments; no single response SHALL exceed the 256 KiB bridge bound.
 
 ## TEAM.SYS.DOCS-R10 — Non-Goals of Version 1
 

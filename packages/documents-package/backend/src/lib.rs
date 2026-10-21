@@ -422,6 +422,72 @@ mod store_tests {
         assert_eq!(f.store.edit_records(Some(&document)).unwrap().len(), 2);
     }
 
+    // Verifies: AC5 — v3 databases migrate with nullable author time; old records stay
+    // readable after restart and new signed times survive projection and replay.
+    #[test]
+    fn comment_time_migrates_v3_and_replays_old_and_new_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(concat!(
+                    include_str!("../migrations/0001_documents.sql"),
+                    include_str!("../migrations/0002_edit_targets.sql"),
+                    include_str!("../migrations/0003_comments.sql")
+                ))
+                .unwrap();
+            connection.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let old = DomainRecord::comment_add(ALICE, &document, None, None, "Old").unwrap();
+        let new =
+            DomainRecord::comment_add_at(BOB, &document, None, None, "New", Some("1730000000000"))
+                .unwrap();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            ingest(
+                &store,
+                1,
+                ALICE,
+                &DomainRecord::collection_create(ALICE, "C").unwrap(),
+            );
+            ingest(
+                &store,
+                2,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &collection, "D").unwrap(),
+            );
+            ingest(&store, 3, ALICE, &old);
+            ingest(&store, 4, BOB, &new);
+            assert_eq!(store.comments(&document).unwrap()[0].created_at, None);
+            assert_eq!(
+                store.comments(&document).unwrap()[1].created_at.as_deref(),
+                Some("1730000000000")
+            );
+        }
+        let store = DocumentStore::open(&path).unwrap();
+        assert_eq!(store.comments(&document).unwrap()[0].created_at, None);
+        assert_eq!(
+            store.comments(&document).unwrap()[1].created_at.as_deref(),
+            Some("1730000000000")
+        );
+        for (seed, record) in [(3, old), (4, new)] {
+            store
+                .remember_opened(&hex(64, seed), &hex(82, seed), &record.encode())
+                .unwrap();
+        }
+        assert_eq!(
+            store.comments(&document).unwrap()[0].markdown.as_deref(),
+            Some("Old")
+        );
+        assert_eq!(
+            store.comments(&document).unwrap()[1].markdown.as_deref(),
+            Some("New")
+        );
+    }
+
     // Verifies: AC5 — comments thread, wait for their parent, resolve last-writer-wins, and
     // rehydrate their text from opened records after restart.
     #[test]

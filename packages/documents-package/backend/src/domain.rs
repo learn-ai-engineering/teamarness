@@ -75,6 +75,8 @@ pub enum DomainRecord {
         parent: Option<String>,
         quote: Option<String>,
         markdown: String,
+        /// Author-clock Unix milliseconds for display only; never an ordering authority.
+        created_at: Option<String>,
     },
     CommentResolve {
         author: String,
@@ -98,6 +100,7 @@ pub enum DomainError {
     InvalidUpdate,
     InvalidMarkdown,
     InvalidQuote,
+    InvalidTimestamp,
 }
 impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -224,8 +227,22 @@ impl DomainRecord {
         quote: Option<&str>,
         markdown: &str,
     ) -> Result<Self, DomainError> {
+        Self::comment_add_at(author, document, parent, quote, markdown, None)
+    }
+
+    pub fn comment_add_at(
+        author: &str,
+        document: &str,
+        parent: Option<&str>,
+        quote: Option<&str>,
+        markdown: &str,
+        created_at: Option<&str>,
+    ) -> Result<Self, DomainError> {
         validate_identity(author)?;
         validate_target(document)?;
+        if let Some(time) = created_at {
+            validate_timestamp(time)?;
+        }
         if let Some(parent) = parent {
             validate_target(parent)?;
         }
@@ -243,6 +260,7 @@ impl DomainRecord {
             parent: parent.map(str::to_owned),
             quote: quote.map(str::to_owned),
             markdown: markdown.into(),
+            created_at: created_at.map(str::to_owned),
         })
     }
     pub fn comment_resolve(author: &str, comment: &str) -> Result<Self, DomainError> {
@@ -425,6 +443,7 @@ impl DomainRecord {
                 parent,
                 quote,
                 markdown,
+                created_at,
             } => {
                 out.push(20);
                 put_text(&mut out, author);
@@ -432,6 +451,9 @@ impl DomainRecord {
                 put_text(&mut out, parent.as_deref().unwrap_or(""));
                 put_text(&mut out, quote.as_deref().unwrap_or(""));
                 put_text(&mut out, markdown);
+                if let Some(time) = created_at {
+                    put_text(&mut out, time);
+                }
             }
             Self::CommentResolve { author, comment } => {
                 out.push(21);
@@ -506,12 +528,18 @@ impl DomainRecord {
                 let parent = take_text(bytes, &mut p)?;
                 let quote = take_text(bytes, &mut p)?;
                 let markdown = take_text(bytes, &mut p)?;
-                Self::comment_add(
+                let created_at = if p == bytes.len() {
+                    None
+                } else {
+                    Some(take_text(bytes, &mut p)?)
+                };
+                Self::comment_add_at(
                     &author,
                     &document,
                     (!parent.is_empty()).then_some(parent.as_str()),
                     (!quote.is_empty()).then_some(quote.as_str()),
                     &markdown,
+                    created_at.as_deref(),
                 )?
             }
             21 => {
@@ -551,14 +579,26 @@ pub(crate) fn validate_target(v: &str) -> Result<(), DomainError> {
     }
 }
 
-/// A name or title: 1 to `max` UTF-8 bytes with no control characters and no leading or
-/// trailing whitespace, which is the UI contract's grammar.
+/// A name or title: 1 to `max` Unicode scalar values, matching published character limits.
+/// Control characters and leading or trailing whitespace are disallowed.
 fn validate_text(v: &str, max: usize, error: DomainError) -> Result<(), DomainError> {
-    if v.is_empty() || v.len() > max || v.chars().any(char::is_control) || v.trim() != v {
+    if v.is_empty() || v.chars().count() > max || v.chars().any(char::is_control) || v.trim() != v {
         Err(error)
     } else {
         Ok(())
     }
+}
+
+fn validate_timestamp(time: &str) -> Result<(), DomainError> {
+    // Canonical decimal Unix milliseconds; the year 9999 is the latest displayable date.
+    if time.is_empty()
+        || (time.len() > 1 && time.starts_with('0'))
+        || !time.bytes().all(|b| b.is_ascii_digit())
+        || !matches!(time.parse::<u64>(), Ok(value) if value <= 253_402_300_799_999)
+    {
+        return Err(DomainError::InvalidTimestamp);
+    }
+    Ok(())
 }
 
 fn put_text(out: &mut Vec<u8>, v: &str) {
@@ -614,6 +654,37 @@ mod tests {
     use super::*;
 
     const TARGET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn old_comment_fixture_and_new_author_clock_round_trip() {
+        // Sealed TDOCS\x01 comment.add layout before creation time was appended.
+        let mut old = b"TDOCS\x01\x14".to_vec();
+        for field in ["alice", TARGET, "", "", "Old"] {
+            put_text(&mut old, field);
+        }
+        assert_eq!(DomainRecord::decode(&old).unwrap().encode(), old);
+        let new =
+            DomainRecord::comment_add_at("alice", TARGET, None, None, "New", Some("1730000000000"))
+                .unwrap();
+        assert_eq!(DomainRecord::decode(&new.encode()).unwrap(), new);
+        assert!(
+            DomainRecord::comment_add_at("alice", TARGET, None, None, "x", Some("253402300800000"))
+                .is_err()
+        );
+        assert!(
+            DomainRecord::comment_add_at("alice", TARGET, None, None, "x", Some("01")).is_err()
+        );
+    }
+
+    #[test]
+    fn names_and_titles_count_unicode_characters() {
+        assert!(DomainRecord::collection_create("alice", &"界".repeat(MAX_NAME)).is_ok());
+        assert!(DomainRecord::collection_create("alice", &"界".repeat(MAX_NAME + 1)).is_err());
+        assert!(DomainRecord::document_create("alice", TARGET, &"界".repeat(MAX_TITLE)).is_ok());
+        assert!(
+            DomainRecord::document_create("alice", TARGET, &"界".repeat(MAX_TITLE + 1)).is_err()
+        );
+    }
 
     #[test]
     fn every_kind_round_trips() {

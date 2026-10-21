@@ -33,7 +33,7 @@ The text CRDT is `loro` 1.16.2, pinned exactly.
 - Record growth is append-only with no compaction; a snapshot record is the planned relief. Every non-archived Document's body is resident per Backend per Workspace.
 - Folder mapping (editing documents from a mapped folder with any editor or CLI agent) is a separate workstream; Loro's text diff import keeps it open.
 - The dependency tree grows by roughly 140 crates, including second `getrandom` and `rand` versions; all are MIT, Apache-2.0, MPL-2.0, BSL-1.0, Zlib, or Unlicense.
-- The 256 KiB UI payload bound sets a 192 KiB document cap in v1; larger documents need paging.
+- The 256 KiB UI payload bound requires bounded full-text chunks and comment pages. Local edits have a 192 KiB growth budget; concurrent valid remote edits can grow a Document beyond it and remain convergent, with only no-growth or shrinking local edits allowed until it is back under budget.
 
 ## Evidence
 

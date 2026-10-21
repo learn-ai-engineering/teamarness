@@ -229,6 +229,7 @@ pub(crate) fn project_domain(
             parent,
             quote,
             markdown,
+            created_at,
         } => {
             if !document_exists(tx, document)? {
                 return ProjectionOutcome::deferred(tx, record_id, domain);
@@ -251,8 +252,8 @@ pub(crate) fn project_domain(
                 }
             }
             tx.execute(
-                "INSERT OR IGNORE INTO comments(comment_id,document_id,parent_id,author,create_order,state_order,resolved) VALUES(?1,?2,?3,?4,?5,?5,0)",
-                params![record_id, document, parent, author, order_key],
+                "INSERT OR IGNORE INTO comments(comment_id,document_id,parent_id,author,create_order,state_order,resolved,created_at) VALUES(?1,?2,?3,?4,?5,?5,0,?6)",
+                params![record_id, document, parent, author, order_key, created_at],
             )?;
             clear(tx, record_id)?;
             Ok(ProjectionOutcome {

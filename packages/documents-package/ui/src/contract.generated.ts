@@ -19,6 +19,7 @@ export type CollectionRequest = {
 
 export type Comment = {
   readonly "author": string;
+  readonly "createdAt"?: string;
   readonly "documentId": RecordId;
   readonly "id": RecordId;
   readonly "isLocal": boolean;
@@ -35,7 +36,8 @@ export type CommentRequest = {
 
 export type Comments = {
   readonly "comments": readonly Comment[];
-  readonly "truncated"?: boolean;
+  readonly "hasMore"?: boolean;
+  readonly "nextCursor"?: string | null;
 };
 
 export type Document = {
@@ -124,7 +126,10 @@ export type DocumentsContract = {
       }; readonly response: Appended };
     readonly "documents.comment.reopen": { readonly request: CommentRequest; readonly response: Appended };
     readonly "documents.comment.resolve": { readonly request: CommentRequest; readonly response: Appended };
-    readonly "documents.comments": { readonly request: DocumentRequest; readonly response: Comments };
+    readonly "documents.comments": { readonly request: {
+        readonly "cursor"?: string;
+        readonly "documentId": RecordId;
+      }; readonly response: Comments };
     readonly "documents.document.archive": { readonly request: DocumentRequest; readonly response: Appended };
     readonly "documents.document.create": { readonly request: {
         readonly "collectionId": RecordId;
