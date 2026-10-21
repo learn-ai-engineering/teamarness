@@ -93,6 +93,7 @@ export type TextEvent = {
   readonly "editable": boolean;
   readonly "origin"?: "local" | "remote";
   readonly "revision": Revision;
+  readonly "savedRevision"?: Revision;
   readonly "text"?: string;
   readonly "transfer"?: "begin" | "chunk" | "end";
 };

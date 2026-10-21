@@ -101,19 +101,19 @@ export class DocumentsController {
     }
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);
     const pending = this.pendingSelectionId;
-    if (pending !== null && snapshot.collections.some((c) => c.id === pending)) {
+    if (pending !== null && visible.some((c) => c.id === pending)) {
       this.pendingSelectionId = null;
       this.update({ snapshot, selectedCollectionId: pending });
       return;
     }
     const current = this._state.selectedCollectionId;
-    const stillThere = current !== null && snapshot.collections.some((c) => c.id === current);
+    const stillThere = current !== null && visible.some((c) => c.id === current);
     const selectedCollectionId = stillThere ? current : (visible[0]?.id ?? null);
     this.update({ snapshot, selectedCollectionId });
   }
 
   selectCollection(id: string): void {
-    if (this._state.snapshot.collections.some((c) => c.id === id)) {
+    if (this.visibleCollections.some((c) => c.id === id)) {
       this.update({ selectedCollectionId: id, error: null });
     }
   }
@@ -169,11 +169,18 @@ export class DocumentsController {
     try {
       const listed = await this.client.request("documents.comments", { documentId });
       if (this.disposed || this._state.openDocumentId !== documentId || sequence !== this.commentsSequence) return;
-      // Keep previously loaded older pages when a new comment or state change refreshes page one.
-      const ids = new Set(listed.comments.map((comment) => comment.id));
-      const older = this._state.comments.filter((comment) => !ids.has(comment.id));
-      this.update({ comments: [...listed.comments, ...older], commentsCursor: this._state.commentsCursor ?? listed.nextCursor ?? null,
-        commentsLoading: false });
+      // Re-read the loaded range: an older Comment may have changed state remotely.
+      const oldest = this._state.comments.at(-1)?.id;
+      const fullyLoaded = this._state.comments.length > 0 && this._state.commentsCursor === null;
+      const comments = [...listed.comments];
+      let cursor = listed.nextCursor ?? null;
+      while (cursor !== null && (fullyLoaded || (oldest !== undefined && !comments.some((comment) => comment.id === oldest)))) {
+        const page = await this.client.request("documents.comments", { documentId, cursor });
+        if (this.disposed || this._state.openDocumentId !== documentId || sequence !== this.commentsSequence) return;
+        comments.push(...page.comments);
+        cursor = page.nextCursor ?? null;
+      }
+      this.update({ comments, commentsCursor: cursor, commentsLoading: false });
     } catch (error) {
       if (isAbortError(error) || this.disposed || sequence !== this.commentsSequence) return;
       this.update({ error: describeError(error), commentsLoading: false });

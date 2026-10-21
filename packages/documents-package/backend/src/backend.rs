@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -71,6 +71,8 @@ struct BodyHub {
     flush: Arc<Notify>,
     /// Serializes append attempts with requests without holding the body mutex across I/O.
     append_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    waiting_metadata: Arc<Mutex<HashSet<String>>>,
+    metadata_lock: Arc<tokio::sync::Mutex<()>>,
     /// This Installation's Loro peer id, stable across restarts and distinct across Installations.
     peer: u64,
 }
@@ -104,6 +106,7 @@ impl BodyHub {
     fn apply_edits(&self, edits: &[(String, Vec<u8>)]) {
         for (document, update) in edits {
             let published = self.with_body(document, |body| match body.import(update) {
+                Ok(Some(_)) if !body.editable() => None,
                 Ok(Some(delta)) => Some(json!({
                     "documentId": document, "revision": body.revision().to_string(),
                     "origin": "remote", "delta": delta, "editable": body.editable(),
@@ -128,7 +131,12 @@ impl BodyHub {
 
     fn text_events(&self, document: &str) -> Vec<JsonValue> {
         self.with_body(document, |body| {
-            full_text_events(document, body.revision(), body.text(), body.editable())
+            full_text_events(
+                document,
+                body.revision(),
+                if body.editable() { body.text() } else { "" },
+                body.editable(),
+            )
         })
     }
 
@@ -240,6 +248,7 @@ pub(crate) struct ActivationHandles {
     pub(crate) store: DocumentStore,
     pub(crate) sync: Arc<Mutex<SyncReport>>,
     pub(crate) bodies: Bodies,
+    pub(crate) waiting_metadata: Arc<Mutex<HashSet<String>>>,
 }
 
 pub(crate) type ActivationObserver = Arc<Mutex<Option<ActivationHandles>>>;
@@ -347,6 +356,8 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 events,
                 flush: Arc::new(Notify::new()),
                 append_locks: Arc::new(Mutex::new(HashMap::new())),
+                waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
+                metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
                 peer: peer_id(&installation),
             };
             rehydrate(&store, &log, &hub, &cancellation).await?;
@@ -360,6 +371,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     store: store.clone(),
                     sync: sync.clone(),
                     bodies: hub.bodies.clone(),
+                    waiting_metadata: hub.waiting_metadata.clone(),
                 });
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
@@ -1174,6 +1186,80 @@ async fn append(
     Ok(json!({ "ok": true, "id": id }))
 }
 
+/// Re-opens metadata still waiting for history without re-ingesting already projected rows.
+async fn reopen_metadata(
+    store: &DocumentStore,
+    log: &RecordLog,
+    hub: &BodyHub,
+    cancellation: &CancellationToken,
+    waiting_only: bool,
+) -> Result<(), BackendError> {
+    let _guard = hub.metadata_lock.lock().await;
+    if waiting_only && hub.waiting_metadata.lock().unwrap().is_empty() {
+        return Ok(());
+    }
+    for deferred in [false, true] {
+        let reader = store.clone();
+        let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
+            (if deferred {
+                reader.deferred_records()
+            } else {
+                reader.control_records()
+            })
+            .map_err(|_| storage_failed())
+        })
+        .await?;
+        let rows: Vec<_> = if waiting_only {
+            let waiting = hub.waiting_metadata.lock().unwrap();
+            rows.into_iter()
+                .filter(|row| waiting.contains(&row.record_id))
+                .collect()
+        } else {
+            rows
+        };
+        for batch in open_batches(&rows) {
+            let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+            let results = log.open(&sealed).await.map_err(|cause| {
+                capability_error(
+                    if deferred {
+                        "open-deferred-records"
+                    } else {
+                        "open-control-records"
+                    },
+                    cause,
+                )
+            })?;
+            for (row, result) in batch.iter().zip(results) {
+                match result {
+                    OpenResult::WaitingForHistoryAccess => {
+                        hub.waiting_metadata
+                            .lock()
+                            .unwrap()
+                            .insert(row.record_id.clone());
+                    }
+                    OpenResult::Ready(record) => {
+                        if deferred {
+                            let ingested = store
+                                .retry_deferred(&row.record_id, &record.canonical)
+                                .map_err(|_| storage_failed())?;
+                            hub.apply_edits(&ingested.edits);
+                        } else {
+                            store
+                                .remember_opened(&row.record_id, &row.order_key, &record.canonical)
+                                .map_err(|_| storage_failed())?;
+                        }
+                        hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
+                    }
+                    OpenResult::WrongScope | OpenResult::Corrupt => {
+                        hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Re-opens the sealed metadata records the listing needs, and retries deferred ones.
 async fn rehydrate(
     store: &DocumentStore,
@@ -1181,42 +1267,7 @@ async fn rehydrate(
     hub: &BodyHub,
     cancellation: &CancellationToken,
 ) -> Result<(), BackendError> {
-    let reader = store.clone();
-    let control = teamarness_package_sdk::blocking(cancellation, move |_| {
-        reader.control_records().map_err(|_| storage_failed())
-    })
-    .await?;
-    for batch in open_batches(&control) {
-        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
-        let results = log
-            .open(&sealed)
-            .await
-            .map_err(|cause| capability_error("open-control-records", cause))?;
-        for (row, result) in batch.iter().zip(results) {
-            if let OpenResult::Ready(record) = result {
-                let _ = store.remember_opened(&row.record_id, &row.order_key, &record.canonical);
-            }
-        }
-    }
-    let reader = store.clone();
-    let deferred = teamarness_package_sdk::blocking(cancellation, move |_| {
-        reader.deferred_records().map_err(|_| storage_failed())
-    })
-    .await?;
-    for batch in open_batches(&deferred) {
-        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
-        let results = log
-            .open(&sealed)
-            .await
-            .map_err(|cause| capability_error("open-deferred-records", cause))?;
-        for (row, result) in batch.iter().zip(results.iter()) {
-            if let OpenResult::Ready(record) = result
-                && let Ok(ingested) = store.retry_deferred(&row.record_id, &record.canonical)
-            {
-                hub.apply_edits(&ingested.edits);
-            }
-        }
-    }
+    reopen_metadata(store, log, hub, cancellation, false).await?;
     // Rebuild every body from its edit records; a Document whose records cannot be opened yet
     // stays pending until `documents.document.open` retries it.
     let reader = store.clone();
@@ -1232,6 +1283,7 @@ async fn rehydrate(
         by_document.entry(document).or_default().push(row);
     }
     for (document, rows) in by_document {
+        hub.with_body(&document, |body| body.set_unopened(rows.len()));
         let unopened = import_edit_rows(log, hub, &rows).await?;
         hub.with_body(&document, |body| body.set_unopened(unopened));
     }
@@ -1303,16 +1355,30 @@ where
     F: FnMut(Vec<u8>) -> Fut,
     Fut: Future<Output = Result<(), BackendError>>,
 {
+    let mut appended = false;
     loop {
         let next = hub.with_body(document, |body| {
             body.flush(Instant::now(), force)
                 .and_then(|flushed| flushed.updates.into_iter().next())
         });
         let Some(update) = next else {
+            if appended {
+                let saved_revision = hub.with_body(document, |body| body.last_request_revision());
+                if let Some(saved_revision) = saved_revision {
+                    let mut events = hub.text_events(document);
+                    if let Some(last) = events.last_mut() {
+                        last["savedRevision"] = json!(saved_revision.to_string());
+                    }
+                    for event in events {
+                        let _ = hub.events.send(event);
+                    }
+                }
+            }
             return Ok(());
         };
         append(update).await?;
         hub.with_body(document, DocumentBody::append_succeeded);
+        appended = true;
     }
 }
 
@@ -1422,8 +1488,10 @@ fn start_session(
         changes: changes.clone(),
         sync: sync.clone(),
         hub: hub.clone(),
+        log: log.clone(),
+        cancellation: CancellationToken::new(),
     });
-    let cancellation = CancellationToken::new();
+    let cancellation = sink.cancellation.clone();
     let task = tokio::spawn(run_session(
         log.clone(),
         sink,
@@ -1455,6 +1523,8 @@ pub(crate) struct DocumentsSink {
     changes: watch::Sender<u64>,
     sync: Arc<Mutex<SyncReport>>,
     hub: BodyHub,
+    log: RecordLog,
+    cancellation: CancellationToken,
 }
 
 impl DocumentsSink {
@@ -1502,6 +1572,22 @@ impl RecordLogSink for DocumentsSink {
         // observation gives pending editors another opportunity to open sealed edits.
         self.changes
             .send_modify(|revision| *revision = revision.saturating_add(1));
+        if self.hub.waiting_metadata.lock().unwrap().is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let log = self.log.clone();
+        let hub = self.hub.clone();
+        let cancellation = self.cancellation.clone();
+        let changes = self.changes.clone();
+        tokio::spawn(async move {
+            if reopen_metadata(&store, &log, &hub, &cancellation, true)
+                .await
+                .is_ok()
+            {
+                changes.send_modify(|revision| *revision = revision.saturating_add(1));
+            }
+        });
     }
 
     fn on_warning(&self, warning: &SyncWarning) {
@@ -1612,6 +1698,8 @@ mod tests {
             events,
             flush: Arc::new(Notify::new()),
             append_locks: Arc::new(Mutex::new(HashMap::new())),
+            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
+            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 3,
         };
         let mut alice = DocumentBody::new(1);
@@ -1659,6 +1747,44 @@ mod tests {
                 .collect::<String>(),
             merged
         );
+    }
+
+    #[test]
+    fn pending_body_never_publishes_partial_ready_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, mut receiver) = broadcast::channel(16);
+        let hub = BodyHub {
+            store,
+            bodies: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            flush: Arc::new(Notify::new()),
+            append_locks: Arc::new(Mutex::new(HashMap::new())),
+            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
+            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
+            peer: 3,
+        };
+        let mut source = DocumentBody::new(1);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "complete".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        hub.with_body("doc", |body| body.set_unopened(2));
+        hub.apply_edits(&[("doc".into(), update.clone())]);
+        assert_eq!(hub.open_response("doc")["text"], "");
+        assert!(
+            receiver.try_recv().is_err(),
+            "no partial delta is broadcast"
+        );
+        hub.with_body("doc", |body| body.set_unopened(0));
+        assert_eq!(hub.open_response("doc")["text"], "complete");
+        assert_eq!(hub.open_response("doc")["editable"], true);
     }
 
     #[test]
@@ -1877,6 +2003,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiting_metadata_and_deferred_records_recover_on_history_state_without_restart() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let collection = DomainRecord::collection_create("bob", "Plan").unwrap();
+        let document = DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap();
+        let comment = DomainRecord::comment_add("bob", &hex(64, 2), None, None, "Hello").unwrap();
+        let deferred = DomainRecord::document_create("bob", &hex(64, 99), "Later").unwrap();
+        let records = [collection, document, comment, deferred];
+        let mut canonical = HashMap::new();
+        for (index, record) in records.iter().enumerate() {
+            let seed = index as u64 + 1;
+            store
+                .ingest(
+                    &hex(64, seed),
+                    &hex(82, seed),
+                    "bob",
+                    record.kind(),
+                    "sig",
+                    &record.encode(),
+                    &vec![seed as u8; 32 * 1024],
+                    None,
+                )
+                .unwrap();
+            canonical.insert(
+                seed as u8,
+                (
+                    record.kind().to_owned(),
+                    URL_SAFE_NO_PAD.encode(record.encode()),
+                ),
+            );
+        }
+        drop(store);
+        let access = Arc::new(AtomicBool::new(false));
+        let gained = access.clone();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => {
+                let sealed = payload["sealedRecords"].as_array().unwrap();
+                assert!(sealed.len() <= 32);
+                assert!(sealed.iter().map(|value| URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap().len()).sum::<usize>() <= 512 * 1024);
+                Ok(json!({"results": sealed.iter().map(|value| {
+                    let seed = URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap()[0];
+                    if gained.load(Ordering::SeqCst) {
+                        let (purpose, canonical) = &canonical[&seed];
+                        json!({"status":"ready", "recordId":hex(64, seed as u64), "orderKey":hex(82, seed as u64),
+                            "author":"bob", "purpose":purpose, "signature":"c2ln", "canonical":canonical})
+                    } else { json!({"status":"waiting_for_history_access"}) }
+                }).collect::<Vec<_>>() }))
+            }
+            _ => Err(error("unavailable", false)),
+        });
+        let session = start(directory.path(), scripted.clone()).await;
+        assert_eq!(session.handles.store.collections().unwrap()[0].name, None);
+        assert_eq!(
+            session.handles.store.comments(&hex(64, 2)).unwrap()[0].markdown,
+            None
+        );
+        access.store(true, Ordering::SeqCst);
+        let stream = scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        assert!(
+            stream
+                .send(json!({"kind":"state", "availability":"current", "pendingRecordCount":"0"}))
+                .await
+        );
+        let store = session.handles.store.clone();
+        wait_until(
+            || {
+                store.collections().unwrap()[0].name.as_deref() == Some("Plan")
+                    && store.comments(&hex(64, 2)).unwrap()[0].markdown.as_deref() == Some("Hello")
+            },
+            "waiting titles and comments",
+        )
+        .await;
+        assert_eq!(
+            store.documents().unwrap()[0].title.as_deref(),
+            Some("Notes")
+        );
+        let waiting = session.handles.waiting_metadata.clone();
+        wait_until(
+            || waiting.lock().unwrap().is_empty(),
+            "deferred metadata retry",
+        )
+        .await;
+        store
+            .ingest(
+                &hex(64, 99),
+                &hex(82, 99),
+                "bob",
+                "collection.create",
+                "sig",
+                &DomainRecord::collection_create("bob", "Later collection")
+                    .unwrap()
+                    .encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.documents().unwrap().len(),
+            2,
+            "opened deferred record applies when parent arrives"
+        );
+        let count = scripted
+            .recorded_calls()
+            .iter()
+            .filter(|call| call.method == "open")
+            .count();
+        assert!(count >= 2, "metadata was retried on state change");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn seventeen_large_records_replay_in_all_paths_and_history_becomes_editable() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let directory = tempfile::tempdir().unwrap();
@@ -1892,7 +2133,8 @@ mod tests {
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let mut seed = 1;
         let mut save = |record: DomainRecord, target: u8| {
-            let sealed = vec![target; 32 * 1024];
+            let mut sealed = vec![target; 32 * 1024];
+            sealed[1] = seed as u8;
             store
                 .ingest(
                     &hex(64, seed),
@@ -1937,7 +2179,7 @@ mod tests {
                 assert!(sealed.len() <= 32 && total <= 512 * 1024);
                 Ok(json!({"results": sealed.iter().map(|value| {
                     let bytes = URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap();
-                    if bytes[0] == 5 && gained.load(Ordering::SeqCst) {
+                    if bytes[0] == 5 && (gained.load(Ordering::SeqCst) || bytes[1] == 37) {
                         json!({"status":"ready", "recordId":hex(64, 37), "orderKey":hex(82, 37),
                             "author":"bob", "purpose":"document.edit", "signature":"c2ln", "canonical":canonical})
                     } else { json!({"status":"waiting_for_history_access"}) }
@@ -1948,7 +2190,7 @@ mod tests {
         let mut session = start(directory.path(), scripted.clone()).await;
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].unopened(),
-            17
+            16
         );
         let mut subscription = session
             .harness
@@ -1965,6 +2207,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending["editable"], false);
+        assert_eq!(
+            pending["text"], "",
+            "one ready edit must not reveal partial body"
+        );
         access.store(true, Ordering::SeqCst);
         let ready = session
             .harness
@@ -2042,6 +2288,12 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap().unwrap();
         let request =
             json!({"documentId": document, "baseRevision":"0", "ops":[{"insert":"draft"}]});
         let result = session
@@ -2061,6 +2313,18 @@ mod tests {
             "background append retry",
         )
         .await;
+        let saved = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = text.next_event().await.unwrap().unwrap();
+                if event.get("savedRevision").is_some() {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(saved["savedRevision"], "1");
+        assert_eq!(saved["text"], "draft");
         let response = session
             .harness
             .request("documents.document.edit", request)
@@ -2088,6 +2352,7 @@ mod tests {
             !session.handles.bodies.lock().unwrap()[&document].has_pending(),
             "graceful dispose drains outstanding edits"
         );
+        text.close().await;
         session.harness.shutdown().await.unwrap();
     }
 
@@ -2182,6 +2447,8 @@ mod tests {
             events,
             flush: Arc::new(Notify::new()),
             append_locks: Arc::new(Mutex::new(HashMap::new())),
+            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
+            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 1,
         };
         let text = "x".repeat(150 * 1024);
@@ -2239,6 +2506,8 @@ mod tests {
             events,
             flush: Arc::new(Notify::new()),
             append_locks: Arc::new(Mutex::new(HashMap::new())),
+            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
+            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 1,
         };
         hub.with_body("doc", |body| {
@@ -2379,12 +2648,16 @@ mod tests {
             .await
             .unwrap();
         assert!(stream.send(record_frame(9, "bob", &remote)).await);
-        let pushed = tokio::time::timeout(Duration::from_secs(2), text.next_event())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(pushed["origin"], "remote");
+        let pushed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = text.next_event().await.unwrap().unwrap();
+                if event["origin"] == "remote" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(pushed["revision"], "3");
         let reopened = session
             .harness

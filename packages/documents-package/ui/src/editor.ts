@@ -26,14 +26,15 @@ export function diffOps(before: string, after: string): TextOp[] {
 
 /** Applies a delta to `text`; positions are Unicode scalar positions. */
 export function applyOps(text: string, ops: readonly TextOp[]): string {
-  const chars = Array.from(text);
+  let chars = Array.from(text);
   let position = 0;
   for (const op of ops) {
     if ("retain" in op) {
       position += op.retain;
     } else if ("insert" in op) {
-      chars.splice(position, 0, ...Array.from(op.insert));
-      position += Array.from(op.insert).length;
+      const inserted = Array.from(op.insert);
+      chars = chars.slice(0, position).concat(inserted, chars.slice(position));
+      position += inserted.length;
     } else {
       chars.splice(position, op.delete);
     }
@@ -92,6 +93,7 @@ export class DocumentEditor {
   private draft: string;
   private retry: { base: string; ops: TextOp[]; text: string } | null = null;
   private inFlightText: string | null = null;
+  private savedRevision: string | null = null;
   private transfer: { revision: string; editable: boolean; chunks: number; parts: string[] } | null = null;
   private abandonedRevision: string | null = null;
   private readonly resync: () => void;
@@ -165,7 +167,7 @@ export class DocumentEditor {
       this.transfer = null;
       if (transfer.parts.length !== transfer.chunks) { this.requestResync(event.revision); return caret; }
       return this.receive({ documentId: event.documentId, revision: event.revision,
-        editable: transfer.editable, text: transfer.parts.join("") }, caret);
+        editable: transfer.editable, text: transfer.parts.join(""), savedRevision: event.savedRevision }, caret);
     }
     if (event.text === undefined && Number(event.revision) > Number(this.state.revision) + 1) {
       this.transfer = null;
@@ -185,8 +187,14 @@ export class DocumentEditor {
       this.state = { ...this.state, text: event.text, revision: event.revision, editable: event.editable };
       this.draft = previousDraft === pendingBase || previousDraft === event.text
         ? event.text : applyOps(event.text, rebase(diffOps(pendingBase, previousDraft), applied));
+      if (event.savedRevision !== undefined) this.savedRevision = event.savedRevision;
+      if (this.retry !== null && event.savedRevision === String(Number(this.retry.base) + 1)) {
+        this.retry = null;
+        this.inFlightText = null;
+        this.state = { ...this.state, error: null };
+      }
       this.announce();
-      void this.flush();
+      if (this.retry === null || this.state.error === null) void this.flush();
       return caret === null ? null : { start: Math.min(caret.start, this.draft.length), end: Math.min(caret.end, this.draft.length) };
     }
     const delta = event.delta ?? [];
@@ -238,6 +246,14 @@ export class DocumentEditor {
         ? { ...this.state, sending: false }
         : { ...this.state, text: sent, revision, sending: false };
     } catch (error) {
+      if (this.savedRevision === String(Number(base) + 1)) {
+        this.retry = null;
+        this.inFlightText = null;
+        this.state = { ...this.state, sending: false, error: null };
+        this.announce();
+        void this.flush();
+        return;
+      }
       const code = (error as { code?: unknown } | null)?.code;
       if (code === "documents.stale_revision") {
         // A delta is on its way; it will re-flush once applied.

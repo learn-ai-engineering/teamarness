@@ -15,6 +15,23 @@ describe("text ops", () => {
     expect(diffOps("abc", "ac")).toEqual([{ retain: 1 }, { delete: 1 }]);
   });
 
+  it("rebases a near-budget ASCII and Unicode draft through delta and full recovery", () => {
+    for (const draft of ["a".repeat(190 * 1024), "😀".repeat(45 * 1024)]) {
+      expect(applyOps("Z", [{ retain: 1 }, { insert: draft }])).toBe(`Z${draft}`);
+      const editor = new DocumentEditor(event({ revision: "0", text: "base" }), () => new Promise(() => {}), () => {});
+      editor.input(`base${draft}`);
+      editor.receive(event({ revision: "1", origin: "remote", delta: [{ insert: "Z" }] }), null);
+      expect(editor.value).toBe(`Zbase${draft}`);
+      editor.receive(event({ revision: "2", text: "YZbase" }), null);
+      expect(editor.value).toBe(`YZbase${draft}`);
+      editor.receive(event({ revision: "3", transfer: "begin", chunks: 2 }), null);
+      editor.receive(event({ revision: "3", transfer: "chunk", chunkIndex: 0, chunk: "X" }), null);
+      editor.receive(event({ revision: "3", transfer: "chunk", chunkIndex: 1, chunk: "YZbase" }), null);
+      editor.receive(event({ revision: "3", transfer: "end" }), null);
+      expect(editor.value).toBe(`XYZbase${draft}`);
+    }
+  });
+
   it("moves a caret across remote inserts and deletes", () => {
     expect(transformCaret(5, [{ retain: 2 }, { insert: "ab" }])).toBe(7);
     expect(transformCaret(1, [{ retain: 2 }, { insert: "ab" }])).toBe(1);
@@ -71,6 +88,61 @@ describe("DocumentEditor", () => {
     expect(editor.current.text).toBe("ZZabc");
     expect(editor.value).toBe("ZZabcX");
     expect(caret).toEqual({ start: 6, end: 6 });
+  });
+
+  it("clears only the matching failed edit after a background durable append, preserving newer typing", async () => {
+    const requests: { base: string; ops: unknown }[] = [];
+    const editor = new DocumentEditor(event({ revision: "0", text: "" }),
+      async (_id, base, ops) => { requests.push({ base, ops }); throw { code: "documents.capability_unavailable" }; }, () => {});
+    editor.input("draft");
+    await Promise.resolve();
+    expect(editor.current.error).not.toBeNull();
+    editor.receive(event({ revision: "1", origin: "local", delta: [{ insert: "draft" }] }), null);
+    editor.input("draft more");
+    await Promise.resolve();
+    expect(editor.current.error).not.toBeNull();
+    editor.receive(event({ revision: "1", text: "draft", savedRevision: "99" }), null);
+    expect(editor.current.error).not.toBeNull();
+    editor.receive(event({ revision: "1", text: "draft", savedRevision: "1" }), null);
+    expect(editor.current.error).toBeNull();
+    expect(editor.current.text).toBe("draft");
+    expect(editor.value).toBe("draft more");
+    expect(requests).toEqual([
+      { base: "0", ops: [{ insert: "draft" }] },
+      { base: "0", ops: [{ insert: "draft" }] },
+      { base: "1", ops: [{ retain: 5 }, { insert: " more" }] },
+    ]);
+  });
+
+  it("shows Saved after background completion with no further input, including chunked recovery", async () => {
+    let sends = 0;
+    const editor = new DocumentEditor(event({ revision: "0", text: "" }),
+      async () => { sends++; throw { code: "documents.capability_unavailable" }; }, () => {});
+    editor.input("draft");
+    await Promise.resolve();
+    expect(editor.current.error).not.toBeNull();
+    editor.receive(event({ revision: "1", transfer: "begin", chunks: 2 }), null);
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 0, chunk: "dra" }), null);
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 1, chunk: "ft" }), null);
+    editor.receive(event({ revision: "1", transfer: "end", savedRevision: "1" }), null);
+    expect(editor.current.error).toBeNull();
+    expect(editor.current.sending).toBe(false);
+    expect(editor.current.text).toBe("draft");
+    expect(editor.value).toBe("draft");
+    expect(sends).toBe(1);
+  });
+
+  it("reconciles a durable event preceding a failed request response", async () => {
+    let rejectSend: (cause: unknown) => void = () => {};
+    const editor = new DocumentEditor(event({ revision: "0", text: "" }),
+      () => new Promise((_resolve, reject) => { rejectSend = reject; }), () => {});
+    editor.input("draft");
+    editor.receive(event({ revision: "1", text: "draft", savedRevision: "1" }), null);
+    rejectSend({ code: "documents.capability_unavailable" });
+    await Promise.resolve();
+    expect(editor.current.error).toBeNull();
+    expect(editor.current.text).toBe("draft");
+    expect(editor.current.sending).toBe(false);
   });
 
   it("keeps failed edits unsaved and retries the identical request", async () => {

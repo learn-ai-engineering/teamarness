@@ -118,6 +118,10 @@ impl DocumentBody {
             })
     }
 
+    pub(crate) fn last_request_revision(&self) -> Option<u64> {
+        self.last_request.as_ref().map(|(_, _, revision)| *revision)
+    }
+
     pub(crate) fn remember_request(&mut self, base: u64, ops: &[TextOp]) {
         self.last_request = Some((base, ops.to_vec(), self.revision));
     }

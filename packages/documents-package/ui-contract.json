@@ -219,6 +219,9 @@
           "type": "string",
           "enum": ["begin", "chunk", "end"]
         },
+        "savedRevision": {
+          "$ref": "#/$defs/revision"
+        },
         "chunks": {
           "type": "integer",
           "minimum": 1

@@ -140,6 +140,30 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("hides a selected archived Collection and its Documents until Archived is shown", async () => {
+    const research = "4".repeat(64);
+    let current = { ...snapshot(),
+      collections: [...snapshot().collections, { id: research, name: "Research", archived: false }],
+      documents: [...snapshot().documents, { id: "5".repeat(64), collectionId: research, title: "New plan", archived: false }],
+    };
+    const { fake } = backend(() => current);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    current = { ...current, collections: current.collections.map((collection) =>
+      collection.id === planning ? { ...collection, archived: true } : collection) };
+    await fake.emit("documents.changes", current);
+    expect(texts(root, ".collection-button")).toEqual(["Research"]);
+    expect(root.querySelector(".collection-button[aria-current=page]")?.textContent).toBe("Research");
+    expect(texts(root, ".document-title")).toEqual(["New plan"]);
+    const toggle = root.querySelector(".archived-toggle input") as HTMLInputElement;
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change"));
+    expect(texts(root, ".collection-button")).toContain("Planning");
+    ([...root.querySelectorAll(".collection-button")].find((button) => button.textContent === "Planning") as HTMLButtonElement).click();
+    expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
+    await unmount();
+  });
+
   it("opens a Document, sends typed edits, and applies a remote delta with the caret moved", async () => {
     const edits: { base: string; ops: unknown }[] = [];
     const fake = createFakePackageClient({
@@ -289,6 +313,44 @@ describe("Documents mount", () => {
     expect(requests).toEqual([{ documentId: doc }, { documentId: doc, cursor: "older" }]);
     expect(texts(root, ".comment-body").map((text) => text.trim())).toEqual(["Parent", "Reply"]);
     expect(texts(root, ".comment-time")[0]).toBe("Time unavailable");
+    await unmount();
+  });
+
+  it("refreshes loaded older Comments after a remote resolve and reopen", async () => {
+    const older = "4".repeat(64);
+    const newest = "5".repeat(64);
+    let resolved = false;
+    const requests: unknown[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+        "documents.comments": (payload) => {
+          requests.push(payload);
+          return "cursor" in (payload as object)
+            ? { comments: [{ id: older, documentId: doc, author: "bob", position: "01", resolved, isLocal: false, markdown: "Older" }], nextCursor: null, hasMore: false }
+            : { comments: [{ id: newest, documentId: doc, author: "bob", position: "02", resolved: false, isLocal: false, markdown: "Newest" }], nextCursor: "older", hasMore: true };
+        },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    (root.querySelector(".comments-load-older") as HTMLButtonElement).click();
+    await tick();
+    expect(root.querySelector(".comment.is-resolved")).toBeNull();
+    resolved = true;
+    await fake.emit("documents.changes", snapshot());
+    await tick();
+    expect(texts(root, ".comment-body").map((text) => text.trim())).toEqual(["Older", "Newest"]);
+    expect(root.querySelector(".comment.is-resolved .comment-body")?.textContent).toContain("Older");
+    resolved = false;
+    await fake.emit("documents.changes", snapshot());
+    await tick();
+    expect(root.querySelector(".comment.is-resolved")).toBeNull();
+    expect(requests.filter((payload) => "cursor" in (payload as object))).toHaveLength(3);
     await unmount();
   });
 
