@@ -1248,6 +1248,7 @@ fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::CapabilityVersionUnsupported => "capability_version_unsupported",
         PackageErrorCode::DeadlineExceeded => "deadline_exceeded",
         PackageErrorCode::Overloaded => "overloaded",
+        PackageErrorCode::PrincipalNotBound => "principal_not_bound",
         _ => "capability_request_invalid",
     }
 }

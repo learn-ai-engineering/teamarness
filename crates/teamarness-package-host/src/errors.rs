@@ -29,6 +29,7 @@ pub enum PackageErrorCode {
     CapabilityUnavailable,
     CapabilityVersionUnsupported,
     CapabilityRequestInvalid,
+    PrincipalNotBound,
     SpawnFailed,
     HandshakeTimeout,
     HandshakeMismatch,
@@ -201,6 +202,7 @@ pub(crate) fn activation_error(
         PackageErrorCode::CapabilityUnavailable
             | PackageErrorCode::CapabilityVersionUnsupported
             | PackageErrorCode::CapabilityRequestInvalid
+            | PackageErrorCode::PrincipalNotBound
     ) {
         PackageErrorStage::Capability
     } else {

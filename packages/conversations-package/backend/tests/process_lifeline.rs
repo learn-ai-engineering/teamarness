@@ -72,7 +72,7 @@ impl Backend {
                 "major": 1,
                 "minor": 0,
             }, {
-                "identity": "teamarness.person-names",
+                "identity": "teamarness.principals",
                 "grant": "bmFtZS1ncmFudA",
                 "major": 1,
                 "minor": 0,

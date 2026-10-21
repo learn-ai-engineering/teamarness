@@ -146,43 +146,43 @@ fn code(temp: &TempDir) -> teamarness_package_host::PackageErrorCode {
 }
 
 #[test]
-fn reserved_person_name_identity_cannot_be_selected_by_manifest() {
+fn reserved_principal_identity_cannot_be_selected_by_manifest() {
     let temp = valid_package();
     write_manifest(
         &temp,
-        serde_json::json!({"identity": "internal:teamarness.person-names"}),
+        serde_json::json!({"identity": "internal:teamarness.principals"}),
     );
     assert_eq!(code(&temp), PackageErrorCode::InvalidPackageIdentity);
     assert!(
         !teamarness_package_contract::identity::is_valid_package_identity(
-            "internal:teamarness.person-names"
+            "internal:teamarness.principals"
         )
     );
     assert!(
-        "internal:teamarness.person-names"
+        "internal:teamarness.principals"
             .parse::<PackageIdentity>()
             .is_err()
     );
     assert!(
         teamarness_package_contract::identity::is_valid_package_identity(
-            "internal.teamarness.person-names"
+            "internal.teamarness.principals"
         )
     );
     assert!(
-        "internal.teamarness.person-names"
+        "internal.teamarness.principals"
             .parse::<PackageIdentity>()
             .is_ok()
     );
     write_manifest(
         &temp,
-        serde_json::json!({"identity": "internal.teamarness.person-names"}),
+        serde_json::json!({"identity": "internal.teamarness.principals"}),
     );
     assert_eq!(
         manifest::load(temp.path(), "aarch64-apple-darwin")
             .unwrap()
             .identity
             .as_str(),
-        "internal.teamarness.person-names"
+        "internal.teamarness.principals"
     );
 }
 

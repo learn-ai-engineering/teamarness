@@ -572,7 +572,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
             "capabilities":[
                 {"identity":"teamarness.workspace-context","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.membership","major":1,"minMinor":0,"maxMinor":0},
-                {"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0},
+                {"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.signing","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":0,"maxMinor":0}
             ],

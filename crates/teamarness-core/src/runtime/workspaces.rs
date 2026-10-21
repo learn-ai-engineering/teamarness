@@ -496,6 +496,29 @@ impl CoreRuntime {
         ))
     }
 
+    pub fn workspace_principal(
+        &self,
+        workspace: WorkspaceId,
+        identity: PublicIdentity,
+    ) -> Result<Option<crate::WorkspacePrincipal>, crate::PersonNameError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        crate::principals::lookup(&state.connection, projection, identity)
+    }
+
     pub fn principal(
         &self,
         workspace: WorkspaceId,

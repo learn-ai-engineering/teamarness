@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
+use teamarness_package_sdk::capabilities::principals::{PrincipalSnapshot, Principals};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
@@ -69,7 +69,7 @@ struct Session {
 pub struct ConversationsActive {
     store: ConversationStore,
     log: RecordLog,
-    names: PersonNames,
+    names: Principals,
     sync: Arc<Mutex<SyncReport>>,
     changes: watch::Sender<u64>,
     /// The Installation this Package Instance belongs to, which decides who may hide a Channel.
@@ -162,11 +162,9 @@ pub(crate) fn router_observing(
             .await?;
             let log = RecordLog::from_initialization(&initialization, capabilities)
                 .map_err(|cause| capability_error("record-log", cause))?;
-            let names = PersonNames::from_initialization(
-                &initialization,
-                activation.capabilities().clone(),
-            )
-            .map_err(|cause| capability_error("person-names", cause))?;
+            let names =
+                Principals::from_initialization(&initialization, activation.capabilities().clone())
+                    .map_err(|cause| capability_error("principals", cause))?;
             rehydrate(&store, &log, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
@@ -391,16 +389,20 @@ pub(crate) fn router_observing(
     )
 }
 
-fn name_snapshots(snapshot: PersonNameSnapshot) -> Vec<JsonValue> {
+fn name_snapshots(snapshot: PrincipalSnapshot) -> Vec<JsonValue> {
     // The capability bounds the roster to 1,024 Persons and each name to 256 UTF-8 bytes.
     // 64 entries leave ample room even for JSON-escaped names under both bridge limits.
     const PERSONS_PER_EVENT: usize = 64;
     let persons: Vec<_> = snapshot
-        .persons
+        .principals
         .into_iter()
+        .filter(|principal| {
+            principal.kind
+                == teamarness_package_sdk::capabilities::principals::PrincipalKind::Person
+        })
         .map(|person| {
             json!({
-                "identity": person.identity, "personId": person.person_id,
+                "identity": person.keys[0], "personId": person.principal_id,
                 "name": person.name, "fingerprint": person.fingerprint,
             })
         })
@@ -1007,7 +1009,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
                 .capability(RECORD_LOG, scripted.clone())
-                .capability("teamarness.person-names", ScriptedCapability::new())
+                .capability("teamarness.principals", ScriptedCapability::new())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -2224,14 +2226,16 @@ mod session_tests {
 
     #[test]
     fn large_person_name_snapshot_reaches_every_author_in_bounded_parts() {
-        use teamarness_package_sdk::capabilities::person_names::PersonName;
-        let snapshot = PersonNameSnapshot {
+        use teamarness_package_sdk::capabilities::principals::{Principal, PrincipalKind};
+        let snapshot = PrincipalSnapshot {
             workspace_id: "a".repeat(32),
             cursor: 1,
-            persons: (0..1024)
-                .map(|n| PersonName {
-                    identity: format!("{n:064x}"),
-                    person_id: format!("{n:064x}"),
+            principals: (0..1024)
+                .map(|n| Principal {
+                    principal_id: format!("{n:064x}"),
+                    kind: PrincipalKind::Person,
+                    steward_principal_id: None,
+                    keys: vec![format!("{n:064x}")],
                     name: Some("🌻".repeat(64)),
                     fingerprint: "a".repeat(12),
                 })
@@ -2252,13 +2256,15 @@ mod session_tests {
             assert_eq!(event["parts"], events.len());
             assert!(serde_json::to_vec(event).unwrap().len() <= HISTORY_REPLY_BUDGET);
         }
-        let escaping = PersonNameSnapshot {
+        let escaping = PrincipalSnapshot {
             workspace_id: "a".repeat(32),
             cursor: 2,
-            persons: (0..1024)
-                .map(|n| PersonName {
-                    identity: format!("{n:064x}"),
-                    person_id: format!("{n:064x}"),
+            principals: (0..1024)
+                .map(|n| Principal {
+                    principal_id: format!("{n:064x}"),
+                    kind: PrincipalKind::Person,
+                    steward_principal_id: None,
+                    keys: vec![format!("{n:064x}")],
                     name: Some("\\\"".repeat(128)),
                     fingerprint: "f".repeat(64),
                 })
@@ -2281,9 +2287,9 @@ mod session_tests {
         let directory = tempfile::tempdir().unwrap();
         let names = ScriptedCapability::new().calls(|method, _| match method {
             "current" => Ok(
-                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [
-                { "identity": "b".repeat(64), "personId": "c".repeat(64),
-                  "name": "Alice", "fingerprint": "bbbbbbbbbbbb" }
+                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [
+                { "principalId": "c".repeat(64), "kind": "person", "stewardPrincipalId": null,
+                  "keys": ["b".repeat(64)], "name": "Alice", "fingerprint": "bbbbbbbbbbbb" }
             ] }),
             ),
             _ => Err(BackendError::new(
@@ -2299,7 +2305,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory.path())
                 .capability(RECORD_LOG, scripted_log())
-                .capability("teamarness.person-names", names.clone())
+                .capability("teamarness.principals", names.clone())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -2337,9 +2343,9 @@ mod session_tests {
         names
             .stream()
             .send(
-                json!({"workspaceId": "a".repeat(32), "cursor": "1", "persons": [
-                    { "identity": signed_author, "personId": "c".repeat(64),
-                      "name": "Alice 🌻", "fingerprint": "bbbbbbbbbbbb" }
+                json!({"workspaceId": "a".repeat(32), "cursor": "1", "principals": [
+                    { "principalId": "c".repeat(64), "kind": "person", "stewardPrincipalId": null,
+                      "keys": [signed_author], "name": "Alice 🌻", "fingerprint": "bbbbbbbbbbbb" }
                 ]}),
             )
             .await;
@@ -2364,7 +2370,9 @@ mod session_tests {
     async fn closing_idle_names_subscription_closes_capability_stream() {
         let directory = tempfile::tempdir().unwrap();
         let names = ScriptedCapability::new().calls(|method, _| match method {
-            "current" => Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [] })),
+            "current" => {
+                Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [] }))
+            }
             _ => Err(BackendError::new(
                 "capability_unavailable",
                 false,
@@ -2376,7 +2384,7 @@ mod session_tests {
             .installation(ALICE, "Alice")
             .data_directory(directory.path())
             .capability(RECORD_LOG, scripted_log())
-            .capability("teamarness.person-names", names.clone())
+            .capability("teamarness.principals", names.clone())
             .start()
             .await;
         harness.activate().await.unwrap();
@@ -2395,7 +2403,7 @@ mod session_tests {
         subscription.close().await;
         tokio::time::timeout(
             Duration::from_secs(2),
-            wait_until(|| !stream.is_open(), "idle person-names stream closure"),
+            wait_until(|| !stream.is_open(), "idle principals stream closure"),
         )
         .await
         .unwrap();
