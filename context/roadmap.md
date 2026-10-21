@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete; Phase 7 (Documents Package) is implemented on the `workspace-documents` workstream pending its two-profile manual Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next for the core.
 
 ## Phases
 
@@ -82,6 +82,14 @@ Branch `ui-polish-member-names`, merged to `main` on 2026-09-22. Polished the Sh
 
 Branch `architecture-review`, merged to `main` on 2026-09-22. Reviewed the whole system across five parallel lanes — architecture, code quality, synchronization, security, Package authoring — and executed five fix rounds closing every finding at the cause, with ADRs 0013–0018 recorded under `context/.decisions/`. Verification: independent round-4 confirmation (37 executed perturbations, sandbox hermeticity observation) and a consolidated passing review record; full required check green; developer manual smoke 2026-09-22 confirmed the branch's behaviour changes. Carried follow-ups live in the workstream issues log: the content-key stall (Member cannot post until a key holder syncs — Phase 5), two load-dependent test flakes, and the Shell bounds pairing.
 
+### Phase 7 - Documents Package
+
+Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Package (`packages/documents-package`) owns Collections, Documents, Comments, and a collaborative plain-text Markdown body replicated as Loro updates on the immutable record log, with no Core change (ADR 0023). Automated qualification covers record convergence in any order, deferral and quarantine, Loro import order independence, coalesced and bounded edit records, restart replay, and the UI edit and comment flows. The two-profile manual Verify (two-second visibility across NAT, offline merge, late joiner) is recorded in the workstream.
+
+**Outcome:** Two team members on separate networks edit a planning document together and discuss it in comments that stay with the document (vision success criterion 4).
+
+**Depends on:** Phase 4. Follow-up: folder mapping, so a mapped folder lets any editor or CLI agent edit documents.
+
 ## Later (unscheduled)
 
 Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
@@ -91,8 +99,9 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - CI-published updates that reach every Member within one hour (vision success criterion 6), with code signing, notarization, and CI/CD (`TEAM.DEL`).
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
-- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (4 bundled Packages × 3 Workspaces = 12 processes); measure before scheduling.
-- Collaborative planning documents (vision success criterion 4).
+- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
+- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0023).
+- Document log compaction via the reserved `document.snapshot` record kind (ADR 0023).
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
 

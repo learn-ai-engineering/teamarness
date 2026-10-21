@@ -81,6 +81,16 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Channel Membership** | Package-owned policy determining who can read and post in a specific Channel, bounded by Canonical Membership. Phase 4 has no separate Channel Membership records because every current Workspace Member participates in every Channel |
 | **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns records and domain policy; `teamarness.synchronization.immutable-record-log` owns reusable transport, replication, retry, and backpressure |
 
+## Documents
+
+| Term | Definition |
+|---|---|
+| **Collection** | A flat, named group of Documents within a Workspace, identified by the Record ID of the record that created it. It can be renamed, archived, and restored; it is never deleted |
+| **Document** | A collaboratively edited plain-text Markdown document that belongs to exactly one Collection, identified by the Record ID of its create record. Its title, Collection, and archive state are metadata records; its body is a Loro text container rebuilt from Document Edit records and never persisted as plaintext |
+| **Document Edit** | An immutable record carrying one Loro update for one Document's body. Edits converge in any arrival order; a Document is editable once every locally known Document Edit has been opened |
+| **Comment** | An immutable Markdown remark anchored to one Document, optionally quoting an excerpt and optionally replying to a parent Comment on the same Document. Comments can be resolved and reopened and are never deleted |
+| **Archive** | Hiding a Collection or Document from the default listing by a record; archived entries remain openable and can be restored. Documents are never purged |
+
 ## Synchronization and Protection
 
 | Term | Definition |

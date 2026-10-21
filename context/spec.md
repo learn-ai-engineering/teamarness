@@ -16,6 +16,7 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 | `TEAM.SYS.REPO` | `02-system/06-repos/` | The Repo-aware Package: repository registration, local read-only Git inspection, and repository views. No repository replication |
 | `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package frame mounting, workspace controls, theming |
 | `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
+| `TEAM.SYS.DOCS` | `02-system/09-documents/` | The Documents Package: Collections, Documents with a collaborative Markdown body, Comments, record validation and projections, and its UI. Consumes the immutable-record Synchronization Capability (ADR 0023) |
 | `TEAM.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
 | `TEAM.CONTRIB` | `04-contributing/` | Development setup, contribution workflow, code standards |
 
