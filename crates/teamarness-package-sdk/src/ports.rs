@@ -87,6 +87,20 @@ impl PortClient {
             )
             .await
     }
+
+    /// Explicitly observes live Provider events; a declaration alone never subscribes.
+    pub async fn subscribe_event(
+        &self,
+        contract: &str,
+        port: &str,
+    ) -> Result<CapabilitySubscription, BackendError> {
+        self.capabilities
+            .subscribe(
+                &self.grant,
+                serde_json::json!({"contract":contract,"port":port,"kind":"event"}),
+            )
+            .await
+    }
 }
 
 #[derive(Deserialize)]

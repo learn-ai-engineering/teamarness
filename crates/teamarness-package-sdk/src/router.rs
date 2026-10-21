@@ -186,6 +186,7 @@ pub struct Router<S: Send + Sync + 'static> {
     subscriptions: BTreeMap<&'static str, SubscriptionHandler<S>>,
     port_requests: BTreeMap<(&'static str, &'static str, &'static str), RequestHandler<S>>,
     port_queries: BTreeMap<(&'static str, &'static str), SubscriptionHandler<S>>,
+    port_events: BTreeMap<(&'static str, &'static str), SubscriptionHandler<S>>,
 }
 
 impl Router<()> {
@@ -213,6 +214,7 @@ impl<S: Send + Sync + 'static> Router<S> {
             subscriptions: BTreeMap::new(),
             port_requests: BTreeMap::new(),
             port_queries: BTreeMap::new(),
+            port_events: BTreeMap::new(),
         }
     }
 
@@ -359,6 +361,42 @@ impl<S: Send + Sync + 'static> Router<S> {
         self
     }
 
+    /// Registers a live event source. The Host opens it once for the first subscriber.
+    #[must_use]
+    pub fn port_event<F, Fut>(
+        mut self,
+        contract: &'static str,
+        port: &'static str,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Context<S>, PortActor) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<EventSubscription, BackendError>> + Send + 'static,
+    {
+        assert!(valid_operation_name(port));
+        let key = (contract, port);
+        assert!(
+            !self.port_events.contains_key(&key),
+            "port registered twice"
+        );
+        let handler = Arc::new(handler);
+        self.port_events.insert(
+            key,
+            Arc::new(move |context, payload| {
+                let handler = handler.clone();
+                Box::pin(async move {
+                    let envelope: ProviderEnvelope =
+                        serde_json::from_value(payload).map_err(|_| invalid_payload())?;
+                    if envelope.major != 1 || envelope.request != serde_json::json!({}) {
+                        return Err(invalid_payload());
+                    }
+                    handler(context, envelope.actor).await
+                })
+            }),
+        );
+        self
+    }
+
     /// Registers a consumer-initiated streaming query; the SDK controls its stream credit.
     #[must_use]
     pub fn port_live_query<Req, F, Fut>(
@@ -428,6 +466,7 @@ impl<S: Send + Sync + 'static> Router<S> {
             subscriptions: self.subscriptions,
             port_requests: self.port_requests,
             port_queries: self.port_queries,
+            port_events: self.port_events,
         })
     }
 
@@ -463,6 +502,7 @@ struct RouterBackend<S: Send + Sync + 'static> {
     subscriptions: BTreeMap<&'static str, SubscriptionHandler<S>>,
     port_requests: BTreeMap<(&'static str, &'static str, &'static str), RequestHandler<S>>,
     port_queries: BTreeMap<(&'static str, &'static str), SubscriptionHandler<S>>,
+    port_events: BTreeMap<(&'static str, &'static str), SubscriptionHandler<S>>,
 }
 
 impl<S: Send + Sync + 'static> RouterBackend<S> {
@@ -604,11 +644,18 @@ impl<S: Send + Sync + 'static> Backend for RouterBackend<S> {
         request: BackendRequest,
     ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>> {
         Box::pin(async move {
-            if request.operation == "teamarness.port.query.v1" {
+            if matches!(
+                request.operation.as_str(),
+                "teamarness.port.query.v1" | "teamarness.port.event.v1"
+            ) {
                 let envelope: ProviderEnvelope = serde_json::from_value(request.payload.clone())
                     .map_err(|_| invalid_payload())?;
-                let handler = self
-                    .port_queries
+                let ports = if request.operation == "teamarness.port.event.v1" {
+                    &self.port_events
+                } else {
+                    &self.port_queries
+                };
+                let handler = ports
                     .get(&(envelope.contract.as_str(), envelope.port.as_str()))
                     .ok_or_else(|| unknown("package.unknown_port"))?
                     .clone();

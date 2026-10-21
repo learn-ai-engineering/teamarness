@@ -193,7 +193,8 @@ pub(crate) async fn run(
                         .await
                         .is_err()
                         {
-                            return Err(SdkError::Protocol("event_lagged"));
+                            state.lock().await.retire_stream(&id);
+                            writer.control(stream_close(&id, "event_lagged")).await?;
                         }
                     }
                     FrameKind::Response | FrameKind::Error => {
@@ -426,4 +427,129 @@ fn stream_close(stream_id: &str, code: &str) -> JsonValue {
 
 fn empty_object() -> JsonValue {
     JsonValue::Object(Default::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::priority_writer;
+    use teamarness_package_protocol::{Frame, MAX_WRITER_FRAMES, decode_frame};
+    use tokio::io::{AsyncReadExt, DuplexStream, duplex};
+    use tokio::sync::oneshot;
+
+    async fn read_frame(stream: &mut DuplexStream) -> Frame {
+        let mut prefix = [0; 4];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize + 4];
+        bytes[..4].copy_from_slice(&prefix);
+        stream.read_exact(&mut bytes[4..]).await.unwrap();
+        decode_frame(&bytes).unwrap()
+    }
+
+    fn frame(value: JsonValue) -> Frame {
+        Frame::try_from(value).unwrap()
+    }
+
+    // Verifies: TEAM.SYS.PKG-R14
+    #[tokio::test]
+    async fn inbound_event_lag_closes_one_stream_and_dispatcher_answers_ping() {
+        let (writer, control, data) = PriorityWriter::channels();
+        let writer = Arc::new(writer);
+        let state = Arc::new(Mutex::new(
+            teamarness_package_protocol::ContractState::default(),
+        ));
+        let (sdk_out, mut host_in) = duplex(4096);
+        let (stop, stopped) = oneshot::channel();
+        let writer_task = tokio::spawn(priority_writer::run(
+            sdk_out,
+            control,
+            data,
+            stopped,
+            state.clone(),
+        ));
+        let (host_frames, frames) = mpsc::channel(MAX_WRITER_FRAMES);
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let streams: CapabilityStreams = Arc::new(Mutex::new(BTreeMap::new()));
+        let task = tokio::spawn(run(
+            crate::Router::stateless().into_backend(),
+            writer.clone(),
+            frames,
+            pending,
+            streams.clone(),
+            Handle::current(),
+            state,
+        ));
+        host_frames.send(frame(serde_json::json!({
+            "kind":"initialize","nonce":"bm9uY2U",
+            "package":{"identity":"dev.teamarness.fixture","version":"1.0.0",
+                "manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+            "uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "processGeneration":"1","workspace":{"id":"workspace1","name":"Workspace"},
+            "installation":{"identity":"installation1","displayName":"Installation"},
+            "dataDirectory":{"path":"/tmp/package","continuityId":"Y29udGludWl0eQ"},
+            "protocol":{"major":1,"minor":0},"capabilities":[],
+            "limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,
+                "maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}
+        }))).await.unwrap();
+        assert_eq!(
+            read_frame(&mut host_in).await.kind(),
+            FrameKind::Initialized
+        );
+        for id in ["p:slow", "p:peer"] {
+            writer
+                .control(serde_json::json!({"kind":"stream_open","id":id,
+                "topic":"capability.stream","initialCredit":32,"payload":{}}))
+                .await
+                .unwrap();
+            assert_eq!(read_frame(&mut host_in).await.kind(), FrameKind::StreamOpen);
+        }
+        // The test injects a smaller adapter queue while retaining the wire's
+        // legal 32-event credit. This is the only way a conforming classifier
+        // can expose adapter lag without fabricating a fatal credit violation.
+        const LAG_TEST_QUEUE: usize = INITIAL_STREAM_CREDIT / INITIAL_STREAM_CREDIT;
+        let (slow, mut slow_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        let (peer, mut peer_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        streams.lock().await.extend([
+            (
+                "p:slow".into(),
+                crate::capability::CapabilityStreamRoute { sender: slow },
+            ),
+            (
+                "p:peer".into(),
+                crate::capability::CapabilityStreamRoute { sender: peer },
+            ),
+        ]);
+        for (id, sequence) in [("p:slow", 1), ("p:slow", 2), ("p:peer", 1)] {
+            host_frames
+                .send(frame(serde_json::json!({"kind":"event","streamId":id,
+                "sequence":sequence.to_string(),"payload":{"order":sequence}})))
+                .await
+                .unwrap();
+        }
+        let close = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut host_in))
+            .await
+            .unwrap();
+        assert_eq!(close.kind(), FrameKind::StreamClose);
+        assert_eq!(close.field("streamId").unwrap(), "p:slow");
+        assert_eq!(close.field("code").unwrap(), "event_lagged");
+        assert_eq!(slow_rx.recv().await.unwrap().unwrap()["order"], 1);
+        assert_eq!(
+            slow_rx.recv().await.unwrap().unwrap_err().code(),
+            "event_lagged"
+        );
+        assert_eq!(peer_rx.recv().await.unwrap().unwrap()["order"], 1);
+        host_frames
+            .send(frame(serde_json::json!({"kind":"ping","nonce":"cGVlcg"})))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut host_in))
+            .await
+            .unwrap();
+        assert_eq!(pong.kind(), FrameKind::Pong);
+        drop(host_frames);
+        assert!(matches!(task.await.unwrap(), Err(SdkError::ParentClosed)));
+        let _ = stop.send(());
+        writer_task.await.unwrap().unwrap();
+    }
 }

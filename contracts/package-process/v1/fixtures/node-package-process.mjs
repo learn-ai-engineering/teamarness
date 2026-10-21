@@ -366,6 +366,12 @@ async function serve() {
   let portQueryStream;
   const portEvents = [];
   let portCloseCode = null;
+  let portEventStream;
+  const portEventEvents = [];
+  let portEventClose = null;
+  const providerEventStreams = new Map();
+  let providerEventOpens = 0;
+  let providerEventCloses = 0;
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -406,6 +412,8 @@ async function serve() {
         immutableEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === portQueryStream) {
         portEvents.push(frame.payload);
+      } else if (frame.kind === "event" && frame.streamId === portEventStream) {
+        portEventEvents.push(frame.payload);
       } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
         membershipStream = undefined;
       } else if (frame.kind === "stream_close" && frame.streamId === immutableStream) {
@@ -414,9 +422,15 @@ async function serve() {
       } else if (frame.kind === "stream_close" && frame.streamId === portQueryStream) {
         portCloseCode = frame.code ?? null;
         portQueryStream = undefined;
+      } else if (frame.kind === "stream_close" && frame.streamId === portEventStream) {
+        portEventClose = frame.code ?? null;
+        portEventStream = undefined;
       } else if (frame.kind === "stream_open") {
         uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
-        if (frame.topic === "teamarness.port.query.v1") {
+        if (frame.topic === "teamarness.port.event.v1") {
+          providerEventOpens += 1;
+          providerEventStreams.set(frame.id, { sequence: 0, credit: frame.initialCredit });
+        } else if (frame.topic === "teamarness.port.query.v1") {
           send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: packageIdentity === "com.example.invalid" ? "invalid" : 1 } });
           if (packageIdentity !== "com.example.invalid") send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
           send({ kind: "stream_close", streamId: frame.id, code: "completed" });
@@ -456,6 +470,10 @@ async function serve() {
         }
       } else if (frame.kind === "credit" && uiStreams.has(frame.streamId)) {
         const stream = uiStreams.get(frame.streamId);
+        if (stream.topic === "teamarness.port.event.v1") {
+          const providerStream = providerEventStreams.get(frame.streamId);
+          if (providerStream) providerStream.credit += frame.amount;
+        }
         if (stream.topic === "fixture.saturation") {
           for (let index = 0; index < frame.amount; index += 1) {
             stream.sequence += 1;
@@ -463,6 +481,7 @@ async function serve() {
           }
         }
       } else if (frame.kind === "stream_close" && uiStreams.has(frame.streamId)) {
+        if (providerEventStreams.delete(frame.streamId)) providerEventCloses += 1;
         uiStreams.delete(frame.streamId);
       } else if (frame.kind === "request" && frame.operation === "fixture.person_names_open") {
         capabilitySequence += 1;
@@ -604,6 +623,47 @@ async function serve() {
         send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_events") {
         send({ kind: "response", id: frame.id, payload: { events: portEvents, closeCode: portCloseCode } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_event_open") {
+        capabilitySequence += 1;
+        portEventStream = `p:port-event-${capabilitySequence}`;
+        portEventEvents.length = 0;
+        portEventClose = null;
+        send({ kind: "stream_open", id: portEventStream, topic: "capability.stream", initialCredit: 32,
+          payload: { grant: frame.payload.grant ?? capabilityGrants.get("teamarness.package-ports"),
+            contract: "com.example.messages", port: frame.payload.port ?? "message.created", kind: "event",
+            ...(frame.payload.extra ?? {}) } });
+        send({ kind: "response", id: frame.id, payload: { opened: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_event_events") {
+        send({ kind: "response", id: frame.id, payload: frame.payload.summary
+          ? { count: portEventEvents.length, lastOrder: portEventEvents.at(-1)?.order ?? null,
+              paddingLength: portEventEvents.at(-1)?.padding?.length ?? null, closeCode: portEventClose }
+          : { events: portEventEvents, closeCode: portEventClose } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_event_credit") {
+        if (portEventStream && frame.payload.amount > 0) {
+          send({ kind: "credit", streamId: portEventStream, amount: frame.payload.amount });
+        }
+        send({ kind: "response", id: frame.id, payload: { credited: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_event_close") {
+        if (portEventStream) send({ kind: "stream_close", streamId: portEventStream, code: "closed" });
+        portEventStream = undefined;
+        send({ kind: "response", id: frame.id, payload: { closed: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_event_emit") {
+        let emitted = 0;
+        for (const [streamId, stream] of providerEventStreams) {
+          if (stream.credit === 0) continue;
+          stream.credit -= 1;
+          stream.sequence += 1;
+          send({ kind: "event", streamId, sequence: String(stream.sequence), payload: {
+            order: frame.payload.order ?? stream.sequence,
+            ...(frame.payload.invalid ? { order: "invalid" } : {}),
+            ...(frame.payload.padding ? { padding: frame.payload.padding } : {})
+          } });
+          emitted += 1;
+        }
+        send({ kind: "response", id: frame.id, payload: { emitted } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_event_stats") {
+        send({ kind: "response", id: frame.id, payload: { opens: providerEventOpens, closes: providerEventCloses,
+          active: providerEventStreams.size } });
       } else if (frame.kind === "request" && frame.operation === "fixture.grant") {
         send({ kind: "response", id: frame.id, payload: { grant: capabilityGrants.get(frame.payload.capability) ?? "missing" } });
       } else if (frame.kind === "request" && frame.operation === "fixture.capability") {

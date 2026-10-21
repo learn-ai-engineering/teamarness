@@ -124,6 +124,18 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
             Ok(serde_json::json!({"actor": identity}))
         },
     )
+    .port_event(
+        "com.example.messages",
+        "message.created",
+        |_context, actor| async move {
+            let (sender, subscription) = event_channel(2);
+            let teamarness_package_sdk::ports::PortActor::Person { identity } = actor;
+            tokio::spawn(async move {
+                let _ = sender.send(serde_json::json!({"actor":identity})).await;
+            });
+            Ok(subscription)
+        },
+    )
     .port_live_query(
         "com.example.messages",
         "message.watch",
@@ -227,6 +239,23 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
     let event = read_frame(&mut session.host_read).await;
     assert_eq!(event.kind(), FrameKind::Event);
     assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::StreamClose
+    );
+    write_json(&mut session.host_write,
+        r#"{"kind":"stream_open","id":"h:event","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":1,"minor":0,"port":"message.created","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+    let event = read_frame(&mut session.host_read).await;
+    assert_eq!(event.kind(), FrameKind::Event);
+    assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::StreamClose
+    );
+    let response = session
+        .request("h:after-event", "fixture.add", r#"{"a":2,"b":3}"#)
+        .await;
+    assert_eq!(response.field("payload").unwrap()["sum"], 5);
     session.finish().await;
 }
 

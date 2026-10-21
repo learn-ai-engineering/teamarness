@@ -359,6 +359,40 @@ impl GenerationCapabilities {
                 .broker
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
+            if object.get("kind").and_then(Value::as_str) == Some("event") {
+                let subscription = broker
+                    .subscribe_event(
+                        &self.scope.package_identity,
+                        &self.scope.workspace_id,
+                        &self.core.public_identity().to_string(),
+                        object,
+                    )
+                    .await?;
+                let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
+                let mut streams = self.streams.lock().await;
+                if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
+                    drop(streams);
+                    broker.drop_event_subscription(&subscription).await;
+                    return Err(PackageErrorCode::Overloaded);
+                }
+                drop(streams);
+                let all_streams = self.streams.clone();
+                let cancelled = self.cancelled.subscribe();
+                tokio::spawn(async move {
+                    broker
+                        .clone()
+                        .run_event_subscription(
+                            stream_id.clone(),
+                            subscription,
+                            receiver,
+                            output,
+                            cancelled,
+                        )
+                        .await;
+                    all_streams.lock().await.remove(&stream_id);
+                });
+                return Ok(());
+            }
             let query = broker
                 .query_stream(
                     &self.scope.package_identity,
@@ -949,7 +983,7 @@ impl Registry {
 }
 
 #[derive(Clone, Copy)]
-enum StreamCommand {
+pub(crate) enum StreamCommand {
     Credit(u64),
     Close,
 }

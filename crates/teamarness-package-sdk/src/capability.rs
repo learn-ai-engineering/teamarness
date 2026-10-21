@@ -238,13 +238,22 @@ impl CapabilityClient {
         payload: JsonValue,
     ) -> Result<(), &'static str> {
         let mut routes = streams.lock().await;
-        let Some(route) = routes.get_mut(id) else {
+        let Some(route) = routes.get(id) else {
             return Ok(());
         };
-        route
-            .sender
-            .try_send(Ok(payload))
-            .map_err(|_| "event_lagged")
+        if route.sender.try_send(Ok(payload)).is_err() {
+            let route = routes.remove(id).expect("stream was present");
+            // Preserve already accepted events, then report the local overflow.
+            // Waiting for queue space on the reader would stall the entire session.
+            tokio::spawn(async move {
+                let _ = route
+                    .sender
+                    .send(Err(BackendError::new("event_lagged", false, object([]))))
+                    .await;
+            });
+            return Err("event_lagged");
+        }
+        Ok(())
     }
 
     pub(crate) async fn close_stream(
@@ -255,7 +264,11 @@ impl CapabilityClient {
         if let Some(route) = streams.lock().await.remove(id)
             && let Some(error) = error
         {
-            let _ = route.sender.send(Err(error)).await;
+            // The terminal follows accepted events, but a full stream must not
+            // suspend the session reader (or another stream's close).
+            tokio::spawn(async move {
+                let _ = route.sender.send(Err(error)).await;
+            });
         }
     }
 
@@ -362,4 +375,40 @@ fn unavailable() -> BackendError {
         true,
         JsonValue::Object(Default::default()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verifies: TEAM.SYS.PKG-R14
+    #[tokio::test]
+    async fn inbound_event_lag_retires_only_its_stream_after_accepted_events() {
+        // Inject one slot instead of the full published credit window to exercise
+        // a locally lagged adapter without violating the wire classifier.
+        const LAG_TEST_QUEUE: usize = INITIAL_STREAM_CREDIT / INITIAL_STREAM_CREDIT;
+        let (slow, mut slow_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        let (peer, mut peer_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        let streams = Arc::new(Mutex::new(BTreeMap::from([
+            ("p:slow".to_owned(), CapabilityStreamRoute { sender: slow }),
+            ("p:peer".to_owned(), CapabilityStreamRoute { sender: peer }),
+        ])));
+        CapabilityClient::event(&streams, "p:slow", serde_json::json!({"order":1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            CapabilityClient::event(&streams, "p:slow", serde_json::json!({"order":2})).await,
+            Err("event_lagged")
+        );
+        CapabilityClient::event(&streams, "p:peer", serde_json::json!({"order":2}))
+            .await
+            .unwrap();
+        assert_eq!(slow_rx.recv().await.unwrap().unwrap()["order"], 1);
+        assert_eq!(
+            slow_rx.recv().await.unwrap().unwrap_err().code(),
+            "event_lagged"
+        );
+        assert_eq!(peer_rx.recv().await.unwrap().unwrap()["order"], 2);
+        assert!(streams.lock().await.contains_key("p:peer"));
+    }
 }

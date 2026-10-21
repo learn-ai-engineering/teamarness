@@ -204,7 +204,7 @@ fn capability_router(gate: Arc<tokio::sync::Semaphore>) -> Router<()> {
 
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn generic_port_client_uses_exact_grant_and_live_query_stream() {
+async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let scripted = ScriptedCapability::new().calls(|method, payload| match method {
         "available" => {
@@ -241,7 +241,10 @@ async fn generic_port_client_uses_exact_grant_and_live_query_stream() {
             .await?;
         let event = query.recv().await.unwrap()?;
         query.close().await;
-        Ok(serde_json::json!({"available":available,"result":result,"event":event}))
+        let mut events = client.subscribe_event("com.example.messages", "message.created").await?;
+        let created = events.recv().await.unwrap()?;
+        events.close().await;
+        Ok(serde_json::json!({"available":available,"result":result,"event":event,"created":created}))
     });
     let mut harness = HarnessBuilder::new(router.into_backend())
         .data_directory(directory.path())
@@ -252,11 +255,22 @@ async fn generic_port_client_uses_exact_grant_and_live_query_stream() {
     let pending = harness.start_request("fixture.ports", empty()).await;
     let sender = scripted.stream();
     assert!(sender.send(serde_json::json!({"order":1})).await);
+    for _ in 0..200 {
+        if scripted.recorded_opens().len() == 2 {
+            break;
+        }
+        // poll-interval: bounded by 200 attempts while the explicit event open is recorded.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(scripted.recorded_opens().len(), 2);
+    assert!(sender.send(serde_json::json!({"order":2})).await);
     let answer = pending.result().await.unwrap();
     assert_eq!(answer["result"]["accepted"], true);
     assert_eq!(answer["event"]["order"], 1);
+    assert_eq!(answer["created"]["order"], 2);
     assert_eq!(scripted.recorded_calls().len(), 2);
-    assert_eq!(scripted.recorded_opens().len(), 1);
+    assert_eq!(scripted.recorded_opens()[1]["kind"], "event");
+    assert_eq!(scripted.recorded_opens()[1]["port"], "message.created");
     harness.shutdown().await.unwrap();
 }
 

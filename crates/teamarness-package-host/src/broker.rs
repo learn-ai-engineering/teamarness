@@ -8,6 +8,9 @@ use teamarness_package_contract::port_contract::{CompiledPortContracts, PortKind
 use teamarness_package_protocol::{MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[path = "event_subscriptions.rs"]
+mod subscriptions;
+
 use crate::admission::PortAvailability;
 use crate::instance::InstanceActor;
 use crate::protocol::{PortQueryStream, WireFailure};
@@ -30,6 +33,12 @@ pub(crate) struct PortBroker {
     instances: RwLock<BTreeMap<PackageInstanceKey, Weak<InstanceActor>>>,
     routes: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
+    events: Arc<tokio::sync::Mutex<subscriptions::EventRegistry>>,
+    event_streams: Arc<Semaphore>,
+    event_subscribers: Arc<Semaphore>,
+    event_bytes: Arc<Semaphore>,
+    event_open_locks:
+        std::sync::Mutex<BTreeMap<subscriptions::EventKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 pub(crate) struct RoutePermits {
@@ -50,6 +59,13 @@ impl PortBroker {
             instances: RwLock::new(BTreeMap::new()),
             routes: Arc::new(Semaphore::new(ROUTES)),
             bytes: Arc::new(Semaphore::new(ROUTE_BYTES)),
+            events: Arc::new(tokio::sync::Mutex::new(
+                subscriptions::EventRegistry::default(),
+            )),
+            event_streams: Arc::new(Semaphore::new(subscriptions::MAX_EVENT_UPSTREAMS)),
+            event_subscribers: Arc::new(Semaphore::new(subscriptions::MAX_EVENT_SUBSCRIBERS)),
+            event_bytes: Arc::new(Semaphore::new(subscriptions::EVENT_BYTES)),
+            event_open_locks: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 

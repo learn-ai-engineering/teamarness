@@ -198,6 +198,7 @@ enum EventContract {
 }
 
 pub(crate) struct PortQueryStream {
+    pub(crate) generation: u64,
     pub(crate) receiver: UiEventReceiver,
     pub(crate) client: ProcessClient,
     pub(crate) id: String,
@@ -225,7 +226,9 @@ impl UiEventReceiver {
             let terminal = self.terminal.borrow().clone();
             if let Some(end) = terminal {
                 // A Package-owned end, like a completion, drains what the Package already sent.
-                if matches!(end, StreamEnd::Completed | StreamEnd::Package(_)) {
+                if matches!(end, StreamEnd::Completed | StreamEnd::Package(_))
+                    || matches!(self.route.contract, EventContract::Port { .. })
+                {
                     match self.events.try_recv() {
                         Ok(event) => {
                             self.route.mark_delivered(event.sequence).await;
@@ -1334,6 +1337,7 @@ impl ProcessClient {
     pub(crate) async fn open_port_stream(
         &self,
         id: String,
+        topic: &str,
         payload: PackageValue,
         schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
         contract: String,
@@ -1347,7 +1351,7 @@ impl ProcessClient {
         if let Err(error) = self
             .writer
             .control(json!({
-                "kind":"stream_open", "id":id, "topic":"teamarness.port.query.v1",
+                "kind":"stream_open", "id":id, "topic":topic,
                 "initialCredit":INITIAL_STREAM_CREDIT, "payload":package_value_to_json(payload)
             }))
             .await
