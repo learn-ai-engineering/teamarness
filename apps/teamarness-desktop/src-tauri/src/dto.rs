@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use teamarness_core::{
-    MemberSnapshot, MembershipRole, MembershipSnapshot, PublicIdentity, WorkspacePerson,
+    MemberSnapshot, MembershipRole, MembershipSnapshot, PrincipalKind, WorkspacePrincipal,
     WorkspaceSummary,
 };
 
@@ -43,12 +43,34 @@ pub enum MemberRoleDto {
 pub struct MemberDto {
     pub identity: String,
     pub role: MemberRoleDto,
+    pub principal_id: String,
+    pub kind: PrincipalKindDto,
+    pub steward_principal_id: Option<String>,
 }
 
-impl From<&MemberSnapshot> for MemberDto {
-    fn from(value: &MemberSnapshot) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalKindDto {
+    Person,
+    Agent,
+}
+
+impl From<PrincipalKind> for PrincipalKindDto {
+    fn from(value: PrincipalKind) -> Self {
+        match value {
+            PrincipalKind::Person => Self::Person,
+            PrincipalKind::Agent => Self::Agent,
+        }
+    }
+}
+
+impl MemberDto {
+    fn from_core(value: &MemberSnapshot, principal: &WorkspacePrincipal) -> Self {
         Self {
             identity: value.identity().to_string(),
+            principal_id: principal.id().to_string(),
+            kind: principal.kind().into(),
+            steward_principal_id: principal.steward_principal_id().map(|id| id.to_string()),
             role: match value.role() {
                 MembershipRole::Member => MemberRoleDto::Member,
                 MembershipRole::Manager => MemberRoleDto::Manager,
@@ -66,43 +88,63 @@ pub struct MembershipDto {
     pub members: Vec<MemberDto>,
 }
 
-impl From<MembershipSnapshot> for MembershipDto {
-    fn from(value: MembershipSnapshot) -> Self {
-        Self {
+impl MembershipDto {
+    pub fn from_core(
+        value: MembershipSnapshot,
+        principals: &[WorkspacePrincipal],
+    ) -> Result<Self, crate::error::BridgeError> {
+        Ok(Self {
             workspace_id: value.workspace_id().to_string(),
             epoch: value.epoch().value().to_string(),
             version: value.version().to_string(),
-            members: value.members().iter().map(MemberDto::from).collect(),
-        }
+            members: value
+                .members()
+                .iter()
+                .map(|member| {
+                    let principal = principals
+                        .iter()
+                        .find(|row| row.keys().contains(&member.identity()))
+                        .ok_or(crate::error::BridgeError::new(
+                            crate::error::BridgeErrorCode::LocalConflict,
+                            true,
+                        ))?;
+                    Ok::<_, crate::error::BridgeError>(MemberDto::from_core(member, principal))
+                })
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspacePersonDto {
-    pub identity: String,
-    pub person_id: String,
+pub struct WorkspacePrincipalDto {
+    pub principal_id: String,
+    pub kind: PrincipalKindDto,
+    pub steward_principal_id: Option<String>,
+    pub keys: Vec<String>,
     pub name: Option<String>,
     pub fingerprint: String,
 }
 
-impl WorkspacePersonDto {
-    pub fn from_core(identity: PublicIdentity, person: WorkspacePerson) -> Self {
+impl From<WorkspacePrincipal> for WorkspacePrincipalDto {
+    fn from(value: WorkspacePrincipal) -> Self {
         Self {
-            identity: identity.to_string(),
-            person_id: person.id().to_string(),
-            name: person.name().map(str::to_owned),
-            fingerprint: person.fingerprint().to_owned(),
+            principal_id: value.id().to_string(),
+            kind: value.kind().into(),
+            steward_principal_id: value.steward_principal_id().map(|id| id.to_string()),
+            keys: value.keys().iter().map(ToString::to_string).collect(),
+            name: value.name().map(str::to_owned),
+            fingerprint: value.fingerprint().to_owned(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PersonNameSnapshotDto {
+pub struct PrincipalsSnapshotDto {
     pub workspace_id: String,
     pub cursor: String,
-    pub persons: Vec<WorkspacePersonDto>,
+    pub principals: Vec<WorkspacePrincipalDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,10 +191,16 @@ mod tests {
                 MemberDto {
                     identity: "1".repeat(64),
                     role: MemberRoleDto::Member,
+                    principal_id: "c".repeat(64),
+                    kind: PrincipalKindDto::Person,
+                    steward_principal_id: None,
                 },
                 MemberDto {
                     identity: "a".repeat(64),
                     role: MemberRoleDto::Manager,
+                    principal_id: "d".repeat(64),
+                    kind: PrincipalKindDto::Person,
+                    steward_principal_id: None,
                 },
             ],
         };
@@ -163,6 +211,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(membership).unwrap(),
             fixture["membership"]
+        );
+        let principals: PrincipalsSnapshotDto =
+            serde_json::from_value(fixture["principals"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(principals).unwrap(),
+            fixture["principals"]
         );
         assert_eq!(
             serde_json::to_value(InvitationDto {

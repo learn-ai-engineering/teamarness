@@ -14,8 +14,20 @@
     "epoch": "2",
     "version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "members": [
-      { "identity": "1111111111111111111111111111111111111111111111111111111111111111", "role": "member" },
-      { "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "role": "manager" }
+      {
+        "identity": "1111111111111111111111111111111111111111111111111111111111111111",
+        "role": "member",
+        "principalId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "kind": "person",
+        "stewardPrincipalId": null
+      },
+      {
+        "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "role": "manager",
+        "principalId": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "kind": "person",
+        "stewardPrincipalId": null
+      }
     ]
   },
   "invitation": {
@@ -23,17 +35,87 @@
     "sensitivity": "bearer_admission"
   },
   "errors": [
-    { "code": "invalid_input", "retryable": false },
-    { "code": "authentication", "retryable": false },
-    { "code": "expired", "retryable": false },
-    { "code": "already_used", "retryable": false },
-    { "code": "readiness", "retryable": true },
-    { "code": "timeout", "retryable": true },
-    { "code": "overload", "retryable": true },
-    { "code": "invalid_bootstrap", "retryable": false },
-    { "code": "local_conflict", "retryable": false },
-    { "code": "admission_no_longer_current", "retryable": false },
-    { "code": "uncertain_storage_outcome", "retryable": false },
-    { "code": "shutdown", "retryable": true }
-  ]
+    {
+      "code": "invalid_input",
+      "retryable": false
+    },
+    {
+      "code": "authentication",
+      "retryable": false
+    },
+    {
+      "code": "expired",
+      "retryable": false
+    },
+    {
+      "code": "already_used",
+      "retryable": false
+    },
+    {
+      "code": "readiness",
+      "retryable": true
+    },
+    {
+      "code": "timeout",
+      "retryable": true
+    },
+    {
+      "code": "overload",
+      "retryable": true
+    },
+    {
+      "code": "invalid_bootstrap",
+      "retryable": false
+    },
+    {
+      "code": "local_conflict",
+      "retryable": false
+    },
+    {
+      "code": "admission_no_longer_current",
+      "retryable": false
+    },
+    {
+      "code": "uncertain_storage_outcome",
+      "retryable": false
+    },
+    {
+      "code": "shutdown",
+      "retryable": true
+    },
+    {
+      "code": "not_steward",
+      "retryable": false
+    },
+    {
+      "code": "principal_not_bound",
+      "retryable": false
+    }
+  ],
+  "principals": {
+    "workspaceId": "00112233445566778899aabbccddeeff",
+    "cursor": "1",
+    "principals": [
+      {
+        "principalId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "kind": "person",
+        "stewardPrincipalId": null,
+        "keys": [
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        "name": "Remote",
+        "fingerprint": "111111111111"
+      },
+      {
+        "principalId": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "kind": "person",
+        "stewardPrincipalId": null,
+        "keys": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "name": "Alice",
+        "fingerprint": "aaaaaaaaaaaa"
+      }
+    ]
+  }
 }

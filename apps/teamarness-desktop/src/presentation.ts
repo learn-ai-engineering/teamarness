@@ -40,7 +40,7 @@ export async function buildShellPresentation(
   const workspace = model.workspaces.find(({ id }) => id === selectedWorkspaceId) ?? null;
   const membership = workspace ? model.memberships[workspace.id] : undefined;
   const members = model.installation && membership
-    ? await presentMembers(model.installation, membership, model.personNames[workspace!.id])
+    ? await presentMembers(model.installation, membership, model.principals[workspace!.id])
     : [];
   const activeWorkspaceIndex = model.activeWorkspaceId === null
     ? null
@@ -51,7 +51,7 @@ export async function buildShellPresentation(
     activeWorkspaceIndex: activeWorkspaceIndex === -1 ? null : activeWorkspaceIndex,
     workspace: workspace ? {
       name: workspace.name,
-      ownPersonName: model.personNames[workspace.id]?.persons.find(({ identity }) => identity === model.installation?.identity)?.name ?? "",
+      ownPersonName: model.principals[workspace.id]?.principals.find(({ keys, kind }) => kind === "person" && keys.includes(model.installation?.identity ?? ""))?.name ?? "",
       members,
       memberCount: members.length,
       membershipLoaded: membership !== undefined && model.installation !== null,
@@ -133,6 +133,8 @@ function errorMessage(code: BridgeErrorCode): string {
     uncertain_storage_outcome: "Storage outcome is uncertain. Restart Teamarness.",
     package_reconciliation: "Some Packages could not start for this Workspace. Try again, or reopen Teamarness.",
     shutdown: "Teamarness is shutting down. Try again after reopening.",
+    not_steward: "Only the steward can rename this Agent. Only the steward or Workspace Manager can remove it.",
+    principal_not_bound: "This Package is not linked to the Agent.",
   };
   return messages[code];
 }

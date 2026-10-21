@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
-import type { Installation, Membership, Workspace } from "./contracts";
+import type { Installation, Membership, PrincipalsSnapshot, Workspace } from "./contracts";
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
 import type { PackageLifecycleResult } from "./package-shell";
 import { Shell, type ShellFrame, type ShellRoute } from "./shell";
@@ -66,7 +66,7 @@ class TestControl {
   }
 
   public click(): void {
-    this.listener?.({} as Event);
+    this.listener?.({ preventDefault: () => undefined } as unknown as Event);
   }
 }
 
@@ -78,8 +78,15 @@ class SettingsRegion extends Region {
   public readonly suspend = new TestControl();
   public readonly retryLifecycle = new TestControl();
   public readonly retrySnapshot = new TestControl();
+  public readonly addAgent = new TestControl();
+  public readonly removeAgent = new TestControl();
+  public readonly renameAgent = new TestControl();
+  public readonly agentName = { value: "Helper" };
+  public readonly renamedAgentName = { value: "Helper renamed" };
 
   public querySelector(selector: string): TestControl | null {
+    if (selector === "#add-agent") return this.addAgent;
+    if (selector === "#agent-name") return this.agentName as unknown as TestControl;
     if (selector === "[data-package-snapshot-retry]" && this.innerHTML.includes("data-package-snapshot-retry")) {
       return this.retrySnapshot;
     }
@@ -87,6 +94,15 @@ class SettingsRegion extends Region {
   }
 
   public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector === "[data-remove-agent]") {
+      this.removeAgent.dataset.removeAgent = "2";
+      return this.innerHTML.includes('data-remove-agent="2"') ? [this.removeAgent] : [];
+    }
+    if (selector === "[data-rename-agent]") {
+      this.renameAgent.dataset.renameAgent = "2";
+      (this.renameAgent as TestControl & { querySelector: () => unknown }).querySelector = () => this.renamedAgentName;
+      return this.innerHTML.includes('data-rename-agent="2"') ? [this.renameAgent] : [];
+    }
     if (selector === "[data-package-failure-action]") {
       this.retryLifecycle.dataset.packageFailureAction = "recover";
       this.retryLifecycle.dataset.packageActionIndex = "1";
@@ -154,7 +170,7 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
     installation,
     workspaces: [workspace, otherWorkspace],
     memberships: { [workspace.id]: membership },
-    personNames: {},
+    principals: {},
     activeWorkspaceId,
     loading: false,
     error: null,
@@ -170,6 +186,7 @@ function harness(
   }> = {},
   workspaceRail: HTMLElement = new Region() as unknown as HTMLElement,
   contextualNavigation: HTMLElement = new Region() as unknown as HTMLElement,
+  agentActions: Readonly<{ addAgent?: (id: string, name: string) => Promise<void>; removeAgent?: (id: string, agentId: string) => Promise<void>; renameAgent?: (id: string, agentId: string, name: string) => Promise<void> }> = {},
 ): {
   shell: Shell;
   frame: ShellFrame;
@@ -208,6 +225,9 @@ function harness(
       createWorkspace: async () => undefined,
       joinWorkspace: async () => undefined,
       rename: async () => undefined,
+      addAgent: agentActions.addAgent ?? (async () => undefined),
+      removeAgent: agentActions.removeAgent ?? (async () => undefined),
+      renameAgent: agentActions.renameAgent ?? (async () => undefined),
       copyInvitation: async () => undefined,
       refreshMembership: async () => undefined,
       retry: async () => { calls.push("retry"); },
@@ -522,5 +542,32 @@ describe("persistent Shell frame", () => {
         }
       }
     }
+  });
+});
+
+
+describe("Workspace Agent Shell controls", () => {
+  const agentId = "e".repeat(64);
+  const agentIdentity = "f".repeat(64);
+  const agent = { identity: agentIdentity, role: "member" as const, principalId: agentId, kind: "agent" as const, stewardPrincipalId: "d".repeat(64) };
+  const principal = { principalId: agentId, kind: "agent" as const, stewardPrincipalId: "d".repeat(64), keys: [agentIdentity], name: "Helper", fingerprint: agentIdentity.slice(0, 12) };
+
+  it("routes name-only add, ID-only removal and steward rename through settings", async () => {
+    const screen = new SettingsRegion();
+    const calls: string[] = [];
+    const test = harness(screen as unknown as HTMLElement, {}, undefined, undefined, {
+      addAgent: async (id, name) => { calls.push(`add:${id}:${name}`); },
+      removeAgent: async (id, agentId) => { calls.push(`remove:${id}:${agentId}`); },
+      renameAgent: async (id, agentId, name) => { calls.push(`rename:${id}:${agentId}:${name}`); },
+    });
+    await test.shell.updateWorkspace({ ...model(), memberships: { [workspace.id]: { ...membership, members: [...membership.members, agent] } }, principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, principal] } as PrincipalsSnapshot } });
+    screen.addAgent.click();
+    screen.removeAgent.click();
+    screen.renameAgent.click();
+    expect(calls).toEqual([
+      `add:${workspace.id}:Helper`,
+      `remove:${workspace.id}:${agentId}`,
+      `rename:${workspace.id}:${agentId}:Helper renamed`,
+    ]);
   });
 });

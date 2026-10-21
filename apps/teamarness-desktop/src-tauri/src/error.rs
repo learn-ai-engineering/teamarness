@@ -28,6 +28,8 @@ pub enum BridgeErrorCode {
     /// itself is usable; some of its Packages are not.
     PackageReconciliation,
     Shutdown,
+    NotSteward,
+    PrincipalNotBound,
 }
 
 impl BridgeError {
@@ -83,8 +85,8 @@ impl From<PersonNameError> for BridgeError {
             PersonNameError::InvalidName
             | PersonNameError::InvalidPackageIdentity
             | PersonNameError::WorkspaceNotFound
-            | PersonNameError::NotOwnPerson
             | PersonNameError::AgentNotFound => Self::invalid_input(),
+            PersonNameError::NotOwnPerson => Self::new(BridgeErrorCode::NotSteward, false),
             PersonNameError::Membership(error) => error.into(),
             PersonNameError::Storage(error) => error.into(),
         }
@@ -174,7 +176,21 @@ mod tests {
             "../../contracts/fixtures/bridge-contract.json"
         ))
         .unwrap();
-        assert_eq!(actual, fixture["errors"]);
+        assert_eq!(
+            actual.as_array().unwrap().as_slice(),
+            &fixture["errors"].as_array().unwrap()[..errors.len()]
+        );
+        assert_eq!(
+            serde_json::to_value([
+                BridgeError::from(PersonNameError::NotOwnPerson),
+                BridgeError::new(BridgeErrorCode::PrincipalNotBound, false),
+            ])
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .as_slice(),
+            &fixture["errors"].as_array().unwrap()[errors.len()..]
+        );
     }
 
     /// A reconcile failure that is not a Host shutdown must not tell the person

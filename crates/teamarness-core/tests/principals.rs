@@ -85,6 +85,7 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
     steward.join_workspace(&invitation).await.unwrap();
     manager.remember_loopback_peer_for_tests(&steward);
     steward.remember_loopback_peer_for_tests(&manager);
+    let mut manager_principals = manager.subscribe_principals(workspace).unwrap();
     let first = steward.add_agent(workspace, "One").unwrap();
     let second = steward.add_agent(workspace, "Two").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -95,6 +96,15 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(manager.principal(workspace, first).unwrap().is_some());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        manager_principals.changed(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (added_cursor, added_rows) = manager.principals_snapshot(workspace).unwrap();
+    assert!(added_rows.iter().any(|row| row.id() == first));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
     while manager.principal(workspace, first).unwrap().unwrap().name() != Some("One")
         && std::time::Instant::now() < deadline
@@ -114,8 +124,12 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
         manager.bind_agent_package(workspace, first, "pkg"),
         Err(PersonNameError::NotOwnPerson)
     );
+    let mut steward_principals = steward.subscribe_principals(workspace).unwrap();
     manager.remove_agent(workspace, first).unwrap();
     assert!(manager.principal(workspace, first).unwrap().is_none());
+    let (removed_cursor, removed_rows) = manager.principals_snapshot(workspace).unwrap();
+    assert!(removed_cursor > added_cursor);
+    assert!(!removed_rows.iter().any(|row| row.id() == first));
     assert!(manager.principal(workspace, second).unwrap().is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while steward.principal(workspace, first).unwrap().is_some()
@@ -125,6 +139,15 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(steward.principal(workspace, first).unwrap().is_none());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        steward_principals.changed(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (_, steward_rows) = steward.principals_snapshot(workspace).unwrap();
+    assert!(!steward_rows.iter().any(|row| row.id() == first));
     assert_eq!(
         steward
             .principal(workspace, second)

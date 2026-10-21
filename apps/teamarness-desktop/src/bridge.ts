@@ -3,7 +3,7 @@ import type {
   Installation,
   Invitation,
   Membership,
-  PersonNameSnapshot,
+  PrincipalsSnapshot,
   Workspace,
   WorkspaceState,
 } from "./contracts";
@@ -14,9 +14,11 @@ export interface TeamarnessBridge {
   createWorkspace(name: string, personName: string): Promise<WorkspaceState>;
   createWorkspaceInvitation(workspaceId: string): Promise<Invitation>;
   joinWorkspace(invitation: string, personName: string): Promise<WorkspaceState>;
-  setOwnPersonName(workspaceId: string, name: string): Promise<void>;
-  personNameSnapshot(workspaceId: string): Promise<PersonNameSnapshot>;
-  subscribePersonNames(workspaceId: string, afterCursor: string, listener: (snapshot: PersonNameSnapshot) => void, terminated: () => void): Promise<void>;
+  renameWorkspacePrincipal(workspaceId: string, principalId: string, name: string): Promise<void>;
+  addWorkspaceAgent(workspaceId: string, name: string): Promise<Membership>;
+  removeWorkspaceAgent(workspaceId: string, agentId: string): Promise<Membership>;
+  principalsSnapshot(workspaceId: string): Promise<PrincipalsSnapshot>;
+  subscribePrincipals(workspaceId: string, afterCursor: string, listener: (snapshot: PrincipalsSnapshot) => void, terminated: () => void): Promise<void>;
   currentMembership(workspaceId: string): Promise<Membership>;
 }
 
@@ -27,14 +29,16 @@ export const bridge: TeamarnessBridge = Object.freeze({
   createWorkspaceInvitation: (workspaceId: string) =>
     invoke<Invitation>("create_workspace_invitation", { workspaceId }),
   joinWorkspace: (invitation: string, personName: string) => invoke<WorkspaceState>("join_workspace", { invitation, personName }),
-  setOwnPersonName: (workspaceId: string, name: string) => invoke<void>("set_own_person_name", { workspaceId, name }),
-  personNameSnapshot: (workspaceId: string) => invoke<PersonNameSnapshot>("person_name_snapshot", { workspaceId }),
-  subscribePersonNames: async (workspaceId: string, afterCursor: string, listener: (snapshot: PersonNameSnapshot) => void, terminated: () => void) => {
-    const onEvent = new Channel<{ kind: "snapshot"; snapshot: PersonNameSnapshot } | { kind: "terminated" }>((event) => {
+  renameWorkspacePrincipal: (workspaceId: string, principalId: string, name: string) => invoke<void>("rename_workspace_principal", { workspaceId, principalId, name }),
+  addWorkspaceAgent: (workspaceId: string, name: string) => invoke<Membership>("add_workspace_agent", { workspaceId, name }),
+  removeWorkspaceAgent: (workspaceId: string, agentId: string) => invoke<Membership>("remove_workspace_agent", { workspaceId, agentId }),
+  principalsSnapshot: (workspaceId: string) => invoke<PrincipalsSnapshot>("principals_snapshot", { workspaceId }),
+  subscribePrincipals: async (workspaceId: string, afterCursor: string, listener: (snapshot: PrincipalsSnapshot) => void, terminated: () => void) => {
+    const onEvent = new Channel<{ kind: "snapshot"; snapshot: PrincipalsSnapshot } | { kind: "terminated" }>((event) => {
       if (event.kind === "terminated") terminated();
       else listener(event.snapshot);
     });
-    await invoke("subscribe_person_names", { workspaceId, afterCursor, onEvent });
+    await invoke("subscribe_principals", { workspaceId, afterCursor, onEvent });
   },
   currentMembership: (workspaceId: string) =>
     invoke<Membership>("current_membership", { workspaceId }),
