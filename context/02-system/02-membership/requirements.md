@@ -8,7 +8,7 @@ The system SHALL maintain a signed, causally ordered, append-only membership ope
 
 ## TEAM.SYS.MEM-R02 — Membership Operations
 
-The system SHALL support two post-genesis membership operations: `admit` and `revoke`. Each operation SHALL be signed by an existing workspace member with appropriate capability. Operation payloads SHALL include the target `PublicIdentity`, an author-declared timestamp, and content-hash links to their causal dependencies. The runtime SHALL verify the canonical content hash, signature, workspace genesis descent, and dependency integrity before authorization processing.
+The system SHALL support these post-genesis membership operations: `create person`, `admit`, `revoke`, `add agent key`, and `remove agent key`. `admit` and `revoke` SHALL target a Workspace Person's key group in the Workspace group; `create person`, `add agent key`, and `remove agent key` SHALL target that Person's own key group. Each operation SHALL be signed by a key that holds the authority its target group requires for that action: a Manager for the Workspace group, and the Person's Installation key for the Person's group. An `add agent key` operation SHALL carry the Agent Identity's proof of possession bound to the Workspace, the Person's group, and the Steward's key. A key that is a current Member of any Person's group SHALL NOT be added again, and an Agent Identity SHALL NOT author any membership operation. Operation payloads SHALL include the target (a key group or a key), an author-declared timestamp, and content-hash links to their causal dependencies. The runtime SHALL verify the canonical content hash, signature, workspace genesis descent, dependency integrity, and any proof of possession before authorization processing (ADR 0023).
 
 ## TEAM.SYS.MEM-R03 — Single-Use Invitations
 
@@ -16,7 +16,7 @@ The system SHALL generate cryptographically signed, single-use Invitation tokens
 
 ## TEAM.SYS.MEM-R04 — Membership Intervals
 
-The system SHALL model membership as intervals: `[admitted, revoked?)`. A member's interval SHALL begin at admission and end at revocation. Phase 1 SHALL reject causal re-admission after revocation, so a member cannot have gaps. The system SHALL support historical queries: `was_member(identity, at_timestamp)`. Historical timestamps are signed author-declared event time and SHALL NOT authorize new writes.
+The system SHALL model membership as intervals: `[admitted, revoked?)`. A Workspace Person's interval SHALL begin at the admission of its key group and end at that group's revocation; a Workspace Agent's interval SHALL begin when its key is added and end when its key is removed or its Steward is revoked, whichever is first. The system SHALL reject causal re-admission of a Person or re-addition of a removed Agent Identity, in any Person's group, so no key has gaps. The system SHALL support historical queries for any key: `was_member(identity, at_timestamp)`. Historical timestamps are signed author-declared event time and SHALL NOT authorize new writes.
 
 ## TEAM.SYS.MEM-R05 — Epoch Advancement
 
@@ -32,13 +32,13 @@ The system SHALL project the canonical membership log into a current member snap
 
 ## TEAM.SYS.MEM-R08 — Manager-Only Membership
 
-The initial implementation SHALL use manager-only membership: only members with appropriate capability may admit or revoke members. Free delegation (any member may delegate onward) is deferred. The membership log schema SHALL support future capability models without migration.
+The initial implementation SHALL use manager-only membership for Workspace Persons: only a Manager may admit or revoke a Person's key group, and the Workspace creator SHALL remain the only key holding manage authority on the Workspace group. A Workspace Person SHALL add and remove its own Agent Identities inside its key group with its own authority, without a Manager operation, and a Manager SHALL be able to remove any Agent. Free delegation (any member may delegate onward) is deferred. The membership log schema SHALL support future capability models without migration.
 
 ## TEAM.SYS.MEM-R09 — Local Workspace Join
 
-A joining installation SHALL NOT report membership until it has validated and durably stored the workspace identity, genesis, canonical membership history required for validation, and its own accepted admission operation. The admitting installation SHALL validate the invitation claim, spend the invitation once, and commit the admission before reporting success. Both installations SHALL derive the same current membership from the accepted operation set. Join retries after interruption SHALL be safe and SHALL NOT create duplicate admission operations. A retry by the installation already admitted through that invitation MAY recover the accepted result, but another installation SHALL NOT reuse the invitation.
+A joining Installation SHALL sign the `create person` operation for its own key group and SHALL carry it in the invitation claim. It SHALL NOT report membership until it has validated and durably stored the workspace identity, genesis, canonical membership history required for validation, its own `create person` operation, and the accepted admission of its key group. The admitting Installation SHALL validate the invitation claim, spend the invitation once, and commit the `create person` operation and the admission in one transaction before reporting success. The Workspace creator SHALL commit its own key group create and attachment beside genesis. Both installations SHALL derive the same current membership from the accepted operation set. Join retries after interruption SHALL be safe and SHALL NOT create duplicate admission operations. A retry by the installation already admitted through that invitation MAY recover the accepted result, but another installation SHALL NOT reuse the invitation.
 
-Workspace Person Names are presentation-only and SHALL NOT modify accepted membership operations, `MembershipVersion`, or membership epoch. A current roster's Person/name lookup is separate from membership authorization; a revoked member is absent from current presentation. See `TEAM.SYS.ID-R09` and ADR 0022.
+Principal Names are presentation-only and SHALL NOT modify accepted membership operations, `MembershipVersion`, or membership epoch. A current roster's Principal lookup is separate from membership authorization; a revoked Person and its Agents are absent from current presentation. See `TEAM.SYS.ID-R09` and ADR 0023.
 
 ## TEAM.SYS.MEM-R10 — Membership Replication
 

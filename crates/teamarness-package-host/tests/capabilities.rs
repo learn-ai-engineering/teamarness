@@ -923,7 +923,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
     for name in [
         "workspace-context.schema.json",
         "membership.schema.json",
-        "person-names.schema.json",
+        "principals.schema.json",
         "signing.schema.json",
         "immutable-record-log.schema.json",
         "signing-envelope.golden.json",

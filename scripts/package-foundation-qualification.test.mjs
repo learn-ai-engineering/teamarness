@@ -424,7 +424,7 @@ test("delivery configuration has one local admitted loader and no deferred Packa
   const capabilityEntries = await readdir(new URL("contracts/package-capabilities/v1/", root));
   assert.deepEqual(
     capabilityEntries.sort(),
-    ["README.md", "immutable-record-invalid.golden.json", "immutable-record-log.schema.json", "immutable-record-log.test.mjs", "immutable-record.golden.json", "membership.schema.json", "person-names.schema.json", "signing-envelope.golden.json", "signing.schema.json", "workspace-context.schema.json"],
+    ["README.md", "immutable-record-invalid.golden.json", "immutable-record-log.schema.json", "immutable-record-log.test.mjs", "immutable-record.golden.json", "membership.schema.json", "principals.schema.json", "principals.test.mjs", "signing-envelope.golden.json", "signing.schema.json", "workspace-context.schema.json"],
   );
 
   const productionPaths = [
