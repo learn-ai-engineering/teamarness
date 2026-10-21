@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::body::{BodyError, COALESCE_WINDOW, DocumentBody, TextOp};
 use crate::domain::{DomainError, DomainRecord};
-use crate::store::{DocumentStore, IngestResult, Ingested};
+use crate::store::{DocumentStore, IngestResult};
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -68,6 +69,8 @@ struct BodyHub {
     events: broadcast::Sender<JsonValue>,
     /// Wakes the flusher when a local edit is pending.
     flush: Arc<Notify>,
+    /// Serializes append attempts with requests without holding the body mutex across I/O.
+    append_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// This Installation's Loro peer id, stable across restarts and distinct across Installations.
     peer: u64,
 }
@@ -86,6 +89,15 @@ impl BodyHub {
             .entry(document.to_owned())
             .or_insert_with(|| DocumentBody::new(self.peer));
         with(body)
+    }
+
+    fn append_lock(&self, document: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.append_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(document.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Imports body updates a store ingest made applicable and publishes their deltas.
@@ -275,6 +287,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 bodies: Arc::new(Mutex::new(HashMap::new())),
                 events,
                 flush: Arc::new(Notify::new()),
+                append_locks: Arc::new(Mutex::new(HashMap::new())),
                 peer: peer_id(&installation),
             };
             rehydrate(&store, &log, &hub, &cancellation).await?;
@@ -460,9 +473,14 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 .map_err(|_| invalid_request())?;
             let hub = context.state().hub.clone();
             let document = request.document_id.clone();
-            let (revision, delta, editable) = hub.with_body(&document, |body| {
+            let append_lock = hub.append_lock(&document);
+            let _append_guard = append_lock.lock().await;
+            let (revision, delta, editable, is_retry) = hub.with_body(&document, |body| {
                 if !body.editable() {
                     return Err(error("documents.document_pending", true));
+                }
+                if let Some(revision) = body.retried_revision(base, &request.ops) {
+                    return Ok((revision, Vec::new(), body.editable(), true));
                 }
                 if body.revision() != base {
                     return Err(BackendError::new(
@@ -472,17 +490,38 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     ));
                 }
                 match body.apply(&request.ops) {
-                    Ok(delta) => Ok((body.revision(), delta, body.editable())),
+                    Ok(delta) => {
+                        body.remember_request(base, &request.ops);
+                        Ok((body.revision(), delta, body.editable(), false))
+                    }
                     Err(BodyError::TooLarge) => Err(error("documents.document_too_large", false)),
                     Err(BodyError::OutOfRange) => Err(invalid_request()),
                     Err(BodyError::Loro) => Err(error("documents.edit_failed", true)),
                 }
             })?;
-            let _ = hub.events.send(json!({
-                "documentId": document, "revision": revision.to_string(),
-                "origin": "local", "delta": delta, "editable": editable,
-            }));
-            hub.flush.notify_one();
+            if !is_retry {
+                hub.flush.notify_one();
+                let _ = hub.events.send(json!({
+                    "documentId": document, "revision": revision.to_string(),
+                    "origin": "local", "delta": delta, "editable": editable,
+                }));
+            }
+            // Keep the draft visible during the coalescing window, but never acknowledge it
+            // until every export in this request has reached the Core record log.
+            if !is_retry {
+                tokio::time::sleep(COALESCE_WINDOW).await;
+            }
+            drain_document(&hub, &document, true, |update| {
+                append_edit(
+                    &context.state().log,
+                    &hub,
+                    &context.state().changes,
+                    &context.state().installation,
+                    &document,
+                    update,
+                )
+            })
+            .await?;
             Ok(json!({ "ok": true, "revision": revision.to_string() }))
         },
     )
@@ -1071,20 +1110,18 @@ fn start_flusher(
                 continue;
             }
             for document in pending {
-                let flushed = hub.with_body(&document, |body| body.flush(Instant::now(), false));
-                let Some(flushed) = flushed else {
-                    continue;
-                };
-                for update in flushed.updates {
-                    if let Err(cause) =
-                        append_edit(&log, &hub, &changes, &author, &document, update).await
-                    {
-                        eprintln!(
-                            "documents edit append failure: document={document} code={} retryable={}",
-                            cause.code(),
-                            cause.retryable()
-                        );
-                    }
+                let append_lock = hub.append_lock(&document);
+                let _guard = append_lock.lock().await;
+                if let Err(cause) = drain_document(&hub, &document, false, |update| {
+                    append_edit(&log, &hub, &changes, &author, &document, update)
+                })
+                .await
+                {
+                    eprintln!(
+                        "documents edit append failure: document={document} code={} retryable={}",
+                        cause.code(),
+                        cause.retryable()
+                    );
                 }
             }
             tokio::select! {
@@ -1094,6 +1131,30 @@ fn start_flusher(
         }
     });
     Session { cancellation, task }
+}
+
+/// The caller serializes append attempts; failed exports remain at the front of the queue.
+async fn drain_document<F, Fut>(
+    hub: &BodyHub,
+    document: &str,
+    force: bool,
+    mut append: F,
+) -> Result<(), BackendError>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<(), BackendError>>,
+{
+    loop {
+        let next = hub.with_body(document, |body| {
+            body.flush(Instant::now(), force)
+                .and_then(|flushed| flushed.updates.into_iter().next())
+        });
+        let Some(update) = next else {
+            return Ok(());
+        };
+        append(update).await?;
+        hub.with_body(document, DocumentBody::append_succeeded);
+    }
 }
 
 async fn append_edit(
@@ -1113,7 +1174,7 @@ async fn append_edit(
         .map_err(|cause| capability_error(purpose, cause))?;
     let store = hub.store.clone();
     let changes = changes.clone();
-    let ingested: Ingested = tokio::task::spawn_blocking(move || {
+    let ingested = tokio::task::spawn_blocking(move || {
         store
             .ingest_with_commit(
                 appended.record_id.as_str(),
@@ -1128,15 +1189,24 @@ async fn append_edit(
             )
             .map_err(|_| storage_failed())
     })
-    .await
-    .map_err(|_| error("documents.storage_failed", true))??;
-    // The local body already holds this update; only edits a deferred create unblocked matter.
-    let others: Vec<(String, Vec<u8>)> = ingested
-        .edits
-        .into_iter()
-        .filter(|(target, _)| target != document)
-        .collect();
-    hub.apply_edits(&others);
+    .await;
+    // Core has durably accepted the exact update. A projection error must not append it twice;
+    // activation replay rebuilds the projection from the sealed Core record.
+    match ingested {
+        Ok(Ok(ingested)) => {
+            let others: Vec<(String, Vec<u8>)> = ingested
+                .edits
+                .into_iter()
+                .filter(|(target, _)| target != document)
+                .collect();
+            hub.apply_edits(&others);
+        }
+        Ok(Err(cause)) => eprintln!(
+            "documents edit projection failure after append: {}",
+            cause.code()
+        ),
+        Err(cause) => eprintln!("documents edit projection task failed after append: {cause}"),
+    }
     Ok(())
 }
 
@@ -1149,6 +1219,34 @@ async fn stop_flusher(state: &DocumentsActive) {
     if let Some(flusher) = flusher {
         flusher.cancellation.cancel();
         let _ = flusher.task.await;
+    }
+    let documents: Vec<String> = state
+        .hub
+        .lock()
+        .iter()
+        .filter(|(_, body)| body.has_pending())
+        .map(|(id, _)| id.clone())
+        .collect();
+    for document in documents {
+        let append_lock = state.hub.append_lock(&document);
+        let _guard = append_lock.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_document(&state.hub, &document, true, |update| {
+                append_edit(
+                    &state.log,
+                    &state.hub,
+                    &state.changes,
+                    &state.installation,
+                    &document,
+                    update,
+                )
+            }),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            eprintln!("documents pending edit not drained on shutdown: document={document}");
+        }
     }
 }
 
@@ -1494,6 +1592,278 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn edit_failure_is_retryable_and_retries_without_duplicate_operations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(true));
+        let failure = fail.clone();
+        let appended = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let scripted = ScriptedCapability::new().calls(move |method, payload| {
+            if method == "append" && payload["purpose"] == "document.edit"
+                && failure.load(Ordering::SeqCst) {
+                return Err(error("unavailable", true));
+            }
+            match method {
+                "open" => Ok(json!({ "results": (0..payload["sealedRecords"].as_array().map_or(0, Vec::len))
+                    .map(|_| json!({ "status": "waiting_for_history_access" })).collect::<Vec<_>>() })),
+                "append" => {
+                    let seed = appended.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({ "recordId": hex(64, seed), "orderKey": hex(82, seed),
+                        "author": ALICE, "signature": "c2ln", "sealedRecord": "c2VhbGVk",
+                        "durability": "committed" }))
+                }
+                _ => Err(error("unavailable", false)),
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({"name":"Plans"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId": collection, "title":"Q4"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let request =
+            json!({"documentId": document, "baseRevision":"0", "ops":[{"insert":"draft"}]});
+        let result = session
+            .harness
+            .request("documents.document.edit", request.clone())
+            .await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            "documents.capability_unavailable"
+        );
+        assert!(session.handles.bodies.lock().unwrap()[&document].has_pending());
+        fail.store(false, Ordering::SeqCst);
+        let handles = session.handles.clone();
+        let waiting_document = document.clone();
+        wait_until(
+            || !handles.bodies.lock().unwrap()[&waiting_document].has_pending(),
+            "background append retry",
+        )
+        .await;
+        let response = session
+            .harness
+            .request("documents.document.edit", request)
+            .await
+            .unwrap();
+        assert_eq!(response["revision"], "1");
+        assert!(!session.handles.bodies.lock().unwrap()[&document].has_pending());
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            "draft"
+        );
+        fail.store(true, Ordering::SeqCst);
+        let second = json!({"documentId": document, "baseRevision":"1", "ops":[{"retain":5},{"insert":"!"}]});
+        assert!(
+            session
+                .harness
+                .request("documents.document.edit", second)
+                .await
+                .is_err()
+        );
+        assert!(session.handles.bodies.lock().unwrap()[&document].has_pending());
+        fail.store(false, Ordering::SeqCst);
+        session.harness.dispose().await.unwrap();
+        assert!(
+            !session.handles.bodies.lock().unwrap()[&document].has_pending(),
+            "graceful dispose drains outstanding edits"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledged_edit_replays_from_core_records_after_restart() {
+        let records = Arc::new(Mutex::new(HashMap::<String, (u64, String, String)>::new()));
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let saved = records.clone();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "append" => {
+                let seed = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let sealed = URL_SAFE_NO_PAD.encode(seed.to_string());
+                saved.lock().unwrap().insert(
+                    sealed.clone(),
+                    (
+                        seed,
+                        payload["purpose"].as_str().unwrap().to_owned(),
+                        payload["canonical"].as_str().unwrap().to_owned(),
+                    ),
+                );
+                Ok(
+                    json!({ "recordId": hex(64, seed), "orderKey": hex(82, seed),
+                    "author": ALICE, "signature": "c2ln", "sealedRecord": sealed,
+                    "durability": "committed" }),
+                )
+            }
+            "open" => Ok(
+                json!({ "results": payload["sealedRecords"].as_array().unwrap()
+                .iter().map(|sealed| {
+                    let (seed, purpose, canonical) = saved.lock().unwrap()
+                        [sealed.as_str().unwrap()].clone();
+                    json!({ "status": "ready", "recordId": hex(64, seed),
+                        "orderKey": hex(82, seed), "author": ALICE, "signature": "c2ln",
+                        "purpose": purpose, "canonical": canonical })
+                }).collect::<Vec<_>>() }),
+            ),
+            _ => Err(error("unavailable", false)),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut first = start(directory.path(), scripted.clone()).await;
+        let collection = first
+            .harness
+            .request("documents.collection.create", json!({"name":"Plans"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = first
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId": collection, "title":"Q4"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = first
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({"documentId": document, "baseRevision":"0", "ops":[{"insert":"durable"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["revision"], "1");
+        assert_eq!(
+            records.lock().unwrap().len(),
+            3,
+            "the edit was appended before ACK"
+        );
+        first.harness.shutdown().await.unwrap();
+        let restarted = start(directory.path(), scripted).await;
+        assert_eq!(
+            restarted.handles.bodies.lock().unwrap()[&document].text(),
+            "durable"
+        );
+        assert!(!restarted.handles.bodies.lock().unwrap()[&document].has_pending());
+        restarted.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_append_failure_retries_only_unacknowledged_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let hub = BodyHub {
+            store,
+            bodies: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            flush: Arc::new(Notify::new()),
+            append_locks: Arc::new(Mutex::new(HashMap::new())),
+            peer: 1,
+        };
+        let text = "x".repeat(150 * 1024);
+        hub.with_body("doc", |body| {
+            body.apply(&[TextOp::Insert {
+                insert: text.clone(),
+            }])
+            .unwrap();
+        });
+        let exports = hub.with_body("doc", |body| {
+            body.flush(Instant::now(), true).unwrap().updates
+        });
+        assert!(exports.len() >= 2);
+        let mut appended = Vec::new();
+        let failure = drain_document(&hub, "doc", true, |update| {
+            if appended.is_empty() {
+                appended.push(update);
+                std::future::ready(Ok(()))
+            } else {
+                std::future::ready(Err(error("documents.capability_unavailable", true)))
+            }
+        })
+        .await;
+        assert!(
+            failure.is_err(),
+            "the request cannot acknowledge a partial append"
+        );
+        assert!(hub.with_body("doc", |body| body.has_pending()));
+        drain_document(&hub, "doc", true, |update| {
+            appended.push(update);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            appended, exports,
+            "a retry must not duplicate an accepted export"
+        );
+        assert!(!hub.with_body("doc", |body| body.has_pending()));
+        let mut restarted = DocumentBody::new(2);
+        for update in &appended {
+            restarted.import(update).unwrap();
+        }
+        assert_eq!(restarted.text(), text);
+    }
+
+    #[tokio::test]
+    async fn failed_append_keeps_export_for_retry_and_shutdown_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let hub = BodyHub {
+            store,
+            bodies: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            flush: Arc::new(Notify::new()),
+            append_locks: Arc::new(Mutex::new(HashMap::new())),
+            peer: 1,
+        };
+        hub.with_body("doc", |body| {
+            body.apply(&[TextOp::Insert {
+                insert: "saved".into(),
+            }])
+            .unwrap();
+        });
+        let first = hub.with_body("doc", |body| {
+            body.flush(Instant::now(), true).unwrap().updates[0].clone()
+        });
+        let failure = drain_document(&hub, "doc", true, |_update| async {
+            Err(error("documents.capability_unavailable", true))
+        })
+        .await;
+        assert!(failure.is_err());
+        assert!(hub.with_body("doc", |body| body.has_pending()));
+        let mut persisted = Vec::new();
+        drain_document(&hub, "doc", true, |update| {
+            persisted.push(update);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(persisted, vec![first]);
+        assert!(!hub.with_body("doc", |body| body.has_pending()));
+        let mut restarted = DocumentBody::new(1);
+        restarted.import(&persisted[0]).unwrap();
+        assert_eq!(restarted.text(), "saved");
+    }
+
     // Verifies: AC2, AC3 — local edits are echoed, coalesced into one appended record, and a
     // remote edit record is imported and pushed to the open text subscription.
     #[tokio::test]
@@ -1566,7 +1936,7 @@ mod tests {
             .unwrap();
         let _ = text.next_event().await.unwrap().unwrap();
 
-        // Both edits coalesce into one appended `document.edit` record after the window.
+        // Each sequentially acknowledged request has its own durable append.
         let edit_appends = |scripted: &ScriptedCapability| {
             scripted
                 .recorded_calls()
@@ -1577,12 +1947,12 @@ mod tests {
                 .count()
         };
         let scripted = session.scripted.clone();
-        wait_until(|| edit_appends(&scripted) == 1, "one coalesced edit append").await;
+        wait_until(|| edit_appends(&scripted) == 2, "two durable edit appends").await;
         tokio::time::sleep(COALESCE_WINDOW * 2).await;
         assert_eq!(
             edit_appends(&session.scripted),
-            1,
-            "no second record for an appended edit"
+            2,
+            "no repeated record for an appended edit"
         );
         {
             let bodies = session.handles.bodies.lock().unwrap();

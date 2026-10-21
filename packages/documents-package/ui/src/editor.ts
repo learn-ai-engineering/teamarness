@@ -90,6 +90,8 @@ export type EditorState = Readonly<{
 export class DocumentEditor {
   private state: EditorState;
   private draft: string;
+  private retry: { base: string; ops: TextOp[]; text: string } | null = null;
+  private inFlightText: string | null = null;
   private readonly send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>;
   private readonly announce: () => void;
 
@@ -128,11 +130,21 @@ export class DocumentEditor {
   /** A Backend event for this Document: a full text or a delta, local echo or remote. */
   receive(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
     if (event.documentId !== this.state.documentId) return caret;
+    if (Number(event.revision) < Number(this.state.revision)) return caret;
     if (event.text !== undefined) {
+      const base = this.state.text;
+      const previousDraft = this.draft;
+      // A lagged full recovery can already contain the in-flight edit even when its echo
+      // was missed. In that case only the typing *after* that edit needs rebasing.
+      const pendingBase = this.inFlightText !== null && event.text.includes(this.inFlightText)
+        ? this.inFlightText : base;
+      const applied = diffOps(pendingBase, event.text);
       this.state = { ...this.state, text: event.text, revision: event.revision, editable: event.editable };
-      this.draft = event.text;
+      this.draft = previousDraft === pendingBase || previousDraft === event.text
+        ? event.text : applyOps(event.text, rebase(diffOps(pendingBase, previousDraft), applied));
       this.announce();
-      return caret === null ? null : { start: Math.min(caret.start, event.text.length), end: Math.min(caret.end, event.text.length) };
+      void this.flush();
+      return caret === null ? null : { start: Math.min(caret.start, this.draft.length), end: Math.min(caret.end, this.draft.length) };
     }
     const delta = event.delta ?? [];
     const base = this.state.text;
@@ -162,15 +174,20 @@ export class DocumentEditor {
 
   private async flush(): Promise<void> {
     if (this.state.sending || !this.state.editable) return;
-    const ops = diffOps(this.state.text, this.draft);
+    const ops = this.retry?.ops ?? diffOps(this.state.text, this.draft);
     if (ops.length === 0) return;
-    const base = this.state.revision;
-    const sent = this.draft;
+    const base = this.retry?.base ?? this.state.revision;
+    const sent = this.retry?.text ?? this.draft;
     this.state = { ...this.state, sending: true, error: null };
+    this.inFlightText = sent;
     this.announce();
     try {
       const { revision } = await this.send(this.state.documentId, base, ops);
-      this.state = { ...this.state, text: sent, revision, sending: false };
+      this.retry = null;
+      this.inFlightText = null;
+      this.state = Number(this.state.revision) > Number(revision)
+        ? { ...this.state, sending: false }
+        : { ...this.state, text: sent, revision, sending: false };
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code;
       if (code === "documents.stale_revision") {
@@ -178,8 +195,8 @@ export class DocumentEditor {
         this.state = { ...this.state, sending: false };
         return;
       }
+      this.retry = { base, ops, text: sent };
       this.state = { ...this.state, sending: false, error: describe(code) };
-      this.draft = this.state.text;
       this.announce();
       return;
     }

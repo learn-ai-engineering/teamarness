@@ -382,7 +382,7 @@ export class DocumentsView {
     }
     const { editable, sending, error } = editor.current;
     this.textarea.disabled = !editable;
-    this.editorStatus.textContent = error ?? (!editable ? "Waiting for history" : sending ? "Saving…" : "Saved");
+    this.editorStatus.textContent = error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
     this.syncTextarea(null);
     const preview = this.controller.state.preview;
     this.previewButton.setAttribute("aria-pressed", String(preview));

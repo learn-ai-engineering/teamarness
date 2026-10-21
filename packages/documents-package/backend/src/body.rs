@@ -4,6 +4,7 @@
 //! Nothing here is persisted. A body is rebuilt at activation by importing every opened
 //! `document.edit` record; the Package SQLite never holds plaintext.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -55,14 +56,18 @@ pub(crate) struct DocumentBody {
     revision: u64,
     /// The version already appended as records; exports start here.
     appended: VersionVector,
-    /// When the oldest unappended local edit was made, if any.
+    /// Version exported into the ordered queue; only successful appends advance `appended`.
+    staged_version: VersionVector,
+    /// When the oldest unexported local edit was made, if any.
     pending_since: Option<Instant>,
-    /// Exports taken because the pending size reached the budget, awaiting append.
-    staged: Vec<Vec<u8>>,
+    /// Exports awaiting append, paired with the version each export reaches.
+    staged: VecDeque<(Vec<u8>, VersionVector)>,
     /// Edit records known locally whose sealed bytes have not been opened yet.
     unopened: usize,
     /// A conservative estimate of the pending export size, so a keystroke never exports.
     pending_estimate: usize,
+    /// Last request identity allows retry after a failed append without reapplying its ops.
+    last_request: Option<(u64, Vec<TextOp>, u64)>,
 }
 
 impl DocumentBody {
@@ -75,10 +80,12 @@ impl DocumentBody {
             text: String::new(),
             revision: 0,
             appended: VersionVector::default(),
+            staged_version: VersionVector::default(),
             pending_since: None,
-            staged: Vec::new(),
+            staged: VecDeque::new(),
             unopened: 0,
             pending_estimate: 0,
+            last_request: None,
         }
     }
 
@@ -101,6 +108,18 @@ impl DocumentBody {
     }
     pub(crate) fn has_pending(&self) -> bool {
         self.pending_since.is_some() || !self.staged.is_empty()
+    }
+
+    pub(crate) fn retried_revision(&self, base: u64, ops: &[TextOp]) -> Option<u64> {
+        self.last_request
+            .as_ref()
+            .and_then(|(previous, previous_ops, revision)| {
+                (*previous == base && previous_ops == ops).then_some(*revision)
+            })
+    }
+
+    pub(crate) fn remember_request(&mut self, base: u64, ops: &[TextOp]) {
+        self.last_request = Some((base, ops.to_vec(), self.revision));
     }
 
     /// Applies UI operations as local edits and returns the delta the UI should see echoed.
@@ -169,12 +188,17 @@ impl DocumentBody {
     /// Imports one update from a record and returns the delta the UI should apply, or `None`
     /// when the text did not change (already known, or its dependencies are still pending).
     pub(crate) fn import(&mut self, update: &[u8]) -> Result<Option<Vec<TextOp>>, BodyError> {
-        let before = std::mem::take(&mut self.text);
+        let before = self.text.clone();
         self.doc.import(update).map_err(|_| BodyError::Loro)?;
         let after = self.doc.get_text(CONTAINER).to_string();
         // A remote update never advances what this peer has appended, but the remote ops are
         // now part of the version the next export is taken from; exclude them explicitly.
         self.appended = merge_remote(&self.appended, &self.doc.oplog_vv(), self.doc.peer_id());
+        self.staged_version = merge_remote(
+            &self.staged_version,
+            &self.doc.oplog_vv(),
+            self.doc.peer_id(),
+        );
         let delta = diff(&before, &after);
         self.text = after;
         if delta.is_empty() {
@@ -197,8 +221,15 @@ impl DocumentBody {
             return None;
         }
         Some(Flushed {
-            updates: std::mem::take(&mut self.staged),
+            updates: self.staged.iter().map(|(bytes, _)| bytes.clone()).collect(),
         })
+    }
+
+    /// Confirm the oldest export only after Core accepted its append.
+    pub(crate) fn append_succeeded(&mut self) {
+        if let Some((_, version)) = self.staged.pop_front() {
+            self.appended = merge_remote(&version, &self.doc.oplog_vv(), self.doc.peer_id());
+        }
     }
 
     fn stage_if_large(&mut self) {
@@ -210,7 +241,7 @@ impl DocumentBody {
     fn stage_pending(&mut self) {
         let update = self
             .doc
-            .export(ExportMode::updates(&self.appended))
+            .export(ExportMode::updates(&self.staged_version))
             .unwrap_or_default();
         self.pending_since = None;
         self.pending_estimate = 0;
@@ -221,8 +252,8 @@ impl DocumentBody {
             update.len() <= MAX_UPDATE,
             "an export stayed within one record"
         );
-        self.appended = self.doc.oplog_vv();
-        self.staged.push(update);
+        self.staged_version = self.doc.oplog_vv();
+        self.staged.push_back((update, self.staged_version.clone()));
     }
 }
 
@@ -299,9 +330,14 @@ mod tests {
     }
 
     fn take_all(body: &mut DocumentBody) -> Vec<Vec<u8>> {
-        body.flush(Instant::now(), true)
+        let updates = body
+            .flush(Instant::now(), true)
             .map(|f| f.updates)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for _ in &updates {
+            body.append_succeeded();
+        }
+        updates
     }
 
     // Verifies: AC3 — two peers converge whatever order their records arrive in.
@@ -407,6 +443,7 @@ mod tests {
         let first = body
             .flush(now + COALESCE_WINDOW, false)
             .expect("due after the window");
+        body.append_succeeded();
         assert!(body.flush(now + COALESCE_WINDOW * 2, false).is_none());
         // A large paste is split and each piece stays under the record bound.
         let paste = "x".repeat(150 * 1024);
@@ -424,6 +461,31 @@ mod tests {
             reader.import(u).unwrap();
         }
         assert_eq!(reader.text().len(), 1 + paste.len());
+    }
+
+    #[test]
+    fn failed_append_retries_the_same_bytes_and_durable_replay_survives_restart() {
+        let mut writer = DocumentBody::new(1);
+        apply_text(&mut writer, 0, "durable");
+        let first = writer.flush(Instant::now(), true).unwrap().updates;
+        let retry = writer.flush(Instant::now(), true).unwrap().updates;
+        assert_eq!(
+            first, retry,
+            "an append failure must not consume the export"
+        );
+        writer.append_succeeded();
+        assert!(!writer.has_pending());
+        let mut restarted = DocumentBody::new(1);
+        restarted.import(&first[0]).unwrap();
+        assert_eq!(restarted.text(), "durable");
+    }
+
+    #[test]
+    fn malformed_import_preserves_nonempty_cached_text() {
+        let mut body = DocumentBody::new(1);
+        apply_text(&mut body, 0, "keep me");
+        assert_eq!(body.import(b"not loro"), Err(BodyError::Loro));
+        assert_eq!(body.text(), "keep me");
     }
 
     #[test]
