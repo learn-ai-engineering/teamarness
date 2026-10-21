@@ -1,7 +1,9 @@
 {
   "schemaVersion": 1,
   "$defs": {
-    "recordId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "recordId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^\\S(.*\\S)?$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S(.*\\S)?$" },
     "availability": { "type": "string", "enum": ["waiting_for_history_access", "offline", "catching_up", "current"] },
     "collection": {
       "type": "object",
@@ -34,13 +36,54 @@
         "availability": { "$ref": "#/$defs/availability" },
         "warnings": { "type": "array", "items": { "type": "string" } }
       }
+    },
+    "appended": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "id"],
+      "properties": {
+        "ok": { "const": true },
+        "id": { "$ref": "#/$defs/recordId" }
+      }
+    },
+    "collectionRequest": {
+      "type": "object", "additionalProperties": false, "required": ["collectionId"],
+      "properties": { "collectionId": { "$ref": "#/$defs/recordId" } }
+    },
+    "documentRequest": {
+      "type": "object", "additionalProperties": false, "required": ["documentId"],
+      "properties": { "documentId": { "$ref": "#/$defs/recordId" } }
     }
   },
   "requests": {
     "documents.snapshot": {
       "request": { "type": "object", "additionalProperties": false },
       "response": { "$ref": "#/$defs/snapshot" }
-    }
+    },
+    "documents.collection.create": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["name"], "properties": { "name": { "$ref": "#/$defs/name" } } },
+      "response": { "$ref": "#/$defs/appended" }
+    },
+    "documents.collection.rename": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["collectionId", "name"], "properties": { "collectionId": { "$ref": "#/$defs/recordId" }, "name": { "$ref": "#/$defs/name" } } },
+      "response": { "$ref": "#/$defs/appended" }
+    },
+    "documents.collection.archive": { "request": { "$ref": "#/$defs/collectionRequest" }, "response": { "$ref": "#/$defs/appended" } },
+    "documents.collection.restore": { "request": { "$ref": "#/$defs/collectionRequest" }, "response": { "$ref": "#/$defs/appended" } },
+    "documents.document.create": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["collectionId", "title"], "properties": { "collectionId": { "$ref": "#/$defs/recordId" }, "title": { "$ref": "#/$defs/title" } } },
+      "response": { "$ref": "#/$defs/appended" }
+    },
+    "documents.document.rename": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "title"], "properties": { "documentId": { "$ref": "#/$defs/recordId" }, "title": { "$ref": "#/$defs/title" } } },
+      "response": { "$ref": "#/$defs/appended" }
+    },
+    "documents.document.move": {
+      "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "collectionId"], "properties": { "documentId": { "$ref": "#/$defs/recordId" }, "collectionId": { "$ref": "#/$defs/recordId" } } },
+      "response": { "$ref": "#/$defs/appended" }
+    },
+    "documents.document.archive": { "request": { "$ref": "#/$defs/documentRequest" }, "response": { "$ref": "#/$defs/appended" } },
+    "documents.document.restore": { "request": { "$ref": "#/$defs/documentRequest" }, "response": { "$ref": "#/$defs/appended" } }
   },
   "subscriptions": {
     "documents.changes": {

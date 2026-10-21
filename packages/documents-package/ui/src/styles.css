@@ -1,9 +1,33 @@
 /* The Frame host has min-height, not a definite height; size this Package to its viewport. */
 :host { display: block; height: 100vh; height: 100dvh; color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
 * { box-sizing: border-box; }
-button, input, textarea { font: inherit; }
+button, input, select, textarea { font: inherit; }
 .documents-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
+.documents-page.teamarness-page > * + * { margin-top: 0; }
 .documents-page .teamarness-page-header { display: flex; flex: none; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .35rem 1rem; border-bottom: 1px solid var(--teamarness-color-border); padding: .85rem 1.4rem; }
 .documents-page .teamarness-page-title { margin: 0; font-size: 1.4rem; }
 .availability { margin: 0; color: var(--teamarness-color-text-muted); font-size: .8rem; }
-.documents-empty { margin: 0; padding: 1.25rem 1.4rem; color: var(--teamarness-color-text-muted); }
+.archived-toggle { display: inline-flex; align-items: center; gap: .3rem; color: var(--teamarness-color-text-muted); font-size: .85rem; }
+.documents-warnings:empty, .documents-page [hidden] { display: none; }
+.documents-warnings .teamarness-notice, .documents-page .teamarness-notice--danger { margin: .6rem 1.4rem 0; }
+.documents-shell { display: grid; grid-template-columns: clamp(12rem, 22%, 17rem) minmax(0, 1fr); flex: 1; min-height: 0; min-width: 0; }
+.collection-rail { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--teamarness-color-border); background: color-mix(in srgb, var(--teamarness-color-panel) 80%, var(--teamarness-color-background)); }
+.collection-rail h2 { margin: 0; padding: .85rem .8rem .45rem 1.2rem; color: var(--teamarness-color-text-muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }
+.collection-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0 .7rem .8rem; }
+.collection-button { display: block; width: 100%; padding: .65rem .6rem; background: transparent; border: 0; border-radius: var(--teamarness-radius-control, 6px); color: var(--teamarness-color-text); cursor: pointer; font-size: 1rem; text-align: left; }
+.collection-button:hover { background: var(--teamarness-color-background); }
+.collection-button[aria-current="page"] { background: color-mix(in srgb, var(--teamarness-color-accent) 14%, var(--teamarness-color-panel)); box-shadow: inset 3px 0 var(--teamarness-color-accent); font-weight: 750; }
+.collection-button.is-archived, .document-row.is-archived .document-title { color: var(--teamarness-color-text-muted); text-decoration: line-through; }
+.collection-create, .document-create, .collection-rename, .document-rename { display: flex; flex-direction: row; gap: .5rem; align-items: center; }
+.collection-create { flex: none; padding: .7rem .8rem; border-top: 1px solid var(--teamarness-color-border); }
+.collection-create .teamarness-input, .document-create .teamarness-input, .collection-rename .teamarness-input, .document-rename .teamarness-input { flex: 1; min-width: 0; }
+.documents-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.documents-panel-header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; border-bottom: 1px solid var(--teamarness-color-border); padding: .6rem 1.4rem; }
+.collection-name { margin: 0; font-size: 1rem; }
+.collection-actions, .document-actions { display: flex; gap: .4rem; align-items: center; }
+.document-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: .6rem 1.4rem; }
+.document-row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .55rem 0; border-bottom: 1px solid var(--teamarness-color-border); }
+.document-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.document-move { max-width: 12rem; }
+.document-create { flex: none; padding: .7rem 1.4rem; border-top: 1px solid var(--teamarness-color-border); }
+.documents-empty { margin: 0; padding: .6rem 0; color: var(--teamarness-color-text-muted); }
