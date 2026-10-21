@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "recordId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "availability": { "type": "string", "enum": ["waiting_for_history_access", "offline", "catching_up", "current"] },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "archived"],
+      "properties": {
+        "id": { "$ref": "#/$defs/recordId" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "archived": { "type": "boolean" }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "collectionId", "title", "archived"],
+      "properties": {
+        "id": { "$ref": "#/$defs/recordId" },
+        "collectionId": { "$ref": "#/$defs/recordId" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "archived": { "type": "boolean" }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collections", "documents", "availability"],
+      "properties": {
+        "collections": { "type": "array", "items": { "$ref": "#/$defs/collection" } },
+        "documents": { "type": "array", "items": { "$ref": "#/$defs/document" } },
+        "availability": { "$ref": "#/$defs/availability" },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "requests": {
+    "documents.snapshot": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": { "$ref": "#/$defs/snapshot" }
+    }
+  },
+  "subscriptions": {
+    "documents.changes": {
+      "request": { "type": "object", "additionalProperties": false },
+      "event": { "$ref": "#/$defs/snapshot" }
+    }
+  }
+}

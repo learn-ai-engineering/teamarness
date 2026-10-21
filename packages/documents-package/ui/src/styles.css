@@ -1,0 +1,9 @@
+/* The Frame host has min-height, not a definite height; size this Package to its viewport. */
+:host { display: block; height: 100vh; height: 100dvh; color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
+* { box-sizing: border-box; }
+button, input, textarea { font: inherit; }
+.documents-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
+.documents-page .teamarness-page-header { display: flex; flex: none; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .35rem 1rem; border-bottom: 1px solid var(--teamarness-color-border); padding: .85rem 1.4rem; }
+.documents-page .teamarness-page-title { margin: 0; font-size: 1.4rem; }
+.availability { margin: 0; color: var(--teamarness-color-text-muted); font-size: .8rem; }
+.documents-empty { margin: 0; padding: 1.25rem 1.4rem; color: var(--teamarness-color-text-muted); }

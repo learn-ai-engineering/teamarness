@@ -142,6 +142,6 @@ The runtime exclusively owns one private `core.sqlite3`. Uncertain commit outcom
 - `context/` is the canonical requirements, ontology, roadmap, and decision tree.
 - `crates/teamarness-core/` contains the Core Runtime library, API documentation, and tests.
 - `crates/teamarness-package-host/`, `crates/teamarness-package-protocol/`, and `crates/teamarness-package-sdk/` contain the Package runtime and supported Rust tooling.
-- `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, and `packages/repo-aware/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
+- `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, `packages/repo-aware/`, and `packages/documents-package/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
 - `apps/teamarness-desktop/` contains the typed Tauri adapter and Shell.
 - `p2p-local-first-user-management.md` is the supporting P2P membership research baseline.

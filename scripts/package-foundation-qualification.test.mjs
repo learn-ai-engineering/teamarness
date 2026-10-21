@@ -306,6 +306,7 @@ test("generated foundation and bundled Package policies remain independent", asy
     "dev.teamarness.tutorial",
     "dev.teamarness.conversations",
     "dev.teamarness.repo-aware",
+    "dev.teamarness.documents",
   ]);
   assert.deepEqual(index, applicationIndexDocument(bundled));
   const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
