@@ -52,27 +52,8 @@ impl PackageHost {
                     .map(|contract| (admission.manifest.identity.clone(), contract.clone()))
             })
             .collect();
-        let authoring_catalog = report
-            .admissions
-            .iter()
-            .filter_map(|admission| {
-                report
-                    .snapshot
-                    .packages
-                    .iter()
-                    .find(|entry| entry.identity == admission.manifest.identity)
-                    .map(|package| crate::AuthoringCatalogEntry {
-                        package: package.clone(),
-                        provided: admission
-                            .manifest
-                            .port_contract
-                            .as_ref()
-                            .map_or_else(Vec::new, |contract| contract.contracts.clone()),
-                        definitions: serde_json::Map::new(),
-                        consumed: admission.manifest.consumed_ports.clone(),
-                    })
-            })
-            .collect();
+        debug_assert_eq!(report.graph.len(), report.snapshot.packages.len());
+        let authoring_catalog = report.catalog.clone();
         let (templates, admitted_ui) = Self::build_process_templates(&config, &mut report)?;
         // One permit pool and one set of protocol bounds for every Package in
         // this Host.
@@ -101,6 +82,7 @@ impl PackageHost {
             templates,
             admitted_ui,
             authoring_catalog,
+            report.graph,
             port_contracts,
             report.snapshot.packages,
             report.snapshot.diagnostics,
@@ -227,6 +209,7 @@ impl PackageHost {
                     admission.manifest.protocol.major,
                     admission.manifest.protocol.max_minor,
                 ),
+                activation: admission.manifest.activation,
                 capabilities: admission
                     .manifest
                     .capabilities
@@ -277,7 +260,10 @@ impl PackageHost {
                 }
                 let (key, actor) =
                     prepare_instance(config, core, calls, store, template, workspace).await?;
-                if let Err(failure) = actor.activate().await {
+                if template.activation
+                    == teamarness_package_contract::manifest::ActivationPolicy::Eager
+                    && let Err(failure) = actor.activate().await
+                {
                     diagnostics.push(activation_error(&failure, &key));
                 }
                 instances.insert(key, actor);
@@ -295,6 +281,7 @@ impl PackageHost {
         templates: Vec<supervisor::ProcessTemplate>,
         admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
         authoring_catalog: Vec<crate::AuthoringCatalogEntry>,
+        port_graph: BTreeMap<PackageIdentity, Vec<crate::PortAvailability>>,
         port_contracts: BTreeMap<
             PackageIdentity,
             Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
@@ -324,6 +311,7 @@ impl PackageHost {
                 templates,
                 admitted_ui,
                 authoring_catalog,
+                port_graph,
                 port_contracts,
                 reconciliation: Mutex::new(()),
                 mount_management: Mutex::new(()),
@@ -360,7 +348,10 @@ impl PackageHost {
                     workspace,
                 )
                 .await?;
-                if let Err(failure) = actor.activate().await {
+                if template.activation
+                    == teamarness_package_contract::manifest::ActivationPolicy::Eager
+                    && let Err(failure) = actor.activate().await
+                {
                     self.inner
                         .data
                         .lock()

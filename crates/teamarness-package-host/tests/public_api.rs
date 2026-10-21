@@ -298,12 +298,17 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::UiEntrypointMissing,
         PackageErrorCode::UiContractViolation,
         PackageErrorCode::PortContractViolation,
+        PackageErrorCode::PortProviderConflict,
+        PackageErrorCode::PortContractMissing,
+        PackageErrorCode::PortMissing,
+        PackageErrorCode::PortVersionMismatch,
+        PackageErrorCode::PortDependencyCycle,
         PackageErrorCode::UiLoadFailed,
         PackageErrorCode::UiException,
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 42);
+    assert_eq!(codes.len(), 47);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -344,6 +349,11 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::UiEntrypointMissing
             | PackageErrorCode::UiContractViolation
             | PackageErrorCode::PortContractViolation
+            | PackageErrorCode::PortProviderConflict
+            | PackageErrorCode::PortContractMissing
+            | PackageErrorCode::PortMissing
+            | PackageErrorCode::PortVersionMismatch
+            | PackageErrorCode::PortDependencyCycle
             | PackageErrorCode::UiLoadFailed
             | PackageErrorCode::UiException
             | PackageErrorCode::StaleMount

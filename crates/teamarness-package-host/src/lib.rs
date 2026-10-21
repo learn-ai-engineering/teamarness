@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, watch};
 
+pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome, ReadUiResource,
@@ -60,6 +61,8 @@ pub struct AuthoringCatalogEntry {
     pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
     pub definitions: serde_json::Map<String, serde_json::Value>,
     pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+    pub availability: Vec<PortAvailability>,
+    pub diagnostics: Vec<PackageErrorEnvelope>,
 }
 
 use crate::subscriptions::PackageHostSubscriptionKind;
@@ -80,6 +83,7 @@ struct PackageHostInner {
     templates: Vec<supervisor::ProcessTemplate>,
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
     authoring_catalog: Vec<AuthoringCatalogEntry>,
+    port_graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
     port_contracts: BTreeMap<
         PackageIdentity,
         Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
@@ -134,10 +138,13 @@ impl PackageHost {
     }
 
     /// Returns the installed, admitted declarations without starting any Provider.
-    /// Availability and installation-wide dependency diagnostics are added by graph admission.
+    /// Includes installation-wide admission diagnostics and optional availability.
     pub fn authoring_catalog(&self) -> Vec<AuthoringCatalogEntry> {
         let mut entries = self.inner.authoring_catalog.clone();
         for entry in &mut entries {
+            if let Some(availability) = self.inner.port_graph.get(&entry.package.identity) {
+                entry.availability = availability.clone();
+            }
             if let Some(compiled) = self.inner.port_contracts.get(&entry.package.identity) {
                 entry.definitions = compiled.definitions.clone();
             }

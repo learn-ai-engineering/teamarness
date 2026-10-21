@@ -70,6 +70,12 @@ impl InstanceActor {
     }
 
     pub(crate) async fn activate(self: &Arc<Self>) -> Result<(), WireFailure> {
+        let _gate = self.lifecycle_gate.lock().await;
+        match self.state.lock().await.lifecycle {
+            LifecycleState::Active => return Ok(()),
+            LifecycleState::Admitted => {}
+            _ => return Err(WireFailure::new(PackageErrorCode::InvalidLifecycleState)),
+        }
         self.start_generation(false, true).await
     }
 
@@ -210,6 +216,7 @@ impl InstanceActor {
         };
         match lifecycle {
             LifecycleState::Active => Ok(()),
+            LifecycleState::Admitted => self.start_generation(false, true).await,
             LifecycleState::Suspended => {
                 let process =
                     process.ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;

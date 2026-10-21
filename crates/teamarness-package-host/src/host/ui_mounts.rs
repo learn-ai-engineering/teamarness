@@ -33,6 +33,10 @@ impl PackageHost {
             actor.close_mount(&mount).await;
             self.revoke_mount(&mount).await;
         }
+        actor
+            .activate()
+            .await
+            .map_err(|failure| instance_error(failure, &input.instance))?;
         let (mount, process_generation) = actor
             .open_mount()
             .await

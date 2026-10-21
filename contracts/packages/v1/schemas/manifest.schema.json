@@ -234,6 +234,7 @@
         "$ref": "#/$defs/packageIdentity"
       }
     },
+    "activation": {"enum": ["eager", "on_demand"]},
     "portContract": {
       "type": "object",
       "required": [

@@ -43,6 +43,7 @@ pub(crate) struct ProcessTemplate {
     pub(crate) trust_label: String,
     pub(crate) protocol: (u16, u16),
     pub(crate) capabilities: Vec<CapabilityRequirement>,
+    pub(crate) activation: teamarness_package_contract::manifest::ActivationPolicy,
 }
 
 /// The Host-wide call environment every Package process shares: one blocking
@@ -433,6 +434,7 @@ mod tests {
                 trust_label: "application_bundled".into(),
                 protocol: (1, 0),
                 capabilities: vec![],
+                activation: teamarness_package_contract::manifest::ActivationPolicy::Eager,
             },
             workspace_id: WorkspaceId::new("00112233445566778899aabbccddeeff").unwrap(),
             workspace_name: "Orphan test".into(),

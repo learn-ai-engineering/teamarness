@@ -16,6 +16,8 @@ use crate::{
 pub(crate) struct AdmissionReport {
     pub(crate) snapshot: PackageHostSnapshot,
     pub(crate) admissions: Vec<Admission>,
+    pub(crate) graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    pub(crate) catalog: Vec<crate::AuthoringCatalogEntry>,
 }
 
 pub(crate) struct Admission {
@@ -27,6 +29,16 @@ pub(crate) struct Admission {
 #[derive(Debug)]
 pub(crate) struct AdmissionFailure {
     pub(crate) code: PackageErrorCode,
+}
+
+/// The installed graph's per-declaration availability, before generation grants exist.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortAvailability {
+    pub contract: String,
+    pub provider: Option<PackageIdentity>,
+    pub minor: Option<u16>,
+    pub unavailable: Option<PackageErrorCode>,
 }
 
 struct Candidate {
@@ -150,13 +162,12 @@ pub(crate) fn admit(
         }
     }
 
-    let mut packages = Vec::new();
-    let mut admissions = Vec::new();
+    // Finalize local validity before considering any installation-wide Provider claim.
+    let mut eligible = BTreeMap::new();
     for candidate in selected {
         match finalize(config, store, candidate) {
             Ok((catalog, admission)) => {
-                packages.push(catalog);
-                admissions.push(admission);
+                eligible.insert(catalog.identity.clone(), (catalog, admission));
             }
             Err((code, identity)) => diagnostics.push(diagnostic(
                 code,
@@ -164,6 +175,171 @@ pub(crate) fn admit(
                 Some(identity),
             )),
         }
+    }
+    let catalog_candidates: Vec<_> = eligible
+        .values()
+        .map(|(package, admission)| {
+            (
+                package.clone(),
+                admission.manifest.port_contract.clone(),
+                admission.manifest.consumed_ports.clone(),
+            )
+        })
+        .collect();
+    let incumbent = store
+        .port_providers()
+        .map_err(|error| AdmissionFailure { code: error.code })?;
+    let mut claims: BTreeMap<String, Vec<PackageIdentity>> = BTreeMap::new();
+    for (identity, (_, admission)) in &eligible {
+        if let Some(contracts) = &admission.manifest.port_contract {
+            for contract in &contracts.contracts {
+                claims
+                    .entry(contract.identity.clone())
+                    .or_default()
+                    .push(identity.clone());
+            }
+        }
+    }
+    // BTreeMap order is stable regardless of registration order. A still-valid incumbent
+    // wins over a newly installed, lexically earlier contender.
+    let mut providers = BTreeMap::new();
+    loop {
+        providers.clear();
+        let mut losers = BTreeSet::new();
+        for (contract, all_candidates) in &claims {
+            let mut candidates: Vec<_> = all_candidates
+                .iter()
+                .filter(|candidate| eligible.contains_key(*candidate))
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.sort_by_key(|id| {
+                let source = eligible[id].0.source;
+                (matches!(source, PackageSourceKind::Local), id.clone())
+            });
+            let winner = incumbent
+                .get(contract)
+                .and_then(|id| candidates.iter().find(|candidate| candidate.as_str() == id))
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
+            losers.extend(
+                candidates
+                    .into_iter()
+                    .filter(|candidate| *candidate != winner),
+            );
+            providers.insert(contract.clone(), winner);
+        }
+        if losers.is_empty() {
+            break;
+        }
+        for candidate in losers {
+            eligible.remove(&candidate);
+            diagnostics.push(diagnostic(
+                PackageErrorCode::PortProviderConflict,
+                PackageErrorStage::Admission,
+                Some(candidate),
+            ));
+        }
+    }
+
+    let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
+    // Reject required cycles before propagating missing dependencies, so every member of
+    // a cycle receives the same stable cycle verdict.
+    let cycle_members = required_cycle_members(&eligible, &providers);
+    for identity in cycle_members {
+        remaining.remove(&identity);
+        diagnostics.push(diagnostic(
+            PackageErrorCode::PortDependencyCycle,
+            PackageErrorStage::Admission,
+            Some(identity),
+        ));
+    }
+    loop {
+        let failures: Vec<_> = remaining
+            .iter()
+            .filter_map(|identity| {
+                let admission = &eligible[identity].1;
+                admission
+                    .manifest
+                    .consumed_ports
+                    .iter()
+                    .filter(|request| request.required)
+                    .find_map(|request| {
+                        let availability = resolve(request, &providers, &eligible, &remaining);
+                        availability
+                            .unavailable
+                            .map(|code| (identity.clone(), code))
+                    })
+            })
+            .collect();
+        if failures.is_empty() {
+            break;
+        }
+        for (identity, code) in failures {
+            remaining.remove(&identity);
+            diagnostics.push(diagnostic(
+                code,
+                PackageErrorStage::Admission,
+                Some(identity),
+            ));
+        }
+    }
+    let graph = remaining
+        .iter()
+        .map(|identity| {
+            let ports = eligible[identity]
+                .1
+                .manifest
+                .consumed_ports
+                .iter()
+                .map(|request| resolve(request, &providers, &eligible, &remaining))
+                .collect();
+            (identity.clone(), ports)
+        })
+        .collect();
+    for (contract, identity) in &providers {
+        if remaining.contains(identity) {
+            store
+                .record_port_provider(contract, identity.as_str())
+                .map_err(|error| AdmissionFailure { code: error.code })?;
+        }
+    }
+    let catalog = catalog_candidates
+        .into_iter()
+        .map(|(package, document, consumed)| {
+            let availability = consumed
+                .iter()
+                .map(|request| resolve(request, &providers, &eligible, &remaining))
+                .collect();
+            let diagnostics = diagnostics
+                .iter()
+                .filter(|error| error.affected_package.as_ref() == Some(&package.identity))
+                .cloned()
+                .collect();
+            crate::AuthoringCatalogEntry {
+                package,
+                provided: document
+                    .as_ref()
+                    .map_or_else(Vec::new, |document| document.contracts.clone()),
+                definitions: document
+                    .as_ref()
+                    .map_or_else(serde_json::Map::new, |document| {
+                        document.definitions.clone()
+                    }),
+                consumed,
+                availability,
+                diagnostics,
+            }
+        })
+        .collect();
+    let mut packages = Vec::new();
+    let mut admissions = Vec::new();
+    for identity in remaining {
+        let (catalog, admission) = eligible.remove(&identity).expect("selected identity");
+        packages.push(catalog);
+        admissions.push(admission);
     }
     packages.sort_by(|left, right| left.identity.cmp(&right.identity));
     admissions.sort_by(|left, right| left.manifest.identity.cmp(&right.manifest.identity));
@@ -182,7 +358,104 @@ pub(crate) fn admit(
             diagnostics,
         },
         admissions,
+        graph,
+        catalog,
     })
+}
+
+fn resolve(
+    request: &teamarness_package_contract::manifest::ConsumedContract,
+    providers: &BTreeMap<String, PackageIdentity>,
+    eligible: &BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>,
+    remaining: &BTreeSet<PackageIdentity>,
+) -> PortAvailability {
+    let mut result = PortAvailability {
+        contract: request.identity.clone(),
+        provider: None,
+        minor: None,
+        unavailable: None,
+    };
+    let descriptor = providers
+        .get(&request.identity)
+        .filter(|identity| remaining.contains(*identity))
+        .and_then(|identity| {
+            eligible[identity]
+                .1
+                .manifest
+                .port_contract
+                .as_ref()?
+                .contracts
+                .iter()
+                .find(|contract| contract.identity == request.identity)
+                .map(|contract| (identity, contract))
+        });
+    result.unavailable = match descriptor {
+        None => Some(PackageErrorCode::PortContractMissing),
+        Some((identity, contract)) => {
+            if contract.major != request.major || contract.minor < request.min_minor {
+                Some(PackageErrorCode::PortVersionMismatch)
+            } else if request.ports.iter().any(|requested| {
+                !contract
+                    .ports
+                    .iter()
+                    .any(|port| port.name == requested.name && port.kind == requested.kind)
+            }) {
+                Some(PackageErrorCode::PortMissing)
+            } else {
+                result.provider = Some(identity.clone());
+                result.minor = Some(contract.minor.min(request.max_minor));
+                None
+            }
+        }
+    };
+    result
+}
+
+fn required_cycle_members(
+    eligible: &BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>,
+    providers: &BTreeMap<String, PackageIdentity>,
+) -> BTreeSet<PackageIdentity> {
+    let all: BTreeSet<_> = eligible.keys().cloned().collect();
+    let edges: BTreeMap<_, Vec<_>> = eligible
+        .iter()
+        .map(|(id, (_, admission))| {
+            (
+                id.clone(),
+                admission
+                    .manifest
+                    .consumed_ports
+                    .iter()
+                    .filter(|request| request.required)
+                    .filter(|request| {
+                        resolve(request, providers, eligible, &all)
+                            .unavailable
+                            .is_none()
+                    })
+                    .filter_map(|request| providers.get(&request.identity))
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
+    // A node belongs to a cycle exactly when it can reach itself through one or more
+    // required edges. Nodes leading into a cycle are rejected by the later fixed point.
+    edges
+        .keys()
+        .filter(|origin| {
+            let mut visited = BTreeSet::new();
+            let mut stack = edges[*origin].clone();
+            while let Some(node) = stack.pop() {
+                if &node == *origin {
+                    return true;
+                }
+                if visited.insert(node.clone()) {
+                    stack.extend(edges.get(&node).into_iter().flatten().cloned());
+                }
+            }
+            false
+        })
+        .cloned()
+        .collect()
 }
 
 fn load_application(

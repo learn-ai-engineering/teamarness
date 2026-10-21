@@ -74,6 +74,7 @@ pub struct ManifestDocument {
     pub protocol: VersionRange,
     pub capabilities: Vec<CapabilityRequirement>,
     pub consumed_ports: Vec<ConsumedContract>,
+    pub activation: ActivationPolicy,
     port_contract: Option<DigestFile>,
     backends: Vec<FileArtifact>,
     ui: UiDocument,
@@ -128,9 +129,19 @@ pub struct LoadedManifest {
     pub ui: LoadedUi,
     pub capabilities: Vec<CapabilityRequirement>,
     pub consumed_ports: Vec<ConsumedContract>,
+    pub activation: ActivationPolicy,
     pub port_contract: Option<Arc<CompiledPortContracts>>,
     pub port_contract_digest: Option<String>,
     pub manifest_digest: String,
+}
+
+/// Package Backend startup policy; legacy manifests start eagerly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationPolicy {
+    #[default]
+    Eager,
+    OnDemand,
 }
 
 /// An inclusive major plus minor-range version request.
@@ -231,6 +242,8 @@ struct RawManifest {
     capabilities: Vec<CapabilityRequirement>,
     #[serde(default)]
     consumed_ports: Vec<ConsumedContract>,
+    #[serde(default)]
+    activation: ActivationPolicy,
     port_contract: Option<DigestFile>,
     #[serde(default)]
     extensions: BTreeMap<String, Value>,
@@ -414,6 +427,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
         protocol: document.protocol,
         capabilities: document.capabilities,
         consumed_ports: document.consumed_ports,
+        activation: document.activation,
         port_contract: document.port_contract,
         backends: document.backends,
         ui: document.ui,
@@ -535,6 +549,7 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
         },
         capabilities: document.capabilities,
         consumed_ports: document.consumed_ports,
+        activation: document.activation,
         port_contract,
         port_contract_digest,
         manifest_digest: document.manifest_digest,
