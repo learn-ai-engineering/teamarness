@@ -145,6 +145,7 @@ describe("Documents mount", () => {
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
+        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
         "documents.document.edit": (payload) => {
           const { baseRevision, ops } = payload as { baseRevision: string; ops: unknown };
           edits.push({ base: baseRevision, ops });
@@ -181,6 +182,29 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("retries pending history after availability changes and enables the existing editor", async () => {
+    let opens = 0;
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => ({ ...snapshot(), availability: "waiting_for_history_access" }),
+        "documents.document.open": () => { opens++; return { documentId: doc, revision: "0", editable: opens > 1, text: "" }; },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: false, text: "" });
+    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(true);
+    await fake.emit("documents.changes", snapshot());
+    await tick();
+    expect(opens).toBe(2);
+    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "" });
+    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(false);
+    await unmount();
+  });
+
   it("lists threaded comments for the open Document and adds one with a quote", async () => {
     const root = "a".repeat(64);
     const reply = "b".repeat(64);
@@ -192,6 +216,7 @@ describe("Documents mount", () => {
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
+        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
         "documents.comments": () => ({ comments } as never),
         "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
         "documents.comment.resolve": () => ({ ok: true as const, id: root }),

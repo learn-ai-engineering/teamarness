@@ -92,6 +92,9 @@ export class DocumentEditor {
   private draft: string;
   private retry: { base: string; ops: TextOp[]; text: string } | null = null;
   private inFlightText: string | null = null;
+  private transfer: { revision: string; editable: boolean; chunks: number; parts: string[] } | null = null;
+  private abandonedRevision: string | null = null;
+  private readonly resync: () => void;
   private readonly send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>;
   private readonly announce: () => void;
 
@@ -99,6 +102,7 @@ export class DocumentEditor {
     initial: TextEvent,
     send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>,
     announce: () => void,
+    resync: () => void = () => {},
   ) {
     this.state = {
       documentId: initial.documentId,
@@ -111,6 +115,7 @@ export class DocumentEditor {
     this.draft = this.state.text;
     this.send = send;
     this.announce = announce;
+    this.resync = resync;
   }
 
   get current(): EditorState {
@@ -119,6 +124,10 @@ export class DocumentEditor {
 
   get value(): string {
     return this.draft;
+  }
+
+  get assembling(): boolean {
+    return this.transfer !== null;
   }
 
   /** The Member typed: record the draft and send the difference when nothing is in flight. */
@@ -131,7 +140,41 @@ export class DocumentEditor {
   receive(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
     if (event.documentId !== this.state.documentId) return caret;
     if (Number(event.revision) < Number(this.state.revision)) return caret;
+    if (event.transfer === "begin") {
+      if (this.transfer !== null && this.transfer.revision !== event.revision) this.requestResync(this.transfer.revision);
+      this.abandonedRevision = null;
+      this.transfer = event.chunks !== undefined && event.chunks > 0
+        ? { revision: event.revision, editable: event.editable, chunks: event.chunks, parts: [] } : null;
+      if (this.transfer === null) this.requestResync(event.revision);
+      return caret;
+    }
+    if (event.transfer === "chunk" || event.transfer === "end") {
+      const transfer = this.transfer;
+      if (transfer === null) {
+        if (Number(event.revision) > Number(this.state.revision)) this.requestResync(event.revision);
+        return caret;
+      }
+      if (transfer.revision !== event.revision) return caret;
+      if (event.transfer === "chunk") {
+        if (event.chunkIndex !== transfer.parts.length || event.chunk === undefined || transfer.parts.length >= transfer.chunks) {
+          this.transfer = null;
+          this.requestResync(event.revision);
+        } else transfer.parts.push(event.chunk);
+        return caret;
+      }
+      this.transfer = null;
+      if (transfer.parts.length !== transfer.chunks) { this.requestResync(event.revision); return caret; }
+      return this.receive({ documentId: event.documentId, revision: event.revision,
+        editable: transfer.editable, text: transfer.parts.join("") }, caret);
+    }
+    if (event.text === undefined && Number(event.revision) > Number(this.state.revision) + 1) {
+      this.transfer = null;
+      this.requestResync(event.revision);
+      return caret;
+    }
     if (event.text !== undefined) {
+      this.transfer = null;
+      this.abandonedRevision = null;
       const base = this.state.text;
       const previousDraft = this.draft;
       // A lagged full recovery can already contain the in-flight edit even when its echo
@@ -170,6 +213,12 @@ export class DocumentEditor {
     this.announce();
     void this.flush();
     return next;
+  }
+
+  private requestResync(revision: string): void {
+    if (this.abandonedRevision === revision) return;
+    this.abandonedRevision = revision;
+    this.resync();
   }
 
   private async flush(): Promise<void> {

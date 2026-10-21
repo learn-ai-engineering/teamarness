@@ -115,19 +115,71 @@ impl BodyHub {
                 }
             });
             if let Some(event) = published {
-                let _ = self.events.send(event);
+                if event.to_string().len() > TEXT_EVENT_BUDGET {
+                    for full in self.text_events(document) {
+                        let _ = self.events.send(full);
+                    }
+                } else {
+                    let _ = self.events.send(event);
+                }
             }
         }
     }
 
-    fn text_event(&self, document: &str) -> JsonValue {
+    fn text_events(&self, document: &str) -> Vec<JsonValue> {
         self.with_body(document, |body| {
-            json!({
-                "documentId": document, "revision": body.revision().to_string(),
-                "text": body.text(), "editable": body.editable(),
-            })
+            full_text_events(document, body.revision(), body.text(), body.editable())
         })
     }
+
+    // The request frame is bounded even when the subscription must deliver the text in parts.
+    fn open_response(&self, document: &str) -> JsonValue {
+        let first = self.text_events(document).remove(0);
+        if first["transfer"] == "begin" {
+            json!({ "documentId": document, "revision": first["revision"], "editable": first["editable"] })
+        } else {
+            first
+        }
+    }
+}
+
+// Reserve plenty of room for the Package UI envelope and JSON escaping of control characters.
+const TEXT_EVENT_BUDGET: usize = 96 * 1024;
+const TEXT_CHUNK_BYTES: usize = 24 * 1024;
+
+fn full_text_events(document: &str, revision: u64, text: &str, editable: bool) -> Vec<JsonValue> {
+    let base =
+        json!({ "documentId": document, "revision": revision.to_string(), "editable": editable });
+    let mut small = base.clone();
+    small["text"] = json!(text);
+    if small.to_string().len() <= TEXT_EVENT_BUDGET {
+        return vec![small];
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let mut end = (offset + TEXT_CHUNK_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[offset..end]);
+        offset = end;
+    }
+    let mut events = vec![
+        json!({ "documentId": document, "revision": revision.to_string(),
+        "editable": editable, "transfer": "begin", "chunks": chunks.len() }),
+    ];
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        events.push(
+            json!({ "documentId": document, "revision": revision.to_string(),
+            "editable": editable, "transfer": "chunk", "chunkIndex": index, "chunk": chunk }),
+        );
+    }
+    events.push(
+        json!({ "documentId": document, "revision": revision.to_string(),
+        "editable": editable, "transfer": "end" }),
+    );
+    events
 }
 
 /// Derives a Loro peer id from the Installation identity: the first eight bytes of a
@@ -460,7 +512,11 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         |context: Context<DocumentsActive>, request: DocumentRequest| async move {
             require_document(&context, &request.document_id).await?;
             reopen_unopened_edits(&context, &request.document_id).await?;
-            Ok(context.state().hub.text_event(&request.document_id))
+            let hub = &context.state().hub;
+            for event in hub.text_events(&request.document_id) {
+                let _ = hub.events.send(event);
+            }
+            Ok(hub.open_response(&request.document_id))
         },
     )
     .request(
@@ -501,10 +557,17 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             })?;
             if !is_retry {
                 hub.flush.notify_one();
-                let _ = hub.events.send(json!({
+                let event = json!({
                     "documentId": document, "revision": revision.to_string(),
                     "origin": "local", "delta": delta, "editable": editable,
-                }));
+                });
+                if event.to_string().len() > TEXT_EVENT_BUDGET {
+                    for full in hub.text_events(&document) {
+                        let _ = hub.events.send(full);
+                    }
+                } else {
+                    let _ = hub.events.send(event);
+                }
             }
             // Keep the draft visible during the coalescing window, but never acknowledge it
             // until every export in this request has reached the Core record log.
@@ -586,10 +649,12 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             tokio::spawn(async move {
                 // The initial full text is taken after subscribing, so no delta between the two
                 // is lost; a delta older than the initial revision is skipped below.
-                let initial = hub.text_event(&document);
-                let mut revision = revision_of(&initial);
-                if sender.send(initial).await.is_err() {
-                    return;
+                let initial = hub.text_events(&document);
+                let mut revision = revision_of(&initial[0]);
+                for event in initial {
+                    if sender.send(event).await.is_err() {
+                        return;
+                    }
                 }
                 loop {
                     let event = tokio::select! {
@@ -602,7 +667,21 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                                 continue;
                             }
                             let next = revision_of(&event);
-                            if next <= revision {
+                            if next < revision
+                                || (next == revision
+                                    && event.get("transfer").is_none()
+                                    && event.get("text").is_none())
+                            {
+                                continue;
+                            }
+                            if next > revision.saturating_add(1) {
+                                let full = hub.text_events(&document);
+                                revision = revision_of(&full[0]);
+                                for part in full {
+                                    if sender.send(part).await.is_err() {
+                                        return;
+                                    }
+                                }
                                 continue;
                             }
                             revision = next;
@@ -612,10 +691,12 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             // Resynchronize with the full text rather than guess what was missed.
-                            let full = hub.text_event(&document);
-                            revision = revision_of(&full);
-                            if sender.send(full).await.is_err() {
-                                return;
+                            let full = hub.text_events(&document);
+                            revision = revision_of(&full[0]);
+                            for part in full {
+                                if sender.send(part).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
@@ -817,6 +898,36 @@ fn revision_of(event: &JsonValue) -> u64 {
         .unwrap_or(0)
 }
 
+/// Both the SDK and host cap an `open` call at 32 records and 512 KiB of decoded sealed input.
+fn open_batches(
+    rows: &[crate::store::StoredRecord],
+) -> impl Iterator<Item = &[crate::store::StoredRecord]> {
+    let mut remaining = rows;
+    std::iter::from_fn(move || {
+        if remaining.is_empty() {
+            return None;
+        }
+        let mut count = 0;
+        let mut bytes: usize = 0;
+        for row in remaining.iter().take(32) {
+            let Some(total) = bytes.checked_add(row.sealed_record.len()) else {
+                break;
+            };
+            if total > 512 * 1024 {
+                break;
+            }
+            count += 1;
+            bytes = total;
+        }
+        // An individually invalid sealed record is handed to the SDK for its usual error;
+        // a valid record always fits the capability's per-batch budget.
+        let count = count.max(1);
+        let (batch, rest) = remaining.split_at(count);
+        remaining = rest;
+        Some(batch)
+    })
+}
+
 /// Re-opens the edit records of one Document whose sealed bytes could not be opened before,
 /// so a Document becomes editable as soon as history access arrives.
 async fn reopen_unopened_edits(
@@ -833,7 +944,16 @@ async fn reopen_unopened_edits(
         .blocking(move |_| store.edit_records(Some(&id)).map_err(|_| storage_failed()))
         .await?;
     let unopened = import_edit_rows(&context.state().log, &hub, &rows).await?;
-    hub.with_body(document, |body| body.set_unopened(unopened));
+    let changed = hub.with_body(document, |body| {
+        let changed = body.unopened() != unopened;
+        body.set_unopened(unopened);
+        changed
+    });
+    if changed {
+        for event in hub.text_events(document) {
+            let _ = hub.events.send(event);
+        }
+    }
     Ok(())
 }
 
@@ -847,7 +967,7 @@ async fn import_edit_rows(
     rows: &[crate::store::StoredRecord],
 ) -> Result<usize, BackendError> {
     let mut unopened = 0;
-    for batch in rows.chunks(32) {
+    for batch in open_batches(rows) {
         let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
         let results = log
             .open(&sealed)
@@ -1027,7 +1147,7 @@ async fn rehydrate(
         reader.control_records().map_err(|_| storage_failed())
     })
     .await?;
-    for batch in control.chunks(32) {
+    for batch in open_batches(&control) {
         let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
         let results = log
             .open(&sealed)
@@ -1044,7 +1164,7 @@ async fn rehydrate(
         reader.deferred_records().map_err(|_| storage_failed())
     })
     .await?;
-    for batch in deferred.chunks(32) {
+    for batch in open_batches(&deferred) {
         let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
         let results = log
             .open(&sealed)
@@ -1339,6 +1459,10 @@ impl RecordLogSink for DocumentsSink {
 
     fn on_state(&self, state: &SyncState) {
         self.with_report(|report| report.availability = state.availability);
+        // History access can arrive while availability remains `current`; every session state
+        // observation gives pending editors another opportunity to open sealed edits.
+        self.changes
+            .send_modify(|revision| *revision = revision.saturating_add(1));
     }
 
     fn on_warning(&self, warning: &SyncWarning) {
@@ -1376,6 +1500,127 @@ impl RecordLogSink for DocumentsSink {
 mod tests {
     use super::*;
     use teamarness_package_sdk::testing::assert_router_matches_contract;
+
+    #[test]
+    fn all_replay_paths_partition_seventeen_large_sealed_records() {
+        let rows: Vec<crate::store::StoredRecord> = (0..17)
+            .map(|seed| crate::store::StoredRecord {
+                record_id: hex(64, seed),
+                order_key: hex(82, seed),
+                author: ALICE.into(),
+                purpose: "document.edit".into(),
+                signature: "sig".into(),
+                sealed_record: vec![b'x'; 32 * 1024],
+                cursor: None,
+                ingestion_ordinal: seed,
+                target: None,
+            })
+            .collect();
+        let batches: Vec<_> = open_batches(&rows).collect();
+        assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 17);
+        assert!(batches.len() >= 2);
+        for batch in batches {
+            assert!(batch.len() <= 32);
+            assert!(
+                batch
+                    .iter()
+                    .map(|row| row.sealed_record.len())
+                    .sum::<usize>()
+                    <= 512 * 1024
+            );
+        }
+        let mut small = vec![rows[0].clone(); 33];
+        for row in &mut small {
+            row.sealed_record = vec![1];
+        }
+        assert_eq!(
+            open_batches(&small)
+                .map(|batch| batch.len())
+                .collect::<Vec<_>>(),
+            vec![32, 1]
+        );
+    }
+
+    #[test]
+    fn full_text_and_oversized_delta_frames_stay_below_bridge_limit() {
+        let text = "\u{0000}😀".repeat(60_000);
+        let events = full_text_events(&hex(64, 1), 42, &text, true);
+        assert!(events.len() > 3);
+        assert_eq!(events[0]["transfer"], "begin");
+        assert_eq!(events.last().unwrap()["transfer"], "end");
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event["chunk"].as_str())
+                .collect::<String>(),
+            text
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.to_string().len() < 256 * 1024)
+        );
+    }
+
+    #[test]
+    fn oversized_import_delta_falls_back_to_bounded_full_text_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, mut receiver) = broadcast::channel(256);
+        let hub = BodyHub {
+            store,
+            bodies: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            flush: Arc::new(Notify::new()),
+            append_locks: Arc::new(Mutex::new(HashMap::new())),
+            peer: 3,
+        };
+        let mut alice = DocumentBody::new(1);
+        let mut bob = DocumentBody::new(2);
+        alice
+            .apply(&[TextOp::Insert {
+                insert: "a".repeat(110 * 1024),
+            }])
+            .unwrap();
+        bob.apply(&[TextOp::Insert {
+            insert: "\u{0000}😀".repeat(20_000),
+        }])
+        .unwrap();
+        for update in alice.flush(Instant::now(), true).unwrap().updates {
+            hub.apply_edits(&[("doc".into(), update)]);
+            while receiver.try_recv().is_ok() {}
+        }
+        for update in bob.flush(Instant::now(), true).unwrap().updates {
+            hub.apply_edits(&[("doc".into(), update)]);
+        }
+        let merged = hub.with_body("doc", |body| body.text().to_owned());
+        assert!(merged.len() > crate::body::MAX_TEXT_BYTES);
+        let published: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            published
+                .iter()
+                .any(|event: &JsonValue| event["transfer"] == "begin")
+        );
+        assert!(
+            published
+                .iter()
+                .all(|event| event.to_string().len() < 256 * 1024)
+        );
+        let response = hub.open_response("doc");
+        assert!(response.get("text").is_none());
+        assert!(response.to_string().len() < 256 * 1024);
+        let full = hub.text_events("doc");
+        assert!(
+            full.iter()
+                .all(|event| event.to_string().len() < 256 * 1024)
+        );
+        assert_eq!(
+            full.iter()
+                .filter_map(|event| event["chunk"].as_str())
+                .collect::<String>(),
+            merged
+        );
+    }
 
     #[test]
     fn router_matches_the_ui_contract() {
@@ -1589,6 +1834,128 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot["availability"], "current");
         assert_eq!(snapshot["collections"][0]["name"], "Shared");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seventeen_large_records_replay_in_all_paths_and_history_becomes_editable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let mut body = DocumentBody::new(90);
+        body.apply(&[TextOp::Insert {
+            insert: "recovered".into(),
+        }])
+        .unwrap();
+        let update = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+        let edit = DomainRecord::document_edit("bob", &document, update).unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let mut seed = 1;
+        let mut save = |record: DomainRecord, target: u8| {
+            let sealed = vec![target; 32 * 1024];
+            store
+                .ingest(
+                    &hex(64, seed),
+                    &hex(82, seed),
+                    "bob",
+                    record.kind(),
+                    "sig",
+                    &record.encode(),
+                    &sealed,
+                    None,
+                )
+                .unwrap();
+            seed += 1;
+        };
+        save(DomainRecord::collection_create("bob", "Plan").unwrap(), 1);
+        save(
+            DomainRecord::document_create("bob", &collection, "Notes").unwrap(),
+            2,
+        );
+        for _ in 0..17 {
+            save(
+                DomainRecord::collection_rename("bob", &collection, "Plan").unwrap(),
+                3,
+            );
+        }
+        for _ in 0..17 {
+            save(
+                DomainRecord::collection_rename("bob", &hex(64, 99), "Waiting").unwrap(),
+                4,
+            );
+        }
+        for _ in 0..17 {
+            save(edit.clone(), 5);
+        }
+        let access = Arc::new(AtomicBool::new(false));
+        let gained = access.clone();
+        let canonical = URL_SAFE_NO_PAD.encode(edit.encode());
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => {
+                let sealed = payload["sealedRecords"].as_array().unwrap();
+                let total: usize = sealed.iter().map(|value| URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap().len()).sum();
+                assert!(sealed.len() <= 32 && total <= 512 * 1024);
+                Ok(json!({"results": sealed.iter().map(|value| {
+                    let bytes = URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap();
+                    if bytes[0] == 5 && gained.load(Ordering::SeqCst) {
+                        json!({"status":"ready", "recordId":hex(64, 37), "orderKey":hex(82, 37),
+                            "author":"bob", "purpose":"document.edit", "signature":"c2ln", "canonical":canonical})
+                    } else { json!({"status":"waiting_for_history_access"}) }
+                }).collect::<Vec<_>>() }))
+            }
+            _ => Err(error("unavailable", false)),
+        });
+        let mut session = start(directory.path(), scripted.clone()).await;
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].unopened(),
+            17
+        );
+        let mut subscription = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(
+            subscription.next_event().await.unwrap().unwrap()["editable"],
+            false
+        );
+        let pending = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(pending["editable"], false);
+        access.store(true, Ordering::SeqCst);
+        let ready = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(ready["editable"], true);
+        assert_eq!(ready["text"], "recovered");
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].unopened(),
+            0
+        );
+        let mut published = false;
+        for _ in 0..4 {
+            if subscription.next_event().await.unwrap().unwrap()["editable"] == true {
+                published = true;
+                break;
+            }
+        }
+        assert!(
+            published,
+            "the existing subscription sees the final editable state"
+        );
+        let calls = scripted.recorded_calls();
+        let activation_opens = calls.iter().filter(|call| call.method == "open").count();
+        assert!(
+            activation_opens >= 6,
+            "control, deferred and edit paths each require two batches"
+        );
+        subscription.close().await;
         session.harness.shutdown().await.unwrap();
     }
 

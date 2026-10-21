@@ -83,12 +83,16 @@ export type Snapshot = {
 };
 
 export type TextEvent = {
+  readonly "chunk"?: string;
+  readonly "chunkIndex"?: number;
+  readonly "chunks"?: number;
   readonly "delta"?: readonly TextOp[];
   readonly "documentId": RecordId;
   readonly "editable": boolean;
   readonly "origin"?: "local" | "remote";
   readonly "revision": Revision;
   readonly "text"?: string;
+  readonly "transfer"?: "begin" | "chunk" | "end";
 };
 
 export type TextOp = {

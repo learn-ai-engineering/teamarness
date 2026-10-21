@@ -92,6 +92,10 @@ export class DocumentsController {
     if (this.disposed) return;
     // Any committed record may be a Comment on the open Document; refresh its thread.
     void this.refreshComments();
+    if (this._state.openDocumentId !== null && this.editor !== null
+      && !this.editor.current.editable && !this.editor.assembling) {
+      void this.retryOpen(this._state.openDocumentId, this.openSequence);
+    }
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);
     const pending = this.pendingSelectionId;
     if (pending !== null && snapshot.collections.some((c) => c.id === pending)) {
@@ -128,9 +132,20 @@ export class DocumentsController {
         return;
       }
       this.textSubscription = subscription;
+      await this.retryOpen(documentId, sequence);
     } catch (error) {
       if (sequence !== this.openSequence || this.disposed) return;
       this.update({ openDocumentId: null, error: describeError(error) });
+    }
+  }
+
+  private async retryOpen(documentId: string, sequence: number): Promise<void> {
+    try {
+      await this.client.request("documents.document.open", { documentId });
+    } catch (error) {
+      if (!this.disposed && sequence === this.openSequence && !isAbortError(error)) {
+        this.update({ error: describeError(error) });
+      }
     }
   }
 
@@ -181,17 +196,23 @@ export class DocumentsController {
 
   /** Called by the view with the caret so a remote change can move it. */
   receiveText(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
-    if (this.editor === null || event.text !== undefined && this.editor.current.documentId !== event.documentId) {
+    if (event.documentId !== this._state.openDocumentId) return caret;
+    if (this.editor === null || this.editor.current.documentId !== event.documentId) {
+      if (event.text === undefined && event.transfer !== "begin") {
+        void this.retryOpen(event.documentId, this.openSequence);
+        return caret;
+      }
       this.editor = new DocumentEditor(
-        event,
+        event.transfer === "begin" ? { documentId: event.documentId, revision: "0", editable: false, text: "" } : event,
         async (documentId, baseRevision, ops) => {
           const { revision } = await this.client.request("documents.document.edit", { documentId, baseRevision, ops });
           return { revision };
         },
         this.announce,
+        () => { void this.retryOpen(event.documentId, this.openSequence); },
       );
       this.announce();
-      return caret;
+      return event.transfer === "begin" ? this.editor.receive(event, caret) : caret;
     }
     return this.editor.receive(event, caret);
   }

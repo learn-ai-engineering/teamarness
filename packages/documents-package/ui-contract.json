@@ -213,7 +213,23 @@
         },
         "text": {
           "type": "string",
-          "maxLength": 196608
+          "maxLength": 98304
+        },
+        "transfer": {
+          "type": "string",
+          "enum": ["begin", "chunk", "end"]
+        },
+        "chunks": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "chunkIndex": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chunk": {
+          "type": "string",
+          "maxLength": 24576
         },
         "origin": {
           "type": "string",

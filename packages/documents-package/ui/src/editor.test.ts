@@ -120,7 +120,7 @@ describe("DocumentEditor", () => {
     const editor = new DocumentEditor(event({ revision: "0", text: "abc" }),
       () => new Promise((resolve) => { acknowledge = resolve; }), () => {});
     editor.input("abcX");
-    editor.receive(event({ revision: "2", origin: "remote", delta: [{ insert: "Z" }] }), null);
+    editor.receive(event({ revision: "2", text: "Zabc" }), null);
     acknowledge({ revision: "1" });
     await Promise.resolve();
     expect(editor.current.revision).toBe("2");
@@ -167,6 +167,75 @@ describe("DocumentEditor", () => {
     acknowledge({ revision: "1" });
     await Promise.resolve();
     expect(editor.value).toBe("ZabcXY");
+  });
+
+  it("assembles UTF-8 text chunks only after a complete revision and preserves an unsent draft", () => {
+    const editor = new DocumentEditor(event({ revision: "0", text: "abc", editable: false }), () => new Promise(() => {}), () => {});
+    editor.input("abcX");
+    editor.receive(event({ revision: "1", transfer: "begin", chunks: 2 }), null);
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 0, chunk: "Zabc" }), null);
+    expect(editor.current.text).toBe("abc");
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 1, chunk: "😀" }), null);
+    editor.receive(event({ revision: "1", transfer: "end" }), null);
+    expect(editor.current.text).toBe("Zabc😀");
+    expect(editor.value).toBe("Zabc😀X");
+  });
+
+  it("rebases an in-flight edit and later typing over a chunked recovery", async () => {
+    let acknowledge: (value: { revision: string }) => void = () => {};
+    const editor = new DocumentEditor(event({ revision: "0", text: "abc" }),
+      () => new Promise((resolve) => { acknowledge = resolve; }), () => {});
+    editor.input("abcX");
+    editor.input("abcXY");
+    editor.receive(event({ revision: "2", transfer: "begin", chunks: 2 }), null);
+    editor.receive(event({ revision: "2", transfer: "chunk", chunkIndex: 0, chunk: "Zabc" }), null);
+    editor.receive(event({ revision: "2", transfer: "chunk", chunkIndex: 1, chunk: "X" }), null);
+    editor.receive(event({ revision: "2", transfer: "end" }), null);
+    expect(editor.value).toBe("ZabcXY");
+    acknowledge({ revision: "1" });
+    await Promise.resolve();
+    expect(editor.current.revision).toBe("2");
+    expect(editor.value).toBe("ZabcXY");
+  });
+
+  it("requests full resync on a delta revision gap and retains unsent typing", () => {
+    let resyncs = 0;
+    const editor = new DocumentEditor(event({ revision: "0", text: "abc", editable: false }),
+      () => new Promise(() => {}), () => {}, () => { resyncs++; });
+    editor.input("abcX");
+    editor.receive(event({ revision: "2", origin: "remote", delta: [{ insert: "Z" }] }), null);
+    expect(resyncs).toBe(1);
+    expect(editor.current.text).toBe("abc");
+    expect(editor.value).toBe("abcX");
+    editor.receive(event({ revision: "2", text: "Zabc" }), null);
+    expect(editor.value).toBe("ZabcX");
+  });
+
+  it("requests resync when a begin frame is missing", () => {
+    let resyncs = 0;
+    const editor = new DocumentEditor(event({ revision: "0", text: "a", editable: false }),
+      () => new Promise(() => {}), () => {}, () => { resyncs++; });
+    editor.input("aX");
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 0, chunk: "z" }), null);
+    editor.receive(event({ revision: "1", transfer: "end" }), null);
+    expect(resyncs).toBe(1);
+    expect(editor.value).toBe("aX");
+  });
+
+  it("discards stale/interrupted chunks and resynchronizes on a missing chunk without losing the draft", () => {
+    let resyncs = 0;
+    const editor = new DocumentEditor(event({ revision: "0", text: "a" }), () => new Promise(() => {}), () => {}, () => { resyncs++; });
+    editor.input("aX");
+    editor.receive(event({ revision: "1", transfer: "begin", chunks: 2 }), null);
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 1, chunk: "z" }), null);
+    expect(resyncs).toBe(1);
+    editor.receive(event({ revision: "1", transfer: "end" }), null);
+    editor.receive(event({ revision: "2", transfer: "begin", chunks: 1 }), null);
+    editor.receive(event({ revision: "1", transfer: "chunk", chunkIndex: 0, chunk: "old" }), null);
+    editor.receive(event({ revision: "2", transfer: "chunk", chunkIndex: 0, chunk: "za" }), null);
+    editor.receive(event({ revision: "2", transfer: "end" }), null);
+    expect(editor.current.text).toBe("za");
+    expect(editor.value).toBe("zaX");
   });
 
   it("replaces everything on a full-text event and clamps the caret", () => {

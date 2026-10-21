@@ -18,7 +18,7 @@ const CONTAINER: &str = "body";
 pub(crate) const COALESCE_WINDOW: Duration = Duration::from_millis(300);
 /// Pending local edits are appended early once their export reaches this size.
 pub(crate) const EXPORT_BUDGET: usize = 64 * 1024;
-/// The largest body the UI protocol carries in one event.
+/// Local growth budget; remote CRDT merges can exceed it and are delivered in bounded chunks.
 pub(crate) const MAX_TEXT_BYTES: usize = 192 * 1024;
 /// A single inserted run larger than this is applied in pieces with an export between them,
 /// so no one record approaches the canonical bound.
@@ -39,7 +39,7 @@ pub(crate) enum TextOp {
 pub(crate) enum BodyError {
     /// The ops run past the end of the text.
     OutOfRange,
-    /// Applying the ops would exceed [`MAX_TEXT_BYTES`].
+    /// The ops would grow a body beyond [`MAX_TEXT_BYTES`], or grow one already above it.
     TooLarge,
     Loro,
 }
@@ -125,9 +125,10 @@ impl DocumentBody {
     /// Applies UI operations as local edits and returns the delta the UI should see echoed.
     pub(crate) fn apply(&mut self, ops: &[TextOp]) -> Result<Vec<TextOp>, BodyError> {
         let mut inserted = 0usize;
-        let mut deleted = 0usize;
+        let mut deleted_bytes = 0usize;
         let mut cursor = 0usize;
-        let length = self.text.chars().count();
+        let chars: Vec<char> = self.text.chars().collect();
+        let length = chars.len();
         for op in ops {
             match op {
                 TextOp::Retain { retain } => {
@@ -135,16 +136,27 @@ impl DocumentBody {
                 }
                 TextOp::Insert { insert } => inserted += insert.len(),
                 TextOp::Delete { delete } => {
-                    cursor = cursor.checked_add(*delete).ok_or(BodyError::OutOfRange)?;
-                    deleted += delete;
+                    let end = cursor.checked_add(*delete).ok_or(BodyError::OutOfRange)?;
+                    if end > length {
+                        return Err(BodyError::OutOfRange);
+                    }
+                    deleted_bytes += chars[cursor..end]
+                        .iter()
+                        .map(|ch| ch.len_utf8())
+                        .sum::<usize>();
+                    cursor = end;
                 }
             }
             if cursor > length {
                 return Err(BodyError::OutOfRange);
             }
         }
-        // Deleted bytes are at least as many as deleted characters; the bound is conservative.
-        if self.text.len() + inserted > MAX_TEXT_BYTES + deleted {
+        let next_bytes = self
+            .text
+            .len()
+            .saturating_sub(deleted_bytes)
+            .saturating_add(inserted);
+        if next_bytes > MAX_TEXT_BYTES && next_bytes > self.text.len() {
             return Err(BodyError::TooLarge);
         }
         let container = self.doc.get_text(CONTAINER);
@@ -338,6 +350,45 @@ mod tests {
             body.append_succeeded();
         }
         updates
+    }
+
+    #[test]
+    fn concurrent_overflow_converges_and_only_shrinking_edits_are_allowed() {
+        let mut alice = DocumentBody::new(1);
+        let mut bob = DocumentBody::new(2);
+        apply_text(&mut alice, 0, &"a".repeat(110 * 1024));
+        apply_text(&mut bob, 0, &"b".repeat(110 * 1024));
+        let alice_updates = take_all(&mut alice);
+        let bob_updates = take_all(&mut bob);
+        for update in &bob_updates {
+            alice.import(update).unwrap();
+        }
+        for update in &alice_updates {
+            bob.import(update).unwrap();
+        }
+        assert_eq!(alice.text(), bob.text());
+        assert!(alice.text().len() > MAX_TEXT_BYTES);
+        assert_eq!(
+            alice.apply(&[TextOp::Insert { insert: "!".into() }]),
+            Err(BodyError::TooLarge)
+        );
+        assert!(
+            alice
+                .apply(&[
+                    TextOp::Delete { delete: 1 },
+                    TextOp::Insert { insert: "!".into() }
+                ])
+                .is_ok(),
+            "no-growth replacement stays editable"
+        );
+        assert_eq!(
+            alice.apply(&[TextOp::Delete { delete: 1 }]),
+            Ok(vec![TextOp::Delete { delete: 1 }])
+        );
+        assert_eq!(
+            alice.apply(&[TextOp::Insert { insert: "!".into() }]),
+            Err(BodyError::TooLarge)
+        );
     }
 
     // Verifies: AC3 — two peers converge whatever order their records arrive in.
