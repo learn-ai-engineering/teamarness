@@ -225,7 +225,7 @@ pub(crate) struct AppliedMembership {
 pub(crate) fn change_from_action(action: &MembershipAction) -> Option<MembershipChange> {
     match action {
         MembershipAction::Create
-        | MembershipAction::CreatePerson
+        | MembershipAction::CreatePerson { .. }
         | MembershipAction::AttachPerson { .. } => None,
         MembershipAction::Admit { target, .. } => {
             Some(MembershipChange::Admitted { member: *target })
@@ -245,7 +245,7 @@ pub(crate) fn change_from_action(action: &MembershipAction) -> Option<Membership
 /// Whether a parked operation is a Person group create that waits for the
 /// operation attaching it, rather than for its own timestamp.
 fn is_waiting_person_create(envelope: &MembershipEnvelope, creator: PublicIdentity) -> bool {
-    matches!(envelope.action, MembershipAction::CreatePerson) && envelope.author != creator
+    matches!(envelope.action, MembershipAction::CreatePerson { .. }) && envelope.author != creator
 }
 
 pub(crate) fn recover(
@@ -2267,7 +2267,7 @@ pub(crate) fn action_tag(action: &MembershipAction) -> i64 {
         MembershipAction::Create => 0,
         MembershipAction::Admit { .. } => 1,
         MembershipAction::Revoke { .. } => 2,
-        MembershipAction::CreatePerson => 3,
+        MembershipAction::CreatePerson { .. } => 3,
         MembershipAction::AttachPerson { .. } => 4,
         MembershipAction::AddAgentKey { .. } => 5,
         MembershipAction::RemoveAgentKey { .. } => 6,

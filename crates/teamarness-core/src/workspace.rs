@@ -279,7 +279,9 @@ fn genesis_companions(
         secret_key,
         request.workspace_id,
         request.authored_at_unix_ms,
-        MembershipAction::CreatePerson,
+        MembershipAction::CreatePerson {
+            creator: request.creator,
+        },
         vec![request.genesis_id],
     )
     .map_err(fault!(StorageError::CorruptWorkspace))?;

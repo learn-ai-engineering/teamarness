@@ -4,18 +4,53 @@ use crate::CoreRuntime;
 use crate::invitation::{InvitationClaim, InvitationToken};
 
 const TOKEN: &str = "01020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03";
-const CLAIM: &str = "0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03031398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca00c20000005e010203030303030303030303030303030303011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca00000000000003e8030001df840a304e772ef4cdfb23293d8adadde8d43567bde4b0190c3d954f696f0b0a2c1cef900bd65c538acc9d640489783f97c686d546b7002d33f27931144b721985982f5b44b0e0cbab702c16fbb8cc27df50c949bb4c09aebd7d4b68ce0278a654c3801e5f586a647de07983fe9be9a8b5759ce24e40d49ca90e1a0524529c0751aa5902347873fcefe3e7646597adb906ac1ca8742c18ae9fabbfb4ab0e6afee35ace76a9a3da292d8e0662f5baff0390b232ffa15db791522d8483eb772509";
-const ADMIT: &str = "0000028e01020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c000000000000044c01011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca0101ec0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03031398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca00c20000005e010203030303030303030303030303030303011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca00000000000003e8030001df840a304e772ef4cdfb23293d8adadde8d43567bde4b0190c3d954f696f0b0a2c1cef900bd65c538acc9d640489783f97c686d546b7002d33f27931144b721985982f5b44b0e0cbab702c16fbb8cc27df50c949bb4c09aebd7d4b68ce0278a654c3801e5f586a647de07983fe9be9a8b5759ce24e40d49ca90e1a0524529c0751aa5902347873fcefe3e7646597adb906ac1ca8742c18ae9fabbfb4ab0e6afee35ace76a9a3da292d8e0662f5baff0390b232ffa15db791522d8483eb77250900022c1cef900bd65c538acc9d640489783f97c686d546b7002d33f27931144b7219df840a304e772ef4cdfb23293d8adadde8d43567bde4b0190c3d954f696f0b0a39aba3fb22be4ede443b8b28d99a3c3ea62e7f25aee5ec62acfda34289eb2bd516021b9bde1ccd6aae0c4e4caddfdfa8201d36d3125fc79421de9b2ac54e93aab613eba89208000432797f3895ab927f7f545ea63fdab747079e0c853d40cd03";
+fn signed_claim() -> crate::invitation::VerifiedInvitationClaim {
+    let token = crate::invitation::sign_token(
+        &iroh_base::SecretKey::from_bytes(&[7; 32]),
+        crate::WorkspaceId::from_bytes([3; 16]),
+        1_000,
+        2_000,
+        [9; 32],
+    )
+    .unwrap();
+    crate::invitation::sign_claim(
+        &iroh_base::SecretKey::from_bytes(&[8; 32]),
+        &token,
+        crate::MembershipOperationId::digest(b"genesis"),
+    )
+    .unwrap()
+}
 
 #[test]
 fn golden_token_claim_and_admit_authenticate_without_a_workspace() {
     assert_eq!(InvitationToken::from_str(TOKEN).unwrap().encoded(), TOKEN);
-    assert_eq!(InvitationClaim::from_str(CLAIM).unwrap().encoded(), CLAIM);
+    let claim = signed_claim();
+    let encoded = InvitationClaim::from_verified(&claim);
     assert_eq!(
-        CoreRuntime::authenticate_membership_operation(&decode_hex(ADMIT))
+        InvitationClaim::from_str(encoded.encoded())
             .unwrap()
-            .to_string(),
-        "39aba3fb22be4ede443b8b28d99a3c3ea62e7f25aee5ec62acfda34289eb2bd5"
+            .verified()
+            .unwrap()
+            .create_person
+            .id,
+        claim.create_person.id
+    );
+    let admission = crate::membership::MembershipEnvelope::sign(
+        &iroh_base::SecretKey::from_bytes(&[7; 32]),
+        claim.token.workspace_id,
+        1_100,
+        crate::membership::MembershipAction::Admit {
+            target: claim.invitee,
+            proof: Box::new(crate::membership::AdmissionProof {
+                claim: claim.clone(),
+            }),
+        },
+        vec![claim.create_person.id],
+    )
+    .unwrap();
+    assert_eq!(
+        CoreRuntime::authenticate_membership_operation(admission.canonical_bytes()).unwrap(),
+        admission.id,
     );
 }
 
@@ -28,20 +63,31 @@ fn malformed_tampered_and_changed_target_values_are_rejected() {
     token.replace_range(140..142, "08");
     assert!(InvitationToken::from_str(&token).is_err());
 
-    let mut claim = CLAIM.to_owned();
-    // First byte of the invitee identity in the complete claim.
-    claim.replace_range(400..402, "12");
-    assert!(InvitationClaim::from_str(&claim).is_err());
+    let mut claim = signed_claim().bytes;
+    // The claim signature cannot authenticate a changed invitee.
+    claim[3 + 196 + 1] ^= 1;
+    assert!(crate::invitation::decode_claim(&claim).is_err());
 
     let mut oversized = TOKEN.to_owned();
     oversized.push_str("00");
     assert!(InvitationToken::from_str(&oversized).is_err());
 
-    let mut admit = decode_hex(ADMIT);
+    let signed = signed_claim();
+    let mut admit = crate::membership::MembershipEnvelope::sign(
+        &iroh_base::SecretKey::from_bytes(&[7; 32]),
+        signed.token.workspace_id,
+        1_100,
+        crate::membership::MembershipAction::Admit {
+            target: signed.invitee,
+            proof: Box::new(crate::membership::AdmissionProof {
+                claim: signed.clone(),
+            }),
+        },
+        vec![signed.create_person.id],
+    )
+    .unwrap()
+    .canonical_bytes()
+    .to_vec();
     admit[100] ^= 1;
     assert!(CoreRuntime::authenticate_membership_operation(&admit).is_err());
-}
-
-fn decode_hex(value: &str) -> Vec<u8> {
-    crate::encoding::hex_decode(value).expect("hex fixture")
 }

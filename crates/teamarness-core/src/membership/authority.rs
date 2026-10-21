@@ -60,7 +60,7 @@ impl Ledger {
     pub(crate) fn record(&mut self, operation: &MembershipEnvelope) {
         match &operation.action {
             MembershipAction::Create => {}
-            MembershipAction::CreatePerson => {
+            MembershipAction::CreatePerson { .. } => {
                 self.groups.insert(operation.id, operation.author);
             }
             MembershipAction::Admit { target, proof } => {
@@ -146,7 +146,14 @@ pub(crate) fn authorize(
         MembershipAction::Create => Err(MembershipError::ConflictingGenesis),
         // A group create grants nothing until a Manager attaches it, so it
         // needs no prior standing; the attachment carries every check.
-        MembershipAction::CreatePerson => Ok(()),
+        MembershipAction::CreatePerson {
+            creator: co_manager,
+        } => {
+            if *co_manager != creator {
+                return Err(MembershipError::NotManager);
+            }
+            Ok(())
+        }
         MembershipAction::Admit { target, proof } => {
             if operation.author != creator {
                 return Err(MembershipError::NotManager);
@@ -160,6 +167,11 @@ pub(crate) fn authorize(
                 return Err(MembershipError::InvalidAdmissionProof);
             }
             let group = proof.claim.create_person.id;
+            if !matches!(proof.claim.create_person.action, MembershipAction::CreatePerson { creator: co_manager } if co_manager == creator)
+                || proof.claim.token.inviter != creator
+            {
+                return Err(MembershipError::InvalidAdmissionProof);
+            }
             match ancestry.groups.get(&group) {
                 Some(author) if *author == *target => {}
                 _ => return Err(MembershipError::UnknownPersonGroup),
@@ -209,7 +221,11 @@ pub(crate) fn authorize(
             ancestry.admit_key(*agent, creator)
         }
         MembershipAction::RemoveAgentKey { group, agent } => {
-            ancestry.managed_group(*group, operation.author)?;
+            if operation.author != creator {
+                ancestry.managed_group(*group, operation.author)?;
+            } else if !ancestry.groups.contains_key(group) {
+                return Err(MembershipError::UnknownPersonGroup);
+            }
             if !ancestry.group_admitted(*group) {
                 return Err(MembershipError::PersonNotAdmitted);
             }

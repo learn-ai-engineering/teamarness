@@ -30,7 +30,8 @@ This index is the one place that lists every decision's status, its supersession
 | [0020](0020-subscription-driven-content-key-acquisition.md) | Subscription-driven Content Key acquisition | accepted (2026-09-22) | – | – | In the ADR | Refines 0008 (first-key bootstrap trigger), 0009 and 0014 (durable synchronization work); preserves 0013 grant authority |
 | [0021](0021-fair-class-selection-under-scheduler-cap.md) | Fair class selection under the synchronization cap | accepted (2026-09-23) | – | – | In the ADR | Refines 0014 (scheduling) and 0020 (TRANS-R08) |
 | [0022](0022-workspace-person-names.md) | Workspace Person names are Core-owned, not a Profile Package | accepted (2026-10-11) | – | 0023 (one Person per Installation; names-only; no cross-Package Person data; `teamarness.person-names`) | In the ADR | Refines 0003, 0004, 0008/0009, 0018 |
-| [0023](0023-workspace-principals-key-per-principal.md) | Workspace Principals and key-per-Principal attribution | accepted (2026-10-21) | 0022 (part) | – | In the ADR | Refines 0004 (Person key groups), 0005 (group create in the claim), 0017 (Agent key custody); replaces `teamarness.person-names` with `teamarness.principals`; record-log 1.1 `principal` selector |
+| [0023](0023-workspace-principals-key-per-principal.md) | Workspace Principals and key-per-Principal attribution | accepted (2026-10-21) | 0022 (part) | 0024 (§2 sole manager and Manager-uninvolved Agent removal) | In the ADR | Refines 0004 (Person key groups), 0005 (group create in the claim), 0017 (Agent key custody); replaces `teamarness.person-names` with `teamarness.principals`; record-log 1.1 `principal` selector |
+| [0024](0024-manager-co-manages-person-groups.md) | Workspace Manager co-manages Person key groups | accepted (2026-10-21) | 0023 (§2 part) | – | In the ADR | Signed co-manager from genesis; Manager removes an individual Agent, but cannot add to another Person's group |
 
 ### Former file names
 

@@ -67,7 +67,9 @@ fn agent_key_proof_forgery_is_rejected_before_authorization() {
         &CREATOR,
         workspace,
         10,
-        TestAction::CreatePerson,
+        TestAction::CreatePerson {
+            creator: identity_of(&CREATOR),
+        },
         &[genesis_id],
     );
     let attach = sign_operation(

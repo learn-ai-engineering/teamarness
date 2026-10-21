@@ -190,7 +190,9 @@ mod groups {
                 &CREATOR,
                 workspace,
                 10,
-                TestAction::CreatePerson,
+                TestAction::CreatePerson {
+                    creator: identity_of(&CREATOR),
+                },
                 &[genesis_id],
             );
             let creator_group_id = operation_id(&creator_group);
@@ -333,7 +335,7 @@ mod groups {
                 if actor == "creator" {
                     Ok(())
                 } else {
-                    not_manager(actor)
+                    Err(MembershipError::NotManager)
                 },
             ));
             // Revoke the Member's group.
@@ -357,7 +359,13 @@ mod groups {
             // parks a non-creator group create until a Manager attaches it.
             rows.push((
                 format!("{actor} creates a group"),
-                vec![fixture.sign(&secret, TestAction::CreatePerson, 70)],
+                vec![fixture.sign(
+                    &secret,
+                    TestAction::CreatePerson {
+                        creator: identity_of(&CREATOR),
+                    },
+                    70,
+                )],
                 if actor == "agent" {
                     Err(MembershipError::AgentKeyCannotAuthor)
                 } else {
@@ -365,7 +373,13 @@ mod groups {
                 },
             ));
             // AttachPerson of a group the actor just created.
-            let group = fixture.sign(&secret, TestAction::CreatePerson, 70);
+            let group = fixture.sign(
+                &secret,
+                TestAction::CreatePerson {
+                    creator: identity_of(&CREATOR),
+                },
+                70,
+            );
             let attach = sign_operation(
                 &secret,
                 fixture.workspace,
@@ -400,9 +414,8 @@ mod groups {
                     _ => not_manager(actor),
                 },
             ));
-            // RemoveAgentKey of the Member's Agent from the Member's group (the
-            // Manager included: it is not that group's manager), or from the
-            // revoked Person's own group.
+            // The Steward and Workspace creator may remove the Member's Agent;
+            // other keys cannot remove it or act inside a revoked group.
             rows.push((
                 format!("{actor} removes an agent key"),
                 vec![fixture.sign(
@@ -418,7 +431,7 @@ mod groups {
                     70,
                 )],
                 match actor {
-                    "member" => Ok(()),
+                    "creator" | "member" => Ok(()),
                     "revoked" => Err(MembershipError::PersonNotAdmitted),
                     _ => not_manager(actor),
                 },
@@ -440,6 +453,20 @@ mod groups {
             }
         }
 
+        // A signed Person create cannot nominate an unrelated co-manager,
+        // even before the group is attached to the Workspace.
+        rows.push((
+            "wrong workspace creator in signed group create".to_owned(),
+            vec![fixture.sign(
+                &OUTSIDER,
+                TestAction::CreatePerson {
+                    creator: identity_of(&MEMBER),
+                },
+                70,
+            )],
+            Err(MembershipError::NotManager),
+        ));
+
         // Cross-group and readmission rules.
         rows.push((
             "member adds a key to another Person's group".to_owned(),
@@ -453,7 +480,25 @@ mod groups {
             )],
             Err(MembershipError::NotManager),
         ));
-        let unattached = fixture.sign(&MEMBER, TestAction::CreatePerson, 70);
+        rows.push((
+            "manager cannot add an Agent to another Person's group".to_owned(),
+            vec![fixture.sign(
+                &CREATOR,
+                TestAction::AddAgentKey {
+                    group: fixture.member_group,
+                    agent_secret: NEW_AGENT,
+                },
+                70,
+            )],
+            Err(MembershipError::NotManager),
+        ));
+        let unattached = fixture.sign(
+            &MEMBER,
+            TestAction::CreatePerson {
+                creator: identity_of(&CREATOR),
+            },
+            70,
+        );
         rows.push((
             "member adds a key to a group that is not admitted".to_owned(),
             vec![
@@ -620,6 +665,56 @@ mod groups {
         );
     }
 
+    #[test]
+    fn concurrent_manager_remove_and_steward_add_preserve_the_person_and_new_agent() {
+        let fixture = Fixture::build();
+        let remove = fixture.sign(
+            &CREATOR,
+            TestAction::RemoveAgentKey {
+                group: fixture.member_group,
+                agent: identity_of(&AGENT),
+            },
+            70,
+        );
+        let add = fixture.sign(
+            &MEMBER,
+            TestAction::AddAgentKey {
+                group: fixture.member_group,
+                agent_secret: NEW_AGENT,
+            },
+            70,
+        );
+        let first = fixture.replay(&[remove.clone(), add.clone()]).unwrap();
+        let second = fixture.replay(&[add, remove]).unwrap();
+        assert_eq!(first, second);
+        assert!(
+            first
+                .members()
+                .iter()
+                .any(|member| member.identity() == identity_of(&MEMBER))
+        );
+        assert!(
+            first
+                .members()
+                .iter()
+                .any(|member| member.identity() == identity_of(&NEW_AGENT))
+        );
+        assert!(
+            !first
+                .members()
+                .iter()
+                .any(|member| member.identity() == identity_of(&AGENT))
+        );
+        assert_eq!(
+            first
+                .members()
+                .iter()
+                .filter(|member| member.role() == MembershipRole::Manager)
+                .count(),
+            1
+        );
+    }
+
     /// A group create from anyone but the creator is parked by the runtime
     /// until a Manager attaches it; it never enters the accepted set alone.
     #[tokio::test]
@@ -635,7 +730,9 @@ mod groups {
             &OUTSIDER,
             workspace,
             now_unix_ms(),
-            TestAction::CreatePerson,
+            TestAction::CreatePerson {
+                creator: runtime.public_identity(),
+            },
             &heads,
         );
         assert_eq!(

@@ -16,7 +16,9 @@ use super::{AdmissionProof, AgentKeyProof, MembershipAction, MembershipEnvelope}
 #[doc(hidden)]
 pub enum TestAction {
     Create,
-    CreatePerson,
+    CreatePerson {
+        creator: PublicIdentity,
+    },
     AttachPerson {
         group: MembershipOperationId,
     },
@@ -97,7 +99,7 @@ pub fn try_sign_operation(
     let steward = identity_of(author_secret);
     let action = match action {
         TestAction::Create => MembershipAction::Create,
-        TestAction::CreatePerson => MembershipAction::CreatePerson,
+        TestAction::CreatePerson { creator } => MembershipAction::CreatePerson { creator },
         TestAction::AttachPerson { group } => MembershipAction::AttachPerson { group },
         TestAction::Revoke { target, group } => MembershipAction::Revoke { target, group },
         TestAction::AddAgentKey {

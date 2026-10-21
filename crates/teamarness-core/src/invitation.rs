@@ -143,7 +143,9 @@ pub(crate) fn sign_claim(
         secret_key,
         token.workspace_id,
         token.issued_at_unix_ms,
-        MembershipAction::CreatePerson,
+        MembershipAction::CreatePerson {
+            creator: token.inviter,
+        },
         vec![genesis_id],
     )
     .map_err(|_| InvitationError::Malformed)?;
@@ -277,7 +279,7 @@ pub(crate) fn decode_claim(bytes: &[u8]) -> Result<VerifiedInvitationClaim, Invi
         .map_err(|_| InvitationError::Malformed)?;
     // The embedded operation must be the invitee's own group create for this
     // Workspace, anchored on exactly one dependency (the genesis).
-    if !matches!(create_person.action, MembershipAction::CreatePerson)
+    if !matches!(create_person.action, MembershipAction::CreatePerson { creator } if creator == token.inviter)
         || create_person.workspace_id != token.workspace_id
         || create_person.dependencies.len() != 1
     {
@@ -343,6 +345,9 @@ mod tests {
         let claim = sign_claim(&secret(8), &token, genesis()).unwrap();
         assert_eq!(claim.bytes.len(), CLAIM_LEN);
         assert_eq!(claim.create_person.author, claim.invitee);
+        assert!(
+            matches!(claim.create_person.action, MembershipAction::CreatePerson { creator } if creator == token.inviter)
+        );
         assert_eq!(claim.create_person.dependencies, vec![genesis()]);
         assert_eq!(claim.create_person.authored_at_unix_ms, 1_000);
 
@@ -384,7 +389,9 @@ mod tests {
             &secret(9),
             workspace,
             1_000,
-            MembershipAction::CreatePerson,
+            MembershipAction::CreatePerson {
+                creator: token.inviter,
+            },
             vec![genesis()],
         )
         .unwrap();
@@ -396,7 +403,9 @@ mod tests {
             &secret(8),
             WorkspaceId::from_bytes([4; 16]),
             1_000,
-            MembershipAction::CreatePerson,
+            MembershipAction::CreatePerson {
+                creator: token.inviter,
+            },
             vec![genesis()],
         )
         .unwrap();
@@ -413,6 +422,20 @@ mod tests {
         )
         .unwrap();
         assert!(sign_claim_with_create_person(&secret(8), &token, &not_a_create).is_err());
+        let wrong_inviter = MembershipEnvelope::sign(
+            &secret(8),
+            workspace,
+            1_000,
+            MembershipAction::CreatePerson {
+                creator: PublicIdentity::from_bytes(*secret(9).public().as_bytes()).unwrap(),
+            },
+            vec![genesis()],
+        )
+        .unwrap();
+        assert!(matches!(
+            sign_claim_with_create_person(&secret(8), &token, &wrong_inviter),
+            Err(InvitationError::Malformed)
+        ));
     }
 
     #[test]

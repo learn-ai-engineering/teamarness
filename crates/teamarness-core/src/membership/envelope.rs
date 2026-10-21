@@ -27,7 +27,7 @@ pub(crate) const MAX_ENVELOPE_BYTES: usize = 4 + MAX_UNSIGNED_BYTES + 32 + 64;
 /// A `create person` operation with one dependency has this exact canonical
 /// width: header (1 + 1 + 16 + 1 + 32 + 8), action tag, dependency count and
 /// one dependency, then the identifier and signature.
-pub(crate) const CREATE_PERSON_ENVELOPE_BYTES: usize = 4 + (59 + 1 + 2 + 32) + 32 + 64;
+pub(crate) const CREATE_PERSON_ENVELOPE_BYTES: usize = 4 + (59 + 1 + 1 + 32 + 2 + 32) + 32 + 64;
 
 #[derive(Clone)]
 pub(crate) struct AdmissionProof {
@@ -112,7 +112,9 @@ pub(crate) enum MembershipAction {
         group: MembershipOperationId,
     },
     /// Creates the author's own key group; the group is this operation's ID.
-    CreatePerson,
+    CreatePerson {
+        creator: PublicIdentity,
+    },
     /// Adds the creator's own Person group to the Workspace beside genesis.
     AttachPerson {
         group: MembershipOperationId,
@@ -134,7 +136,7 @@ impl MembershipAction {
     /// The key whose membership this action changes, if any.
     pub(crate) fn subject(&self) -> Option<PublicIdentity> {
         match self {
-            Self::Create | Self::CreatePerson | Self::AttachPerson { .. } => None,
+            Self::Create | Self::CreatePerson { .. } | Self::AttachPerson { .. } => None,
             Self::Admit { target, .. } | Self::Revoke { target, .. } => Some(*target),
             Self::AddAgentKey { agent, .. } | Self::RemoveAgentKey { agent, .. } => Some(*agent),
         }
@@ -154,7 +156,10 @@ impl MembershipAction {
     /// Field-level equality, used to confirm a parsed copy against its bytes.
     pub(crate) fn same_as(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Create, Self::Create) | (Self::CreatePerson, Self::CreatePerson) => true,
+            (Self::Create, Self::Create) => true,
+            (Self::CreatePerson { creator: left }, Self::CreatePerson { creator: right }) => {
+                left == right
+            }
             (
                 Self::Admit {
                     target: left_target,
@@ -364,7 +369,11 @@ fn encode_unsigned(
             bytes.push(PERSON_GROUP_TAG);
             bytes.extend_from_slice(group.as_bytes());
         }
-        MembershipAction::CreatePerson => bytes.push(CREATE_PERSON_TAG),
+        MembershipAction::CreatePerson { creator } => {
+            bytes.push(CREATE_PERSON_TAG);
+            bytes.push(INSTALLATION_TAG);
+            bytes.extend_from_slice(creator.as_bytes());
+        }
         MembershipAction::AttachPerson { group } => {
             bytes.push(ATTACH_PERSON_TAG);
             bytes.push(PERSON_GROUP_TAG);
@@ -454,7 +463,9 @@ fn decode_unsigned(
             let group = reader.person_group()?;
             MembershipAction::Revoke { target, group }
         }
-        CREATE_PERSON_TAG => MembershipAction::CreatePerson,
+        CREATE_PERSON_TAG => MembershipAction::CreatePerson {
+            creator: reader.installation()?,
+        },
         ATTACH_PERSON_TAG => {
             let group = reader.person_group()?;
             if reader.byte()? != MEMBER_ACCESS {
@@ -626,7 +637,9 @@ mod tests {
             &secret(4),
             WorkspaceId::from_bytes([5; 16]),
             42,
-            MembershipAction::CreatePerson,
+            MembershipAction::CreatePerson {
+                creator: identity(4),
+            },
             vec![MembershipOperationId::digest(b"genesis")],
         )
         .unwrap();
@@ -859,7 +872,9 @@ mod tests {
                     target: identity(seed + 32),
                     group,
                 },
-                3 => MembershipAction::CreatePerson,
+                3 => MembershipAction::CreatePerson {
+                    creator: identity(seed),
+                },
                 4 => MembershipAction::AttachPerson { group },
                 5 => MembershipAction::AddAgentKey {
                     group,

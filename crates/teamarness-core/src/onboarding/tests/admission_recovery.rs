@@ -54,7 +54,7 @@ async fn exact_retry_recovers_after_expiry_without_a_duplicate_admission() {
         .unwrap();
     let workspace = issuer.create_workspace("Exact recovery").unwrap();
     let token = issuer
-        .issue_invitation(workspace.id(), now_unix_ms() + 50)
+        .issue_invitation(workspace.id(), now_unix_ms() + 1_000)
         .unwrap();
     let claim = invitee
         .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
@@ -65,7 +65,7 @@ async fn exact_retry_recovers_after_expiry_without_a_duplicate_admission() {
         .unwrap();
     let first_response = decode_success(&first).unwrap();
     // negative-wait: the invitation's expiry is a wall-clock timestamp, not an event.
-    std::thread::sleep(Duration::from_millis(75));
+    std::thread::sleep(Duration::from_millis(1_050));
     let recovered = issuer
         .admit_and_export_for_test(&claim, invitee.public_identity(), None)
         .unwrap();
