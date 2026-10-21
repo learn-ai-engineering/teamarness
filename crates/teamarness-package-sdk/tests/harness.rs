@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use teamarness_package_protocol::JsonValue;
+use teamarness_package_sdk::ports::PortClient;
 use teamarness_package_sdk::testing::{
     HarnessBuilder, ScriptedCapability, assert_router_matches_contract,
 };
@@ -199,6 +200,64 @@ fn capability_router(gate: Arc<tokio::sync::Semaphore>) -> Router<()> {
             Ok(serde_json::json!({ "greeting": greeting, "received": received }))
         }
     })
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_port_client_uses_exact_grant_and_live_query_stream() {
+    let directory = tempfile::tempdir().unwrap();
+    let scripted = ScriptedCapability::new().calls(|method, payload| match method {
+        "available" => {
+            assert_eq!(payload, empty());
+            Ok(serde_json::json!({"contracts":[]}))
+        }
+        "invoke" => {
+            assert_eq!(payload["contract"], "com.example.messages");
+            assert_eq!(payload["port"], "message.post");
+            assert_eq!(payload["kind"], "command");
+            assert_eq!(payload["request"], serde_json::json!({"text":"hello"}));
+            Ok(serde_json::json!({"accepted":true}))
+        }
+        _ => panic!("unexpected method {method}"),
+    });
+    let router = Router::stateless().request("fixture.ports", |context, _: Empty| async move {
+        let grant = context
+            .initialization()
+            .capability("teamarness.package-ports")
+            .unwrap()
+            .grant
+            .clone();
+        let client = PortClient::new(context.capabilities().clone(), grant);
+        let available = client.available().await?;
+        let result = client
+            .command(
+                "com.example.messages",
+                "message.post",
+                serde_json::json!({"text":"hello"}),
+            )
+            .await?;
+        let mut query = client
+            .live_query("com.example.messages", "message.watch", empty())
+            .await?;
+        let event = query.recv().await.unwrap()?;
+        query.close().await;
+        Ok(serde_json::json!({"available":available,"result":result,"event":event}))
+    });
+    let mut harness = HarnessBuilder::new(router.into_backend())
+        .data_directory(directory.path())
+        .capability("teamarness.package-ports", scripted.clone())
+        .start()
+        .await;
+    harness.activate().await.unwrap();
+    let pending = harness.start_request("fixture.ports", empty()).await;
+    let sender = scripted.stream();
+    assert!(sender.send(serde_json::json!({"order":1})).await);
+    let answer = pending.result().await.unwrap();
+    assert_eq!(answer["result"]["accepted"], true);
+    assert_eq!(answer["event"]["order"], 1);
+    assert_eq!(scripted.recorded_calls().len(), 2);
+    assert_eq!(scripted.recorded_opens().len(), 1);
+    harness.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

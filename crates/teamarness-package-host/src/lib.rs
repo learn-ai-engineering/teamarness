@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod broker;
 mod capability;
 mod catalog;
 mod commands;
@@ -84,6 +85,7 @@ struct PackageHostInner {
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
     authoring_catalog: Vec<AuthoringCatalogEntry>,
     port_graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    port_broker: Arc<broker::PortBroker>,
     port_contracts: BTreeMap<
         PackageIdentity,
         Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,

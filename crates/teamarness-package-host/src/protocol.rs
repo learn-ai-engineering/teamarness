@@ -185,8 +185,24 @@ pub(crate) struct UiEventRoute {
     terminal: watch::Sender<Option<StreamEnd>>,
     bytes: Arc<Semaphore>,
     state: Mutex<UiEventRouteState>,
-    contract: Arc<AdmittedUi>,
+    contract: EventContract,
     operation: String,
+}
+
+enum EventContract {
+    Ui(Arc<AdmittedUi>),
+    Port {
+        schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        contract: String,
+    },
+}
+
+pub(crate) struct PortQueryStream {
+    pub(crate) receiver: UiEventReceiver,
+    pub(crate) client: ProcessClient,
+    pub(crate) id: String,
+    pub(crate) _route: Box<dyn Send + Sync>,
+    pub(crate) _provider: OwnedSemaphorePermit,
 }
 
 /// What the route owes its subscriber, and nothing about the wire.
@@ -241,7 +257,19 @@ impl UiEventReceiver {
 }
 
 impl UiEventRoute {
+    fn new_port(
+        schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        contract: String,
+        operation: String,
+    ) -> (Arc<Self>, UiEventReceiver) {
+        Self::new_internal(EventContract::Port { schemas, contract }, operation)
+    }
+
     fn new(contract: Arc<AdmittedUi>, operation: String) -> (Arc<Self>, UiEventReceiver) {
+        Self::new_internal(EventContract::Ui(contract), operation)
+    }
+
+    fn new_internal(contract: EventContract, operation: String) -> (Arc<Self>, UiEventReceiver) {
         let (events, receiver) = mpsc::channel(UI_EVENT_CAPACITY);
         let (terminal, terminal_receiver) = watch::channel(None);
         let route = Arc::new(Self {
@@ -275,16 +303,24 @@ impl UiEventRoute {
     /// byte budget both hold the whole credit window, and credit returns only
     /// for an event the subscriber has acknowledged.
     fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
-        let payload: PackageValue =
-            serde_json::from_value(value).map_err(|_| PackageErrorCode::UiContractViolation)?;
-        self.contract
-            .contract
-            .validate_event(&self.operation, &payload)
+        let payload: PackageValue = serde_json::from_value(value.clone())
             .map_err(|_| PackageErrorCode::UiContractViolation)?;
+        match &self.contract {
+            EventContract::Ui(contract) => contract
+                .contract
+                .validate_event(&self.operation, &payload)
+                .map_err(|_| PackageErrorCode::UiContractViolation)?,
+            EventContract::Port { schemas, contract } => schemas
+                .validate(contract, &self.operation, "event", &value)
+                .map_err(|_| PackageErrorCode::PortEventInvalid)?,
+        }
         let encoded =
             serde_json::to_vec(&payload).map_err(|_| PackageErrorCode::UiContractViolation)?;
         if encoded.len() > MAX_UI_PAYLOAD_BYTES {
-            return Err(PackageErrorCode::UiContractViolation);
+            return Err(match &self.contract {
+                EventContract::Ui(_) => PackageErrorCode::UiContractViolation,
+                EventContract::Port { .. } => PackageErrorCode::PortEventInvalid,
+            });
         }
         let permits =
             u32::try_from(encoded.len()).map_err(|_| PackageErrorCode::UiContractViolation)?;
@@ -638,10 +674,11 @@ impl Writer {
 }
 
 /// A failed capability call, and whether its state change may still land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapabilityFailure {
     pub(crate) code: PackageErrorCode,
     pub(crate) outcome_uncertain: bool,
+    pub(crate) package_error: Option<PackageOwnedError>,
 }
 
 impl CapabilityFailure {
@@ -649,6 +686,7 @@ impl CapabilityFailure {
         Self {
             code,
             outcome_uncertain: false,
+            package_error: None,
         }
     }
 }
@@ -990,8 +1028,12 @@ async fn reader_task<R>(
                             // A state-changing call whose Core work had already
                             // begun may still commit. `append` is content
                             // idempotent, so the Package can retry it.
-                            outcome_uncertain: method == "append"
+                            outcome_uncertain: (method == "append"
+                                || (method == "invoke"
+                                    && payload.get("kind").and_then(Value::as_str)
+                                        == Some("command")))
                                 && started.load(std::sync::atomic::Ordering::Acquire),
+                            package_error: None,
                         })
                     });
                     let response = match result {
@@ -999,7 +1041,10 @@ async fn reader_task<R>(
                         Err(failure) => {
                             let mut details = json!({
                                 "kind":"error", "id":id,
-                                "code":capability_code(failure.code),
+                                "code":if failure.outcome_uncertain && method == "invoke"
+                                    && failure.code == PackageErrorCode::DeadlineExceeded {
+                                    "outcome_unknown"
+                                } else { capability_code(failure.code) },
                                 "retryable":matches!(
                                     failure.code,
                                     PackageErrorCode::Overloaded
@@ -1007,10 +1052,18 @@ async fn reader_task<R>(
                                 ),
                                 "details":{}
                             });
+                            if let Some(provider) = failure.package_error
+                                && let Some(object) = details.as_object_mut()
+                            {
+                                object.insert("details".to_owned(), json!({"provider":provider}));
+                            }
                             if failure.outcome_uncertain
                                 && let Some(object) = details.as_object_mut()
                             {
                                 object.insert("outcomeUncertain".to_owned(), Value::Bool(true));
+                                if method == "invoke" {
+                                    object.insert("retryable".to_owned(), Value::Bool(false));
+                                }
                             }
                             details
                         }
@@ -1052,6 +1105,11 @@ async fn reader_task<R>(
                         }
                     }
                 });
+            }
+            FrameKind::Cancel => {
+                // The classifier retired the caller's wait. Port dispatch has its own task and
+                // keeps the request/byte permits until Provider work ends; no command is replayed.
+                // A late answer is ignored by the classifier on both peers.
             }
             FrameKind::StreamOpen => {
                 let Some(id) = frame.field("id").and_then(Value::as_str).map(str::to_owned) else {
@@ -1238,6 +1296,7 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
     match code {
         PackageErrorCode::UiContractViolation => "ui_contract_violation",
         PackageErrorCode::EventLagged => "event_lagged",
+        PackageErrorCode::PortEventInvalid => "port_event_invalid",
         _ => "protocol_violation",
     }
 }
@@ -1248,6 +1307,14 @@ fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::CapabilityVersionUnsupported => "capability_version_unsupported",
         PackageErrorCode::DeadlineExceeded => "deadline_exceeded",
         PackageErrorCode::Overloaded => "overloaded",
+        PackageErrorCode::PortUnavailable => "port_unavailable",
+        PackageErrorCode::PortUngranted => "ungranted_port",
+        PackageErrorCode::PortRequestInvalid => "port_request_invalid",
+        PackageErrorCode::PortResponseInvalid => "port_response_invalid",
+        PackageErrorCode::PortEventInvalid => "port_event_invalid",
+        PackageErrorCode::OutcomeUncertain => "outcome_unknown",
+        PackageErrorCode::ProcessExited => "provider_exited",
+        PackageErrorCode::BackendError => "provider_error",
         _ => "capability_request_invalid",
     }
 }
@@ -1264,6 +1331,34 @@ fn protocol_code(error: teamarness_package_protocol::ProtocolError) -> PackageEr
 }
 
 impl ProcessClient {
+    pub(crate) async fn open_port_stream(
+        &self,
+        id: String,
+        payload: PackageValue,
+        schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        contract: String,
+        port: String,
+    ) -> Result<UiEventReceiver, WireFailure> {
+        let (route, receiver) = UiEventRoute::new_port(schemas, contract, port);
+        self.ui_event_routes
+            .lock()
+            .await
+            .insert(id.clone(), route.clone());
+        if let Err(error) = self
+            .writer
+            .control(json!({
+                "kind":"stream_open", "id":id, "topic":"teamarness.port.query.v1",
+                "initialCredit":INITIAL_STREAM_CREDIT, "payload":package_value_to_json(payload)
+            }))
+            .await
+        {
+            self.ui_event_routes.lock().await.remove(&id);
+            route.terminate(StreamEnd::Host(error.code));
+            return Err(error);
+        }
+        Ok(receiver)
+    }
+
     pub(crate) async fn initialize(&self, value: Value) -> Result<Frame, WireFailure> {
         self.writer.control(value).await?;
         let receiver = self
@@ -1287,6 +1382,49 @@ impl ProcessClient {
         deadline: Duration,
         state_changing: bool,
     ) -> Result<Value, WireFailure> {
+        self.request_inner(
+            id,
+            operation,
+            mount,
+            payload,
+            deadline,
+            state_changing,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_port(
+        &self,
+        id: String,
+        operation: &str,
+        payload: PackageValue,
+        dispatched: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Value, WireFailure> {
+        self.request_inner(
+            id,
+            operation,
+            None,
+            payload,
+            Duration::from_secs(8),
+            true,
+            Some(dispatched),
+        )
+        .await
+    }
+
+    // The legacy mount request and a port call share one writer-acceptance boundary.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_inner(
+        &self,
+        id: String,
+        operation: &str,
+        mount: Option<&str>,
+        payload: PackageValue,
+        deadline: Duration,
+        state_changing: bool,
+        dispatched: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Value, WireFailure> {
         if self.pending.lock().await.len() >= MAX_IN_FLIGHT_EACH_DIRECTION {
             return Err(WireFailure::new(PackageErrorCode::Overloaded));
         }
@@ -1306,10 +1444,30 @@ impl ProcessClient {
         if let Some(mount) = mount {
             value["mountId"] = Value::String(mount.to_owned());
         }
-        self.writer.data(value).await?;
+        if let Err(error) = self.writer.data(value).await {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        if let Some(dispatched) = dispatched {
+            dispatched.store(true, std::sync::atomic::Ordering::Release);
+        }
         match tokio::time::timeout(deadline, &mut receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(WireFailure::new(PackageErrorCode::ProcessExited)),
+            Ok(Ok(result)) => result.map_err(|mut error| {
+                if state_changing
+                    && !matches!(
+                        error.code,
+                        PackageErrorCode::BackendError | PackageErrorCode::Overloaded
+                    )
+                {
+                    error.outcome_uncertain = true;
+                }
+                error
+            }),
+            Ok(Err(_)) => {
+                let mut error = WireFailure::new(PackageErrorCode::ProcessExited);
+                error.outcome_uncertain = state_changing;
+                Err(error)
+            }
             Err(_) => {
                 self.send_cancel(&id).await?;
                 match tokio::time::timeout(Duration::from_millis(500), &mut receiver).await {

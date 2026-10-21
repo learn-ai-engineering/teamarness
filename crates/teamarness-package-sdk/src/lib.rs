@@ -14,6 +14,7 @@ mod dispatcher;
 mod initialization;
 mod lifecycle;
 mod parent_lifeline;
+pub mod ports;
 mod priority_writer;
 mod reader;
 mod router;
@@ -70,6 +71,7 @@ impl BackendRequest {
 pub struct BackendError {
     code: String,
     retryable: bool,
+    outcome_uncertain: bool,
     details: JsonValue,
 }
 
@@ -90,6 +92,7 @@ impl BackendError {
         Self {
             code,
             retryable,
+            outcome_uncertain: false,
             details: if details.is_object() {
                 details
             } else {
@@ -108,6 +111,20 @@ impl BackendError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         self.retryable
+    }
+
+    /// Whether a dispatched command may already have taken effect. Never replay it automatically.
+    #[must_use]
+    pub const fn outcome_uncertain(&self) -> bool {
+        self.outcome_uncertain
+    }
+
+    pub(crate) fn with_outcome_uncertain(mut self, uncertain: bool) -> Self {
+        self.outcome_uncertain = uncertain;
+        if uncertain {
+            self.retryable = false;
+        }
+        self
     }
 
     /// The bounded object the Package attached to this error.

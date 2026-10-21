@@ -115,6 +115,27 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
         });
         Ok(subscription)
     })
+    .port_request(
+        "com.example.messages",
+        "message.post",
+        "command",
+        |_context, actor, _: Empty| async move {
+            let teamarness_package_sdk::ports::PortActor::Person { identity } = actor;
+            Ok(serde_json::json!({"actor": identity}))
+        },
+    )
+    .port_live_query(
+        "com.example.messages",
+        "message.watch",
+        |_context, actor, _: Empty| async move {
+            let (sender, subscription) = event_channel(2);
+            let teamarness_package_sdk::ports::PortActor::Person { identity } = actor;
+            tokio::spawn(async move {
+                let _ = sender.send(serde_json::json!({"actor":identity})).await;
+            });
+            Ok(subscription)
+        },
+    )
     .subscription("fixture.watch", |context, request: Add| async move {
         let (sender, subscription) = event_channel(2);
         let id = context.state().id;
@@ -183,6 +204,30 @@ impl Session {
         drop(self.host_write);
         self.service.await.unwrap().unwrap();
     }
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
+    let mut session = start(counting_router(Arc::new(Hooks::default()))).await;
+    session
+        .request("h:activate", "lifecycle.activate", "{}")
+        .await;
+    let envelope = r#"{"contract":"com.example.messages","major":1,"minor":0,"port":"message.post","actor":{"kind":"person","identity":"installation1"},"request":{}}"#;
+    let response = session
+        .request("h:port", "teamarness.port.command.v1", envelope)
+        .await;
+    assert_eq!(response.kind(), FrameKind::Response);
+    assert_eq!(response.field("payload").unwrap()["actor"], "installation1");
+    let forged = session.request("h:forged", "teamarness.port.command.v1",
+        r#"{"contract":"com.example.messages","major":1,"minor":0,"port":"message.post","actor":{"kind":"agent","identity":"someone"},"request":{}}"#).await;
+    assert_eq!(forged.field("code").unwrap(), "package.invalid_payload");
+    write_json(&mut session.host_write,
+        r#"{"kind":"stream_open","id":"h:live","topic":"teamarness.port.query.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":1,"minor":0,"port":"message.watch","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+    let event = read_frame(&mut session.host_read).await;
+    assert_eq!(event.kind(), FrameKind::Event);
+    assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
+    session.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -12,6 +12,14 @@ A different shape is a **new family**, declared and negotiated beside the existi
 
 See ADR 0018, Package seam versioning, for the policy, including the deprecation window intended for the first breaking change.
 
+## `teamarness.package-ports` 1.0
+
+A Package must declare this family and the exact consumed contract/port/kind set in its manifest. Its opaque grant is bound to its Package, Installation, Workspace and process generation. The Host's immutable installation graph chooses the Provider; a caller cannot choose a target Package, Workspace, or acting Principal. `capability.call` with `method:"available"` and no other payload fields returns `{contracts:[{contract,major,minor,available,ports}]}` for **only** the caller's declared contracts and ports. A missing optional Provider remains listed with `available:false`, `minor:null`.
+
+For a command or ordinary query, call `method:"invoke"` with exactly `{contract,port,kind,request}` beside `method`; `kind` is `command` or `query`. The requested Port must match the manifest's individual name and kind. For a live query, open `capability.stream` with exactly `{grant,contract,port,kind:"query",request}`. A command/query request or response and every live-query event is checked against the admitted Provider's schema. An unavailable optional Port returns `port_unavailable`, an undeclared Port or wrong kind `ungranted_port`; invalid payloads report `port_request_invalid`, `port_response_invalid` or stream close `port_event_invalid`. `overloaded` is a bounded, pre-dispatch refusal.
+
+A command rejected before the Provider writer accepts its frame is certain. After acceptance, timeout, exit, cancellation race or an invalid response can conceal a mutation: the Host returns `outcome_unknown` with `outcomeUncertain:true` and `retryable:false` (for an invalid response, `port_response_invalid` with the same flags). The Host never automatically replays a command. Queries may be retryable but are not automatically replayed. A live query is one-to-one, credit-controlled and not an event subscription. The Provider receives typed Host-authored `{kind:"person",identity:<Installation public identity>}` actor context for an unbound Instance; current Agent binding integration is gated on the Agent/Core work landing, and callers cannot submit their own actor context.
+
 ## `teamarness.workspace-context` 1.0
 
 `get` takes no arguments. It returns `workspaceId`, `workspaceName`, `installationIdentity`, and `installationDisplayName`.

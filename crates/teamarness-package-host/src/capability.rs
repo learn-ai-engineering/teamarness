@@ -11,7 +11,7 @@ use teamarness_core::{
 use teamarness_package_protocol::INITIAL_STREAM_CREDIT;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
-use crate::protocol::{CapabilityFailure, HostStreamSender};
+use crate::protocol::{CapabilityFailure, HostStreamSender, PortQueryStream, StreamEnd};
 use crate::{InstallationPublicIdentity, PackageErrorCode, PackageIdentity, WorkspaceId};
 
 const SIGNING_CONTEXT: &str = "package-signing/v1";
@@ -146,6 +146,7 @@ enum CapabilityKind {
     PersonNames,
     Signing,
     ImmutableRecordLog,
+    PackagePorts,
     #[cfg(test)]
     Neutral,
 }
@@ -193,6 +194,7 @@ pub(crate) struct GenerationCapabilities {
     advertised: Vec<AdvertisedGrant>,
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     cancelled: watch::Sender<bool>,
+    broker: std::sync::Weak<crate::broker::PortBroker>,
 }
 
 impl GenerationCapabilities {
@@ -202,6 +204,7 @@ impl GenerationCapabilities {
         requirements: &[CapabilityRequirement],
         generation: u64,
         limiter: CoreCallLimiter,
+        broker: std::sync::Weak<crate::broker::PortBroker>,
     ) -> Result<Arc<Self>, PackageErrorCode> {
         if scope.package_identity.as_str() == crate::values::RESERVED_PERSON_NAME_SCOPE {
             return Err(PackageErrorCode::InvalidPackageIdentity);
@@ -241,6 +244,7 @@ impl GenerationCapabilities {
             advertised,
             streams: Arc::new(Mutex::new(BTreeMap::new())),
             cancelled,
+            broker,
         }))
     }
 
@@ -256,6 +260,53 @@ impl GenerationCapabilities {
         payload: &Value,
         started: Arc<AtomicBool>,
     ) -> Result<Value, CapabilityFailure> {
+        let bound = self
+            .bound_grant(grant)
+            .map_err(CapabilityFailure::certain)?;
+        if bound.descriptor.kind == CapabilityKind::PackagePorts {
+            let object = payload
+                .as_object()
+                .ok_or(PackageErrorCode::CapabilityRequestInvalid)
+                .map_err(CapabilityFailure::certain)?;
+            let method = string_field(object, "method").map_err(CapabilityFailure::certain)?;
+            let broker = self
+                .broker
+                .upgrade()
+                .ok_or(PackageErrorCode::CapabilityUnavailable)
+                .map_err(CapabilityFailure::certain)?;
+            return match method {
+                "available" if object.len() == 1 => Ok(broker
+                    .availability(&self.scope.package_identity, &self.scope.workspace_id)
+                    .await),
+                "invoke" => broker
+                    .call(
+                        &self.scope.package_identity,
+                        &self.scope.workspace_id,
+                        &self.core.public_identity().to_string(),
+                        object,
+                        started,
+                    )
+                    .await
+                    .map_err(|failure| CapabilityFailure {
+                        code: if failure.outcome_uncertain
+                            && matches!(
+                                failure.code,
+                                PackageErrorCode::ProcessExited
+                                    | PackageErrorCode::DeadlineExceeded
+                                    | PackageErrorCode::Cancelled
+                            ) {
+                            PackageErrorCode::OutcomeUncertain
+                        } else {
+                            failure.code
+                        },
+                        outcome_uncertain: failure.outcome_uncertain,
+                        package_error: failure.package_error,
+                    }),
+                _ => Err(CapabilityFailure::certain(
+                    PackageErrorCode::CapabilityRequestInvalid,
+                )),
+            };
+        }
         self.call_inner(grant, payload, started)
             .await
             .map_err(CapabilityFailure::certain)
@@ -282,6 +333,7 @@ impl GenerationCapabilities {
             CapabilityKind::ImmutableRecordLog => {
                 self.immutable_record(method, object, started).await
             }
+            CapabilityKind::PackagePorts => Err(PackageErrorCode::CapabilityRequestInvalid),
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
         }
@@ -302,6 +354,36 @@ impl GenerationCapabilities {
             .as_object()
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         let grant = self.bound_grant(Some(string_field(object, "grant")?))?;
+        if grant.descriptor.kind == CapabilityKind::PackagePorts {
+            let broker = self
+                .broker
+                .upgrade()
+                .ok_or(PackageErrorCode::CapabilityUnavailable)?;
+            let query = broker
+                .query_stream(
+                    &self.scope.package_identity,
+                    &self.scope.workspace_id,
+                    &self.core.public_identity().to_string(),
+                    object,
+                )
+                .await?;
+            let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
+            let mut streams = self.streams.lock().await;
+            if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
+                let _ = query.client.stream_close(&query.id).await;
+                return Err(PackageErrorCode::Overloaded);
+            }
+            drop(streams);
+            tokio::spawn(run_port_query(
+                stream_id,
+                query,
+                receiver,
+                output,
+                self.streams.clone(),
+                self.cancelled.subscribe(),
+            ));
+            return Ok(());
+        }
         let method = string_field(object, "method")?;
         let core_workspace =
             teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
@@ -819,6 +901,13 @@ impl Registry {
             kind: CapabilityKind::Signing,
         });
         registry.register(Descriptor {
+            family: CapabilityFamily::new("teamarness.package-ports"),
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::PackagePorts,
+        });
+        registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.synchronization.immutable-record-log"),
             major: 1,
             min_minor: 0,
@@ -932,6 +1021,54 @@ fn person_name_snapshot(
 
 // A profile cursor invalidates a snapshot; it is not a replay ledger. A lagging
 // consumer receives the latest bounded snapshot and resumes at its cursor.
+async fn run_port_query(
+    id: String,
+    mut query: PortQueryStream,
+    mut commands: mpsc::Receiver<StreamCommand>,
+    output: HostStreamSender,
+    streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let mut credit = MAX_STREAM_CREDIT;
+    let mut sequence = 0;
+    let reason = loop {
+        if *cancelled.borrow()
+            || !drain_commands(&mut commands, &mut credit).await
+            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
+        {
+            break "closed";
+        }
+        tokio::select! {
+            biased;
+            change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
+            command = commands.recv() => match command {
+                Some(StreamCommand::Credit(amount)) => credit += amount,
+                Some(StreamCommand::Close) | None => break "closed",
+            },
+            event = query.receiver.changed() => match event {
+                Ok(event) => {
+                    sequence += 1;
+                    credit -= 1;
+                    let value = match serde_json::to_value(event.payload) {
+                        Ok(value) => value,
+                        Err(_) => break "port_event_invalid",
+                    };
+                    if output.event(&id, sequence, value).await.is_err() { break "process_exited"; }
+                    if query.client.credit(&query.id, 1).await.is_err() { break "process_exited"; }
+                }
+                Err(StreamEnd::Completed) => break "completed",
+                Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
+                Err(StreamEnd::Host(PackageErrorCode::Overloaded)) => break "overloaded",
+                Err(_) => break "provider_exited",
+            },
+        }
+    };
+    let _ = query.client.stream_close(&query.id).await;
+    output.retire(&id).await;
+    streams.lock().await.remove(&id);
+    let _ = output.close(&id, reason).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_person_name_stream(
     core: Arc<CoreRuntime>,
@@ -1568,6 +1705,7 @@ mod tests {
             }],
             1,
             limiter,
+            std::sync::Weak::new(),
         )
         .unwrap();
         let grant = capabilities.advertised()[0].grant.clone();

@@ -65,11 +65,13 @@ pub(crate) struct ProcessSpec {
     pub(crate) core: Arc<teamarness_core::CoreRuntime>,
     pub(crate) calls: CallEnvironment,
     pub(crate) store: HostStoreHandle,
+    pub(crate) broker: std::sync::Weak<crate::broker::PortBroker>,
 }
 
 pub(crate) struct ProcessGeneration {
     pub(crate) generation: u64,
     pub(crate) client: ProcessClient,
+    pub(crate) port_routes: Arc<tokio::sync::Semaphore>,
     child: Arc<Mutex<Child>>,
     process_group: i32,
     package: PackageIdentity,
@@ -94,6 +96,7 @@ pub(crate) async fn spawn(
         &spec.template.capabilities,
         generation,
         spec.calls.limiter.clone(),
+        spec.broker.clone(),
     )
     .map_err(WireFailure::new)?;
     // Reading and hashing the Backend executable is blocking file work.
@@ -238,6 +241,7 @@ pub(crate) async fn spawn(
     Ok(ProcessGeneration {
         generation,
         client,
+        port_routes: Arc::new(tokio::sync::Semaphore::new(crate::broker::PROVIDER_LIMIT)),
         child,
         process_group,
         package: spec.template.package_identity.clone(),
@@ -448,6 +452,7 @@ mod tests {
                 limits: crate::protocol::ProtocolLimits::CURRENT,
             },
             store: HostStoreHandle::open(private.clone()).await.unwrap(),
+            broker: std::sync::Weak::new(),
         };
 
         let error = match spawn(&spec, 1, false).await {

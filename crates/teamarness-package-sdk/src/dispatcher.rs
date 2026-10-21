@@ -211,7 +211,7 @@ pub(crate) async fn run(
                                 frame.field("code").and_then(JsonValue::as_str).unwrap_or("capability_error"),
                                 frame.field("retryable").and_then(JsonValue::as_bool).unwrap_or(false),
                                 frame.field("details").cloned().unwrap_or_else(empty_object),
-                            ))
+                            ).with_outcome_uncertain(frame.field("outcomeUncertain").and_then(JsonValue::as_bool).unwrap_or(false)))
                         };
                         let _ = sender.send(result);
                     }

@@ -363,6 +363,9 @@ async function serve() {
   let immutableCredited = 0;
   let immutableStream;
   let immutableCloseCode = null;
+  let portQueryStream;
+  const portEvents = [];
+  let portCloseCode = null;
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -394,21 +397,32 @@ async function serve() {
       } else if ((frame.kind === "response" || frame.kind === "error") && pendingCapabilityCalls.has(frame.id)) {
         const requestId = pendingCapabilityCalls.get(frame.id);
         pendingCapabilityCalls.delete(frame.id);
-        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code, retryable: frame.retryable ?? false, outcomeUncertain: frame.outcomeUncertain ?? false } });
+        send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code, retryable: frame.retryable ?? false, outcomeUncertain: frame.outcomeUncertain ?? false, details: frame.details ?? {} } });
       } else if (frame.kind === "event" && frame.streamId === personNameStream) {
         personNameEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === membershipStream) {
         membershipEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === immutableStream) {
         immutableEvents.push(frame.payload);
+      } else if (frame.kind === "event" && frame.streamId === portQueryStream) {
+        portEvents.push(frame.payload);
       } else if (frame.kind === "stream_close" && frame.streamId === membershipStream) {
         membershipStream = undefined;
       } else if (frame.kind === "stream_close" && frame.streamId === immutableStream) {
         immutableCloseCode = frame.code ?? null;
         immutableStream = undefined;
+      } else if (frame.kind === "stream_close" && frame.streamId === portQueryStream) {
+        portCloseCode = frame.code ?? null;
+        portQueryStream = undefined;
       } else if (frame.kind === "stream_open") {
         uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
-        if (frame.topic === "fixture.close") {
+        if (frame.topic === "teamarness.port.query.v1") {
+          send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: packageIdentity === "com.example.invalid" ? "invalid" : 1 } });
+          if (packageIdentity !== "com.example.invalid") send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
+          send({ kind: "stream_close", streamId: frame.id, code: "completed" });
+          uiStreams.delete(frame.id);
+        }
+        else if (frame.topic === "fixture.close") {
           send({ kind: "stream_close", streamId: frame.id, code: "closed" });
           uiStreams.delete(frame.id);
         } else if (frame.topic === "fixture.rejected_stream") {
@@ -556,6 +570,40 @@ async function serve() {
         if (immutableStream) send({ kind: "stream_close", streamId: immutableStream, code: "closed" });
         immutableStream = undefined;
         send({ kind: "response", id: frame.id, payload: { closed: true } });
+      } else if (frame.kind === "request" && ["teamarness.port.command.v1", "teamarness.port.query.v1"].includes(frame.operation)) {
+        if (frame.payload.request.text === "stall") {
+          delayedRequest = frame;
+        } else if (frame.payload.request.text === "exit") {
+          await import("node:fs/promises").then((fs) => fs.appendFile("port-command-attempts", "1\n"));
+          process.abort();
+        } else if (frame.payload.request.text === "bad_response") {
+          send({ kind: "response", id: frame.id, payload: { accepted: "not a boolean" } });
+        } else if (frame.payload.request.text === "provider_error") {
+          send({ kind: "error", id: frame.id, code: "fixture.rejected", retryable: false, details: { reason: "fixture" } });
+        } else {
+          send({ kind: "response", id: frame.id, payload: frame.operation === "teamarness.port.query.v1"
+            ? { accepted: true, actor: frame.payload.actor } : { accepted: true } });
+        }
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_cancel") {
+        capabilitySequence += 1;
+        const id = `p:port-cancel-${capabilitySequence}`;
+        send({ kind: "request", id, operation: "capability.call",
+          grant: capabilityGrants.get("teamarness.package-ports"), deadlineUnixMs: frame.deadlineUnixMs,
+          payload: { method: "invoke", contract: "com.example.messages", port: "message.post",
+            kind: "command", request: { text: "stall" } } });
+        send({ kind: "cancel", id: `p:cancel-port-${capabilitySequence}`, targetId: id });
+        send({ kind: "response", id: frame.id, payload: { cancelled: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_open") {
+        capabilitySequence += 1;
+        portQueryStream = `p:port-query-${capabilitySequence}`;
+        portCloseCode = null;
+        portEvents.length = 0;
+        send({ kind: "stream_open", id: portQueryStream, topic: "capability.stream", initialCredit: 32,
+          payload: { grant: capabilityGrants.get("teamarness.package-ports"),
+            contract: "com.example.messages", port: "message.watch", kind: "query", request: {} } });
+        send({ kind: "response", id: frame.id, payload: { opened: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_events") {
+        send({ kind: "response", id: frame.id, payload: { events: portEvents, closeCode: portCloseCode } });
       } else if (frame.kind === "request" && frame.operation === "fixture.grant") {
         send({ kind: "response", id: frame.id, payload: { grant: capabilityGrants.get(frame.payload.capability) ?? "missing" } });
       } else if (frame.kind === "request" && frame.operation === "fixture.capability") {

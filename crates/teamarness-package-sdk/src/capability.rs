@@ -286,6 +286,8 @@ impl CapabilityClient {
                 JsonValue::Object(Default::default()),
             ));
         }
+        let command =
+            method == "invoke" && input.get("kind").and_then(JsonValue::as_str) == Some("command");
         let id = format!("p:{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let deadline = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -317,10 +319,15 @@ impl CapabilityClient {
                 self.pending.lock().await.remove(&id);
                 self.state.lock().await.retire_request(&id);
                 Err(BackendError::new(
-                    "deadline_exceeded",
-                    true,
+                    if command {
+                        "outcome_unknown"
+                    } else {
+                        "deadline_exceeded"
+                    },
+                    !command,
                     JsonValue::Object(Default::default()),
-                ))
+                )
+                .with_outcome_uncertain(command))
             }
         }
     }

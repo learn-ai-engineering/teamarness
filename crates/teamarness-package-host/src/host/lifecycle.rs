@@ -15,8 +15,8 @@ use crate::values::{
 };
 use crate::{
     DisposePackage, HostData, PackageHost, PackageHostInner, PackageHostOutcome,
-    ReconcileWorkspaces, RecoverPackage, SuspendPackage, admission, capability, data_directory,
-    host_store, instance, protocol, supervisor, ui,
+    ReconcileWorkspaces, RecoverPackage, SuspendPackage, admission, broker, capability,
+    data_directory, host_store, instance, protocol, supervisor, ui,
 };
 
 /// A Package Identity and Workspace pair whose orphan lease is unresolved, so no
@@ -41,7 +41,10 @@ impl PackageHost {
         let mut report = Self::admit_sources(&config, &store).await?;
         let blocked = Self::reconcile_orphan_leases(&store, &mut report).await?;
         let workspaces = Self::list_core_workspaces(&core).await?;
-        let port_contracts = report
+        let port_contracts: BTreeMap<
+            PackageIdentity,
+            Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        > = report
             .admissions
             .iter()
             .filter_map(|admission| {
@@ -54,6 +57,18 @@ impl PackageHost {
             .collect();
         debug_assert_eq!(report.graph.len(), report.snapshot.packages.len());
         let authoring_catalog = report.catalog.clone();
+        let consumed = report
+            .admissions
+            .iter()
+            .map(|admission| {
+                (
+                    admission.manifest.identity.clone(),
+                    admission.manifest.consumed_ports.clone(),
+                )
+            })
+            .collect();
+        let port_broker =
+            broker::PortBroker::new(report.graph.clone(), consumed, port_contracts.clone());
         let (templates, admitted_ui) = Self::build_process_templates(&config, &mut report)?;
         // One permit pool and one set of protocol bounds for every Package in
         // this Host.
@@ -72,6 +87,7 @@ impl PackageHost {
             &workspaces,
             &blocked,
             &mut report.snapshot.diagnostics,
+            &port_broker,
         )
         .await?;
         Ok(Self::assemble(
@@ -84,6 +100,7 @@ impl PackageHost {
             authoring_catalog,
             report.graph,
             port_contracts,
+            port_broker,
             report.snapshot.packages,
             report.snapshot.diagnostics,
             instances,
@@ -241,6 +258,7 @@ impl PackageHost {
         workspaces: &[teamarness_core::WorkspaceSummary],
         blocked: &BlockedInstances,
         diagnostics: &mut Vec<PackageErrorEnvelope>,
+        broker: &Arc<broker::PortBroker>,
     ) -> Result<BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>, PackageErrorEnvelope>
     {
         let mut instances = BTreeMap::new();
@@ -259,14 +277,23 @@ impl PackageHost {
                     continue;
                 }
                 let (key, actor) =
-                    prepare_instance(config, core, calls, store, template, workspace).await?;
-                if template.activation
-                    == teamarness_package_contract::manifest::ActivationPolicy::Eager
+                    prepare_instance(config, core, calls, store, template, workspace, broker)
+                        .await?;
+                broker.register(key.clone(), &actor);
+                instances.insert(key, actor);
+            }
+        }
+        // Every actor and its immutable graph must be addressable before any eager Backend
+        // is activated: activation itself may call an already-admitted Provider.
+        for template in templates.iter().filter(|template| {
+            template.activation == teamarness_package_contract::manifest::ActivationPolicy::Eager
+        }) {
+            for (key, actor) in &instances {
+                if key.package_identity == template.package_identity
                     && let Err(failure) = actor.activate().await
                 {
-                    diagnostics.push(activation_error(&failure, &key));
+                    diagnostics.push(activation_error(&failure, key));
                 }
-                instances.insert(key, actor);
             }
         }
         Ok(instances)
@@ -286,6 +313,7 @@ impl PackageHost {
             PackageIdentity,
             Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
         >,
+        port_broker: Arc<broker::PortBroker>,
         packages: Vec<crate::PackageCatalogEntry>,
         diagnostics: Vec<PackageErrorEnvelope>,
         instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
@@ -313,6 +341,7 @@ impl PackageHost {
                 authoring_catalog,
                 port_graph,
                 port_contracts,
+                port_broker,
                 reconciliation: Mutex::new(()),
                 mount_management: Mutex::new(()),
             }),
@@ -327,6 +356,7 @@ impl PackageHost {
     ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
         let _gate = self.inner.reconciliation.lock().await;
         let workspaces = Self::list_core_workspaces(&self.inner.core).await?;
+        let mut eager = Vec::new();
         for template in &self.inner.templates {
             for workspace in &workspaces {
                 let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
@@ -346,20 +376,26 @@ impl PackageHost {
                     &self.inner.store,
                     template,
                     workspace,
+                    &self.inner.port_broker,
                 )
                 .await?;
+                self.inner.port_broker.register(key.clone(), &actor);
                 if template.activation
                     == teamarness_package_contract::manifest::ActivationPolicy::Eager
-                    && let Err(failure) = actor.activate().await
                 {
-                    self.inner
-                        .data
-                        .lock()
-                        .await
-                        .diagnostics
-                        .push(activation_error(&failure, &key));
+                    eager.push((key.clone(), actor.clone()));
                 }
                 self.inner.data.lock().await.instances.insert(key, actor);
+            }
+        }
+        for (key, actor) in eager {
+            if let Err(failure) = actor.activate().await {
+                self.inner
+                    .data
+                    .lock()
+                    .await
+                    .diagnostics
+                    .push(activation_error(&failure, &key));
             }
         }
         let revision = self.bump_revision().await;
@@ -475,6 +511,7 @@ pub(crate) async fn prepare_instance(
     store: &host_store::HostStoreHandle,
     template: &supervisor::ProcessTemplate,
     workspace: &teamarness_core::WorkspaceSummary,
+    broker: &Arc<broker::PortBroker>,
 ) -> Result<(PackageInstanceKey, Arc<instance::InstanceActor>), PackageErrorEnvelope> {
     let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
         host_error(
@@ -510,6 +547,7 @@ pub(crate) async fn prepare_instance(
         core: core.clone(),
         calls: calls.clone(),
         store: store.clone(),
+        broker: Arc::downgrade(broker),
     };
     Ok((
         key.clone(),
