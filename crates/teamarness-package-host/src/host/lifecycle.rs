@@ -41,6 +41,38 @@ impl PackageHost {
         let mut report = Self::admit_sources(&config, &store).await?;
         let blocked = Self::reconcile_orphan_leases(&store, &mut report).await?;
         let workspaces = Self::list_core_workspaces(&core).await?;
+        let port_contracts = report
+            .admissions
+            .iter()
+            .filter_map(|admission| {
+                admission
+                    .manifest
+                    .port_contract
+                    .as_ref()
+                    .map(|contract| (admission.manifest.identity.clone(), contract.clone()))
+            })
+            .collect();
+        let authoring_catalog = report
+            .admissions
+            .iter()
+            .filter_map(|admission| {
+                report
+                    .snapshot
+                    .packages
+                    .iter()
+                    .find(|entry| entry.identity == admission.manifest.identity)
+                    .map(|package| crate::AuthoringCatalogEntry {
+                        package: package.clone(),
+                        provided: admission
+                            .manifest
+                            .port_contract
+                            .as_ref()
+                            .map_or_else(Vec::new, |contract| contract.contracts.clone()),
+                        definitions: serde_json::Map::new(),
+                        consumed: admission.manifest.consumed_ports.clone(),
+                    })
+            })
+            .collect();
         let (templates, admitted_ui) = Self::build_process_templates(&config, &mut report)?;
         // One permit pool and one set of protocol bounds for every Package in
         // this Host.
@@ -68,6 +100,8 @@ impl PackageHost {
             calls,
             templates,
             admitted_ui,
+            authoring_catalog,
+            port_contracts,
             report.snapshot.packages,
             report.snapshot.diagnostics,
             instances,
@@ -260,6 +294,11 @@ impl PackageHost {
         calls: supervisor::CallEnvironment,
         templates: Vec<supervisor::ProcessTemplate>,
         admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
+        authoring_catalog: Vec<crate::AuthoringCatalogEntry>,
+        port_contracts: BTreeMap<
+            PackageIdentity,
+            Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        >,
         packages: Vec<crate::PackageCatalogEntry>,
         diagnostics: Vec<PackageErrorEnvelope>,
         instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
@@ -284,6 +323,8 @@ impl PackageHost {
                 core,
                 templates,
                 admitted_ui,
+                authoring_catalog,
+                port_contracts,
                 reconciliation: Mutex::new(()),
                 mount_management: Mutex::new(()),
             }),

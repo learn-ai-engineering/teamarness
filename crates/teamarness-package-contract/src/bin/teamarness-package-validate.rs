@@ -8,12 +8,14 @@
 //! Exit `0` when the Package passes, `1` when a rule fails, `2` for a usage error.
 
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use teamarness_package_contract::manifest::{
     MANIFEST_NAME, load_package_directory, parse_manifest,
 };
+use teamarness_package_contract::port_contract::compile_port_contracts;
 use teamarness_package_contract::smoke::smoke;
 use teamarness_package_contract::ui_contract::compile_ui_contract;
 use teamarness_package_contract::{ContractError, ContractErrorCode};
@@ -160,6 +162,26 @@ fn validate_source(root: &Path) -> Report {
         Ok(bytes) => match parse_manifest(&bytes) {
             Err(error) => report.push(MANIFEST_NAME, error),
             Ok(document) => {
+                if let Some(path) = document.port_contract_path() {
+                    let bytes = std::fs::File::open(root.join(path)).and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                        Ok(bytes)
+                    });
+                    match bytes {
+                        Ok(bytes) => match compile_port_contracts(&bytes) {
+                            Ok(compiled) => report.notes.extend(compiled.warnings),
+                            Err(error) => report.push(path, error),
+                        },
+                        Err(_) => report.push(
+                            path,
+                            ContractError::new(
+                                ContractErrorCode::PortContractViolation,
+                                "port_contract.missing",
+                            ),
+                        ),
+                    }
+                }
                 if document.ui_contract_path() != ASSEMBLER_CONTRACT_PATH {
                     report.notes.push(format!(
                         "the manifest declares ui.contract.path {:?}; the standard assembler writes {ASSEMBLER_CONTRACT_PATH:?}",
@@ -198,6 +220,9 @@ fn validate_directory(root: &Path, target: &str, smoke_requested: bool) -> Repor
     if let Err(error) = compile_ui_contract(&loaded.ui.contract.bytes) {
         report.push(&loaded.ui.contract.relative_path.clone(), error);
         return report;
+    }
+    if let Some(ports) = &loaded.port_contract {
+        report.notes.extend(ports.warnings.clone());
     }
     if smoke_requested {
         match smoke(root, &loaded) {

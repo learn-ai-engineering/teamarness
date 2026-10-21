@@ -50,6 +50,18 @@ pub use crate::values::{
 };
 
 use crate::errors::host_error;
+
+/// Complete read-only port declaration metadata for authoring tools, separate from UI snapshots
+/// and from the generation-bound, availability-filtered runtime view.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoringCatalogEntry {
+    pub package: PackageCatalogEntry,
+    pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
+    pub definitions: serde_json::Map<String, serde_json::Value>,
+    pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+}
+
 use crate::subscriptions::PackageHostSubscriptionKind;
 
 /// Actor facade for admitted and supervised Package Instances.
@@ -67,6 +79,11 @@ struct PackageHostInner {
     core: Arc<teamarness_core::CoreRuntime>,
     templates: Vec<supervisor::ProcessTemplate>,
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
+    authoring_catalog: Vec<AuthoringCatalogEntry>,
+    port_contracts: BTreeMap<
+        PackageIdentity,
+        Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+    >,
     reconciliation: Mutex<()>,
     mount_management: Mutex<()>,
 }
@@ -114,6 +131,18 @@ impl PackageHost {
             instances: snapshots,
             diagnostics,
         }
+    }
+
+    /// Returns the installed, admitted declarations without starting any Provider.
+    /// Availability and installation-wide dependency diagnostics are added by graph admission.
+    pub fn authoring_catalog(&self) -> Vec<AuthoringCatalogEntry> {
+        let mut entries = self.inner.authoring_catalog.clone();
+        for entry in &mut entries {
+            if let Some(compiled) = self.inner.port_contracts.get(&entry.package.identity) {
+                entry.definitions = compiled.definitions.clone();
+            }
+        }
+        entries
     }
 
     /// Claims a coalesced host-state subscription or one open UI event route.

@@ -16,6 +16,7 @@ pub enum ContractErrorCode {
     ArtifactChanged,
     UiEntrypointMissing,
     UiContractViolation,
+    PortContractViolation,
     /// Produced only by `teamarness-package-validate --smoke`.
     SmokeFailed,
 }
@@ -33,6 +34,7 @@ impl ContractErrorCode {
             Self::ArtifactChanged => "artifact_changed",
             Self::UiEntrypointMissing => "ui_entrypoint_missing",
             Self::UiContractViolation => "ui_contract_violation",
+            Self::PortContractViolation => "port_contract_violation",
             Self::SmokeFailed => "smoke_failed",
         }
     }

@@ -217,3 +217,57 @@ fn usage_errors_exit_two() {
         assert_eq!(output.status.code(), Some(2), "{arguments:?}");
     }
 }
+
+// Verifies: TEAM.SYS.PKG-R12
+#[test]
+fn source_mode_checks_port_contracts_and_reports_grammar_as_notes() {
+    let temp = TempDir::new().unwrap();
+    template_source(temp.path(), |_| {});
+    let path = repository_root().join("contracts/package-ports/v1/fixtures/version-1-0.json");
+    let bytes = fs::read(path).unwrap();
+    fs::write(temp.path().join("ports.json"), &bytes).unwrap();
+    let manifest_path = temp.path().join("teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["portContract"] = serde_json::json!({"path":"ports.json","sha256":sha256(&bytes)});
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let output = validate(&["source", &temp.path().to_string_lossy(), "--json"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let parsed: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert!(!parsed["notes"].as_array().unwrap().is_empty());
+    fs::write(temp.path().join("ports.json"), vec![b' '; 1024 * 1024 + 1]).unwrap();
+    let output = validate(&["source", &temp.path().to_string_lossy()]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("port_contract.too_large"));
+    fs::write(temp.path().join("ports.json"), b"{}").unwrap();
+    let output = validate(&["source", &temp.path().to_string_lossy()]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("port_contract_violation/port_contract.malformed"));
+}
+
+// Verifies: TEAM.SYS.PKG-R12
+#[test]
+fn directory_mode_uses_shared_port_schema_verdict() {
+    let temp = TempDir::new().unwrap();
+    package_directory(temp.path());
+    let mut document: Value = serde_json::from_slice(
+        &fs::read(repository_root().join("contracts/package-ports/v1/fixtures/version-1-0.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    document["contracts"][0]["ports"][0]["request"] =
+        serde_json::json!({"$ref":"https://example.com/invalid"});
+    let bytes = serde_json::to_vec(&document).unwrap();
+    fs::write(temp.path().join("ports.json"), &bytes).unwrap();
+    let path = temp.path().join("teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["portContract"] = serde_json::json!({"path":"ports.json","sha256":sha256(&bytes)});
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let output = validate(&["directory", &temp.path().to_string_lossy(), "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let parsed: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(parsed["errors"][0]["code"], "port_contract_violation");
+    assert_eq!(
+        parsed["errors"][0]["rule"],
+        "port_contract.reference_not_local"
+    );
+}

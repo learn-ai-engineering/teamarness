@@ -48,6 +48,7 @@ pub enum PackageErrorCode {
     ShuttingDown,
     UiEntrypointMissing,
     UiContractViolation,
+    PortContractViolation,
     UiLoadFailed,
     UiException,
     StaleMount,

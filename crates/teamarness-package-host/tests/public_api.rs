@@ -297,12 +297,13 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::ShuttingDown,
         PackageErrorCode::UiEntrypointMissing,
         PackageErrorCode::UiContractViolation,
+        PackageErrorCode::PortContractViolation,
         PackageErrorCode::UiLoadFailed,
         PackageErrorCode::UiException,
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 41);
+    assert_eq!(codes.len(), 42);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -342,6 +343,7 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::ShuttingDown
             | PackageErrorCode::UiEntrypointMissing
             | PackageErrorCode::UiContractViolation
+            | PackageErrorCode::PortContractViolation
             | PackageErrorCode::UiLoadFailed
             | PackageErrorCode::UiException
             | PackageErrorCode::StaleMount

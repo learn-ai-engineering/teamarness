@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{fs, io};
 
 use semver::Version;
@@ -50,6 +51,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{ContractError, ContractErrorCode};
 use crate::identity::is_valid_package_identity;
 use crate::json::strict_json;
+use crate::port_contract::{CompiledPortContracts, PortKind, compile_port_contracts};
 
 /// The manifest file name inside a Package Directory.
 pub const MANIFEST_NAME: &str = "teamarness.package.json";
@@ -71,13 +73,21 @@ pub struct ManifestDocument {
     pub display_name: String,
     pub protocol: VersionRange,
     pub capabilities: Vec<CapabilityRequirement>,
+    pub consumed_ports: Vec<ConsumedContract>,
+    port_contract: Option<DigestFile>,
     backends: Vec<FileArtifact>,
     ui: UiDocument,
     manifest_digest: String,
 }
 
 impl ManifestDocument {
-    /// The declared path of the UI contract file, relative to the Package Directory.
+    /// The declared path of the provided Port Contract file, if any.
+    #[must_use]
+    pub fn port_contract_path(&self) -> Option<&str> {
+        self.port_contract.as_ref().map(|file| file.path.as_str())
+    }
+
+    /// The declared path of the UI contract.
     #[must_use]
     pub fn ui_contract_path(&self) -> &str {
         &self.ui.contract.path
@@ -117,6 +127,9 @@ pub struct LoadedManifest {
     pub backend: VerifiedFile,
     pub ui: LoadedUi,
     pub capabilities: Vec<CapabilityRequirement>,
+    pub consumed_ports: Vec<ConsumedContract>,
+    pub port_contract: Option<Arc<CompiledPortContracts>>,
+    pub port_contract_digest: Option<String>,
     pub manifest_digest: String,
 }
 
@@ -179,6 +192,31 @@ impl CapabilityRequirement {
     }
 }
 
+/// An exact set of consumed ports under one compatible contract version range.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsumedContract {
+    pub identity: String,
+    pub major: u16,
+    pub min_minor: u16,
+    pub max_minor: u16,
+    #[serde(default = "required_by_default")]
+    pub required: bool,
+    pub ports: Vec<ConsumedPort>,
+}
+
+fn required_by_default() -> bool {
+    true
+}
+
+/// One port, including its kind, not implicit permission to consume its siblings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumedPort {
+    pub name: String,
+    pub kind: PortKind,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawManifest {
@@ -191,6 +229,9 @@ struct RawManifest {
     ui: UiDocument,
     #[serde(default)]
     capabilities: Vec<CapabilityRequirement>,
+    #[serde(default)]
+    consumed_ports: Vec<ConsumedContract>,
+    port_contract: Option<DigestFile>,
     #[serde(default)]
     extensions: BTreeMap<String, Value>,
 }
@@ -292,6 +333,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
     }
     validate_extensions(&document.extensions)?;
     validate_capabilities(&document.capabilities)?;
+    validate_consumed_ports(&document.consumed_ports)?;
     if document.ui.entrypoint.size > MAX_UI_ENTRYPOINT_BYTES as u64
         || document.ui.assets.len() > MAX_UI_ASSETS
         || document
@@ -342,6 +384,14 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
     if !seen_paths.insert(document.ui.contract.path.clone()) {
         return Err(malformed("manifest.duplicate_path").at("/ui/contract/path"));
     }
+    if let Some(port_contract) = &document.port_contract {
+        normalized_relative_path(&port_contract.path)
+            .map_err(|error| error.at("/portContract/path"))?;
+        validate_digest(&port_contract.sha256).map_err(|error| error.at("/portContract/sha256"))?;
+        if !seen_paths.insert(port_contract.path.clone()) {
+            return Err(malformed("manifest.duplicate_path").at("/portContract/path"));
+        }
+    }
     for (index, asset) in document.ui.assets.iter().enumerate() {
         normalized_relative_path(&asset.path)
             .map_err(|error| error.at(format!("/ui/assets/{index}/path")))?;
@@ -363,6 +413,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
         display_name: document.presentation.display_name,
         protocol: document.protocol,
         capabilities: document.capabilities,
+        consumed_ports: document.consumed_ports,
+        port_contract: document.port_contract,
         backends: document.backends,
         ui: document.ui,
         manifest_digest: sha256(bytes),
@@ -462,6 +514,14 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
         return Err(malformed("manifest.ui_bounds").at("/ui"));
     }
 
+    let (port_contract, port_contract_digest) = if let Some(reference) = &document.port_contract {
+        let file = verify_port_contract_file(root, reference)?;
+        let compiled = compile_port_contracts(&file.bytes)?;
+        (Some(Arc::new(compiled)), Some(file.digest))
+    } else {
+        (None, None)
+    };
+
     Ok(LoadedManifest {
         identity: document.identity,
         version: document.version,
@@ -474,6 +534,9 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
             contract,
         },
         capabilities: document.capabilities,
+        consumed_ports: document.consumed_ports,
+        port_contract,
+        port_contract_digest,
         manifest_digest: document.manifest_digest,
     })
 }
@@ -511,6 +574,37 @@ fn validate_capabilities(values: &[CapabilityRequirement]) -> Result<(), Contrac
             return Err(
                 malformed("manifest.capability_duplicate").at(format!("/capabilities/{index}"))
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_consumed_ports(values: &[ConsumedContract]) -> Result<(), ContractError> {
+    if values.len() > 64 {
+        return Err(malformed("manifest.consumed_bounds"));
+    }
+    let mut identities = BTreeSet::new();
+    for contract in values {
+        if !is_valid_package_identity(&contract.identity) || !identities.insert(&contract.identity)
+        {
+            return Err(malformed("manifest.consumed_identity"));
+        }
+        validate_range(
+            VersionRange {
+                major: contract.major,
+                min_minor: contract.min_minor,
+                max_minor: contract.max_minor,
+            },
+            "manifest.consumed_range",
+        )?;
+        if contract.ports.is_empty() || contract.ports.len() > 256 {
+            return Err(malformed("manifest.consumed_bounds"));
+        }
+        let mut ports = BTreeSet::new();
+        for port in &contract.ports {
+            if !crate::ui_contract::valid_operation_name(&port.name) || !ports.insert(&port.name) {
+                return Err(malformed("manifest.consumed_port"));
+            }
         }
     }
     Ok(())
@@ -567,6 +661,31 @@ fn verify_digest_file(root: &Path, artifact: &DigestFile) -> Result<VerifiedFile
         ContractErrorCode::UiContractViolation,
         "manifest.contract_missing",
         MAX_UI_CONTRACT_BYTES,
+    )?;
+    if sha256(&bytes) != artifact.sha256 {
+        return Err(ContractError::new(
+            ContractErrorCode::ArtifactChanged,
+            "manifest.digest_mismatch",
+        )
+        .at(artifact.path.clone()));
+    }
+    Ok(VerifiedFile {
+        relative_path: artifact.path.clone(),
+        bytes,
+        digest: artifact.sha256.clone(),
+    })
+}
+
+fn verify_port_contract_file(
+    root: &Path,
+    artifact: &DigestFile,
+) -> Result<VerifiedFile, ContractError> {
+    let bytes = read_regular_file_bounded(
+        root,
+        &artifact.path,
+        ContractErrorCode::PortContractViolation,
+        "port_contract.missing",
+        1024 * 1024,
     )?;
     if sha256(&bytes) != artifact.sha256 {
         return Err(ContractError::new(

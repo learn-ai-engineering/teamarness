@@ -287,6 +287,10 @@ fn admission_digest(manifest: &LoadedManifest, source: PackageSourceKind) -> Str
         manifest.ui.entrypoint.digest,
         manifest.ui.contract.digest,
     );
+    if let Some(digest) = &manifest.port_contract_digest {
+        content.push_str(digest);
+        content.push('\0');
+    }
     for asset in &manifest.ui.assets {
         content.push_str(&asset.file.relative_path);
         content.push('\0');
