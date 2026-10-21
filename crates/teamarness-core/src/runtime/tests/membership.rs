@@ -26,7 +26,9 @@ async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen(
             issuer.clock.now_unix_ms().saturating_add(60_000),
         )
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
 
     assert_eq!(
         issuer
@@ -51,10 +53,11 @@ async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen(
 
     let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     let snapshot = reopened.membership_snapshot(workspace.id()).unwrap();
-    assert_eq!(snapshot.epoch(), MembershipEpoch::new(1));
+    // Genesis bundle (epochs 0..=2), then the invitee's group create and admission.
+    assert_eq!(snapshot.epoch(), MembershipEpoch::new(4));
     assert_eq!(snapshot.members().len(), 2);
     let recovered = reopened.redeem_invitation(&claim).unwrap();
-    assert_eq!(recovered.epoch(), MembershipEpoch::new(1));
+    assert_eq!(recovered.epoch(), MembershipEpoch::new(4));
 
     reopened.shutdown().await.unwrap();
     drop(reopened);
@@ -77,28 +80,35 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
     let workspace = runtime.create_workspace("Membership validation").unwrap();
     let manager = runtime_secret(&runtime);
     let member = member_secret(31);
+    let genesis = runtime_genesis(&runtime, workspace.id());
     let base = workspace.created_at_unix_ms();
 
-    let admission = admit(
+    let (group_create, admission) = admit(
         &manager,
         &member,
         workspace.id(),
+        genesis,
         base + 1,
         runtime_heads(&runtime, workspace.id()),
         1,
     );
+    // The invitee's group create alone grants nothing and waits for its admission.
+    let parked = runtime
+        .apply_membership_envelope(group_create.canonical_bytes())
+        .unwrap();
+    assert!(!parked.accepted && parked.quarantined);
     let accepted = runtime
         .apply_membership_envelope(admission.canonical_bytes())
         .unwrap();
     assert!(accepted.accepted);
     assert!(!accepted.quarantined);
-    assert_eq!(accepted.snapshot.epoch(), MembershipEpoch::new(1));
+    assert_eq!(accepted.snapshot.epoch(), MembershipEpoch::new(4));
 
     let duplicate = runtime
         .apply_membership_envelope(admission.canonical_bytes())
         .unwrap();
     assert!(!duplicate.accepted);
-    assert_eq!(duplicate.snapshot.epoch(), MembershipEpoch::new(1));
+    assert_eq!(duplicate.snapshot.epoch(), MembershipEpoch::new(4));
     let transition_count: i64 = runtime
         .state
         .lock()
@@ -108,11 +118,11 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
             row.get(0)
         })
         .unwrap();
-    assert_eq!(transition_count, 1);
+    assert_eq!(transition_count, 4);
 
     let outsider = member_secret(32);
     let wrong_token = sign_token(&outsider, workspace.id(), base, base + 100_000, [2; 32]).unwrap();
-    let wrong_claim = sign_claim(&member_secret(33), &wrong_token).unwrap();
+    let wrong_claim = sign_claim(&member_secret(33), &wrong_token, genesis).unwrap();
     let invalid_proof = MembershipEnvelope::sign(
         &manager,
         workspace.id(),
@@ -137,6 +147,7 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
         base + 2,
         MembershipAction::Revoke {
             target: runtime.public_identity(),
+            group: group_create.id,
         },
         runtime_heads(&runtime, workspace.id()),
     )
@@ -149,7 +160,7 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
     );
     assert_eq!(
         runtime.membership_snapshot(workspace.id()).unwrap().epoch(),
-        MembershipEpoch::new(1)
+        MembershipEpoch::new(4)
     );
 
     let revocation = runtime
@@ -158,14 +169,21 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
             PublicIdentity::from_bytes(*member.public().as_bytes()).unwrap(),
         )
         .unwrap();
-    assert_eq!(revocation.epoch(), MembershipEpoch::new(2));
-    let readmission = admit(
+    assert_eq!(revocation.epoch(), MembershipEpoch::new(5));
+    let (readmission_group, readmission) = admit(
         &manager,
         &member,
         workspace.id(),
+        genesis,
         base + 100_000,
         vec![revocation.cause()],
         3,
+    );
+    assert!(
+        runtime
+            .apply_membership_envelope(readmission_group.canonical_bytes())
+            .unwrap()
+            .quarantined
     );
     assert_eq!(
         runtime
@@ -174,7 +192,7 @@ async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_adv
         MembershipError::CausalReadmission
     );
     let final_snapshot = runtime.membership_snapshot(workspace.id()).unwrap();
-    assert_eq!(final_snapshot.epoch(), MembershipEpoch::new(2));
+    assert_eq!(final_snapshot.epoch(), MembershipEpoch::new(5));
     assert_eq!(final_snapshot.members().len(), 1);
 
     runtime.shutdown().await.unwrap();
@@ -218,34 +236,28 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
         .unwrap();
     let workspace = runtime.create_workspace("Reachable convergence").unwrap();
     let manager = runtime_secret(&runtime);
-    let genesis = runtime_heads(&runtime, workspace.id())[0];
+    let genesis = runtime_genesis(&runtime, workspace.id());
+    let heads = runtime_heads(&runtime, workspace.id());
     let base = workspace.created_at_unix_ms();
     let member_a = member_secret(41);
     let member_b = member_secret(42);
-    let member_c = member_secret(43);
 
-    let admit_a = admit(
+    let (group_a, admit_a) = admit(
         &manager,
         &member_a,
         workspace.id(),
+        genesis,
         base + 1,
-        vec![genesis],
+        heads.clone(),
         11,
     );
-    let duplicate_a = admit(
-        &manager,
-        &member_a,
-        workspace.id(),
-        base + 2,
-        vec![genesis],
-        12,
-    );
-    let admit_b = admit(
+    let (group_b, admit_b) = admit(
         &manager,
         &member_b,
         workspace.id(),
+        genesis,
         base + 3,
-        vec![genesis],
+        heads,
         13,
     );
     let revoke_a = MembershipEnvelope::sign(
@@ -254,24 +266,18 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
         base + 4,
         MembershipAction::Revoke {
             target: PublicIdentity::from_bytes(*member_a.public().as_bytes()).unwrap(),
+            group: group_a.id,
         },
         vec![admit_a.id],
     )
     .unwrap();
-    let admit_c = admit(
-        &manager,
-        &member_c,
-        workspace.id(),
-        base + 4,
-        vec![admit_b.id],
-        14,
-    );
-    let operations = [admit_a, duplicate_a, admit_b, revoke_a, admit_c]
+    let operations = [group_a, admit_a, group_b, admit_b, revoke_a]
         .map(|operation| operation.canonical_bytes().to_vec());
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
-    let orders = topological_orders(&[vec![], vec![], vec![], vec![0], vec![2]]);
+    // A group create precedes its admission; a revocation follows its admission.
+    let orders = topological_orders(&[vec![], vec![0], vec![], vec![2], vec![1]]);
     assert!(orders.len() > 1);
     let mut expected = None;
     for (index, order) in orders.into_iter().enumerate() {
@@ -290,15 +296,18 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
             .await
             .unwrap();
         for operation in order {
-            assert!(
-                branch
-                    .apply_membership_envelope(&operations[operation])
-                    .unwrap()
-                    .accepted
-            );
+            let applied = branch
+                .apply_membership_envelope(&operations[operation])
+                .unwrap();
+            // A member's group create is parked until its admission arrives.
+            if operation == 0 || operation == 2 {
+                assert!(applied.quarantined);
+            } else {
+                assert!(applied.accepted);
+            }
         }
         let snapshot = branch.membership_snapshot(workspace.id()).unwrap();
-        assert_eq!(snapshot.epoch(), MembershipEpoch::new(5));
+        assert_eq!(snapshot.epoch(), MembershipEpoch::new(7));
         let member_a_identity = PublicIdentity::from_bytes(*member_a.public().as_bytes()).unwrap();
         assert!(
             branch
@@ -343,13 +352,14 @@ async fn quarantine_retries_dependency_first_and_never_advances_twice() {
     let workspace = runtime.create_workspace("Quarantine").unwrap();
     let manager = runtime_secret(&runtime);
     let member = member_secret(51);
-    let genesis = runtime_heads(&runtime, workspace.id())[0];
-    let admission = admit(
+    let genesis = runtime_genesis(&runtime, workspace.id());
+    let (group_create, admission) = admit(
         &manager,
         &member,
         workspace.id(),
+        genesis,
         301_001,
-        vec![genesis],
+        runtime_heads(&runtime, workspace.id()),
         21,
     );
     let revocation = MembershipEnvelope::sign(
@@ -358,21 +368,25 @@ async fn quarantine_retries_dependency_first_and_never_advances_twice() {
         301_002,
         MembershipAction::Revoke {
             target: PublicIdentity::from_bytes(*member.public().as_bytes()).unwrap(),
+            group: group_create.id,
         },
         vec![admission.id],
     )
     .unwrap();
 
+    let parked_group = runtime
+        .apply_membership_envelope(group_create.canonical_bytes())
+        .unwrap();
     let first = runtime
         .apply_membership_envelope(admission.canonical_bytes())
         .unwrap();
     let second = runtime
         .apply_membership_envelope(revocation.canonical_bytes())
         .unwrap();
-    assert!(first.quarantined && second.quarantined);
+    assert!(parked_group.quarantined && first.quarantined && second.quarantined);
     assert_eq!(
         runtime.membership_snapshot(workspace.id()).unwrap().epoch(),
-        MembershipEpoch::new(0)
+        MembershipEpoch::new(2)
     );
     let member_identity = PublicIdentity::from_bytes(*member.public().as_bytes()).unwrap();
     assert!(
@@ -389,7 +403,7 @@ async fn quarantine_retries_dependency_first_and_never_advances_twice() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(transition_count, 0);
+    assert_eq!(transition_count, 2);
 
     runtime.shutdown().await.unwrap();
     drop(runtime);
@@ -399,7 +413,8 @@ async fn quarantine_retries_dependency_first_and_never_advances_twice() {
             .await
             .unwrap();
     let eligible = recovered.membership_snapshot(workspace.id()).unwrap();
-    assert_eq!(eligible.epoch(), MembershipEpoch::new(2));
+    // Group create, admission and revocation leave the quarantine in order.
+    assert_eq!(eligible.epoch(), MembershipEpoch::new(5));
     assert_eq!(eligible.members().len(), 1);
     assert!(
         recovered
@@ -420,7 +435,7 @@ async fn quarantine_retries_dependency_first_and_never_advances_twice() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(transition_count, 2);
+    assert_eq!(transition_count, 5);
     assert_eq!(
         recovered.membership_snapshot(workspace.id()).unwrap(),
         eligible

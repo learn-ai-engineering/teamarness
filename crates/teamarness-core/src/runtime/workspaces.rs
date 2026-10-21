@@ -172,12 +172,12 @@ impl CoreRuntime {
                 .map_err(fault!(crate::PersonNameError::Storage(
                     StorageError::Database
                 )))?;
+        // Agent keys are Members without a Person anchor until the principals
+        // registry replaces this snapshot; they are left out here.
         let members = projection
-            .snapshot()
-            .members()
-            .iter()
-            .map(|member| {
-                let identity = member.identity();
+            .installation_members()
+            .into_iter()
+            .map(|identity| {
                 crate::person_names::lookup(&state.connection, projection, identity)
                     .map(|person| (identity, person.expect("current member has an anchor")))
             })

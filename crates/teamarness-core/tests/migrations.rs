@@ -68,6 +68,101 @@ async fn migration_0001_reserves_nullable_human_identity_subjects() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Batch 16 widens the membership action CHECK without weakening the
+/// append-only guards or the foreign keys held by dependent tables.
+#[tokio::test]
+async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
+    let directory = private_data_directory("migration-person-groups");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    // Build an empty version-15 membership table with its old action CHECK.
+    // It has no Workspace rows, so the structural downgrade loses no data.
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER membership_operations_no_update;
+         DROP TRIGGER membership_operations_no_delete;
+         DROP TABLE membership_operations;
+         CREATE TABLE membership_operations (
+             operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 32),
+             workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id),
+             author_public_identity BLOB NOT NULL CHECK (length(author_public_identity) = 32),
+             authored_at_unix_ms INTEGER NOT NULL,
+             action INTEGER NOT NULL CHECK (action IN (0, 1, 2)),
+             canonical_envelope BLOB NOT NULL UNIQUE
+         ) STRICT;
+         CREATE TRIGGER membership_operations_no_update
+         BEFORE UPDATE ON membership_operations BEGIN
+             SELECT RAISE(ABORT, 'canonical membership operations are append-only');
+         END;
+         CREATE TRIGGER membership_operations_no_delete
+         BEFORE DELETE ON membership_operations BEGIN
+             SELECT RAISE(ABORT, 'canonical membership operations are append-only');
+         END;
+         PRAGMA user_version = 15;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let upgraded = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
+    upgraded.create_workspace("Upgraded").unwrap();
+    upgraded.shutdown().await.unwrap();
+    drop(upgraded);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 16);
+    let violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM membership_operations WHERE action IN (3, 4)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "creator group creation and attachment use the widened CHECK"
+    );
+    assert!(
+        connection
+            .execute("UPDATE membership_operations SET action = 2", [])
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM membership_operations", [])
+            .is_err()
+    );
+    let workspace_id: Vec<u8> = connection
+        .query_row("SELECT workspace_id FROM workspaces", [], |row| row.get(0))
+        .unwrap();
+    let error = connection.execute(
+        "INSERT INTO membership_operations (operation_id, workspace_id, author_public_identity, authored_at_unix_ms, action, canonical_envelope) VALUES (?1, ?2, ?3, 0, 7, ?4)",
+        params![[9_u8; 32].as_slice(), workspace_id, [8_u8; 32].as_slice(), [7_u8].as_slice()],
+    ).unwrap_err();
+    assert!(error.to_string().contains("CHECK constraint failed"));
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn migration_0002_adds_workspace_membership_state_and_append_only_guards() {
     let directory = private_data_directory("migration-workspaces");
@@ -255,7 +350,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     for column in [
         "scope_id",
         "log_id",
@@ -330,7 +425,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -356,7 +451,8 @@ async fn migration_0010_adds_membership_wakes_and_parking_and_drops_pending_reco
         )
         .unwrap();
     assert_eq!(wake.0, hex_bytes(&workspace.id().to_string()));
-    assert_eq!((wake.1, wake.2), (0, 0));
+    // The creator's group create and attachment each bump the wake once.
+    assert_eq!((wake.1, wake.2), (2, 0));
 
     for column in [
         "operation_hash",
@@ -429,7 +525,10 @@ async fn accepted_membership_operations_bump_the_membership_wake() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(generation, 2, "one admission and one revocation");
+    assert_eq!(
+        generation, 5,
+        "creation (group create, attachment), one admission (group create, admit) and one revocation"
+    );
     drop(connection);
 
     let joiner_connection = Connection::open(joiner_directory.join("core.sqlite3")).unwrap();
@@ -662,7 +761,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     connection
         .execute(
             insert,
@@ -739,7 +838,7 @@ async fn migration_0015_preserves_v14_pending_name_and_assigns_intent_revision()
 }
 
 #[tokio::test]
-async fn migration_0015_rejects_future_schema_versions() {
+async fn migration_0016_rejects_future_schema_versions() {
     let directory = private_data_directory("migration-future-schema");
     let config = CoreRuntimeConfig::new(&directory);
     let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
@@ -748,7 +847,7 @@ async fn migration_0015_rejects_future_schema_versions() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.pragma_update(None, "user_version", 16).unwrap();
+    connection.pragma_update(None, "user_version", 17).unwrap();
     drop(connection);
     assert!(matches!(
         CoreRuntime::open_loopback_for_tests(config).await,
@@ -799,7 +898,7 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();

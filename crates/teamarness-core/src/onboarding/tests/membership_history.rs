@@ -74,7 +74,9 @@ async fn declared_history_uses_inclusive_admission_and_exclusive_revocation_boun
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer.redeem_invitation(&claim).unwrap();
     let admitted_at = operation_time(&issuer_directory, 1);
 

@@ -41,3 +41,139 @@ fn decode_hex(value: &str) -> Vec<u8> {
         .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
         .collect()
 }
+
+/// Verifies: TEAM.SYS.MEM-R02, ID-R10. An `add agent key` proof binds the
+/// Agent key to one Workspace, one Person group and one Steward. A proof made
+/// for any other binding, or by another key, is an invalid proof; tampered
+/// canonical bytes fail hash or signature authentication before any authority
+/// is considered.
+#[test]
+fn agent_key_proof_forgery_is_rejected_before_authorization() {
+    use teamarness_core::test_authoring::{
+        TestAction, identity_of, operation_id, replay_for_tests, sign_admission,
+        sign_agent_key_proof, sign_operation, try_sign_operation,
+    };
+    use teamarness_core::{MembershipError, WorkspaceId};
+
+    const CREATOR: [u8; 32] = [1; 32];
+    const MEMBER: [u8; 32] = [2; 32];
+    const AGENT: [u8; 32] = [3; 32];
+    const OTHER: [u8; 32] = [4; 32];
+
+    let workspace = WorkspaceId::from_str("07070707070707070707070707070707").unwrap();
+    let genesis = sign_operation(&CREATOR, workspace, 10, TestAction::Create, &[]);
+    let genesis_id = operation_id(&genesis);
+    let creator_group = sign_operation(
+        &CREATOR,
+        workspace,
+        10,
+        TestAction::CreatePerson,
+        &[genesis_id],
+    );
+    let attach = sign_operation(
+        &CREATOR,
+        workspace,
+        10,
+        TestAction::AttachPerson {
+            group: operation_id(&creator_group),
+        },
+        &[operation_id(&creator_group)],
+    );
+    let (member_group, admit) = sign_admission(
+        &CREATOR,
+        &MEMBER,
+        workspace,
+        genesis_id,
+        20,
+        1_000,
+        [1; 32],
+        30,
+        &[operation_id(&attach)],
+    );
+    let group = operation_id(&member_group);
+    let head = operation_id(&admit);
+    let base = vec![genesis, creator_group, attach, member_group, admit.clone()];
+    let replay = |extra: Vec<u8>| {
+        let mut all = base.clone();
+        all.push(extra);
+        replay_for_tests(workspace, identity_of(&CREATOR), &all).map(|_| ())
+    };
+    let steward = identity_of(&MEMBER);
+    let agent = identity_of(&AGENT);
+
+    // The genuine proof is accepted.
+    let genuine = sign_operation(
+        &MEMBER,
+        workspace,
+        40,
+        TestAction::AddAgentKey {
+            group,
+            agent_secret: AGENT,
+        },
+        &[head],
+    );
+    assert_eq!(replay(genuine.clone()), Ok(()));
+
+    let forged = [
+        (
+            "signed by the wrong key",
+            sign_agent_key_proof(&OTHER, workspace, group, steward),
+        ),
+        (
+            "over the wrong workspace",
+            sign_agent_key_proof(
+                &AGENT,
+                WorkspaceId::from_str("08080808080808080808080808080808").unwrap(),
+                group,
+                steward,
+            ),
+        ),
+        (
+            "over the wrong group",
+            sign_agent_key_proof(&AGENT, workspace, genesis_id, steward),
+        ),
+        (
+            "over the wrong steward",
+            sign_agent_key_proof(&AGENT, workspace, group, identity_of(&CREATOR)),
+        ),
+    ];
+    for (case, proof) in forged {
+        // The envelope codec authenticates the proof while decoding, so a forged
+        // proof never produces an envelope at all, let alone reaches authority.
+        let outcome = try_sign_operation(
+            &MEMBER,
+            workspace,
+            40,
+            TestAction::AddAgentKeyWithProof {
+                group,
+                agent,
+                proof,
+            },
+            &[head],
+        );
+        assert_eq!(
+            outcome.map(|_| ()),
+            Err(MembershipError::InvalidAdmissionProof),
+            "a proof {case} is an invalid admission proof"
+        );
+    }
+
+    // Tampered canonical bytes: the content hash and signature are checked
+    // before any authority rule can run.
+    let mut hash_tampered = genuine.clone();
+    // Length prefix, header (version, workspace, author, timestamp), action tag
+    // and group tag, then the first byte of the group identifier.
+    let group_offset = 4 + (1 + 1 + 16 + 1 + 32 + 8) + 1 + 1;
+    hash_tampered[group_offset] ^= 0x01;
+    assert_eq!(
+        replay(hash_tampered),
+        Err(MembershipError::ContentHashMismatch)
+    );
+    let mut signature_tampered = genuine.clone();
+    let last = signature_tampered.len() - 1;
+    signature_tampered[last] ^= 0x01;
+    assert_eq!(
+        replay(signature_tampered),
+        Err(MembershipError::InvalidSignature)
+    );
+}

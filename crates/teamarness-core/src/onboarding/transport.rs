@@ -619,7 +619,12 @@ mod tests {
         let token =
             sign_token(&secret(1), WorkspaceId::from_bytes([3; 16]), 1, 2, [4; 32]).unwrap();
         let request = encode_request(&JoinRequest {
-            claim: sign_claim(&secret(2), &token).unwrap(),
+            claim: sign_claim(
+                &secret(2),
+                &token,
+                crate::MembershipOperationId::digest(b"genesis"),
+            )
+            .unwrap(),
         })
         .unwrap();
         let (mut send, _receive) = connection.open_bi().await.unwrap();

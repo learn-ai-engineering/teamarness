@@ -150,7 +150,8 @@ pub(crate) fn disclosure(
     Ok(Disclosure::None)
 }
 
-/// Every `Revoke` of `peer` together with its transitive dependencies.
+/// Every `Revoke` of `peer`, or removal of `peer` as an Agent key, together
+/// with its transitive dependencies.
 fn revocation_closure(
     projection: &WorkspaceProjection,
     peer: PublicIdentity,
@@ -160,7 +161,8 @@ fn revocation_closure(
         .operations
         .iter()
         .filter(|(_, operation)| {
-            matches!(&operation.action, MembershipAction::Revoke { target } if *target == peer)
+            matches!(&operation.action, MembershipAction::Revoke { target, .. } if *target == peer)
+                || matches!(&operation.action, MembershipAction::RemoveAgentKey { agent, .. } if *agent == peer)
         })
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
@@ -240,8 +242,12 @@ mod tests {
             [target; 32],
         )
         .expect("a test invitation token signs");
-        let claim = crate::invitation::sign_claim(&SecretKey::from_bytes(&[target; 32]), &token)
-            .expect("a test invitation claim signs");
+        let claim = crate::invitation::sign_claim(
+            &SecretKey::from_bytes(&[target; 32]),
+            &token,
+            MembershipOperationId::digest(b"genesis"),
+        )
+        .expect("a test invitation claim signs");
         envelope(
             author,
             MembershipAction::Admit {
@@ -269,6 +275,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(2),
+                group: id(2),
             },
             vec![genesis.id],
         );
@@ -276,6 +283,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(3),
+                group: id(3),
             },
             vec![genesis.id],
         );
@@ -283,6 +291,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(4),
+                group: id(4),
             },
             vec![left.id, right.id],
         );
@@ -325,6 +334,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(2),
+                group: id(2),
             },
             vec![genesis.id],
         );
@@ -356,6 +366,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(9),
+                group: id(9),
             },
             vec![genesis.id],
         );
@@ -380,6 +391,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(2),
+                group: id(2),
             },
             vec![admitted.id],
         );

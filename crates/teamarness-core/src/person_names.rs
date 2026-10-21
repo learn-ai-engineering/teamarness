@@ -284,7 +284,7 @@ mod tests {
         let admission = |nonce: u8, dependencies: Vec<MembershipOperationId>| {
             let token =
                 crate::invitation::sign_token(&manager, workspace, 10, 200, [nonce; 32]).unwrap();
-            let claim = crate::invitation::sign_claim(&joiner, &token).unwrap();
+            let claim = crate::invitation::sign_claim(&joiner, &token, genesis.id).unwrap();
             MembershipEnvelope::sign(
                 &manager,
                 workspace,

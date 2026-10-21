@@ -47,8 +47,14 @@ pub use error::{
     StorageError, SubscriptionError, ValueParseError, WorkspaceError,
 };
 pub use membership::MembershipOperationId;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use membership::test_authoring;
 pub use onboarding::WorkspaceInvitation;
 pub use person_names::{PersonNameError, WorkspacePerson, WorkspacePersonId};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use runtime::MembershipApplyOutcomeForTests;
 /// Test observation hooks. See the `test-hooks` feature.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

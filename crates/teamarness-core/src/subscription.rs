@@ -119,7 +119,8 @@ fn load_after_with_limit(
                     o.canonical_envelope
              FROM membership_transitions t
              JOIN membership_operations o ON o.operation_id = t.cause_operation_id
-             WHERE t.workspace_id = ?1 AND t.epoch > ?2 ORDER BY t.epoch LIMIT ?3",
+             WHERE t.workspace_id = ?1 AND t.epoch > ?2 AND o.action IN (1, 2, 5, 6)
+             ORDER BY t.epoch LIMIT ?3",
         )
         .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
     let rows = statement
@@ -234,7 +235,12 @@ mod tests {
             [9; 32],
         )
         .unwrap();
-        let claim = sign_claim(&secret(8), &token).unwrap();
+        let claim = sign_claim(
+            &secret(8),
+            &token,
+            MembershipOperationId::digest(b"genesis"),
+        )
+        .unwrap();
         let joiner = claim.invitee;
         let admit = envelope(
             &manager,
@@ -248,7 +254,13 @@ mod tests {
             (MembershipChange::Admitted { member: joiner }, author)
         );
 
-        let revoke = envelope(&manager, MembershipAction::Revoke { target: joiner });
+        let revoke = envelope(
+            &manager,
+            MembershipAction::Revoke {
+                target: joiner,
+                group: MembershipOperationId::digest(b"group"),
+            },
+        );
         assert_eq!(
             change_from_envelope(&revoke).unwrap(),
             (MembershipChange::Revoked { member: joiner }, author)

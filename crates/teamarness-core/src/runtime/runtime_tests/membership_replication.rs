@@ -249,8 +249,9 @@ async fn revoked_member_learns_only_its_revocation_closure() {
         .difference(&before_d)
         .copied()
         .collect::<BTreeSet<_>>();
-    assert_eq!(admit_c.len(), 1);
-    assert_eq!(admit_d.len(), 1);
+    // Each admission commits the joiner's group create beside it.
+    assert_eq!(admit_c.len(), 2);
+    assert_eq!(admit_d.len(), 2);
     cluster.restart("b").await;
 
     cluster

@@ -363,6 +363,8 @@ mod types;
 mod workspaces;
 
 pub use subscription::MembershipSubscription;
+#[cfg(feature = "test-hooks")]
+pub use test_hooks::MembershipApplyOutcomeForTests;
 #[cfg(test)]
 pub(crate) use test_hooks::ProbeOutcome;
 #[cfg(any(test, feature = "test-hooks"))]

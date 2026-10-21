@@ -962,11 +962,11 @@ fn peers_of(
     if !projection.contains_member(local) {
         return Vec::new();
     }
+    // Agent keys are Members but never peers: they live on their Steward's
+    // Installation, receive no Protection Grants and are asked for no keys.
     projection
-        .snapshot()
-        .members()
-        .iter()
-        .map(crate::MemberSnapshot::identity)
+        .installation_members()
+        .into_iter()
         .filter(|peer| *peer != local)
         .collect()
 }
@@ -1130,6 +1130,12 @@ mod tests {
             let summary = crate::workspace::create(&mut connection, &secret, "Scheduling", 0)
                 .expect("the Workspace is created");
             let workspace = summary.id();
+            // Creation commits the creator's group create and attachment, each
+            // of which bumps the membership wake; the fixture starts with no
+            // membership work pending so only record jobs are due.
+            connection
+                .execute("UPDATE membership_sync_wakes SET wake_generation = 0", [])
+                .expect("the membership wake is reset");
             crate::synchronization::append(
                 &mut connection,
                 &secret,

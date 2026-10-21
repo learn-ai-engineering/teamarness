@@ -342,9 +342,10 @@ async fn routes_scoped_workspace_membership_and_signing_calls() {
         capability("teamarness.membership", "current", object([])),
     )
     .await;
+    // Genesis now atomically includes the creator's Person group and attachment.
     assert_eq!(
         current.get("epoch"),
-        Some(&PackageValue::String("0".into()))
+        Some(&PackageValue::String("2".into()))
     );
     assert!(
         matches!(current.get("members"), Some(PackageValue::Array(values)) if values.len() == 1)

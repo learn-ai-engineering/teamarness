@@ -108,7 +108,7 @@ async fn forged_or_wrong_workspace_genesis_refuses_reopen() {
                     .execute(
                         "UPDATE membership_operations
                          SET canonical_envelope = X'00'
-                         WHERE workspace_id = ?1",
+                         WHERE workspace_id = ?1 AND action = 0",
                         [first_id],
                     )
                     .unwrap();

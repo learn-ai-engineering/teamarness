@@ -56,7 +56,9 @@ async fn exact_retry_recovers_after_expiry_without_a_duplicate_admission() {
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 50)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
 
     let first = issuer
         .admit_and_export_for_test(&claim, invitee.public_identity(), None)
@@ -107,7 +109,9 @@ async fn peer_binding_fault_boundaries_and_response_loss_preserve_one_commit() {
         .unwrap();
     let workspace = issuer.create_workspace("Fault recovery").unwrap();
     let token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     let wrong_peer = SecretKey::from_bytes(&[99; 32]).public();
 
     assert_eq!(
@@ -163,7 +167,9 @@ async fn uncertain_after_commit_recovers_exactly_after_authenticated_reopen() {
         .unwrap();
     let workspace = issuer.create_workspace("Uncertain commit").unwrap();
     let token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
 
     assert_eq!(
         issuer
@@ -206,7 +212,9 @@ async fn authenticated_handler_returns_bootstrap_after_releasing_runtime_state()
         .unwrap();
     let verified = invitation.verified().unwrap();
     let invitee_secret = SecretKey::from_bytes(&[88; 32]);
-    let claim = crate::invitation::sign_claim(&invitee_secret, &verified.token).unwrap();
+    let claim =
+        crate::invitation::sign_claim(&invitee_secret, &verified.token, verified.genesis_id)
+            .unwrap();
     let client = Transport::bind_loopback(invitee_secret, Duration::from_millis(20), true)
         .await
         .unwrap();
@@ -247,8 +255,12 @@ async fn different_claimant_and_revoked_recovery_are_rejected() {
         .unwrap();
     let workspace = issuer.create_workspace("Claim binding").unwrap();
     let token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let first_claim = first.create_invitation_claim(&token).unwrap();
-    let second_claim = second.create_invitation_claim(&token).unwrap();
+    let first_claim = first
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
+    let second_claim = second
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer
         .admit_and_export_for_test(&first_claim, first.public_identity(), None)
         .unwrap();
@@ -294,7 +306,9 @@ async fn recovered_export_includes_later_operations_and_current_version() {
         .unwrap();
     let workspace = issuer.create_workspace("Current export").unwrap();
     let first_token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let first_claim = first.create_invitation_claim(&first_token).unwrap();
+    let first_claim = first
+        .create_invitation_claim(&first_token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     let first_response = decode_success(
         &issuer
             .admit_and_export_for_test(&first_claim, first.public_identity(), None)
@@ -302,7 +316,9 @@ async fn recovered_export_includes_later_operations_and_current_version() {
     )
     .unwrap();
     let second_token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let second_claim = second.create_invitation_claim(&second_token).unwrap();
+    let second_claim = second
+        .create_invitation_claim(&second_token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer
         .admit_and_export_for_test(&second_claim, second.public_identity(), None)
         .unwrap();
@@ -314,7 +330,9 @@ async fn recovered_export_includes_later_operations_and_current_version() {
     )
     .unwrap();
     assert_eq!(recovered.admission_id, first_response.admission_id);
-    assert_eq!(recovered.post_genesis.len(), 2);
+    // The creator's group create and attachment, then a group create and an
+    // admission for each of the two Members.
+    assert_eq!(recovered.post_genesis.len(), 6);
     assert_eq!(
         recovered.membership_version,
         issuer.membership_version(workspace.id()).unwrap()
@@ -345,13 +363,17 @@ async fn admission_and_revocation_fail_before_commit_when_bootstrap_is_over_limi
         .unwrap();
     let workspace = issuer.create_workspace("Mutation limits").unwrap();
     let first_token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let first_claim = first.create_invitation_claim(&first_token).unwrap();
+    let first_claim = first
+        .create_invitation_claim(&first_token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer
         .admit_and_export_for_test(&first_claim, first.public_identity(), None)
         .unwrap();
     let before = issuer.membership_snapshot(workspace.id()).unwrap();
     let second_token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let second_claim = second.create_invitation_claim(&second_token).unwrap();
+    let second_claim = second
+        .create_invitation_claim(&second_token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     let tiny_operations = BootstrapLimits {
         max_body_bytes: 8 * 1024 * 1024,
         max_operations: 1,
@@ -421,7 +443,9 @@ async fn contradictory_spent_binding_fails_closed_as_corruption() {
         .unwrap();
     let workspace = issuer.create_workspace("Corrupt binding").unwrap();
     let token = issuer.issue_invitation(workspace.id(), i64::MAX).unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer.redeem_invitation(&claim).unwrap();
 
     let connection = Connection::open(issuer_directory.join("core.sqlite3")).unwrap();

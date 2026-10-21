@@ -547,12 +547,16 @@ async fn membership_generation_write_failure_rolls_back_local_and_remote_revocat
     let version = creator.membership_version(workspace).unwrap();
     let envelope = {
         let state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
         crate::membership::MembershipEnvelope::sign(
             &state.secret_key,
             workspace,
             creator.clock.now_unix_ms(),
-            crate::membership::MembershipAction::Revoke { target: member },
-            state.memberships.get(&workspace).unwrap().heads(),
+            crate::membership::MembershipAction::Revoke {
+                target: member,
+                group: projection.person_group(member).unwrap(),
+            },
+            projection.heads(),
         )
         .unwrap()
     };
@@ -2099,5 +2103,143 @@ async fn forged_order_key_does_not_end_the_session() {
     );
     assert_eq!(seen.len(), 1, "neither forged record entered the journal");
     assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.ID-R10, MEM-R02. An Agent key is a Member, but it lives on
+/// its Steward's Installation: Protection Grants, key demands and sessions
+/// address Installation keys only. Recipients and scheduled peers are subsets
+/// of current Installations (a grant or session is not required for every key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protection_grants_and_sessions_address_installation_keys_only() {
+    use crate::membership::{AgentKeyProof, MembershipAction, MembershipEnvelope};
+
+    let cluster = SyncCluster::start("no-grants-to-agents", &["creator", "member"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Agents")
+        .unwrap()
+        .id();
+    cluster
+        .node("creator")
+        .append_record(workspace, PACKAGE, "message.post", b"seed")
+        .unwrap();
+    cluster.admit("creator", "member", workspace).await;
+
+    // The Member adds an Agent key to its own key group.
+    let agent_secret = iroh_base::SecretKey::from_bytes(&[77; 32]);
+    let agent = crate::PublicIdentity::from_bytes(*agent_secret.public().as_bytes()).unwrap();
+    let member_identity = cluster.identity("member");
+    let add_agent = {
+        let member = cluster.node("member");
+        let state = member.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let group = projection.person_group(member_identity).unwrap();
+        MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            member.clock.now_unix_ms(),
+            MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof: AgentKeyProof::sign(&agent_secret, workspace, group, member_identity)
+                    .unwrap(),
+            },
+            projection.heads(),
+        )
+        .unwrap()
+    };
+    assert!(
+        cluster
+            .node("member")
+            .apply_membership_envelope(add_agent.canonical_bytes())
+            .unwrap()
+            .accepted
+    );
+    cluster
+        .replicate_membership("member", "creator", workspace)
+        .await;
+    // Records flow both ways, so each side issues the other a Protection Grant.
+    cluster
+        .node("member")
+        .replicate_records_to_address_for_test(
+            workspace,
+            PACKAGE,
+            cluster.address("creator"),
+            cluster.identity("creator"),
+        )
+        .await
+        .unwrap();
+    cluster
+        .node("member")
+        .append_record(workspace, PACKAGE, "message.post", b"from member")
+        .unwrap();
+    cluster
+        .node("creator")
+        .replicate_records_to_address_for_test(
+            workspace,
+            PACKAGE,
+            cluster.address("member"),
+            cluster.identity("member"),
+        )
+        .await
+        .unwrap();
+
+    let installations = BTreeSet::from([cluster.identity("creator"), member_identity]);
+    for name in ["creator", "member"] {
+        let node = cluster.node(name);
+        let recipients = {
+            let state = node.state.lock().unwrap();
+            let projection = state.memberships.get(&workspace).unwrap();
+            assert!(
+                projection.contains_member(agent),
+                "{name} counts the Agent as a Member"
+            );
+            assert_eq!(
+                projection
+                    .installation_members()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                installations,
+                "{name} addresses exactly the Installation keys"
+            );
+            let mut statement = state
+                .connection
+                .prepare(
+                    "SELECT DISTINCT recipient_public_identity FROM protection_control_operations
+                     WHERE operation_kind = 'grant'",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .map(|row| {
+                    crate::PublicIdentity::from_bytes(row.unwrap().try_into().unwrap()).unwrap()
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(!recipients.is_empty(), "{name} holds at least one grant");
+        assert!(
+            recipients.is_subset(&installations),
+            "{name}: every grant recipient is an Installation key"
+        );
+        assert!(
+            !recipients.contains(&agent),
+            "{name}: no grant targets the Agent key"
+        );
+        let peers = node
+            .scheduler_snapshot_for_test()
+            .into_iter()
+            .map(|peer| peer.peer)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            peers.is_subset(&installations),
+            "{name}: the scheduler dials Installation keys only"
+        );
+        assert!(
+            !peers.contains(&agent),
+            "{name}: the Agent key is never a peer"
+        );
+    }
     cluster.finish().await;
 }

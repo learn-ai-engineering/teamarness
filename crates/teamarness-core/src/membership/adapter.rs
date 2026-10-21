@@ -5,6 +5,11 @@ use p2panda_core::Hash;
 
 use super::{AuthId, MembershipAction, MembershipEnvelope};
 
+/// Maps one authenticated envelope onto the p2panda group operation it is.
+///
+/// Workspace-group actions name the Workspace as their group and add or remove
+/// a Person's key group. Person-group actions name the Person group, which is
+/// the identifier of the `create person` operation that made it.
 #[derive(Clone)]
 pub(crate) struct OperationAdapter(pub(crate) MembershipEnvelope);
 
@@ -26,23 +31,42 @@ impl Operation<AuthId, Hash, ()> for OperationAdapter {
     }
 
     fn group_id(&self) -> AuthId {
-        AuthId::workspace(self.0.workspace_id)
+        match &self.0.action {
+            MembershipAction::CreatePerson => AuthId::person(self.0.id),
+            MembershipAction::AddAgentKey { group, .. }
+            | MembershipAction::RemoveAgentKey { group, .. } => AuthId::person(*group),
+            MembershipAction::Create
+            | MembershipAction::Admit { .. }
+            | MembershipAction::AttachPerson { .. }
+            | MembershipAction::Revoke { .. } => AuthId::workspace(self.0.workspace_id),
+        }
     }
 
     fn action(&self) -> GroupAction<AuthId, ()> {
         match &self.0.action {
-            MembershipAction::Create => GroupAction::Create {
+            MembershipAction::Create | MembershipAction::CreatePerson => GroupAction::Create {
                 initial_members: vec![(
                     GroupMember::Individual(AuthId::installation(self.0.author)),
                     Access::manage(),
                 )],
             },
-            MembershipAction::Admit { target, .. } => GroupAction::Add {
-                member: GroupMember::Individual(AuthId::installation(*target)),
+            MembershipAction::Admit { proof, .. } => GroupAction::Add {
+                member: GroupMember::Group(AuthId::person(proof.claim.create_person.id)),
                 access: Access::write(),
             },
-            MembershipAction::Revoke { target } => GroupAction::Remove {
-                member: GroupMember::Individual(AuthId::installation(*target)),
+            MembershipAction::AttachPerson { group } => GroupAction::Add {
+                member: GroupMember::Group(AuthId::person(*group)),
+                access: Access::write(),
+            },
+            MembershipAction::Revoke { group, .. } => GroupAction::Remove {
+                member: GroupMember::Group(AuthId::person(*group)),
+            },
+            MembershipAction::AddAgentKey { agent, .. } => GroupAction::Add {
+                member: GroupMember::Individual(AuthId::installation(*agent)),
+                access: Access::write(),
+            },
+            MembershipAction::RemoveAgentKey { agent, .. } => GroupAction::Remove {
+                member: GroupMember::Individual(AuthId::installation(*agent)),
             },
         }
     }
@@ -50,12 +74,25 @@ impl Operation<AuthId, Hash, ()> for OperationAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use iroh_base::SecretKey;
-    use p2panda_auth::group::{GroupAction, GroupMember};
+    use p2panda_auth::group::resolver::StrongRemove;
+    use p2panda_auth::group::{GroupAction, GroupCrdt, GroupMember};
     use p2panda_auth::traits::Operation;
 
     use super::*;
-    use crate::WorkspaceId;
+    use crate::invitation::{sign_claim, sign_token};
+    use crate::membership::{AdmissionProof, AgentKeyProof};
+    use crate::{MembershipOperationId, PublicIdentity, WorkspaceId};
+
+    fn secret(byte: u8) -> SecretKey {
+        SecretKey::from_bytes(&[byte; 32])
+    }
+
+    fn identity(byte: u8) -> PublicIdentity {
+        PublicIdentity::from_bytes(*secret(byte).public().as_bytes()).unwrap()
+    }
 
     #[test]
     fn adapter_returns_owned_p2panda_values_with_distinct_roles() {
@@ -85,5 +122,259 @@ mod tests {
                     Access::manage(),
                 )]
         ));
+    }
+
+    /// A probe operation: the real adapter, or a deliberately wrong mapping
+    /// used to confirm a library refusal.
+    #[derive(Clone)]
+    enum Probe {
+        Real(OperationAdapter),
+        ManagerGroupAdd(MembershipEnvelope, MembershipOperationId),
+    }
+
+    impl Operation<AuthId, Hash, ()> for Probe {
+        fn id(&self) -> Hash {
+            match self {
+                Self::Real(adapter) => adapter.id(),
+                Self::ManagerGroupAdd(envelope, _) => envelope.id.as_hash(),
+            }
+        }
+        fn author(&self) -> AuthId {
+            match self {
+                Self::Real(adapter) => adapter.author(),
+                Self::ManagerGroupAdd(envelope, _) => AuthId::installation(envelope.author),
+            }
+        }
+        fn dependencies(&self) -> Vec<Hash> {
+            match self {
+                Self::Real(adapter) => adapter.dependencies(),
+                Self::ManagerGroupAdd(envelope, _) => {
+                    envelope.dependencies.iter().map(|d| d.as_hash()).collect()
+                }
+            }
+        }
+        fn group_id(&self) -> AuthId {
+            match self {
+                Self::Real(adapter) => adapter.group_id(),
+                Self::ManagerGroupAdd(envelope, _) => AuthId::workspace(envelope.workspace_id),
+            }
+        }
+        fn action(&self) -> GroupAction<AuthId, ()> {
+            match self {
+                Self::Real(adapter) => adapter.action(),
+                Self::ManagerGroupAdd(_, group) => GroupAction::Add {
+                    member: GroupMember::Group(AuthId::person(*group)),
+                    access: Access::manage(),
+                },
+            }
+        }
+    }
+
+    type ProbeCrdt = GroupCrdt<AuthId, Hash, Probe, (), StrongRemove<AuthId, Hash, Probe, ()>>;
+    type ProbeState = p2panda_auth::group::GroupCrdtState<AuthId, Hash, Probe, ()>;
+
+    /// Replays `operations` from an empty state, so a step that must fail can
+    /// be tried without needing the library state to be clonable.
+    fn build(operations: &[&MembershipEnvelope]) -> ProbeState {
+        operations.iter().fold(
+            ProbeCrdt::init(),
+            |state, envelope| match ProbeCrdt::process(
+                state,
+                &Probe::Real(OperationAdapter((*envelope).clone())),
+            ) {
+                Ok(state) => state,
+                Err(_) => panic!("the probe prefix is accepted by the library"),
+            },
+        )
+    }
+
+    fn members_of(state: &ProbeState, workspace: WorkspaceId) -> BTreeSet<(AuthId, bool)> {
+        state
+            .members(AuthId::workspace(workspace))
+            .into_iter()
+            .map(|(id, access)| (id, access.is_manage()))
+            .collect()
+    }
+
+    /// Drives `GroupCrdt` directly with the adapter's output, so the nested
+    /// group semantics the design relies on are confirmed against the library
+    /// rather than inferred from Teamarness replay.
+    #[test]
+    fn p2panda_probe_nested_person_groups_flatten_add_remove_and_revoke() {
+        let workspace = WorkspaceId::from_bytes([5; 16]);
+        let creator = secret(1);
+        let joiner = secret(2);
+        let agent = secret(3);
+        let creator_id = AuthId::installation(identity(1));
+        let joiner_id = AuthId::installation(identity(2));
+        let agent_id = AuthId::installation(identity(3));
+
+        // Creator genesis: the creator is the Workspace group's sole manager.
+        let genesis =
+            MembershipEnvelope::sign(&creator, workspace, 10, MembershipAction::Create, vec![])
+                .unwrap();
+        assert_eq!(
+            members_of(&build(&[&genesis]), workspace),
+            BTreeSet::from([(creator_id, true)])
+        );
+
+        // Group create by the joiner: a new nested group with the joiner as
+        // its manager, not yet visible in the Workspace.
+        let token = sign_token(&creator, workspace, 20, 1_000, [7; 32]).unwrap();
+        let claim = sign_claim(&joiner, &token, genesis.id).unwrap();
+        let create_person = claim.create_person.clone();
+        let group = create_person.id;
+        let state = build(&[&genesis, &create_person]);
+        assert_eq!(
+            members_of(&state, workspace),
+            BTreeSet::from([(creator_id, true)])
+        );
+        assert_eq!(
+            state
+                .members(AuthId::person(group))
+                .into_iter()
+                .map(|(id, access)| (id, access.is_manage()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(joiner_id, true)])
+        );
+
+        // Group admit by the creator: the joiner appears transitively as a
+        // writer, capped by the group's write access.
+        let admit = MembershipEnvelope::sign(
+            &creator,
+            workspace,
+            30,
+            MembershipAction::Admit {
+                target: identity(2),
+                proof: Box::new(AdmissionProof { claim }),
+            },
+            vec![genesis.id, group],
+        )
+        .unwrap();
+        assert_eq!(
+            members_of(&build(&[&genesis, &create_person, &admit]), workspace),
+            BTreeSet::from([(creator_id, true), (joiner_id, false)])
+        );
+
+        // Agent add inside the Person group by its manager: the agent is a
+        // transitive Workspace member with write access.
+        let add_agent = MembershipEnvelope::sign(
+            &joiner,
+            workspace,
+            40,
+            MembershipAction::AddAgentKey {
+                group,
+                agent: identity(3),
+                proof: AgentKeyProof::sign(&agent, workspace, group, identity(2)).unwrap(),
+            },
+            vec![admit.id],
+        )
+        .unwrap();
+        let prefix = [&genesis, &create_person, &admit, &add_agent];
+        assert_eq!(
+            members_of(&build(&prefix), workspace),
+            BTreeSet::from([(creator_id, true), (joiner_id, false), (agent_id, false)])
+        );
+
+        // The Workspace manager is not a member of the Person group, so the
+        // library refuses a manager-authored remove inside it.
+        let manager_remove = MembershipEnvelope::sign(
+            &creator,
+            workspace,
+            45,
+            MembershipAction::RemoveAgentKey {
+                group,
+                agent: identity(3),
+            },
+            vec![add_agent.id],
+        )
+        .unwrap();
+        assert!(
+            ProbeCrdt::process(
+                build(&prefix),
+                &Probe::Real(OperationAdapter(manager_remove))
+            )
+            .is_err()
+        );
+
+        // Agent remove by the Person: the agent leaves the Workspace.
+        let remove_agent = MembershipEnvelope::sign(
+            &joiner,
+            workspace,
+            50,
+            MembershipAction::RemoveAgentKey {
+                group,
+                agent: identity(3),
+            },
+            vec![add_agent.id],
+        )
+        .unwrap();
+        let prefix = [&genesis, &create_person, &admit, &add_agent, &remove_agent];
+        assert_eq!(
+            members_of(&build(&prefix), workspace),
+            BTreeSet::from([(creator_id, true), (joiner_id, false)])
+        );
+
+        // Re-add, then group revoke by the creator: the Person and its agent
+        // are both gone from the Workspace although the Person group itself
+        // still lists them.
+        let add_again = MembershipEnvelope::sign(
+            &joiner,
+            workspace,
+            60,
+            MembershipAction::AddAgentKey {
+                group,
+                agent: identity(3),
+                proof: AgentKeyProof::sign(&agent, workspace, group, identity(2)).unwrap(),
+            },
+            vec![remove_agent.id],
+        )
+        .unwrap();
+        let revoke = MembershipEnvelope::sign(
+            &creator,
+            workspace,
+            70,
+            MembershipAction::Revoke {
+                target: identity(2),
+                group,
+            },
+            vec![add_again.id],
+        )
+        .unwrap();
+        let state = build(&[
+            &genesis,
+            &create_person,
+            &admit,
+            &add_agent,
+            &remove_agent,
+            &add_again,
+            &revoke,
+        ]);
+        assert_eq!(
+            members_of(&state, workspace),
+            BTreeSet::from([(creator_id, true)])
+        );
+        assert_eq!(state.members(AuthId::person(group)).len(), 2);
+
+        // A group holding manage access is refused by the library, which is
+        // why the creator stays an individual manager beside its own group.
+        let manager_group = MembershipEnvelope::sign(
+            &creator,
+            workspace,
+            80,
+            MembershipAction::AttachPerson { group },
+            vec![revoke.id],
+        )
+        .unwrap();
+        let state = build(&[
+            &genesis,
+            &create_person,
+            &admit,
+            &add_agent,
+            &remove_agent,
+            &add_again,
+            &revoke,
+        ]);
+        assert!(ProbeCrdt::process(state, &Probe::ManagerGroupAdd(manager_group, group)).is_err());
     }
 }
