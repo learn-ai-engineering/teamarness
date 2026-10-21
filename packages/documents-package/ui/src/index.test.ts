@@ -175,7 +175,7 @@ describe("Documents mount", () => {
     await fake.emit("documents.document.text", { documentId: doc, revision: "2", editable: true, origin: "remote", delta: [{ insert: "> intro\n" }] });
     expect(textarea.value).toBe("> intro\n# Q4\n- hire\n");
     expect(textarea.selectionStart).toBe(20);
-    (root.querySelector(".editor-header button") as HTMLButtonElement).click();
+    ([...root.querySelectorAll(".editor-header button")].find((b) => b.textContent === "Close") as HTMLButtonElement).click();
     await tick();
     expect(pane.hidden).toBe(true);
     await unmount();
@@ -196,7 +196,7 @@ describe("Documents mount", () => {
         "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
         "documents.comment.resolve": () => ({ ok: true as const, id: root }),
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined, "documents.names": () => undefined },
     });
     const rootNode = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root: rootNode }));
@@ -208,6 +208,18 @@ describe("Documents mount", () => {
     expect(items[0]?.querySelector(".comment-quote")?.textContent).toBe("# Q4");
     expect(items[0]?.querySelector(".comment-body strong")?.textContent).toBe("dates");
     expect(items[1]?.querySelector(".comment-author")?.textContent).toBe("You");
+    expect(items[0]?.querySelector(".comment-author")?.textContent).toBe("cccccccc…cccccc");
+    const person = { identity: "c".repeat(64), personId: "c".repeat(64), name: "Carol", fingerprint: "cccccccccccc" };
+    await fake.emit("documents.names", { available: true, cursor: "1", persons: [person], part: 0, parts: 1 });
+    expect(rootNode.querySelector(".comment-author")?.textContent).toBe("Carol");
+    await fake.emit("documents.names", { available: true, cursor: "2", persons: [{ ...person, name: "Carol R" }], part: 0, parts: 1 });
+    expect(rootNode.querySelector(".comment-author")?.textContent).toBe("Carol R");
+    // Preview renders the current draft and hides the editor.
+    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.textContent === "Preview") as HTMLButtonElement).click();
+    expect((rootNode.querySelector(".editor-textarea") as HTMLElement).hidden).toBe(true);
+    expect(rootNode.querySelector(".editor-preview h1")?.textContent).toBe("Q4");
+    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.textContent === "Edit") as HTMLButtonElement).click();
+    expect((rootNode.querySelector(".editor-textarea") as HTMLElement).hidden).toBe(false);
     expect(items[1]?.classList.contains("is-resolved")).toBe(true);
     expect((items[1] as HTMLElement).style.getPropertyValue("--comment-depth")).toBe("1");
 

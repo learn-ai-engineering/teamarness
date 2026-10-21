@@ -56,6 +56,21 @@ export type Edited = {
 
 export type Name = string;
 
+export type Names = {
+  readonly "available": boolean;
+  readonly "cursor": Revision;
+  readonly "part"?: number;
+  readonly "parts"?: number;
+  readonly "persons": readonly PersonName[];
+};
+
+export type PersonName = {
+  readonly "fingerprint": string;
+  readonly "identity": string;
+  readonly "name": string | null;
+  readonly "personId": string;
+};
+
 export type RecordId = string;
 
 export type Revision = string;
@@ -131,5 +146,6 @@ export type DocumentsContract = {
   readonly subscriptions: {
     readonly "documents.changes": { readonly request: Record<string, never>; readonly event: Snapshot };
     readonly "documents.document.text": { readonly request: DocumentRequest; readonly event: TextEvent };
+    readonly "documents.names": { readonly request: Record<string, never>; readonly event: Names };
   };
 };

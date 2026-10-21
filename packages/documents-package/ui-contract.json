@@ -321,6 +321,77 @@
           "$ref": "#/$defs/recordId"
         }
       }
+    },
+    "personName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "personId",
+        "name",
+        "fingerprint"
+      ],
+      "properties": {
+        "identity": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "personId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      }
+    },
+    "names": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "cursor",
+        "persons"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "$ref": "#/$defs/revision"
+        },
+        "persons": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/personName"
+          }
+        },
+        "part": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "parts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        }
+      }
     }
   },
   "requests": {
@@ -576,6 +647,15 @@
       },
       "event": {
         "$ref": "#/$defs/textEvent"
+      }
+    },
+    "documents.names": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "event": {
+        "$ref": "#/$defs/names"
       }
     }
   }

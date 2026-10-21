@@ -23,6 +23,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     throw error;
   }
   let disposed = false;
+  let nameRetry: ReturnType<typeof setTimeout> | undefined;
+  let nameSubscription: Awaited<ReturnType<typeof client.subscribe>> | null = null;
+  let nameRetryDelay = 1000;
   let view: DocumentsView | undefined;
   const controller = new DocumentsController(client, () => {
     if (!disposed) view?.render();
@@ -34,13 +37,49 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     const subscription = await client.subscribe("documents.changes", {}, (snapshot) => {
       if (!disposed) controller.applySnapshot(snapshot);
     });
+
+    // Names are optional presentation: a name stream failure must not prevent documents.
+    const scheduleNameRetry = () => {
+      if (disposed || nameRetry !== undefined) return;
+      nameSubscription = null;
+      nameRetry = setTimeout(() => {
+        nameRetry = undefined;
+        void openNames();
+      }, nameRetryDelay);
+      nameRetryDelay = Math.min(nameRetryDelay * 2, 30_000);
+    };
+    const openNames = async (): Promise<void> => {
+      let terminated = false;
+      try {
+        const opened = await client.subscribe("documents.names", {}, (names) => {
+          if (!disposed) {
+            nameRetryDelay = 1000;
+            controller.applyNames(names);
+          }
+        }, { onTerminated: () => {
+          terminated = true;
+          scheduleNameRetry();
+        } });
+        if (disposed || terminated) await opened.close();
+        else nameSubscription = opened;
+      } catch {
+        scheduleNameRetry();
+      }
+    };
+    await openNames();
+
     return async () => {
       if (disposed) return;
       disposed = true;
+      if (nameRetry) clearTimeout(nameRetry);
       controller.dispose();
       view?.dispose();
       try {
-        await subscription.close();
+        try {
+          await subscription.close();
+        } finally {
+          await nameSubscription?.close();
+        }
       } finally {
         cleanupStyles();
         cleanupKit();
@@ -48,6 +87,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     };
   } catch (error) {
     disposed = true;
+    if (nameRetry) clearTimeout(nameRetry);
     controller.dispose();
     view?.dispose();
     cleanupStyles();

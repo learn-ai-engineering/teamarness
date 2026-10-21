@@ -1,6 +1,6 @@
 import type { Collection, Comment, Document, TextEvent } from "./contract.generated";
 import type { DocumentsController } from "./controller";
-import { authorLabel, renderMarkdown } from "./markdown";
+import { renderMarkdown } from "./markdown";
 
 const KIT = {
   primary: "teamarness-control teamarness-control--primary",
@@ -81,6 +81,8 @@ export class DocumentsView {
   private readonly editorStatus: HTMLElement;
   private readonly textarea: HTMLTextAreaElement;
   private readonly closeButton: HTMLButtonElement;
+  private readonly previewButton: HTMLButtonElement;
+  private readonly preview: HTMLElement;
   private readonly commentsPanel: HTMLElement;
   private readonly commentList: HTMLElement;
   private readonly commentForm: HTMLFormElement;
@@ -169,8 +171,14 @@ export class DocumentsView {
     this.editorStatus = document.createElement("span");
     this.editorStatus.className = "editor-status";
     this.editorStatus.setAttribute("role", "status");
+    this.previewButton = button("Preview", KIT.secondary, () => controller.togglePreview());
+    this.previewButton.setAttribute("aria-pressed", "false");
     this.closeButton = button("Close", KIT.secondary, () => { void controller.closeDocument(); });
-    editorHeader.append(this.editorTitle, this.editorStatus, this.closeButton);
+    editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton, this.closeButton);
+    this.preview = document.createElement("article");
+    this.preview.className = "editor-preview";
+    this.preview.setAttribute("aria-label", "Rendered document");
+    this.preview.hidden = true;
     this.textarea = document.createElement("textarea");
     this.textarea.className = `${KIT.input} editor-textarea`;
     this.textarea.setAttribute("aria-label", "Document text (Markdown)");
@@ -178,7 +186,7 @@ export class DocumentsView {
     this.textarea.addEventListener("input", () => {
       controller.openEditor?.input(this.textarea.value);
     });
-    this.editorPane.append(editorHeader, this.textarea);
+    this.editorPane.append(editorHeader, this.textarea, this.preview);
     controller.textListener = (event: TextEvent) => this.onTextEvent(event);
 
     // --- comments (built once; the list is rebuilt per render, the composer persists) ---
@@ -287,7 +295,8 @@ export class DocumentsView {
     meta.className = "comment-meta";
     const author = document.createElement("span");
     author.className = "comment-author";
-    author.textContent = authorLabel(comment.author, undefined, comment.isLocal);
+    author.textContent = this.controller.labelFor(comment.author, comment.isLocal);
+    author.title = comment.author;
     const state = document.createElement("span");
     state.className = "comment-state";
     state.textContent = comment.resolved ? "Resolved" : "";
@@ -375,6 +384,12 @@ export class DocumentsView {
     this.textarea.disabled = !editable;
     this.editorStatus.textContent = error ?? (!editable ? "Waiting for history" : sending ? "Saving…" : "Saved");
     this.syncTextarea(null);
+    const preview = this.controller.state.preview;
+    this.previewButton.setAttribute("aria-pressed", String(preview));
+    this.previewButton.textContent = preview ? "Edit" : "Preview";
+    this.textarea.hidden = preview;
+    this.preview.hidden = !preview;
+    if (preview) this.preview.innerHTML = renderMarkdown(editor.value);
   }
 
   render(): void {

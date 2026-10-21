@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use teamarness_package_sdk::capabilities::person_names::PersonNames;
+use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
@@ -160,7 +160,6 @@ struct Session {
 pub struct DocumentsActive {
     store: DocumentStore,
     log: RecordLog,
-    #[allow(dead_code)]
     names: PersonNames,
     sync: Arc<Mutex<SyncReport>>,
     changes: watch::Sender<u64>,
@@ -588,6 +587,74 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         },
     )
     .subscription(
+        "documents.names",
+        |context: Context<DocumentsActive>, _: Empty| async move {
+            let (sender, subscription) = event_channel(4);
+            let names = context.state().names.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut cursor = match names.current().await {
+                        Ok(snapshot) => {
+                            let cursor = snapshot.cursor;
+                            for event in name_snapshots(snapshot) {
+                                if sender.send(event).await.is_err() {
+                                    return;
+                                }
+                            }
+                            cursor
+                        }
+                        Err(_) => {
+                            if sender
+                                .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
+                    if let Ok(mut stream) = names.subscribe(cursor).await {
+                        loop {
+                            let result = tokio::select! {
+                                result = stream.next() => result,
+                                () = sender.closed() => {
+                                    stream.close().await;
+                                    return;
+                                }
+                            };
+                            match result {
+                                Some(Ok(snapshot)) => {
+                                    if snapshot.cursor >= cursor {
+                                        cursor = snapshot.cursor;
+                                        for event in name_snapshots(snapshot) {
+                                            if sender.send(event).await.is_err() {
+                                                stream.close().await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(Err(_)) | None => break,
+                            }
+                        }
+                        stream.close().await;
+                    }
+                    if sender
+                        .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+            Ok(subscription)
+        },
+    )
+    .subscription(
         "documents.changes",
         |context: Context<DocumentsActive>, _: Empty| async move {
             let (sender, subscription) = event_channel(32);
@@ -652,6 +719,38 @@ async fn require_document(
     } else {
         Err(error("documents.unknown_document", false))
     }
+}
+
+/// Splits a roster into events of at most 64 Persons, which fit the bridge limits with room.
+fn name_snapshots(snapshot: PersonNameSnapshot) -> Vec<JsonValue> {
+    const PERSONS_PER_EVENT: usize = 64;
+    let persons: Vec<_> = snapshot
+        .persons
+        .into_iter()
+        .map(|person| {
+            json!({
+                "identity": person.identity, "personId": person.person_id,
+                "name": person.name, "fingerprint": person.fingerprint,
+            })
+        })
+        .collect();
+    let parts = persons.len().max(1).div_ceil(PERSONS_PER_EVENT);
+    persons
+        .chunks(PERSONS_PER_EVENT)
+        .enumerate()
+        .map(|(part, chunk)| {
+            json!({
+                "available": true, "cursor": snapshot.cursor.to_string(),
+                "persons": chunk, "part": part, "parts": parts,
+            })
+        })
+        .chain((persons.is_empty()).then(|| {
+            json!({
+                "available": true, "cursor": snapshot.cursor.to_string(),
+                "persons": [], "part": 0, "parts": 1,
+            })
+        }))
+        .collect()
 }
 
 async fn require_comment(context: &Context<DocumentsActive>, id: &str) -> Result<(), BackendError> {
@@ -1597,5 +1696,45 @@ mod tests {
         assert_eq!(comments[1]["parentId"], root);
         assert_eq!(comments[1]["resolved"], false);
         session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC6 — the names roster is forwarded in bounded parts and the stream closes
+    // with the subscription.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn names_are_forwarded_and_the_stream_closes_with_the_subscription() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = ScriptedCapability::new().calls(|method, _| match method {
+            "current" => Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [] })),
+            _ => Err(BackendError::new(
+                "capability_unavailable",
+                false,
+                json!({}),
+            )),
+        });
+        let observer: ActivationObserver = Arc::new(Mutex::new(None));
+        let mut harness = HarnessBuilder::new(router_observing(Some(observer)).into_backend())
+            .package_identity("dev.teamarness.documents")
+            .installation(ALICE, "Alice")
+            .data_directory(directory.path())
+            .capability(RECORD_LOG, scripted_log())
+            .capability("teamarness.person-names", names.clone())
+            .start()
+            .await;
+        harness.activate().await.unwrap();
+        let mut subscription = harness
+            .subscribe("documents.names", json!({}))
+            .await
+            .unwrap();
+        let first = subscription.next_event().await.unwrap().unwrap();
+        assert_eq!(first["cursor"], "0");
+        assert_eq!(first["persons"], json!([]));
+        assert_eq!(first["parts"], 1);
+        let stream = names.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        subscription.close().await;
+        wait_until(|| !stream.is_open(), "idle person-names stream closure").await;
+        harness.shutdown().await.unwrap();
     }
 }

@@ -1,7 +1,8 @@
 import { describePackageError, isAbortError } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Collection, Comment, Document, DocumentsContract, Snapshot, TextEvent } from "./contract.generated";
+import type { Collection, Comment, Document, DocumentsContract, Names, Snapshot, TextEvent } from "./contract.generated";
 import { DocumentEditor } from "./editor";
+import { authorLabel } from "./markdown";
 
 export type ControllerState = Readonly<{
   snapshot: Snapshot;
@@ -9,6 +10,9 @@ export type ControllerState = Readonly<{
   openDocumentId: string | null;
   comments: readonly Comment[];
   commentsTruncated: boolean;
+  names: Names;
+  /** Document body shown as rendered Markdown instead of the editor. */
+  preview: boolean;
   showArchived: boolean;
   busy: boolean;
   error: string | null;
@@ -29,6 +33,8 @@ export class DocumentsController {
     openDocumentId: null,
     comments: [],
     commentsTruncated: false,
+    names: { available: false, cursor: "0", persons: [] },
+    preview: false,
     showArchived: false,
     busy: false,
     error: null,
@@ -40,6 +46,7 @@ export class DocumentsController {
   private editor: DocumentEditor | null = null;
   private textSubscription: { close(): Promise<void> } | null = null;
   private openSequence = 0;
+  private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
 
   constructor(client: TypedPackageClient<DocumentsContract>, announce: () => void) {
     this.client = client;
@@ -195,6 +202,41 @@ export class DocumentsController {
 
   /** The view installs this to supply the caret when an event arrives. */
   textListener: ((event: TextEvent) => void) | null = null;
+
+  togglePreview(): void {
+    this.update({ preview: !this._state.preview });
+  }
+
+  /** The current Workspace Person Name for an author identity, with duplicate detection. */
+  labelFor(author: string, isLocal: boolean): string {
+    const person = this._state.names.persons.find((p) => p.identity === author);
+    const name = person?.name ?? null;
+    const duplicate = name !== null && this._state.names.persons.filter((p) => p.name === name).length > 1;
+    return authorLabel(author, undefined, isLocal, name, duplicate);
+  }
+
+  /** Applies a roster event, reassembling multi-part rosters by cursor and part order. */
+  applyNames(names: Names): void {
+    if (this.disposed) return;
+    if (!names.available) {
+      this.pendingNames = null;
+      this.update({ names: { available: false, cursor: "0", persons: [] } });
+      return;
+    }
+    if (this._state.names.available && BigInt(names.cursor) < BigInt(this._state.names.cursor)) return;
+    if (names.part !== undefined && names.parts !== undefined) {
+      if (names.part === 0) this.pendingNames = { cursor: names.cursor, parts: names.parts, nextPart: 0, persons: [] };
+      const pending = this.pendingNames;
+      if (!pending || pending.cursor !== names.cursor || pending.parts !== names.parts || names.part !== pending.nextPart) return;
+      this.pendingNames = { ...pending, nextPart: pending.nextPart + 1, persons: [...pending.persons, ...names.persons] };
+      if (names.part !== names.parts - 1) return;
+      names = { available: true, cursor: names.cursor, persons: this.pendingNames.persons };
+      this.pendingNames = null;
+    } else {
+      this.pendingNames = null;
+    }
+    this.update({ names });
+  }
 
   toggleArchived(): void {
     this.update({ showArchived: !this._state.showArchived });
