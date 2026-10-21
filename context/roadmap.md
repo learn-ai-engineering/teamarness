@@ -127,6 +127,28 @@ The Conversations Package UI redesign and history-continuity replacement are com
 
 If prioritized, start a separate Scope for these nonblocking review findings: make the advancing-page mount fixture supply a valid open watermark (`SM-007`); avoid one redundant terminal delta request (`SF-006`); and restore the no-request assertion for malformed Channel slugs (`SM-008`). Retest the accepted but unavailable long-history, theme, resize, keyboard-error, and pending-access desktop cases when safe fixtures exist. If an issue appears, open a new workstream rather than rewriting the accepted manual result. Real Message time provenance also needs a separate Scope before dates or times can be shown; no timestamp was fabricated in this workstream.
 
+### Package platform direction (recorded 2026-10-21)
+
+A design conversation on 2026-10-21 compared Teamarness with a thin-shell, package-host application model (WebAssembly components, typed ports, drop-in installation, per-package updates) and a biological membrane analogy. Reading the conversation against the context tree found that most of the "membrane" already exists at the Host seam: manifest-declared capability families negotiated per activation (ADR 0018), closed-schema UI contracts with requests and subscriptions, a Shell-owned UI contract (ADR 0015), and host-brokered calls. Two gaps remain: a Package cannot offer commands, queries, or events to another Package, and there is no Package signing, endorsement, or update distribution. Once Core owns Packages' seams, almost all later development is Package authoring, so these seams decide how far Package work can be parallelized.
+
+The agreed sequence is four workstreams. Each needs its own Scope.
+
+#### Package interface
+
+Workstream `package-interface`. A Package declares the commands, queries, and events it provides and the ones it consumes; the Package Host brokers every call, authorizes by grant with the acting Principal resolved from the Instance binding (ADR 0023), derives the wiring graph from manifests at Package Admission, and activates a provider lazily on first use. This is the interface the Agent Package from `agent-invite` and the Documents Package from `workspace-documents` both need, so it is scheduled first. No change to the Package Process Protocol major, the UI contract, or existing capability families.
+
+#### Data format versioning
+
+An ADR that governs the stored-record seam separately from the live Host seam that ADR 0018 governs. Synced records are signed by peers that cannot be asked to stop, so an old reader must tolerate additive fields and degrade visibly, never reject or fork. Today the Conversations and Documents canonical codecs are positional and reject trailing bytes, and the pinned Loro CRDT will make its encoding part of the Documents format. Scheduled early because there is no install base yet, which makes the rule cheapest now.
+
+#### WebAssembly Package class
+
+Re-evaluate ADR 0006's deferral. Its blocking reason, Package-owned Tokio and Iroh work, was removed by ADR 0007 when Core took ownership of transport and replication, and WASI 0.3 with component-model async has since shipped. The open question is Package-local state without native SQLite or `gix`. Agent Packages holding an Agent key with the user's ambient authority (ADR 0023) are the motivating case for a stronger execution boundary. Outcome: an ADR introducing a second Package class, or a dated re-deferral with explicit criteria.
+
+#### Package distribution and per-Instance restart
+
+Author signature over the Package artifact, a team endorsement of an exact digest and capability set recorded in the membership log, a Host-owned update feed per Package (The Update Framework's threat list as the checklist, Packages never fetch their own updates), a consolidated installed-Packages view with permission diffs, and restarting one Package Instance without restarting the application. Depends on the code-signing work under Later.
+
 ## Maintenance rule
 
 Update this roadmap when a phase starts, closes, changes order, or changes direction. Update subsystem requirements and specs when behavior or architecture intent changes. Record hard-to-reverse trade-off decisions in `context/.decisions/`, unresolved design questions in `context/open-questions.md`, and known implementation divergence in `context/.delta/`.
