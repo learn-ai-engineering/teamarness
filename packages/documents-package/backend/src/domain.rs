@@ -9,6 +9,9 @@ use std::fmt;
 const MAGIC: &[u8] = b"TDOCS\x01";
 pub(crate) const MAX_NAME: usize = 128;
 pub(crate) const MAX_TITLE: usize = 256;
+/// The largest Loro update one edit record carries, leaving headroom under the 262,144-byte
+/// canonical bound for the envelope, author, and target.
+pub(crate) const MAX_UPDATE: usize = 200 * 1024;
 const TARGET_LEN: usize = 64;
 
 /// The record vocabulary. Kind numbers are part of the canonical encoding and are never
@@ -55,6 +58,12 @@ pub enum DomainRecord {
         author: String,
         document: String,
     },
+    /// One Loro update for a Document's body, exported since the author's previous edit.
+    DocumentEdit {
+        author: String,
+        document: String,
+        update: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +75,7 @@ pub enum DomainError {
     InvalidTarget,
     InvalidName,
     InvalidTitle,
+    InvalidUpdate,
 }
 impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -168,6 +178,23 @@ impl DomainRecord {
         })
     }
 
+    pub fn document_edit(
+        author: &str,
+        document: &str,
+        update: Vec<u8>,
+    ) -> Result<Self, DomainError> {
+        validate_identity(author)?;
+        validate_target(document)?;
+        if update.is_empty() || update.len() > MAX_UPDATE {
+            return Err(DomainError::InvalidUpdate);
+        }
+        Ok(Self::DocumentEdit {
+            author: author.into(),
+            document: document.into(),
+            update,
+        })
+    }
+
     /// The signer every record claims; the projection refuses a record whose log author differs.
     pub fn author(&self) -> &str {
         match self {
@@ -179,7 +206,8 @@ impl DomainRecord {
             | Self::DocumentRename { author, .. }
             | Self::DocumentMove { author, .. }
             | Self::DocumentArchive { author, .. }
-            | Self::DocumentRestore { author, .. } => author,
+            | Self::DocumentRestore { author, .. }
+            | Self::DocumentEdit { author, .. } => author,
         }
     }
 
@@ -197,7 +225,8 @@ impl DomainRecord {
             Self::DocumentRename { document, .. }
             | Self::DocumentMove { document, .. }
             | Self::DocumentArchive { document, .. }
-            | Self::DocumentRestore { document, .. } => Some(document),
+            | Self::DocumentRestore { document, .. }
+            | Self::DocumentEdit { document, .. } => Some(document),
         }
     }
 
@@ -212,8 +241,12 @@ impl DomainRecord {
             Self::DocumentMove { .. } => "document.move",
             Self::DocumentArchive { .. } => "document.archive",
             Self::DocumentRestore { .. } => "document.restore",
+            Self::DocumentEdit { .. } => "document.edit",
         }
     }
+
+    /// The purpose of body edit records, which the listing never needs to open.
+    pub const EDIT_KIND: &'static str = "document.edit";
 
     /// Every purpose this crate appends or projects, for the control-record query.
     pub const METADATA_KINDS: [&'static str; 9] = [
@@ -296,6 +329,16 @@ impl DomainRecord {
                 put_text(&mut out, author);
                 put_text(&mut out, document);
             }
+            Self::DocumentEdit {
+                author,
+                document,
+                update,
+            } => {
+                out.push(10);
+                put_text(&mut out, author);
+                put_text(&mut out, document);
+                put_bytes(&mut out, update);
+            }
         }
         out
     }
@@ -349,6 +392,11 @@ impl DomainRecord {
                 let document = take_text(bytes, &mut p)?;
                 Self::document_restore(&author, &document)?
             }
+            10 => {
+                let document = take_text(bytes, &mut p)?;
+                let update = take_bytes(bytes, &mut p)?;
+                Self::document_edit(&author, &document, update)?
+            }
             _ => return Err(DomainError::InvalidKind),
         };
         if p != bytes.len() {
@@ -389,8 +437,24 @@ fn validate_text(v: &str, max: usize, error: DomainError) -> Result<(), DomainEr
 }
 
 fn put_text(out: &mut Vec<u8>, v: &str) {
+    put_bytes(out, v.as_bytes());
+}
+fn put_bytes(out: &mut Vec<u8>, v: &[u8]) {
     out.extend((u32::try_from(v.len()).unwrap()).to_be_bytes());
-    out.extend(v.as_bytes());
+    out.extend(v);
+}
+fn take_bytes(b: &[u8], p: &mut usize) -> Result<Vec<u8>, DomainError> {
+    if b.len().saturating_sub(*p) < 4 {
+        return Err(DomainError::InvalidLength);
+    };
+    let n = u32::from_be_bytes(b[*p..*p + 4].try_into().unwrap()) as usize;
+    *p += 4;
+    if n > b.len().saturating_sub(*p) {
+        return Err(DomainError::InvalidLength);
+    };
+    let out = b[*p..*p + n].to_vec();
+    *p += n;
+    Ok(out)
 }
 fn take_text(b: &[u8], p: &mut usize) -> Result<String, DomainError> {
     if b.len().saturating_sub(*p) < 4 {
@@ -444,6 +508,12 @@ mod tests {
             assert_eq!(DomainRecord::decode(&bytes).unwrap(), record);
             assert!(DomainRecord::METADATA_KINDS.contains(&record.kind()));
         }
+        let edit = DomainRecord::document_edit("alice", TARGET, vec![0, 255, 7]).unwrap();
+        assert_eq!(DomainRecord::decode(&edit.encode()).unwrap(), edit);
+        assert_eq!(edit.kind(), DomainRecord::EDIT_KIND);
+        assert!(!DomainRecord::METADATA_KINDS.contains(&edit.kind()));
+        assert!(DomainRecord::document_edit("alice", TARGET, Vec::new()).is_err());
+        assert!(DomainRecord::document_edit("alice", TARGET, vec![1; MAX_UPDATE + 1]).is_err());
     }
 
     #[test]
@@ -475,7 +545,7 @@ mod tests {
             DomainError::InvalidLength
         );
         let mut unknown = MAGIC.to_vec();
-        unknown.push(10);
+        unknown.push(11);
         put_text(&mut unknown, "alice");
         assert_eq!(
             DomainRecord::decode(&unknown).unwrap_err(),

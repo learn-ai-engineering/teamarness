@@ -36,6 +36,8 @@ pub struct StoredRecord {
     pub sealed_record: Vec<u8>,
     pub cursor: Option<String>,
     pub ingestion_ordinal: u64,
+    /// The Document a body edit belongs to; `None` for metadata records.
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +64,14 @@ pub enum IngestResult {
     Duplicate,
     Deferred(String),
     Quarantined(String),
+}
+
+/// What one ingest committed, plus every body update it made applicable: the record's own
+/// edit, and any deferred edits a newly created Document unblocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ingested {
+    pub result: IngestResult,
+    pub edits: Vec<(String, Vec<u8>)>,
 }
 
 /// The Package's durable projection: sealed records, ordering, and archive state in SQLite;
@@ -171,6 +181,7 @@ impl DocumentStore {
             cursor,
             &|| {},
         )
+        .map(|ingested| ingested.result)
     }
 
     /// Commits the sealed row, its projection, and the delivery cursor in one transaction
@@ -191,7 +202,7 @@ impl DocumentStore {
         sealed: &[u8],
         cursor: Option<&str>,
         on_commit: &dyn Fn(),
-    ) -> Result<IngestResult, StoreError> {
+    ) -> Result<Ingested, StoreError> {
         let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
         let parsed = DomainRecord::decode(canonical);
         let mut inner = lock(&self.inner)?;
@@ -234,16 +245,23 @@ impl DocumentStore {
                 transaction.commit().map_err(rerr)?;
                 on_commit();
                 drop(inner);
+                let mut edits = Vec::new();
                 if let Some(target) = created {
-                    self.retry_for_target(&target, on_commit)?;
+                    self.retry_for_target(&target, on_commit, &mut edits)?;
                     self.commit_delivery_cursor(cursor)?;
                 }
-                return Ok(IngestResult::Duplicate);
+                return Ok(Ingested {
+                    result: IngestResult::Duplicate,
+                    edits,
+                });
             }
             quarantine(&transaction, record_id, "immutable_field_mismatch").map_err(rerr)?;
             transaction.commit().map_err(rerr)?;
             on_commit();
-            return Ok(IngestResult::Quarantined("immutable_field_mismatch".into()));
+            return Ok(Ingested {
+                result: IngestResult::Quarantined("immutable_field_mismatch".into()),
+                edits: Vec::new(),
+            });
         }
         let previous: i64 = transaction
             .query_row(
@@ -297,12 +315,13 @@ impl DocumentStore {
         }
         let created = outcome.created;
         let result = outcome.result;
+        let mut edits: Vec<(String, Vec<u8>)> = outcome.edit.into_iter().collect();
         drop(inner);
         if let Some(target) = created {
-            self.retry_for_target(&target, on_commit)?;
+            self.retry_for_target(&target, on_commit, &mut edits)?;
             self.commit_delivery_cursor(cursor)?;
         }
-        Ok(result)
+        Ok(Ingested { result, edits })
     }
 
     fn commit_delivery_cursor(&self, cursor: Option<&str>) -> Result<(), StoreError> {
@@ -316,8 +335,14 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Re-projects every deferred record that waits on `target`, in order.
-    fn retry_for_target(&self, target: &str, on_commit: &dyn Fn()) -> Result<(), StoreError> {
+    /// Re-projects every deferred record that waits on `target`, in order, collecting the body
+    /// updates that became applicable.
+    fn retry_for_target(
+        &self,
+        target: &str,
+        on_commit: &dyn Fn(),
+        edits: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<(), StoreError> {
         let mut inner = lock(&self.inner)?;
         let mut waiting: Vec<(String, DomainRecord)> = inner
             .deferred
@@ -352,13 +377,16 @@ impl DocumentStore {
             if let Some((id, order, text)) = outcome.text {
                 remember_text(&mut inner.texts, id, order, text);
             }
+            if let Some(edit) = outcome.edit {
+                edits.push(edit);
+            }
             if !matches!(outcome.result, IngestResult::Deferred(_)) {
                 inner.deferred.remove(&record_id);
             }
             if let Some(created) = outcome.created {
                 // A deferred Document create can itself unblock its dependants.
                 drop(inner);
-                self.retry_for_target(&created, on_commit)?;
+                self.retry_for_target(&created, on_commit, edits)?;
                 inner = lock(&self.inner)?;
             }
         }
@@ -384,7 +412,7 @@ impl DocumentStore {
         let mut statement = inner
             .conn
             .prepare(&format!(
-                "SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal FROM records WHERE {filter} ORDER BY order_key,record_id"
+                "SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,target FROM records WHERE {filter} ORDER BY order_key,record_id"
             ))
             .map_err(rerr)?;
         let rows = statement
@@ -398,6 +426,7 @@ impl DocumentStore {
                     sealed_record: row.get(5)?,
                     cursor: row.get(6)?,
                     ingestion_ordinal: row.get::<_, i64>(7)? as u64,
+                    target: row.get(8)?,
                 })
             })
             .map_err(rerr)?;
@@ -433,19 +462,26 @@ impl DocumentStore {
         &self,
         record_id: &str,
         canonical: &[u8],
-    ) -> Result<IngestResult, StoreError> {
+    ) -> Result<Ingested, StoreError> {
         let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
         let Ok(domain) = DomainRecord::decode(canonical) else {
-            return Ok(IngestResult::Quarantined("malformed_record".into()));
+            return Ok(Ingested {
+                result: IngestResult::Quarantined("malformed_record".into()),
+                edits: Vec::new(),
+            });
         };
         let Some(target) = domain.target().map(str::to_owned) else {
-            return Ok(IngestResult::Duplicate);
+            return Ok(Ingested {
+                result: IngestResult::Duplicate,
+                edits: Vec::new(),
+            });
         };
         {
             let mut inner = lock(&self.inner)?;
             inner.deferred.insert(record_id.to_owned(), domain);
         }
-        self.retry_for_target(&target, &|| {})?;
+        let mut edits = Vec::new();
+        self.retry_for_target(&target, &|| {}, &mut edits)?;
         let inner = lock(&self.inner)?;
         let code: Option<String> = inner
             .conn
@@ -455,11 +491,29 @@ impl DocumentStore {
                 |row| row.get(0),
             )
             .map_err(rerr)?;
-        Ok(match code.as_deref() {
+        let result = match code.as_deref() {
             None => IngestResult::Applied,
             Some(WAITING) => IngestResult::Deferred(WAITING.into()),
             Some(code) => IngestResult::Quarantined(code.to_owned()),
-        })
+        };
+        Ok(Ingested { result, edits })
+    }
+
+    /// Every applied body edit record, oldest first, optionally for one Document.
+    pub fn edit_records(&self, document: Option<&str>) -> Result<Vec<StoredRecord>, StoreError> {
+        match document {
+            Some(id) => {
+                validate_sql_identity(id)?;
+                self.records_where(&format!(
+                    "purpose='{}' AND quarantine_code IS NULL AND target='{id}'",
+                    DomainRecord::EDIT_KIND
+                ))
+            }
+            None => self.records_where(&format!(
+                "purpose='{}' AND quarantine_code IS NULL",
+                DomainRecord::EDIT_KIND
+            )),
+        }
     }
 
     pub(crate) fn has_projection_warnings(&self) -> Result<bool, StoreError> {
@@ -553,6 +607,19 @@ impl DocumentStore {
             .map_err(rerr)
         })
         .collect()
+    }
+}
+
+/// A record identity is 64 lowercase hex characters, so it is safe to splice into a filter.
+fn validate_sql_identity(id: &str) -> Result<(), StoreError> {
+    if id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Storage)
     }
 }
 

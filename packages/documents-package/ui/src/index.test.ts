@@ -140,6 +140,47 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("opens a Document, sends typed edits, and applies a remote delta with the caret moved", async () => {
+    const edits: { base: string; ops: unknown }[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.document.edit": (payload) => {
+          const { baseRevision, ops } = payload as { baseRevision: string; ops: unknown };
+          edits.push({ base: baseRevision, ops });
+          return { ok: true as const, revision: String(Number(baseRevision) + 1) };
+        },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    const pane = root.querySelector(".editor-pane") as HTMLElement;
+    expect(pane.hidden).toBe(false);
+    expect(root.querySelector(".editor-title")?.textContent).toBe("Q4 plan");
+    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "# Q4\n" });
+    const textarea = root.querySelector("textarea") as HTMLTextAreaElement;
+    expect(textarea.value).toBe("# Q4\n");
+    expect(textarea.disabled).toBe(false);
+    textarea.value = "# Q4\n- hire\n";
+    textarea.dispatchEvent(new Event("input"));
+    await tick();
+    expect(edits).toEqual([{ base: "0", ops: [{ retain: 5 }, { insert: "- hire\n" }] }]);
+    await fake.emit("documents.document.text", { documentId: doc, revision: "1", editable: true, origin: "local", delta: [{ retain: 5 }, { insert: "- hire\n" }] });
+    expect(textarea.value).toBe("# Q4\n- hire\n");
+    textarea.focus();
+    textarea.setSelectionRange(12, 12);
+    await fake.emit("documents.document.text", { documentId: doc, revision: "2", editable: true, origin: "remote", delta: [{ insert: "> intro\n" }] });
+    expect(textarea.value).toBe("> intro\n# Q4\n- hire\n");
+    expect(textarea.selectionStart).toBe(20);
+    (root.querySelector(".editor-header button") as HTMLButtonElement).click();
+    await tick();
+    expect(pane.hidden).toBe(true);
+    await unmount();
+  });
+
   it("surfaces a request error without losing the listing", async () => {
     const fake = createFakePackageClient({
       requests: {

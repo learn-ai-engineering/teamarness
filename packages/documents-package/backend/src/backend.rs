@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -10,10 +12,11 @@ use teamarness_package_sdk::capabilities::record_log::{
 use teamarness_package_sdk::{
     BackendError, CancellationToken, Context, Empty, Router, event_channel,
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, broadcast, watch};
 
+use crate::body::{BodyError, COALESCE_WINDOW, DocumentBody, TextOp};
 use crate::domain::{DomainError, DomainRecord};
-use crate::store::{DocumentStore, IngestResult};
+use crate::store::{DocumentStore, IngestResult, Ingested};
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -45,8 +48,83 @@ fn domain_error(cause: DomainError) -> BackendError {
     match cause {
         DomainError::InvalidName => error("documents.invalid_name", false),
         DomainError::InvalidTitle => error("documents.invalid_title", false),
+        DomainError::InvalidUpdate => error("documents.invalid_update", false),
         _ => invalid_request(),
     }
+}
+
+/// Every Document body this activation holds, keyed by Document identity.
+type Bodies = Arc<Mutex<HashMap<String, DocumentBody>>>;
+
+/// The shared pieces that import remote edits and publish text events, used by the request
+/// handlers, the record-log sink, and the flusher alike.
+#[derive(Clone)]
+struct BodyHub {
+    store: DocumentStore,
+    bodies: Bodies,
+    /// Text events for every Document; subscriptions filter by `documentId`.
+    events: broadcast::Sender<JsonValue>,
+    /// Wakes the flusher when a local edit is pending.
+    flush: Arc<Notify>,
+    /// This Installation's Loro peer id, stable across restarts and distinct across Installations.
+    peer: u64,
+}
+
+impl BodyHub {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, DocumentBody>> {
+        self.bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs `with` on the body of `document`, creating it on first use.
+    fn with_body<T>(&self, document: &str, with: impl FnOnce(&mut DocumentBody) -> T) -> T {
+        let mut bodies = self.lock();
+        let body = bodies
+            .entry(document.to_owned())
+            .or_insert_with(|| DocumentBody::new(self.peer));
+        with(body)
+    }
+
+    /// Imports body updates a store ingest made applicable and publishes their deltas.
+    fn apply_edits(&self, edits: &[(String, Vec<u8>)]) {
+        for (document, update) in edits {
+            let published = self.with_body(document, |body| match body.import(update) {
+                Ok(Some(delta)) => Some(json!({
+                    "documentId": document, "revision": body.revision().to_string(),
+                    "origin": "remote", "delta": delta, "editable": body.editable(),
+                })),
+                Ok(None) => None,
+                Err(_) => {
+                    eprintln!("documents body import failure: document={document}");
+                    None
+                }
+            });
+            if let Some(event) = published {
+                let _ = self.events.send(event);
+            }
+        }
+    }
+
+    fn text_event(&self, document: &str) -> JsonValue {
+        self.with_body(document, |body| {
+            json!({
+                "documentId": document, "revision": body.revision().to_string(),
+                "text": body.text(), "editable": body.editable(),
+            })
+        })
+    }
+}
+
+/// Derives a Loro peer id from the Installation identity: the first eight bytes of a
+/// domain-separated SHA-256, so it is stable across restarts and distinct across Installations.
+fn peer_id(installation: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"teamarness.documents.loro-peer\x00");
+    hasher.update(installation.as_bytes());
+    let digest = hasher.finalize();
+    u64::from_be_bytes(digest[..8].try_into().expect("eight bytes"))
 }
 
 /// What the Package tells the UI about synchronization.
@@ -86,6 +164,8 @@ pub struct DocumentsActive {
     changes: watch::Sender<u64>,
     installation: String,
     session: Mutex<Option<Session>>,
+    hub: BodyHub,
+    flusher: Mutex<Option<Session>>,
 }
 
 /// What one activation built, for a test that must look inside.
@@ -94,6 +174,7 @@ pub struct DocumentsActive {
 pub(crate) struct ActivationHandles {
     pub(crate) store: DocumentStore,
     pub(crate) sync: Arc<Mutex<SyncReport>>,
+    pub(crate) bodies: Bodies,
 }
 
 pub(crate) type ActivationObserver = Arc<Mutex<Option<ActivationHandles>>>;
@@ -137,6 +218,13 @@ struct DocumentMoveRequest {
 struct DocumentRequest {
     document_id: String,
 }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditRequest {
+    document_id: String,
+    base_revision: String,
+    ops: Vec<TextOp>,
+}
 
 /// The Documents Backend.
 #[must_use]
@@ -164,7 +252,16 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 .map_err(|cause| capability_error("record-log", cause))?;
             let names = PersonNames::from_initialization(&initialization, capabilities)
                 .map_err(|cause| capability_error("person-names", cause))?;
-            rehydrate(&store, &log, &cancellation).await?;
+            let installation = initialization.installation().identity.clone();
+            let (events, _) = broadcast::channel(256);
+            let hub = BodyHub {
+                store: store.clone(),
+                bodies: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                flush: Arc::new(Notify::new()),
+                peer: peer_id(&installation),
+            };
+            rehydrate(&store, &log, &hub, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
             let (changes, _) = watch::channel(0);
@@ -174,35 +271,58 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActivationHandles {
                     store: store.clone(),
                     sync: sync.clone(),
+                    bodies: hub.bodies.clone(),
                 });
             }
-            let session = start_session(&store, &log, &sync, &changes);
+            let session = start_session(&store, &log, &sync, &changes, &hub);
+            let flusher = start_flusher(&log, &hub, &changes, installation.clone());
             Ok(DocumentsActive {
                 store,
                 log,
                 names,
                 sync,
                 changes,
-                installation: initialization.installation().identity.clone(),
+                installation,
                 session: Mutex::new(Some(session)),
+                hub,
+                flusher: Mutex::new(Some(flusher)),
             })
         }
     })
     .on_suspend(|state: Arc<DocumentsActive>| async move {
         stop_session(&state).await;
+        stop_flusher(&state).await;
         Ok(())
     })
     .on_resume(|state: Arc<DocumentsActive>| async move {
         stop_session(&state).await;
-        let session = start_session(&state.store, &state.log, &state.sync, &state.changes);
+        stop_flusher(&state).await;
+        let session = start_session(
+            &state.store,
+            &state.log,
+            &state.sync,
+            &state.changes,
+            &state.hub,
+        );
         *state
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+        let flusher = start_flusher(
+            &state.log,
+            &state.hub,
+            &state.changes,
+            state.installation.clone(),
+        );
+        *state
+            .flusher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flusher);
         Ok(())
     })
     .on_dispose(|state: Arc<DocumentsActive>| async move {
         stop_session(&state).await;
+        stop_flusher(&state).await;
         Ok(())
     })
     .request(
@@ -306,6 +426,100 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             append(&context, record).await
         },
     )
+    .request(
+        "documents.document.open",
+        |context: Context<DocumentsActive>, request: DocumentRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            reopen_unopened_edits(&context, &request.document_id).await?;
+            Ok(context.state().hub.text_event(&request.document_id))
+        },
+    )
+    .request(
+        "documents.document.edit",
+        |context: Context<DocumentsActive>, request: EditRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            let base: u64 = request
+                .base_revision
+                .parse()
+                .map_err(|_| invalid_request())?;
+            let hub = context.state().hub.clone();
+            let document = request.document_id.clone();
+            let (revision, delta, editable) = hub.with_body(&document, |body| {
+                if !body.editable() {
+                    return Err(error("documents.document_pending", true));
+                }
+                if body.revision() != base {
+                    return Err(BackendError::new(
+                        "documents.stale_revision",
+                        false,
+                        json!({ "revision": body.revision().to_string() }),
+                    ));
+                }
+                match body.apply(&request.ops) {
+                    Ok(delta) => Ok((body.revision(), delta, body.editable())),
+                    Err(BodyError::TooLarge) => Err(error("documents.document_too_large", false)),
+                    Err(BodyError::OutOfRange) => Err(invalid_request()),
+                    Err(BodyError::Loro) => Err(error("documents.edit_failed", true)),
+                }
+            })?;
+            let _ = hub.events.send(json!({
+                "documentId": document, "revision": revision.to_string(),
+                "origin": "local", "delta": delta, "editable": editable,
+            }));
+            hub.flush.notify_one();
+            Ok(json!({ "ok": true, "revision": revision.to_string() }))
+        },
+    )
+    .subscription(
+        "documents.document.text",
+        |context: Context<DocumentsActive>, request: DocumentRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            let hub = context.state().hub.clone();
+            let document = request.document_id;
+            let (sender, subscription) = event_channel(64);
+            let mut events = hub.events.subscribe();
+            tokio::spawn(async move {
+                // The initial full text is taken after subscribing, so no delta between the two
+                // is lost; a delta older than the initial revision is skipped below.
+                let initial = hub.text_event(&document);
+                let mut revision = revision_of(&initial);
+                if sender.send(initial).await.is_err() {
+                    return;
+                }
+                loop {
+                    let event = tokio::select! {
+                        event = events.recv() => event,
+                        () = sender.closed() => return,
+                    };
+                    match event {
+                        Ok(event) => {
+                            if event["documentId"].as_str() != Some(document.as_str()) {
+                                continue;
+                            }
+                            let next = revision_of(&event);
+                            if next <= revision {
+                                continue;
+                            }
+                            revision = next;
+                            if sender.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Resynchronize with the full text rather than guess what was missed.
+                            let full = hub.text_event(&document);
+                            revision = revision_of(&full);
+                            if sender.send(full).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            });
+            Ok(subscription)
+        },
+    )
     .subscription(
         "documents.changes",
         |context: Context<DocumentsActive>, _: Empty| async move {
@@ -371,6 +585,67 @@ async fn require_document(
     } else {
         Err(error("documents.unknown_document", false))
     }
+}
+
+fn revision_of(event: &JsonValue) -> u64 {
+    event["revision"]
+        .as_str()
+        .and_then(|revision| revision.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Re-opens the edit records of one Document whose sealed bytes could not be opened before,
+/// so a Document becomes editable as soon as history access arrives.
+async fn reopen_unopened_edits(
+    context: &Context<DocumentsActive>,
+    document: &str,
+) -> Result<(), BackendError> {
+    let hub = context.state().hub.clone();
+    if hub.with_body(document, |body| body.unopened()) == 0 {
+        return Ok(());
+    }
+    let store = context.state().store.clone();
+    let id = document.to_owned();
+    let rows = context
+        .blocking(move |_| store.edit_records(Some(&id)).map_err(|_| storage_failed()))
+        .await?;
+    let unopened = import_edit_rows(&context.state().log, &hub, &rows).await?;
+    hub.with_body(document, |body| body.set_unopened(unopened));
+    Ok(())
+}
+
+/// Opens `rows` in batches, imports the ready ones, and returns how many stayed unopened.
+///
+/// A body rebuilt this way imports every record, including ones it already holds; Loro
+/// ignores operations it knows, so re-opening is idempotent.
+async fn import_edit_rows(
+    log: &RecordLog,
+    hub: &BodyHub,
+    rows: &[crate::store::StoredRecord],
+) -> Result<usize, BackendError> {
+    let mut unopened = 0;
+    for batch in rows.chunks(32) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+        let results = log
+            .open(&sealed)
+            .await
+            .map_err(|cause| capability_error("open-edit-records", cause))?;
+        for result in results {
+            match result {
+                OpenResult::Ready(record) => {
+                    if let Ok(DomainRecord::DocumentEdit {
+                        document, update, ..
+                    }) = DomainRecord::decode(&record.canonical)
+                    {
+                        hub.apply_edits(&[(document, update)]);
+                    }
+                }
+                OpenResult::WaitingForHistoryAccess => unopened += 1,
+                OpenResult::WrongScope | OpenResult::Corrupt => {}
+            }
+        }
+    }
+    Ok(unopened)
 }
 
 impl DocumentsActive {
@@ -447,7 +722,7 @@ async fn append(
         .map_err(|cause| capability_error(purpose, cause))?;
     let state = context.state().clone();
     let id = appended.record_id.as_str().to_owned();
-    let outcome = context
+    let ingested = context
         .blocking(move |_| {
             state
                 .store
@@ -469,7 +744,8 @@ async fn append(
                 .map_err(|_| storage_failed())
         })
         .await?;
-    match outcome {
+    context.state().hub.apply_edits(&ingested.edits);
+    match ingested.result {
         IngestResult::Applied | IngestResult::Duplicate => {}
         IngestResult::Deferred(_) => return Err(error("documents.deferred", true)),
         IngestResult::Quarantined(_) => return Err(error("documents.rejected", false)),
@@ -481,6 +757,7 @@ async fn append(
 async fn rehydrate(
     store: &DocumentStore,
     log: &RecordLog,
+    hub: &BodyHub,
     cancellation: &CancellationToken,
 ) -> Result<(), BackendError> {
     let reader = store.clone();
@@ -512,12 +789,144 @@ async fn rehydrate(
             .await
             .map_err(|cause| capability_error("open-deferred-records", cause))?;
         for (row, result) in batch.iter().zip(results.iter()) {
-            if let OpenResult::Ready(record) = result {
-                let _ = store.retry_deferred(&row.record_id, &record.canonical);
+            if let OpenResult::Ready(record) = result
+                && let Ok(ingested) = store.retry_deferred(&row.record_id, &record.canonical)
+            {
+                hub.apply_edits(&ingested.edits);
             }
         }
     }
+    // Rebuild every body from its edit records; a Document whose records cannot be opened yet
+    // stays pending until `documents.document.open` retries it.
+    let reader = store.clone();
+    let edits = teamarness_package_sdk::blocking(cancellation, move |_| {
+        reader.edit_records(None).map_err(|_| storage_failed())
+    })
+    .await?;
+    let mut by_document: HashMap<String, Vec<crate::store::StoredRecord>> = HashMap::new();
+    for row in edits {
+        let Some(document) = row.target.clone() else {
+            continue;
+        };
+        by_document.entry(document).or_default().push(row);
+    }
+    for (document, rows) in by_document {
+        let unopened = import_edit_rows(log, hub, &rows).await?;
+        hub.with_body(&document, |body| body.set_unopened(unopened));
+    }
     Ok(())
+}
+
+/// Appends due local edits as `document.edit` records.
+///
+/// One task per activation wakes on a local edit and then every 100 ms while anything is
+/// pending, so a burst of keystrokes becomes one record once the coalescing window passes.
+fn start_flusher(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: String,
+) -> Session {
+    let log = log.clone();
+    let hub = hub.clone();
+    let changes = changes.clone();
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let pending: Vec<String> = hub
+                .lock()
+                .iter()
+                .filter(|(_, body)| body.has_pending())
+                .map(|(id, _)| id.clone())
+                .collect();
+            if pending.is_empty() {
+                tokio::select! {
+                    () = hub.flush.notified() => {}
+                    () = token.cancelled() => return,
+                }
+                continue;
+            }
+            for document in pending {
+                let flushed = hub.with_body(&document, |body| body.flush(Instant::now(), false));
+                let Some(flushed) = flushed else {
+                    continue;
+                };
+                for update in flushed.updates {
+                    if let Err(cause) =
+                        append_edit(&log, &hub, &changes, &author, &document, update).await
+                    {
+                        eprintln!(
+                            "documents edit append failure: document={document} code={} retryable={}",
+                            cause.code(),
+                            cause.retryable()
+                        );
+                    }
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(COALESCE_WINDOW.min(Duration::from_millis(100))) => {}
+                () = token.cancelled() => return,
+            }
+        }
+    });
+    Session { cancellation, task }
+}
+
+async fn append_edit(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: &str,
+    document: &str,
+    update: Vec<u8>,
+) -> Result<(), BackendError> {
+    let record = DomainRecord::document_edit(author, document, update).map_err(domain_error)?;
+    let purpose = record.kind();
+    let canonical = record.encode();
+    let appended = log
+        .append(purpose, &canonical)
+        .await
+        .map_err(|cause| capability_error(purpose, cause))?;
+    let store = hub.store.clone();
+    let changes = changes.clone();
+    let ingested: Ingested = tokio::task::spawn_blocking(move || {
+        store
+            .ingest_with_commit(
+                appended.record_id.as_str(),
+                appended.order_key.as_str(),
+                &appended.author,
+                purpose,
+                &appended.signature,
+                &canonical,
+                &appended.sealed_record,
+                None,
+                &|| changes.send_modify(|revision| *revision = revision.saturating_add(1)),
+            )
+            .map_err(|_| storage_failed())
+    })
+    .await
+    .map_err(|_| error("documents.storage_failed", true))??;
+    // The local body already holds this update; only edits a deferred create unblocked matter.
+    let others: Vec<(String, Vec<u8>)> = ingested
+        .edits
+        .into_iter()
+        .filter(|(target, _)| target != document)
+        .collect();
+    hub.apply_edits(&others);
+    Ok(())
+}
+
+async fn stop_flusher(state: &DocumentsActive) {
+    let flusher = state
+        .flusher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(flusher) = flusher {
+        flusher.cancellation.cancel();
+        let _ = flusher.task.await;
+    }
 }
 
 /// Starts the record log session that ingests everything the host delivers.
@@ -526,11 +935,13 @@ fn start_session(
     log: &RecordLog,
     sync: &Arc<Mutex<SyncReport>>,
     changes: &watch::Sender<u64>,
+    hub: &BodyHub,
 ) -> Session {
     let sink = Arc::new(DocumentsSink {
         store: store.clone(),
         changes: changes.clone(),
         sync: sync.clone(),
+        hub: hub.clone(),
     });
     let cancellation = CancellationToken::new();
     let task = tokio::spawn(run_session(
@@ -563,6 +974,7 @@ pub(crate) struct DocumentsSink {
     store: DocumentStore,
     changes: watch::Sender<u64>,
     sync: Arc<Mutex<SyncReport>>,
+    hub: BodyHub,
 }
 
 impl DocumentsSink {
@@ -582,7 +994,8 @@ impl RecordLogSink for DocumentsSink {
     }
 
     fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
-        self.store
+        let ingested = self
+            .store
             .ingest_with_commit(
                 record.record_id.as_str(),
                 record.order_key.as_str(),
@@ -595,6 +1008,7 @@ impl RecordLogSink for DocumentsSink {
                 &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
             )
             .map_err(|_| storage_failed())?;
+        self.hub.apply_edits(&ingested.edits);
         Ok(())
     }
 
@@ -854,6 +1268,136 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot["availability"], "current");
         assert_eq!(snapshot["collections"][0]["name"], "Shared");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC2, AC3 — local edits are echoed, coalesced into one appended record, and a
+    // remote edit record is imported and pushed to the open text subscription.
+    #[tokio::test]
+    async fn edits_are_echoed_appended_and_remote_edits_pushed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({ "name": "Plans" }))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({ "collectionId": collection, "title": "Q4" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = session
+            .harness
+            .request("documents.document.open", json!({ "documentId": document }))
+            .await
+            .unwrap();
+        assert_eq!(opened["text"], "");
+        assert_eq!(opened["revision"], "0");
+        assert_eq!(opened["editable"], true);
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({ "documentId": document }))
+            .await
+            .unwrap();
+        let initial = text.next_event().await.unwrap().unwrap();
+        assert_eq!(initial["text"], "");
+
+        let edited = session
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({ "documentId": document, "baseRevision": "0", "ops": [{ "insert": "# Plan" }] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited["revision"], "1");
+        let echo = text.next_event().await.unwrap().unwrap();
+        assert_eq!(echo["origin"], "local");
+        assert_eq!(echo["delta"], json!([{ "insert": "# Plan" }]));
+        let stale = session
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({ "documentId": document, "baseRevision": "0", "ops": [{ "insert": "x" }] }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), "documents.stale_revision");
+        session
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({ "documentId": document, "baseRevision": "1", "ops": [{ "retain": 6 }, { "insert": "\n" }] }),
+            )
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap().unwrap();
+
+        // Both edits coalesce into one appended `document.edit` record after the window.
+        let edit_appends = |scripted: &ScriptedCapability| {
+            scripted
+                .recorded_calls()
+                .iter()
+                .filter(|call| {
+                    call.method == "append" && call.payload["purpose"] == "document.edit"
+                })
+                .count()
+        };
+        let scripted = session.scripted.clone();
+        wait_until(|| edit_appends(&scripted) == 1, "one coalesced edit append").await;
+        tokio::time::sleep(COALESCE_WINDOW * 2).await;
+        assert_eq!(
+            edit_appends(&session.scripted),
+            1,
+            "no second record for an appended edit"
+        );
+        {
+            let bodies = session.handles.bodies.lock().unwrap();
+            assert_eq!(bodies[&document].text(), "# Plan\n");
+            assert!(!bodies[&document].has_pending());
+        }
+
+        // A remote peer's edit arrives as a record and is pushed as a remote delta.
+        let mut bob = DocumentBody::new(77);
+        bob.apply(&[TextOp::Insert {
+            insert: "bob: ".into(),
+        }])
+        .unwrap();
+        let update = bob.flush(Instant::now(), true).unwrap().updates.remove(0);
+        let remote = DomainRecord::document_edit("bob", &document, update).unwrap();
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        assert!(stream.send(record_frame(9, "bob", &remote)).await);
+        let pushed = tokio::time::timeout(Duration::from_secs(2), text.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed["origin"], "remote");
+        assert_eq!(pushed["revision"], "3");
+        let reopened = session
+            .harness
+            .request("documents.document.open", json!({ "documentId": document }))
+            .await
+            .unwrap();
+        let merged = reopened["text"].as_str().unwrap();
+        assert!(
+            merged.contains("# Plan\n") && merged.contains("bob: "),
+            "{merged:?}"
+        );
+        text.close().await;
         session.harness.shutdown().await.unwrap();
     }
 }

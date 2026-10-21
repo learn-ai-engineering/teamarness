@@ -1,4 +1,4 @@
-import type { Collection, Document } from "./contract.generated";
+import type { Collection, Document, TextEvent } from "./contract.generated";
 import type { DocumentsController } from "./controller";
 
 const KIT = {
@@ -75,6 +75,11 @@ export class DocumentsView {
   private readonly panelHeader: HTMLElement;
   private readonly documentList: HTMLUListElement;
   private readonly archivedToggle: HTMLInputElement;
+  private readonly editorPane: HTMLElement;
+  private readonly editorTitle: HTMLElement;
+  private readonly editorStatus: HTMLElement;
+  private readonly textarea: HTMLTextAreaElement;
+  private readonly closeButton: HTMLButtonElement;
   private readonly controller: DocumentsController;
   private renamingDocumentId: string | null = null;
   private renamingCollection = false;
@@ -144,9 +149,67 @@ export class DocumentsView {
     });
     panel.append(this.panelHeader, this.documentList, this.documentForm.form);
 
-    shell.append(rail, panel);
+    // --- editor pane (built once; shown when a Document is open) ---
+    this.editorPane = document.createElement("section");
+    this.editorPane.className = "editor-pane";
+    this.editorPane.hidden = true;
+    const editorHeader = document.createElement("div");
+    editorHeader.className = "editor-header";
+    this.editorTitle = document.createElement("h2");
+    this.editorTitle.className = "editor-title";
+    this.editorStatus = document.createElement("span");
+    this.editorStatus.className = "editor-status";
+    this.editorStatus.setAttribute("role", "status");
+    this.closeButton = button("Close", KIT.secondary, () => { void controller.closeDocument(); });
+    editorHeader.append(this.editorTitle, this.editorStatus, this.closeButton);
+    this.textarea = document.createElement("textarea");
+    this.textarea.className = `${KIT.input} editor-textarea`;
+    this.textarea.setAttribute("aria-label", "Document text (Markdown)");
+    this.textarea.spellcheck = false;
+    this.textarea.addEventListener("input", () => {
+      controller.openEditor?.input(this.textarea.value);
+    });
+    this.editorPane.append(editorHeader, this.textarea);
+    controller.textListener = (event: TextEvent) => this.onTextEvent(event);
+
+    shell.append(rail, panel, this.editorPane);
     this.page.append(header, this.warnings, this.error, shell);
     root.append(this.page);
+  }
+
+  /** Routes a text event through the controller with the live caret, then syncs the textarea. */
+  private onTextEvent(event: TextEvent): void {
+    const focused = this.textarea.ownerDocument.activeElement === this.textarea
+      || (this.textarea.getRootNode() as ShadowRoot).activeElement === this.textarea;
+    const caret = focused ? { start: this.textarea.selectionStart, end: this.textarea.selectionEnd } : null;
+    const next = this.controller.receiveText(event, caret);
+    this.syncTextarea(next);
+  }
+
+  private syncTextarea(caret: { start: number; end: number } | null): void {
+    const editor = this.controller.openEditor;
+    if (!editor) return;
+    if (this.textarea.value !== editor.value) {
+      this.textarea.value = editor.value;
+      if (caret) this.textarea.setSelectionRange(caret.start, caret.end);
+    }
+  }
+
+  private renderEditor(): void {
+    const open = this.controller.openDocument;
+    const editor = this.controller.openEditor;
+    this.editorPane.hidden = open === null;
+    if (open === null) return;
+    this.editorTitle.textContent = open.title;
+    if (!editor) {
+      this.editorStatus.textContent = "Opening…";
+      this.textarea.disabled = true;
+      return;
+    }
+    const { editable, sending, error } = editor.current;
+    this.textarea.disabled = !editable;
+    this.editorStatus.textContent = error ?? (!editable ? "Waiting for history" : sending ? "Saving…" : "Saved");
+    this.syncTextarea(null);
   }
 
   render(): void {
@@ -168,6 +231,7 @@ export class DocumentsView {
     this.renderPanel();
     this.documentForm.submit.disabled = busy || this.controller.selectedCollection === null;
     this.documentForm.form.hidden = this.controller.selectedCollection === null;
+    this.renderEditor();
   }
 
   dispose(): void {
@@ -270,9 +334,10 @@ export class DocumentsView {
       row.append(rename.form);
       return row;
     }
-    const title = document.createElement("span");
-    title.className = "document-title";
-    title.textContent = document_.title + (document_.archived ? " (archived)" : "");
+    const title = button(document_.title + (document_.archived ? " (archived)" : ""), "document-title", () => {
+      void this.controller.openDocumentById(document_.id);
+    });
+    if (this.controller.state.openDocumentId === document_.id) title.setAttribute("aria-current", "true");
     const actions = document.createElement("div");
     actions.className = "document-actions";
     actions.append(

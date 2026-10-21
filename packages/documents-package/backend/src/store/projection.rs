@@ -14,6 +14,8 @@ pub(crate) struct ProjectionOutcome {
     pub(crate) deferred: Option<DomainRecord>,
     /// A newly created target whose deferred dependants can now be retried.
     pub(crate) created: Option<String>,
+    /// A body update to import, with the Document it belongs to.
+    pub(crate) edit: Option<(String, Vec<u8>)>,
 }
 
 impl ProjectionOutcome {
@@ -23,6 +25,7 @@ impl ProjectionOutcome {
             text: None,
             deferred: None,
             created: None,
+            edit: None,
         }
     }
     fn quarantined(
@@ -193,6 +196,22 @@ pub(crate) fn project_domain(
             )?;
             clear(tx, record_id)?;
             Ok(ProjectionOutcome::applied())
+        }
+        DomainRecord::DocumentEdit {
+            document, update, ..
+        } => {
+            tx.execute(
+                "UPDATE records SET target=?2 WHERE record_id=?1",
+                params![record_id, document],
+            )?;
+            if !document_exists(tx, document)? {
+                return ProjectionOutcome::deferred(tx, record_id, domain);
+            }
+            clear(tx, record_id)?;
+            Ok(ProjectionOutcome {
+                edit: Some((document.clone(), update.clone())),
+                ..ProjectionOutcome::applied()
+            })
         }
     }
 }

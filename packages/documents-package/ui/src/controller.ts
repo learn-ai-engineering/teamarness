@@ -1,10 +1,12 @@
 import { describePackageError, isAbortError } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Collection, Document, DocumentsContract, Snapshot } from "./contract.generated";
+import type { Collection, Document, DocumentsContract, Snapshot, TextEvent } from "./contract.generated";
+import { DocumentEditor } from "./editor";
 
 export type ControllerState = Readonly<{
   snapshot: Snapshot;
   selectedCollectionId: string | null;
+  openDocumentId: string | null;
   showArchived: boolean;
   busy: boolean;
   error: string | null;
@@ -22,6 +24,7 @@ export class DocumentsController {
   private _state: ControllerState = {
     snapshot: EMPTY,
     selectedCollectionId: null,
+    openDocumentId: null,
     showArchived: false,
     busy: false,
     error: null,
@@ -29,6 +32,10 @@ export class DocumentsController {
   private disposed = false;
   /** A Collection this Installation just created, selected once its record is listed. */
   private pendingSelectionId: string | null = null;
+  /** The editor for the open Document and its text subscription. */
+  private editor: DocumentEditor | null = null;
+  private textSubscription: { close(): Promise<void> } | null = null;
+  private openSequence = 0;
 
   constructor(client: TypedPackageClient<DocumentsContract>, announce: () => void) {
     this.client = client;
@@ -37,6 +44,15 @@ export class DocumentsController {
 
   get state(): ControllerState {
     return this._state;
+  }
+
+  get openEditor(): DocumentEditor | null {
+    return this.editor;
+  }
+
+  get openDocument(): Document | null {
+    const id = this._state.openDocumentId;
+    return this._state.snapshot.documents.find((d) => d.id === id) ?? null;
   }
 
   /** Collections in listing order, hiding archived ones unless asked for. */
@@ -81,6 +97,61 @@ export class DocumentsController {
       this.update({ selectedCollectionId: id, error: null });
     }
   }
+
+  /** Opens a Document for editing: fetches its text, then follows its text events. */
+  async openDocumentById(documentId: string): Promise<void> {
+    if (this.disposed || this._state.openDocumentId === documentId) return;
+    await this.closeDocument();
+    const sequence = ++this.openSequence;
+    this.update({ openDocumentId: documentId, error: null });
+    try {
+      const subscription = await this.client.subscribe("documents.document.text", { documentId }, (event) => {
+        if (this.disposed || sequence !== this.openSequence) return;
+        this.onTextEvent(event);
+      });
+      if (this.disposed || sequence !== this.openSequence) {
+        await subscription.close();
+        return;
+      }
+      this.textSubscription = subscription;
+    } catch (error) {
+      if (sequence !== this.openSequence || this.disposed) return;
+      this.update({ openDocumentId: null, error: describeError(error) });
+    }
+  }
+
+  async closeDocument(): Promise<void> {
+    this.openSequence += 1;
+    const subscription = this.textSubscription;
+    this.textSubscription = null;
+    this.editor = null;
+    if (this._state.openDocumentId !== null) this.update({ openDocumentId: null });
+    if (subscription) await subscription.close();
+  }
+
+  /** Called by the view with the caret so a remote change can move it. */
+  receiveText(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
+    if (this.editor === null || event.text !== undefined && this.editor.current.documentId !== event.documentId) {
+      this.editor = new DocumentEditor(
+        event,
+        async (documentId, baseRevision, ops) => {
+          const { revision } = await this.client.request("documents.document.edit", { documentId, baseRevision, ops });
+          return { revision };
+        },
+        this.announce,
+      );
+      this.announce();
+      return caret;
+    }
+    return this.editor.receive(event, caret);
+  }
+
+  private onTextEvent(event: TextEvent): void {
+    this.textListener?.(event);
+  }
+
+  /** The view installs this to supply the caret when an event arrives. */
+  textListener: ((event: TextEvent) => void) | null = null;
 
   toggleArchived(): void {
     this.update({ showArchived: !this._state.showArchived });
@@ -129,6 +200,7 @@ export class DocumentsController {
 
   dispose(): void {
     this.disposed = true;
+    void this.closeDocument();
   }
 
   private async perform<T>(action: () => Promise<T>): Promise<T | null> {

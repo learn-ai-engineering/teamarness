@@ -1,0 +1,227 @@
+import type { TextEvent, TextOp } from "./contract.generated";
+
+/** A minimal common-prefix/suffix delta from `before` to `after`, in Unicode scalar positions. */
+export function diffOps(before: string, after: string): TextOp[] {
+  const b = Array.from(before);
+  const a = Array.from(after);
+  let prefix = 0;
+  while (prefix < b.length && prefix < a.length && b[prefix] === a[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < b.length - prefix &&
+    suffix < a.length - prefix &&
+    b[b.length - 1 - suffix] === a[a.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const deleted = b.length - prefix - suffix;
+  const inserted = a.slice(prefix, a.length - suffix).join("");
+  const ops: TextOp[] = [];
+  if (deleted === 0 && inserted.length === 0) return ops;
+  if (prefix > 0) ops.push({ retain: prefix });
+  if (deleted > 0) ops.push({ delete: deleted });
+  if (inserted.length > 0) ops.push({ insert: inserted });
+  return ops;
+}
+
+/** Applies a delta to `text`; positions are Unicode scalar positions. */
+export function applyOps(text: string, ops: readonly TextOp[]): string {
+  const chars = Array.from(text);
+  let position = 0;
+  for (const op of ops) {
+    if ("retain" in op) {
+      position += op.retain;
+    } else if ("insert" in op) {
+      chars.splice(position, 0, ...Array.from(op.insert));
+      position += Array.from(op.insert).length;
+    } else {
+      chars.splice(position, op.delete);
+    }
+  }
+  return chars.join("");
+}
+
+/** Moves a caret (a Unicode scalar position) across a delta someone else applied. */
+export function transformCaret(caret: number, ops: readonly TextOp[]): number {
+  let position = 0;
+  let result = caret;
+  for (const op of ops) {
+    if ("retain" in op) {
+      position += op.retain;
+    } else if ("insert" in op) {
+      const length = Array.from(op.insert).length;
+      if (position <= caret) result += length;
+      position += length;
+    } else {
+      if (position < caret) result -= Math.min(op.delete, caret - position);
+    }
+    if (position > caret) break;
+  }
+  return Math.max(0, result);
+}
+
+/** UTF-16 offset (what a textarea reports) to a Unicode scalar position. */
+export function utf16ToScalar(text: string, offset: number): number {
+  return Array.from(text.slice(0, offset)).length;
+}
+
+/** Unicode scalar position to a UTF-16 offset for a textarea. */
+export function scalarToUtf16(text: string, position: number): number {
+  return Array.from(text).slice(0, position).join("").length;
+}
+
+export type EditorState = Readonly<{
+  documentId: string;
+  /** The text the Backend last acknowledged or pushed; edits are diffed against it. */
+  text: string;
+  revision: string;
+  editable: boolean;
+  /** An edit request is in flight; further changes wait for its acknowledgement. */
+  sending: boolean;
+  /** The Backend refused the last edit with a message to show. */
+  error: string | null;
+}>;
+
+/**
+ * Tracks one open Document: what the Backend knows, what the Member has typed since, and the
+ * single in-flight edit. A pushed delta is applied to the local draft and the caret so a remote
+ * change never loses a keystroke.
+ */
+export class DocumentEditor {
+  private state: EditorState;
+  private draft: string;
+  private readonly send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>;
+  private readonly announce: () => void;
+
+  constructor(
+    initial: TextEvent,
+    send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>,
+    announce: () => void,
+  ) {
+    this.state = {
+      documentId: initial.documentId,
+      text: initial.text ?? "",
+      revision: initial.revision,
+      editable: initial.editable,
+      sending: false,
+      error: null,
+    };
+    this.draft = this.state.text;
+    this.send = send;
+    this.announce = announce;
+  }
+
+  get current(): EditorState {
+    return this.state;
+  }
+
+  get value(): string {
+    return this.draft;
+  }
+
+  /** The Member typed: record the draft and send the difference when nothing is in flight. */
+  input(value: string): void {
+    this.draft = value;
+    void this.flush();
+  }
+
+  /** A Backend event for this Document: a full text or a delta, local echo or remote. */
+  receive(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
+    if (event.documentId !== this.state.documentId) return caret;
+    if (event.text !== undefined) {
+      this.state = { ...this.state, text: event.text, revision: event.revision, editable: event.editable };
+      this.draft = event.text;
+      this.announce();
+      return caret === null ? null : { start: Math.min(caret.start, event.text.length), end: Math.min(caret.end, event.text.length) };
+    }
+    const delta = event.delta ?? [];
+    const base = this.state.text;
+    const nextBase = applyOps(base, delta);
+    this.state = { ...this.state, text: nextBase, revision: event.revision, editable: event.editable };
+    if (event.origin === "local") {
+      // Our own change coming back: the draft already contains it.
+      this.announce();
+      return caret;
+    }
+    // Carry the unsent local difference over the remote change, then send it again.
+    // Positions are rebased by caret transformation, which is exact unless both sides edited
+    // the same characters inside one coalescing window; the Backend's text stays authoritative.
+    const pending = diffOps(base, this.draft);
+    const previousDraft = this.draft;
+    this.draft = applyOps(nextBase, rebase(pending, delta));
+    let next = caret;
+    if (caret !== null) {
+      const start = scalarToUtf16(this.draft, transformCaret(utf16ToScalar(previousDraft, caret.start), delta));
+      const end = scalarToUtf16(this.draft, transformCaret(utf16ToScalar(previousDraft, caret.end), delta));
+      next = { start, end };
+    }
+    this.announce();
+    void this.flush();
+    return next;
+  }
+
+  private async flush(): Promise<void> {
+    if (this.state.sending || !this.state.editable) return;
+    const ops = diffOps(this.state.text, this.draft);
+    if (ops.length === 0) return;
+    const base = this.state.revision;
+    const sent = this.draft;
+    this.state = { ...this.state, sending: true, error: null };
+    this.announce();
+    try {
+      const { revision } = await this.send(this.state.documentId, base, ops);
+      this.state = { ...this.state, text: sent, revision, sending: false };
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code === "documents.stale_revision") {
+        // A delta is on its way; it will re-flush once applied.
+        this.state = { ...this.state, sending: false };
+        return;
+      }
+      this.state = { ...this.state, sending: false, error: describe(code) };
+      this.draft = this.state.text;
+      this.announce();
+      return;
+    }
+    this.announce();
+    void this.flush();
+  }
+}
+
+function describe(code: unknown): string {
+  switch (code) {
+    case "documents.document_too_large":
+      return "This document has reached its size limit.";
+    case "documents.document_pending":
+      return "Waiting for this document's history before edits can be made.";
+    default:
+      return "The edit could not be saved.";
+  }
+}
+
+/**
+ * Rewrites `pending` (made against the old base) so it applies to the base after `applied`.
+ * Retains and deletes skip characters of the new base; each old position maps through the
+ * caret transformation of `applied`.
+ */
+function rebase(pending: readonly TextOp[], applied: readonly TextOp[]): TextOp[] {
+  const out: TextOp[] = [];
+  let oldPosition = 0;
+  let newPosition = 0;
+  for (const op of pending) {
+    if ("retain" in op) {
+      oldPosition += op.retain;
+      const target = transformCaret(oldPosition, applied);
+      if (target > newPosition) out.push({ retain: target - newPosition });
+      newPosition = Math.max(newPosition, target);
+    } else if ("insert" in op) {
+      out.push(op);
+    } else {
+      oldPosition += op.delete;
+      const target = transformCaret(oldPosition, applied);
+      if (target > newPosition) out.push({ delete: target - newPosition });
+      newPosition = Math.max(newPosition, target);
+    }
+  }
+  return out;
+}

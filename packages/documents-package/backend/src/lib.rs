@@ -7,6 +7,7 @@
 //! stay in Core.
 
 mod backend;
+pub(crate) mod body;
 pub(crate) mod domain;
 pub(crate) mod store;
 
@@ -340,7 +341,8 @@ mod store_tests {
         assert!(matches!(
             store
                 .retry_deferred(&hex(64, 2), &document.encode())
-                .unwrap(),
+                .unwrap()
+                .result,
             IngestResult::Deferred(_)
         ));
         ingest(
@@ -352,9 +354,71 @@ mod store_tests {
         assert_eq!(
             store
                 .retry_deferred(&hex(64, 2), &document.encode())
-                .unwrap(),
+                .unwrap()
+                .result,
             IngestResult::Applied
         );
         assert_eq!(store.documents().unwrap().len(), 1);
+    }
+
+    /// A body edit that arrives before its Document waits, then surfaces once the Document's
+    /// create record is applied; the edit rows are findable per Document afterwards.
+    #[test]
+    fn edits_wait_for_their_document_and_surface_when_it_arrives() {
+        let f = fixture();
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let edit = DomainRecord::document_edit(BOB, &document, vec![1, 2, 3]).unwrap();
+        assert!(matches!(
+            ingest(&f.store, 3, BOB, &edit),
+            IngestResult::Deferred(_)
+        ));
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "C").unwrap(),
+        );
+        let ingested = f
+            .store
+            .ingest_with_commit(
+                &hex(64, 2),
+                &hex(82, 2),
+                ALICE,
+                "document.create",
+                "sig",
+                &DomainRecord::document_create(ALICE, &collection, "Doc")
+                    .unwrap()
+                    .encode(),
+                b"sealed",
+                Some(&hex(50, 2)),
+                &|| {},
+            )
+            .unwrap();
+        assert_eq!(ingested.result, IngestResult::Applied);
+        assert_eq!(ingested.edits, vec![(document.clone(), vec![1, 2, 3])]);
+        assert_eq!(f.store.edit_records(Some(&document)).unwrap().len(), 1);
+        assert_eq!(
+            f.store.edit_records(None).unwrap()[0].target.as_deref(),
+            Some(document.as_str())
+        );
+        assert!(f.store.edit_records(Some("not-an-id")).is_err());
+        let direct = DomainRecord::document_edit(ALICE, &document, vec![9]).unwrap();
+        let ingested = f
+            .store
+            .ingest_with_commit(
+                &hex(64, 4),
+                &hex(82, 4),
+                ALICE,
+                "document.edit",
+                "sig",
+                &direct.encode(),
+                b"sealed",
+                None,
+                &|| {},
+            )
+            .unwrap();
+        assert_eq!(ingested.edits, vec![(document.clone(), vec![9])]);
+        assert_eq!(f.store.edit_records(Some(&document)).unwrap().len(), 2);
     }
 }
