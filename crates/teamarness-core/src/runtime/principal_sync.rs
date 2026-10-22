@@ -4,11 +4,11 @@ use crate::principals::{self, edit};
 use crate::synchronization::{self, MembershipStanding};
 use std::collections::BTreeSet;
 
-// A scan is triggered by an accepted membership transition or a new reference.
-// Unknown references are visited once per scan, in bounded pages, not on every
-// scheduler reload; a later claim starts a new scan so no target can starve.
+// Unknown references are visited once per membership projection, in bounded
+// pages. An appended reference must not rewind an active scan past older unknowns.
 pub(super) struct ReplayScan {
     known: BTreeSet<[u8; 32]>,
+    version: crate::MembershipVersion,
     after: Option<i64>,
 }
 
@@ -34,6 +34,7 @@ fn restart_scan(
             workspace,
             ReplayScan {
                 known,
+                version: state.memberships[&workspace].snapshot().version(),
                 after: Some(0),
             },
         );
@@ -71,7 +72,14 @@ pub(super) fn initialize(
     } else {
         synchronization::declare_member_key_demand(&state.connection, workspace, SCOPE)?;
     }
-    restart_scan(state, workspace)?;
+    let version = projection.snapshot().version();
+    if !state
+        .name_replay_scans
+        .get(&workspace)
+        .is_some_and(|scan| scan.version == version)
+    {
+        restart_scan(state, workspace)?;
+    }
     state.sync_wake.notify_one();
     reconcile(state, workspace)
 }
@@ -173,7 +181,11 @@ fn reconcile_page(
                                     )
                                 })?;
                                 if let Some(scan) = state.name_replay_scans.get_mut(&workspace) {
-                                    scan.after = Some(0);
+                                    // A completed pass needs only the appended row; an active
+                                    // pass will reach it without revisiting earlier unknowns.
+                                    if scan.after.is_none() {
+                                        scan.after = Some(sequence - 1);
+                                    }
                                 } else {
                                     restart_scan(state, workspace)?;
                                 }

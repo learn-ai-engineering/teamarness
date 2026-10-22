@@ -291,7 +291,10 @@ async fn early_name_reference_failure_does_not_advance_consumption() {
 async fn empty_name_replay_does_not_probe_historical_principals_on_scheduler_reload() {
     let cluster = SyncCluster::start("name-empty-replay", &["creator"]).await;
     let creator = cluster.node("creator");
-    let workspace = creator.create_workspace("Names").unwrap().id();
+    let workspace = creator
+        .create_workspace_with_person_name("Names", "Creator")
+        .unwrap()
+        .id();
     creator.sync_worker.shutdown().await;
     for index in 0..64 {
         creator
@@ -301,11 +304,157 @@ async fn empty_name_replay_does_not_probe_historical_principals_on_scheduler_rel
     {
         let mut state = creator.state.lock().unwrap();
         assert_eq!(state.memberships[&workspace].principal_history().len(), 65);
+        let principal = crate::principals::derive(
+            workspace,
+            crate::principals::anchor(&state.memberships[&workspace], creator.public_identity())
+                .unwrap(),
+        );
+        state.connection.execute(
+            "INSERT INTO pending_principal_name_edits (workspace_id, principal_id, name) VALUES (?1, ?2, 'Pending')",
+            rusqlite::params![workspace.as_bytes().as_slice(), principal.as_bytes().as_slice()],
+        ).unwrap();
         for _ in 0..3 {
+            super::super::principal_sync::retry_pending_initialization(&mut state);
             super::super::principal_sync::continue_replay(&mut state);
             assert!(!state.name_replay_scans.contains_key(&workspace));
         }
     }
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appended_unknown_names_do_not_rewind_active_eligible_replay() {
+    let cluster = SyncCluster::start("name-interleaved-replay", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    let agent = creator.add_agent(workspace, "Initial").unwrap();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        let scope = crate::synchronization::reserved_principals_scope();
+        let unknown = crate::principals::derive_agent(
+            workspace,
+            crate::MembershipOperationId::digest(b"never-added-interleaved"),
+        );
+        let append = |state: &mut super::super::RuntimeState, target, counter, name: &str| {
+            let edit = crate::principals::edit::PrincipalNameEdit::sign(
+                &secret, workspace, target, counter, name,
+            )
+            .unwrap();
+            crate::synchronization::append(
+                &mut state.connection,
+                &secret,
+                workspace,
+                scope,
+                "principal-name.edit",
+                edit.canonical_bytes(),
+                crate::synchronization::MembershipStanding::Current,
+                true,
+                creator.clock.now_unix_ms(),
+            )
+            .unwrap()
+            .1
+        };
+        for counter in 1..=80 {
+            let sequence = append(&mut state, unknown, counter, "Unclaimed");
+            state.connection.execute(
+                "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![workspace.as_bytes().as_slice(), sequence, unknown.as_bytes().as_slice()],
+            ).unwrap();
+        }
+        let sequence = append(&mut state, agent, 2, "Reached");
+        state.connection.execute(
+            "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace.as_bytes().as_slice(), sequence, agent.as_bytes().as_slice()],
+        ).unwrap();
+        state.connection.execute(
+            "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
+            rusqlite::params![workspace.as_bytes().as_slice(), sequence],
+        ).unwrap();
+        super::super::principal_sync::initialize(&mut state, workspace).unwrap();
+        for counter in 81..=84 {
+            append(&mut state, unknown, counter, "Unclaimed");
+            super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        }
+    }
+    assert_eq!(
+        creator.principal(workspace, agent).unwrap().unwrap().name(),
+        Some("Reached"),
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_name_intent_retry_keeps_active_replay_position() {
+    let cluster = SyncCluster::start("name-idle-replay", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator
+        .create_workspace_with_person_name("Names", "Creator")
+        .unwrap()
+        .id();
+    let agent = creator.add_agent(workspace, "Initial").unwrap();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let principal = crate::principals::derive(
+            workspace,
+            crate::principals::anchor(&state.memberships[&workspace], creator.public_identity())
+                .unwrap(),
+        );
+        let unknown = crate::principals::derive_agent(
+            workspace,
+            crate::MembershipOperationId::digest(b"never-added-idle"),
+        );
+        let secret = state.secret_key.clone();
+        for counter in 1..=80 {
+            let (target, name) = if counter == 60 {
+                (agent, "Reached")
+            } else {
+                (unknown, "Unclaimed")
+            };
+            let edit = crate::principals::edit::PrincipalNameEdit::sign(
+                &secret,
+                workspace,
+                target,
+                if counter == 60 { 2 } else { counter },
+                name,
+            )
+            .unwrap();
+            let (_, sequence) = crate::synchronization::append(
+                &mut state.connection,
+                &secret,
+                workspace,
+                crate::synchronization::reserved_principals_scope(),
+                "principal-name.edit",
+                edit.canonical_bytes(),
+                crate::synchronization::MembershipStanding::Current,
+                true,
+                creator.clock.now_unix_ms(),
+            )
+            .unwrap();
+            state.connection.execute(
+                "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![workspace.as_bytes().as_slice(), sequence, target.as_bytes().as_slice()],
+            ).unwrap();
+            if counter == 80 {
+                state.connection.execute(
+                    "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
+                    rusqlite::params![workspace.as_bytes().as_slice(), sequence],
+                ).unwrap();
+            }
+        }
+        super::super::principal_sync::initialize(&mut state, workspace).unwrap();
+        state.connection.execute(
+            "INSERT INTO pending_principal_name_edits (workspace_id, principal_id, name) VALUES (?1, ?2, 'Pending')",
+            rusqlite::params![workspace.as_bytes().as_slice(), principal.as_bytes().as_slice()],
+        ).unwrap();
+        super::super::principal_sync::retry_pending_initialization(&mut state);
+    }
+    assert_eq!(
+        creator.principal(workspace, agent).unwrap().unwrap().name(),
+        Some("Reached")
+    );
     cluster.finish().await;
 }
 
