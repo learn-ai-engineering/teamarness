@@ -285,6 +285,104 @@ async fn revoked_member_learns_only_its_revocation_closure() {
     cluster.finish().await;
 }
 
+/// Verifies: TEAM.SYS.MEM-R10. A Person disabled by a concurrent Agent
+/// claim must learn that signed claim, not unrelated operations after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflict_disabled_person_learns_claim_through_membership_exchange() {
+    use crate::membership::{AgentKeyProof, MembershipAction, MembershipEnvelope};
+
+    let mut cluster = SyncCluster::start(
+        "person-conflict-closure",
+        &["manager", "person", "steward", "later"],
+    )
+    .await;
+    let workspace = cluster
+        .node("manager")
+        .create_workspace("Conflict closure")
+        .unwrap()
+        .id();
+    cluster.admit("manager", "steward", workspace).await;
+    let person_secret = cluster
+        .node("person")
+        .state
+        .lock()
+        .unwrap()
+        .secret_key
+        .clone();
+    let agent_claim = {
+        let steward = cluster.node("steward");
+        let state = steward.state.lock().unwrap();
+        let group = state
+            .memberships
+            .get(&workspace)
+            .unwrap()
+            .person_group(cluster.identity("steward"))
+            .unwrap();
+        MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            steward.clock.now_unix_ms(),
+            MembershipAction::AddAgentKey {
+                group,
+                agent: cluster.identity("person"),
+                proof: AgentKeyProof::sign(
+                    &person_secret,
+                    workspace,
+                    group,
+                    cluster.identity("steward"),
+                )
+                .unwrap(),
+            },
+            state.memberships.get(&workspace).unwrap().heads(),
+        )
+        .unwrap()
+    };
+    cluster.admit("manager", "person", workspace).await;
+    cluster.stop("person").await;
+    assert!(
+        cluster
+            .node("steward")
+            .apply_membership_envelope(agent_claim.canonical_bytes())
+            .unwrap()
+            .accepted
+    );
+    cluster
+        .replicate_membership("steward", "manager", workspace)
+        .await;
+    assert!(
+        !cluster
+            .members("manager", workspace)
+            .contains(&cluster.identity("person"))
+    );
+    let before_later = cluster.membership_operation_ids("manager", workspace);
+    cluster.admit("manager", "later", workspace).await;
+    let unrelated = cluster
+        .membership_operation_ids("manager", workspace)
+        .difference(&before_later)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    cluster.restart("person").await;
+    cluster
+        .wait_until(
+            "conflict claim reaches former Person",
+            DEFAULT_DEADLINE,
+            |c| {
+                c.membership_operation_ids("person", workspace)
+                    .contains(&agent_claim.id)
+                    && !c
+                        .members("person", workspace)
+                        .contains(&c.identity("person"))
+            },
+        )
+        .await;
+    assert!(
+        cluster
+            .membership_operation_ids("person", workspace)
+            .is_disjoint(&unrelated)
+    );
+    cluster.finish().await;
+}
+
 /// Verifies: TEAM.SYS.MEM-R10
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stranger_receives_no_membership_operations() {

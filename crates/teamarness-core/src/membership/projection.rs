@@ -70,7 +70,7 @@ impl WorkspaceProjection {
             .members()
             .iter()
             .map(MemberSnapshot::identity)
-            .filter(|identity| !self.agent_keys.contains(identity))
+            .filter(|identity| self.contains_installation_member(*identity))
             .collect()
     }
 
@@ -145,6 +145,22 @@ impl WorkspaceProjection {
             .members()
             .iter()
             .any(|member| member.identity() == identity)
+    }
+
+    pub(crate) fn contains_installation_member(&self, identity: PublicIdentity) -> bool {
+        self.contains_member(identity) && !self.agent_keys.contains(&identity)
+    }
+
+    pub(crate) fn has_person_history(&self, identity: PublicIdentity) -> bool {
+        self.creator == identity
+            || self.operations.values().any(|operation| {
+                matches!(&operation.action, MembershipAction::Admit { target, .. } if *target == identity)
+                    || matches!(&operation.action, MembershipAction::AttachPerson { .. } if operation.author == identity)
+            })
+    }
+
+    pub(crate) fn has_unrevoked_person_conflict(&self, identity: PublicIdentity) -> bool {
+        self.conflicted_keys.contains(&identity) && self.person_group(identity).is_some()
     }
 
     pub(crate) fn has_membership_history(&self, identity: PublicIdentity) -> bool {

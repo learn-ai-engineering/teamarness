@@ -41,6 +41,39 @@ pub(crate) enum ProbeOutcome {
     Failed(String),
 }
 
+/// Probes the real inbound package gate using an endpoint with a separately
+/// held key; the fake receiver only supplies the probe's outbound side.
+#[cfg(test)]
+pub(super) async fn probe_package_sync_as_key_for_test(
+    endpoint: &iroh::Endpoint,
+    address: iroh_base::EndpointAddr,
+    responder: &CoreRuntime,
+    workspace: WorkspaceId,
+    package: &str,
+) -> ProbeOutcome {
+    let result = crate::synchronization::network_handler::outbound_log_session(
+        endpoint,
+        address,
+        Arc::new(ProbeReceiver),
+        crate::synchronization::PeerSessions::new(),
+        Arc::clone(&responder.health),
+        workspace,
+        package.to_owned(),
+        responder.public_identity,
+        responder.session_limits,
+    )
+    .await;
+    match result {
+        Ok(report) => ProbeOutcome::Welcomed {
+            operations_received: report.outcomes.applied,
+        },
+        Err(crate::synchronization::LogSessionError::Refused(reason)) => {
+            ProbeOutcome::Refused(reason)
+        }
+        Err(error) => ProbeOutcome::Failed(error.to_string()),
+    }
+}
+
 /// Serves this Installation's real operations plus a fixed set of extras.
 ///
 /// Only the sending side is altered: the peer applies everything through its

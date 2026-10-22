@@ -2167,6 +2167,49 @@ async fn protection_grants_and_sessions_address_installation_keys_only() {
     cluster
         .replicate_membership("member", "creator", workspace)
         .await;
+    // A real endpoint authenticated with the Agent key must not be treated as
+    // an Installation, even though its key is in the effective Member roster.
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(agent_secret.clone())
+        .alpns(Vec::new())
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let creator = cluster.node("creator");
+    let outcome = crate::runtime::test_hooks::probe_package_sync_as_key_for_test(
+        &endpoint,
+        cluster.address("creator"),
+        creator,
+        workspace,
+        PACKAGE,
+    )
+    .await;
+    assert_eq!(outcome, ProbeOutcome::Refused(Refusal::NotAuthorized));
+    let (operations, refused) = crate::membership_sync::session::probe_membership_sync(
+        &endpoint,
+        cluster.address("creator"),
+        workspace,
+        Vec::new(),
+    )
+    .await;
+    assert!(operations.is_empty());
+    assert!(refused);
+    let receiver = super::super::RuntimeSyncReceiver {
+        state: std::sync::Arc::downgrade(&creator.state),
+        clock: std::sync::Arc::clone(&creator.clock),
+        demand: std::sync::Arc::clone(&creator.membership_demand),
+        health: std::sync::Arc::clone(&creator.health),
+    };
+    use crate::synchronization::SyncReceiver;
+    assert!(matches!(
+        receiver.protection_bundle_for(workspace, PACKAGE, agent),
+        Err(crate::synchronization::SyncRejection::NotMember)
+    ));
     // Records flow both ways, so each side issues the other a Protection Grant.
     cluster
         .node("member")
@@ -2319,5 +2362,18 @@ async fn protection_grants_and_sessions_address_installation_keys_only() {
                 .any(|peer| peer.peer == agent)
         );
     }
+    let (operations, refused) = crate::membership_sync::session::probe_membership_sync(
+        &endpoint,
+        cluster.address("creator"),
+        workspace,
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        operations.is_empty(),
+        "a former Agent-only key receives no membership"
+    );
+    assert!(refused);
+    endpoint.close().await;
     cluster.finish().await;
 }
