@@ -2,6 +2,46 @@
 use super::*;
 use crate::principals::{self, edit};
 use crate::synchronization::{self, MembershipStanding};
+use std::collections::BTreeSet;
+
+// A scan is triggered by an accepted membership transition or a new reference.
+// Unknown references are visited once per scan, in bounded pages, not on every
+// scheduler reload; a later claim starts a new scan so no target can starve.
+pub(super) struct ReplayScan {
+    known: BTreeSet<[u8; 32]>,
+    after: Option<i64>,
+}
+
+fn restart_scan(
+    state: &mut RuntimeState,
+    workspace: WorkspaceId,
+) -> Result<(), crate::SynchronizationError> {
+    let pending: bool = state
+        .connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM deferred_principal_names WHERE workspace_id=?1)",
+            [workspace.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+    if pending {
+        let known = state.memberships[&workspace]
+            .principal_history()
+            .into_iter()
+            .map(|id| *id.as_bytes())
+            .collect();
+        state.name_replay_scans.insert(
+            workspace,
+            ReplayScan {
+                known,
+                after: Some(0),
+            },
+        );
+    } else {
+        state.name_replay_scans.remove(&workspace);
+    }
+    Ok(())
+}
 
 const SCOPE: &str = synchronization::reserved_principals_scope();
 const PURPOSE: &str = "principal-name.edit";
@@ -31,6 +71,7 @@ pub(super) fn initialize(
     } else {
         synchronization::declare_member_key_demand(&state.connection, workspace, SCOPE)?;
     }
+    restart_scan(state, workspace)?;
     state.sync_wake.notify_one();
     reconcile(state, workspace)
 }
@@ -131,6 +172,11 @@ fn reconcile_page(
                                         StorageError::UncertainOutcome,
                                     )
                                 })?;
+                                if let Some(scan) = state.name_replay_scans.get_mut(&workspace) {
+                                    scan.after = Some(0);
+                                } else {
+                                    restart_scan(state, workspace)?;
+                                }
                                 continue;
                             }
                             Err(edit::EditError::InvalidEdit | edit::EditError::Unauthorized) => {}
@@ -170,38 +216,35 @@ fn advance_cursor(
     Ok(())
 }
 
-// Query by known target, not by oldest unresolved sequence: an honest claim
-// must never wait behind an arbitrary number of never-known targets.
+struct DeferredDelivery {
+    sequence: i64,
+    target: Vec<u8>,
+    sealed: Vec<u8>,
+}
+
 fn eligible_page(
     connection: &rusqlite::Connection,
     workspace: WorkspaceId,
-    projection: &crate::membership::WorkspaceProjection,
+    after: i64,
     limit: usize,
-) -> Result<Vec<(i64, Vec<u8>)>, crate::SynchronizationError> {
-    let mut page = Vec::new();
-    for target in projection.principal_history() {
-        if page.len() == limit {
-            break;
-        }
-        let mut query = connection.prepare(
-            "SELECT d.delivery_sequence, r.sealed_record FROM deferred_principal_names d JOIN record_delivery delivery ON delivery.delivery_sequence=d.delivery_sequence JOIN immutable_records r ON r.record_id=delivery.record_id WHERE d.workspace_id=?1 AND d.principal_id=?2 ORDER BY d.delivery_sequence LIMIT ?3"
-        ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
-        let rows = query
-            .query_map(
-                rusqlite::params![
-                    workspace.as_bytes().as_slice(),
-                    target.as_bytes().as_slice(),
-                    (limit - page.len()) as i64
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
-        page.extend(
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?,
-        );
-    }
-    Ok(page)
+) -> Result<Vec<DeferredDelivery>, crate::SynchronizationError> {
+    let mut query = connection.prepare(
+        "SELECT d.delivery_sequence, d.principal_id, r.sealed_record FROM deferred_principal_names d JOIN record_delivery delivery ON delivery.delivery_sequence=d.delivery_sequence JOIN immutable_records r ON r.record_id=delivery.record_id WHERE d.workspace_id=?1 AND d.delivery_sequence>?2 ORDER BY d.delivery_sequence LIMIT ?3"
+    ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+    query
+        .query_map(
+            rusqlite::params![workspace.as_bytes().as_slice(), after, limit as i64],
+            |row| {
+                Ok(DeferredDelivery {
+                    sequence: row.get(0)?,
+                    target: row.get(1)?,
+                    sealed: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?
+        .collect::<Result<_, _>>()
+        .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))
 }
 
 fn replay_eligible(
@@ -210,13 +253,29 @@ fn replay_eligible(
     projection: &crate::membership::WorkspaceProjection,
     limit: usize,
 ) -> Result<(), crate::SynchronizationError> {
-    let page = eligible_page(&state.connection, workspace, projection, limit)?;
-    for (sequence, sealed) in &page {
+    if limit == 0 {
+        return Ok(());
+    }
+    let Some(scan) = state.name_replay_scans.get(&workspace) else {
+        return Ok(());
+    };
+    let Some(after) = scan.after else {
+        return Ok(());
+    };
+    let page = eligible_page(&state.connection, workspace, after, limit)?;
+    for delivery in &page {
+        if !<[u8; 32]>::try_from(delivery.target.as_slice())
+            .ok()
+            .is_some_and(|id| state.name_replay_scans[&workspace].known.contains(&id))
+        {
+            state.name_replay_scans.get_mut(&workspace).unwrap().after = Some(delivery.sequence);
+            continue;
+        }
         let opened = synchronization::open_records(
             &state.connection,
             workspace,
             SCOPE,
-            std::slice::from_ref(sealed),
+            std::slice::from_ref(&delivery.sealed),
             state.clock.now_unix_ms(),
         );
         match opened {
@@ -242,11 +301,14 @@ fn replay_eligible(
             ) => {}
             Err(error) => return Err(error),
         }
-        state.connection.execute("DELETE FROM deferred_principal_names WHERE workspace_id=?1 AND delivery_sequence=?2", rusqlite::params![workspace.as_bytes().as_slice(), sequence])
+        state.connection.execute("DELETE FROM deferred_principal_names WHERE workspace_id=?1 AND delivery_sequence=?2", rusqlite::params![workspace.as_bytes().as_slice(), delivery.sequence])
             .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+        state.name_replay_scans.get_mut(&workspace).unwrap().after = Some(delivery.sequence);
     }
-    if limit > 0 && page.len() == limit {
+    if page.len() == limit {
         state.sync_wake.notify_one();
+    } else {
+        state.name_replay_scans.get_mut(&workspace).unwrap().after = None;
     }
     Ok(())
 }
@@ -284,10 +346,10 @@ pub(crate) fn continue_replay(state: &mut RuntimeState) {
             "SELECT EXISTS(SELECT 1 FROM record_delivery d WHERE d.scope_id=?1 AND d.delivery_sequence > COALESCE((SELECT delivery_sequence FROM principal_name_consumption WHERE workspace_id=?2), 0))",
             rusqlite::params![scope.as_slice(), workspace.as_bytes().as_slice()], |row| row.get(0),
         ).unwrap_or(false);
-        let eligible = state.memberships.get(&workspace).is_some_and(|projection| {
-            eligible_page(&state.connection, workspace, projection, 1)
-                .is_ok_and(|page| !page.is_empty())
-        });
+        let eligible = state
+            .name_replay_scans
+            .get(&workspace)
+            .is_some_and(|scan| scan.after.is_some());
         if outstanding || eligible {
             match reconcile(state, workspace) {
                 Ok(()) => state.sync_wake.notify_one(), // another Workspace may have a backlog

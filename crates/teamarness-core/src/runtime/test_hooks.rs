@@ -389,6 +389,7 @@ impl RuntimeState {
             record_heads: Arc::default(),
             membership_epochs: BTreeMap::new(),
             profile_generations: BTreeMap::new(),
+            name_replay_scans: BTreeMap::new(),
             #[cfg(test)]
             person_name_open_error_once: false,
             principal_sync_init_faults: 0,

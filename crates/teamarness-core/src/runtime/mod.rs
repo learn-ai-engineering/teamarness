@@ -81,6 +81,7 @@ pub(crate) struct RuntimeState {
     /// membership stream waits instead of polling.
     membership_epochs: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
     profile_generations: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
+    name_replay_scans: BTreeMap<WorkspaceId, principal_sync::ReplayScan>,
     #[cfg(test)]
     person_name_open_error_once: bool,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -188,6 +189,7 @@ impl CoreRuntime {
             record_heads,
             membership_epochs: BTreeMap::new(),
             profile_generations: BTreeMap::new(),
+            name_replay_scans: BTreeMap::new(),
             #[cfg(test)]
             person_name_open_error_once: false,
             #[cfg(any(test, feature = "test-hooks"))]

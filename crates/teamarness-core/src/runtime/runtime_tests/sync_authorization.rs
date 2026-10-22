@@ -95,6 +95,9 @@ async fn agent_name_delivered_before_membership_converges_after_restart() {
     cluster
         .node("peer")
         .pause_membership_replication_for_test(true);
+    cluster
+        .node("steward")
+        .pause_membership_replication_for_test(true);
     let agent = cluster
         .node("steward")
         .add_agent(workspace, "Early")
@@ -133,6 +136,15 @@ async fn agent_name_delivered_before_membership_converges_after_restart() {
             .name(),
         Some("Still progressing")
     );
+    let deferred_count = |cluster: &SyncCluster| {
+        let state = cluster.node("peer").state.lock().unwrap();
+        state.connection.query_row(
+            "SELECT COUNT(*) FROM deferred_principal_names WHERE workspace_id=?1 AND principal_id=?2",
+            rusqlite::params![workspace.as_bytes().as_slice(), agent.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        ).unwrap()
+    };
+    assert_eq!(deferred_count(&cluster), 2);
     cluster.stop("peer").await;
     cluster.restart("peer").await;
     assert!(
@@ -142,6 +154,7 @@ async fn agent_name_delivered_before_membership_converges_after_restart() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(deferred_count(&cluster), 2);
     // An authenticated current Person who is not the Agent's Steward cannot
     // override the deferred name when membership becomes known.
     {
@@ -170,8 +183,19 @@ async fn agent_name_delivered_before_membership_converges_after_restart() {
         .unwrap();
         super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
     }
+    assert!(
+        cluster
+            .node("peer")
+            .principal(workspace, agent)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(deferred_count(&cluster), 3);
     cluster
         .node("peer")
+        .pause_membership_replication_for_test(false);
+    cluster
+        .node("steward")
         .pause_membership_replication_for_test(false);
     cluster
         .replicate_membership("steward", "peer", workspace)
@@ -264,6 +288,28 @@ async fn early_name_reference_failure_does_not_advance_consumption() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_name_replay_does_not_probe_historical_principals_on_scheduler_reload() {
+    let cluster = SyncCluster::start("name-empty-replay", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    creator.sync_worker.shutdown().await;
+    for index in 0..64 {
+        creator
+            .add_agent(workspace, &format!("Agent {index}"))
+            .unwrap();
+    }
+    {
+        let mut state = creator.state.lock().unwrap();
+        assert_eq!(state.memberships[&workspace].principal_history().len(), 65);
+        for _ in 0..3 {
+            super::super::principal_sync::continue_replay(&mut state);
+            assert!(!state.name_replay_scans.contains_key(&workspace));
+        }
+    }
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eligible_name_replay_is_bounded_without_starvation_by_unknown_targets() {
     let cluster = SyncCluster::start("name-eligible-page", &["creator"]).await;
     let creator = cluster.node("creator");
@@ -315,6 +361,19 @@ async fn eligible_name_replay_is_bounded_without_starvation_by_unknown_targets()
             )
             .unwrap();
         state.connection.execute("INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence", rusqlite::params![workspace.as_bytes().as_slice(), max_sequence]).unwrap();
+        super::super::principal_sync::initialize(&mut state, workspace).unwrap();
+        let remaining: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deferred_principal_names WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 80,
+            "one lock hold inspects at most 32 references"
+        );
         super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
         let remaining: i64 = state
             .connection
@@ -325,8 +384,8 @@ async fn eligible_name_replay_is_bounded_without_starvation_by_unknown_targets()
             )
             .unwrap();
         assert_eq!(
-            remaining, 48,
-            "one lock hold replays at most 32 eligible deliveries"
+            remaining, 56,
+            "the next bounded scan reaches eligible deliveries"
         );
         super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
         let remaining: i64 = state
