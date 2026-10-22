@@ -121,6 +121,23 @@ impl WorkspaceProjection {
         result
     }
 
+    /// Includes accepted anchors no longer in the current roster.
+    pub(crate) fn principal_history(&self) -> Vec<crate::principals::PrincipalId> {
+        self.operations
+            .values()
+            .filter_map(|operation| match operation.action {
+                MembershipAction::CreatePerson { .. } => {
+                    Some(crate::principals::derive(self.workspace_id, operation.id))
+                }
+                MembershipAction::AddAgentKey { .. } => Some(crate::principals::derive_agent(
+                    self.workspace_id,
+                    operation.id,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
     }

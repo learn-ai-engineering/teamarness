@@ -118,6 +118,12 @@ impl PrincipalNameEdit {
     pub(crate) fn author(&self) -> PublicIdentity {
         self.author
     }
+    pub(crate) fn target(&self) -> PrincipalId {
+        self.person
+    }
+    pub(crate) fn workspace(&self) -> WorkspaceId {
+        self.workspace
+    }
     #[cfg(test)]
     pub(crate) fn id(&self) -> [u8; 32] {
         self.id
@@ -143,6 +149,16 @@ fn authorized_author(
                 *key == author
             }
     })
+}
+
+/// Only an authenticated current Person's edit for an as-yet-unclaimed target
+/// can wait for membership. Historical and currently known targets are terminal.
+pub(crate) fn is_early_target(projection: &WorkspaceProjection, edit: &PrincipalNameEdit) -> bool {
+    edit.workspace == projection.workspace_id()
+        && !projection.principal_history().contains(&edit.person)
+        && registry(projection)
+            .iter()
+            .any(|(_, key, kind, _, _)| *key == edit.author && *kind == PrincipalKind::Person)
 }
 
 fn edit_id(unsigned: &[u8]) -> [u8; 32] {
@@ -406,6 +422,30 @@ mod tests {
         );
         let person = derive(workspace, group.id);
         (db, projection, key, person)
+    }
+
+    #[test]
+    fn early_target_requires_current_person_and_unknown_membership_anchor() {
+        let (_, projection, steward, person) = fixture();
+        let workspace = projection.workspace_id();
+        let unknown = derive_agent(workspace, MembershipOperationId::digest(b"future-agent"));
+        let valid = PrincipalNameEdit::sign(&steward, workspace, unknown, 1, "Waiting").unwrap();
+        assert!(is_early_target(&projection, &valid));
+        let outsider = SecretKey::from_bytes(&[43; 32]);
+        let unauthorized =
+            PrincipalNameEdit::sign(&outsider, workspace, unknown, 1, "Wrong").unwrap();
+        assert!(!is_early_target(&projection, &unauthorized));
+        let known = PrincipalNameEdit::sign(&steward, workspace, person, 1, "Known").unwrap();
+        assert!(!is_early_target(&projection, &known));
+        let other = PrincipalNameEdit::sign(
+            &steward,
+            WorkspaceId::from_bytes([52; 16]),
+            unknown,
+            1,
+            "Other",
+        )
+        .unwrap();
+        assert!(!is_early_target(&projection, &other));
     }
 
     #[test]

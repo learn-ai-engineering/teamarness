@@ -125,7 +125,7 @@ async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     let violations: i64 = connection
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -352,7 +352,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     for column in [
         "scope_id",
         "log_id",
@@ -427,7 +427,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -569,7 +569,8 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;
+            "DROP TABLE deferred_principal_names;
+             DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;
              DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;
              DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;
              DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;
@@ -753,7 +754,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
         )
         .unwrap();
     assert_eq!(left, 0, "peer progress cascades when demand is cleared");
-    connection.execute_batch("DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;              DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;              DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;              DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;              DROP TABLE principal_names; DROP TABLE workspace_principals; DROP TABLE agent_package_bindings; DROP TABLE agent_keys; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
+    connection.execute_batch("DROP TABLE deferred_principal_names; DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;              DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;              DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;              DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;              DROP TABLE principal_names; DROP TABLE workspace_principals; DROP TABLE agent_package_bindings; DROP TABLE agent_keys; ALTER TABLE workspace_creation_requests DROP COLUMN initial_person_name; DROP TABLE sync_scope_key_demand_peer_progress; DROP TABLE sync_scope_key_demands; PRAGMA user_version = 12;").unwrap();
     drop(connection);
 
     let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
@@ -763,7 +764,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     connection
         .execute(
             insert,
@@ -801,7 +802,7 @@ async fn migration_0017_replaces_names_with_principals_from_v16() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        17
+        18
     );
     assert_eq!(
         connection
@@ -824,7 +825,47 @@ async fn migration_0017_replaces_names_with_principals_from_v16() {
 }
 
 #[tokio::test]
-async fn migration_0017_rejects_future_schema_versions() {
+async fn migration_0018_opens_v17_and_is_idempotent() {
+    let directory = private_data_directory("migration-early-names");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection
+        .execute_batch("DROP TABLE deferred_principal_names; PRAGMA user_version=17;")
+        .unwrap();
+    drop(connection);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 18);
+    let columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('deferred_principal_names')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 3);
+    let indexes: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='deferred_principal_names_target'", [], |row| row.get(0)).unwrap();
+    assert_eq!(indexes, 1);
+    drop(connection);
+    let runtime = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn migration_0018_rejects_future_schema_versions() {
     let directory = private_data_directory("migration-future-schema");
     let config = CoreRuntimeConfig::new(&directory);
     let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
@@ -833,7 +874,7 @@ async fn migration_0017_rejects_future_schema_versions() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.pragma_update(None, "user_version", 18).unwrap();
+    connection.pragma_update(None, "user_version", 19).unwrap();
     drop(connection);
     assert!(matches!(
         CoreRuntime::open_loopback_for_tests(config).await,
@@ -884,7 +925,7 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();
@@ -910,7 +951,7 @@ async fn migration_0017_unnamed_person_is_not_given_a_name() {
 }
 
 fn drop_principal_tables(connection: &Connection) {
-    connection.execute_batch("DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;
+    connection.execute_batch("DROP TABLE deferred_principal_names; DROP TRIGGER principal_name_intent_insert; DROP TRIGGER principal_name_intent_name_update;
         DROP TABLE principal_name_consumption; DROP TABLE principal_name_generations;
         DROP TABLE principal_name_winners; DROP TABLE principal_name_intent_revisions;
         DROP TABLE pending_principal_join_names; DROP TABLE pending_principal_name_edits;

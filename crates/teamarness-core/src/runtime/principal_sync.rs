@@ -69,6 +69,7 @@ fn reconcile_page(
         .optional()
         .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?
         .unwrap_or(0);
+    let mut consumed = 0;
     'page: {
         let page: Vec<(i64, Vec<u8>)> = {
             let mut query = state.connection.prepare(
@@ -85,6 +86,7 @@ fn reconcile_page(
         if page.is_empty() {
             break 'page;
         }
+        consumed = page.len();
         for (sequence, sealed) in &page {
             #[cfg(test)]
             let injected_error = std::mem::take(&mut state.person_name_open_error_once);
@@ -109,9 +111,29 @@ fn reconcile_page(
                         && edit_bytes.author() == record.author()
                     {
                         match edit::accept(&mut state.connection, &projection, record.canonical()) {
-                            Ok(_)
-                            | Err(edit::EditError::InvalidEdit | edit::EditError::Unauthorized) => {
+                            Ok(_) => {}
+                            Err(edit::EditError::Unauthorized)
+                                if edit::is_early_target(&projection, &edit_bytes)
+                                    && edit_bytes.workspace() == workspace =>
+                            {
+                                // The reference and cursor are one durable decision. A failed
+                                // insert cannot silently consume the only replay opportunity.
+                                let transaction = state.connection.transaction().map_err(|_| {
+                                    crate::SynchronizationError::Storage(StorageError::Database)
+                                })?;
+                                transaction.execute(
+                                    "INSERT OR IGNORE INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+                                    rusqlite::params![workspace.as_bytes().as_slice(), sequence, edit_bytes.target().as_bytes().as_slice()],
+                                ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+                                advance_cursor(&transaction, workspace, *sequence)?;
+                                transaction.commit().map_err(|_| {
+                                    crate::SynchronizationError::Storage(
+                                        StorageError::UncertainOutcome,
+                                    )
+                                })?;
+                                continue;
                             }
+                            Err(edit::EditError::InvalidEdit | edit::EditError::Unauthorized) => {}
                             Err(edit::EditError::Storage(error)) => {
                                 return Err(crate::SynchronizationError::Storage(error));
                             }
@@ -125,16 +147,107 @@ fn reconcile_page(
                 ) => {}
                 Err(error) => return Err(error),
             }
-            state.connection.execute(
-                "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
-                rusqlite::params![workspace.as_bytes().as_slice(), sequence],
-            ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+            advance_cursor(&state.connection, workspace, *sequence)?;
         }
         if page.len() == 32 {
             state.sync_wake.notify_one();
         }
     }
+    replay_eligible(state, workspace, &projection, 32 - consumed)?;
     flush_pending(state, workspace)?;
+    Ok(())
+}
+
+fn advance_cursor(
+    connection: &rusqlite::Connection,
+    workspace: WorkspaceId,
+    sequence: i64,
+) -> Result<(), crate::SynchronizationError> {
+    connection.execute(
+        "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
+        rusqlite::params![workspace.as_bytes().as_slice(), sequence],
+    ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+    Ok(())
+}
+
+// Query by known target, not by oldest unresolved sequence: an honest claim
+// must never wait behind an arbitrary number of never-known targets.
+fn eligible_page(
+    connection: &rusqlite::Connection,
+    workspace: WorkspaceId,
+    projection: &crate::membership::WorkspaceProjection,
+    limit: usize,
+) -> Result<Vec<(i64, Vec<u8>)>, crate::SynchronizationError> {
+    let mut page = Vec::new();
+    for target in projection.principal_history() {
+        if page.len() == limit {
+            break;
+        }
+        let mut query = connection.prepare(
+            "SELECT d.delivery_sequence, r.sealed_record FROM deferred_principal_names d JOIN record_delivery delivery ON delivery.delivery_sequence=d.delivery_sequence JOIN immutable_records r ON r.record_id=delivery.record_id WHERE d.workspace_id=?1 AND d.principal_id=?2 ORDER BY d.delivery_sequence LIMIT ?3"
+        ).map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+        let rows = query
+            .query_map(
+                rusqlite::params![
+                    workspace.as_bytes().as_slice(),
+                    target.as_bytes().as_slice(),
+                    (limit - page.len()) as i64
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+        page.extend(
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?,
+        );
+    }
+    Ok(page)
+}
+
+fn replay_eligible(
+    state: &mut RuntimeState,
+    workspace: WorkspaceId,
+    projection: &crate::membership::WorkspaceProjection,
+    limit: usize,
+) -> Result<(), crate::SynchronizationError> {
+    let page = eligible_page(&state.connection, workspace, projection, limit)?;
+    for (sequence, sealed) in &page {
+        let opened = synchronization::open_records(
+            &state.connection,
+            workspace,
+            SCOPE,
+            std::slice::from_ref(sealed),
+            state.clock.now_unix_ms(),
+        );
+        match opened {
+            Ok(records) => {
+                let record = &records[0];
+                if record.purpose() == PURPOSE
+                    && let Ok(decoded) = edit::PrincipalNameEdit::decode(record.canonical())
+                    && decoded.author() == record.author()
+                {
+                    match edit::accept(&mut state.connection, projection, record.canonical()) {
+                        Ok(_)
+                        | Err(edit::EditError::InvalidEdit | edit::EditError::Unauthorized) => {}
+                        Err(edit::EditError::Storage(error)) => {
+                            return Err(crate::SynchronizationError::Storage(error));
+                        }
+                    }
+                }
+            }
+            Err(
+                crate::SynchronizationError::CorruptRecord
+                | crate::SynchronizationError::WrongScope
+                | crate::SynchronizationError::InvalidInput,
+            ) => {}
+            Err(error) => return Err(error),
+        }
+        state.connection.execute("DELETE FROM deferred_principal_names WHERE workspace_id=?1 AND delivery_sequence=?2", rusqlite::params![workspace.as_bytes().as_slice(), sequence])
+            .map_err(|_| crate::SynchronizationError::Storage(StorageError::Database))?;
+    }
+    if limit > 0 && page.len() == limit {
+        state.sync_wake.notify_one();
+    }
     Ok(())
 }
 
@@ -171,7 +284,11 @@ pub(crate) fn continue_replay(state: &mut RuntimeState) {
             "SELECT EXISTS(SELECT 1 FROM record_delivery d WHERE d.scope_id=?1 AND d.delivery_sequence > COALESCE((SELECT delivery_sequence FROM principal_name_consumption WHERE workspace_id=?2), 0))",
             rusqlite::params![scope.as_slice(), workspace.as_bytes().as_slice()], |row| row.get(0),
         ).unwrap_or(false);
-        if outstanding {
+        let eligible = state.memberships.get(&workspace).is_some_and(|projection| {
+            eligible_page(&state.connection, workspace, projection, 1)
+                .is_ok_and(|page| !page.is_empty())
+        });
+        if outstanding || eligible {
             match reconcile(state, workspace) {
                 Ok(()) => state.sync_wake.notify_one(), // another Workspace may have a backlog
                 Err(error) => eprintln!("private name replay deferred after error: {error}"),
