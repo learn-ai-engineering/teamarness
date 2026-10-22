@@ -5,6 +5,11 @@ import test from 'node:test';
 const directory = new URL('.', import.meta.url);
 const schema = JSON.parse(await readFile(new URL('principals.schema.json', directory)));
 
+test('fingerprint documentation names the current signing key, not the Principal ID', async () => {
+  const readme = await readFile(new URL('README.md', directory), 'utf8');
+  assert.match(readme, /fingerprint \(the first 12 hex characters of its current signing key\)/);
+});
+
 const closed = (value, keys) => assert.deepEqual(Object.keys(value).sort(), [...keys].sort());
 
 test('principals capability schema is closed and presentation-only', () => {

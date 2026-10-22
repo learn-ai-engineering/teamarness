@@ -7,6 +7,18 @@
 
 use super::*;
 
+/// Test-only admission failure boundary; no production caller can select one.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAddFaultForTests {
+    BeforeName,
+    BeforeCommit,
+    AfterCommit,
+    BootstrapBound,
+    PostCommitInitialization,
+}
+
 /// What applying a canonical membership operation through a test hook did.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
@@ -346,6 +358,7 @@ impl RuntimeState {
             profile_generations: BTreeMap::new(),
             #[cfg(test)]
             person_name_open_error_once: false,
+            principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
         }

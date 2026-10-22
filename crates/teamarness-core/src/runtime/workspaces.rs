@@ -272,10 +272,32 @@ impl CoreRuntime {
 
 impl CoreRuntime {
     /// Adds a locally custodied Agent to the caller's admitted Person group.
+    /// An uncertain commit poisons this runtime. Reopen and inspect the roster
+    /// before choosing whether to issue a new add: names are non-unique, so a
+    /// new name-only call cannot identify the outcome of an earlier attempt.
     pub fn add_agent(
         &self,
         workspace: WorkspaceId,
         name: &str,
+    ) -> Result<crate::PrincipalId, crate::PersonNameError> {
+        self.add_agent_inner(
+            workspace,
+            name,
+            crate::membership::projection::BootstrapLimits::CURRENT,
+            |_| Ok(()),
+            false,
+        )
+    }
+
+    fn add_agent_inner(
+        &self,
+        workspace: WorkspaceId,
+        name: &str,
+        limits: crate::membership::projection::BootstrapLimits,
+        fault: impl FnMut(
+            crate::membership::projection::LocalAgentAddBoundary,
+        ) -> Result<(), StorageError>,
+        defer_initialization: bool,
     ) -> Result<crate::PrincipalId, crate::PersonNameError> {
         crate::principals::validate(name)?;
         let mut state = self
@@ -317,42 +339,49 @@ impl CoreRuntime {
         )
         .map_err(crate::PersonNameError::Membership)?;
         let id = crate::principals::derive_agent(workspace, envelope.id);
-        crate::principals::agent_keys::store(&state.connection, workspace, id, &secret)
-            .map_err(crate::PersonNameError::Storage)?;
         let applied = {
             let RuntimeState {
                 connection,
                 memberships,
                 ..
             } = &mut *state;
-            crate::membership::projection::apply_canonical(
+            crate::membership::projection::apply_local_agent_add(
                 connection,
                 memberships,
-                envelope.canonical_bytes(),
+                envelope,
                 self.clock.now_unix_ms(),
+                crate::membership::projection::LocalAgentAdd {
+                    id,
+                    author: self.public_identity,
+                    secret: &secret,
+                    name,
+                },
+                limits,
+                fault,
             )
         };
         match applied {
             Ok(applied) if applied.accepted => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if defer_initialization {
+                    state.principal_sync_init_faults = 2;
+                }
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                let _ = defer_initialization;
                 if let Some(transition) = Self::transition_from_applied(applied) {
                     replication::after_membership_accepted(&mut state, &transition);
                 }
-                let current = state
-                    .memberships
-                    .get(&workspace)
-                    .ok_or(crate::PersonNameError::WorkspaceNotFound)?
-                    .clone();
-                crate::principals::set_id(
-                    &mut state.connection,
-                    &current,
-                    self.public_identity,
-                    id,
-                    name,
-                )?;
                 principal_sync::publish_generation(&state, workspace);
-                principal_sync::initialize(&mut state, workspace).map_err(fault!(
-                    crate::PersonNameError::Storage(StorageError::Database)
-                ))?;
+                // A durable intent/wake recovers initialization independently of this add.
+                if let Err(error) = principal_sync::initialize(&mut state, workspace) {
+                    if matches!(
+                        error,
+                        crate::SynchronizationError::Storage(StorageError::UncertainOutcome)
+                    ) {
+                        state.poisoned = true;
+                    }
+                    state.sync_wake.notify_one();
+                }
                 self.sync_worker.wake();
                 Ok(id)
             }
@@ -369,6 +398,50 @@ impl CoreRuntime {
                 Err(crate::PersonNameError::Membership(error))
             }
         }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn add_agent_with_fault_for_tests(
+        &self,
+        workspace: WorkspaceId,
+        name: &str,
+        boundary: crate::runtime::AgentAddFaultForTests,
+    ) -> Result<crate::PrincipalId, crate::PersonNameError> {
+        use crate::membership::projection::{BootstrapLimits, LocalAgentAddBoundary};
+        let limits = if boundary == crate::runtime::AgentAddFaultForTests::BootstrapBound {
+            BootstrapLimits {
+                max_operations: 2,
+                ..BootstrapLimits::CURRENT
+            }
+        } else {
+            BootstrapLimits::CURRENT
+        };
+        self.add_agent_inner(
+            workspace,
+            name,
+            limits,
+            |current| {
+                let matched = matches!(
+                    (boundary, current),
+                    (
+                        crate::runtime::AgentAddFaultForTests::BeforeName,
+                        LocalAgentAddBoundary::BeforeName
+                    ) | (
+                        crate::runtime::AgentAddFaultForTests::BeforeCommit,
+                        LocalAgentAddBoundary::BeforeCommit
+                    ) | (
+                        crate::runtime::AgentAddFaultForTests::AfterCommit,
+                        LocalAgentAddBoundary::AfterCommit
+                    )
+                );
+                if matched {
+                    Err(StorageError::Database)
+                } else {
+                    Ok(())
+                }
+            },
+            boundary == crate::runtime::AgentAddFaultForTests::PostCommitInitialization,
+        )
     }
 
     /// Removes exactly one current Agent. A creator may remove a remote Agent
@@ -540,6 +613,40 @@ impl CoreRuntime {
             .get(&workspace)
             .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
         crate::principals::lookup_id(&state.connection, projection, id)
+    }
+
+    /// Membership and Principal presentation from one runtime state, after pending
+    /// membership transitions have been applied. A Shell roster must use this pair.
+    pub fn principal_roster(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<(crate::MembershipSnapshot, Vec<crate::WorkspacePrincipal>), crate::PersonNameError>
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        self.maintain_and_publish(&mut state, self.clock.now_unix_ms())
+            .map_err(crate::PersonNameError::Membership)?;
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        let rows = crate::principals::registry(projection)
+            .into_iter()
+            .map(|(id, _, _, _, _)| {
+                crate::principals::lookup_id(&state.connection, projection, id)
+                    .map(|row| row.expect("current Principal has an anchor"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((projection.snapshot(), rows))
     }
 
     pub fn principals_snapshot(

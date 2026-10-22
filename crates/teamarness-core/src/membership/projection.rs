@@ -372,6 +372,46 @@ pub(crate) fn maintain_quarantine(
     }
 }
 
+pub(crate) struct LocalAgentAdd<'a> {
+    pub(crate) id: crate::PrincipalId,
+    pub(crate) author: PublicIdentity,
+    pub(crate) secret: &'a SecretKey,
+    pub(crate) name: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalAgentAddBoundary {
+    BeforeName,
+    BeforeCommit,
+    AfterCommit,
+}
+
+pub(crate) fn apply_local_agent_add(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    envelope: MembershipEnvelope,
+    now_unix_ms: i64,
+    local: LocalAgentAdd<'_>,
+    limits: BootstrapLimits,
+    fault: impl FnMut(LocalAgentAddBoundary) -> Result<(), StorageError>,
+) -> Result<AppliedMembership, MembershipError> {
+    if !matches!(&envelope.action, MembershipAction::AddAgentKey { agent, .. } if agent.as_bytes() == local.secret.public().as_bytes())
+        || local.id != crate::principals::derive_agent(envelope.workspace_id, envelope.id)
+    {
+        return Err(MembershipError::AuthorizationRejected);
+    }
+    apply_authenticated_inner(
+        connection,
+        projections,
+        envelope,
+        now_unix_ms,
+        None,
+        limits,
+        Some(local),
+        fault,
+    )
+}
+
 pub(crate) fn apply_canonical(
     connection: &mut Connection,
     projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
@@ -1365,6 +1405,32 @@ fn apply_authenticated_with_limits(
     future_id: Option<MembershipOperationId>,
     limits: BootstrapLimits,
 ) -> Result<AppliedMembership, MembershipError> {
+    apply_authenticated_inner(
+        connection,
+        projections,
+        envelope,
+        now_unix_ms,
+        future_id,
+        limits,
+        None,
+        |_| Ok(()),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "local admission adds a typed persistence payload and fault boundary to authenticated acceptance"
+)]
+fn apply_authenticated_inner(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    envelope: MembershipEnvelope,
+    now_unix_ms: i64,
+    future_id: Option<MembershipOperationId>,
+    limits: BootstrapLimits,
+    local: Option<LocalAgentAdd<'_>>,
+    mut fault: impl FnMut(LocalAgentAddBoundary) -> Result<(), StorageError>,
+) -> Result<AppliedMembership, MembershipError> {
     let projection = projections
         .get(&envelope.workspace_id)
         .ok_or(MembershipError::WorkspaceNotFound)?;
@@ -1435,7 +1501,7 @@ fn apply_authenticated_with_limits(
     let mut released = parked.iter().map(|parked| parked.id).collect::<Vec<_>>();
     released.extend(future_id);
     persist_candidate(
-        connection, &stages, &envelope, &candidate, &released, limits,
+        connection, &stages, &envelope, &candidate, &released, limits, local, &mut fault,
     )?;
     let result = applied_result(&candidate, &envelope, true, false);
     projections.insert(envelope.workspace_id, candidate);
@@ -1877,6 +1943,10 @@ fn dependency_context(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "membership persistence also stages local custody and name in its one transaction"
+)]
 fn persist_candidate(
     connection: &mut Connection,
     stages: &[(MembershipEnvelope, WorkspaceProjection)],
@@ -1884,6 +1954,8 @@ fn persist_candidate(
     candidate: &WorkspaceProjection,
     released_future_ids: &[MembershipOperationId],
     limits: BootstrapLimits,
+    local: Option<LocalAgentAdd<'_>>,
+    fault: &mut impl FnMut(LocalAgentAddBoundary) -> Result<(), StorageError>,
 ) -> Result<(), MembershipError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1892,6 +1964,27 @@ fn persist_candidate(
         persist_candidate_rows(&transaction, staged_envelope, staged)?;
     }
     persist_candidate_rows(&transaction, envelope, candidate)?;
+    if let Some(local) = local {
+        crate::principals::agent_keys::store(
+            &transaction,
+            envelope.workspace_id,
+            local.id,
+            local.secret,
+        )
+        .map_err(MembershipError::Storage)?;
+        fault(LocalAgentAddBoundary::BeforeName).map_err(MembershipError::Storage)?;
+        crate::principals::set_id_in_transaction(
+            &transaction,
+            candidate,
+            local.author,
+            local.id,
+            local.name,
+        )
+        .map_err(|error| match error {
+            crate::PersonNameError::Storage(storage) => MembershipError::Storage(storage),
+            _ => MembershipError::AuthorizationRejected,
+        })?;
+    }
     // Every accepted mutation must leave a complete onboarding bootstrap encodable.
     encode_current_bootstrap_with_limits(&transaction, candidate, candidate.genesis_id, limits)?;
     for id in released_future_ids {
@@ -1908,8 +2001,11 @@ fn persist_candidate(
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
+    fault(LocalAgentAddBoundary::BeforeCommit).map_err(MembershipError::Storage)?;
     transaction
         .commit()
+        .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))?;
+    fault(LocalAgentAddBoundary::AfterCommit)
         .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))
 }
 

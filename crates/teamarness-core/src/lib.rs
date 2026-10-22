@@ -55,13 +55,13 @@ pub use principals::{
     PersonNameError, PrincipalId, PrincipalKind, WorkspacePerson, WorkspacePersonId,
     WorkspacePrincipal,
 };
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub use runtime::MembershipApplyOutcomeForTests;
 /// Test observation hooks. See the `test-hooks` feature.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use runtime::RuntimeStateHold;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use runtime::{AgentAddFaultForTests, MembershipApplyOutcomeForTests};
 pub use runtime::{
     CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipChange, MembershipEpoch,
     MembershipRole, MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription,

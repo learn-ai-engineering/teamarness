@@ -136,11 +136,8 @@ fn roster(
     runtime: &teamarness_core::CoreRuntime,
     workspace: WorkspaceId,
 ) -> Result<MembershipDto, BridgeError> {
-    let membership = runtime
-        .membership_snapshot(workspace)
-        .map_err(BridgeError::from)?;
-    let (_, principals) = runtime
-        .principals_snapshot(workspace)
+    let (membership, principals) = runtime
+        .principal_roster(workspace)
         .map_err(BridgeError::from)?;
     MembershipDto::from_core(membership, &principals)
 }
@@ -338,6 +335,42 @@ async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn roster_remains_consistent_when_an_agent_is_removed_between_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "shell-roster-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runtime = teamarness_core::CoreRuntime::open_loopback_for_tests(
+            teamarness_core::CoreRuntimeConfig::new(&path),
+        )
+        .await
+        .unwrap();
+        let workspace = runtime
+            .create_workspace_with_person_name("Team", "Owner")
+            .unwrap()
+            .id();
+        let agent = runtime.add_agent(workspace, "Agent").unwrap();
+        let old_membership = runtime.membership_snapshot(workspace).unwrap();
+        runtime.remove_agent(workspace, agent).unwrap();
+        let (_, new_principals) = runtime.principals_snapshot(workspace).unwrap();
+        assert!(MembershipDto::from_core(old_membership, &new_principals).is_err());
+        let current = roster(&runtime, workspace).unwrap();
+        assert_eq!(current.members.len(), 1);
+        assert_eq!(
+            current.epoch,
+            runtime
+                .membership_snapshot(workspace)
+                .unwrap()
+                .epoch()
+                .value()
+                .to_string()
+        );
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[tokio::test]
     async fn post_start_name_read_failure_signals_termination() {

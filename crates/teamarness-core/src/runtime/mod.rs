@@ -83,6 +83,8 @@ pub(crate) struct RuntimeState {
     profile_generations: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
     #[cfg(test)]
     person_name_open_error_once: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    principal_sync_init_faults: u8,
     next_subscriber_id: u64,
     pub(crate) poisoned: bool,
 }
@@ -188,6 +190,8 @@ impl CoreRuntime {
             profile_generations: BTreeMap::new(),
             #[cfg(test)]
             person_name_open_error_once: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
         }));
@@ -363,12 +367,12 @@ mod types;
 mod workspaces;
 
 pub use subscription::MembershipSubscription;
-#[cfg(feature = "test-hooks")]
-pub use test_hooks::MembershipApplyOutcomeForTests;
 #[cfg(test)]
 pub(crate) use test_hooks::ProbeOutcome;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_hooks::RuntimeStateHold;
+#[cfg(feature = "test-hooks")]
+pub use test_hooks::{AgentAddFaultForTests, MembershipApplyOutcomeForTests};
 pub use types::*;
 
 // `test_hooks` reaches this through `use super::*`; nothing else in `runtime` needs it.

@@ -656,6 +656,9 @@ fn load_due_jobs(
     forced: &BTreeSet<(WorkspaceId, PublicIdentity)>,
     selection: &mut SelectionCursor,
 ) -> Vec<DueJob> {
+    if kind == ReloadKind::RecordIdle {
+        crate::runtime::principal_sync::retry_pending_initialization(state);
+    }
     crate::runtime::principal_sync::continue_replay(state);
     let mut jobs = Vec::new();
     #[cfg(test)]

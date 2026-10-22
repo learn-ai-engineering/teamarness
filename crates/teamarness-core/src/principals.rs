@@ -307,6 +307,23 @@ pub(crate) fn set_id(
     name: &str,
 ) -> Result<(), PrincipalError> {
     validate(name)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| PrincipalError::Storage(StorageError::Database))?;
+    set_id_in_transaction(&transaction, projection, author, id, name)?;
+    transaction
+        .commit()
+        .map_err(|_| PrincipalError::Storage(StorageError::UncertainOutcome))
+}
+
+pub(crate) fn set_id_in_transaction(
+    transaction: &Connection,
+    projection: &WorkspaceProjection,
+    author: PublicIdentity,
+    id: PrincipalId,
+    name: &str,
+) -> Result<(), PrincipalError> {
+    validate(name)?;
     let (anchor, identity) = projection
         .principal_anchors()
         .into_iter()
@@ -323,9 +340,6 @@ pub(crate) fn set_id(
             .then_some((anchor, key))
         })
         .ok_or(PrincipalError::NotOwnPerson)?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| PrincipalError::Storage(StorageError::Database))?;
     let written = transaction.execute(
         "INSERT INTO principal_names (workspace_id, principal_id, anchor_operation_id, owner_public_identity, name)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -341,15 +355,13 @@ pub(crate) fn set_id(
          ON CONFLICT(workspace_id, principal_id) DO UPDATE SET name = excluded.name",
         params![projection.workspace_id().as_bytes().as_slice(), id.0.as_slice(), name],
     ).map_err(|_| PrincipalError::Storage(StorageError::Database))?;
-    edit::advance_generation(&transaction, projection.workspace_id()).map_err(
+    edit::advance_generation(transaction, projection.workspace_id()).map_err(
         |error| match error {
             edit::EditError::Storage(storage) => PrincipalError::Storage(storage),
             _ => PrincipalError::Storage(StorageError::CorruptWorkspace),
         },
     )?;
-    transaction
-        .commit()
-        .map_err(|_| PrincipalError::Storage(StorageError::UncertainOutcome))
+    Ok(())
 }
 
 pub(crate) fn stage_join(

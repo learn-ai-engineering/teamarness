@@ -10,6 +10,11 @@ pub(super) fn initialize(
     state: &mut RuntimeState,
     workspace: WorkspaceId,
 ) -> Result<(), crate::SynchronizationError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if state.principal_sync_init_faults > 0 {
+        state.principal_sync_init_faults -= 1;
+        return Err(crate::SynchronizationError::Storage(StorageError::Database));
+    }
     let Some(projection) = state.memberships.get(&workspace) else {
         return Ok(());
     };
@@ -135,6 +140,23 @@ fn reconcile_page(
 
 /// The LogSync worker calls this on its blocking reload thread, one Workspace
 /// and one page at a time. A full page schedules the next reload.
+pub(crate) fn retry_pending_initialization(state: &mut RuntimeState) {
+    let workspaces: Vec<_> = state.memberships.keys().copied().collect();
+    for workspace in workspaces {
+        let pending: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_principal_name_edits WHERE workspace_id=?1)",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if pending && let Err(error) = initialize(state, workspace) {
+            eprintln!("private name initialization deferred: {error}");
+        }
+    }
+}
+
 pub(crate) fn continue_replay(state: &mut RuntimeState) {
     let local = PublicIdentity(state.secret_key.public());
     let workspaces: Vec<_> = state

@@ -180,3 +180,151 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
     std::fs::remove_dir_all(manager_path).unwrap();
     std::fs::remove_dir_all(steward_path).unwrap();
 }
+
+fn admission_rows(path: &std::path::Path) -> (i64, i64, i64, i64) {
+    let db = rusqlite::Connection::open(path.join("core.sqlite3")).unwrap();
+    db.query_row(
+        "SELECT (SELECT COUNT(*) FROM membership_operations WHERE action=5),
+                (SELECT COUNT(*) FROM agent_keys),
+                (SELECT COUNT(*) FROM principal_names n JOIN workspace_principals p USING(workspace_id,principal_id) WHERE p.kind='agent'),
+                (SELECT COUNT(*) FROM pending_principal_name_edits e JOIN workspace_principals p USING(workspace_id,principal_id) WHERE p.kind='agent')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap()
+}
+
+#[tokio::test]
+async fn failed_named_agent_add_commits_neither_membership_nor_custody() {
+    use teamarness_core::AgentAddFaultForTests as Fault;
+    for boundary in [
+        Fault::BeforeName,
+        Fault::BeforeCommit,
+        Fault::BootstrapBound,
+    ] {
+        let path = directory();
+        let runtime = open(&path).await;
+        let workspace = runtime
+            .create_workspace_with_person_name("Team", "Owner")
+            .unwrap()
+            .id();
+        let before = runtime.membership_snapshot(workspace).unwrap();
+        assert!(
+            runtime
+                .add_agent_with_fault_for_tests(workspace, "Agent", boundary)
+                .is_err()
+        );
+        assert_eq!(runtime.membership_snapshot(workspace).unwrap(), before);
+        assert_eq!(admission_rows(&path), (0, 0, 0, 0));
+        let id = runtime.add_agent(workspace, "Agent").unwrap();
+        assert_eq!(
+            runtime.principal(workspace, id).unwrap().unwrap().name(),
+            Some("Agent")
+        );
+        assert_eq!(admission_rows(&path).0, 1);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        let reopened = open(&path).await;
+        assert_eq!(
+            reopened.principal(workspace, id).unwrap().unwrap().name(),
+            Some("Agent")
+        );
+        reopened.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn uncertain_named_agent_commit_poisoned_until_roster_reconciliation() {
+    use teamarness_core::{AgentAddFaultForTests as Fault, MembershipError, StorageError};
+    let path = directory();
+    let runtime = open(&path).await;
+    let workspace = runtime
+        .create_workspace_with_person_name("Team", "Owner")
+        .unwrap()
+        .id();
+    assert_eq!(
+        runtime.add_agent_with_fault_for_tests(workspace, "Agent", Fault::AfterCommit),
+        Err(PersonNameError::Membership(MembershipError::Storage(
+            StorageError::UncertainOutcome
+        )))
+    );
+    assert_eq!(
+        runtime.add_agent(workspace, "Agent"),
+        Err(PersonNameError::Storage(StorageError::RuntimePoisoned))
+    );
+    assert_eq!(admission_rows(&path), (1, 1, 1, 1));
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let reopened = open(&path).await;
+    let (membership, principals) = reopened.principal_roster(workspace).unwrap();
+    assert_eq!(membership.members().len(), 2);
+    assert_eq!(
+        principals
+            .iter()
+            .filter(|p| p.kind() == PrincipalKind::Agent && p.name() == Some("Agent"))
+            .count(),
+        1
+    );
+    assert_eq!(admission_rows(&path).0, 1);
+    reopened.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn committed_agent_name_survives_deferred_sync_initialization() {
+    let path = directory();
+    let runtime = open(&path).await;
+    let workspace = runtime
+        .create_workspace_with_person_name("Team", "Owner")
+        .unwrap()
+        .id();
+    let id = runtime
+        .add_agent_with_fault_for_tests(
+            workspace,
+            "Agent",
+            teamarness_core::AgentAddFaultForTests::PostCommitInitialization,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.principal(workspace, id).unwrap().unwrap().name(),
+        Some("Agent")
+    );
+    assert_eq!(admission_rows(&path).0, 1);
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let reopened = open(&path).await;
+    assert_eq!(
+        reopened.principal(workspace, id).unwrap().unwrap().name(),
+        Some("Agent")
+    );
+    reopened.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn principal_roster_reads_one_transition_not_two_separate_epochs() {
+    let path = directory();
+    let runtime = open(&path).await;
+    let workspace = runtime
+        .create_workspace_with_person_name("Team", "Owner")
+        .unwrap()
+        .id();
+    let old = runtime.membership_snapshot(workspace).unwrap();
+    let id = runtime.add_agent(workspace, "Agent").unwrap();
+    let (_, new_rows) = runtime.principals_snapshot(workspace).unwrap();
+    assert!(
+        old.members()
+            .iter()
+            .all(|m| new_rows.iter().any(|p| p.keys().contains(&m.identity())))
+    );
+    let (snapshot, rows) = runtime.principal_roster(workspace).unwrap();
+    assert_eq!(snapshot.members().len(), 2);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|p| p.id() == id));
+    runtime.remove_agent(workspace, id).unwrap();
+    let (snapshot, rows) = runtime.principal_roster(workspace).unwrap();
+    assert_eq!(snapshot.members().len(), 1);
+    assert_eq!(rows.len(), 1);
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
