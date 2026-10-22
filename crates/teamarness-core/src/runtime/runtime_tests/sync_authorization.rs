@@ -2249,5 +2249,75 @@ async fn protection_grants_and_sessions_address_installation_keys_only() {
             "{name}: the Agent key is never a peer"
         );
     }
+
+    // The creator's own Person group independently claims the same key. It
+    // depends only on its group attachment, not on the member's Agent add.
+    // The conflict must cancel any subscribed session for the effective key
+    // rather than promote it as a second admission.
+    let creator = cluster.node("creator");
+    let attachment = creator
+        .export_membership_operations_for_tests(workspace)
+        .iter()
+        .map(|bytes| crate::membership::authenticate(bytes).unwrap())
+        .find(|operation| matches!(operation.action, MembershipAction::AttachPerson { .. }))
+        .unwrap()
+        .id;
+    let session = creator.state.lock().unwrap().peer_sessions.subscribe(agent);
+    let competing = {
+        let state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let group = projection
+            .person_group(cluster.identity("creator"))
+            .unwrap();
+        MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            creator.clock.now_unix_ms(),
+            MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof: AgentKeyProof::sign(
+                    &agent_secret,
+                    workspace,
+                    group,
+                    cluster.identity("creator"),
+                )
+                .unwrap(),
+            },
+            vec![attachment],
+        )
+        .unwrap()
+    };
+    assert!(
+        creator
+            .apply_membership_envelope(competing.canonical_bytes())
+            .unwrap()
+            .accepted
+    );
+    assert!(
+        session.has_changed().unwrap(),
+        "conflict cancels the effective key's sessions"
+    );
+    cluster
+        .replicate_membership("creator", "member", workspace)
+        .await;
+    for name in ["creator", "member"] {
+        let node = cluster.node(name);
+        let state = node.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        assert!(!projection.contains_member(agent));
+        assert!(!projection.installation_members().contains(&agent));
+        let grants: i64 = state.connection.query_row(
+            "SELECT COUNT(*) FROM protection_control_operations WHERE operation_kind = 'grant' AND recipient_public_identity = ?1",
+            [agent.as_bytes().as_slice()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(grants, 0, "no grant to the conflicted key");
+        assert!(
+            !node
+                .scheduler_snapshot_for_test()
+                .iter()
+                .any(|peer| peer.peer == agent)
+        );
+    }
     cluster.finish().await;
 }

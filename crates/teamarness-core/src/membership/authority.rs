@@ -5,7 +5,7 @@
 //! Installations that hold the same operations reach the same verdicts in any
 //! application order (MEM-R07). The p2panda group CRDT then enforces group
 //! access itself; these rules add what Teamarness requires on top: invitation
-//! proofs, one group per key, no readmission, and Agent keys that never author.
+//! proofs, causal no-readmission, and Agent keys that never author.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,7 +25,10 @@ pub(crate) struct Ledger {
     /// Groups ever revoked from the Workspace.
     revoked: BTreeSet<MembershipOperationId>,
     /// Keys ever added, with the group each entered through.
-    added_keys: BTreeMap<PublicIdentity, MembershipOperationId>,
+    added_keys: BTreeMap<PublicIdentity, BTreeSet<MembershipOperationId>>,
+    /// Independently accepted admission anchors, including multiple adds to
+    /// the same group. Once a key has two, its causal descendants cannot use it.
+    admission_counts: BTreeMap<PublicIdentity, usize>,
     /// Agent keys ever removed from their group.
     removed_keys: BTreeSet<PublicIdentity>,
     /// Keys ever added as Agent keys; they may never author.
@@ -66,17 +69,23 @@ impl Ledger {
             MembershipAction::Admit { target, proof } => {
                 let group = proof.claim.create_person.id;
                 self.attached.insert(group);
-                self.added_keys.insert(*target, group);
+                self.added_keys.entry(*target).or_default().insert(group);
+                *self.admission_counts.entry(*target).or_default() += 1;
             }
             MembershipAction::AttachPerson { group } => {
                 self.attached.insert(*group);
-                self.added_keys.insert(operation.author, *group);
+                self.added_keys
+                    .entry(operation.author)
+                    .or_default()
+                    .insert(*group);
+                *self.admission_counts.entry(operation.author).or_default() += 1;
             }
             MembershipAction::Revoke { group, .. } => {
                 self.revoked.insert(*group);
             }
             MembershipAction::AddAgentKey { group, agent, .. } => {
-                self.added_keys.insert(*agent, *group);
+                self.added_keys.entry(*agent).or_default().insert(*group);
+                *self.admission_counts.entry(*agent).or_default() += 1;
                 self.agents.insert(*agent);
             }
             MembershipAction::RemoveAgentKey { agent, .. } => {
@@ -93,9 +102,10 @@ impl Ledger {
         if key == creator {
             return true;
         }
-        self.added_keys
-            .get(&key)
-            .is_some_and(|group| self.group_admitted(*group) && !self.removed_keys.contains(&key))
+        self.added_keys.get(&key).is_some_and(|groups| {
+            groups.iter().any(|group| self.group_admitted(*group))
+                && !self.removed_keys.contains(&key)
+        })
     }
 
     /// A key may enter a group only once, ever: a current member is a
@@ -139,7 +149,13 @@ pub(crate) fn authorize(
     creator: PublicIdentity,
     ancestry: &Ledger,
 ) -> Result<(), MembershipError> {
-    if ancestry.agents.contains(&operation.author) {
+    if ancestry.agents.contains(&operation.author)
+        || (operation.author != creator
+            && ancestry
+                .admission_counts
+                .get(&operation.author)
+                .is_some_and(|count| *count > 1))
+    {
         return Err(MembershipError::AgentKeyCannotAuthor);
     }
     match &operation.action {
@@ -229,7 +245,10 @@ pub(crate) fn authorize(
             if !ancestry.group_admitted(*group) {
                 return Err(MembershipError::PersonNotAdmitted);
             }
-            let in_this_group = ancestry.added_keys.get(agent) == Some(group)
+            let in_this_group = ancestry
+                .added_keys
+                .get(agent)
+                .is_some_and(|groups| groups.contains(group))
                 && ancestry.agents.contains(agent)
                 && !ancestry.removed_keys.contains(agent);
             if !in_this_group {

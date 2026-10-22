@@ -372,6 +372,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn p2panda_probe_concurrent_signed_cross_group_agent_claims() {
+        let workspace = WorkspaceId::from_bytes([5; 16]);
+        let genesis =
+            MembershipEnvelope::sign(&secret(1), workspace, 10, MembershipAction::Create, vec![])
+                .unwrap();
+        let mut prefix = vec![genesis.clone()];
+        let mut attachments = Vec::new();
+        for steward in [2, 3] {
+            let create = MembershipEnvelope::sign(
+                &secret(steward),
+                workspace,
+                20,
+                MembershipAction::CreatePerson {
+                    creator: identity(1),
+                },
+                vec![genesis.id],
+            )
+            .unwrap();
+            let attach = MembershipEnvelope::sign(
+                &secret(1),
+                workspace,
+                30,
+                MembershipAction::AttachPerson { group: create.id },
+                vec![create.id],
+            )
+            .unwrap();
+            prefix.push(create);
+            prefix.push(attach.clone());
+            attachments.push(attach);
+        }
+        let claims = [2, 3].map(|steward| {
+            let group = match attachments[usize::from(steward - 2)].action {
+                MembershipAction::AttachPerson { group } => group,
+                _ => unreachable!(),
+            };
+            MembershipEnvelope::sign(
+                &secret(steward),
+                workspace,
+                40,
+                MembershipAction::AddAgentKey {
+                    group,
+                    agent: identity(4),
+                    proof: AgentKeyProof::sign(&secret(4), workspace, group, identity(steward))
+                        .unwrap(),
+                },
+                vec![attachments[usize::from(steward - 2)].id],
+            )
+            .unwrap()
+        });
+        for order in [[0, 1], [1, 0]] {
+            let mut state = build(&prefix.iter().collect::<Vec<_>>());
+            for index in order {
+                state = ProbeCrdt::process(
+                    state,
+                    &Probe::Real(OperationAdapter(claims[index].clone())),
+                )
+                .unwrap_or_else(|_| {
+                    panic!("both independently valid signed claims must remain processable")
+                });
+            }
+            assert!(
+                members_of(&state, workspace).contains(&(AuthId::installation(identity(4)), false))
+            );
+        }
+        let group = match attachments[0].action {
+            MembershipAction::AttachPerson { group } => group,
+            _ => unreachable!(),
+        };
+        let independent = MembershipEnvelope::sign(
+            &secret(2),
+            workspace,
+            41,
+            MembershipAction::AddAgentKey {
+                group,
+                agent: identity(4),
+                proof: AgentKeyProof::sign(&secret(4), workspace, group, identity(2)).unwrap(),
+            },
+            vec![attachments[0].id],
+        )
+        .unwrap();
+        let state = ProbeCrdt::process(
+            build(&prefix.iter().collect::<Vec<_>>()),
+            &Probe::Real(OperationAdapter(claims[0].clone())),
+        )
+        .unwrap_or_else(|_| panic!("first same-group claim is valid"));
+        ProbeCrdt::process(state, &Probe::Real(OperationAdapter(independent)))
+            .unwrap_or_else(|_| panic!("independent same-group add is processable"));
+    }
+
     /// Drives `GroupCrdt` directly with the adapter's output, so the nested
     /// group semantics the design relies on are confirmed against the library
     /// rather than inferred from Teamarness replay.

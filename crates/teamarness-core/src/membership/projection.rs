@@ -52,6 +52,9 @@ pub(crate) struct WorkspaceProjection {
     /// Every key ever added as an Agent key. Agent keys are Members but never
     /// peers: grants, key demands and sessions address Installation keys only.
     agent_keys: BTreeSet<PublicIdentity>,
+    /// Keys with multiple independently accepted admission anchors. This is
+    /// derived from signed facts, not the order in which peers saw them.
+    conflicted_keys: BTreeSet<PublicIdentity>,
 }
 
 impl WorkspaceProjection {
@@ -101,6 +104,7 @@ impl WorkspaceProjection {
             if matches!(operation.action, MembershipAction::CreatePerson { .. })
                 && self.person_group(operation.author) == Some(operation.id)
                 && self.contains_member(operation.author)
+                && !self.conflicted_keys.contains(&operation.author)
             {
                 result.push((operation.id, operation.author, None));
             }
@@ -108,6 +112,7 @@ impl WorkspaceProjection {
         for operation in self.operations.values() {
             if let MembershipAction::AddAgentKey { group, agent, .. } = operation.action
                 && self.contains_member(agent)
+                && !self.conflicted_keys.contains(&agent)
                 && let Some((_, steward, _)) = result.iter().find(|(id, _, _)| *id == group)
             {
                 result.push((operation.id, agent, Some((group, *steward))));
@@ -180,6 +185,7 @@ impl WorkspaceProjection {
                     .collect(),
             ),
             agent_keys: BTreeSet::new(),
+            conflicted_keys: BTreeSet::new(),
         }
     }
 
@@ -212,6 +218,24 @@ pub(crate) struct AppliedMembership {
 
 /// Derives the reported change from a membership action. A `create` action
 /// starts a workspace and reports no change.
+pub(crate) fn effective_change_from_action(
+    action: &MembershipAction,
+    snapshot: &MembershipSnapshot,
+) -> Option<MembershipChange> {
+    if matches!(
+        action,
+        MembershipAction::Admit { .. } | MembershipAction::AddAgentKey { .. }
+    ) && let Some(subject) = action.subject()
+        && !snapshot
+            .members()
+            .iter()
+            .any(|member| member.identity() == subject)
+    {
+        return Some(MembershipChange::Revoked { member: subject });
+    }
+    change_from_action(action)
+}
+
 pub(crate) fn change_from_action(action: &MembershipAction) -> Option<MembershipChange> {
     match action {
         MembershipAction::Create
@@ -1465,7 +1489,7 @@ fn applied_result(
         snapshot_digest: snapshot_digest(&projection.snapshot),
         accepted,
         quarantined,
-        change: change_from_action(&envelope.action),
+        change: effective_change_from_action(&envelope.action, &projection.snapshot),
         author: envelope.author,
     }
 }
@@ -1724,7 +1748,45 @@ fn replay_until(
     }
 
     ensure_membership_deadline(deadline)?;
-    // The snapshot flattens every nested Person group: each transitive key is
+    // Count independently accepted admission anchors, even when one branch
+    // has since been removed. A revocation cannot resurrect the other claim.
+    let mut admitted = BTreeSet::new();
+    let mut conflicted_keys = BTreeSet::new();
+    for operation in operations.values() {
+        let key = match &operation.action {
+            MembershipAction::Admit { target, .. } => Some(*target),
+            MembershipAction::AttachPerson { .. } => Some(operation.author),
+            MembershipAction::AddAgentKey { agent, .. } => Some(*agent),
+            _ => None,
+        };
+        if let Some(key) = key
+            && key != creator
+            && !admitted.insert(key)
+        {
+            conflicted_keys.insert(key);
+        }
+    }
+    let conflicted_stewards = operations
+        .values()
+        .filter_map(|operation| match &operation.action {
+            MembershipAction::Admit { target, proof } if conflicted_keys.contains(target) => {
+                Some(proof.claim.create_person.id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let ineffective_agents = operations
+        .values()
+        .filter_map(|operation| match &operation.action {
+            MembershipAction::AddAgentKey { group, agent, .. }
+                if conflicted_stewards.contains(group) =>
+            {
+                Some(*agent)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    // The snapshot flattens every nested Person group: each effective key is
     // a Member, and only the creator holds manage access.
     let mut members = Vec::new();
     for (id, access) in state.members(AuthId::workspace(workspace_id)) {
@@ -1734,6 +1796,9 @@ fn replay_until(
         };
         let identity =
             PublicIdentity::from_bytes(bytes).map_err(|_| MembershipError::InvalidRole)?;
+        if conflicted_keys.contains(&identity) || ineffective_agents.contains(&identity) {
+            continue;
+        }
         let role = if access.is_manage() {
             MembershipRole::Manager
         } else if access.is_write() {
@@ -1767,6 +1832,7 @@ fn replay_until(
         operations,
         snapshot,
         agent_keys,
+        conflicted_keys,
     })
 }
 

@@ -113,6 +113,7 @@ fn load_after_with_limit(
     }
 
     let after = i64::try_from(after_epoch.value()).map_err(|_| SubscriptionError::CursorAhead)?;
+    let has_conflicting_claims = has_conflicting_claims(connection, workspace_id)?;
     let mut statement = connection
         .prepare(
             "SELECT t.epoch, t.membership_version, t.cause_operation_id, t.snapshot_digest,
@@ -153,7 +154,15 @@ fn load_after_with_limit(
         if envelope.id != cause || envelope.workspace_id != workspace_id {
             return Err(SubscriptionError::Storage(StorageError::CorruptWorkspace));
         }
-        let (change, author) = change_from_envelope(&envelope)?;
+        let (mut change, author) = change_from_envelope(&envelope)?;
+        if has_conflicting_claims && matches!(change, MembershipChange::Admitted { .. }) {
+            let snapshot = snapshot_at_epoch(connection, workspace_id, epoch)?;
+            change = crate::membership::projection::effective_change_from_action(
+                &envelope.action,
+                &snapshot,
+            )
+            .ok_or(SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+        }
         transitions.push(MembershipTransition::new(
             workspace_id,
             MembershipEpoch::new(
@@ -168,6 +177,92 @@ fn load_after_with_limit(
         ));
     }
     Ok(transitions)
+}
+
+fn has_conflicting_claims(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+) -> Result<bool, SubscriptionError> {
+    use std::collections::BTreeSet;
+    let mut statement = connection
+        .prepare(
+            "SELECT canonical_envelope FROM membership_operations
+         WHERE workspace_id = ?1 AND action IN (1, 4, 5)",
+        )
+        .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+    let rows = statement
+        .query_map([workspace_id.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+    let mut claimed = BTreeSet::new();
+    for row in rows {
+        let bytes = row.map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+        let operation = crate::membership::authenticate(&bytes)
+            .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+        if let Some(key) = match operation.action {
+            crate::membership::MembershipAction::Admit { target, .. } => Some(target),
+            crate::membership::MembershipAction::AttachPerson { .. } => Some(operation.author),
+            crate::membership::MembershipAction::AddAgentKey { agent, .. } => Some(agent),
+            _ => None,
+        } && !claimed.insert(key)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Reconstructs only the requested transition's accepted prefix. The durable
+/// cause/epoch order is already verified on open; no arrival-order winner or
+/// new persisted change field is needed for a conflict's effective event.
+fn snapshot_at_epoch(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    epoch: i64,
+) -> Result<crate::MembershipSnapshot, SubscriptionError> {
+    use std::collections::BTreeMap;
+    let (creator, genesis): (Vec<u8>, Vec<u8>) = connection.query_row(
+        "SELECT creator_public_identity, genesis_operation_id FROM workspaces WHERE workspace_id = ?1",
+        [workspace_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+    let creator = PublicIdentity::from_bytes(fixed(&creator)?)
+        .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+    let genesis = MembershipOperationId::from_hash(Hash::from_bytes(fixed(&genesis)?));
+    let mut statement = connection
+        .prepare(
+            "SELECT o.canonical_envelope FROM membership_transitions t
+         JOIN membership_operations o ON o.operation_id = t.cause_operation_id
+         WHERE t.workspace_id = ?1 AND t.epoch <= ?2 ORDER BY t.epoch",
+        )
+        .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![workspace_id.as_bytes().as_slice(), epoch],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+    let mut operations = BTreeMap::new();
+    let genesis_bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT genesis_envelope FROM workspaces WHERE workspace_id = ?1",
+            [workspace_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+    let genesis_envelope = crate::membership::authenticate(&genesis_bytes)
+        .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+    operations.insert(genesis, genesis_envelope);
+    for row in rows {
+        let bytes = row.map_err(|_| SubscriptionError::Storage(StorageError::Database))?;
+        let envelope = crate::membership::authenticate(&bytes)
+            .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))?;
+        operations.insert(envelope.id, envelope);
+    }
+    crate::membership::projection::replay(workspace_id, creator, genesis, operations)
+        .map(|projection| projection.snapshot())
+        .map_err(|_| SubscriptionError::Storage(StorageError::CorruptWorkspace))
 }
 
 /// Derives a durable transition's change and author from the canonical bytes of
