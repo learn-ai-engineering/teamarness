@@ -1,5 +1,93 @@
 use super::*;
 
+/// Rolls back on the command's first clock read, not during runtime startup
+/// or on a background worker's thread.
+struct AddAgentRollbackClock {
+    now: Arc<AtomicI64>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    command_thread: std::thread::ThreadId,
+}
+
+impl Clock for AddAgentRollbackClock {
+    fn now_unix_ms(&self) -> i64 {
+        if std::thread::current().id() == self.command_thread
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.now.store(399_999, Ordering::SeqCst);
+            return 1_000_000;
+        }
+        self.now.load(Ordering::SeqCst)
+    }
+}
+
+/// Verifies: TEAM.SYS.ID-R10, TEAM.SYS.MEM-R09
+#[tokio::test]
+async fn local_named_agent_add_survives_clock_rollback_without_parking_or_losing_custody() {
+    let directory = std::env::temp_dir().join(format!(
+        "teamarness-runtime-agent-clock-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    let config = CoreRuntimeConfig::new(&directory);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let now = Arc::new(AtomicI64::new(1_000_000));
+    let runtime = CoreRuntime::open_with_clock(
+        config.clone(),
+        Box::new(AddAgentRollbackClock {
+            now: Arc::clone(&now),
+            armed: Arc::clone(&armed),
+            command_thread: std::thread::current().id(),
+        }),
+    )
+    .await
+    .unwrap();
+    let workspace = runtime
+        .create_workspace_with_person_name("Team", "Steward")
+        .unwrap()
+        .id();
+    let before = runtime.membership_snapshot(workspace).unwrap();
+    armed.store(true, Ordering::SeqCst);
+    let id = runtime.add_agent(workspace, "Named Agent").unwrap();
+    assert!(!armed.load(Ordering::SeqCst));
+    assert_eq!(now.load(Ordering::SeqCst), 399_999);
+    assert_eq!(
+        runtime
+            .membership_snapshot(workspace)
+            .unwrap()
+            .members()
+            .len(),
+        before.members().len() + 1
+    );
+    assert_eq!(
+        runtime.principal(workspace, id).unwrap().unwrap().name(),
+        Some("Named Agent")
+    );
+    let counts: (i64, i64, i64, i64) = runtime.state.lock().unwrap().connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM future_membership_operations WHERE workspace_id = ?1),
+                (SELECT COUNT(*) FROM membership_operations WHERE workspace_id = ?1 AND action = 5),
+                (SELECT COUNT(*) FROM agent_keys WHERE workspace_id = ?1),
+                (SELECT COUNT(*) FROM principal_names WHERE workspace_id = ?1 AND principal_id = ?2)",
+        rusqlite::params![workspace.as_bytes().as_slice(), id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(counts, (0, 1, 1, 1));
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let reopened = CoreRuntime::open_with_clock(
+        config,
+        Box::new(AdjustableClock(Arc::new(AtomicI64::new(1_000_000)))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.principal(workspace, id).unwrap().unwrap().name(),
+        Some("Named Agent")
+    );
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen() {
     let issuer_directory = std::env::temp_dir().join(format!(

@@ -326,10 +326,11 @@ impl CoreRuntime {
         let proof =
             crate::membership::AgentKeyProof::sign(&secret, workspace, group, self.public_identity)
                 .map_err(crate::PersonNameError::Membership)?;
+        let now_unix_ms = self.clock.now_unix_ms();
         let envelope = crate::membership::MembershipEnvelope::sign(
             &state.secret_key,
             workspace,
-            self.clock.now_unix_ms(),
+            now_unix_ms,
             crate::membership::MembershipAction::AddAgentKey {
                 group,
                 agent,
@@ -349,7 +350,7 @@ impl CoreRuntime {
                 connection,
                 memberships,
                 envelope,
-                self.clock.now_unix_ms(),
+                now_unix_ms,
                 crate::membership::projection::LocalAgentAdd {
                     id,
                     author: self.public_identity,
