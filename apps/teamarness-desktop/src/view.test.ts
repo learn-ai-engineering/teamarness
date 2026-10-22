@@ -21,8 +21,8 @@ function fakeBridge(overrides: Partial<TeamarnessBridge> = {}): TeamarnessBridge
     joinWorkspace: async () => state,
     currentMembership: async () => membership,
     renameWorkspacePrincipal: async () => undefined,
-    addWorkspaceAgent: async () => membership,
-    removeWorkspaceAgent: async () => membership,
+    addWorkspaceAgent: async () => undefined,
+    removeWorkspaceAgent: async () => undefined,
     principalsSnapshot: async (workspaceId): Promise<PrincipalsSnapshot> => ({ ...fixture.principals, workspaceId, cursor: "0" } as PrincipalsSnapshot),
     subscribePrincipals: async () => undefined,
     ...overrides,
@@ -39,6 +39,7 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     loading: false,
     error: null,
     notice: null,
+    membershipRefreshUnavailable: null,
     ...change,
   };
 }
@@ -113,6 +114,42 @@ describe("Shell Workspace screens", () => {
     expect(controller.snapshot().principals[workspace.id]?.cursor).toBe("2");
     listener?.({ workspaceId: workspace.id, cursor: "0", principals: [] });
     expect(controller.snapshot().principals[workspace.id]?.cursor).toBe("2");
+  });
+
+  it.each(["load", "refresh", "post-add"] as const)("keeps a newer Principal wake roster over a delayed %s result, then accepts a newer read", async (action) => {
+    let listener: ((snapshot: PrincipalsSnapshot) => void) | undefined;
+    let release: ((value: Membership) => void) | undefined;
+    let pending: Promise<Membership> | undefined;
+    let reads = 0;
+    let current: Membership;
+    const epoch2 = { ...membership, epoch: "2" };
+    const epoch3 = { ...membership, epoch: "3" };
+    const epoch4 = { ...membership, epoch: "4" };
+    current = epoch2;
+    const controller = new ShellController(fakeBridge({
+      currentMembership: async () => {
+        reads++;
+        return pending ?? current;
+      },
+      subscribePrincipals: async (_id, _cursor, next) => { listener = next; },
+    }), () => undefined);
+    await controller.load();
+    pending = new Promise<Membership>((resolve) => { release = resolve; });
+    const inFlight = action === "load" ? controller.load() : action === "refresh"
+      ? controller.refreshMembership(workspace.id) : controller.addAgent(workspace.id, "Helper");
+    // Allow the delayed read to start before the wake triggers its own read.
+    await vi.waitFor(() => expect(reads).toBe(2));
+    pending = undefined;
+    current = epoch3;
+    listener?.({ workspaceId: workspace.id, cursor: "1", principals: [] });
+    await vi.waitFor(() => expect(reads).toBe(3));
+    expect(controller.snapshot().memberships[workspace.id]?.epoch).toBe("3");
+    release?.(epoch2);
+    await inFlight;
+    expect(controller.snapshot().memberships[workspace.id]?.epoch).toBe("3");
+    current = epoch4;
+    await controller.refreshMembership(workspace.id);
+    expect(controller.snapshot().memberships[workspace.id]?.epoch).toBe("4");
   });
 
   it("keeps a live rename when a delayed refresh or load returns an older snapshot", async () => {
@@ -392,6 +429,7 @@ describe("shared bridge fixture", () => {
     ]);
     expect(fixture.workspace.id).toMatch(/^[0-9a-f]{32}$/);
     expect(fixture.membership.version).toMatch(/^[0-9a-f]{64}$/);
+    expect(fixture.agentMutationResponses).toEqual({ addWorkspaceAgent: null, removeWorkspaceAgent: null });
   });
 });
 
@@ -401,11 +439,33 @@ describe("Workspace Agent settings", () => {
   const agentMember = { identity: agentKey, role: "member" as const, principalId: agentId, kind: "agent" as const, stewardPrincipalId: "c".repeat(64) };
   const agentProfile = { principalId: agentId, kind: "agent" as const, stewardPrincipalId: "c".repeat(64), keys: [agentKey], name: "Helper <script>", fingerprint: agentKey.slice(0, 12) };
 
+  it.each(["add", "remove"] as const)("reports committed %s success and a distinct refresh action when roster read fails", async (action) => {
+    const calls: string[] = [];
+    let fail = false;
+    const controller = new ShellController(fakeBridge({
+      addWorkspaceAgent: async () => { calls.push("add"); },
+      removeWorkspaceAgent: async () => { calls.push("remove"); },
+      currentMembership: async () => { calls.push("roster"); if (fail) throw { code: "timeout", retryable: true }; return membership; },
+    }), () => undefined);
+    await controller.load();
+    fail = true;
+    if (action === "add") await controller.addAgent(workspace.id, "Helper");
+    else await controller.removeAgent(workspace.id, agentId);
+    expect(controller.snapshot()).toMatchObject({ error: null, notice: action === "add" ? "Agent added" : "Agent removed", membershipRefreshUnavailable: workspace.id });
+    expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id })).toContain('id="retry-membership-refresh"');
+    fail = false;
+    await controller.refreshMembership(workspace.id);
+    expect(controller.snapshot().membershipRefreshUnavailable).toBeNull();
+    expect(calls.filter((call) => call === action)).toHaveLength(1);
+  });
+
   it("adds by name and removes by opaque Agent ID, updating the roster even without optional profile reads", async () => {
     const calls: string[] = [];
+    let roster: Membership = membership;
     const controller = new ShellController(fakeBridge({
-      addWorkspaceAgent: async (id, name) => { calls.push(`add:${id}:${name}`); return { ...membership, members: [...membership.members, agentMember] }; },
-      removeWorkspaceAgent: async (id, agent) => { calls.push(`remove:${id}:${agent}`); return membership; },
+      addWorkspaceAgent: async (id, name) => { calls.push(`add:${id}:${name}`); roster = { ...membership, members: [...membership.members, agentMember] }; },
+      removeWorkspaceAgent: async (id, agent) => { calls.push(`remove:${id}:${agent}`); roster = membership; },
+      currentMembership: async () => roster,
       principalsSnapshot: async () => { throw { code: "timeout", retryable: true }; },
     }), () => undefined);
     await controller.load();

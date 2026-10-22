@@ -15,6 +15,7 @@ export type ShellPresentation = Readonly<{
   }> | null;
   loading: boolean;
   notice: string | null;
+  membershipRefreshUnavailable: string | null;
   error: Readonly<{ message: string; canRetry: boolean }> | null;
 }>;
 
@@ -58,6 +59,7 @@ export async function buildShellPresentation(
     } : null,
     loading: model.loading,
     notice: model.notice,
+    membershipRefreshUnavailable: model.membershipRefreshUnavailable,
     error: model.error ? { message: errorMessage(model.error), canRetry: true } : null,
   };
 }

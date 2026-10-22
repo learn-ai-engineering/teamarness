@@ -30,6 +30,10 @@
       }
     ]
   },
+  "agentMutationResponses": {
+    "addWorkspaceAgent": null,
+    "removeWorkspaceAgent": null
+  },
   "invitation": {
     "value": "teamarness-workspace-v1.00",
     "sensitivity": "bearer_admission"

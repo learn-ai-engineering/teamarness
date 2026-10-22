@@ -197,16 +197,24 @@ pub async fn add_workspace_agent(
     workspace_id: String,
     name: String,
     state: State<'_, DesktopState>,
-) -> Result<MembershipDto, BridgeError> {
+) -> Result<(), BridgeError> {
     let workspace =
         WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
     blocking(&state, move |runtime| {
-        runtime
-            .add_agent(workspace, &name)
-            .map_err(BridgeError::from)?;
-        roster(&runtime, workspace)
+        add_agent_mutation(&runtime, workspace, &name)
     })
     .await
+}
+
+fn add_agent_mutation(
+    runtime: &teamarness_core::CoreRuntime,
+    workspace: WorkspaceId,
+    name: &str,
+) -> Result<(), BridgeError> {
+    runtime
+        .add_agent(workspace, name)
+        .map(|_| ())
+        .map_err(BridgeError::from)
 }
 
 #[tauri::command]
@@ -214,17 +222,24 @@ pub async fn remove_workspace_agent(
     workspace_id: String,
     agent_id: String,
     state: State<'_, DesktopState>,
-) -> Result<MembershipDto, BridgeError> {
+) -> Result<(), BridgeError> {
     let workspace =
         WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
     let agent = PrincipalId::from_str(&agent_id).map_err(|_| BridgeError::invalid_input())?;
     blocking(&state, move |runtime| {
-        runtime
-            .remove_agent(workspace, agent)
-            .map_err(BridgeError::from)?;
-        roster(&runtime, workspace)
+        remove_agent_mutation(&runtime, workspace, agent)
     })
     .await
+}
+
+fn remove_agent_mutation(
+    runtime: &teamarness_core::CoreRuntime,
+    workspace: WorkspaceId,
+    agent: PrincipalId,
+) -> Result<(), BridgeError> {
+    runtime
+        .remove_agent(workspace, agent)
+        .map_err(BridgeError::from)
 }
 
 #[tauri::command]
@@ -368,6 +383,49 @@ mod tests {
                 .value()
                 .to_string()
         );
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_mutation_acknowledges_core_commit_without_a_roster_read() {
+        let path = std::env::temp_dir().join(format!(
+            "shell-agent-ack-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runtime = teamarness_core::CoreRuntime::open_loopback_for_tests(
+            teamarness_core::CoreRuntimeConfig::new(&path),
+        )
+        .await
+        .unwrap();
+        let workspace = runtime
+            .create_workspace_with_person_name("Team", "Owner")
+            .unwrap()
+            .id();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../contracts/fixtures/bridge-contract.json"
+        ))
+        .unwrap();
+        add_agent_mutation(&runtime, workspace, "Agent").unwrap();
+        assert_eq!(
+            serde_json::to_value(()).unwrap(),
+            fixture["agentMutationResponses"]["addWorkspaceAgent"]
+        );
+        let agent = runtime
+            .principal_roster(workspace)
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|principal| principal.kind() == teamarness_core::PrincipalKind::Agent)
+            .unwrap()
+            .id();
+        remove_agent_mutation(&runtime, workspace, agent).unwrap();
+        assert_eq!(
+            serde_json::to_value(()).unwrap(),
+            fixture["agentMutationResponses"]["removeWorkspaceAgent"]
+        );
+        assert!(roster(&runtime, WorkspaceId::from_str(&"0".repeat(32)).unwrap()).is_err());
         runtime.shutdown().await.unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }

@@ -155,8 +155,10 @@ class ThemeRailRegion extends Region {
 
 class RetryRegion extends Region {
   public readonly retry = new TestControl();
+  public readonly refresh = new TestControl();
 
   public querySelector(selector: string): TestControl | null {
+    if (selector === "#retry-membership-refresh" && this.innerHTML.includes('id="retry-membership-refresh"')) return this.refresh;
     return selector === "#retry" && this.innerHTML.includes('id="retry"') ? this.retry : null;
   }
 
@@ -175,6 +177,7 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
     loading: false,
     error: null,
     notice: null,
+    membershipRefreshUnavailable: null,
   };
 }
 
@@ -229,7 +232,7 @@ function harness(
       removeAgent: agentActions.removeAgent ?? (async () => undefined),
       renameAgent: agentActions.renameAgent ?? (async () => undefined),
       copyInvitation: async () => undefined,
-      refreshMembership: async () => undefined,
+      refreshMembership: async (id) => { calls.push(`refresh:${id}`); },
       retry: async () => { calls.push("retry"); },
     },
     onRouteChange: (route) => { routes.push(route); },
@@ -487,6 +490,20 @@ describe("persistent Shell frame", () => {
     await test.shell.navigate({ kind: "package-instance", instance: key });
     expect(test.frame.contextualNavigation.innerHTML).toContain(name);
     expect(test.calls).toEqual([`mount:${key.packageIdentity}`]);
+  });
+
+  it("binds the post-mutation warning to membership refresh, not the add action", async () => {
+    const screen = new RetryRegion();
+    const test = harness(screen as unknown as HTMLElement, {}, undefined, undefined, {
+      addAgent: async () => { test.calls.push("add"); },
+    });
+    await test.shell.updateWorkspace({ ...model(), membershipRefreshUnavailable: workspace.id, notice: "Agent added" });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(screen.innerHTML).toContain('id="retry-membership-refresh"');
+    screen.refresh.click();
+    await Promise.resolve();
+    expect(test.calls).toContain(`refresh:${workspace.id}`);
+    expect(test.calls).not.toContain("add");
   });
 
   it("binds bridge-error retry feedback to the supported reload action", async () => {

@@ -309,9 +309,11 @@ export class Shell {
       this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#copy-invitation")?.addEventListener("click", () => {
         void this.options.workspaceActions.copyInvitation(workspaceId);
       });
-      this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#refresh-membership")?.addEventListener("click", () => {
-        void this.options.workspaceActions.refreshMembership(workspaceId);
-      });
+      for (const selector of ["#refresh-membership", "#retry-membership-refresh"]) {
+        this.shellFrame.shellScreen.querySelector<HTMLButtonElement>(selector)?.addEventListener("click", () => {
+          void this.options.workspaceActions.refreshMembership(workspaceId);
+        });
+      }
     }
     this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => {
       void this.options.workspaceActions.retry();

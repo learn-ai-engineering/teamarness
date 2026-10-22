@@ -15,8 +15,8 @@ export interface TeamarnessBridge {
   createWorkspaceInvitation(workspaceId: string): Promise<Invitation>;
   joinWorkspace(invitation: string, personName: string): Promise<WorkspaceState>;
   renameWorkspacePrincipal(workspaceId: string, principalId: string, name: string): Promise<void>;
-  addWorkspaceAgent(workspaceId: string, name: string): Promise<Membership>;
-  removeWorkspaceAgent(workspaceId: string, agentId: string): Promise<Membership>;
+  addWorkspaceAgent(workspaceId: string, name: string): Promise<void>;
+  removeWorkspaceAgent(workspaceId: string, agentId: string): Promise<void>;
   principalsSnapshot(workspaceId: string): Promise<PrincipalsSnapshot>;
   subscribePrincipals(workspaceId: string, afterCursor: string, listener: (snapshot: PrincipalsSnapshot) => void, terminated: () => void): Promise<void>;
   currentMembership(workspaceId: string): Promise<Membership>;
@@ -30,8 +30,8 @@ export const bridge: TeamarnessBridge = Object.freeze({
     invoke<Invitation>("create_workspace_invitation", { workspaceId }),
   joinWorkspace: (invitation: string, personName: string) => invoke<WorkspaceState>("join_workspace", { invitation, personName }),
   renameWorkspacePrincipal: (workspaceId: string, principalId: string, name: string) => invoke<void>("rename_workspace_principal", { workspaceId, principalId, name }),
-  addWorkspaceAgent: (workspaceId: string, name: string) => invoke<Membership>("add_workspace_agent", { workspaceId, name }),
-  removeWorkspaceAgent: (workspaceId: string, agentId: string) => invoke<Membership>("remove_workspace_agent", { workspaceId, agentId }),
+  addWorkspaceAgent: (workspaceId: string, name: string) => invoke<void>("add_workspace_agent", { workspaceId, name }),
+  removeWorkspaceAgent: (workspaceId: string, agentId: string) => invoke<void>("remove_workspace_agent", { workspaceId, agentId }),
   principalsSnapshot: (workspaceId: string) => invoke<PrincipalsSnapshot>("principals_snapshot", { workspaceId }),
   subscribePrincipals: async (workspaceId: string, afterCursor: string, listener: (snapshot: PrincipalsSnapshot) => void, terminated: () => void) => {
     const onEvent = new Channel<{ kind: "snapshot"; snapshot: PrincipalsSnapshot } | { kind: "terminated" }>((event) => {

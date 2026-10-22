@@ -13,6 +13,7 @@ export type ShellModel = Readonly<{
   loading: boolean;
   error: BridgeErrorCode | null;
   notice: string | null;
+  membershipRefreshUnavailable: string | null;
 }>;
 
 const initialModel: ShellModel = {
@@ -24,6 +25,7 @@ const initialModel: ShellModel = {
   loading: false,
   error: null,
   notice: null,
+  membershipRefreshUnavailable: null,
 };
 
 export class ShellRenderer {
@@ -80,7 +82,7 @@ export class ShellController {
       const activeWorkspaceId = workspaces.some(({ id }) => id === this.model.activeWorkspaceId)
         ? this.model.activeWorkspaceId
         : workspaces[0]?.id ?? null;
-      this.set({ installation, workspaces, memberships, activeWorkspaceId });
+      this.set({ installation, workspaces, memberships: this.mergeMemberships(memberships), activeWorkspaceId });
       await Promise.all(workspaces.map(({ id }) => this.loadOptionalPrincipals(id)));
     });
   }
@@ -90,7 +92,7 @@ export class ShellController {
       const created = await this.bridge.createWorkspace(name, personName);
       this.set({
         workspaces: [...this.model.workspaces, created.workspace],
-        memberships: { ...this.model.memberships, [created.workspace.id]: created.membership },
+        memberships: this.mergeMemberships({ [created.workspace.id]: created.membership }),
         activeWorkspaceId: created.workspace.id,
         notice: `Created ${created.workspace.name}`,
       });
@@ -110,8 +112,10 @@ export class ShellController {
     await this.perform(async () => {
       const membership = await this.bridge.currentMembership(workspaceId);
       this.set({
-        memberships: { ...this.model.memberships, [workspaceId]: membership },
+        memberships: this.mergeMemberships({ [workspaceId]: membership }),
         notice: "Membership refreshed",
+        membershipRefreshUnavailable: this.model.membershipRefreshUnavailable === workspaceId
+          ? null : this.model.membershipRefreshUnavailable,
       });
       await this.loadOptionalPrincipals(workspaceId);
     });
@@ -123,7 +127,7 @@ export class ShellController {
       const existing = this.model.workspaces.filter(({ id }) => id !== joined.workspace.id);
       this.set({
         workspaces: [...existing, joined.workspace],
-        memberships: { ...this.model.memberships, [joined.workspace.id]: joined.membership },
+        memberships: this.mergeMemberships({ [joined.workspace.id]: joined.membership }),
         activeWorkspaceId: joined.workspace.id,
         notice: `Joined ${joined.workspace.name}`,
       });
@@ -143,17 +147,17 @@ export class ShellController {
 
   public async addAgent(workspaceId: string, name: string): Promise<void> {
     await this.perform(async () => {
-      const membership = await this.bridge.addWorkspaceAgent(workspaceId, name);
-      this.set({ memberships: { ...this.model.memberships, [workspaceId]: membership }, notice: "Agent added" });
-      await this.loadOptionalPrincipals(workspaceId);
+      await this.bridge.addWorkspaceAgent(workspaceId, name);
+      this.set({ notice: "Agent added" });
+      await this.refreshAfterAgentMutation(workspaceId);
     });
   }
 
   public async removeAgent(workspaceId: string, agentId: string): Promise<void> {
     await this.perform(async () => {
-      const membership = await this.bridge.removeWorkspaceAgent(workspaceId, agentId);
-      this.set({ memberships: { ...this.model.memberships, [workspaceId]: membership }, notice: "Agent removed" });
-      await this.loadOptionalPrincipals(workspaceId);
+      await this.bridge.removeWorkspaceAgent(workspaceId, agentId);
+      this.set({ notice: "Agent removed" });
+      await this.refreshAfterAgentMutation(workspaceId);
     });
   }
 
@@ -163,6 +167,29 @@ export class ShellController {
       this.set({ notice: "Agent name updated" });
       await this.loadOptionalPrincipals(workspaceId);
     });
+  }
+
+  private async refreshAfterAgentMutation(workspaceId: string): Promise<void> {
+    try {
+      const membership = await this.bridge.currentMembership(workspaceId);
+      this.set({
+        memberships: this.mergeMemberships({ [workspaceId]: membership }),
+        membershipRefreshUnavailable: this.model.membershipRefreshUnavailable === workspaceId
+          ? null : this.model.membershipRefreshUnavailable,
+      });
+    } catch {
+      this.set({ membershipRefreshUnavailable: workspaceId });
+    }
+    await this.loadOptionalPrincipals(workspaceId);
+  }
+
+  private mergeMemberships(memberships: Readonly<Record<string, Membership>>): Record<string, Membership> {
+    const merged = { ...this.model.memberships };
+    for (const [id, membership] of Object.entries(memberships)) {
+      const previous = merged[id];
+      if (!previous || BigInt(membership.epoch) >= BigInt(previous.epoch)) merged[id] = membership;
+    }
+    return merged;
   }
 
   private receivePrincipals(snapshot: PrincipalsSnapshot): void {
@@ -210,10 +237,7 @@ export class ShellController {
       // The Principal wake also covers membership transitions on a remote peer.
       void this.bridge.currentMembership(workspaceId).then((membership) => {
         if (this.disposed || !this.model.workspaces.some(({ id }) => id === workspaceId)) return;
-        const previous = this.model.memberships[workspaceId];
-        if (!previous || BigInt(membership.epoch) >= BigInt(previous.epoch)) {
-          this.set({ memberships: { ...this.model.memberships, [workspaceId]: membership } });
-        }
+        this.set({ memberships: this.mergeMemberships({ [workspaceId]: membership }) });
       }).catch(() => undefined);
     }, terminated).catch(terminated);
   }
@@ -261,7 +285,10 @@ export function renderShell(
   const error = `<div class="shell-alert" role="alert">${presentation.error
     ? `<p class="error">${escape(presentation.error.message)}</p>${presentation.error.canRetry ? '<button id="retry" type="button">Retry</button>' : ""}`
     : ""}</div>`;
-  const feedback = `${status}${error}`;
+  const refreshWarning = presentation.membershipRefreshUnavailable && routeWorkspaceId(route) === presentation.membershipRefreshUnavailable
+    ? '<div class="shell-alert" role="alert"><p>Agent change succeeded, but members could not be refreshed. Check the roster before another change.</p><button id="retry-membership-refresh" type="button">Refresh members</button></div>'
+    : "";
+  const feedback = `${status}${error}${refreshWarning}`;
 
   if (route.kind === "workspace-chooser") {
     const choices = presentation.workspaceChoices.map(({ name }, index) =>

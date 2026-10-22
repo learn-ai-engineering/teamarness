@@ -70,6 +70,7 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     loading: false,
     error: null,
     notice: null,
+    membershipRefreshUnavailable: null,
     ...change,
   };
 }
