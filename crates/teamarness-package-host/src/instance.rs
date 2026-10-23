@@ -421,9 +421,9 @@ impl InstanceActor {
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         on_assignment: F,
     ) -> Result<serde_json::Value, WireFailure> {
-        if self.state.lock().await.lifecycle == LifecycleState::Admitted {
-            self.activate().await?;
-        }
+        // The gate also waits for a concurrent first-use activation; a snapshot
+        // of Activating is not a Provider exit.
+        self.activate().await?;
         let (process, id, generation) = {
             let mut state = self.state.lock().await;
             if state.lifecycle != LifecycleState::Active {
@@ -484,9 +484,7 @@ impl InstanceActor {
         contract: String,
         port: String,
     ) -> Result<PortQueryStream, WireFailure> {
-        if self.state.lock().await.lifecycle == LifecycleState::Admitted {
-            self.activate().await?;
-        }
+        self.activate().await?;
         let (process, id, generation) = {
             let mut state = self.state.lock().await;
             if state.lifecycle != LifecycleState::Active {
@@ -534,9 +532,7 @@ impl InstanceActor {
         port: String,
         permits: RoutePermits,
     ) -> Result<PortQueryStream, WireFailure> {
-        if self.state.lock().await.lifecycle == LifecycleState::Admitted {
-            self.activate().await?;
-        }
+        self.activate().await?;
         let (process, id, generation) = {
             let mut state = self.state.lock().await;
             if state.lifecycle != LifecycleState::Active {

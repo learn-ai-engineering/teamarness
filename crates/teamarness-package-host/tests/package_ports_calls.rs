@@ -113,6 +113,66 @@ async fn request(
 
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
+async fn concurrent_first_calls_share_on_demand_provider_activation() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+        &[serde_json::json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    declare(&fixture, "provider", true);
+    declare(&fixture, "consumer", false);
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    let consumer = snapshot
+        .instances
+        .iter()
+        .find(|slot| slot.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key
+        .clone();
+    let mount = mount(&host, consumer).await;
+    let command = request(
+        &host,
+        &mount,
+        "first-command",
+        "fixture.capability",
+        serde_json::json!({
+            "capability":"teamarness.package-ports", "method":"invoke",
+            "arguments":{"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"first"}}
+        }),
+    );
+    let query = request(
+        &host,
+        &mount,
+        "first-query",
+        "fixture.capability",
+        serde_json::json!({
+            "capability":"teamarness.package-ports", "method":"invoke",
+            "arguments":{"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+        }),
+    );
+    let (posted, listed) = tokio::join!(command, query);
+    assert_eq!(
+        posted["result"]["accepted"], true,
+        "first command: {posted:?}"
+    );
+    assert_eq!(
+        listed["result"]["accepted"], true,
+        "concurrent query: {listed:?}"
+    );
+    let provider = host
+        .snapshot()
+        .await
+        .instances
+        .into_iter()
+        .find(|slot| slot.key.package_identity.as_str() == "com.example.provider")
+        .unwrap();
+    assert_eq!(provider.process_generation, Some(1));
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test]
 async fn exact_scoped_calls_activate_provider_and_validate_request() {
     let fixture = common::Fixture::node_with_capabilities(
         &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],

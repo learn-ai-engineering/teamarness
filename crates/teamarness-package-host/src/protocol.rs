@@ -937,13 +937,22 @@ async fn writer_task<W>(
     }
 }
 
+struct PendingStreamOpen {
+    task: tokio::task::JoinHandle<()>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Default)]
-struct PendingStreamOpens(BTreeMap<String, tokio::task::JoinHandle<()>>);
+struct PendingStreamOpens(BTreeMap<String, PendingStreamOpen>);
 
 impl Drop for PendingStreamOpens {
     fn drop(&mut self) {
-        for task in self.0.values() {
-            task.abort();
+        // Provider activation is not cancellation-safe: an open already in
+        // lifecycle startup must settle and reap/register its child. Its task
+        // owns a permit and closes any route it creates after this reader ends.
+        for open in self.0.values() {
+            open.closed
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -966,6 +975,7 @@ async fn reader_task<R>(
 {
     let mut initialized = Some(initialized);
     let mut opening_streams = PendingStreamOpens::default();
+    let pending_open_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_EACH_DIRECTION));
     loop {
         let frame = match read_frame(&mut input).await {
             Ok(frame) => frame,
@@ -978,7 +988,7 @@ async fn reader_task<R>(
         };
         // Completed opens no longer need an abort handle. Live pending opens are
         // bounded by the process stream classifier; a close aborts its own task.
-        opening_streams.0.retain(|_, task| !task.is_finished());
+        opening_streams.0.retain(|_, open| !open.task.is_finished());
         // One classifier, before every branch. There is no side of `observe` on
         // which an adapter can hold its own idea of which races are tolerable,
         // and no frame kind that reaches its adapter without being classified.
@@ -1183,6 +1193,24 @@ async fn reader_task<R>(
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
                 let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
+                let Ok(slot) = pending_open_slots.clone().try_acquire_owned() else {
+                    // The classifier accepts distinct stream IDs without a
+                    // per-process count ceiling. Refuse excess adapter work
+                    // without waiting on a slow Provider from the reader.
+                    if writer
+                        .control(json!({
+                            "kind":"stream_close", "streamId":id, "code":"overloaded"
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        let _ = failure.send(Some(PackageErrorCode::ProcessExited));
+                        return;
+                    }
+                    continue;
+                };
+                let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let task_closed = closed.clone();
                 let handler = capabilities.clone();
                 let task_writer = writer.clone();
                 let task_state = state.clone();
@@ -1192,7 +1220,8 @@ async fn reader_task<R>(
                 // this Consumer's health probe. The classified open owns one
                 // bounded stream task, never the process reader.
                 let task = tokio::spawn(async move {
-                    if let Err(code) = handler
+                    let _slot = slot;
+                    let result = handler
                         .open_stream(
                             stream_id.clone(),
                             &topic,
@@ -1203,8 +1232,10 @@ async fn reader_task<R>(
                                 state: task_state,
                             },
                         )
-                        .await
-                    {
+                        .await;
+                    if task_closed.load(std::sync::atomic::Ordering::Acquire) {
+                        handler.close_stream(&stream_id).await;
+                    } else if let Err(code) = result {
                         let response = json!({
                             "kind":"stream_close", "streamId":stream_id,
                             "code":capability_code(code)
@@ -1214,7 +1245,9 @@ async fn reader_task<R>(
                         }
                     }
                 });
-                opening_streams.0.insert(id, task);
+                opening_streams
+                    .0
+                    .insert(id, PendingStreamOpen { task, closed });
             }
             FrameKind::Credit => {
                 let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
@@ -1237,17 +1270,14 @@ async fn reader_task<R>(
                 };
                 if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
                     route.terminate(stream_end(&frame));
-                } else if let Some(task) = opening_streams.0.remove(stream_id) {
-                    // Settle cancellation before closing the route: the open
-                    // must not register a Provider stream after close returns.
-                    task.abort();
-                    let handler = capabilities.clone();
-                    let stream_id = stream_id.to_owned();
-                    tokio::spawn(async move {
-                        let _ = task.await;
-                        handler.close_stream(&stream_id).await;
-                    });
                 } else {
+                    if let Some(open) = opening_streams.0.remove(stream_id) {
+                        // A close does not cancel Provider activation. If the
+                        // open registers a route later, its owned task closes
+                        // it after startup settles. Its permit remains held.
+                        open.closed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                     capabilities.close_stream(stream_id).await;
                 }
             }

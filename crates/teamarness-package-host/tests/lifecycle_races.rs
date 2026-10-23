@@ -636,6 +636,7 @@ async fn closing_a_pending_port_open_retires_only_that_stream() {
         entered: Arc<Notify>,
         release: Arc<Notify>,
         closed: Arc<Notify>,
+        activation: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl host_protocol::CapabilityHandler for PendingOpen {
         fn call<'a>(
@@ -661,9 +662,12 @@ async fn closing_a_pending_port_open_retires_only_that_stream() {
         > {
             let entered = self.entered.clone();
             let release = self.release.clone();
+            let activation = self.activation.clone();
             Box::pin(async move {
+                activation.store(1, Ordering::Release);
                 entered.notify_one();
                 release.notified().await;
+                activation.store(2, Ordering::Release);
                 Ok(())
             })
         }
@@ -685,11 +689,13 @@ async fn closing_a_pending_port_open_retires_only_that_stream() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let closed = Arc::new(Notify::new());
+    let activation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (client, mut package) = connect(
         Arc::new(PendingOpen {
             entered: entered.clone(),
             release: release.clone(),
             closed: closed.clone(),
+            activation: activation.clone(),
         }),
         4096,
     );
@@ -703,13 +709,123 @@ async fn closing_a_pending_port_open_retires_only_that_stream() {
     package
         .send(json!({"kind":"stream_close", "streamId":"p:pending"}))
         .await;
-    tokio::time::timeout(Duration::from_secs(2), closed.notified())
-        .await
-        .expect("the pending open was canceled and closed");
-    release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), package.round_trip("p:after-close"))
         .await
-        .expect("the generation remains usable");
+        .expect("close does not wait for the Provider activation");
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while activation.load(Ordering::Acquire) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("activation must settle after close");
+    tokio::time::timeout(Duration::from_secs(2), closed.notified())
+        .await
+        .expect("the settled open is closed");
+    assert_eq!(client.failure(), None);
+}
+
+/// Classified opens still need a finite per-process pending-work ceiling.
+#[tokio::test]
+async fn pending_stream_open_limit_rejects_only_excess_streams() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    struct HeldOpens {
+        entered: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    }
+    impl host_protocol::CapabilityHandler for HeldOpens {
+        fn call<'a>(
+            &'a self,
+            _grant: Option<&'a str>,
+            _payload: &'a Value,
+            _started: Arc<AtomicBool>,
+            _id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn open_stream<'a>(
+            &'a self,
+            _id: String,
+            _topic: &'a str,
+            _credit: u64,
+            _payload: &'a Value,
+            _output: HostStreamSender,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        > {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                entered.fetch_add(1, Ordering::Release);
+                release.notified().await;
+                Ok(())
+            })
+        }
+        fn add_credit<'a>(
+            &'a self,
+            _id: &'a str,
+            _amount: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+        fn close_stream<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    let (client, mut package) = connect(
+        Arc::new(HeldOpens {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        8192,
+    );
+    for index in 0..MAX_IN_FLIGHT_EACH_DIRECTION {
+        package
+            .send(json!({"kind":"stream_open", "id":format!("p:held-{index}"),
+            "topic":"capability.stream", "initialCredit":32, "payload":{}}))
+            .await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while entered.load(Ordering::Acquire) < MAX_IN_FLIGHT_EACH_DIRECTION {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the published request ceiling opens are in flight");
+    package
+        .send(json!({"kind":"stream_open", "id":"p:excess",
+        "topic":"capability.stream", "initialCredit":32, "payload":{}}))
+        .await;
+    let close = tokio::time::timeout(Duration::from_secs(2), package.next_frame())
+        .await
+        .expect("excess open has a stream-local answer");
+    assert_eq!(close.kind(), FrameKind::StreamClose);
+    assert_eq!(
+        close.field("streamId").and_then(Value::as_str),
+        Some("p:excess")
+    );
+    assert_eq!(
+        close.field("code").and_then(Value::as_str),
+        Some("overloaded")
+    );
+    assert_eq!(
+        entered.load(Ordering::Acquire),
+        MAX_IN_FLIGHT_EACH_DIRECTION
+    );
+    tokio::time::timeout(Duration::from_secs(2), package.round_trip("p:while-full"))
+        .await
+        .expect("the process reader remains usable");
+    release.notify_waiters();
     assert_eq!(client.failure(), None);
 }
 
