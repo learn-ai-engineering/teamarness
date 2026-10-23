@@ -386,7 +386,11 @@ pub(crate) async fn fail_all(pending: &PendingCapabilities, streams: &Capability
     }
     let routes = std::mem::take(&mut *streams.lock().await);
     for (_, route) in routes {
-        let _ = route.sender.send(Err(unavailable())).await;
+        // A retained full receiver must not hold process shutdown open. The
+        // terminal follows accepted events if that Consumer later drains them.
+        tokio::spawn(async move {
+            let _ = route.sender.send(Err(unavailable())).await;
+        });
     }
 }
 
@@ -422,6 +426,34 @@ fn unavailable_after_enqueue(command: bool) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_full_retained_stream() {
+        let (sender, mut receiver) = mpsc::channel(INITIAL_STREAM_CREDIT);
+        for sequence in 0..INITIAL_STREAM_CREDIT {
+            sender
+                .try_send(Ok(serde_json::json!({"sequence":sequence})))
+                .unwrap();
+        }
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let streams = Arc::new(Mutex::new(BTreeMap::from([(
+            "p:full".to_owned(),
+            CapabilityStreamRoute { sender },
+        )])));
+        tokio::time::timeout(Duration::from_millis(100), fail_all(&pending, &streams))
+            .await
+            .expect("shutdown cannot depend on a Consumer draining the queue");
+        for sequence in 0..INITIAL_STREAM_CREDIT {
+            assert_eq!(
+                receiver.recv().await.unwrap().unwrap()["sequence"],
+                sequence
+            );
+        }
+        assert_eq!(
+            receiver.recv().await.unwrap().unwrap_err().code(),
+            "host_unavailable"
+        );
+    }
 
     #[tokio::test]
     async fn session_loss_after_command_enqueue_is_uncertain_but_query_loss_is_retryable() {

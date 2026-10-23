@@ -1056,11 +1056,14 @@ async fn reader_task<R>(
                             // A state-changing call whose Core work had already
                             // begun may still commit. `append` is content
                             // idempotent, so the Package can retry it.
-                            outcome_uncertain: (method == "append"
-                                || (method == "invoke"
-                                    && payload.get("kind").and_then(Value::as_str)
-                                        == Some("command")))
-                                && started.load(std::sync::atomic::Ordering::Acquire),
+                            outcome_uncertain: (method == "invoke"
+                                && payload.get("kind").and_then(Value::as_str)
+                                    == Some("command"))
+                                // Port work may own a detached task that can dispatch
+                                // *after* this outer timeout. Without a fence, a
+                                // certain timeout would invite a duplicate write.
+                                || (method == "append"
+                                    && started.load(std::sync::atomic::Ordering::Acquire)),
                             package_error: None,
                         })
                     });
@@ -1101,7 +1104,11 @@ async fn reader_task<R>(
                     // uncertainty if the Provider already accepted a command.
                     let accepted_command = method == "invoke"
                         && payload.get("kind").and_then(Value::as_str) == Some("command")
-                        && started.load(std::sync::atomic::Ordering::Acquire);
+                        && (started.load(std::sync::atomic::Ordering::Acquire)
+                            || response
+                                .get("outcomeUncertain")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false));
                     let delivered = match tokio::time::timeout(
                         limits.capability_call,
                         writer.send_waiting(response, true),

@@ -521,9 +521,110 @@ async fn every_in_flight_capability_call_is_answered_behind_a_slow_pipe() {
 }
 
 /// SF2-002: Rule 1's third verdict, under the congestion that triggers it.
+/// An outer timeout cannot certify a command safe to retry while its detached
+/// Provider task can still reach the writer after that verdict.
+#[tokio::test]
+async fn a_late_detached_command_dispatch_keeps_the_timeout_uncertain() {
+    use tokio::sync::Notify;
+
+    struct LateDispatch {
+        release: Arc<Notify>,
+        dispatched: Arc<Notify>,
+    }
+    impl host_protocol::CapabilityHandler for LateDispatch {
+        fn call<'a>(
+            &'a self,
+            _grant: Option<&'a str>,
+            _payload: &'a Value,
+            started: Arc<AtomicBool>,
+            _consumer_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
+        > {
+            let release = self.release.clone();
+            let dispatched = self.dispatched.clone();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    release.notified().await;
+                    started.store(true, Ordering::Release);
+                    dispatched.notify_one();
+                })
+                .await
+                .unwrap();
+                Ok(json!({}))
+            })
+        }
+        fn open_stream<'a>(
+            &'a self,
+            _id: String,
+            _topic: &'a str,
+            _credit: u64,
+            _payload: &'a Value,
+            _output: HostStreamSender,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+        }
+        fn add_credit<'a>(
+            &'a self,
+            _id: &'a str,
+            _amount: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+        fn close_stream<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    let release = Arc::new(Notify::new());
+    let dispatched = Arc::new(Notify::new());
+    let (_client, mut package) = connect_with_limits(
+        Arc::new(LateDispatch {
+            release: release.clone(),
+            dispatched: dispatched.clone(),
+        }),
+        4096,
+        ProtocolLimits {
+            capability_call: Duration::from_millis(30),
+        },
+    );
+    package
+        .send(json!({
+            "kind":"request", "id":"p:late", "operation":"capability.call",
+            "grant":"Z3JhbnQx", "deadlineUnixMs":"9007199254740998",
+            "payload":{"method":"invoke", "kind":"command", "contract":"fixture.messages",
+                "port":"message.post", "request":{}}
+        }))
+        .await;
+    let answer = tokio::time::timeout(Duration::from_secs(2), package.next_frame())
+        .await
+        .expect("the Host answers the expired call");
+    assert_eq!(
+        answer.field("code").and_then(Value::as_str),
+        Some("outcome_unknown")
+    );
+    assert_eq!(
+        answer.field("outcomeUncertain").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        answer.field("retryable").and_then(Value::as_bool),
+        Some(false)
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), dispatched.notified())
+        .await
+        .expect("detached Provider work can still dispatch");
+}
+
 ///
 /// A capability answer that cannot get control-lane capacity within the call
-/// deadline is answered for that one request id with a typed retryable error,
+/// deadline is answered for that one request id with a typed error,
 /// never by dropping the answer and never by failing the generation. The
 /// fallback is itself that request's one terminal frame, so it waits for
 /// capacity too: the budget is exactly full here, which is the one condition
