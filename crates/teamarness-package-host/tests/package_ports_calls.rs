@@ -121,6 +121,7 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
             .lifecycle,
         LifecycleState::Admitted
     );
+    let mut observations = host.observe_ports();
     for (id, kind, port, input, expected) in [
         (
             "one",
@@ -169,6 +170,43 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
             assert_eq!(value["error"], expected, "{value}");
         }
     }
+    let trace: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok()).collect();
+    let dispatch: Vec<_> = trace
+        .iter()
+        .filter(|event| event.stage == teamarness_package_host::PortStage::Dispatched)
+        .collect();
+    assert_eq!(dispatch.len(), 2);
+    for assigned in dispatch {
+        assert!(assigned.consumer_id.starts_with("p:"));
+        assert!(
+            assigned
+                .provider_id
+                .as_deref()
+                .unwrap()
+                .starts_with("h:port-")
+        );
+        assert!(
+            trace
+                .iter()
+                .any(|terminal| terminal.consumer_id == assigned.consumer_id
+                    && terminal.provider_id == assigned.provider_id
+                    && terminal.stage == teamarness_package_host::PortStage::Completed)
+        );
+    }
+    assert_eq!(
+        trace
+            .iter()
+            .filter(
+                |event| event.stage == teamarness_package_host::PortStage::Rejected
+                    && event.provider_id.is_none()
+            )
+            .count(),
+        2
+    );
+    assert!(
+        !format!("{trace:?}").contains("hi"),
+        "observations must contain no Message payload"
+    );
     let cancelled = request(
         &host,
         &mount,
@@ -193,6 +231,16 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     assert_eq!(bad_response["error"], "port_response_invalid");
     assert_eq!(bad_response["outcomeUncertain"], true);
     assert_eq!(bad_response["retryable"], false);
+    let failure_trace: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok()).collect();
+    assert!(failure_trace.iter().any(|event| {
+        event.stage == teamarness_package_host::PortStage::Failed
+            && event.code == Some("port_response_invalid")
+            && event.outcome_uncertain
+            && event
+                .provider_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("h:port-"))
+    }));
     let owned = request(&host, &mount, "owned-error", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
         "arguments":{"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"provider_error"}}
@@ -213,6 +261,18 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     assert_eq!(stalled["error"], "outcome_unknown");
     assert_eq!(stalled["outcomeUncertain"], true);
     assert_eq!(stalled["retryable"], false);
+    let timeout_trace: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok()).collect();
+    assert!(!timeout_trace.iter().any(|event| {
+        event.stage == teamarness_package_host::PortStage::Completed
+            && event.port.as_deref() == Some("message.post")
+            && event.provider_id.as_deref().is_some_and(|id| {
+                timeout_trace.iter().any(|other| {
+                    other.stage == teamarness_package_host::PortStage::Dispatched
+                        && other.provider_id.as_deref() == Some(id)
+                        && other.consumer_id == event.consumer_id
+                })
+            })
+    }));
     let result = request(
         &host,
         &mount,

@@ -33,6 +33,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0023](0023-workspace-principals-key-per-principal.md) | Workspace Principals and key-per-Principal attribution | accepted (2026-10-21) | 0022 (part) | 0024 (§2 sole manager and Manager-uninvolved Agent removal) | In the ADR | Refines 0004 (Person key groups), 0005 (group create in the claim), 0017 (Agent key custody); replaces `teamarness.person-names` with `teamarness.principals`; record-log 1.1 `principal` selector |
 | [0024](0024-manager-co-manages-person-groups.md) | Workspace Manager co-manages Person key groups | accepted (2026-10-21) | 0023 (§2 part) | – | In the ADR | Signed co-manager from genesis; Manager removes an individual Agent, but cannot add to another Person's group |
 | [0025](0025-conflicting-principal-key-claims.md) | Conflicting Principal key claims fail closed | accepted (2026-10-22) | – | – | In the ADR | Refines 0023/0024: accepted concurrent claims stay signed facts, but contested keys and their dependent Agents have no effective membership |
+| [0026](0026-host-brokered-package-ports.md) | Host-brokered Package ports | accepted (2026-10-21) | – | – | In the ADR | Exact scoped contracts, Person-only Conversations proof, and bounded local observations; Agent signing and in-app diagnostics deferred |
 
 ### Former file names
 

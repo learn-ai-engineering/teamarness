@@ -261,6 +261,7 @@ impl GenerationCapabilities {
         grant: Option<&str>,
         payload: &Value,
         started: Arc<AtomicBool>,
+        consumer_id: &str,
     ) -> Result<Value, CapabilityFailure> {
         let bound = self
             .bound_grant(grant)
@@ -287,6 +288,8 @@ impl GenerationCapabilities {
                         &self.core.public_identity().to_string(),
                         object,
                         started,
+                        consumer_id,
+                        self.generation,
                     )
                     .await
                     .map_err(|failure| CapabilityFailure {
@@ -369,6 +372,7 @@ impl GenerationCapabilities {
                         &self.scope.workspace_id,
                         &self.core.public_identity().to_string(),
                         object,
+                        self.generation,
                     )
                     .await?;
                 let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
@@ -379,6 +383,7 @@ impl GenerationCapabilities {
                     return Err(PackageErrorCode::Overloaded);
                 }
                 drop(streams);
+                broker.record_event_subscription(&subscription, &stream_id);
                 let all_streams = self.streams.clone();
                 let cancelled = self.cancelled.subscribe();
                 tokio::spawn(async move {
@@ -901,10 +906,17 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
         grant: Option<&'a str>,
         payload: &'a Value,
         started: Arc<AtomicBool>,
+        consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
-        Box::pin(GenerationCapabilities::call(self, grant, payload, started))
+        Box::pin(GenerationCapabilities::call(
+            self,
+            grant,
+            payload,
+            started,
+            consumer_id,
+        ))
     }
 
     fn open_stream<'a>(
@@ -1824,6 +1836,7 @@ mod tests {
                     Some(&grant),
                     &append_request(),
                     Arc::new(AtomicBool::new(false)),
+                    "p:test",
                 )
                 .await
         });

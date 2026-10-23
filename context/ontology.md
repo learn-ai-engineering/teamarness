@@ -75,6 +75,8 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Validator** | The author-runnable command that applies Package Admission's Package Manifest and UI contract rules to a Package project or Package Directory |
 | **Capability Grant** | An opaque, per-process-generation token that binds one Package Instance's declared Semantic Capability to its Package Identity, Workspace, and Installation. Grants are implicit in capability calls and are not transferable |
 | **Package Source Label** | A presentation alias shown by the Shell: `Team` for Package Source `bundled`, `Personal` for `local`. It is not a trust verdict and does not define Registration Scope, Workspace enablement, or sharing |
+| **Port Contract** | A versioned, digest-verified document independent of Package Identity. It names exact commands, queries, and events with closed schemas; the Host admits and grants declared Consumers against one Provider per contract |
+| **Port Observation** | An optional, bounded, payload-free, process-local diagnostic joining a Consumer's `p:` route to a Provider's `h:` route. Multiple Consumer streams can share one Provider event stream; missing or lagged observations do not determine domain outcomes |
 
 ## Conversations
 
@@ -84,6 +86,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Message** | An attributed, authenticated, encrypted Markdown record appended immutably to a Channel through the generic immutable-record capability. Transport details remain Core-owned |
 | **Channel Membership** | Package-owned policy determining who can read and post in a specific Channel, bounded by Canonical Membership. Phase 4 has no separate Channel Membership records because every current Workspace Member participates in every Channel |
 | **Conversation Synchronization** | Replication of Conversation records between peers. The Conversations Package owns records and domain policy; `teamarness.synchronization.immutable-record-log` owns reusable transport, replication, retry, and backpressure |
+| **Message Port invalidation** | The live, coalescible, payload-free `messages.changed` event. It signals a local projection change, not one Message or a replayable history item. Consumers query `message.page` on receipt and after reconnecting |
 
 ## Synchronization and Protection
 

@@ -143,6 +143,7 @@ impl host_protocol::CapabilityHandler for ClosingStream {
         _grant: Option<&'a str>,
         _payload: &'a Value,
         _started: Arc<AtomicBool>,
+        _consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
@@ -204,6 +205,7 @@ impl host_protocol::CapabilityHandler for LargePage {
         _grant: Option<&'a str>,
         _payload: &'a Value,
         _started: Arc<AtomicBool>,
+        _consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
@@ -450,6 +452,7 @@ async fn every_in_flight_capability_call_is_answered_behind_a_slow_pipe() {
             _grant: Option<&'a str>,
             _payload: &'a Value,
             _started: Arc<AtomicBool>,
+            _consumer_id: &'a str,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
         > {
@@ -538,6 +541,7 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
             _grant: Option<&'a str>,
             payload: &'a Value,
             _started: Arc<AtomicBool>,
+            _consumer_id: &'a str,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
         > {

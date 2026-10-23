@@ -143,6 +143,7 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
             .clone()
     };
     let a = mount(&host, key("com.example.consumer-a")).await;
+    let mut observations = host.observe_ports();
     assert_eq!(
         request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await["opened"],
         true
@@ -252,6 +253,33 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
         events(&host, &b, 101).await["events"],
         json!([{"order":2},{"order":3}])
     );
+    let trace: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok()).collect();
+    let subscribers: Vec<_> = trace
+        .iter()
+        .filter(|event| event.stage == teamarness_package_host::PortStage::Subscribed)
+        .collect();
+    assert_eq!(subscribers.len(), 2);
+    assert_eq!(
+        subscribers[0].provider_id, subscribers[1].provider_id,
+        "one upstream must map to distinct Consumer streams"
+    );
+    assert_ne!(
+        subscribers[0].consumer_package,
+        subscribers[1].consumer_package
+    );
+    // p: IDs are process-scoped, so these two streams may have the same local counter.
+    assert!(subscribers.iter().all(|event| {
+        event.consumer_id.starts_with("p:")
+            && event
+                .provider_id
+                .as_deref()
+                .unwrap()
+                .starts_with("h:port-event-")
+    }));
+    assert!(trace.iter().any(
+        |event| event.stage == teamarness_package_host::PortStage::Event
+            && event.provider_id == subscribers[0].provider_id
+    ));
     request(&host, &a, "close-a", "fixture.port_event_close", json!({})).await;
     assert_eq!(stats(&host, &p, 3).await["active"], 1);
     request(&host, &b, "close-b", "fixture.port_event_close", json!({})).await;
@@ -265,6 +293,11 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
         },
     )
     .await;
+    let closes: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok()).collect();
+    assert!(closes.iter().any(
+        |event| event.stage == teamarness_package_host::PortStage::Closed
+            && event.provider_id == subscribers[0].provider_id
+    ));
     request(&host, &a, "open-late", "fixture.port_event_open", json!({})).await;
     common::eventually(
         Duration::from_secs(4),

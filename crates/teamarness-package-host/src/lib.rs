@@ -7,6 +7,8 @@
 
 mod admission;
 mod broker;
+mod port_observation;
+pub use port_observation::{PortObservation, PortObservations, PortStage};
 mod capability;
 mod catalog;
 mod commands;
@@ -152,6 +154,12 @@ impl PackageHost {
             }
         }
         entries
+    }
+
+    /// Opt in to bounded, process-local Port routing observations. A slow receiver reports lag.
+    /// Observations are diagnostic only and cannot establish whether a command committed.
+    pub fn observe_ports(&self) -> PortObservations {
+        self.inner.port_broker.observe()
     }
 
     /// Claims a coalesced host-state subscription or one open UI event route.

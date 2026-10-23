@@ -6,14 +6,15 @@ use serde_json::{Map, Value, json};
 use teamarness_package_contract::manifest::ConsumedContract;
 use teamarness_package_contract::port_contract::{CompiledPortContracts, PortKind};
 use teamarness_package_protocol::{MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 
 #[path = "event_subscriptions.rs"]
 mod subscriptions;
 
 use crate::admission::PortAvailability;
 use crate::instance::InstanceActor;
-use crate::protocol::{PortQueryStream, WireFailure};
+use crate::port_observation::{PortObservation, PortObservations, PortStage};
+use crate::protocol::{PortQueryStream, WireFailure, capability_code};
 use crate::{PackageErrorCode, PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
 
 // Four maximum request/response pairs fit this Host-wide byte budget; the per-generation
@@ -28,6 +29,7 @@ const _: () = {
 
 pub(crate) struct PortBroker {
     graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    observations: broadcast::Sender<PortObservation>,
     consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
     contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
     instances: RwLock<BTreeMap<PackageInstanceKey, Weak<InstanceActor>>>,
@@ -54,6 +56,7 @@ impl PortBroker {
     ) -> Arc<Self> {
         Arc::new(Self {
             graph,
+            observations: crate::port_observation::channel(),
             consumed,
             contracts,
             instances: RwLock::new(BTreeMap::new()),
@@ -67,6 +70,15 @@ impl PortBroker {
             event_bytes: Arc::new(Semaphore::new(subscriptions::EVENT_BYTES)),
             event_open_locks: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    pub(crate) fn observe(&self) -> PortObservations {
+        self.observations.subscribe()
+    }
+
+    fn record(&self, observation: PortObservation) {
+        // `send` refuses if nobody subscribed, and never waits for a slow receiver.
+        let _ = self.observations.send(observation);
     }
 
     pub(crate) fn register(&self, key: PackageInstanceKey, actor: &Arc<InstanceActor>) {
@@ -205,6 +217,7 @@ impl PortBroker {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // Scope, wire ID, and generation remain explicit at this boundary.
     pub(crate) async fn call(
         &self,
         caller: &PackageIdentity,
@@ -212,6 +225,80 @@ impl PortBroker {
         installation: &str,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
+        consumer_id: &str,
+        consumer_generation: u64,
+    ) -> Result<Value, WireFailure> {
+        let provider_id = Arc::new(std::sync::Mutex::new(None::<(String, u64)>));
+        let result = self
+            .call_inner(
+                caller,
+                workspace,
+                installation,
+                input,
+                dispatched,
+                consumer_id,
+                consumer_generation,
+                provider_id.clone(),
+            )
+            .await;
+        let assigned = provider_id
+            .lock()
+            .expect("port observation poisoned")
+            .clone();
+        // Untrusted names are not recorded when the route was rejected before dispatch.
+        let (contract, port) = if assigned.is_some() {
+            (
+                input
+                    .get("contract")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                input.get("port").and_then(Value::as_str).map(str::to_owned),
+            )
+        } else {
+            (None, None)
+        };
+        let kind = if input.get("kind").and_then(Value::as_str) == Some("command") {
+            "command"
+        } else {
+            "query"
+        };
+        self.record(PortObservation {
+            kind,
+            contract,
+            port,
+            consumer_id: consumer_id.to_owned(),
+            consumer_package: caller.as_str().to_owned(),
+            consumer_generation,
+            provider_id: assigned.as_ref().map(|entry| entry.0.clone()),
+            provider_generation: assigned.as_ref().map(|entry| entry.1),
+            stage: match &result {
+                Ok(_) => PortStage::Completed,
+                Err(_) if assigned.is_none() => PortStage::Rejected,
+                Err(_) => PortStage::Failed,
+            },
+            code: result
+                .as_ref()
+                .err()
+                .map(|failure| capability_code(failure.code)),
+            outcome_uncertain: result
+                .as_ref()
+                .err()
+                .is_some_and(|failure| failure.outcome_uncertain),
+        });
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // The private dispatch path also carries the optional ID join.
+    async fn call_inner(
+        &self,
+        caller: &PackageIdentity,
+        workspace: &WorkspaceId,
+        installation: &str,
+        input: &Map<String, Value>,
+        dispatched: Arc<std::sync::atomic::AtomicBool>,
+        consumer_id: &str,
+        consumer_generation: u64,
+        provider_id: Arc<std::sync::Mutex<Option<(String, u64)>>>,
     ) -> Result<Value, WireFailure> {
         if input.len() != 5
             || !["method", "contract", "port", "kind", "request"]
@@ -241,8 +328,33 @@ impl PortBroker {
             "actor":{"kind":"person","identity":installation},"request":request});
         let payload: PackageValue = serde_json::from_value(payload)
             .map_err(|_| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
+        let observations = self.observations.clone();
+        let contract_name = contract.to_owned();
+        let port_name = port.to_owned();
+        let consumer = consumer_id.to_owned();
+        let caller_name = caller.as_str().to_owned();
         let result = actor
-            .port_request(kind, payload, permit, dispatched)
+            .port_request(kind, payload, permit, dispatched, move |id, generation| {
+                *provider_id.lock().expect("port observation poisoned") =
+                    Some((id.clone(), generation));
+                let _ = observations.send(PortObservation {
+                    kind: if kind == PortKind::Command {
+                        "command"
+                    } else {
+                        "query"
+                    },
+                    contract: Some(contract_name),
+                    port: Some(port_name),
+                    consumer_id: consumer,
+                    consumer_package: caller_name,
+                    consumer_generation,
+                    provider_id: Some(id),
+                    provider_generation: Some(generation),
+                    stage: PortStage::Dispatched,
+                    code: None,
+                    outcome_uncertain: false,
+                });
+            })
             .await?;
         schemas
             .validate(contract, port, "response", &result)
@@ -327,6 +439,34 @@ fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, WireFa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_observer_lag_does_not_consume_route_capacity_or_copy_payload() {
+        let broker = PortBroker::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let mut slow = broker.observe();
+        let observation = PortObservation {
+            kind: "command",
+            contract: None,
+            port: None,
+            consumer_id: "p:local".into(),
+            consumer_package: "dev.example.consumer".into(),
+            consumer_generation: 1,
+            provider_id: None,
+            provider_generation: None,
+            stage: PortStage::Rejected,
+            code: Some("ungranted_port"),
+            outcome_uncertain: false,
+        };
+        for _ in 0..256 {
+            broker.record(observation.clone());
+        }
+        assert!(matches!(
+            slow.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        assert!(!format!("{observation:?}").contains("markdown"));
+        assert!(broker.permit(&json!({})).is_ok());
+    }
 
     // Verifies: TEAM.SYS.PKG-R14
     #[test]

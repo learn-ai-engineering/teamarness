@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.OBS`
 
-Observability covers stable error reporting, secret-safe diagnostics, and Package failure visibility. Structured logging, metrics, and diagnostic tooling are not yet specified.
+Observability covers stable error reporting, secret-safe diagnostics, and Package failure visibility. A bounded local Package Port observation seam is available for developers. A persisted telemetry store, metrics, and in-app diagnostic tooling are not specified.
 
 ## TEAM.SYS.OBS-R01 — Stable Error Contracts
 
@@ -15,3 +15,7 @@ Logs, diagnostics, and verification notes SHALL NOT contain private keys, raw se
 ## TEAM.SYS.OBS-R03 — Package Failure Visibility
 
 The Package Host SHALL expose each Package Instance's lifecycle state, including `failed` and `crash_loop`, through its snapshot so the Shell can present failures and recovery.
+
+## TEAM.SYS.OBS-R04 — Local Port Diagnosis
+
+An opt-in Host or SDK Port observer SHALL contain only process-local route IDs, contract and Port names, scoped generation, stage, stable outcome code, and uncertainty. It SHALL not contain a Message, canonical or sealed record, grant token, actor identity, invitation, key, or full request or response. A slow observer SHALL report lag without blocking routing. A missing terminal observation SHALL not imply success. Conversations MAY write these fields in developer mode to the existing private, rotated Backend stderr files. Those files SHALL not be presented as a Shell diagnostic API.

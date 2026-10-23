@@ -8,7 +8,7 @@ use teamarness_package_sdk::capabilities::record_log::{
     SyncState, SyncWarning, run_session,
 };
 use teamarness_package_sdk::{
-    BackendError, CancellationToken, Context, Empty, Router, event_channel,
+    BackendError, CancellationToken, Context, Empty, Router, event_channel, ports::PortActor,
 };
 use tokio::sync::watch;
 
@@ -241,24 +241,7 @@ pub(crate) fn router_observing(
     .request(
         "conversations.message.post",
         |context: Context<ConversationsActive>, request: PostRequest| async move {
-            let channel = decode_id(&request.channel_id)
-                .ok_or_else(|| error("conversations.invalid_request", false))?;
-            let state = context.state().clone();
-            let active = context
-                .blocking(move |_| {
-                    state
-                        .store
-                        .channel_is_active(&hex_id(channel))
-                        .map_err(|_| storage_failed())
-                })
-                .await?;
-            if !active {
-                return Err(error("conversations.channel_hidden", false));
-            }
-            let author = context.state().installation.clone();
-            let record = DomainRecord::message_post(channel, &author, request.markdown)
-                .map_err(|_| error("conversations.invalid_markdown", false))?;
-            append(&context, "message.post", record).await
+            post(&context, request).await
         },
     )
     .request(
@@ -294,6 +277,37 @@ pub(crate) fn router_observing(
         "conversations.channel.resolve",
         |context: Context<ConversationsActive>, request: ResolveRequest| async move {
             resolve(&context, request).await
+        },
+    )
+    .port_request(
+        "dev.teamarness.conversations", "message.post", "command",
+        |context: Context<ConversationsActive>, actor: PortActor, request: PostRequest| async move {
+            authorize_person(&context, actor)?;
+            post(&context, request).await
+        },
+    )
+    .port_request(
+        "dev.teamarness.conversations", "message.page", "query",
+        |context: Context<ConversationsActive>, _actor: PortActor, request: PageRequest| async move {
+            page(&context, request).await
+        },
+    )
+    .port_event(
+        "dev.teamarness.conversations", "messages.changed",
+        |context: Context<ConversationsActive>, _actor: PortActor| async move {
+            let (sender, subscription) = event_channel(1);
+            let mut revisions = context.state().changes.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        result = revisions.changed() => {
+                            if result.is_err() || sender.send(json!({})).await.is_err() { break; }
+                        }
+                        () = sender.closed() => break,
+                    }
+                }
+            });
+            Ok(subscription)
         },
     )
     .subscription(
@@ -475,6 +489,41 @@ impl ConversationsActive {
             "warnings": warnings,
         }))
     }
+}
+
+fn authorize_person(
+    context: &Context<ConversationsActive>,
+    actor: PortActor,
+) -> Result<(), BackendError> {
+    match actor {
+        PortActor::Person { identity } if identity == context.state().installation => Ok(()),
+        _ => Err(error("conversations.actor_unauthorized", false)),
+    }
+}
+
+async fn post(
+    context: &Context<ConversationsActive>,
+    request: PostRequest,
+) -> Result<JsonValue, BackendError> {
+    let channel = decode_id(&request.channel_id)
+        .ok_or_else(|| error("conversations.invalid_request", false))?;
+    let state = context.state().clone();
+    let active = context
+        .blocking(move |_| {
+            state
+                .store
+                .channel_is_active(&hex_id(channel))
+                .map_err(|_| storage_failed())
+        })
+        .await?;
+    if !active {
+        return Err(error("conversations.channel_hidden", false));
+    }
+    // The actor never selects the signer: the Core capability signs for this Installation.
+    let author = context.state().installation.clone();
+    let record = DomainRecord::message_post(channel, &author, request.markdown)
+        .map_err(|_| error("conversations.invalid_markdown", false))?;
+    append(context, "message.post", record).await
 }
 
 /// Appends one domain record and projects it locally.
@@ -1026,6 +1075,186 @@ mod session_tests {
             handles,
             scripted,
         }
+    }
+
+    #[test]
+    fn public_port_contract_has_exact_closed_bounded_shapes() {
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        assert_eq!(contract.contracts.len(), 1);
+        let provided = &contract.contracts[0];
+        assert_eq!(provided.identity, "dev.teamarness.conversations");
+        assert_eq!(provided.ports.len(), 3);
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "message.post",
+                    "request",
+                    &json!({"channelId":hex_id(GENERAL_ID),"markdown":"hello"})
+                )
+                .is_ok()
+        );
+        for invalid in [
+            json!({"channelId":hex_id(GENERAL_ID),"markdown":""}),
+            json!({"channelId":hex_id(GENERAL_ID),"markdown":"x","actor":"forged"}),
+            json!({"channelId":hex_id(GENERAL_ID),"markdown":"x".repeat(32769)}),
+        ] {
+            assert!(
+                contract
+                    .validate(
+                        "dev.teamarness.conversations",
+                        "message.post",
+                        "request",
+                        &invalid
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "messages.changed",
+                    "event",
+                    &json!({})
+                )
+                .is_ok()
+        );
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "messages.changed",
+                    "event",
+                    &json!({"markdown":"secret"})
+                )
+                .is_err()
+        );
+        const { assert!(HISTORY_REPLY_BUDGET < teamarness_package_protocol::MAX_FRAME_BYTES) };
+    }
+
+    #[tokio::test]
+    async fn ports_share_ui_post_and_read_only_page_and_invalidate_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let envelope = |port: &str, actor: JsonValue, request: JsonValue| {
+            json!({
+                "contract": "dev.teamarness.conversations", "major": 1, "minor": 0,
+                "port": port, "actor": actor, "request": request
+            })
+        };
+        let person = json!({"kind":"person","identity":ALICE});
+        let page_request = json!({"channelId":hex_id(GENERAL_ID)});
+        let initial = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                envelope("message.page", person.clone(), page_request.clone()),
+            )
+            .await
+            .unwrap();
+        let mut events = session
+            .harness
+            .subscribe(
+                "teamarness.port.event.v1",
+                envelope("messages.changed", person.clone(), json!({})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.next_event())
+                .await
+                .is_err(),
+            "subscription must not emit its current watch value"
+        );
+        let forbidden = session
+            .harness
+            .request(
+                "teamarness.port.command.v1",
+                envelope(
+                    "message.post",
+                    json!({"kind":"person","identity":"stranger"}),
+                    json!({"channelId":hex_id(GENERAL_ID),"markdown":"forbidden"}),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.code(), "conversations.actor_unauthorized");
+        assert!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    envelope(
+                        "message.post",
+                        json!({"kind":"agent","identity":ALICE}),
+                        json!({"channelId":hex_id(GENERAL_ID),"markdown":"forbidden"})
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    envelope(
+                        "message.post",
+                        person.clone(),
+                        json!({"channelId":hex_id(GENERAL_ID),"markdown":"hello"})
+                    )
+                )
+                .await
+                .unwrap(),
+            json!({"ok":true})
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap(),
+            0
+        );
+        let page = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                envelope("message.page", person.clone(), page_request.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["pending"].as_array().unwrap().len(), 1);
+        assert_ne!(page["revision"], initial["revision"]);
+        let ui = session
+            .harness
+            .request("conversations.channel.page", page_request)
+            .await
+            .unwrap();
+        assert_eq!(page, ui);
+        assert_eq!(
+            session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap(),
+            0
+        );
+        session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({"channelId":hex_id(GENERAL_ID)}),
+            )
+            .await
+            .unwrap();
+        assert!(session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap() > 0);
+        events.close().await;
+        session.harness.shutdown().await.unwrap();
     }
 
     impl Session {

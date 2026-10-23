@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::cancellation::CancellationToken;
 use crate::capability::{CapabilityClient, CapabilityStreams, PendingCapabilities};
+use crate::port_observation::{self, ProviderPortObservation, ProviderPortStage};
 use crate::priority_writer::{PriorityWriter, SharedState};
 use crate::{Backend, BackendError, BackendRequest, Initialization, SdkError, object};
 
@@ -39,6 +40,7 @@ struct InFlight {
     answered: Arc<AtomicBool>,
 }
 
+#[allow(clippy::too_many_arguments)] // The optional observer adds no work to the seven transport seams.
 pub(crate) async fn run(
     backend: Arc<dyn Backend>,
     writer: Arc<PriorityWriter>,
@@ -47,6 +49,7 @@ pub(crate) async fn run(
     capability_streams: CapabilityStreams,
     package_runtime: Handle,
     state: SharedState,
+    observations: Option<tokio::sync::broadcast::Sender<ProviderPortObservation>>,
 ) -> Result<(), SdkError> {
     let initialize = frames.recv().await.ok_or(SdkError::ParentClosed)?;
     if initialize.kind() != FrameKind::Initialize {
@@ -128,6 +131,8 @@ pub(crate) async fn run(
                                 }
                             }
                         }
+                        let observed = port_observation::operation(&operation);
+                        emit(&observations, observed, &id, ProviderPortStage::Received, None);
                         let request = BackendRequest {
                             operation,
                             payload: frame.field("payload").cloned().ok_or(SdkError::Protocol("malformed_frame"))?,
@@ -143,6 +148,7 @@ pub(crate) async fn run(
                         let task_id = id.clone();
                         let answered = Arc::new(AtomicBool::new(false));
                         let task_answered = answered.clone();
+                        let observer = observations.clone();
                         let task = package_runtime.spawn(async move {
                             let result = if is_lifecycle {
                                 let _barrier = lifecycle.lock().await;
@@ -159,6 +165,10 @@ pub(crate) async fn run(
                             // terminal frame at all. Only a session that has
                             // already ended can fail this send.
                             if !task_answered.swap(true, Ordering::AcqRel) {
+                                let stage = if result.is_ok() { ProviderPortStage::Completed } else { ProviderPortStage::Failed };
+                                let code = result.as_ref().err().map(|error| error.code().to_owned());
+                                let uncertain = result.as_ref().err().is_some_and(BackendError::outcome_uncertain);
+                                emit(&observer, observed, &id, stage, code.map(|code| (code, uncertain)));
                                 let _ = writer.control_waiting(terminal(&id, result)).await;
                             }
                             let _ = done.send(id).await;
@@ -237,8 +247,10 @@ pub(crate) async fn run(
                             continue;
                         }
                         let cancellation = CancellationToken::new();
+                        let operation = string_field(&frame, "topic")?;
+                        let observed = port_observation::operation(&operation);
                         let request = BackendRequest {
-                            operation: string_field(&frame, "topic")?,
+                            operation,
                             payload: frame.field("payload").cloned().ok_or(SdkError::Protocol("malformed_frame"))?,
                             initialization: initialization.clone(),
                             capabilities: capabilities.clone(),
@@ -250,16 +262,20 @@ pub(crate) async fn run(
                         let stream_id = id.clone();
                         let credit = Arc::new(Semaphore::new(INITIAL_STREAM_CREDIT));
                         let stream_credit = credit.clone();
+                        let observer = observations.clone();
                         let task = package_runtime.spawn(async move {
                             // The Package's own code reaches the Host, and through it the UI.
                             let mut subscription = match backend.subscribe(request).await {
                                 Ok(subscription) => subscription,
                                 Err(error) => {
+                                    emit(&observer, observed, &stream_id, ProviderPortStage::Failed,
+                                        Some((error.code().to_owned(), error.outcome_uncertain())));
                                     let _ =
                                         writer.data(stream_close(&stream_id, error.code())).await;
                                     return;
                                 }
                             };
+                            emit(&observer, observed, &stream_id, ProviderPortStage::Opened, None);
                             let mut sequence = 0_u64;
                             while let Some(event) = subscription.receiver.recv().await {
                                 let permit = match stream_credit.acquire().await {
@@ -276,13 +292,17 @@ pub(crate) async fn run(
                                             ("sequence", JsonValue::String(sequence.to_string())),
                                             ("payload", payload),
                                         ])).await.is_err() { return; }
+                                        emit(&observer, observed, &stream_id, ProviderPortStage::Event, None);
                                     }
                                     Err(error) => {
+                                        emit(&observer, observed, &stream_id, ProviderPortStage::Failed,
+                                            Some((error.code().to_owned(), error.outcome_uncertain())));
                                         let _ = writer.data(stream_close(&stream_id, error.code())).await;
                                         return;
                                     }
                                 }
                             }
+                            emit(&observer, observed, &stream_id, ProviderPortStage::Closed, None);
                             let _ = writer.data(stream_close(&stream_id, "completed")).await;
                         });
                         streams.insert(id, (task, credit, cancellation));
@@ -328,6 +348,26 @@ pub(crate) async fn run(
                 }
             }
         }
+    }
+}
+
+fn emit(
+    sender: &Option<tokio::sync::broadcast::Sender<ProviderPortObservation>>,
+    operation: Option<&'static str>,
+    provider_id: &str,
+    stage: ProviderPortStage,
+    error: Option<(String, bool)>,
+) {
+    if let (Some(sender), Some(operation)) = (sender, operation) {
+        let (code, outcome_uncertain) =
+            error.map_or((None, false), |(code, uncertain)| (Some(code), uncertain));
+        let _ = sender.send(ProviderPortObservation {
+            provider_id: provider_id.to_owned(),
+            operation,
+            stage,
+            code,
+            outcome_uncertain,
+        });
     }
 }
 
@@ -478,6 +518,7 @@ mod tests {
             streams.clone(),
             Handle::current(),
             state,
+            None,
         ));
         host_frames.send(frame(serde_json::json!({
             "kind":"initialize","nonce":"bm9uY2U",

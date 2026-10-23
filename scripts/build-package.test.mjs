@@ -16,8 +16,9 @@ async function packageFixture(root, { sourceDirectory }) {
   await copyFile(join(repositoryRoot, sourceDirectory, "teamarness.package.json"), join(source, "teamarness.package.json"));
   await copyFile(join(repositoryRoot, sourceDirectory, "ui/package.json"), join(source, "ui/package.json"));
   await writeFile(join(source, "ui-contract.json"), '{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}');
-  await writeFile(join(source, "ui/dist/index.js"), "export const mount = () => () => {};\n");
   const manifest = JSON.parse(await readFile(join(source, "teamarness.package.json"), "utf8"));
+  if (manifest.portContract) await copyFile(join(repositoryRoot, sourceDirectory, manifest.portContract.path), join(source, manifest.portContract.path));
+  await writeFile(join(source, "ui/dist/index.js"), "export const mount = () => () => {};\n");
   for (const { path } of manifest.ui.assets) {
     await writeFile(join(source, "ui/dist", path.slice("ui/".length)), `asset:${path}\n`);
   }
@@ -60,6 +61,11 @@ for (const entry of bundledPackages) {
       assert.match(manifest.backends[0].sha256, /^[0-9a-f]{64}$/);
       assert.equal(manifest.ui.entrypoint.size, "export const mount = () => () => {};\n".length);
       assert.match(manifest.ui.contract.sha256, /^[0-9a-f]{64}$/);
+      if (source.portContract) {
+        assert.match(manifest.portContract.sha256, /^[0-9a-f]{64}$/);
+        assert.notEqual(manifest.portContract.sha256, source.portContract.sha256);
+        assert.deepEqual(await readFile(join(output, source.portContract.path)), await readFile(join(root, entry.sourceDirectory, source.portContract.path)));
+      }
       assert.deepEqual(manifest.ui.assets.map(({ path, size }) => ({ path, size })),
         source.ui.assets.map(({ path }) => ({ path, size: `asset:${path}\n`.length })));
       assert.deepEqual(manifest.extensions, source.extensions);

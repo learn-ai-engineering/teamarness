@@ -145,9 +145,9 @@ The agreed sequence is four workstreams. Each needs its own Scope.
 
 #### Package interface
 
-Implementation in progress: Phase 1 establishes shared declarations and a static authoring catalog; the installation graph, routing, events and Agent integration remain pending.
+Implementation in progress: the declaration, admission, scoped broker, and live event phases are committed on `package-interface`. The final source-built Conversations proof, local observations, documentation, and full verification are in progress. ADR 0026 records the Host-brokered interface.
 
-Workstream `package-interface`. A Package declares the commands, queries, and events it provides and the ones it consumes; the Package Host brokers every call, authorizes by grant with the acting Principal resolved from the Instance binding (ADR 0023), derives the wiring graph from manifests at Package Admission, and activates a provider lazily on first use. This is the interface the Agent Package from `agent-invite` and the Documents Package from `workspace-documents` both need, so it is scheduled first. No change to the Package Process Protocol major, the UI contract, or existing capability families.
+A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract exposes a Person-only post, read-only page, and live coalescible invalidation. The Host derives actor context, but cannot delegate another Package's Agent signing key. Agent runtime, Instance binding, and Agent-authored posts need a separate Agent Package workstream. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
 
 #### Data format versioning
 

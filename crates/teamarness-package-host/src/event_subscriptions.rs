@@ -9,7 +9,7 @@ use teamarness_package_protocol::{
 };
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
-use super::PortBroker;
+use super::{PortBroker, PortObservation, PortStage};
 use crate::protocol::{HostStreamSender, PortQueryStream, StreamEnd};
 use crate::{PackageErrorCode, PackageIdentity, PackageValue, WorkspaceId};
 
@@ -48,6 +48,7 @@ pub(super) struct EventRegistry {
 
 struct Upstream {
     generation: u64,
+    provider_id: String,
     token: u64,
     subscribers: BTreeMap<u64, Subscriber>,
     stopped: Arc<Notify>,
@@ -73,6 +74,10 @@ pub(crate) struct EventSubscription {
     terminal: watch::Receiver<Option<&'static str>>,
     key: EventKey,
     subscriber: u64,
+    consumer_package: String,
+    consumer_generation: u64,
+    provider_id: String,
+    generation: u64,
     _slot: OwnedSemaphorePermit,
     _provider_slot: OwnedSemaphorePermit,
 }
@@ -84,6 +89,7 @@ impl PortBroker {
         workspace: &WorkspaceId,
         installation: &str,
         input: &Map<String, Value>,
+        consumer_generation: u64,
     ) -> Result<EventSubscription, PackageErrorCode> {
         if input.len() != 4
             || !["grant", "contract", "port", "kind"]
@@ -235,6 +241,7 @@ impl PortBroker {
                 key.clone(),
                 Upstream {
                     generation,
+                    provider_id: upstream.id.clone(),
                     token,
                     subscribers: BTreeMap::new(),
                     stopped: stopped.clone(),
@@ -279,14 +286,35 @@ impl PortBroker {
                     bytes: Arc::new(Semaphore::new(SUBSCRIBER_BYTES)),
                 },
             );
+        let upstream = registry.streams.get(&key).expect("upstream inserted");
         Ok(EventSubscription {
             events,
             terminal: terminal_receiver,
             key,
             subscriber,
+            consumer_package: caller.as_str().to_owned(),
+            consumer_generation,
+            provider_id: upstream.provider_id.clone(),
+            generation: upstream.generation,
             _slot: slot,
             _provider_slot: provider_slot,
         })
+    }
+
+    pub(crate) fn record_event_subscription(&self, subscription: &EventSubscription, id: &str) {
+        self.record(PortObservation {
+            kind: "event",
+            contract: Some(subscription.key.2.clone()),
+            port: Some(subscription.key.3.clone()),
+            consumer_id: id.to_owned(),
+            consumer_package: subscription.consumer_package.clone(),
+            consumer_generation: subscription.consumer_generation,
+            provider_id: Some(subscription.provider_id.clone()),
+            provider_generation: Some(subscription.generation),
+            stage: PortStage::Subscribed,
+            code: None,
+            outcome_uncertain: false,
+        });
     }
 
     pub(crate) async fn drop_event_subscription(&self, subscription: &EventSubscription) {
@@ -314,6 +342,21 @@ impl PortBroker {
         use super::super::capability::StreamCommand;
         let mut credit = INITIAL_STREAM_CREDIT as u64;
         let mut sequence = 0;
+        let observation = |stage, code| {
+            self.record(PortObservation {
+                kind: "event",
+                contract: Some(subscription.key.2.clone()),
+                port: Some(subscription.key.3.clone()),
+                consumer_id: id.clone(),
+                consumer_package: subscription.consumer_package.clone(),
+                consumer_generation: subscription.consumer_generation,
+                provider_id: Some(subscription.provider_id.clone()),
+                provider_generation: Some(subscription.generation),
+                stage,
+                code,
+                outcome_uncertain: false,
+            })
+        };
         let reason = loop {
             if *cancelled.borrow() {
                 break "closed";
@@ -333,6 +376,7 @@ impl PortBroker {
                         sequence += 1;
                         credit -= 1;
                         if output.event(&id, sequence, event.payload).await.is_err() { break "process_exited"; }
+                        observation(PortStage::Event, None);
                     }
                     None => break subscription.terminal.borrow().unwrap_or("provider_exited"),
                 },
@@ -354,6 +398,7 @@ impl PortBroker {
         }
         drop(registry);
         output.retire(&id).await;
+        observation(PortStage::Closed, Some(reason));
         let _ = output.close(&id, reason).await;
     }
 }

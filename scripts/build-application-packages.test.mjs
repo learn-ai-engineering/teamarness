@@ -12,6 +12,9 @@ async function packageFixture(root, { sourceDirectory, manifest }) {
   await mkdir(join(source, "ui/dist"), { recursive: true });
   await copyFile(join(repositoryRoot, sourceDirectory, "teamarness.package.json"), join(source, "teamarness.package.json"));
   await writeFile(join(source, "ui-contract.json"), '{"schemaVersion":1,"requests":{},"subscriptions":{}}');
+  if (manifest.portContract) {
+    await copyFile(join(repositoryRoot, sourceDirectory, manifest.portContract.path), join(source, manifest.portContract.path));
+  }
   await writeFile(join(source, "ui/dist/index.js"), "export const mount = () => () => {};\n");
   for (const { path } of manifest.ui.assets) {
     await writeFile(join(source, "ui/dist", path.slice("ui/".length)), `asset:${manifest.identity}\n`);

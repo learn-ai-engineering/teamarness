@@ -413,17 +413,18 @@ impl InstanceActor {
         &self.spec.workspace_name
     }
 
-    pub(crate) async fn port_request(
+    pub(crate) async fn port_request<F: FnOnce(String, u64) + Send + 'static>(
         self: &Arc<Self>,
         kind: PortKind,
         payload: PackageValue,
         permits: RoutePermits,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
+        on_assignment: F,
     ) -> Result<serde_json::Value, WireFailure> {
         if self.state.lock().await.lifecycle == LifecycleState::Admitted {
             self.activate().await?;
         }
-        let (process, id) = {
+        let (process, id, generation) = {
             let mut state = self.state.lock().await;
             if state.lifecycle != LifecycleState::Active {
                 return Err(WireFailure::new(PackageErrorCode::ProcessExited));
@@ -434,7 +435,7 @@ impl InstanceActor {
                 .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
             state.next_wire_id = state.next_wire_id.saturating_add(1);
             let id = format!("h:port-{}-{}", state.generation, state.next_wire_id);
-            (process, id)
+            (process, id, state.generation)
         };
         let provider = process
             .port_routes
@@ -447,6 +448,7 @@ impl InstanceActor {
             if let Some(code) = process.client.failure() {
                 return Err(WireFailure::new(code));
             }
+            on_assignment(id.clone(), generation);
             match kind {
                 PortKind::Command => {
                     process

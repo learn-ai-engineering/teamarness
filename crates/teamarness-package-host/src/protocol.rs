@@ -712,6 +712,7 @@ pub(crate) trait CapabilityHandler: Send + Sync {
         grant: Option<&'a str>,
         payload: &'a Value,
         started: Arc<std::sync::atomic::AtomicBool>,
+        consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     >;
@@ -753,6 +754,7 @@ impl CapabilityHandler for RejectCapabilities {
         _grant: Option<&'a str>,
         _payload: &'a Value,
         _started: Arc<std::sync::atomic::AtomicBool>,
+        _consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
@@ -1022,7 +1024,7 @@ async fn reader_task<R>(
                     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let result = tokio::time::timeout(
                         limits.capability_call,
-                        capabilities.call(grant.as_deref(), &payload, started.clone()),
+                        capabilities.call(grant.as_deref(), &payload, started.clone(), &id),
                     )
                     .await
                     .unwrap_or_else(|_| {
@@ -1304,7 +1306,7 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
     }
 }
 
-fn capability_code(code: PackageErrorCode) -> &'static str {
+pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
     match code {
         PackageErrorCode::CapabilityUnavailable => "capability_unavailable",
         PackageErrorCode::CapabilityVersionUnsupported => "capability_version_unsupported",
