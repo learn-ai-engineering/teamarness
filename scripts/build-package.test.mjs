@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -74,6 +74,27 @@ for (const entry of bundledPackages) {
     });
   });
 }
+
+test("builder stages a declared nested Port document path", async () => {
+  const entry = bundledPackages.find(({ manifest }) => manifest.portContract);
+  assert.ok(entry, "a bundled Package provides a Port document");
+  await withRoot("teamarness-package-build-nested-port-", async (root) => {
+    const { manifest, backend } = await packageFixture(root, entry);
+    const source = join(root, entry.sourceDirectory);
+    await mkdir(join(source, "contracts"), { recursive: true });
+    await rename(join(source, manifest.portContract.path), join(source, "contracts/ports.json"));
+    manifest.portContract.path = "contracts/ports.json";
+    await writeFile(join(source, "teamarness.package.json"), JSON.stringify(manifest));
+    const output = await buildPackage({
+      repositoryRoot: root, sourceDirectory: entry.sourceDirectory, backendPath: backend,
+      skipBuilds: true, skipUiBuild: true,
+    });
+    assert.deepEqual(
+      await readFile(join(output, "contracts/ports.json")),
+      await readFile(join(source, "contracts/ports.json")),
+    );
+  });
+});
 
 test("builder applies an explicit Package version", async () => {
   await withRoot("teamarness-package-build-version-", async (root) => {

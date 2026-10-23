@@ -245,6 +245,30 @@ async fn real_sdk_consumer_posts_invalidates_recovers_and_converges() {
     assert_eq!(result["denied"], "ungranted_port");
     assert_eq!(result["malformed"], "port_request_invalid");
     assert_eq!(result["forged"], "capability_request_invalid");
+    assert_eq!(result["hidden"], "provider_error");
+    let failed_post = trace
+        .iter()
+        .find(|event| {
+            event.kind == "command"
+                && event.port.as_deref() == Some("message.post")
+                && event.stage == teamarness_package_host::PortStage::Failed
+                && event.provider_id.is_some()
+        })
+        .expect("real Provider refusal must retain the p: to h: join");
+    assert!(failed_post.consumer_id.starts_with("p:"));
+    let failed_provider_id = failed_post.provider_id.as_deref().unwrap();
+    assert!(failed_provider_id.starts_with("h:port-"));
+    assert!(
+        poll_short(|| async {
+            provider_logged(
+                &alice_private.join("packages/logs"),
+                failed_provider_id,
+                "Failed",
+            )
+        })
+        .await,
+        "Provider SDK's failed h: diagnostic must join the Host's p: route"
+    );
     let author = alice_core.public_identity().to_string();
     let messages = result["recovered"]["messages"].as_array().unwrap();
     for text in ["port-proof-first", "port-proof-second"] {

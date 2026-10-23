@@ -20,6 +20,7 @@ pub(crate) struct AdmissionReport {
     pub(crate) catalog: Vec<crate::AuthoringCatalogEntry>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Admission {
     pub(crate) backend_path: PathBuf,
     pub(crate) ui: Arc<AdmittedUi>,
@@ -200,92 +201,114 @@ pub(crate) fn admit(
             }
         }
     }
-    // BTreeMap order is stable regardless of registration order. A still-valid incumbent
-    // wins over a newly installed, lexically earlier contender.
-    let mut providers = BTreeMap::new();
-    loop {
-        providers.clear();
-        let mut losers = BTreeSet::new();
-        for (contract, all_candidates) in &claims {
-            let mut candidates: Vec<_> = all_candidates
-                .iter()
-                .filter(|candidate| eligible.contains_key(*candidate))
-                .cloned()
-                .collect();
-            if candidates.is_empty() {
-                continue;
-            }
-            candidates.sort_by_key(|id| {
-                let source = eligible[id].0.source;
-                (matches!(source, PackageSourceKind::Local), id.clone())
-            });
-            let winner = incumbent
-                .get(contract)
-                .and_then(|id| candidates.iter().find(|candidate| candidate.as_str() == id))
-                .cloned()
-                .unwrap_or_else(|| candidates[0].clone());
-            losers.extend(
-                candidates
-                    .into_iter()
-                    .filter(|candidate| *candidate != winner),
-            );
-            providers.insert(contract.clone(), winner);
-        }
-        if losers.is_empty() {
-            break;
-        }
-        for candidate in losers {
-            eligible.remove(&candidate);
-            diagnostics.push(diagnostic(
-                PackageErrorCode::PortProviderConflict,
-                PackageErrorStage::Admission,
-                Some(candidate),
-            ));
-        }
-    }
-
-    let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
-    // Reject required cycles before propagating missing dependencies, so every member of
-    // a cycle receives the same stable cycle verdict.
-    let cycle_members = required_cycle_members(&eligible, &providers);
-    for identity in cycle_members {
-        remaining.remove(&identity);
-        diagnostics.push(diagnostic(
-            PackageErrorCode::PortDependencyCycle,
-            PackageErrorStage::Admission,
-            Some(identity),
-        ));
-    }
-    loop {
-        let failures: Vec<_> = remaining
-            .iter()
-            .filter_map(|identity| {
-                let admission = &eligible[identity].1;
-                admission
-                    .manifest
-                    .consumed_ports
+    // Conflict selection is provisional until required dependencies have settled. A
+    // graph-invalid winner must not permanently displace a viable rival on reopen.
+    let mut candidates = eligible;
+    let (mut eligible, providers, remaining) = loop {
+        let mut eligible = candidates.clone();
+        let mut trial_diagnostics = Vec::new();
+        let mut providers = BTreeMap::new();
+        // BTreeMap order is stable regardless of registration order. A still-valid
+        // incumbent wins over a newly installed, lexically earlier contender.
+        loop {
+            providers.clear();
+            let mut losers = BTreeSet::new();
+            for (contract, all_candidates) in &claims {
+                let mut contenders: Vec<_> = all_candidates
                     .iter()
-                    .filter(|request| request.required)
-                    .find_map(|request| {
-                        let availability = resolve(request, &providers, &eligible, &remaining);
-                        availability
-                            .unavailable
-                            .map(|code| (identity.clone(), code))
-                    })
-            })
-            .collect();
-        if failures.is_empty() {
-            break;
+                    .filter(|candidate| eligible.contains_key(*candidate))
+                    .cloned()
+                    .collect();
+                if contenders.is_empty() {
+                    continue;
+                }
+                contenders.sort_by_key(|id| {
+                    let source = eligible[id].0.source;
+                    (matches!(source, PackageSourceKind::Local), id.clone())
+                });
+                let winner = incumbent
+                    .get(contract)
+                    .and_then(|id| contenders.iter().find(|candidate| candidate.as_str() == id))
+                    .cloned()
+                    .unwrap_or_else(|| contenders[0].clone());
+                losers.extend(
+                    contenders
+                        .into_iter()
+                        .filter(|candidate| *candidate != winner),
+                );
+                providers.insert(contract.clone(), winner);
+            }
+            if losers.is_empty() {
+                break;
+            }
+            for candidate in losers {
+                eligible.remove(&candidate);
+                trial_diagnostics.push(diagnostic(
+                    PackageErrorCode::PortProviderConflict,
+                    PackageErrorStage::Admission,
+                    Some(candidate),
+                ));
+            }
         }
-        for (identity, code) in failures {
+
+        let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
+        // Reject required cycles before propagating missing dependencies.
+        for identity in required_cycle_members(&eligible, &providers) {
             remaining.remove(&identity);
-            diagnostics.push(diagnostic(
-                code,
+            trial_diagnostics.push(diagnostic(
+                PackageErrorCode::PortDependencyCycle,
                 PackageErrorStage::Admission,
                 Some(identity),
             ));
         }
-    }
+        loop {
+            let failures: Vec<_> = remaining
+                .iter()
+                .filter_map(|identity| {
+                    let admission = &eligible[identity].1;
+                    admission
+                        .manifest
+                        .consumed_ports
+                        .iter()
+                        .filter(|request| request.required)
+                        .find_map(|request| {
+                            resolve(request, &providers, &eligible, &remaining)
+                                .unavailable
+                                .map(|code| (identity.clone(), code))
+                        })
+                })
+                .collect();
+            if failures.is_empty() {
+                break;
+            }
+            for (identity, code) in failures {
+                remaining.remove(&identity);
+                trial_diagnostics.push(diagnostic(
+                    code,
+                    PackageErrorStage::Admission,
+                    Some(identity),
+                ));
+            }
+        }
+        let invalid_winners: BTreeSet<_> = providers
+            .values()
+            .filter(|identity| !remaining.contains(*identity))
+            .cloned()
+            .collect();
+        if invalid_winners.is_empty() {
+            diagnostics.extend(trial_diagnostics);
+            break (eligible, providers, remaining);
+        }
+        for identity in invalid_winners {
+            if let Some(reason) = trial_diagnostics
+                .iter()
+                .find(|error| error.affected_package.as_ref() == Some(&identity))
+            {
+                diagnostics.push(reason.clone());
+            }
+            candidates.remove(&identity);
+        }
+    };
     let graph = remaining
         .iter()
         .map(|identity| {

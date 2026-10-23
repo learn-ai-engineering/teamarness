@@ -48,7 +48,11 @@ export async function stagePackageDirectory({
     await writeFile(join(outputDirectory, asset.path), asset.bytes, { mode: 0o600 });
   }
   await writeFile(join(outputDirectory, manifest.ui.contract.path), contract, { mode: 0o600 });
-  if (portContract) await writeFile(join(outputDirectory, manifest.portContract.path), portContract, { mode: 0o600 });
+  if (portContract) {
+    const destination = join(outputDirectory, manifest.portContract.path);
+    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+    await writeFile(destination, portContract, { mode: 0o600 });
+  }
   await writeFile(
     join(outputDirectory, "teamarness.package.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,

@@ -1397,6 +1397,27 @@ impl ProcessClient {
             deadline,
             state_changing,
             None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_observed(
+        &self,
+        id: String,
+        operation: &str,
+        payload: PackageValue,
+        on_dispatch: Box<dyn FnOnce() + Send>,
+    ) -> Result<Value, WireFailure> {
+        self.request_inner(
+            id,
+            operation,
+            None,
+            payload,
+            Duration::from_secs(8),
+            false,
+            None,
+            Some(on_dispatch),
         )
         .await
     }
@@ -1407,6 +1428,7 @@ impl ProcessClient {
         operation: &str,
         payload: PackageValue,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
+        on_dispatch: Box<dyn FnOnce() + Send>,
     ) -> Result<Value, WireFailure> {
         self.request_inner(
             id,
@@ -1416,6 +1438,7 @@ impl ProcessClient {
             Duration::from_secs(8),
             true,
             Some(dispatched),
+            Some(on_dispatch),
         )
         .await
     }
@@ -1431,6 +1454,7 @@ impl ProcessClient {
         deadline: Duration,
         state_changing: bool,
         dispatched: Option<Arc<std::sync::atomic::AtomicBool>>,
+        on_dispatch: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<Value, WireFailure> {
         if self.pending.lock().await.len() >= MAX_IN_FLIGHT_EACH_DIRECTION {
             return Err(WireFailure::new(PackageErrorCode::Overloaded));
@@ -1457,6 +1481,9 @@ impl ProcessClient {
         }
         if let Some(dispatched) = dispatched {
             dispatched.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(on_dispatch) = on_dispatch {
+            on_dispatch();
         }
         match tokio::time::timeout(deadline, &mut receiver).await {
             Ok(Ok(result)) => result.map_err(|mut error| {
@@ -1738,6 +1765,55 @@ mod tests {
             "a committed acknowledgement is not owed twice: the repeat takes \
              the ignore verdict (CF-002), releasing no credit"
         );
+    }
+
+    /// A refused writer enqueue is certain: it must not publish a Provider join.
+    #[tokio::test]
+    async fn refused_port_writer_does_not_publish_dispatch_for_command_or_query() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (input, _peer) = tokio::io::duplex(64);
+        let client = start(input, tokio::io::sink());
+        let _block = client
+            .writer
+            .data_bytes
+            .clone()
+            .try_acquire_many_owned(super::DATA_BYTES as u32)
+            .unwrap();
+        for kind in ["command", "query"] {
+            let observed = Arc::new(AtomicBool::new(false));
+            let flag = observed.clone();
+            let on_dispatch: Box<dyn FnOnce() + Send> = Box::new(move || {
+                flag.store(true, Ordering::Release);
+            });
+            let result = if kind == "command" {
+                client
+                    .request_port(
+                        format!("h:refused-{kind}"),
+                        "teamarness.port.command.v1",
+                        crate::PackageValue::Object(Default::default()),
+                        Arc::new(AtomicBool::new(false)),
+                        on_dispatch,
+                    )
+                    .await
+            } else {
+                client
+                    .request_observed(
+                        format!("h:refused-{kind}"),
+                        "teamarness.port.query.v1",
+                        crate::PackageValue::Object(Default::default()),
+                        on_dispatch,
+                    )
+                    .await
+            };
+            assert_eq!(result.unwrap_err().code, PackageErrorCode::Overloaded);
+            assert!(
+                !observed.load(Ordering::Acquire),
+                "{kind} published a refused route"
+            );
+        }
     }
 
     fn ui_contract() -> std::sync::Arc<crate::ui::AdmittedUi> {

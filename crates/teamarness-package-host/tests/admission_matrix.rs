@@ -890,6 +890,66 @@ fn incumbent_survives_earlier_newcomer_and_invalid_incumbent_is_replaced() {
 
 // Verifies: TEAM.SYS.PKG-R13
 #[test]
+fn dependency_invalid_incumbent_yields_to_a_viable_provider_on_reopen() {
+    let fixture = Fixture::new();
+    fixture.add_application("beta", "com.example.beta", "1.0.0");
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.beta"]
+    );
+    fixture.add_application("alpha", "com.example.alpha", "1.0.0");
+    fixture.add_application("consumer", "com.example.consumer", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.shared", 1)],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let reopened = admit(&fixture.config()).unwrap();
+    assert_eq!(
+        package_ids(&reopened),
+        vec!["com.example.alpha", "com.example.consumer"]
+    );
+    assert!(codes(&reopened).contains(&(
+        "com.example.beta".into(),
+        PackageErrorCode::PortContractMissing
+    )));
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.alpha", "com.example.consumer"]
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
 fn additive_provider_minor_negotiates_highest_minor_in_consumers_range() {
     let fixture = Fixture::new();
     fixture.add_application("provider", "com.example.provider", "1.0.0");

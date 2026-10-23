@@ -244,6 +244,103 @@ pub fn check_additive_minor(
     old: &ProvidedContract,
     new: &ProvidedContract,
 ) -> Result<(), ContractError> {
+    // A standalone contract has no document definitions to compare. Fail closed
+    // rather than accepting an unchanged $ref whose meaning changed elsewhere.
+    if old.ports.iter().chain(&new.ports).any(|port| {
+        [&port.request, &port.response, &port.event]
+            .into_iter()
+            .flatten()
+            .any(contains_reference)
+    }) {
+        return Err(violation("port_contract.incompatible_minor"));
+    }
+    compare_port_shapes(old, new)
+}
+
+/// Compares versions with their independently compiled document definitions.
+/// Existing referenced definitions must be identical; unrelated new definitions may be added.
+/// # Errors
+/// Returns an incompatibility when an existing Port or its referenced schema changes.
+pub fn check_additive_minor_documents(
+    old: &CompiledPortContracts,
+    new: &CompiledPortContracts,
+    identity: &str,
+) -> Result<(), ContractError> {
+    let old_contract = old
+        .contracts
+        .iter()
+        .find(|entry| entry.identity == identity)
+        .ok_or_else(|| violation("port_contract.incompatible_minor"))?;
+    let new_contract = new
+        .contracts
+        .iter()
+        .find(|entry| entry.identity == identity)
+        .ok_or_else(|| violation("port_contract.incompatible_minor"))?;
+    compare_port_shapes(old_contract, new_contract)?;
+    let old_defs = Value::Object(old.definitions.clone());
+    let new_defs = Value::Object(new.definitions.clone());
+    let mut pending = Vec::new();
+    for port in &old_contract.ports {
+        for schema in [&port.request, &port.response, &port.event]
+            .into_iter()
+            .flatten()
+        {
+            collect_references(schema, &mut pending);
+        }
+    }
+    let mut checked = BTreeSet::new();
+    while let Some(reference) = pending.pop() {
+        if !checked.insert(reference.clone()) {
+            continue;
+        }
+        let pointer = reference
+            .strip_prefix("#/$defs/")
+            .map(|encoded| format!("/{encoded}"))
+            .ok_or_else(|| violation("port_contract.incompatible_minor"))?;
+        let before = old_defs
+            .pointer(&pointer)
+            .ok_or_else(|| violation("port_contract.incompatible_minor"))?;
+        if Some(before) != new_defs.pointer(&pointer) {
+            return Err(violation("port_contract.incompatible_minor"));
+        }
+        collect_references(before, &mut pending);
+    }
+    Ok(())
+}
+
+fn contains_reference(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.contains_key("$ref") || fields.values().any(contains_reference)
+        }
+        Value::Array(items) => items.iter().any(contains_reference),
+        _ => false,
+    }
+}
+
+fn collect_references(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(reference) = fields.get("$ref").and_then(Value::as_str) {
+                output.push(reference.to_owned());
+            }
+            for value in fields.values() {
+                collect_references(value, output);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_references(item, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compare_port_shapes(
+    old: &ProvidedContract,
+    new: &ProvidedContract,
+) -> Result<(), ContractError> {
     if old.identity != new.identity
         || old.major != new.major
         || old.minor >= new.minor

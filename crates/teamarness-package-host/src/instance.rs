@@ -448,25 +448,26 @@ impl InstanceActor {
             if let Some(code) = process.client.failure() {
                 return Err(WireFailure::new(code));
             }
-            on_assignment(id.clone(), generation);
+            let assigned_id = id.clone();
+            let on_dispatch: Box<dyn FnOnce() + Send> =
+                Box::new(move || on_assignment(assigned_id, generation));
             match kind {
                 PortKind::Command => {
                     process
                         .client
-                        .request_port(id, "teamarness.port.command.v1", payload, dispatched)
+                        .request_port(
+                            id,
+                            "teamarness.port.command.v1",
+                            payload,
+                            dispatched,
+                            on_dispatch,
+                        )
                         .await
                 }
                 PortKind::Query => {
                     process
                         .client
-                        .request(
-                            id,
-                            "teamarness.port.query.v1",
-                            None,
-                            payload,
-                            Duration::from_secs(8),
-                            false,
-                        )
+                        .request_observed(id, "teamarness.port.query.v1", payload, on_dispatch)
                         .await
                 }
                 PortKind::Event => Err(WireFailure::new(PackageErrorCode::PortUngranted)),

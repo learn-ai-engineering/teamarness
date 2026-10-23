@@ -158,6 +158,7 @@
           },
           "ports": {
             "type": "array",
+            "maxItems": 256,
             "items": {
               "$ref": "#/$defs/port"
             }
