@@ -53,6 +53,7 @@ export type DocumentRequest = {
 
 export type Edited = {
   readonly "ok": true;
+  readonly "requestId": RequestId;
   readonly "revision": Revision;
 };
 
@@ -75,6 +76,14 @@ export type PersonName = {
 
 export type RecordId = string;
 
+export type RequestId = string;
+
+export type RequestStatus = {
+  readonly "durability": "durable" | "pending" | "unresolved";
+  readonly "inclusion": "included" | "absent" | "unresolved";
+  readonly "requestId": RequestId;
+};
+
 export type Revision = string;
 
 export type Snapshot = {
@@ -92,10 +101,14 @@ export type TextEvent = {
   readonly "documentId": RecordId;
   readonly "editable": boolean;
   readonly "origin"?: "local" | "remote";
+  readonly "reason"?: "identity_conflict";
+  readonly "requestId"?: RequestId;
+  readonly "requestStatuses"?: readonly RequestStatus[];
   readonly "revision": Revision;
   readonly "savedRevision"?: Revision;
   readonly "text"?: string;
   readonly "transfer"?: "begin" | "chunk" | "end";
+  readonly "transferId"?: RequestId;
 };
 
 export type TextOp = {
@@ -140,12 +153,22 @@ export type DocumentsContract = {
         readonly "baseRevision": Revision;
         readonly "documentId": RecordId;
         readonly "ops": readonly TextOp[];
+        readonly "requestId": RequestId;
       }; readonly response: Edited };
     readonly "documents.document.move": { readonly request: {
         readonly "collectionId": RecordId;
         readonly "documentId": RecordId;
       }; readonly response: Appended };
     readonly "documents.document.open": { readonly request: DocumentRequest; readonly response: TextEvent };
+    readonly "documents.document.recover": { readonly request: {
+        readonly "documentId": RecordId;
+        readonly "requestIds": readonly RequestId[];
+        readonly "transferId": RequestId;
+      }; readonly response: {
+        readonly "documentId": RecordId;
+        readonly "revision": Revision;
+        readonly "transferId": RequestId;
+      } };
     readonly "documents.document.rename": { readonly request: {
         readonly "documentId": RecordId;
         readonly "title": Title;

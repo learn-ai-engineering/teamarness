@@ -78,6 +78,7 @@ pub enum IngestResult {
     Duplicate,
     Deferred(String),
     Quarantined(String),
+    IdentityConflict(String),
 }
 
 /// What one ingest committed, plus every body update it made applicable: the record's own
@@ -163,6 +164,161 @@ impl DocumentStore {
             .execute("UPDATE metadata SET cursor=NULL WHERE singleton=1", [])
             .map(|_| ())
             .map_err(rerr)
+    }
+
+    /// Tracks sealed records already projected before this activation. A from-start
+    /// marker cannot certify the old projection unless Core replayed every one.
+    pub fn begin_replay_qualification(&self) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS replay_expected (record_id TEXT PRIMARY KEY);
+             DELETE FROM replay_expected;
+             INSERT INTO replay_expected SELECT record_id FROM records;",
+            )
+            .map_err(rerr)
+    }
+
+    pub fn note_replayed(&self, id: &str) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .execute("DELETE FROM replay_expected WHERE record_id=?1", [id])
+            .map_err(rerr)?;
+        Ok(())
+    }
+
+    pub fn replayed_previous_projection(&self) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM replay_expected)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
+    }
+
+    /// Exact synchronous lookup; absence is meaningful only after qualified replay/open.
+    pub fn edit_identity(&self, id: &str) -> Result<Option<(String, String, String)>, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT record_id,document_id,author FROM edit_identities WHERE request_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(rerr)
+    }
+
+    pub fn identity_conflicted(&self, document: &str) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM document_identity_conflicts WHERE document_id=?1)",
+                [document],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
+    }
+
+    pub fn conflicted_documents(&self) -> Result<Vec<String>, StoreError> {
+        let inner = lock(&self.inner)?;
+        let mut query = inner
+            .conn
+            .prepare("SELECT document_id FROM document_identity_conflicts ORDER BY document_id")
+            .map_err(rerr)?;
+        let rows = query.query_map([], |row| row.get(0)).map_err(rerr)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(rerr)
+    }
+
+    /// Inspect applied and deferred edits before importing any body on restart.
+    pub fn identity_candidates(&self) -> Result<Vec<StoredRecord>, StoreError> {
+        self.records_where(&format!(
+            "purpose='{}' AND (quarantine_code IS NULL OR quarantine_code='{WAITING}')",
+            DomainRecord::EDIT_KIND
+        ))
+    }
+
+    pub fn indexed_edit_record(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+        let Some((record_id, _, _)) = self.edit_identity(id)? else {
+            return Ok(None);
+        };
+        let inner = lock(&self.inner)?;
+        let mut statement = inner.conn.prepare(
+            "SELECT record_id,order_key,author,purpose,signature,sealed_record,cursor,ingestion_ordinal,target
+             FROM records WHERE record_id=?1 AND quarantine_code IS NULL",
+        ).map_err(rerr)?;
+        statement
+            .query_row([record_id], |row| {
+                Ok(StoredRecord {
+                    record_id: row.get(0)?,
+                    order_key: row.get(1)?,
+                    author: row.get(2)?,
+                    purpose: row.get(3)?,
+                    signature: row.get(4)?,
+                    sealed_record: row.get(5)?,
+                    cursor: row.get(6)?,
+                    ingestion_ordinal: row.get::<_, i64>(7)? as u64,
+                    target: row.get(8)?,
+                })
+            })
+            .optional()
+            .map_err(rerr)
+    }
+
+    /// An opened stored row is indexed only after its authenticated bytes agree with its
+    /// immutable metadata. Deferred v4 rows are indexed before retrying their projection;
+    /// a collision is quarantined before its Loro update can be imported.
+    pub fn index_opened_edit(
+        &self,
+        row: &StoredRecord,
+        canonical: &[u8],
+    ) -> Result<bool, StoreError> {
+        let domain = DomainRecord::decode(canonical).map_err(|_| StoreError::Storage)?;
+        let DomainRecord::IdentifiedDocumentEdit {
+            author,
+            document,
+            request_id,
+            ..
+        } = &domain
+        else {
+            return Ok(true);
+        };
+        if row.purpose != domain.kind()
+            || row.author != *author
+            || row.target.as_deref() != Some(document.as_str())
+            || row.record_id.len() != 64
+            || !row
+                .record_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(StoreError::Storage);
+        }
+        let mut inner = lock(&self.inner)?;
+        let tx = inner.conn.transaction().map_err(rerr)?;
+        let valid: Option<Option<String>> = tx.query_row(
+            "SELECT quarantine_code FROM records WHERE record_id=?1 AND sealed_record=?2 AND author=?3 AND purpose=?4 AND target=?5",
+            params![row.record_id, row.sealed_record, row.author, row.purpose, document], |r| r.get(0),
+        ).optional().map_err(rerr)?;
+        if valid != Some(None) && valid.as_ref().and_then(|v| v.as_deref()) != Some(WAITING) {
+            return Err(StoreError::Storage);
+        }
+        let accepted = index_identity(&tx, request_id, &row.record_id, document, author)?;
+        if !accepted {
+            quarantine(&tx, &row.record_id, "request_id_conflict").map_err(rerr)?;
+        }
+        tx.commit().map_err(rerr)?;
+        if !accepted {
+            inner.deferred.remove(&row.record_id);
+        }
+        Ok(accepted)
     }
 
     pub fn record_count(&self) -> Result<u64, StoreError> {
@@ -252,6 +408,61 @@ impl DocumentStore {
                     ) => Some(record_id.to_owned()),
                     _ => None,
                 };
+                let code: Option<String> = transaction
+                    .query_row(
+                        "SELECT quarantine_code FROM records WHERE record_id=?1",
+                        [record_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(rerr)?;
+                if let Some(code) = code {
+                    if let Some(cursor) = cursor {
+                        transaction
+                            .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])
+                            .map_err(rerr)?;
+                    }
+                    transaction.commit().map_err(rerr)?;
+                    on_commit();
+                    let result = if code == "request_id_conflict" {
+                        IngestResult::IdentityConflict(
+                            parsed
+                                .as_ref()
+                                .ok()
+                                .and_then(DomainRecord::target)
+                                .unwrap_or("")
+                                .to_owned(),
+                        )
+                    } else {
+                        IngestResult::Quarantined(code)
+                    };
+                    return Ok(Ingested {
+                        result,
+                        edits: Vec::new(),
+                    });
+                }
+                if let Ok(DomainRecord::IdentifiedDocumentEdit {
+                    author: owner,
+                    document,
+                    request_id,
+                    ..
+                }) = &parsed
+                    && owner == author
+                    && purpose == DomainRecord::EDIT_KIND
+                    && !index_identity(&transaction, request_id, record_id, document, owner)?
+                {
+                    quarantine(&transaction, record_id, "request_id_conflict").map_err(rerr)?;
+                    if let Some(cursor) = cursor {
+                        transaction
+                            .execute("UPDATE metadata SET cursor=?1 WHERE singleton=1", [cursor])
+                            .map_err(rerr)?;
+                    }
+                    transaction.commit().map_err(rerr)?;
+                    on_commit();
+                    return Ok(Ingested {
+                        result: IngestResult::IdentityConflict(document.clone()),
+                        edits: Vec::new(),
+                    });
+                }
                 if created.is_none()
                     && let Some(cursor) = cursor
                 {
@@ -296,8 +507,42 @@ impl DocumentStore {
             .map_err(rerr)?;
         let outcome = match parsed {
             Ok(domain) => {
-                projection::project_domain(&transaction, record_id, order_key, author, &domain)
-                    .map_err(rerr)?
+                if let DomainRecord::IdentifiedDocumentEdit {
+                    author: owner,
+                    document,
+                    request_id,
+                    ..
+                } = &domain
+                    && owner == author
+                    && purpose == DomainRecord::EDIT_KIND
+                    && !index_identity(&transaction, request_id, record_id, document, owner)?
+                {
+                    quarantine(&transaction, record_id, "request_id_conflict").map_err(rerr)?;
+                    transaction.execute(
+                        "UPDATE metadata SET cursor=?1,next_ingestion_ordinal=?2 WHERE singleton=1",
+                        params![cursor, ordinal],
+                    ).map_err(rerr)?;
+                    transaction.commit().map_err(rerr)?;
+                    on_commit();
+                    return Ok(Ingested {
+                        result: IngestResult::IdentityConflict(document.clone()),
+                        edits: Vec::new(),
+                    });
+                }
+                let outcome =
+                    projection::project_domain(&transaction, record_id, order_key, author, &domain)
+                        .map_err(rerr)?;
+                if matches!(outcome.result, IngestResult::Quarantined(_))
+                    && let DomainRecord::IdentifiedDocumentEdit { request_id, .. } = &domain
+                {
+                    transaction
+                        .execute(
+                            "DELETE FROM edit_identities WHERE request_id=?1 AND record_id=?2",
+                            params![request_id, record_id],
+                        )
+                        .map_err(rerr)?;
+                }
+                outcome
             }
             Err(_) => {
                 quarantine(&transaction, record_id, "malformed_record").map_err(rerr)?;
@@ -416,6 +661,18 @@ impl DocumentStore {
         Ok(())
     }
 
+    pub fn has_deferred_records(&self) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code=?1)",
+                [WAITING],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
+    }
+
     pub fn deferred_records(&self) -> Result<Vec<StoredRecord>, StoreError> {
         self.records_where(&format!("quarantine_code='{WAITING}'"))
     }
@@ -510,6 +767,22 @@ impl DocumentStore {
         };
         {
             let mut inner = lock(&self.inner)?;
+            let code: Option<String> = inner
+                .conn
+                .query_row(
+                    "SELECT quarantine_code FROM records WHERE record_id=?1",
+                    [record_id],
+                    |r| r.get(0),
+                )
+                .map_err(rerr)?;
+            if code.as_deref() != Some(WAITING) {
+                return Ok(Ingested {
+                    result: code
+                        .map(IngestResult::Quarantined)
+                        .unwrap_or(IngestResult::Duplicate),
+                    edits: Vec::new(),
+                });
+            }
             inner.deferred.insert(record_id.to_owned(), domain);
         }
         let mut edits = Vec::new();
@@ -537,15 +810,25 @@ impl DocumentStore {
             Some(id) => {
                 validate_sql_identity(id)?;
                 self.records_where(&format!(
-                    "purpose='{}' AND quarantine_code IS NULL AND target='{id}'",
+                    "purpose='{}' AND quarantine_code IS NULL AND target='{id}' AND NOT EXISTS (SELECT 1 FROM document_identity_conflicts WHERE document_id=target)",
                     DomainRecord::EDIT_KIND
                 ))
             }
             None => self.records_where(&format!(
-                "purpose='{}' AND quarantine_code IS NULL",
+                "purpose='{}' AND quarantine_code IS NULL AND NOT EXISTS (SELECT 1 FROM document_identity_conflicts WHERE document_id=target)",
                 DomainRecord::EDIT_KIND
             )),
         }
+    }
+
+    /// Identity conflicts have a document-local guard and must not prevent qualified
+    /// negative-ID proof for an unrelated Document.
+    pub(crate) fn has_unresolved_projection_warnings(&self) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code IS NOT NULL AND quarantine_code NOT IN ('waiting_for_target','request_id_conflict','identity_conflict'))",
+            [], |row| row.get(0),
+        ).map_err(rerr)
     }
 
     pub(crate) fn has_projection_warnings(&self) -> Result<bool, StoreError> {
@@ -691,6 +974,44 @@ impl DocumentStore {
         })
         .collect()
     }
+}
+
+/// Insert only a provenance-consistent identity. Both duplicate and conflicting record IDs
+/// are decided in the same transaction that projects the sealed record and cursor.
+fn index_identity(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    record_id: &str,
+    document: &str,
+    author: &str,
+) -> Result<bool, StoreError> {
+    let prior: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT record_id,document_id,author FROM edit_identities WHERE request_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(rerr)?;
+    if let Some(prior) = prior {
+        if prior == (record_id.to_owned(), document.to_owned(), author.to_owned()) {
+            return Ok(true);
+        }
+        for target in [&prior.1, document] {
+            tx.execute(
+                "INSERT OR IGNORE INTO document_identity_conflicts(document_id) VALUES(?1)",
+                [target],
+            )
+            .map_err(rerr)?;
+        }
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO edit_identities(request_id,record_id,document_id,author) VALUES(?1,?2,?3,?4)",
+        params![id, record_id, document, author],
+    )
+    .map_err(rerr)?;
+    Ok(true)
 }
 
 /// A record identity is 64 lowercase hex characters, so it is safe to splice into a filter.

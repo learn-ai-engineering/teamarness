@@ -77,6 +77,7 @@ export type EditorState = Readonly<{
   text: string;
   revision: string;
   editable: boolean;
+  reason?: "identity_conflict";
   /** An edit request is in flight; further changes wait for its acknowledgement. */
   sending: boolean;
   /** The Backend refused the last edit with a message to show. */
@@ -91,18 +92,21 @@ export type EditorState = Readonly<{
 export class DocumentEditor {
   private state: EditorState;
   private draft: string;
-  private retry: { base: string; ops: TextOp[]; text: string } | null = null;
+  private retry: { id: string; base: string; ops: TextOp[]; text: string } | null = null;
+  private activeRequestId: string | null = null;
+  private recoveryId: string | null = null;
+  private chunkLimit = 8192;
   private inFlightText: string | null = null;
   private savedRevision: string | null = null;
-  private transfer: { revision: string; editable: boolean; chunks: number; parts: string[] } | null = null;
+  private transfer: { revision: string; editable: boolean; chunks: number; parts: string[]; transferId?: string; requestStatuses?: TextEvent["requestStatuses"] } | null = null;
   private abandonedRevision: string | null = null;
   private readonly resync: () => void;
-  private readonly send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>;
+  private readonly send: (documentId: string, baseRevision: string, ops: TextOp[], requestId: string) => Promise<{ revision: string }>;
   private readonly announce: () => void;
 
   constructor(
     initial: TextEvent,
-    send: (documentId: string, baseRevision: string, ops: TextOp[]) => Promise<{ revision: string }>,
+    send: (documentId: string, baseRevision: string, ops: TextOp[], requestId: string) => Promise<{ revision: string }>,
     announce: () => void,
     resync: () => void = () => {},
   ) {
@@ -111,6 +115,7 @@ export class DocumentEditor {
       text: initial.text ?? "",
       revision: initial.revision,
       editable: initial.editable,
+      reason: initial.reason,
       sending: false,
       error: null,
     };
@@ -132,6 +137,14 @@ export class DocumentEditor {
     return this.transfer !== null;
   }
 
+  get outstandingIds(): string[] {
+    return this.activeRequestId === null ? [] : [this.activeRequestId];
+  }
+
+  beginRecovery(transferId: string): void {
+    this.recoveryId = transferId;
+  }
+
   /** The Member typed: record the draft and send the difference when nothing is in flight. */
   input(value: string): void {
     this.draft = value;
@@ -141,12 +154,26 @@ export class DocumentEditor {
   /** A Backend event for this Document: a full text or a delta, local echo or remote. */
   receive(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
     if (event.documentId !== this.state.documentId) return caret;
+    if (event.reason === "identity_conflict") {
+      if (this.draft === this.state.text) this.draft = "";
+      this.transfer = null;
+      this.retry = null;
+      this.activeRequestId = null;
+      this.inFlightText = null;
+      this.state = { ...this.state, text: "", revision: event.revision, editable: false,
+        reason: "identity_conflict", sending: false, error: null };
+      this.announce();
+      return caret;
+    }
+    if (this.state.reason === "identity_conflict") return caret;
     if (Number(event.revision) < Number(this.state.revision)) return caret;
+    if (event.text === undefined && event.transfer === undefined && Number(event.revision) <= Number(this.state.revision)) return caret;
     if (event.transfer === "begin") {
       if (this.transfer !== null && this.transfer.revision !== event.revision) this.requestResync(this.transfer.revision);
       this.abandonedRevision = null;
       this.transfer = event.chunks !== undefined && event.chunks > 0
-        ? { revision: event.revision, editable: event.editable, chunks: event.chunks, parts: [] } : null;
+        ? { revision: event.revision, editable: event.editable, chunks: event.chunks, parts: [],
+          transferId: event.transferId, requestStatuses: event.requestStatuses } : null;
       if (this.transfer === null) this.requestResync(event.revision);
       return caret;
     }
@@ -156,7 +183,7 @@ export class DocumentEditor {
         if (Number(event.revision) > Number(this.state.revision)) this.requestResync(event.revision);
         return caret;
       }
-      if (transfer.revision !== event.revision) return caret;
+      if (transfer.revision !== event.revision || transfer.transferId !== event.transferId) return caret;
       if (event.transfer === "chunk") {
         if (event.chunkIndex !== transfer.parts.length || event.chunk === undefined || transfer.parts.length >= transfer.chunks) {
           this.transfer = null;
@@ -167,7 +194,8 @@ export class DocumentEditor {
       this.transfer = null;
       if (transfer.parts.length !== transfer.chunks) { this.requestResync(event.revision); return caret; }
       return this.receive({ documentId: event.documentId, revision: event.revision,
-        editable: transfer.editable, text: transfer.parts.join(""), savedRevision: event.savedRevision }, caret);
+        editable: transfer.editable, text: transfer.parts.join(""), savedRevision: event.savedRevision,
+        transferId: transfer.transferId, requestStatuses: transfer.requestStatuses, requestId: event.requestId }, caret);
     }
     if (event.text === undefined && Number(event.revision) > Number(this.state.revision) + 1) {
       this.transfer = null;
@@ -177,32 +205,51 @@ export class DocumentEditor {
     if (event.text !== undefined) {
       this.transfer = null;
       this.abandonedRevision = null;
+      const active = this.activeRequestId;
+      const status = event.transferId === this.recoveryId
+        ? event.requestStatuses?.find((entry) => entry.requestId === active) : undefined;
+      if (active !== null && status === undefined && event.requestId !== active) {
+        // A full broadcast from another editor has no provenance for our request.
+        // Preserve the draft; only an identified recovery can decide inclusion.
+        this.requestResync(event.revision);
+        return caret;
+      }
+      if (active !== null && status?.inclusion === "unresolved") {
+        this.state = { ...this.state, error: "The edit could not be saved." };
+        this.announce();
+        return caret;
+      }
       const base = this.state.text;
       const previousDraft = this.draft;
-      // A lagged full recovery can already contain the in-flight edit even when its echo
-      // was missed. In that case only the typing *after* that edit needs rebasing.
-      const pendingBase = this.inFlightText !== null && event.text.includes(this.inFlightText)
-        ? this.inFlightText : base;
+      const included = active !== null && (status?.inclusion === "included" || event.requestId === active);
+      const pendingBase = included && this.inFlightText !== null ? this.inFlightText : base;
       const applied = diffOps(pendingBase, event.text);
       this.state = { ...this.state, text: event.text, revision: event.revision, editable: event.editable };
       this.draft = previousDraft === pendingBase || previousDraft === event.text
         ? event.text : applyOps(event.text, rebase(diffOps(pendingBase, previousDraft), applied));
       if (event.savedRevision !== undefined) this.savedRevision = event.savedRevision;
-      if (this.retry !== null && event.savedRevision === String(Number(this.retry.base) + 1)) {
+      if (status?.inclusion === "absent") {
         this.retry = null;
+        this.activeRequestId = null;
         this.inFlightText = null;
-        this.state = { ...this.state, error: null };
+        this.state = { ...this.state, sending: false, error: null };
+      } else if (active !== null && (status?.durability === "durable" || event.requestId === active && event.savedRevision !== undefined)) {
+        this.retry = null;
+        this.activeRequestId = null;
+        this.inFlightText = null;
+        this.state = { ...this.state, sending: false, error: null };
       }
       this.announce();
-      if (this.retry === null || this.state.error === null) void this.flush();
+      if (this.activeRequestId === null) void this.flush();
       return caret === null ? null : { start: Math.min(caret.start, this.draft.length), end: Math.min(caret.end, this.draft.length) };
     }
     const delta = event.delta ?? [];
     const base = this.state.text;
     const nextBase = applyOps(base, delta);
     this.state = { ...this.state, text: nextBase, revision: event.revision, editable: event.editable };
-    if (event.origin === "local") {
-      // Our own change coming back: the draft already contains it.
+    if (event.requestId !== undefined && event.requestId === this.activeRequestId) {
+      const suffix = this.inFlightText === null ? [] : diffOps(this.inFlightText, this.draft);
+      this.draft = applyOps(nextBase, rebase(suffix, diffOps(this.inFlightText ?? base, nextBase)));
       this.announce();
       return caret;
     }
@@ -231,22 +278,28 @@ export class DocumentEditor {
 
   private async flush(): Promise<void> {
     if (this.state.sending || !this.state.editable) return;
-    const ops = this.retry?.ops ?? diffOps(this.state.text, this.draft);
+    if (this.activeRequestId !== null && this.retry === null) return;
+    const ops = this.retry?.ops ?? boundedOps(diffOps(this.state.text, this.draft), this.chunkLimit);
     if (ops.length === 0) return;
+    const id = this.retry?.id ?? newRequestId();
     const base = this.retry?.base ?? this.state.revision;
-    const sent = this.retry?.text ?? this.draft;
+    const sent = this.retry?.text ?? applyOps(this.state.text, ops);
     this.state = { ...this.state, sending: true, error: null };
+    this.activeRequestId = id;
     this.inFlightText = sent;
     this.announce();
     try {
-      const { revision } = await this.send(this.state.documentId, base, ops);
+      const { revision } = await this.send(this.state.documentId, base, ops, id);
+      if (this.state.reason === "identity_conflict") return;
       this.retry = null;
+      this.activeRequestId = null;
       this.inFlightText = null;
       this.state = Number(this.state.revision) > Number(revision)
         ? { ...this.state, sending: false }
         : { ...this.state, text: sent, revision, sending: false };
     } catch (error) {
-      if (this.savedRevision === String(Number(base) + 1)) {
+      if (this.state.reason === "identity_conflict") return;
+      if (this.activeRequestId === null) {
         this.retry = null;
         this.inFlightText = null;
         this.state = { ...this.state, sending: false, error: null };
@@ -257,10 +310,29 @@ export class DocumentEditor {
       const code = (error as { code?: unknown } | null)?.code;
       if (code === "documents.stale_revision") {
         // A delta is on its way; it will re-flush once applied.
+        this.activeRequestId = null;
+        this.inFlightText = null;
         this.state = { ...this.state, sending: false };
         return;
       }
-      this.retry = { base, ops, text: sent };
+      if (code === "documents.edit_request_too_large" && this.chunkLimit > 256) {
+        this.chunkLimit = Math.max(256, Math.floor(this.chunkLimit / 2));
+        this.retry = null;
+        this.activeRequestId = null;
+        this.inFlightText = null;
+        this.state = { ...this.state, sending: false };
+        void this.flush();
+        return;
+      }
+      if (code === "documents.document_too_large" || code === "documents.edit_request_too_large") {
+        this.retry = null;
+        this.activeRequestId = null;
+        this.inFlightText = null;
+        this.state = { ...this.state, sending: false, error: describe(code) };
+        this.announce();
+        return;
+      }
+      this.retry = { id, base, ops, text: sent };
       this.state = { ...this.state, sending: false, error: describe(code) };
       this.announce();
       return;
@@ -268,6 +340,33 @@ export class DocumentEditor {
     this.announce();
     void this.flush();
   }
+}
+
+function newRequestId(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** One request owns at most 8 KiB of inserted UTF-8, leaving room for one Loro update. */
+function boundedOps(ops: readonly TextOp[], limit: number): TextOp[] {
+  const out: TextOp[] = [];
+  let bytes = 0;
+  for (const op of ops) {
+    if (!("insert" in op)) {
+      out.push(op);
+      continue;
+    }
+    let chunk = "";
+    for (const scalar of op.insert) {
+      const size = new TextEncoder().encode(scalar).length;
+      if (bytes + size > limit) break;
+      chunk += scalar;
+      bytes += size;
+    }
+    if (chunk) out.push({ insert: chunk });
+    if (chunk.length !== op.insert.length || bytes >= limit) break;
+  }
+  return out;
 }
 
 function describe(code: unknown): string {
@@ -281,28 +380,54 @@ function describe(code: unknown): string {
   }
 }
 
-/**
- * Rewrites `pending` (made against the old base) so it applies to the base after `applied`.
- * Retains and deletes skip characters of the new base; each old position maps through the
- * caret transformation of `applied`.
- */
+/** Maps original characters, not intervals; an inserted remote character is never deleted. */
 function rebase(pending: readonly TextOp[], applied: readonly TextOp[]): TextOp[] {
+  const length = pending.reduce((total, op) => total + ("retain" in op ? op.retain : "delete" in op ? op.delete : 0), 0);
+  const positions: (number | null)[] = Array(length + 1).fill(null);
+  let original = 0;
+  let current = 0;
+  for (const op of applied) {
+    if ("insert" in op) {
+      current += Array.from(op.insert).length;
+    } else if ("delete" in op) {
+      original += op.delete;
+    } else {
+      for (let index = 0; index < op.retain && original <= length; index++) positions[original++] = current++;
+    }
+  }
+  while (original <= length) positions[original++] = current++;
   const out: TextOp[] = [];
   let oldPosition = 0;
   let newPosition = 0;
+  let removed = 0;
+  let inserted = 0;
   for (const op of pending) {
-    if ("retain" in op) {
-      oldPosition += op.retain;
-      const target = transformCaret(oldPosition, applied);
-      if (target > newPosition) out.push({ retain: target - newPosition });
-      newPosition = Math.max(newPosition, target);
-    } else if ("insert" in op) {
+    if ("insert" in op) {
       out.push(op);
-    } else {
-      oldPosition += op.delete;
-      const target = transformCaret(oldPosition, applied);
-      if (target > newPosition) out.push({ delete: target - newPosition });
-      newPosition = Math.max(newPosition, target);
+      inserted += Array.from(op.insert).length;
+      newPosition += Array.from(op.insert).length;
+      continue;
+    }
+    const count = "retain" in op ? op.retain : op.delete;
+    for (let index = 0; index < count; index++) {
+      const mapped = positions[oldPosition++];
+      if (mapped === null || mapped === undefined) continue;
+      const target = mapped - removed + inserted;
+      if (target < newPosition) continue;
+      if ("retain" in op) {
+        out.push({ retain: target - newPosition + 1 });
+        newPosition = target + 1;
+      } else {
+        if (target > newPosition) out.push({ retain: target - newPosition });
+        out.push({ delete: 1 });
+        newPosition = target;
+        removed++;
+      }
+    }
+    if ("retain" in op && count > 0 && oldPosition === length && positions[length] !== null) {
+      // Keep an insertion at the last retained boundary before a subsequent local insert.
+      const boundary = (positions[length] ?? newPosition) - removed + inserted;
+      if (boundary > newPosition) { out.push({ retain: boundary - newPosition }); newPosition = boundary; }
     }
   }
   return out;

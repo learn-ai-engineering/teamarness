@@ -1,0 +1,375 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "teamarness.synchronization.immutable-record-log/1.1",
+  "title": "Immutable Record Log capability",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capability",
+    "methods"
+  ],
+  "properties": {
+    "capability": {
+      "const": "teamarness.synchronization.immutable-record-log",
+      "type": "string"
+    },
+    "methods": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "append",
+        "subscribe",
+        "open"
+      ],
+      "properties": {
+        "append": {
+          "$ref": "#/$defs/append"
+        },
+        "subscribe": {
+          "$ref": "#/$defs/subscribe"
+        },
+        "open": {
+          "$ref": "#/$defs/open"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "base64url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[\\x21-\\x7e]+$"
+    },
+    "recordId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "orderKey": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{82}$"
+    },
+    "cursor": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{50}$"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sealed": {
+      "$ref": "#/$defs/base64url",
+      "minLength": 1,
+      "maxLength": 699051
+    },
+    "append": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "response"
+      ],
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "purpose",
+            "canonical"
+          ],
+          "properties": {
+            "purpose": {
+              "$ref": "#/$defs/purpose"
+            },
+            "canonical": {
+              "$ref": "#/$defs/base64url",
+              "minLength": 1,
+              "maxLength": 349526
+            }
+          }
+        },
+        "response": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "recordId",
+            "orderKey",
+            "author",
+            "signature",
+            "sealedRecord",
+            "durability"
+          ],
+          "properties": {
+            "recordId": {
+              "$ref": "#/$defs/recordId"
+            },
+            "orderKey": {
+              "$ref": "#/$defs/orderKey"
+            },
+            "author": {
+              "$ref": "#/$defs/identity"
+            },
+            "signature": {
+              "$ref": "#/$defs/base64url",
+              "minLength": 1
+            },
+            "sealedRecord": {
+              "$ref": "#/$defs/sealed"
+            },
+            "durability": {
+              "const": "committed"
+            }
+          }
+        }
+      }
+    },
+    "subscribe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "events"
+      ],
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "afterCursor"
+          ],
+          "properties": {
+            "afterCursor": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/cursor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/recordEvent"
+              },
+              {
+                "$ref": "#/$defs/stateEvent"
+              },
+              {
+                "$ref": "#/$defs/warningEvent"
+              },
+              {
+                "$ref": "#/$defs/replayEndEvent"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "recordEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "cursor",
+        "recordId",
+        "orderKey",
+        "author",
+        "purpose",
+        "signature",
+        "canonical",
+        "sealedRecord"
+      ],
+      "properties": {
+        "kind": {
+          "const": "record"
+        },
+        "cursor": {
+          "$ref": "#/$defs/cursor"
+        },
+        "recordId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "orderKey": {
+          "$ref": "#/$defs/orderKey"
+        },
+        "author": {
+          "$ref": "#/$defs/identity"
+        },
+        "purpose": {
+          "$ref": "#/$defs/purpose"
+        },
+        "signature": {
+          "$ref": "#/$defs/base64url"
+        },
+        "canonical": {
+          "$ref": "#/$defs/base64url"
+        },
+        "sealedRecord": {
+          "$ref": "#/$defs/sealed"
+        }
+      }
+    },
+    "stateEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "availability",
+        "pendingRecordCount"
+      ],
+      "properties": {
+        "kind": {
+          "const": "state"
+        },
+        "availability": {
+          "enum": [
+            "waiting_for_history_access",
+            "offline",
+            "catching_up",
+            "current"
+          ]
+        },
+        "pendingRecordCount": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        }
+      }
+    },
+    "warningEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "code"
+      ],
+      "properties": {
+        "kind": {
+          "const": "warning"
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        }
+      }
+    },
+    "open": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "results"
+      ],
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sealedRecords"
+          ],
+          "properties": {
+            "sealedRecords": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 32,
+              "items": {
+                "$ref": "#/$defs/sealed"
+              }
+            }
+          }
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/ready"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "waiting_for_history_access",
+                      "wrong_scope",
+                      "corrupt"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "ready": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "recordId",
+        "orderKey",
+        "author",
+        "purpose",
+        "signature",
+        "canonical"
+      ],
+      "properties": {
+        "status": {
+          "const": "ready"
+        },
+        "recordId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "orderKey": {
+          "$ref": "#/$defs/orderKey"
+        },
+        "author": {
+          "$ref": "#/$defs/identity"
+        },
+        "purpose": {
+          "$ref": "#/$defs/purpose"
+        },
+        "signature": {
+          "$ref": "#/$defs/base64url"
+        },
+        "canonical": {
+          "$ref": "#/$defs/base64url"
+        }
+      }
+    },
+    "replayEndEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "cursor",
+        "gapFree"
+      ],
+      "properties": {
+        "kind": {
+          "const": "replay_end"
+        },
+        "cursor": {
+          "$ref": "#/$defs/cursor"
+        },
+        "gapFree": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

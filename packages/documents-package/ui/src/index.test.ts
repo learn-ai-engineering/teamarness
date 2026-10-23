@@ -206,6 +206,32 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("shows a terminal conflict warning without retrying or rendering quarantined text", async () => {
+    let opens = 0;
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.document.open": () => { opens++; return { documentId: doc, revision: "0", editable: true, text: "secret" }; },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "secret" });
+    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: false, reason: "identity_conflict", text: "" });
+    expect(root.querySelector(".editor-status")?.textContent).toContain("Conflicting edit history");
+    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).value).toBe("");
+    ([...root.querySelectorAll(".editor-header button")].find((button) => button.textContent === "Preview") as HTMLButtonElement).click();
+    expect(root.querySelector(".editor-preview")?.innerHTML).toBe("");
+    await fake.emit("documents.changes", snapshot());
+    await tick();
+    expect(opens).toBe(1);
+    await unmount();
+  });
+
   it("retries pending history after availability changes and enables the existing editor", async () => {
     let opens = 0;
     const fake = createFakePackageClient({

@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use teamarness_package_protocol::TOMBSTONE_CAPACITY;
 
+use crate::capability::AppendFence;
 use crate::protocol::{UiEventReceiver, UiEventRoute, WireFailure};
 use crate::supervisor::{self, CRASH_WINDOW, ProcessGeneration, ProcessSpec, RESTART_DELAYS};
 use crate::ui::{AdmittedUi, MAX_UI_SUBSCRIPTIONS_PER_MOUNT};
@@ -26,6 +27,7 @@ struct InstanceState {
     lifecycle: LifecycleState,
     generation: u64,
     process: Option<Arc<ProcessGeneration>>,
+    append_fence: Option<Arc<AppendFence>>,
     failures: VecDeque<Instant>,
     active_since: Option<Instant>,
     mounts: BTreeMap<UiMountId, MountRecord>,
@@ -56,6 +58,7 @@ impl InstanceActor {
                 lifecycle: LifecycleState::Admitted,
                 generation: 0,
                 process: None,
+                append_fence: None,
                 failures: VecDeque::new(),
                 active_since: None,
                 mounts: BTreeMap::new(),
@@ -70,6 +73,7 @@ impl InstanceActor {
     }
 
     pub(crate) async fn activate(self: &Arc<Self>) -> Result<(), WireFailure> {
+        let _gate = self.lifecycle_gate.lock().await;
         self.start_generation(false, true).await
     }
 
@@ -81,9 +85,19 @@ impl InstanceActor {
         let attempts = if automatic_retries { 4 } else { 1 };
         let mut last = WireFailure::new(PackageErrorCode::SpawnFailed);
         for attempt in 0..attempts {
+            // Includes failed handshakes and activations: their capability calls can
+            // outlive the process even when supervisor::spawn returned no generation.
+            let previous = self.state.lock().await.append_fence.clone();
+            if let Some(previous) = previous
+                && !previous.retire(Duration::from_secs(30)).await
+            {
+                self.state.lock().await.lifecycle = LifecycleState::Failed;
+                return Err(WireFailure::new(PackageErrorCode::OutcomeUncertain));
+            }
             if attempt > 0 {
                 tokio::time::sleep(RESTART_DELAYS[attempt - 1]).await;
             }
+            let append_fence = Arc::new(AppendFence::default());
             let generation = {
                 let mut state = self.state.lock().await;
                 if state.shutting_down {
@@ -96,6 +110,7 @@ impl InstanceActor {
                     state.failures.clear();
                 }
                 state.generation += 1;
+                state.append_fence = Some(append_fence.clone());
                 state.lifecycle = if recovering || state.generation > 1 {
                     LifecycleState::Recovering
                 } else {
@@ -103,7 +118,14 @@ impl InstanceActor {
                 };
                 state.generation
             };
-            match supervisor::spawn(&self.spec, generation, recovering || generation > 1).await {
+            match supervisor::spawn(
+                &self.spec,
+                generation,
+                recovering || generation > 1,
+                append_fence,
+            )
+            .await
+            {
                 Ok(process) => {
                     let process = Arc::new(process);
                     {
@@ -273,6 +295,12 @@ impl InstanceActor {
                 .await
                 .map(drop);
             process.shutdown().await;
+        }
+        if let Some(fence) = self.state.lock().await.append_fence.clone()
+            && !fence.retire(Duration::from_secs(30)).await
+        {
+            self.state.lock().await.lifecycle = LifecycleState::Failed;
+            return Err(WireFailure::new(PackageErrorCode::OutcomeUncertain));
         }
         let mut state = self.state.lock().await;
         clear_process_state(&mut state);
@@ -684,7 +712,7 @@ impl InstanceActor {
         });
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> bool {
         // Mark shutdown before waiting for the lifecycle gate so failure monitors and
         // in-flight (re)starts stop creating generations, then serialize with any
         // lifecycle transition that is already running so its process is visible here.
@@ -694,8 +722,15 @@ impl InstanceActor {
         if let Some(process) = process {
             process.shutdown().await;
         }
+        if let Some(fence) = self.state.lock().await.append_fence.clone()
+            && !fence.retire(Duration::from_secs(30)).await
+        {
+            self.state.lock().await.lifecycle = LifecycleState::Failed;
+            return false;
+        }
         let mut state = self.state.lock().await;
         clear_process_state(&mut state);
+        true
     }
 }
 

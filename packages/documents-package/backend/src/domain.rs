@@ -68,6 +68,14 @@ pub enum DomainRecord {
         document: String,
         update: Vec<u8>,
     },
+    /// One identified, bounded request, unlike legacy kind 10 batches.
+    IdentifiedDocumentEdit {
+        author: String,
+        document: String,
+        request_id: String,
+        payload_digest: [u8; 32],
+        update: Vec<u8>,
+    },
     /// A Comment on a Document, optionally replying to a parent Comment and quoting an excerpt.
     CommentAdd {
         author: String,
@@ -98,6 +106,7 @@ pub enum DomainError {
     InvalidName,
     InvalidTitle,
     InvalidUpdate,
+    InvalidRequestId,
     InvalidMarkdown,
     InvalidQuote,
     InvalidTimestamp,
@@ -220,6 +229,37 @@ impl DomainRecord {
         })
     }
 
+    pub fn identified_document_edit(
+        author: &str,
+        document: &str,
+        request_id: &str,
+        payload_digest: &[u8],
+        update: Vec<u8>,
+    ) -> Result<Self, DomainError> {
+        validate_identity(author)?;
+        validate_target(document)?;
+        if request_id.len() != 32
+            || !request_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(DomainError::InvalidRequestId);
+        }
+        let digest: [u8; 32] = payload_digest
+            .try_into()
+            .map_err(|_| DomainError::InvalidUpdate)?;
+        if update.is_empty() || update.len() > MAX_UPDATE {
+            return Err(DomainError::InvalidUpdate);
+        }
+        Ok(Self::IdentifiedDocumentEdit {
+            author: author.into(),
+            document: document.into(),
+            request_id: request_id.into(),
+            payload_digest: digest,
+            update,
+        })
+    }
+
     pub fn comment_add(
         author: &str,
         document: &str,
@@ -293,6 +333,7 @@ impl DomainRecord {
             | Self::DocumentArchive { author, .. }
             | Self::DocumentRestore { author, .. }
             | Self::DocumentEdit { author, .. }
+            | Self::IdentifiedDocumentEdit { author, .. }
             | Self::CommentAdd { author, .. }
             | Self::CommentResolve { author, .. }
             | Self::CommentReopen { author, .. } => author,
@@ -315,6 +356,7 @@ impl DomainRecord {
             | Self::DocumentArchive { document, .. }
             | Self::DocumentRestore { document, .. }
             | Self::DocumentEdit { document, .. }
+            | Self::IdentifiedDocumentEdit { document, .. }
             | Self::CommentAdd { document, .. } => Some(document),
             Self::CommentResolve { comment, .. } | Self::CommentReopen { comment, .. } => {
                 Some(comment)
@@ -333,7 +375,7 @@ impl DomainRecord {
             Self::DocumentMove { .. } => "document.move",
             Self::DocumentArchive { .. } => "document.archive",
             Self::DocumentRestore { .. } => "document.restore",
-            Self::DocumentEdit { .. } => "document.edit",
+            Self::DocumentEdit { .. } | Self::IdentifiedDocumentEdit { .. } => "document.edit",
             Self::CommentAdd { .. } => "comment.add",
             Self::CommentResolve { .. } => "comment.resolve",
             Self::CommentReopen { .. } => "comment.reopen",
@@ -437,6 +479,20 @@ impl DomainRecord {
                 put_text(&mut out, document);
                 put_bytes(&mut out, update);
             }
+            Self::IdentifiedDocumentEdit {
+                author,
+                document,
+                request_id,
+                payload_digest,
+                update,
+            } => {
+                out.push(11);
+                put_text(&mut out, author);
+                put_text(&mut out, document);
+                put_text(&mut out, request_id);
+                out.extend_from_slice(payload_digest);
+                put_bytes(&mut out, update);
+            }
             Self::CommentAdd {
                 author,
                 document,
@@ -522,6 +578,14 @@ impl DomainRecord {
                 let document = take_text(bytes, &mut p)?;
                 let update = take_bytes(bytes, &mut p)?;
                 Self::document_edit(&author, &document, update)?
+            }
+            11 => {
+                let document = take_text(bytes, &mut p)?;
+                let request_id = take_text(bytes, &mut p)?;
+                let digest = bytes.get(p..p + 32).ok_or(DomainError::InvalidLength)?;
+                p += 32;
+                let update = take_bytes(bytes, &mut p)?;
+                Self::identified_document_edit(&author, &document, &request_id, digest, update)?
             }
             20 => {
                 let document = take_text(bytes, &mut p)?;
@@ -673,6 +737,29 @@ mod tests {
         );
         assert!(
             DomainRecord::comment_add_at("alice", TARGET, None, None, "x", Some("01")).is_err()
+        );
+    }
+
+    #[test]
+    fn identified_edit_round_trips_without_changing_kind_ten() {
+        let old = DomainRecord::document_edit("alice", TARGET, vec![1, 2]).unwrap();
+        assert_eq!(old.encode()[6], 10);
+        let identified = DomainRecord::identified_document_edit(
+            "alice",
+            TARGET,
+            &"a".repeat(32),
+            &[3; 32],
+            vec![1, 2],
+        )
+        .unwrap();
+        assert_eq!(identified.encode()[6], 11);
+        assert_eq!(
+            DomainRecord::decode(&identified.encode()).unwrap(),
+            identified
+        );
+        assert!(
+            DomainRecord::identified_document_edit("alice", TARGET, "short", &[3], vec![1])
+                .is_err()
         );
     }
 

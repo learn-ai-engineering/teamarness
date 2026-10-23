@@ -209,11 +209,22 @@ pub(crate) fn project_domain(
         }
         DomainRecord::DocumentEdit {
             document, update, ..
+        }
+        | DomainRecord::IdentifiedDocumentEdit {
+            document, update, ..
         } => {
             tx.execute(
                 "UPDATE records SET target=?2 WHERE record_id=?1",
                 params![record_id, document],
             )?;
+            let conflicted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM document_identity_conflicts WHERE document_id=?1)",
+                [document],
+                |row| row.get(0),
+            )?;
+            if conflicted {
+                return ProjectionOutcome::quarantined(tx, record_id, "identity_conflict");
+            }
             if !document_exists(tx, document)? {
                 return ProjectionOutcome::deferred(tx, record_id, domain);
             }

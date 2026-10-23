@@ -393,11 +393,20 @@ impl PackageHost {
             .lock()
             .await
             .instances
-            .values()
-            .cloned()
+            .iter()
+            .map(|(key, actor)| (key.clone(), actor.clone()))
             .collect::<Vec<_>>();
-        for actor in actors {
-            actor.shutdown().await;
+        let mut blocked = None;
+        for (key, actor) in actors {
+            if !actor.shutdown().await {
+                blocked = Some(key);
+            }
+        }
+        if let Some(key) = blocked {
+            return Err(instance_error(
+                protocol::WireFailure::new(PackageErrorCode::OutcomeUncertain),
+                &key,
+            ));
         }
         {
             let mut data = self.inner.data.lock().await;

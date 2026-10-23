@@ -208,6 +208,8 @@ impl CoreRuntime {
         }
         let journal = records::journal_of(&state.connection, scope)?;
         let head = records::scope_head(&state, scope);
+        let initial_high_water = after.is_none().then(|| head.subscribe().borrow().sequence);
+        let initial_gap_free = journal.is_some();
         Ok(records::RecordSubscription::new(
             Arc::downgrade(&self.state),
             workspace_id,
@@ -215,6 +217,8 @@ impl CoreRuntime {
             scope,
             journal,
             position,
+            initial_high_water,
+            initial_gap_free,
             head,
             self.public_identity,
             Arc::clone(&self.health),

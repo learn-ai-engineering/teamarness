@@ -125,6 +125,64 @@ async fn creator_subscription_bootstraps_scope_and_signed_origin_without_records
     cluster.finish().await;
 }
 
+/// Verifies: TEAM.SYS.TRANS-R07: an empty scope has a finite replay boundary.
+#[tokio::test]
+async fn empty_creator_scope_qualifies_initial_replay_once() {
+    let cluster = SyncCluster::start("empty-replay-boundary", &["a"]).await;
+    let id = cluster
+        .node("a")
+        .create_workspace("Empty replay")
+        .unwrap()
+        .id();
+    let mut subscription = cluster
+        .node("a")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    let first = subscription.next_page(1).unwrap();
+    let boundary = first.initial_replay.expect("empty scope has a boundary");
+    assert!(boundary.gap_free);
+    assert_eq!(boundary.cursor, subscription.cursor());
+    assert!(subscription.next_page(1).unwrap().initial_replay.is_none());
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.TRANS-R07: new appends cannot postpone the initial prefix.
+#[tokio::test]
+async fn initial_replay_stops_at_subscription_high_water_despite_new_appends() {
+    let cluster = SyncCluster::start("fixed-replay-boundary", &["a"]).await;
+    let id = cluster
+        .node("a")
+        .create_workspace("Fixed replay")
+        .unwrap()
+        .id();
+    for index in 0..3_u8 {
+        cluster
+            .node("a")
+            .append_record(id, PACKAGE, "message.post", &[index])
+            .unwrap();
+    }
+    let mut subscription = cluster
+        .node("a")
+        .subscribe_records(id, PACKAGE, None)
+        .unwrap();
+    cluster
+        .node("a")
+        .append_record(id, PACKAGE, "message.post", b"later")
+        .unwrap();
+    assert!(subscription.next_page(2).unwrap().initial_replay.is_none());
+    let boundary_page = subscription.next_page(32).unwrap();
+    assert_eq!(boundary_page.events.len(), 1);
+    let boundary = boundary_page
+        .initial_replay
+        .expect("fixed high-water reached");
+    assert!(boundary.gap_free);
+    assert_eq!(boundary.cursor, Some(boundary_page.events[0].cursor()));
+    let live = subscription.next_page(32).unwrap();
+    assert_eq!(live.events.len(), 1);
+    assert!(live.initial_replay.is_none());
+    cluster.finish().await;
+}
+
 /// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test]
 async fn subscribe_loads_no_backlog() {
@@ -192,6 +250,13 @@ async fn idle_subscriber_holds_no_buffered_events() {
     loop {
         let page = subscription.next_page(32).unwrap();
         assert!(page.events.len() <= 32);
+        if page.initial_replay.is_some() {
+            assert!(
+                page.events.is_empty(),
+                "the fixed prefix was empty at subscribe"
+            );
+            continue;
+        }
         if page.events.is_empty() {
             break;
         }
@@ -301,7 +366,12 @@ async fn subscribe_before_the_scope_exists_waits_for_it() {
         .node("b")
         .subscribe_records(id, PACKAGE, None)
         .expect("a Member subscription opens before it has a content key");
-    assert!(subscription.next_page(32).unwrap().events.is_empty());
+    let waiting = subscription.next_page(32).unwrap();
+    assert!(waiting.events.is_empty());
+    assert!(
+        waiting.initial_replay.is_none(),
+        "unavailable history has no absence proof"
+    );
 
     let waiter = tokio::spawn(async move {
         subscription.changed().await.expect("the runtime is alive");
@@ -325,6 +395,12 @@ async fn subscribe_before_the_scope_exists_waits_for_it() {
         .await
         .expect("the imported key wakes the Member waiter")
         .expect("the waiting task did not panic");
+    let boundary_page = subscription.next_page(32).unwrap();
+    assert!(
+        boundary_page
+            .initial_replay
+            .is_some_and(|boundary| !boundary.gap_free)
+    );
     let page = subscription.next_page(32).unwrap();
     assert_eq!(page.events.len(), 1);
     assert_eq!(page.events[0].record_id(), appended.record_id());
@@ -366,6 +442,10 @@ async fn quarantined_record_is_skipped_and_position_advances() {
         appended[..2].to_vec()
     );
     assert_eq!(page.quarantined_skipped, 1);
+    assert!(
+        page.initial_replay
+            .is_some_and(|boundary| !boundary.gap_free)
+    );
     let next = subscription.next_page(32).unwrap();
     assert!(
         next.events.is_empty() && next.quarantined_skipped == 0,

@@ -72,6 +72,498 @@ mod store_tests {
             .collect()
     }
 
+    #[test]
+    fn replay_qualification_requires_every_previously_projected_record_after_cursor_reset() {
+        let f = fixture();
+        let create = DomainRecord::collection_create(ALICE, "Plans").unwrap();
+        let rename = DomainRecord::collection_rename(ALICE, &hex(64, 1), "Roadmap").unwrap();
+        assert_eq!(ingest(&f.store, 1, ALICE, &create), IngestResult::Applied);
+        assert_eq!(ingest(&f.store, 2, ALICE, &rename), IngestResult::Applied);
+        f.store.begin_replay_qualification().unwrap();
+        f.store.reset_cursor().unwrap();
+        assert!(!f.store.replayed_previous_projection().unwrap());
+        assert_eq!(ingest(&f.store, 1, ALICE, &create), IngestResult::Duplicate);
+        f.store.note_replayed(&hex(64, 1)).unwrap();
+        assert!(
+            !f.store.replayed_previous_projection().unwrap(),
+            "a changed journal with a missing old row cannot prove absence"
+        );
+        assert_eq!(ingest(&f.store, 2, ALICE, &rename), IngestResult::Duplicate);
+        f.store.note_replayed(&hex(64, 2)).unwrap();
+        assert!(f.store.replayed_previous_projection().unwrap());
+        // A new activation takes a fresh prefix; old proof is never reused.
+        f.store.begin_replay_qualification().unwrap();
+        assert!(!f.store.replayed_previous_projection().unwrap());
+    }
+
+    #[test]
+    fn v4_identified_edits_rebuild_exact_index_without_plaintext() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let doc = hex(64, 2);
+        let id = hex(32, 9);
+        let edit =
+            DomainRecord::identified_document_edit(ALICE, &doc, &id, &[7; 32], vec![42]).unwrap();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            ingest(
+                &store,
+                1,
+                ALICE,
+                &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+            );
+            ingest(
+                &store,
+                2,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+            );
+            ingest(
+                &store,
+                3,
+                ALICE,
+                &DomainRecord::document_edit(ALICE, &doc, vec![1]).unwrap(),
+            );
+            ingest(&store, 4, ALICE, &edit);
+        }
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;")
+            .unwrap();
+        drop(connection);
+        let store = DocumentStore::open(&path).unwrap();
+        assert_eq!(
+            store.edit_identity(&id).unwrap(),
+            None,
+            "migration alone is not proof"
+        );
+        let old = store.edit_records(None).unwrap();
+        assert_eq!(old.len(), 2);
+        assert!(
+            store
+                .index_opened_edit(
+                    &old[0],
+                    &DomainRecord::document_edit(ALICE, &doc, vec![1])
+                        .unwrap()
+                        .encode()
+                )
+                .unwrap()
+        );
+        assert_eq!(store.edit_identity(&id).unwrap(), None, "kind 10 has no ID");
+        assert!(store.index_opened_edit(&old[1], &edit.encode()).unwrap());
+        assert_eq!(
+            store.edit_identity(&id).unwrap(),
+            Some((hex(64, 4), doc.clone(), ALICE.into()))
+        );
+        assert_eq!(
+            store.indexed_edit_record(&id).unwrap().unwrap().record_id,
+            hex(64, 4)
+        );
+        drop(store);
+        let store = DocumentStore::open(&path).unwrap();
+        assert!(store.index_opened_edit(&old[1], &edit.encode()).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(edit_identities)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            ["request_id", "record_id", "document_id", "author"]
+        );
+        assert_eq!(store.edit_identity(&id).unwrap().unwrap().0, hex(64, 4));
+    }
+
+    #[test]
+    fn opposite_arrival_orders_quarantine_both_documents_and_preserve_unrelated_delivery() {
+        let id = hex(32, 77);
+        let a = hex(64, 2);
+        let b = hex(64, 3);
+        for reversed in [false, true] {
+            let f = fixture();
+            ingest(
+                &f.store,
+                1,
+                ALICE,
+                &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+            );
+            for (seed, title) in [(2, "A"), (3, "B")] {
+                ingest(
+                    &f.store,
+                    seed,
+                    ALICE,
+                    &DomainRecord::document_create(ALICE, &hex(64, 1), title).unwrap(),
+                );
+            }
+            let mut records = vec![(4, ALICE, &a, vec![1]), (5, BOB, &b, vec![2])];
+            if reversed {
+                records.reverse();
+            }
+            for (seed, author, target, update) in records {
+                ingest(
+                    &f.store,
+                    seed,
+                    author,
+                    &DomainRecord::identified_document_edit(
+                        author,
+                        target,
+                        &id,
+                        &[seed as u8; 32],
+                        update,
+                    )
+                    .unwrap(),
+                );
+            }
+            for target in [&a, &b] {
+                assert!(f.store.identity_conflicted(target).unwrap());
+                let later = DomainRecord::document_edit(ALICE, target, vec![3]).unwrap();
+                assert_eq!(
+                    ingest(&f.store, 10 + target.eq(&b) as u64, ALICE, &later),
+                    IngestResult::Quarantined("identity_conflict".into())
+                );
+                assert!(f.store.edit_records(Some(target)).unwrap().is_empty());
+            }
+            assert_eq!(
+                ingest(
+                    &f.store,
+                    12,
+                    ALICE,
+                    &DomainRecord::document_edit(ALICE, &hex(64, 99), vec![4]).unwrap()
+                ),
+                IngestResult::Deferred("waiting_for_target".into())
+            );
+            assert_eq!(f.store.cursor().unwrap(), Some(hex(50, 12)));
+        }
+    }
+
+    #[test]
+    fn exact_index_quarantines_collisions_and_delivers_later_edits_after_eviction() {
+        let f = fixture();
+        let doc = hex(64, 2);
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+        );
+        ingest(
+            &f.store,
+            2,
+            ALICE,
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+        );
+        let first = hex(32, 10);
+        let make = |id: &str, author: &str, document: &str| {
+            DomainRecord::identified_document_edit(author, document, id, &[1; 32], vec![42])
+                .unwrap()
+        };
+        assert_eq!(
+            ingest(&f.store, 3, ALICE, &make(&first, ALICE, &doc)),
+            IngestResult::Applied
+        );
+        for n in 0..=crate::body::MAX_RECENT_IDENTITIES {
+            assert_eq!(
+                ingest(
+                    &f.store,
+                    100 + n as u64,
+                    ALICE,
+                    &make(&hex(32, 100 + n as u64), ALICE, &doc)
+                ),
+                IngestResult::Applied
+            );
+        }
+        for (seed, author, document) in [
+            (500, ALICE, doc.clone()),
+            (501, BOB, doc.clone()),
+            (502, ALICE, hex(64, 99)),
+        ] {
+            assert_eq!(
+                ingest(&f.store, seed, author, &make(&first, author, &document)),
+                IngestResult::IdentityConflict(document)
+            );
+            assert_eq!(f.store.cursor().unwrap(), Some(hex(50, seed)));
+        }
+        assert_eq!(
+            f.store.edit_identity(&first).unwrap().unwrap().0,
+            hex(64, 3)
+        );
+        assert!(f.store.has_projection_warnings().unwrap());
+        assert!(f.store.identity_conflicted(&doc).unwrap());
+        assert!(f.store.identity_conflicted(&hex(64, 99)).unwrap());
+        assert!(f.store.edit_records(None).unwrap().is_empty());
+        assert_eq!(
+            ingest(&f.store, 503, ALICE, &make(&hex(32, 503), ALICE, &doc)),
+            IngestResult::Quarantined("identity_conflict".into())
+        );
+        assert!(f.store.edit_records(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn v4_applied_and_deferred_collision_is_hidden_in_both_rebuild_orders_and_restart() {
+        for reverse in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("documents.sqlite3");
+            let document = hex(64, 2);
+            let id = hex(32, 17);
+            let a =
+                DomainRecord::identified_document_edit(ALICE, &document, &id, &[1; 32], vec![1])
+                    .unwrap();
+            let b = DomainRecord::identified_document_edit(BOB, &document, &id, &[2; 32], vec![2])
+                .unwrap();
+            {
+                let store = DocumentStore::open(&path).unwrap();
+                ingest(
+                    &store,
+                    1,
+                    ALICE,
+                    &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+                );
+                ingest(
+                    &store,
+                    2,
+                    ALICE,
+                    &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+                );
+                assert_eq!(ingest(&store, 3, ALICE, &a), IngestResult::Applied);
+                assert_eq!(
+                    ingest(&store, 4, BOB, &b),
+                    IngestResult::IdentityConflict(document.clone())
+                );
+                store.inner.lock().unwrap().conn.execute(
+                    "UPDATE records SET quarantine_code='waiting_for_target',target=?2 WHERE record_id=?1",
+                    rusqlite::params![hex(64, 4), document],
+                ).unwrap();
+            }
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;").unwrap();
+            drop(connection);
+            let store = DocumentStore::open(&path).unwrap();
+            let mut rows = store.identity_candidates().unwrap();
+            if reverse {
+                rows.reverse();
+            }
+            for row in rows {
+                let canonical = if row.record_id == hex(64, 3) {
+                    a.encode()
+                } else {
+                    b.encode()
+                };
+                store.index_opened_edit(&row, &canonical).unwrap();
+            }
+            assert!(store.identity_conflicted(&document).unwrap());
+            assert!(store.edit_records(Some(&document)).unwrap().is_empty());
+            drop(store);
+            let reopened = DocumentStore::open(&path).unwrap();
+            assert!(reopened.identity_conflicted(&document).unwrap());
+            assert!(reopened.edit_records(Some(&document)).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn v4_deferred_identified_edits_index_before_collision_and_never_apply_quarantine() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 9);
+        let id = hex(32, 17);
+        let old = DomainRecord::identified_document_edit(ALICE, &document, &id, &[1; 32], vec![1])
+            .unwrap();
+        let conflicting =
+            DomainRecord::identified_document_edit(BOB, &document, &id, &[2; 32], vec![2]).unwrap();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            assert!(matches!(
+                ingest(&store, 1, ALICE, &old),
+                IngestResult::Deferred(_)
+            ));
+            assert!(matches!(
+                ingest(&store, 2, BOB, &conflicting),
+                IngestResult::IdentityConflict(_)
+            ));
+            // Simulate a v4 projection that stored both authenticated deferred records,
+            // before the opaque table existed to reject the second ID.
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .conn
+                .execute(
+                    "UPDATE records SET quarantine_code='waiting_for_target',target=?2 WHERE record_id=?1",
+                    rusqlite::params![hex(64, 2), document],
+                )
+                .unwrap();
+        }
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;")
+            .unwrap();
+        drop(connection);
+        let store = DocumentStore::open(&path).unwrap();
+        let rows = store.deferred_records().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(store.edit_identity(&id).unwrap().is_none());
+        assert!(store.index_opened_edit(&rows[0], &old.encode()).unwrap());
+        assert!(matches!(
+            store
+                .retry_deferred(&hex(64, 1), &old.encode())
+                .unwrap()
+                .result,
+            IngestResult::Deferred(_)
+        ));
+        assert!(
+            !store
+                .index_opened_edit(&rows[1], &conflicting.encode())
+                .unwrap()
+        );
+        assert_eq!(store.edit_identity(&id).unwrap().unwrap().0, hex(64, 1));
+        assert!(matches!(
+            store
+                .retry_deferred(&hex(64, 2), &conflicting.encode())
+                .unwrap()
+                .result,
+            IngestResult::Quarantined(_)
+        ));
+        // A collision keeps the target unavailable even after its create arrives.
+        assert_eq!(
+            ingest(&store, 3, BOB, &conflicting),
+            IngestResult::IdentityConflict(document.clone())
+        );
+        assert!(matches!(
+            ingest(
+                &store,
+                4,
+                ALICE,
+                &DomainRecord::identified_document_edit(
+                    ALICE,
+                    &document,
+                    &hex(32, 99),
+                    &[3; 32],
+                    vec![3]
+                )
+                .unwrap()
+            ),
+            IngestResult::Quarantined(ref code) if code == "identity_conflict"
+        ));
+        ingest(
+            &store,
+            8,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+        );
+        let created = store
+            .ingest_with_commit(
+                &document,
+                &hex(82, 9),
+                ALICE,
+                "document.create",
+                "sig",
+                &DomainRecord::document_create(ALICE, &hex(64, 8), "Notes")
+                    .unwrap()
+                    .encode(),
+                b"sealed",
+                None,
+                &|| {},
+            )
+            .unwrap();
+        assert_eq!(
+            created.edits.len(),
+            0,
+            "a conflicted target cannot import even its original deferred edit"
+        );
+        assert_eq!(store.cursor().unwrap(), Some(hex(50, 8)));
+    }
+
+    #[test]
+    fn conflict_marker_failure_rolls_back_both_quarantine_and_cursor() {
+        let f = fixture();
+        let document = hex(64, 2);
+        let id = hex(32, 1);
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+        );
+        ingest(
+            &f.store,
+            2,
+            ALICE,
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+        );
+        let first =
+            DomainRecord::identified_document_edit(ALICE, &document, &id, &[1; 32], vec![1])
+                .unwrap();
+        let second =
+            DomainRecord::identified_document_edit(BOB, &document, &id, &[2; 32], vec![2]).unwrap();
+        ingest(&f.store, 3, ALICE, &first);
+        let cursor = f.store.cursor().unwrap();
+        f.store.inner.lock().unwrap().conn.execute_batch(
+            "CREATE TRIGGER reject_conflict BEFORE INSERT ON document_identity_conflicts BEGIN SELECT RAISE(ABORT, 'fault'); END;"
+        ).unwrap();
+        assert!(
+            f.store
+                .ingest(
+                    &hex(64, 4),
+                    &hex(82, 4),
+                    BOB,
+                    second.kind(),
+                    "sig",
+                    &second.encode(),
+                    b"sealed",
+                    Some(&hex(50, 4))
+                )
+                .is_err()
+        );
+        assert_eq!(f.store.cursor().unwrap(), cursor);
+        assert_eq!(f.store.record_count().unwrap(), 3);
+        assert!(!f.store.identity_conflicted(&document).unwrap());
+        assert_eq!(f.store.edit_records(Some(&document)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn index_write_failure_rolls_back_sealed_row_and_cursor() {
+        let f = fixture();
+        let doc = hex(64, 2);
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+        );
+        ingest(
+            &f.store,
+            2,
+            ALICE,
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+        );
+        let cursor = f.store.cursor().unwrap();
+        let edit =
+            DomainRecord::identified_document_edit(ALICE, &doc, &hex(32, 7), &[1; 32], vec![1])
+                .unwrap();
+        f.store.inner.lock().unwrap().conn.execute_batch(
+            "CREATE TRIGGER reject_identity BEFORE INSERT ON edit_identities BEGIN SELECT RAISE(ABORT, 'fault'); END;"
+        ).unwrap();
+        assert!(
+            f.store
+                .ingest(
+                    &hex(64, 3),
+                    &hex(82, 3),
+                    ALICE,
+                    edit.kind(),
+                    "sig",
+                    &edit.encode(),
+                    b"sealed",
+                    Some(&hex(50, 3))
+                )
+                .is_err()
+        );
+        assert_eq!(f.store.cursor().unwrap(), cursor);
+        assert_eq!(f.store.record_count().unwrap(), 2);
+        assert!(f.store.edit_identity(&hex(32, 7)).unwrap().is_none());
+    }
+
     // Verifies: AC4 Collections and Documents converge regardless of arrival order.
     #[test]
     fn metadata_converges_in_any_arrival_order() {
@@ -351,13 +843,13 @@ mod store_tests {
             ALICE,
             &DomainRecord::collection_create(ALICE, "C").unwrap(),
         );
-        assert_eq!(
+        assert!(matches!(
             store
                 .retry_deferred(&hex(64, 2), &document.encode())
                 .unwrap()
                 .result,
-            IngestResult::Applied
-        );
+            IngestResult::Applied | IngestResult::Duplicate
+        ));
         assert_eq!(store.documents().unwrap().len(), 1);
     }
 

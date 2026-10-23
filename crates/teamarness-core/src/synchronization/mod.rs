@@ -31,7 +31,8 @@ pub(crate) use health::{PeerOutcome, SyncHealthRegistry};
 pub(crate) use operation_store::log_id as operation_log_id;
 pub(crate) use quarantine::RecoveryReport;
 pub use record_subscription::{
-    RecordAvailability, RecordPage, RecordSubscription, SyncAvailability, SyncWarning,
+    InitialReplayBoundary, RecordAvailability, RecordPage, RecordSubscription, SyncAvailability,
+    SyncWarning,
 };
 pub(crate) use worker::SyncWorker;
 

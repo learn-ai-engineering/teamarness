@@ -43,12 +43,12 @@ The signed envelope is binary and length-delimited:
 
 Signatures and payloads use unpadded base64url. Private keys and signing-context selection never cross the process boundary.
 
-## `teamarness.synchronization.immutable-record-log` 1.0
+## `teamarness.synchronization.immutable-record-log` 1.0 and 1.1
 
 This generic capability provides one encrypted, append-only record set for the
 implicit Package Identity, Workspace, Installation, and Package Process
 generation selected by its grant. Requests never repeat those scope selectors.
-The closed machine-readable contract is `immutable-record-log.schema.json`.
+The unchanged 1.0 contract is `immutable-record-log.schema.json`; the additive 1.1 contract is `immutable-record-log-1.1.schema.json`.
 
 ### `append`
 
@@ -72,6 +72,10 @@ State events report availability and a pending record count; warning events
 contain only stable non-sensitive codes. Every event consumes credit. A Package
 commits the cursor with its projection and may safely deduplicate a replay by
 `recordId`.
+
+For a negotiated 1.1 stream starting with `afterCursor:null`, Core captures a journal-scoped fixed high-water while serializing append and subscription. Once bounded pages scan that finite local prefix, the Host sends one separately credited `{kind:"replay_end",cursor,gapFree}` event **after** all earlier records on that same stream. New live appends do not postpone the marker. The cursor includes the journal generation; `gapFree:false` reports unavailable history, quarantined or skipped rows, or an otherwise incomplete prefix, never absence. A resumed cursor, an idle page, `current` health, zero pending count, or remote network progress cannot certify this Installation's from-start prefix. The SDK calls a qualified callback only after successful record ingestion and credit; stream close/cancellation invalidates it. A Package that needs absence proof requires minor 1. A 1.0 stream never receives `replay_end`.
+
+The Host retires a Package Process generation's append admission before replacement activation: queued work is cancelled at Core closure entry; entered work drains through closure exit even if its caller timed out. Incomplete drain leaves that Instance failed, so no new subscription can capture a high-water ahead of a still-running old append. This fence is independent per Instance; the Host-wide limiter only bounds capacity.
 
 The first event of every stream is a `state` event. Afterwards one is sent when
 availability changes, when `pendingRecordCount` changes while not

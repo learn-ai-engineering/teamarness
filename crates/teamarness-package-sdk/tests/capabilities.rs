@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use teamarness_package_protocol::JsonValue;
 use teamarness_package_sdk::capabilities::record_log::{
-    Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
-    SyncState, SyncWarning, run_session,
+    Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, ReplayEnd,
+    SessionOptions, SyncState, SyncWarning, run_session, run_session_from_start,
 };
 use teamarness_package_sdk::capabilities::{membership, record_log, signing, workspace_context};
 use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
@@ -443,6 +443,8 @@ struct TestSink {
     states: Mutex<Vec<SyncState>>,
     warnings: Mutex<Vec<String>>,
     errors: Mutex<Vec<String>>,
+    replay: Mutex<Vec<ReplayEnd>>,
+    invalidations: AtomicUsize,
 }
 
 impl TestSink {
@@ -498,6 +500,14 @@ impl RecordLogSink for TestSink {
     fn on_session_error(&self, error: &BackendError) {
         self.errors.lock().unwrap().push(error.code().to_owned());
     }
+
+    fn on_qualified_replay(&self, boundary: &ReplayEnd) {
+        self.replay.lock().unwrap().push(boundary.clone());
+    }
+
+    fn on_replay_invalidated(&self) {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 struct SessionState {
@@ -505,6 +515,14 @@ struct SessionState {
 }
 
 fn session_router(sink: Arc<TestSink>, options: SessionOptions) -> Router<SessionState> {
+    session_router_mode(sink, options, false)
+}
+
+fn session_router_mode(
+    sink: Arc<TestSink>,
+    options: SessionOptions,
+    from_start: bool,
+) -> Router<SessionState> {
     Router::new(move |activation| {
         let sink = sink.clone();
         let log = RecordLog::from_initialization(
@@ -513,7 +531,17 @@ fn session_router(sink: Arc<TestSink>, options: SessionOptions) -> Router<Sessio
         );
         async move {
             let cancellation = CancellationToken::new();
-            tokio::spawn(run_session(log?, sink, cancellation.clone(), options));
+            let log = log?;
+            if from_start {
+                tokio::spawn(run_session_from_start(
+                    log,
+                    sink,
+                    cancellation.clone(),
+                    options,
+                ));
+            } else {
+                tokio::spawn(run_session(log, sink, cancellation.clone(), options));
+            }
             Ok(SessionState { cancellation })
         }
     })
@@ -536,6 +564,91 @@ async fn start_session(
         .await;
     harness.activate().await.unwrap();
     harness
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn from_start_replay_only_qualifies_after_ingest_and_invalidates_on_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let sink = TestSink::open();
+    *sink.cursor.lock().unwrap() = Some(Cursor::parse(hex(50, 9)).unwrap());
+    sink.gate.store(false, Ordering::SeqCst);
+    let scripted = ScriptedCapability::new();
+    let mut harness = HarnessBuilder::new(
+        session_router_mode(sink.clone(), SessionOptions::default(), true).into_backend(),
+    )
+    .data_directory(directory.path())
+    .capability(record_log::IDENTITY, scripted.clone())
+    .start()
+    .await;
+    harness.activate().await.unwrap();
+    wait_for_opens(&scripted, 1).await;
+    assert_eq!(
+        after_cursor(&scripted.recorded_opens()[0]),
+        &JsonValue::Null
+    );
+    assert!(scripted.stream().send(record_frame(1)).await);
+    let replay = serde_json::json!({"kind":"replay_end", "cursor":hex(50, 1), "gapFree":true});
+    let sender = scripted.stream();
+    let feed = tokio::spawn(async move { sender.send(replay).await });
+    // negative-wait: while record ingestion is gated, no marker callback may run.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(sink.replay.lock().unwrap().is_empty());
+    sink.gate.store(true, Ordering::SeqCst);
+    assert!(feed.await.unwrap());
+    wait_until(
+        || sink.replay.lock().unwrap().len() == 1,
+        "qualified replay callback",
+    )
+    .await;
+    assert_eq!(sink.ingested_ids(), vec![hex(64, 1)]);
+    harness.dispose().await.unwrap();
+    wait_until(
+        || sink.invalidations.load(Ordering::SeqCst) > 0,
+        "stream invalidation",
+    )
+    .await;
+    harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn from_start_replay_restarts_without_callback_after_failed_ingest() {
+    let directory = tempfile::tempdir().unwrap();
+    let sink = TestSink::open();
+    sink.fail_next_ingest.store(true, Ordering::SeqCst);
+    let scripted = ScriptedCapability::new();
+    let mut harness = HarnessBuilder::new(
+        session_router_mode(sink.clone(), SessionOptions::default(), true).into_backend(),
+    )
+    .data_directory(directory.path())
+    .capability(record_log::IDENTITY, scripted.clone())
+    .start()
+    .await;
+    harness.activate().await.unwrap();
+    wait_for_opens(&scripted, 1).await;
+    assert!(scripted.stream().send(record_frame(1)).await);
+    wait_for_opens(&scripted, 2).await;
+    assert!(sink.replay.lock().unwrap().is_empty());
+    assert_eq!(
+        after_cursor(&scripted.recorded_opens()[1]),
+        &JsonValue::Null
+    );
+    assert!(scripted.stream().send(record_frame(1)).await);
+    assert!(
+        scripted
+            .stream()
+            .send(serde_json::json!({
+                "kind":"replay_end", "cursor":hex(50, 1), "gapFree":true
+            }))
+            .await
+    );
+    wait_until(
+        || sink.replay.lock().unwrap().len() == 1,
+        "successful replay after retry",
+    )
+    .await;
+    assert_eq!(sink.ingested_ids(), vec![hex(64, 1)]);
+    harness.dispose().await.unwrap();
+    harness.shutdown().await.unwrap();
 }
 
 async fn wait_for_opens(scripted: &ScriptedCapability, count: usize) {

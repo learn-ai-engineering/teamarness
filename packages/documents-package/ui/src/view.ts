@@ -390,16 +390,18 @@ export class DocumentsView {
       this.textarea.disabled = true;
       return;
     }
-    const { editable, sending, error } = editor.current;
+    const { editable, sending, error, reason } = editor.current;
     this.textarea.disabled = !editable;
-    this.editorStatus.textContent = error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
+    this.editorStatus.textContent = reason === "identity_conflict"
+      ? "Conflicting edit history — document unavailable. Unsaved draft remains only in this window."
+      : error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
     this.syncTextarea(null);
     const preview = this.controller.state.preview;
     this.previewButton.setAttribute("aria-pressed", String(preview));
     this.previewButton.textContent = preview ? "Edit" : "Preview";
     this.textarea.hidden = preview;
     this.preview.hidden = !preview;
-    if (preview) this.preview.innerHTML = renderMarkdown(editor.value);
+    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? "" : renderMarkdown(editor.value);
   }
 
   render(): void {

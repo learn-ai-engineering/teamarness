@@ -5,6 +5,8 @@ import test from 'node:test';
 const directory = new URL('.', import.meta.url);
 const schema = JSON.parse(await readFile(new URL('immutable-record-log.schema.json', directory)));
 const golden = JSON.parse(await readFile(new URL('immutable-record.golden.json', directory)));
+const schema11 = JSON.parse(await readFile(new URL('immutable-record-log-1.1.schema.json', directory)));
+const replay = JSON.parse(await readFile(new URL('immutable-record-replay.golden.json', directory)));
 
 const closed = (value, keys) => assert.deepEqual(Object.keys(value).sort(), [...keys].sort());
 
@@ -14,6 +16,18 @@ test('immutable record capability schema is closed to exactly append subscribe o
   assert.deepEqual(schema.properties.methods.properties && Object.keys(schema.properties.methods.properties).sort(), ['append', 'open', 'subscribe']);
   assert.deepEqual(schema.properties.methods.required, ['append', 'subscribe', 'open']);
   assert.equal(schema.$id, 'teamarness.synchronization.immutable-record-log/1.0');
+});
+
+test('v1.1 adds only a closed credited replay-end event while v1.0 remains unchanged', () => {
+  assert.equal(schema.$defs.subscribe.properties.events.items.oneOf.length, 3);
+  assert.equal(schema11.$id, 'teamarness.synchronization.immutable-record-log/1.1');
+  assert.deepEqual(schema11.$defs.subscribe.properties.events.items.oneOf.slice(0, 3), schema.$defs.subscribe.properties.events.items.oneOf);
+  assert.deepEqual(schema11.$defs.subscribe.properties.events.items.oneOf[3], { $ref: '#/$defs/replayEndEvent' });
+  closed(schema11.$defs.replayEndEvent.properties, ['kind', 'cursor', 'gapFree']);
+  assert.equal(schema11.$defs.replayEndEvent.additionalProperties, false);
+  assert.equal(replay.kind, 'replay_end');
+  assert.match(replay.cursor, new RegExp(schema11.$defs.cursor.pattern));
+  assert.equal(replay.gapFree, true);
 });
 
 test('golden fixture records implicit scope and bounded envelope encodings', () => {

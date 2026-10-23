@@ -14,7 +14,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::capability::{CapabilityRequirement, CapabilityScope, GenerationCapabilities};
+use crate::capability::{
+    AppendFence, CapabilityRequirement, CapabilityScope, GenerationCapabilities,
+};
 use crate::diag::fault;
 use crate::host_store::{HostStore, HostStoreHandle, ProcessLease};
 use crate::manifest::sha256;
@@ -81,6 +83,7 @@ pub(crate) async fn spawn(
     spec: &ProcessSpec,
     generation: u64,
     recovering: bool,
+    append_fence: Arc<AppendFence>,
 ) -> Result<ProcessGeneration, WireFailure> {
     let capabilities = GenerationCapabilities::bind(
         spec.core.clone(),
@@ -93,6 +96,7 @@ pub(crate) async fn spawn(
         &spec.template.capabilities,
         generation,
         spec.calls.limiter.clone(),
+        append_fence,
     )
     .map_err(WireFailure::new)?;
     // Reading and hashing the Backend executable is blocking file work.
@@ -448,7 +452,7 @@ mod tests {
             store: HostStoreHandle::open(private.clone()).await.unwrap(),
         };
 
-        let error = match spawn(&spec, 1, false).await {
+        let error = match spawn(&spec, 1, false, Arc::new(AppendFence::default())).await {
             Ok(_) => panic!("malformed handshake unexpectedly succeeded"),
             Err(error) => error,
         };

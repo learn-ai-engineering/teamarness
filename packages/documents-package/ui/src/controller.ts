@@ -96,7 +96,8 @@ export class DocumentsController {
     // Any committed record may be a Comment on the open Document; refresh its thread.
     void this.refreshComments();
     if (this._state.openDocumentId !== null && this.editor !== null
-      && !this.editor.current.editable && !this.editor.assembling) {
+      && !this.editor.current.editable && !this.editor.assembling
+      && this.editor.current.reason !== "identity_conflict") {
       void this.retryOpen(this._state.openDocumentId, this.openSequence);
     }
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);
@@ -144,7 +145,14 @@ export class DocumentsController {
 
   private async retryOpen(documentId: string, sequence: number): Promise<void> {
     try {
-      await this.client.request("documents.document.open", { documentId });
+      const outstanding = this.editor?.current.documentId === documentId ? this.editor.outstandingIds : [];
+      if (outstanding.length > 0) {
+        const transferId = globalThis.crypto.randomUUID().replaceAll("-", "");
+        this.editor?.beginRecovery(transferId);
+        await this.client.request("documents.document.recover", { documentId, transferId, requestIds: outstanding });
+      } else {
+        await this.client.request("documents.document.open", { documentId });
+      }
     } catch (error) {
       if (!this.disposed && sequence === this.openSequence && !isAbortError(error)) {
         this.update({ error: describeError(error) });
@@ -237,8 +245,8 @@ export class DocumentsController {
       }
       this.editor = new DocumentEditor(
         event.transfer === "begin" ? { documentId: event.documentId, revision: "0", editable: false, text: "" } : event,
-        async (documentId, baseRevision, ops) => {
-          const { revision } = await this.client.request("documents.document.edit", { documentId, baseRevision, ops });
+        async (documentId, baseRevision, ops, requestId) => {
+          const { revision } = await this.client.request("documents.document.edit", { documentId, requestId, baseRevision, ops });
           return { revision };
         },
         this.announce,

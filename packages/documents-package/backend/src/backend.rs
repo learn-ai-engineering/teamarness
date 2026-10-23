@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
 use teamarness_package_sdk::capabilities::record_log::{
-    Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
-    SyncState, SyncWarning, run_session,
+    Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, ReplayEnd,
+    SessionOptions, SyncState, SyncWarning, run_session_from_start,
 };
 use teamarness_package_sdk::{
     BackendError, CancellationToken, Context, Empty, Router, event_channel,
@@ -75,6 +77,9 @@ struct BodyHub {
     metadata_lock: Arc<tokio::sync::Mutex<()>>,
     /// This Installation's Loro peer id, stable across restarts and distinct across Installations.
     peer: u64,
+    qualified: Arc<AtomicBool>,
+    identity_index_complete: Arc<AtomicBool>,
+    identity_lookup_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BodyHub {
@@ -93,6 +98,61 @@ impl BodyHub {
         with(body)
     }
 
+    fn remember_identity(
+        &self,
+        document: &str,
+        id: &str,
+        author: &str,
+        digest: [u8; 32],
+        durable: bool,
+    ) {
+        if self
+            .with_body(document, |body| {
+                body.remember_identity(id.to_owned(), author.to_owned(), digest, durable)
+            })
+            .is_err()
+        {
+            // Conflicting sealed identity or an impossible replay never certifies absence.
+            self.qualified.store(false, Ordering::Release);
+        }
+    }
+
+    /// An unopened deferred edit can conflict with an applied edit. Do not show the
+    /// applied body until that sealed row has been opened and checked.
+    fn refresh_deferred_waiting(&self) -> Result<Vec<String>, BackendError> {
+        let waiting = self.waiting_metadata.lock().unwrap().clone();
+        let targets: HashSet<String> = self
+            .store
+            .deferred_records()
+            .map_err(|_| storage_failed())?
+            .into_iter()
+            .filter(|row| {
+                row.purpose == DomainRecord::EDIT_KIND && waiting.contains(&row.record_id)
+            })
+            .filter_map(|row| row.target)
+            .collect();
+        let mut bodies = self.lock();
+        let mut changed = Vec::new();
+        for document in &targets {
+            bodies
+                .entry(document.clone())
+                .or_insert_with(|| DocumentBody::new(self.peer));
+        }
+        for (document, body) in bodies.iter_mut() {
+            if body.set_waiting_deferred(targets.contains(document)) {
+                changed.push(document.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    fn refresh_identity_index_complete(&self) {
+        let bodies_ready = self.lock().values().all(DocumentBody::editable);
+        let metadata_ready = self.waiting_metadata.lock().unwrap().is_empty();
+        self.identity_index_complete
+            .store(bodies_ready && metadata_ready, Ordering::Release);
+    }
+
     fn append_lock(&self, document: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.append_locks
             .lock()
@@ -105,6 +165,9 @@ impl BodyHub {
     /// Imports body updates a store ingest made applicable and publishes their deltas.
     fn apply_edits(&self, edits: &[(String, Vec<u8>)]) {
         for (document, update) in edits {
+            if self.store.identity_conflicted(document).unwrap_or(true) {
+                continue;
+            }
             let published = self.with_body(document, |body| match body.import(update) {
                 Ok(Some(_)) if !body.editable() => None,
                 Ok(Some(delta)) => Some(json!({
@@ -130,6 +193,23 @@ impl BodyHub {
     }
 
     fn text_events(&self, document: &str) -> Vec<JsonValue> {
+        match self.store.identity_conflicted(document) {
+            Ok(true) => {
+                let revision = self.with_body(document, |body| body.revision());
+                return vec![
+                    json!({"documentId":document, "revision":revision.to_string(),
+                    "editable":false, "text":"", "reason":"identity_conflict"}),
+                ];
+            }
+            Err(_) => {
+                let revision = self.with_body(document, |body| body.revision());
+                return vec![
+                    json!({"documentId":document, "revision":revision.to_string(),
+                    "editable":false, "text":""}),
+                ];
+            }
+            Ok(false) => {}
+        }
         self.with_body(document, |body| {
             full_text_events(
                 document,
@@ -156,11 +236,21 @@ const TEXT_EVENT_BUDGET: usize = 96 * 1024;
 const TEXT_CHUNK_BYTES: usize = 24 * 1024;
 
 fn full_text_events(document: &str, revision: u64, text: &str, editable: bool) -> Vec<JsonValue> {
+    full_text_events_bounded(document, revision, text, editable, TEXT_EVENT_BUDGET)
+}
+
+fn full_text_events_bounded(
+    document: &str,
+    revision: u64,
+    text: &str,
+    editable: bool,
+    budget: usize,
+) -> Vec<JsonValue> {
     let base =
         json!({ "documentId": document, "revision": revision.to_string(), "editable": editable });
     let mut small = base.clone();
     small["text"] = json!(text);
-    if small.to_string().len() <= TEXT_EVENT_BUDGET {
+    if small.to_string().len() <= budget {
         return vec![small];
     }
     let mut chunks = Vec::new();
@@ -249,6 +339,8 @@ pub(crate) struct ActivationHandles {
     pub(crate) sync: Arc<Mutex<SyncReport>>,
     pub(crate) bodies: Bodies,
     pub(crate) waiting_metadata: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    qualified: Arc<AtomicBool>,
 }
 
 pub(crate) type ActivationObserver = Arc<Mutex<Option<ActivationHandles>>>;
@@ -318,8 +410,17 @@ struct CommentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EditRequest {
     document_id: String,
+    request_id: String,
     base_revision: String,
     ops: Vec<TextOp>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoverRequest {
+    document_id: String,
+    transfer_id: String,
+    request_ids: Vec<String>,
 }
 
 /// The Documents Backend.
@@ -344,6 +445,10 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     .map_err(|_| storage_failed())
             })
             .await?;
+            let replay_store = store.clone();
+            teamarness_package_sdk::blocking(&cancellation, move |_| {
+                replay_store.begin_replay_qualification().map_err(|_| storage_failed())
+            }).await?;
             let log = RecordLog::from_initialization(&initialization, capabilities.clone())
                 .map_err(|cause| capability_error("record-log", cause))?;
             let names = PersonNames::from_initialization(&initialization, capabilities)
@@ -359,6 +464,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
                 metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
                 peer: peer_id(&installation),
+                qualified: Arc::new(AtomicBool::new(false)),
+                identity_index_complete: Arc::new(AtomicBool::new(false)),
+                identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
             rehydrate(&store, &log, &hub, &cancellation).await?;
 
@@ -372,6 +480,8 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     sync: sync.clone(),
                     bodies: hub.bodies.clone(),
                     waiting_metadata: hub.waiting_metadata.clone(),
+                    #[cfg(test)]
+                    qualified: hub.qualified.clone(),
                 });
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
@@ -397,6 +507,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
     .on_resume(|state: Arc<DocumentsActive>| async move {
         stop_session(&state).await;
         stop_flusher(&state).await;
+        let replay_store = state.store.clone();
+        tokio::task::spawn_blocking(move || replay_store.begin_replay_qualification())
+            .await.map_err(|_| storage_failed())?.map_err(|_| storage_failed())?;
         let session = start_session(
             &state.store,
             &state.log,
@@ -539,6 +652,57 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         },
     )
     .request(
+        "documents.document.recover",
+        |context: Context<DocumentsActive>, request: RecoverRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            if request.transfer_id.len() != 32 || !request.transfer_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || request.request_ids.len() > 8 || request.request_ids.iter().any(|id| id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))) {
+                return Err(invalid_request());
+            }
+            let hub = &context.state().hub;
+            if context.state().store.identity_conflicted(&request.document_id).map_err(|_| storage_failed())? {
+                let mut event = hub.text_events(&request.document_id).remove(0);
+                event["transferId"] = json!(request.transfer_id);
+                event["requestStatuses"] = json!(request.request_ids.iter().map(|id| json!({
+                    "requestId":id,"inclusion":"unresolved","durability":"unresolved"
+                })).collect::<Vec<_>>());
+                let revision = event["revision"].clone();
+                let _ = hub.events.send(event);
+                return Ok(json!({"documentId":request.document_id,"revision":revision,"transferId":request.transfer_id}));
+            }
+            let author = &context.state().installation;
+            let looked_up = lookup_identities(&context.state().log, &context.state().store, hub, &request.request_ids).await;
+            let mut foreign_ids = HashSet::new();
+            if let Ok(found) = &looked_up {
+                for (id, (document, owner, digest)) in found {
+                    if document == &request.document_id && owner == author {
+                        hub.remember_identity(document, id, owner, *digest, true);
+                    } else {
+                        foreign_ids.insert(id.as_str());
+                    }
+                }
+            }
+            // All fields, including ID status, are one body-lock snapshot.
+            let (revision, text, editable, statuses) = hub.with_body(&request.document_id, |body| {
+                let statuses: Vec<JsonValue> = request.request_ids.iter().map(|id| {
+                    match body.identity(id).filter(|known| known.author == *author) {
+                        Some(known) => json!({"requestId":id,"inclusion":if body.editable() { "included" } else { "unresolved" },"durability": if known.durable { "durable" } else { "pending" }}),
+                        None if looked_up.is_ok() && !foreign_ids.contains(id.as_str()) && hub.qualified.load(Ordering::Acquire) && body.editable() => json!({"requestId":id,"inclusion":"absent","durability":"unresolved"}),
+                        None => json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"}),
+                    }
+                }).collect();
+                (body.revision(), if body.editable() { body.text().to_owned() } else { String::new() }, body.editable(), statuses)
+            });
+            let mut events = full_text_events_bounded(&request.document_id, revision, &text, editable, TEXT_EVENT_BUDGET - 2048);
+            for (index, event) in events.iter_mut().enumerate() {
+                event["transferId"] = json!(request.transfer_id);
+                if index == 0 { event["requestStatuses"] = json!(statuses); }
+            }
+            for event in events { let _ = hub.events.send(event); }
+            Ok(json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}))
+        },
+    )
+    .request(
         "documents.document.edit",
         |context: Context<DocumentsActive>, request: EditRequest| async move {
             require_document(&context, &request.document_id).await?;
@@ -550,12 +714,42 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             let document = request.document_id.clone();
             let append_lock = hub.append_lock(&document);
             let _append_guard = append_lock.lock().await;
+            if context.state().store.identity_conflicted(&document).map_err(|_| storage_failed())? {
+                return Err(error("documents.identity_conflict", false));
+            }
+            if request.request_id.len() != 32 || !request.request_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                return Err(invalid_request());
+            }
+            let author = context.state().installation.clone();
+            let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&(base, &request.ops)).map_err(|_| invalid_request())?).into();
+            let _identity_guard = hub.identity_lookup_lock.lock().await;
+            let found = lookup_identities(&context.state().log, &context.state().store, &hub, std::slice::from_ref(&request.request_id)).await?;
+            if let Some((old_document, old_author, old_digest)) = found.get(&request.request_id) {
+                if old_document != &document || old_author != &author || old_digest != &digest {
+                    return Err(invalid_request());
+                }
+                hub.remember_identity(&document, &request.request_id, &author, digest, true);
+            }
+            // A new ID is absent only after the fenced, gap-free from-start replay and
+            // successful opening of every relevant prior edit.
+            if found.is_empty()
+                && !hub.lock().values().any(|body| body.identity(&request.request_id).is_some())
+                && !hub.qualified.load(Ordering::Acquire) {
+                return Err(error("documents.document_pending", true));
+            }
+            // One ID cannot name a request on another Document or Installation.
+            if hub.lock().iter().any(|(id, body)| id != &document && body.identity(&request.request_id).is_some()) {
+                return Err(invalid_request());
+            }
             let (revision, delta, editable, is_retry) = hub.with_body(&document, |body| {
                 if !body.editable() {
                     return Err(error("documents.document_pending", true));
                 }
-                if let Some(revision) = body.retried_revision(base, &request.ops) {
-                    return Ok((revision, Vec::new(), body.editable(), true));
+                if let Some(known) = body.identity(&request.request_id) {
+                    if known.author != author || known.digest != digest {
+                        return Err(invalid_request());
+                    }
+                    return Ok((known.revision, Vec::new(), body.editable(), true));
                 }
                 if body.revision() != base {
                     return Err(BackendError::new(
@@ -564,12 +758,15 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                         json!({ "revision": body.revision().to_string() }),
                     ));
                 }
-                match body.apply(&request.ops) {
-                    Ok(delta) => {
+                let before = body.text().to_owned();
+                match body.apply_identified(&request.ops, request.request_id.clone()) {
+                    Ok(_) => {
                         body.remember_request(base, &request.ops);
-                        Ok((body.revision(), delta, body.editable(), false))
+                        body.remember_identity(request.request_id.clone(), author.clone(), digest, false).map_err(|_| invalid_request())?;
+                        Ok((body.revision(), crate::body::diff(&before, body.text()), body.editable(), false))
                     }
                     Err(BodyError::TooLarge) => Err(error("documents.document_too_large", false)),
+                    Err(BodyError::RecordTooLarge) => Err(error("documents.edit_request_too_large", false)),
                     Err(BodyError::OutOfRange) => Err(invalid_request()),
                     Err(BodyError::Loro) => Err(error("documents.edit_failed", true)),
                 }
@@ -578,7 +775,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 hub.flush.notify_one();
                 let event = json!({
                     "documentId": document, "revision": revision.to_string(),
-                    "origin": "local", "delta": delta, "editable": editable,
+                    "origin": "local", "requestId": request.request_id, "delta": delta, "editable": editable,
                 });
                 if event.to_string().len() > TEXT_EVENT_BUDGET {
                     for full in hub.text_events(&document) {
@@ -604,7 +801,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 )
             })
             .await?;
-            Ok(json!({ "ok": true, "revision": revision.to_string() }))
+            Ok(json!({ "ok": true, "revision": revision.to_string(), "requestId": request.request_id }))
         },
     )
     .request(
@@ -953,6 +1150,76 @@ fn open_batches(
     })
 }
 
+/// Read only the exact indexed sealed row to confirm a local retry's immutable digest.
+/// A missing row remains unresolved until the qualified replay and all opens succeed.
+async fn lookup_identities(
+    log: &RecordLog,
+    store: &DocumentStore,
+    hub: &BodyHub,
+    ids: &[String],
+) -> Result<HashMap<String, (String, String, [u8; 32])>, BackendError> {
+    let mut found = HashMap::new();
+    for id in ids {
+        if let Some(cached) = hub.lock().iter().find_map(|(document, body)| {
+            body.identity(id)
+                .map(|known| (document.clone(), known.author.clone(), known.digest))
+        }) {
+            found.insert(id.clone(), cached);
+            continue;
+        }
+        let reader = store.clone();
+        let key = id.clone();
+        let row = tokio::task::spawn_blocking(move || reader.indexed_edit_record(&key))
+            .await
+            .map_err(|_| storage_failed())?
+            .map_err(|_| storage_failed())?;
+        let Some(row) = row else {
+            if store
+                .edit_identity(id)
+                .map_err(|_| storage_failed())?
+                .is_some()
+            {
+                return Err(error("documents.document_pending", true));
+            }
+            continue;
+        };
+        let opened = log
+            .open(std::slice::from_ref(&row.sealed_record))
+            .await
+            .map_err(|cause| capability_error("lookup-edit-identity", cause))?;
+        let Some(OpenResult::Ready(record)) = opened.into_iter().next() else {
+            return Err(error("documents.document_pending", true));
+        };
+        if record.record_id.as_str() != row.record_id
+            || record.order_key.as_str() != row.order_key
+            || record.author != row.author
+            || record.purpose != row.purpose
+            || record.signature != row.signature
+        {
+            return Err(error("documents.document_pending", true));
+        }
+        let Ok(DomainRecord::IdentifiedDocumentEdit {
+            author,
+            document,
+            request_id,
+            payload_digest,
+            ..
+        }) = DomainRecord::decode(&record.canonical)
+        else {
+            return Err(error("documents.document_pending", true));
+        };
+        if request_id != *id
+            || author != row.author
+            || row.target.as_deref() != Some(&document)
+            || row.purpose != DomainRecord::EDIT_KIND
+        {
+            return Err(error("documents.document_pending", true));
+        }
+        found.insert(id.clone(), (document, author, payload_digest));
+    }
+    Ok(found)
+}
+
 /// Re-opens the edit records of one Document whose sealed bytes could not be opened before,
 /// so a Document becomes editable as soon as history access arrives.
 async fn reopen_unopened_edits(
@@ -975,6 +1242,7 @@ async fn reopen_unopened_edits(
         changed
     });
     if changed {
+        hub.refresh_identity_index_complete();
         for event in hub.text_events(document) {
             let _ = hub.events.send(event);
         }
@@ -998,18 +1266,66 @@ async fn import_edit_rows(
             .open(&sealed)
             .await
             .map_err(|cause| capability_error("open-edit-records", cause))?;
-        for result in results {
+        if results.len() != batch.len() {
+            return Err(error("documents.document_pending", true));
+        }
+        for (row, result) in batch.iter().zip(results) {
             match result {
-                OpenResult::Ready(record) => {
-                    if let Ok(DomainRecord::DocumentEdit {
-                        document, update, ..
-                    }) = DomainRecord::decode(&record.canonical)
-                    {
-                        hub.apply_edits(&[(document, update)]);
+                OpenResult::Ready(record)
+                    if record.record_id.as_str() == row.record_id
+                        && record.order_key.as_str() == row.order_key
+                        && record.author == row.author
+                        && record.purpose == row.purpose
+                        && record.signature == row.signature =>
+                {
+                    match DomainRecord::decode(&record.canonical) {
+                        Ok(DomainRecord::DocumentEdit {
+                            document, update, ..
+                        }) => hub.apply_edits(&[(document, update)]),
+                        Ok(DomainRecord::IdentifiedDocumentEdit {
+                            author,
+                            document,
+                            request_id,
+                            payload_digest,
+                            update,
+                        }) => {
+                            match hub.store.index_opened_edit(row, &record.canonical) {
+                                Ok(false) => {
+                                    // A newly opened collision invalidates a previously visible body.
+                                    for affected in hub
+                                        .store
+                                        .conflicted_documents()
+                                        .map_err(|_| storage_failed())?
+                                    {
+                                        for event in hub.text_events(&affected) {
+                                            let _ = hub.events.send(event);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Err(_) => {
+                                    hub.qualified.store(false, Ordering::Release);
+                                    unopened += 1;
+                                    continue;
+                                }
+                                Ok(true) => {}
+                            }
+                            hub.apply_edits(&[(document.clone(), update)]);
+                            hub.remember_identity(
+                                &document,
+                                &request_id,
+                                &author,
+                                payload_digest,
+                                true,
+                            );
+                        }
+                        _ => unopened += 1,
                     }
                 }
-                OpenResult::WaitingForHistoryAccess => unopened += 1,
-                OpenResult::WrongScope | OpenResult::Corrupt => {}
+                OpenResult::Ready(_)
+                | OpenResult::WaitingForHistoryAccess
+                | OpenResult::WrongScope
+                | OpenResult::Corrupt => unopened += 1,
             }
         }
     }
@@ -1181,7 +1497,9 @@ async fn append(
     match ingested.result {
         IngestResult::Applied | IngestResult::Duplicate => {}
         IngestResult::Deferred(_) => return Err(error("documents.deferred", true)),
-        IngestResult::Quarantined(_) => return Err(error("documents.rejected", false)),
+        IngestResult::Quarantined(_) | IngestResult::IdentityConflict(_) => {
+            return Err(error("documents.rejected", false));
+        }
     }
     Ok(json!({ "ok": true, "id": id }))
 }
@@ -1238,6 +1556,34 @@ async fn reopen_metadata(
                             .insert(row.record_id.clone());
                     }
                     OpenResult::Ready(record) => {
+                        if deferred && row.purpose == DomainRecord::EDIT_KIND {
+                            if record.record_id.as_str() != row.record_id
+                                || record.order_key.as_str() != row.order_key
+                                || record.author != row.author
+                                || record.purpose != row.purpose
+                                || record.signature != row.signature
+                            {
+                                hub.waiting_metadata
+                                    .lock()
+                                    .unwrap()
+                                    .insert(row.record_id.clone());
+                                continue;
+                            }
+                            if !store
+                                .index_opened_edit(row, &record.canonical)
+                                .map_err(|_| storage_failed())?
+                            {
+                                hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
+                                for affected in
+                                    store.conflicted_documents().map_err(|_| storage_failed())?
+                                {
+                                    for event in hub.text_events(&affected) {
+                                        let _ = hub.events.send(event);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         if deferred {
                             let ingested = store
                                 .retry_deferred(&row.record_id, &record.canonical)
@@ -1251,7 +1597,12 @@ async fn reopen_metadata(
                         hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
                     }
                     OpenResult::WrongScope | OpenResult::Corrupt => {
-                        hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
+                        let mut waiting = hub.waiting_metadata.lock().unwrap();
+                        if deferred && row.purpose == DomainRecord::EDIT_KIND {
+                            waiting.insert(row.record_id.clone());
+                        } else {
+                            waiting.remove(&row.record_id);
+                        }
                     }
                 }
             }
@@ -1267,6 +1618,41 @@ async fn rehydrate(
     hub: &BodyHub,
     cancellation: &CancellationToken,
 ) -> Result<(), BackendError> {
+    // Index *all* authenticated applied and deferred edits before any body can be imported
+    // or a deferred target retried. Neither arrival order nor v4 row order picks a winner.
+    let reader = store.clone();
+    let candidates = teamarness_package_sdk::blocking(cancellation, move |_| {
+        reader.identity_candidates().map_err(|_| storage_failed())
+    })
+    .await?;
+    for batch in open_batches(&candidates) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+        let opened = log
+            .open(&sealed)
+            .await
+            .map_err(|cause| capability_error("index-edit-records", cause))?;
+        if opened.len() != batch.len() {
+            return Err(error("documents.document_pending", true));
+        }
+        for (row, result) in batch.iter().zip(opened) {
+            match result {
+                OpenResult::Ready(record)
+                    if record.record_id.as_str() == row.record_id
+                        && record.order_key.as_str() == row.order_key
+                        && record.author == row.author
+                        && record.purpose == row.purpose
+                        && record.signature == row.signature =>
+                {
+                    store
+                        .index_opened_edit(row, &record.canonical)
+                        .map_err(|_| storage_failed())?;
+                }
+                // Applied rows are counted by import_edit_rows; deferred rows are
+                // tracked by reopen_metadata until they can be opened.
+                _ => {}
+            }
+        }
+    }
     reopen_metadata(store, log, hub, cancellation, false).await?;
     // Rebuild every body from its edit records; a Document whose records cannot be opened yet
     // stays pending until `documents.document.open` retries it.
@@ -1287,6 +1673,8 @@ async fn rehydrate(
         let unopened = import_edit_rows(log, hub, &rows).await?;
         hub.with_body(&document, |body| body.set_unopened(unopened));
     }
+    hub.refresh_deferred_waiting()?;
+    hub.refresh_identity_index_complete();
     Ok(())
 }
 
@@ -1310,7 +1698,9 @@ fn start_flusher(
             let pending: Vec<String> = hub
                 .lock()
                 .iter()
-                .filter(|(_, body)| body.has_pending())
+                .filter(|(id, body)| {
+                    body.has_pending() && !hub.store.identity_conflicted(id).unwrap_or(true)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             if pending.is_empty() {
@@ -1356,7 +1746,15 @@ where
     Fut: Future<Output = Result<(), BackendError>>,
 {
     let mut appended = false;
+    let mut completed_id: Option<String> = None;
     loop {
+        if hub
+            .store
+            .identity_conflicted(document)
+            .map_err(|_| storage_failed())?
+        {
+            return Err(error("documents.identity_conflict", false));
+        }
         let next = hub.with_body(document, |body| {
             body.flush(Instant::now(), force)
                 .and_then(|flushed| flushed.updates.into_iter().next())
@@ -1368,6 +1766,9 @@ where
                     let mut events = hub.text_events(document);
                     if let Some(last) = events.last_mut() {
                         last["savedRevision"] = json!(saved_revision.to_string());
+                        if let Some(id) = completed_id {
+                            last["requestId"] = json!(id);
+                        }
                     }
                     for event in events {
                         let _ = hub.events.send(event);
@@ -1376,7 +1777,18 @@ where
             }
             return Ok(());
         };
+        let id = hub.with_body(document, |body| {
+            body.pending_request_id().map(str::to_owned)
+        });
         append(update).await?;
+        if hub
+            .store
+            .identity_conflicted(document)
+            .map_err(|_| storage_failed())?
+        {
+            return Err(error("documents.identity_conflict", false));
+        }
+        completed_id = id;
         hub.with_body(document, DocumentBody::append_succeeded);
         appended = true;
     }
@@ -1390,7 +1802,23 @@ async fn append_edit(
     document: &str,
     update: Vec<u8>,
 ) -> Result<(), BackendError> {
-    let record = DomainRecord::document_edit(author, document, update).map_err(domain_error)?;
+    let identity = hub.with_body(document, |body| {
+        body.pending_request_id()
+            .and_then(|id| body.identity(id).map(|known| (id.to_owned(), known.digest)))
+    });
+    let record = if let Some((id, digest)) = identity.as_ref() {
+        DomainRecord::identified_document_edit(author, document, id, digest, update)
+    } else {
+        DomainRecord::document_edit(author, document, update)
+    }
+    .map_err(domain_error)?;
+    if hub
+        .store
+        .identity_conflicted(document)
+        .map_err(|_| storage_failed())?
+    {
+        return Err(error("documents.identity_conflict", false));
+    }
     let purpose = record.kind();
     let canonical = record.encode();
     let appended = log
@@ -1419,6 +1847,16 @@ async fn append_edit(
     // activation replay rebuilds the projection from the sealed Core record.
     match ingested {
         Ok(Ok(ingested)) => {
+            if matches!(ingested.result, IngestResult::IdentityConflict(_)) {
+                hub.qualified.store(false, Ordering::Release);
+                return Err(error("documents.request_id_conflict", false));
+            }
+            if hub.store.identity_conflicted(document).unwrap_or(true) {
+                return Err(error("documents.identity_conflict", false));
+            }
+            if let Some((id, digest)) = &identity {
+                hub.remember_identity(document, id, author, *digest, true);
+            }
             let others: Vec<(String, Vec<u8>)> = ingested
                 .edits
                 .into_iter()
@@ -1426,11 +1864,21 @@ async fn append_edit(
                 .collect();
             hub.apply_edits(&others);
         }
-        Ok(Err(cause)) => eprintln!(
-            "documents edit projection failure after append: {}",
-            cause.code()
-        ),
-        Err(cause) => eprintln!("documents edit projection task failed after append: {cause}"),
+        Ok(Err(cause)) => {
+            if let Some((id, digest)) = &identity {
+                hub.remember_identity(document, id, author, *digest, true);
+            }
+            eprintln!(
+                "documents edit projection failure after append: {}",
+                cause.code()
+            );
+        }
+        Err(cause) => {
+            if let Some((id, digest)) = &identity {
+                hub.remember_identity(document, id, author, *digest, true);
+            }
+            eprintln!("documents edit projection task failed after append: {cause}");
+        }
     }
     Ok(())
 }
@@ -1492,7 +1940,7 @@ fn start_session(
         cancellation: CancellationToken::new(),
     });
     let cancellation = sink.cancellation.clone();
-    let task = tokio::spawn(run_session(
+    let task = tokio::spawn(run_session_from_start(
         log.clone(),
         sink,
         cancellation.clone(),
@@ -1544,6 +1992,13 @@ impl RecordLogSink for DocumentsSink {
     }
 
     fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
+        if matches!(
+            DomainRecord::decode(&record.canonical),
+            Ok(DomainRecord::IdentifiedDocumentEdit { .. })
+        ) && !self.hub.identity_index_complete.load(Ordering::Acquire)
+        {
+            return Err(error("documents.document_pending", true));
+        }
         let ingested = self
             .store
             .ingest_with_commit(
@@ -1558,12 +2013,85 @@ impl RecordLogSink for DocumentsSink {
                 &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
             )
             .map_err(|_| storage_failed())?;
+        if let IngestResult::IdentityConflict(ref document) = ingested.result {
+            eprintln!("documents identity conflict quarantined: document={document}");
+            for affected in self
+                .store
+                .conflicted_documents()
+                .map_err(|_| storage_failed())?
+            {
+                for event in self.hub.text_events(&affected) {
+                    let _ = self.hub.events.send(event);
+                }
+            }
+            self.store
+                .note_replayed(record.record_id.as_str())
+                .map_err(|_| storage_failed())?;
+            self.with_report(|report| {
+                let code = "request_id_conflict".to_owned();
+                if !report.warnings.contains(&code) && report.warnings.len() < MAX_WARNINGS {
+                    report.warnings.push(code);
+                }
+            });
+            return Ok(());
+        }
+        if matches!(ingested.result, IngestResult::Quarantined(_)) {
+            // A sealed invalid record is handled; it must not halt unrelated delivery.
+            self.store
+                .note_replayed(record.record_id.as_str())
+                .map_err(|_| storage_failed())?;
+            return Ok(());
+        }
         self.hub.apply_edits(&ingested.edits);
+        if matches!(
+            ingested.result,
+            IngestResult::Applied | IngestResult::Duplicate
+        ) {
+            self.store
+                .note_replayed(record.record_id.as_str())
+                .map_err(|_| storage_failed())?;
+        }
+        if matches!(
+            ingested.result,
+            IngestResult::Applied | IngestResult::Duplicate
+        ) && let Ok(DomainRecord::IdentifiedDocumentEdit {
+            author,
+            document,
+            request_id,
+            payload_digest,
+            ..
+        }) = DomainRecord::decode(&record.canonical)
+        {
+            self.hub
+                .remember_identity(&document, &request_id, &author, payload_digest, true);
+        }
         Ok(())
     }
 
     fn reset_cursor(&self) -> Result<(), BackendError> {
         self.store.reset_cursor().map_err(|_| storage_failed())
+    }
+
+    fn on_qualified_replay(&self, _boundary: &ReplayEnd) {
+        let complete = self.store.replayed_previous_projection().unwrap_or(false)
+            && !self.store.has_deferred_records().unwrap_or(true)
+            && !self
+                .store
+                .has_unresolved_projection_warnings()
+                .unwrap_or(true)
+            && self.hub.identity_index_complete.load(Ordering::Acquire);
+        let bodies = self.hub.lock();
+        self.hub.qualified.store(
+            complete
+                && self.hub.waiting_metadata.lock().unwrap().is_empty()
+                && bodies.values().all(DocumentBody::editable),
+            Ordering::Release,
+        );
+    }
+
+    fn on_replay_invalidated(&self) {
+        let _bodies = self.hub.lock();
+        self.hub.qualified.store(false, Ordering::Release);
     }
 
     fn on_state(&self, state: &SyncState) {
@@ -1584,7 +2112,14 @@ impl RecordLogSink for DocumentsSink {
             if reopen_metadata(&store, &log, &hub, &cancellation, true)
                 .await
                 .is_ok()
+                && let Ok(changed) = hub.refresh_deferred_waiting()
             {
+                hub.refresh_identity_index_complete();
+                for document in changed {
+                    for event in hub.text_events(&document) {
+                        let _ = hub.events.send(event);
+                    }
+                }
                 changes.send_modify(|revision| *revision = revision.saturating_add(1));
             }
         });
@@ -1701,6 +2236,9 @@ mod tests {
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
             metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 3,
+            qualified: Arc::new(AtomicBool::new(false)),
+            identity_index_complete: Arc::new(AtomicBool::new(false)),
+            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let mut alice = DocumentBody::new(1);
         let mut bob = DocumentBody::new(2);
@@ -1763,6 +2301,9 @@ mod tests {
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
             metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 3,
+            qualified: Arc::new(AtomicBool::new(false)),
+            identity_index_complete: Arc::new(AtomicBool::new(false)),
+            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let mut source = DocumentBody::new(1);
         source
@@ -1906,6 +2447,23 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    async fn qualify_empty_history(session: &Session) {
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        assert!(
+            stream
+                .send(json!({"kind":"replay_end", "cursor":hex(50, 0), "gapFree":true}))
+                .await
+        );
+        wait_until(
+            || session.handles.qualified.load(Ordering::Acquire),
+            "qualified initial replay",
+        )
+        .await;
+    }
+
     // Verifies: AC1, AC4 — a local create is appended, projected, and answered with its identity.
     #[tokio::test]
     async fn local_creates_are_appended_projected_and_identified() {
@@ -1952,6 +2510,625 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid.code(), "documents.invalid_name");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sink_opposite_arrival_orders_publish_conflict_without_stopping_other_documents() {
+        let document = hex(64, 2);
+        let other = hex(64, 3);
+        let request_id = hex(32, 9);
+        let mut edits = Vec::new();
+        for (seed, peer, text) in [(4, 91, "one"), (5, 92, "two")] {
+            let mut body = DocumentBody::new(peer);
+            body.apply(&[TextOp::Insert {
+                insert: text.into(),
+            }])
+            .unwrap();
+            let update = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+            edits.push((
+                seed,
+                DomainRecord::identified_document_edit(
+                    "bob",
+                    &document,
+                    &request_id,
+                    &[seed as u8; 32],
+                    update,
+                )
+                .unwrap(),
+            ));
+        }
+        for reverse in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut session = start(directory.path(), scripted_log()).await;
+            let stream = session.scripted.stream();
+            tokio::time::timeout(Duration::from_secs(2), stream.opened())
+                .await
+                .unwrap();
+            for (seed, record) in [
+                (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
+                (
+                    2,
+                    DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+                ),
+                (
+                    3,
+                    DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap(),
+                ),
+            ] {
+                assert!(stream.send(record_frame(seed, "bob", &record)).await);
+                let store = session.handles.store.clone();
+                wait_until(
+                    || store.cursor().unwrap().as_deref() == Some(hex(50, seed).as_str()),
+                    "create",
+                )
+                .await;
+            }
+            let mut ordered = edits.clone();
+            if reverse {
+                ordered.reverse();
+            }
+            for (seed, record) in ordered {
+                assert!(stream.send(record_frame(seed, "bob", &record)).await);
+                let store = session.handles.store.clone();
+                wait_until(
+                    || store.cursor().unwrap().as_deref() == Some(hex(50, seed).as_str()),
+                    "edit",
+                )
+                .await;
+                if !store.identity_conflicted(&document).unwrap() {
+                    assert!(
+                        !session.handles.bodies.lock().unwrap()[&document]
+                            .text()
+                            .is_empty()
+                    );
+                }
+            }
+            let hidden = session
+                .harness
+                .request("documents.document.open", json!({"documentId":document}))
+                .await
+                .unwrap();
+            assert_eq!(hidden["reason"], "identity_conflict");
+            assert_eq!(hidden["text"], "");
+            session.handles.qualified.store(true, Ordering::Release);
+            let mut subscription = session
+                .harness
+                .subscribe("documents.document.text", json!({"documentId":document}))
+                .await
+                .unwrap();
+            let transfer = hex(32, 88);
+            session
+                .harness
+                .request(
+                    "documents.document.recover",
+                    json!({"documentId":document,
+                "transferId":transfer,"requestIds":[hex(32, 89)]}),
+                )
+                .await
+                .unwrap();
+            let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = subscription.next_event().await.unwrap().unwrap();
+                    if event["transferId"] == transfer {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(recovered["reason"], "identity_conflict");
+            assert_eq!(recovered["requestStatuses"][0]["inclusion"], "unresolved");
+            assert_eq!(recovered["text"], "");
+            let rejected = session
+                .harness
+                .request(
+                    "documents.document.edit",
+                    json!({"documentId":document,
+                "baseRevision":"0","requestId":hex(32, 89),"ops":[{"insert":"bad"}]}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(rejected.code(), "documents.identity_conflict");
+            let mut unrelated_body = DocumentBody::new(93);
+            unrelated_body
+                .apply(&[TextOp::Insert {
+                    insert: "live".into(),
+                }])
+                .unwrap();
+            let unrelated_update = unrelated_body
+                .flush(Instant::now(), true)
+                .unwrap()
+                .updates
+                .remove(0);
+            let unrelated = DomainRecord::document_edit("bob", &other, unrelated_update).unwrap();
+            assert!(stream.send(record_frame(6, "bob", &unrelated)).await);
+            let store = session.handles.store.clone();
+            wait_until(
+                || store.cursor().unwrap().as_deref() == Some(hex(50, 6).as_str()),
+                "unrelated edit",
+            )
+            .await;
+            assert_eq!(store.edit_records(Some(&other)).unwrap().len(), 1);
+            assert_eq!(
+                session.handles.bodies.lock().unwrap()[&other].text(),
+                "live"
+            );
+            assert!(!store.identity_conflicted(&other).unwrap());
+            session.harness.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_quarantines_evicted_remote_id_and_keeps_later_records_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        assert!(
+            stream
+                .send(record_frame(
+                    1,
+                    "bob",
+                    &DomainRecord::collection_create("bob", "Plan").unwrap()
+                ))
+                .await
+        );
+        let document = hex(64, 2);
+        assert!(
+            stream
+                .send(record_frame(
+                    2,
+                    "bob",
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap()
+                ))
+                .await
+        );
+        let mut source = DocumentBody::new(91);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "first".into(),
+            }])
+            .unwrap();
+        let first_update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        source.append_succeeded();
+        let first_id = hex(32, 10);
+        let edit = |id: &str, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", &document, id, &[7; 32], update).unwrap()
+        };
+        assert!(
+            stream
+                .send(record_frame(
+                    3,
+                    "bob",
+                    &edit(&first_id, first_update.clone())
+                ))
+                .await
+        );
+        for offset in 0..=crate::body::MAX_RECENT_IDENTITIES {
+            let seed = 100 + offset as u64;
+            assert!(
+                stream
+                    .send(record_frame(
+                        seed,
+                        "bob",
+                        &edit(&hex(32, seed), first_update.clone())
+                    ))
+                    .await
+            );
+        }
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 356).as_str()),
+            "eviction replay",
+        )
+        .await;
+        let mut attacker = DocumentBody::new(92);
+        attacker
+            .apply(&[TextOp::Insert {
+                insert: "bad".into(),
+            }])
+            .unwrap();
+        let bad = attacker
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        assert!(
+            stream
+                .send(record_frame(500, "bob", &edit(&first_id, bad)))
+                .await
+        );
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 500).as_str()),
+            "conflict acknowledgement",
+        )
+        .await;
+        assert!(store.has_projection_warnings().unwrap());
+        assert!(store.identity_conflicted(&document).unwrap());
+        source
+            .apply(&[
+                TextOp::Retain { retain: 5 },
+                TextOp::Insert {
+                    insert: "later".into(),
+                },
+            ])
+            .unwrap();
+        let next = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        assert!(
+            stream
+                .send(record_frame(501, "bob", &edit(&hex(32, 501), next)))
+                .await
+        );
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 501).as_str()),
+            "later edit",
+        )
+        .await;
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            "first",
+            "later edit is sealed but not applied after conflict"
+        );
+        assert_eq!(
+            store.edit_identity(&first_id).unwrap().unwrap().0,
+            hex(64, 3)
+        );
+        assert!(
+            session
+                .handles
+                .sync
+                .lock()
+                .unwrap()
+                .warnings
+                .contains(&"request_id_conflict".into())
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unopenable_deferred_identity_hides_applied_body_until_collision_is_known() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let id = hex(32, 9);
+        let mut body = DocumentBody::new(91);
+        body.apply(&[TextOp::Insert {
+            insert: "private".into(),
+        }])
+        .unwrap();
+        let update = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+        let first =
+            DomainRecord::identified_document_edit("bob", &document, &id, &[1; 32], update.clone())
+                .unwrap();
+        let second =
+            DomainRecord::identified_document_edit("bob", &document, &id, &[2; 32], update)
+                .unwrap();
+        let mut stored = HashMap::new();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            for (seed, record) in [
+                (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
+                (
+                    2,
+                    DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+                ),
+                (3, first.clone()),
+                (4, second.clone()),
+            ] {
+                store
+                    .ingest(
+                        &hex(64, seed),
+                        &hex(82, seed),
+                        "bob",
+                        record.kind(),
+                        "c2ln",
+                        &record.encode(),
+                        &[seed as u8],
+                        None,
+                    )
+                    .unwrap();
+                stored.insert(
+                    seed,
+                    (
+                        record.kind().to_owned(),
+                        URL_SAFE_NO_PAD.encode(record.encode()),
+                    ),
+                );
+            }
+            store.inner.lock().unwrap().conn.execute(
+                "UPDATE records SET quarantine_code='waiting_for_target',target=?2 WHERE record_id=?1",
+                rusqlite::params![hex(64, 4), document],
+            ).unwrap();
+        }
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;").unwrap();
+        drop(connection);
+        let access = Arc::new(AtomicBool::new(false));
+        let gained = access.clone();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(
+                json!({"results":payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                let seed = URL_SAFE_NO_PAD.decode(sealed.as_str().unwrap()).unwrap()[0] as u64;
+                if seed == 4 && !gained.load(Ordering::SeqCst) {
+                    json!({"status":"waiting_for_history_access"})
+                } else {
+                    let (purpose, canonical) = &stored[&seed];
+                    json!({"status":"ready","recordId":hex(64,seed),"orderKey":hex(82,seed),
+                        "author":"bob","purpose":purpose,"signature":"c2ln","canonical":canonical})
+                }
+            }).collect::<Vec<_>>()}),
+            ),
+            _ => Err(error("unavailable", false)),
+        });
+        let mut session = start(directory.path(), scripted).await;
+        let pending = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(pending["editable"], false);
+        assert_eq!(pending["text"], "");
+        access.store(true, Ordering::SeqCst);
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        assert!(
+            stream
+                .send(json!({"kind":"state","availability":"current","pendingRecordCount":"0"}))
+                .await
+        );
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.identity_conflicted(&document).unwrap(),
+            "opened deferred collision",
+        )
+        .await;
+        let hidden = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(hidden["reason"], "identity_conflict");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrated_deferred_identity_is_indexed_before_remote_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let absent_document = hex(64, 9);
+        let request_id = hex(32, 13);
+        let mut source = DocumentBody::new(91);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "safe".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let original = DomainRecord::identified_document_edit(
+            "bob",
+            &absent_document,
+            &request_id,
+            &[1; 32],
+            update.clone(),
+        )
+        .unwrap();
+        let mut stored = HashMap::new();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            let create = DomainRecord::collection_create("bob", "Plan").unwrap();
+            let doc = DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap();
+            for (seed, record) in [(1, create), (2, doc), (3, original.clone())] {
+                let sealed = format!("row-{seed}");
+                let result = store
+                    .ingest(
+                        &hex(64, seed),
+                        &hex(82, seed),
+                        "bob",
+                        record.kind(),
+                        "c2ln",
+                        &record.encode(),
+                        sealed.as_bytes(),
+                        None,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    IngestResult::Applied | IngestResult::Deferred(_)
+                ));
+                stored.insert(
+                    URL_SAFE_NO_PAD.encode(sealed),
+                    (
+                        seed,
+                        record.kind().to_owned(),
+                        URL_SAFE_NO_PAD.encode(record.encode()),
+                    ),
+                );
+            }
+        }
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;")
+            .unwrap();
+        drop(connection);
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(
+                json!({"results":payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                let (seed,purpose,canonical) = &stored[sealed.as_str().unwrap()];
+                json!({"status":"ready","recordId":hex(64,*seed),"orderKey":hex(82,*seed),
+                    "author":"bob","purpose":purpose,"signature":"c2ln","canonical":canonical})
+            }).collect::<Vec<_>>() }),
+            ),
+            _ => Err(error("unavailable", false)),
+        });
+        let session = start(directory.path(), scripted).await;
+        let store = session.handles.store.clone();
+        assert_eq!(
+            store.edit_identity(&request_id).unwrap().unwrap().0,
+            hex(64, 3)
+        );
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let conflicting = DomainRecord::identified_document_edit(
+            "bob",
+            &absent_document,
+            &request_id,
+            &[2; 32],
+            update.clone(),
+        )
+        .unwrap();
+        assert!(stream.send(record_frame(500, "bob", &conflicting)).await);
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 500).as_str()),
+            "deferred ID collision",
+        )
+        .await;
+        let valid = DomainRecord::identified_document_edit(
+            "bob",
+            &hex(64, 2),
+            &hex(32, 501),
+            &[3; 32],
+            update,
+        )
+        .unwrap();
+        assert!(stream.send(record_frame(501, "bob", &valid)).await);
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 501).as_str()),
+            "later valid edit",
+        )
+        .await;
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&hex(64, 2)].text(),
+            "safe"
+        );
+        assert!(store.has_projection_warnings().unwrap());
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn core_committed_unprojected_edit_is_indexed_before_replay_absence_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let document = hex(64, 2);
+        let id = hex(32, 88);
+        assert!(session.handles.store.edit_identity(&id).unwrap().is_none());
+        assert!(
+            stream
+                .send(record_frame(
+                    1,
+                    "bob",
+                    &DomainRecord::collection_create("bob", "Plan").unwrap()
+                ))
+                .await
+        );
+        assert!(
+            stream
+                .send(record_frame(
+                    2,
+                    "bob",
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap()
+                ))
+                .await
+        );
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.document_exists(&document).unwrap(),
+            "document arrives",
+        )
+        .await;
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap();
+        let before = hex(32, 90);
+        session
+            .harness
+            .request(
+                "documents.document.recover",
+                json!({"documentId":document,"transferId":before,"requestIds":[id]}),
+            )
+            .await
+            .unwrap();
+        let unresolved = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = text.next_event().await.unwrap().unwrap();
+                if event["transferId"] == before {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
+        let mut source = DocumentBody::new(94);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "replayed".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let edit = DomainRecord::identified_document_edit(ALICE, &document, &id, &[7; 32], update)
+            .unwrap();
+        assert!(stream.send(record_frame(3, ALICE, &edit)).await);
+        assert!(
+            stream
+                .send(json!({"kind":"replay_end","cursor":hex(50, 3),"gapFree":true}))
+                .await
+        );
+        let store = session.handles.store.clone();
+        wait_until(
+            || {
+                store.edit_identity(&id).unwrap().is_some()
+                    && session.handles.qualified.load(Ordering::Acquire)
+            },
+            "Core replay and index",
+        )
+        .await;
+        let next_transfer = hex(32, 91);
+        session.harness.request("documents.document.recover",
+            json!({"documentId":document,"transferId":next_transfer,"requestIds":[id,hex(32,89)]})).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = text.next_event().await.unwrap().unwrap();
+                if event["transferId"] == next_transfer {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received["requestStatuses"][0]["inclusion"], "included");
+        assert_eq!(received["requestStatuses"][1]["inclusion"], "absent");
+        assert_eq!(store.edit_identity(&id).unwrap().unwrap().0, hex(64, 3));
+        text.close().await;
         session.harness.shutdown().await.unwrap();
     }
 
@@ -2180,8 +3357,8 @@ mod tests {
                 Ok(json!({"results": sealed.iter().map(|value| {
                     let bytes = URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap();
                     if bytes[0] == 5 && (gained.load(Ordering::SeqCst) || bytes[1] == 37) {
-                        json!({"status":"ready", "recordId":hex(64, 37), "orderKey":hex(82, 37),
-                            "author":"bob", "purpose":"document.edit", "signature":"c2ln", "canonical":canonical})
+                        json!({"status":"ready", "recordId":hex(64, u64::from(bytes[1])), "orderKey":hex(82, u64::from(bytes[1])),
+                            "author":"bob", "purpose":"document.edit", "signature":"sig", "canonical":canonical})
                     } else { json!({"status":"waiting_for_history_access"}) }
                 }).collect::<Vec<_>>() }))
             }
@@ -2269,6 +3446,7 @@ mod tests {
         });
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), scripted).await;
+        qualify_empty_history(&session).await;
         let collection = session
             .harness
             .request("documents.collection.create", json!({"name":"Plans"}))
@@ -2294,8 +3472,7 @@ mod tests {
             .await
             .unwrap();
         let _ = text.next_event().await.unwrap().unwrap();
-        let request =
-            json!({"documentId": document, "baseRevision":"0", "ops":[{"insert":"draft"}]});
+        let request = json!({"documentId": document, "requestId":"11111111111111111111111111111111", "baseRevision":"0", "ops":[{"insert":"draft"}]});
         let result = session
             .harness
             .request("documents.document.edit", request.clone())
@@ -2337,7 +3514,7 @@ mod tests {
             "draft"
         );
         fail.store(true, Ordering::SeqCst);
-        let second = json!({"documentId": document, "baseRevision":"1", "ops":[{"retain":5},{"insert":"!"}]});
+        let second = json!({"documentId": document, "requestId":"22222222222222222222222222222222", "baseRevision":"1", "ops":[{"retain":5},{"insert":"!"}]});
         assert!(
             session
                 .harness
@@ -2393,6 +3570,7 @@ mod tests {
         });
         let directory = tempfile::tempdir().unwrap();
         let mut first = start(directory.path(), scripted.clone()).await;
+        qualify_empty_history(&first).await;
         let collection = first
             .harness
             .request("documents.collection.create", json!({"name":"Plans"}))
@@ -2416,7 +3594,7 @@ mod tests {
             .harness
             .request(
                 "documents.document.edit",
-                json!({"documentId": document, "baseRevision":"0", "ops":[{"insert":"durable"}]}),
+                json!({"documentId": document, "requestId":"33333333333333333333333333333333", "baseRevision":"0", "ops":[{"insert":"durable"}]}),
             )
             .await
             .unwrap();
@@ -2427,12 +3605,202 @@ mod tests {
             "the edit was appended before ACK"
         );
         first.harness.shutdown().await.unwrap();
-        let restarted = start(directory.path(), scripted).await;
+        // Populate more sealed edit IDs than the bounded recent-ID cache can retain.
+        let original = records
+            .lock()
+            .unwrap()
+            .values()
+            .find(|(seed, _, _)| *seed == 102)
+            .unwrap()
+            .2
+            .clone();
+        let DomainRecord::IdentifiedDocumentEdit {
+            payload_digest,
+            update,
+            ..
+        } = DomainRecord::decode(&URL_SAFE_NO_PAD.decode(original).unwrap()).unwrap()
+        else {
+            panic!("identified edit");
+        };
+        let persisted = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        for index in 0..=crate::body::MAX_RECENT_IDENTITIES {
+            let seed = 1000 + index as u64;
+            let id = format!("{seed:032x}");
+            let record = DomainRecord::identified_document_edit(
+                ALICE,
+                &document,
+                &id,
+                &payload_digest,
+                update.clone(),
+            )
+            .unwrap();
+            let canonical = record.encode();
+            let sealed = seed.to_string();
+            assert_eq!(
+                persisted
+                    .ingest(
+                        &hex(64, seed),
+                        &hex(82, seed),
+                        ALICE,
+                        record.kind(),
+                        "c2ln",
+                        &canonical,
+                        sealed.as_bytes(),
+                        None
+                    )
+                    .unwrap(),
+                IngestResult::Applied
+            );
+            records.lock().unwrap().insert(
+                URL_SAFE_NO_PAD.encode(sealed),
+                (
+                    seed,
+                    record.kind().to_owned(),
+                    URL_SAFE_NO_PAD.encode(canonical),
+                ),
+            );
+        }
+        drop(persisted);
+        let fail_lookup = Arc::new(AtomicBool::new(false));
+        let lookup_failure = fail_lookup.clone();
+        let saved = records.clone();
+        let restart_log = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" if lookup_failure.load(Ordering::SeqCst) => Err(error("unavailable", true)),
+            "open" => Ok(json!({ "results": payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                let (seed, purpose, canonical) = saved.lock().unwrap()[sealed.as_str().unwrap()].clone();
+                json!({ "status":"ready", "recordId":hex(64,seed), "orderKey":hex(82,seed),
+                    "author":ALICE, "signature":"c2ln", "purpose":purpose, "canonical":canonical })
+            }).collect::<Vec<_>>() })),
+            _ => Err(error("unavailable", false)),
+        });
+        let mut restarted = start(directory.path(), restart_log).await;
         assert_eq!(
             restarted.handles.bodies.lock().unwrap()[&document].text(),
             "durable"
         );
         assert!(!restarted.handles.bodies.lock().unwrap()[&document].has_pending());
+        assert!(
+            restarted.handles.bodies.lock().unwrap()[&document]
+                .identity("33333333333333333333333333333333")
+                .is_none(),
+            "the old ID was evicted from the bounded cache"
+        );
+        let old_edit = json!({"documentId":document,"requestId":"33333333333333333333333333333333","baseRevision":"0","ops":[{"insert":"durable"}]});
+        let old_count = records.lock().unwrap().len();
+        fail_lookup.store(true, Ordering::SeqCst);
+        assert_eq!(
+            restarted
+                .harness
+                .request("documents.document.edit", old_edit.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.capability_unavailable"
+        );
+        let mut text = restarted
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap();
+        let transfer = "abababababababababababababababab";
+        let missing = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let query = json!({"documentId":document,"transferId":transfer,"requestIds":["33333333333333333333333333333333",missing]});
+        restarted
+            .harness
+            .request("documents.document.recover", query.clone())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), text.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["transferId"], transfer);
+        assert_eq!(
+            first["requestStatuses"][0]["inclusion"], "unresolved",
+            "failed sealed lookup is not an absence proof"
+        );
+        assert_eq!(first["requestStatuses"][1]["inclusion"], "unresolved");
+        fail_lookup.store(false, Ordering::SeqCst);
+        let repeated = restarted
+            .harness
+            .request("documents.document.edit", old_edit.clone())
+            .await
+            .unwrap();
+        assert_eq!(repeated["revision"], "1");
+        assert_eq!(
+            records.lock().unwrap().len(),
+            old_count,
+            "evicted retry must not append again"
+        );
+        let conflict = json!({"documentId":document,"requestId":"33333333333333333333333333333333","baseRevision":"0","ops":[{"insert":"other"}]});
+        assert_eq!(
+            restarted
+                .harness
+                .request("documents.document.edit", conflict)
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.invalid_request"
+        );
+        restarted
+            .harness
+            .request("documents.document.recover", query.clone())
+            .await
+            .unwrap();
+        let found = text.next_event().await.unwrap().unwrap();
+        assert_eq!(found["requestStatuses"][0]["inclusion"], "included");
+        assert_eq!(found["requestStatuses"][0]["durability"], "durable");
+        let stream = restarted.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let mut existing = records
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        existing.sort_by_key(|(seed, _, _)| *seed);
+        for (seed, purpose, canonical) in existing {
+            assert!(stream.send(json!({
+                "kind":"record","cursor":hex(50,seed),"recordId":hex(64,seed),"orderKey":hex(82,seed),
+                "author":ALICE,"purpose":purpose,"signature":"c2ln","canonical":canonical,
+                "sealedRecord":URL_SAFE_NO_PAD.encode(seed.to_string())
+            })).await);
+        }
+        assert!(
+            stream
+                .send(json!({"kind":"replay_end","cursor":hex(50, 1000 + crate::body::MAX_RECENT_IDENTITIES as u64),"gapFree":true}))
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !restarted.handles.bodies.lock().unwrap()[&document].editable() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The SDK delivers the callback after the credited marker; wait for absence.
+        let absent = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                restarted
+                    .harness
+                    .request("documents.document.recover", query.clone())
+                    .await
+                    .unwrap();
+                let event = text.next_event().await.unwrap().unwrap();
+                if event["requestStatuses"][1]["inclusion"] == "absent" {
+                    break event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(absent["requestStatuses"][0]["durability"], "durable");
+        text.close().await;
         restarted.harness.shutdown().await.unwrap();
     }
 
@@ -2450,6 +3818,9 @@ mod tests {
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
             metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 1,
+            qualified: Arc::new(AtomicBool::new(false)),
+            identity_index_complete: Arc::new(AtomicBool::new(false)),
+            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let text = "x".repeat(150 * 1024);
         hub.with_body("doc", |body| {
@@ -2509,6 +3880,9 @@ mod tests {
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
             metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer: 1,
+            qualified: Arc::new(AtomicBool::new(false)),
+            identity_index_complete: Arc::new(AtomicBool::new(false)),
+            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         hub.with_body("doc", |body| {
             body.apply(&[TextOp::Insert {
@@ -2545,6 +3919,7 @@ mod tests {
     async fn edits_are_echoed_appended_and_remote_edits_pushed() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), scripted_log()).await;
+        qualify_empty_history(&session).await;
         let collection = session
             .harness
             .request("documents.collection.create", json!({ "name": "Plans" }))
@@ -2584,7 +3959,7 @@ mod tests {
             .harness
             .request(
                 "documents.document.edit",
-                json!({ "documentId": document, "baseRevision": "0", "ops": [{ "insert": "# Plan" }] }),
+                json!({ "documentId": document, "requestId":"44444444444444444444444444444444", "baseRevision": "0", "ops": [{ "insert": "# Plan" }] }),
             )
             .await
             .unwrap();
@@ -2596,7 +3971,7 @@ mod tests {
             .harness
             .request(
                 "documents.document.edit",
-                json!({ "documentId": document, "baseRevision": "0", "ops": [{ "insert": "x" }] }),
+                json!({ "documentId": document, "requestId":"55555555555555555555555555555555", "baseRevision": "0", "ops": [{ "insert": "x" }] }),
             )
             .await
             .unwrap_err();
@@ -2605,7 +3980,7 @@ mod tests {
             .harness
             .request(
                 "documents.document.edit",
-                json!({ "documentId": document, "baseRevision": "1", "ops": [{ "retain": 6 }, { "insert": "\n" }] }),
+                json!({ "documentId": document, "requestId":"66666666666666666666666666666666", "baseRevision": "1", "ops": [{ "retain": 6 }, { "insert": "\n" }] }),
             )
             .await
             .unwrap();

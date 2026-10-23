@@ -4,7 +4,7 @@
 //! Nothing here is persisted. A body is rebuilt at activation by importing every opened
 //! `document.edit` record; the Package SQLite never holds plaintext.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -25,6 +25,8 @@ pub(crate) const MAX_TEXT_BYTES: usize = 192 * 1024;
 const INSERT_CHUNK: usize = 48 * 1024;
 /// Per-operation encoding overhead assumed when estimating a pending export's size.
 const OP_OVERHEAD: usize = 32;
+/// Only recent IDs stay in the plaintext in-memory projection; old IDs are opened lazily.
+pub(crate) const MAX_RECENT_IDENTITIES: usize = 256;
 
 /// One operation the UI sends, in Unicode scalar positions against a base revision.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -41,12 +43,21 @@ pub(crate) enum BodyError {
     OutOfRange,
     /// The ops would grow a body beyond [`MAX_TEXT_BYTES`], or grow one already above it.
     TooLarge,
+    RecordTooLarge,
     Loro,
 }
 
 /// Why a flush produced bytes: the caller appends each returned update as one record.
 pub(crate) struct Flushed {
     pub(crate) updates: Vec<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EditIdentity {
+    pub(crate) author: String,
+    pub(crate) digest: [u8; 32],
+    pub(crate) revision: u64,
+    pub(crate) durable: bool,
 }
 
 pub(crate) struct DocumentBody {
@@ -64,10 +75,17 @@ pub(crate) struct DocumentBody {
     staged: VecDeque<(Vec<u8>, VersionVector)>,
     /// Edit records known locally whose sealed bytes have not been opened yet.
     unopened: usize,
+    /// A sealed deferred edit targeting this body has not yet been opened.
+    waiting_deferred: bool,
+    /// Loro has received a sealed update whose causal prerequisites are still missing.
+    pending_history: bool,
     /// A conservative estimate of the pending export size, so a keystroke never exports.
     pending_estimate: usize,
     /// Last request identity allows retry after a failed append without reapplying its ops.
     last_request: Option<(u64, Vec<TextOp>, u64)>,
+    pending_request_id: Option<String>,
+    identities: HashMap<String, EditIdentity>,
+    identity_order: VecDeque<String>,
 }
 
 impl DocumentBody {
@@ -84,8 +102,13 @@ impl DocumentBody {
             pending_since: None,
             staged: VecDeque::new(),
             unopened: 0,
+            waiting_deferred: false,
+            pending_history: false,
             pending_estimate: 0,
             last_request: None,
+            pending_request_id: None,
+            identities: HashMap::new(),
+            identity_order: VecDeque::new(),
         }
     }
 
@@ -101,21 +124,18 @@ impl DocumentBody {
     pub(crate) fn set_unopened(&mut self, count: usize) {
         self.unopened = count;
     }
+    pub(crate) fn set_waiting_deferred(&mut self, waiting: bool) -> bool {
+        let changed = self.waiting_deferred != waiting;
+        self.waiting_deferred = waiting;
+        changed
+    }
     /// A body is editable once every locally known edit has been imported, so this peer's
     /// own earlier operations are present before it creates new ones.
     pub(crate) fn editable(&self) -> bool {
-        self.unopened == 0
+        self.unopened == 0 && !self.waiting_deferred && !self.pending_history
     }
     pub(crate) fn has_pending(&self) -> bool {
         self.pending_since.is_some() || !self.staged.is_empty()
-    }
-
-    pub(crate) fn retried_revision(&self, base: u64, ops: &[TextOp]) -> Option<u64> {
-        self.last_request
-            .as_ref()
-            .and_then(|(previous, previous_ops, revision)| {
-                (*previous == base && previous_ops == ops).then_some(*revision)
-            })
     }
 
     pub(crate) fn last_request_revision(&self) -> Option<u64> {
@@ -124,6 +144,101 @@ impl DocumentBody {
 
     pub(crate) fn remember_request(&mut self, base: u64, ops: &[TextOp]) {
         self.last_request = Some((base, ops.to_vec(), self.revision));
+    }
+
+    pub(crate) fn identity(&self, id: &str) -> Option<&EditIdentity> {
+        self.identities.get(id)
+    }
+
+    pub(crate) fn remember_identity(
+        &mut self,
+        id: String,
+        author: String,
+        digest: [u8; 32],
+        durable: bool,
+    ) -> Result<(), BodyError> {
+        if let Some(known) = self.identities.get_mut(&id) {
+            if known.author != author || known.digest != digest {
+                return Err(BodyError::Loro);
+            }
+            known.durable |= durable;
+        } else {
+            if self.identity_order.len() == MAX_RECENT_IDENTITIES {
+                if self.identity_order.front() == self.pending_request_id.as_ref() {
+                    let active = self
+                        .identity_order
+                        .pop_front()
+                        .expect("full cache has an ID");
+                    self.identity_order.push_back(active);
+                }
+                let oldest = self
+                    .identity_order
+                    .pop_front()
+                    .expect("full identity cache has an oldest ID");
+                self.identities.remove(&oldest);
+            }
+            self.identity_order.push_back(id.clone());
+            self.identities.insert(
+                id,
+                EditIdentity {
+                    author,
+                    digest,
+                    revision: self.revision,
+                    durable,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Preflight on a deep fork before changing live Loro: one identified request
+    /// must fit one canonical record, not a partially committed group of exports.
+    pub(crate) fn apply_identified(
+        &mut self,
+        ops: &[TextOp],
+        request_id: String,
+    ) -> Result<Vec<u8>, BodyError> {
+        if self.has_pending() {
+            return Err(BodyError::Loro);
+        }
+        let mut candidate = Self {
+            doc: self.doc.fork(),
+            text: self.text.clone(),
+            revision: self.revision,
+            appended: self.appended.clone(),
+            staged_version: self.staged_version.clone(),
+            pending_since: None,
+            staged: VecDeque::new(),
+            unopened: self.unopened,
+            waiting_deferred: self.waiting_deferred,
+            pending_history: self.pending_history,
+            pending_estimate: 0,
+            last_request: self.last_request.clone(),
+            pending_request_id: None,
+            identities: self.identities.clone(),
+            identity_order: self.identity_order.clone(),
+        };
+        candidate
+            .doc
+            .set_peer_id(self.doc.peer_id())
+            .map_err(|_| BodyError::Loro)?;
+        candidate.apply(ops)?;
+        let updates = candidate
+            .flush(Instant::now(), true)
+            .ok_or(BodyError::Loro)?
+            .updates;
+        if updates.len() != 1 || updates[0].len() > MAX_UPDATE {
+            return Err(BodyError::RecordTooLarge);
+        }
+        candidate.pending_request_id = Some(request_id);
+        let update = updates[0].clone();
+        *self = candidate;
+        Ok(update)
+    }
+
+    /// The ID of the one staged identified request, if present.
+    pub(crate) fn pending_request_id(&self) -> Option<&str> {
+        self.pending_request_id.as_deref()
     }
 
     /// Applies UI operations as local edits and returns the delta the UI should see echoed.
@@ -205,7 +320,8 @@ impl DocumentBody {
     /// when the text did not change (already known, or its dependencies are still pending).
     pub(crate) fn import(&mut self, update: &[u8]) -> Result<Option<Vec<TextOp>>, BodyError> {
         let before = self.text.clone();
-        self.doc.import(update).map_err(|_| BodyError::Loro)?;
+        let status = self.doc.import(update).map_err(|_| BodyError::Loro)?;
+        self.pending_history = status.pending.is_some();
         let after = self.doc.get_text(CONTAINER).to_string();
         // A remote update never advances what this peer has appended, but the remote ops are
         // now part of the version the next export is taken from; exclude them explicitly.
@@ -245,6 +361,7 @@ impl DocumentBody {
     pub(crate) fn append_succeeded(&mut self) {
         if let Some((_, version)) = self.staged.pop_front() {
             self.appended = merge_remote(&version, &self.doc.oplog_vv(), self.doc.peer_id());
+            self.pending_request_id = None;
         }
     }
 
@@ -264,10 +381,6 @@ impl DocumentBody {
         if update.is_empty() {
             return;
         }
-        debug_assert!(
-            update.len() <= MAX_UPDATE,
-            "an export stayed within one record"
-        );
         self.staged_version = self.doc.oplog_vv();
         self.staged.push_back((update, self.staged_version.clone()));
     }
@@ -354,6 +467,34 @@ mod tests {
             body.append_succeeded();
         }
         updates
+    }
+
+    #[test]
+    fn identified_request_stages_exactly_one_bounded_update_without_partial_growth() {
+        let mut body = DocumentBody::new(1);
+        let delta = [TextOp::Insert {
+            insert: "hello".into(),
+        }];
+        let update = body.apply_identified(&delta, "a".repeat(32)).unwrap();
+        assert!(!update.is_empty());
+        assert_eq!(body.text(), "hello");
+        assert_eq!(
+            body.flush(Instant::now(), true).unwrap().updates,
+            vec![update]
+        );
+        body.append_succeeded();
+        assert_eq!(body.text(), "hello");
+        assert!(body.flush(Instant::now(), true).is_none());
+        assert_eq!(
+            body.apply_identified(
+                &[TextOp::Insert {
+                    insert: "x".repeat(MAX_TEXT_BYTES)
+                }],
+                "b".repeat(32)
+            ),
+            Err(BodyError::TooLarge)
+        );
+        assert_eq!(body.text(), "hello");
     }
 
     #[test]
@@ -561,6 +702,22 @@ mod tests {
         );
         assert_eq!(body.text(), "");
         assert_eq!(body.revision(), 0);
+    }
+
+    #[test]
+    fn recent_identity_cache_is_bounded_and_pins_an_unacknowledged_request() {
+        let mut body = DocumentBody::new(1);
+        body.pending_request_id = Some("active".into());
+        body.remember_identity("active".into(), "alice".into(), [1; 32], false)
+            .unwrap();
+        for index in 0..(MAX_RECENT_IDENTITIES * 3) {
+            body.remember_identity(index.to_string(), "alice".into(), [2; 32], true)
+                .unwrap();
+            assert!(body.identities.len() <= MAX_RECENT_IDENTITIES);
+            assert!(body.identity("active").is_some());
+        }
+        assert!(body.identity("0").is_none());
+        assert_eq!(body.identity_order.len(), body.identities.len());
     }
 
     #[test]
