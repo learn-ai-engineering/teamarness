@@ -39,7 +39,9 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             .memberships
             .get(&workspace)
             .ok_or(crate::synchronization::Refusal::NotAuthorized)?;
-        if !projection.contains_member(local) || !projection.contains_member(peer) {
+        if !projection.contains_installation_member(local)
+            || !projection.contains_installation_member(peer)
+        {
             return Err(crate::synchronization::Refusal::NotAuthorized);
         }
         let membership_version = *projection.snapshot().version().as_bytes();
@@ -80,7 +82,9 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             .get(&workspace)
             .ok_or(SyncRejection::UnknownWorkspace)?;
         let local = PublicIdentity(state.secret_key.public());
-        if !projection.contains_member(local) || !projection.contains_member(recipient) {
+        if !projection.contains_installation_member(local)
+            || !projection.contains_installation_member(recipient)
+        {
             return Err(SyncRejection::NotMember);
         }
         let admission = *projection.snapshot().version().as_bytes();
@@ -137,7 +141,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             .memberships
             .get(&workspace)
             .ok_or(SyncRejection::UnknownWorkspace)?;
-        if !projection.contains_member(peer) {
+        if !projection.contains_installation_member(peer) {
             return Err(SyncRejection::NotMember);
         }
         let creator = projection.creator();
@@ -162,7 +166,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         let promoted = replication::promote_scope(&mut state, workspace, package)
             .map_err(fault!(SyncRejection::Storage))?;
         if crate::synchronization::is_reserved_record_scope(package) {
-            person_name_sync::reconcile(&mut state, workspace)
+            principal_sync::reconcile(&mut state, workspace)
                 .map_err(fault!(SyncRejection::Storage))?;
         }
         Ok(promoted)
@@ -191,7 +195,9 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
             .memberships
             .get(&workspace)
             .ok_or(Refusal::NotAuthorized)?;
-        if !projection.contains_member(local) || !projection.contains_member(peer) {
+        if !projection.contains_installation_member(local)
+            || !projection.contains_installation_member(peer)
+        {
             return Err(Refusal::NotAuthorized);
         }
         let scope = crate::synchronization::scope_digest(package, workspace);
@@ -271,8 +277,8 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         let state = self.state.upgrade().ok_or(SyncRejection::RuntimeGone)?;
         let state = state.lock().map_err(|_| SyncRejection::RuntimeGone)?;
         if !state.memberships.get(&workspace).is_some_and(|projection| {
-            projection.contains_member(PublicIdentity(state.secret_key.public()))
-                && projection.contains_member(peer)
+            projection.contains_installation_member(PublicIdentity(state.secret_key.public()))
+                && projection.contains_installation_member(peer)
         }) {
             return Err(SyncRejection::NotMember);
         }
@@ -327,8 +333,8 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         let state = self.state.upgrade().ok_or(RangeLoadError::Unavailable)?;
         let state = state.lock().map_err(|_| RangeLoadError::Unavailable)?;
         if !state.memberships.get(&workspace).is_some_and(|projection| {
-            projection.contains_member(PublicIdentity(state.secret_key.public()))
-                && projection.contains_member(peer)
+            projection.contains_installation_member(PublicIdentity(state.secret_key.public()))
+                && projection.contains_installation_member(peer)
         }) {
             return Err(RangeLoadError::Unavailable);
         }
@@ -438,7 +444,7 @@ impl crate::synchronization::SyncReceiver for RuntimeSyncReceiver {
         let Some(projection) = state.memberships.get(&workspace) else {
             return Err(FatalSyncError::PeerRevoked);
         };
-        if !projection.contains_member(peer) {
+        if !projection.contains_installation_member(peer) {
             return Err(FatalSyncError::PeerRevoked);
         }
         let now = self.clock.now_unix_ms();
@@ -501,7 +507,7 @@ fn classify_operation(
             );
             if crate::synchronization::is_reserved_record_scope(package) {
                 // Semantic errors are isolated from valid transport and subsequent records.
-                let _ = person_name_sync::reconcile(state, workspace);
+                let _ = principal_sync::reconcile(state, workspace);
             }
             Ok(OperationOutcome::Applied)
         }

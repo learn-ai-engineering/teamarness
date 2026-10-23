@@ -84,6 +84,480 @@ async fn names_converge_without_package_instance_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_name_delivered_before_membership_converges_after_restart() {
+    let mut cluster = SyncCluster::start("early-agent-name", &["steward", "peer"]).await;
+    let workspace = cluster
+        .node("steward")
+        .create_workspace("Names")
+        .unwrap()
+        .id();
+    cluster.admit("steward", "peer", workspace).await;
+    cluster
+        .node("peer")
+        .pause_membership_replication_for_test(true);
+    cluster
+        .node("steward")
+        .pause_membership_replication_for_test(true);
+    let agent = cluster
+        .node("steward")
+        .add_agent(workspace, "Early")
+        .unwrap();
+    cluster
+        .node("steward")
+        .rename_principal(workspace, agent, "Early again")
+        .unwrap();
+    cluster
+        .node("steward")
+        .set_own_person_name(workspace, "Still progressing")
+        .unwrap();
+    cluster
+        .node("steward")
+        .replicate_records_to_address_for_test(
+            workspace,
+            crate::synchronization::reserved_principals_scope(),
+            cluster.address("peer"),
+            cluster.identity("peer"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cluster
+            .node("peer")
+            .principal(workspace, agent)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cluster
+            .node("peer")
+            .workspace_person(workspace, cluster.identity("steward"))
+            .unwrap()
+            .unwrap()
+            .name(),
+        Some("Still progressing")
+    );
+    let deferred_count = |cluster: &SyncCluster| {
+        let state = cluster.node("peer").state.lock().unwrap();
+        state.connection.query_row(
+            "SELECT COUNT(*) FROM deferred_principal_names WHERE workspace_id=?1 AND principal_id=?2",
+            rusqlite::params![workspace.as_bytes().as_slice(), agent.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        ).unwrap()
+    };
+    assert_eq!(deferred_count(&cluster), 2);
+    cluster.stop("peer").await;
+    cluster.restart("peer").await;
+    assert!(
+        cluster
+            .node("peer")
+            .principal(workspace, agent)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(deferred_count(&cluster), 2);
+    // An authenticated current Person who is not the Agent's Steward cannot
+    // override the deferred name when membership becomes known.
+    {
+        let peer = cluster.node("peer");
+        let mut state = peer.state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        let wrong = crate::principals::edit::PrincipalNameEdit::sign(
+            &secret,
+            workspace,
+            agent,
+            3,
+            "Wrong steward",
+        )
+        .unwrap();
+        crate::synchronization::append(
+            &mut state.connection,
+            &secret,
+            workspace,
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
+            wrong.canonical_bytes(),
+            crate::synchronization::MembershipStanding::Current,
+            false,
+            peer.clock.now_unix_ms(),
+        )
+        .unwrap();
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+    }
+    assert!(
+        cluster
+            .node("peer")
+            .principal(workspace, agent)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(deferred_count(&cluster), 3);
+    cluster
+        .node("peer")
+        .pause_membership_replication_for_test(false);
+    cluster
+        .node("steward")
+        .pause_membership_replication_for_test(false);
+    cluster
+        .replicate_membership("steward", "peer", workspace)
+        .await;
+    cluster
+        .wait_until("early agent name appears", DEFAULT_DEADLINE, |c| {
+            c.node("peer")
+                .principal(workspace, agent)
+                .unwrap()
+                .is_some_and(|principal| principal.name() == Some("Early again"))
+        })
+        .await;
+    cluster.stop("peer").await;
+    cluster.restart("peer").await;
+    assert_eq!(
+        cluster
+            .node("peer")
+            .principal(workspace, agent)
+            .unwrap()
+            .unwrap()
+            .name(),
+        Some("Early again")
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_name_reference_failure_does_not_advance_consumption() {
+    let cluster = SyncCluster::start("early-name-fault", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let target = crate::principals::derive_agent(
+            workspace,
+            crate::MembershipOperationId::digest(b"never-admitted-agent"),
+        );
+        let secret = state.secret_key.clone();
+        let edit = crate::principals::edit::PrincipalNameEdit::sign(
+            &secret, workspace, target, 1, "Deferred",
+        )
+        .unwrap();
+        crate::synchronization::append(
+            &mut state.connection,
+            &secret,
+            workspace,
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
+            edit.canonical_bytes(),
+            crate::synchronization::MembershipStanding::Current,
+            true,
+            creator.clock.now_unix_ms(),
+        )
+        .unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_cursor BEFORE INSERT ON principal_name_consumption BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        assert!(matches!(
+            super::super::principal_sync::reconcile(&mut state, workspace),
+            Err(crate::SynchronizationError::Storage(_))
+        ));
+        let cursor: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM principal_name_consumption WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let references: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM deferred_principal_names", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((cursor, references), (0, 0));
+        state
+            .connection
+            .execute_batch("DROP TRIGGER fail_name_cursor")
+            .unwrap();
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        let references: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM deferred_principal_names", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(references, 1);
+    }
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_name_replay_does_not_probe_historical_principals_on_scheduler_reload() {
+    let cluster = SyncCluster::start("name-empty-replay", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator
+        .create_workspace_with_person_name("Names", "Creator")
+        .unwrap()
+        .id();
+    creator.sync_worker.shutdown().await;
+    for index in 0..64 {
+        creator
+            .add_agent(workspace, &format!("Agent {index}"))
+            .unwrap();
+    }
+    {
+        let mut state = creator.state.lock().unwrap();
+        assert_eq!(state.memberships[&workspace].principal_history().len(), 65);
+        let principal = crate::principals::derive(
+            workspace,
+            crate::principals::anchor(&state.memberships[&workspace], creator.public_identity())
+                .unwrap(),
+        );
+        state.connection.execute(
+            "INSERT INTO pending_principal_name_edits (workspace_id, principal_id, name) VALUES (?1, ?2, 'Pending')",
+            rusqlite::params![workspace.as_bytes().as_slice(), principal.as_bytes().as_slice()],
+        ).unwrap();
+        for _ in 0..3 {
+            super::super::principal_sync::retry_pending_initialization(&mut state);
+            super::super::principal_sync::continue_replay(&mut state);
+            assert!(!state.name_replay_scans.contains_key(&workspace));
+        }
+    }
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appended_unknown_names_do_not_rewind_active_eligible_replay() {
+    let cluster = SyncCluster::start("name-interleaved-replay", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    let agent = creator.add_agent(workspace, "Initial").unwrap();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        let scope = crate::synchronization::reserved_principals_scope();
+        let unknown = crate::principals::derive_agent(
+            workspace,
+            crate::MembershipOperationId::digest(b"never-added-interleaved"),
+        );
+        let append = |state: &mut super::super::RuntimeState, target, counter, name: &str| {
+            let edit = crate::principals::edit::PrincipalNameEdit::sign(
+                &secret, workspace, target, counter, name,
+            )
+            .unwrap();
+            crate::synchronization::append(
+                &mut state.connection,
+                &secret,
+                workspace,
+                scope,
+                "principal-name.edit",
+                edit.canonical_bytes(),
+                crate::synchronization::MembershipStanding::Current,
+                true,
+                creator.clock.now_unix_ms(),
+            )
+            .unwrap()
+            .1
+        };
+        for counter in 1..=80 {
+            let sequence = append(&mut state, unknown, counter, "Unclaimed");
+            state.connection.execute(
+                "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![workspace.as_bytes().as_slice(), sequence, unknown.as_bytes().as_slice()],
+            ).unwrap();
+        }
+        let sequence = append(&mut state, agent, 2, "Reached");
+        state.connection.execute(
+            "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace.as_bytes().as_slice(), sequence, agent.as_bytes().as_slice()],
+        ).unwrap();
+        state.connection.execute(
+            "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
+            rusqlite::params![workspace.as_bytes().as_slice(), sequence],
+        ).unwrap();
+        super::super::principal_sync::initialize(&mut state, workspace).unwrap();
+        for counter in 81..=84 {
+            append(&mut state, unknown, counter, "Unclaimed");
+            super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        }
+    }
+    assert_eq!(
+        creator.principal(workspace, agent).unwrap().unwrap().name(),
+        Some("Reached"),
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_name_intent_retry_keeps_active_replay_position() {
+    let cluster = SyncCluster::start("name-idle-replay", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator
+        .create_workspace_with_person_name("Names", "Creator")
+        .unwrap()
+        .id();
+    let agent = creator.add_agent(workspace, "Initial").unwrap();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let principal = crate::principals::derive(
+            workspace,
+            crate::principals::anchor(&state.memberships[&workspace], creator.public_identity())
+                .unwrap(),
+        );
+        let unknown = crate::principals::derive_agent(
+            workspace,
+            crate::MembershipOperationId::digest(b"never-added-idle"),
+        );
+        let secret = state.secret_key.clone();
+        for counter in 1..=80 {
+            let (target, name) = if counter == 60 {
+                (agent, "Reached")
+            } else {
+                (unknown, "Unclaimed")
+            };
+            let edit = crate::principals::edit::PrincipalNameEdit::sign(
+                &secret,
+                workspace,
+                target,
+                if counter == 60 { 2 } else { counter },
+                name,
+            )
+            .unwrap();
+            let (_, sequence) = crate::synchronization::append(
+                &mut state.connection,
+                &secret,
+                workspace,
+                crate::synchronization::reserved_principals_scope(),
+                "principal-name.edit",
+                edit.canonical_bytes(),
+                crate::synchronization::MembershipStanding::Current,
+                true,
+                creator.clock.now_unix_ms(),
+            )
+            .unwrap();
+            state.connection.execute(
+                "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![workspace.as_bytes().as_slice(), sequence, target.as_bytes().as_slice()],
+            ).unwrap();
+            if counter == 80 {
+                state.connection.execute(
+                    "INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence",
+                    rusqlite::params![workspace.as_bytes().as_slice(), sequence],
+                ).unwrap();
+            }
+        }
+        super::super::principal_sync::initialize(&mut state, workspace).unwrap();
+        state.connection.execute(
+            "INSERT INTO pending_principal_name_edits (workspace_id, principal_id, name) VALUES (?1, ?2, 'Pending')",
+            rusqlite::params![workspace.as_bytes().as_slice(), principal.as_bytes().as_slice()],
+        ).unwrap();
+        super::super::principal_sync::retry_pending_initialization(&mut state);
+    }
+    assert_eq!(
+        creator.principal(workspace, agent).unwrap().unwrap().name(),
+        Some("Reached")
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eligible_name_replay_is_bounded_without_starvation_by_unknown_targets() {
+    let cluster = SyncCluster::start("name-eligible-page", &["creator"]).await;
+    let creator = cluster.node("creator");
+    let workspace = creator.create_workspace("Names").unwrap().id();
+    let agent = creator.add_agent(workspace, "Initial").unwrap();
+    creator.sync_worker.shutdown().await;
+    {
+        let mut state = creator.state.lock().unwrap();
+        let secret = state.secret_key.clone();
+        let unknown = crate::principals::derive_agent(
+            workspace,
+            crate::MembershipOperationId::digest(b"never-added"),
+        );
+        let scope = crate::synchronization::reserved_principals_scope();
+        for (target, start) in [(unknown, 1_u64), (agent, 2_u64)] {
+            for offset in 0..40 {
+                let edit = crate::principals::edit::PrincipalNameEdit::sign(
+                    &secret,
+                    workspace,
+                    target,
+                    start + offset,
+                    &format!("Name {offset}"),
+                )
+                .unwrap();
+                let (_, sequence) = crate::synchronization::append(
+                    &mut state.connection,
+                    &secret,
+                    workspace,
+                    scope,
+                    "principal-name.edit",
+                    edit.canonical_bytes(),
+                    crate::synchronization::MembershipStanding::Current,
+                    true,
+                    creator.clock.now_unix_ms(),
+                )
+                .unwrap();
+                state.connection.execute(
+                    "INSERT INTO deferred_principal_names (workspace_id, delivery_sequence, principal_id) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![workspace.as_bytes().as_slice(), sequence, target.as_bytes().as_slice()],
+                ).unwrap();
+            }
+        }
+        let max_sequence: i64 = state
+            .connection
+            .query_row(
+                "SELECT MAX(delivery_sequence) FROM record_delivery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        state.connection.execute("INSERT INTO principal_name_consumption (workspace_id, delivery_sequence) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET delivery_sequence=excluded.delivery_sequence", rusqlite::params![workspace.as_bytes().as_slice(), max_sequence]).unwrap();
+        super::super::principal_sync::initialize(&mut state, workspace).unwrap();
+        let remaining: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deferred_principal_names WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 80,
+            "one lock hold inspects at most 32 references"
+        );
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        let remaining: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deferred_principal_names WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 56,
+            "the next bounded scan reaches eligible deliveries"
+        );
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        let remaining: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deferred_principal_names WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 40,
+            "never-known deliveries remain but do not block the eligible target"
+        );
+    }
+    assert_eq!(
+        creator.principal(workspace, agent).unwrap().unwrap().name(),
+        Some("Name 39")
+    );
+    cluster.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
     let mut cluster = SyncCluster::start("names-replay-backlog", &["creator"]).await;
     let creator = cluster.node("creator");
@@ -92,14 +566,14 @@ async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
     {
         let mut state = creator.state.lock().unwrap();
         let projection = state.memberships.get(&workspace).unwrap();
-        let person = crate::person_names::derive(
+        let person = crate::principals::derive(
             workspace,
-            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+            crate::principals::anchor(projection, creator.public_identity()).unwrap(),
         );
         let secret = state.secret_key.clone();
         for counter in 1..=80 {
             let name = format!("Name {counter}");
-            let edit = crate::person_names::edit::PersonNameEdit::sign(
+            let edit = crate::principals::edit::PrincipalNameEdit::sign(
                 &secret, workspace, person, counter, &name,
             )
             .unwrap();
@@ -107,8 +581,8 @@ async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
                 &mut state.connection,
                 &secret,
                 workspace,
-                crate::synchronization::reserved_person_name_scope(),
-                "person-name.edit",
+                crate::synchronization::reserved_principals_scope(),
+                "principal-name.edit",
                 edit.canonical_bytes(),
                 crate::synchronization::MembershipStanding::Current,
                 true,
@@ -116,8 +590,15 @@ async fn private_name_replay_has_bounded_passes_and_continues_after_restart() {
             )
             .unwrap();
         }
-        super::super::person_name_sync::reconcile(&mut state, workspace).unwrap();
-        let consumed: i64 = state.connection.query_row("SELECT delivery_sequence FROM workspace_person_name_consumption WHERE workspace_id=?1", [workspace.as_bytes().as_slice()], |row| row.get(0)).unwrap();
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
+        let consumed: i64 = state
+            .connection
+            .query_row(
+                "SELECT delivery_sequence FROM principal_name_consumption WHERE workspace_id=?1",
+                [workspace.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(
             consumed, 32,
             "one pass must not hold the runtime lock over the backlog"
@@ -147,11 +628,11 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
     {
         let mut state = creator.state.lock().unwrap();
         let projection = state.memberships.get(&workspace).unwrap();
-        let person = crate::person_names::derive(
+        let person = crate::principals::derive(
             workspace,
-            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+            crate::principals::anchor(projection, creator.public_identity()).unwrap(),
         );
-        let signed = crate::person_names::edit::PersonNameEdit::sign(
+        let signed = crate::principals::edit::PrincipalNameEdit::sign(
             &state.secret_key,
             workspace,
             person,
@@ -164,8 +645,8 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
             &mut state.connection,
             &secret,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
-            "person-name.edit",
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
             signed.canonical_bytes(),
             crate::synchronization::MembershipStanding::Current,
             true,
@@ -174,13 +655,13 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
         .unwrap();
         state.person_name_open_error_once = true;
         assert!(matches!(
-            super::super::person_name_sync::reconcile(&mut state, workspace),
+            super::super::principal_sync::reconcile(&mut state, workspace),
             Err(crate::SynchronizationError::Storage(_))
         ));
         let count: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM workspace_person_name_consumption",
+                "SELECT COUNT(*) FROM principal_name_consumption",
                 [],
                 |row| row.get(0),
             )
@@ -189,7 +670,7 @@ async fn private_edit_storage_open_failure_keeps_delivery_for_retry() {
             count, 0,
             "a storage error must not consume the valid record"
         );
-        super::super::person_name_sync::reconcile(&mut state, workspace).unwrap();
+        super::super::principal_sync::reconcile(&mut state, workspace).unwrap();
     }
     assert_eq!(
         creator
@@ -275,7 +756,7 @@ async fn pending_name_survives_restart_before_private_key_arrives() {
     {
         let state = cluster.node("joiner").state.lock().unwrap();
         let scope = crate::synchronization::scope_digest(
-            crate::synchronization::reserved_person_name_scope(),
+            crate::synchronization::reserved_principals_scope(),
             workspace,
         );
         let key_count: i64 = state
@@ -289,7 +770,7 @@ async fn pending_name_survives_restart_before_private_key_arrives() {
         let pending_count: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM pending_person_name_edits WHERE workspace_id=?1",
+                "SELECT COUNT(*) FROM pending_principal_name_edits WHERE workspace_id=?1",
                 [workspace.as_bytes().as_slice()],
                 |row| row.get(0),
             )
@@ -318,7 +799,7 @@ async fn pending_name_survives_restart_before_private_key_arrives() {
         let pending: i64 = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM pending_person_name_edits WHERE workspace_id=?1",
+                "SELECT COUNT(*) FROM pending_principal_name_edits WHERE workspace_id=?1",
                 [workspace.as_bytes().as_slice()],
                 |row| row.get(0),
             )
@@ -340,16 +821,16 @@ async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_
     let malformed = {
         let creator = cluster.node("creator");
         let state = creator.state.lock().unwrap();
-        let anchor = crate::person_names::anchor(
+        let anchor = crate::principals::anchor(
             state.memberships.get(&workspace).unwrap(),
             creator.public_identity(),
         )
         .unwrap();
         let wrong_workspace = crate::WorkspaceId::from_bytes([99; 16]);
-        crate::person_names::edit::PersonNameEdit::sign(
+        crate::principals::edit::PrincipalNameEdit::sign(
             &state.secret_key,
             wrong_workspace,
-            crate::person_names::derive(workspace, anchor),
+            crate::principals::derive(workspace, anchor),
             100,
             "Forged",
         )
@@ -365,8 +846,8 @@ async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_
             &mut state.connection,
             &secret,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
-            "person-name.edit",
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
             &malformed,
             crate::synchronization::MembershipStanding::Current,
             true,
@@ -377,7 +858,7 @@ async fn malformed_private_edit_does_not_block_valid_name_and_revoked_person_is_
         crate::synchronization::record_subscription::publish_commit(
             &state,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
+            crate::synchronization::reserved_principals_scope(),
             sequence,
         );
         creator.sync_worker.wake();
@@ -477,7 +958,7 @@ async fn existing_workspace_bootstrap_import_advances_generation_atomically_and_
     cluster.admit("creator", "newcomer", workspace).await;
     {
         let state = joiner.state.lock().unwrap();
-        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
     }
     assert!(joiner.join_workspace(&invitation).await.is_err());
     assert_eq!(joiner.person_name_snapshot(workspace).unwrap().0, before);
@@ -547,18 +1028,22 @@ async fn membership_generation_write_failure_rolls_back_local_and_remote_revocat
     let version = creator.membership_version(workspace).unwrap();
     let envelope = {
         let state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
         crate::membership::MembershipEnvelope::sign(
             &state.secret_key,
             workspace,
             creator.clock.now_unix_ms(),
-            crate::membership::MembershipAction::Revoke { target: member },
-            state.memberships.get(&workspace).unwrap().heads(),
+            crate::membership::MembershipAction::Revoke {
+                target: member,
+                group: projection.person_group(member).unwrap(),
+            },
+            projection.heads(),
         )
         .unwrap()
     };
     {
         let state = creator.state.lock().unwrap();
-        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON workspace_person_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_name_generation_insert BEFORE INSERT ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END; CREATE TRIGGER fail_name_generation_update BEFORE UPDATE ON principal_name_generations BEGIN SELECT RAISE(FAIL, 'injected generation failure'); END;").unwrap();
     }
     assert!(creator.revoke_member(workspace, member).is_err());
     assert_eq!(creator.person_name_snapshot(workspace).unwrap().0, before);
@@ -606,20 +1091,21 @@ async fn committed_self_rename_wakes_subscriber_when_private_initialization_fail
     {
         let mut state = creator.state.lock().unwrap();
         let projection = state.memberships.get(&workspace).unwrap();
-        let person = crate::person_names::derive(
+        let person = crate::principals::derive(
             workspace,
-            crate::person_names::anchor(projection, creator.public_identity()).unwrap(),
+            crate::principals::anchor(projection, creator.public_identity()).unwrap(),
         );
         let secret = state.secret_key.clone();
-        let signed =
-            crate::person_names::edit::PersonNameEdit::sign(&secret, workspace, person, 1, "Older")
-                .unwrap();
+        let signed = crate::principals::edit::PrincipalNameEdit::sign(
+            &secret, workspace, person, 1, "Older",
+        )
+        .unwrap();
         crate::synchronization::append(
             &mut state.connection,
             &secret,
             workspace,
-            crate::synchronization::reserved_person_name_scope(),
-            "person-name.edit",
+            crate::synchronization::reserved_principals_scope(),
+            "principal-name.edit",
             signed.canonical_bytes(),
             crate::synchronization::MembershipStanding::Current,
             true,
@@ -640,15 +1126,15 @@ async fn committed_self_rename_wakes_subscriber_when_private_initialization_fail
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reserved_person_name_scope_can_be_initialized_and_demanded_privately() {
+async fn reserved_principals_scope_can_be_initialized_and_demanded_privately() {
     let cluster = SyncCluster::start("private-person-names-scope", &["creator", "joiner"]).await;
     let workspace = cluster
         .node("creator")
         .create_workspace("Names")
         .unwrap()
         .id();
-    let reserved = crate::synchronization::reserved_person_name_scope();
-    assert_eq!(reserved, "internal:teamarness.person-names");
+    let reserved = crate::synchronization::reserved_principals_scope();
+    assert_eq!(reserved, "internal:teamarness.principals");
     let private_record = {
         let creator = cluster.node("creator");
         let mut state = creator.state.lock().unwrap();
@@ -2099,5 +2585,269 @@ async fn forged_order_key_does_not_end_the_session() {
     );
     assert_eq!(seen.len(), 1, "neither forged record entered the journal");
     assert_eq!(cluster.node("b").parked_count_for_test(id, PACKAGE), 0);
+    cluster.finish().await;
+}
+
+/// Verifies: TEAM.SYS.ID-R10, MEM-R02. An Agent key is a Member, but it lives on
+/// its Steward's Installation: Protection Grants, key demands and sessions
+/// address Installation keys only. Recipients and scheduled peers are subsets
+/// of current Installations (a grant or session is not required for every key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protection_grants_and_sessions_address_installation_keys_only() {
+    use crate::membership::{AgentKeyProof, MembershipAction, MembershipEnvelope};
+
+    let cluster = SyncCluster::start("no-grants-to-agents", &["creator", "member"]).await;
+    let workspace = cluster
+        .node("creator")
+        .create_workspace("Agents")
+        .unwrap()
+        .id();
+    cluster
+        .node("creator")
+        .append_record(workspace, PACKAGE, "message.post", b"seed")
+        .unwrap();
+    cluster.admit("creator", "member", workspace).await;
+
+    // The Member adds an Agent key to its own key group.
+    let agent_secret = iroh_base::SecretKey::from_bytes(&[77; 32]);
+    let agent = crate::PublicIdentity::from_bytes(*agent_secret.public().as_bytes()).unwrap();
+    let member_identity = cluster.identity("member");
+    let add_agent = {
+        let member = cluster.node("member");
+        let state = member.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let group = projection.person_group(member_identity).unwrap();
+        MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            member.clock.now_unix_ms(),
+            MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof: AgentKeyProof::sign(&agent_secret, workspace, group, member_identity)
+                    .unwrap(),
+            },
+            projection.heads(),
+        )
+        .unwrap()
+    };
+    assert!(
+        cluster
+            .node("member")
+            .apply_membership_envelope(add_agent.canonical_bytes())
+            .unwrap()
+            .accepted
+    );
+    cluster
+        .replicate_membership("member", "creator", workspace)
+        .await;
+    // A real endpoint authenticated with the Agent key must not be treated as
+    // an Installation, even though its key is in the effective Member roster.
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(agent_secret.clone())
+        .alpns(Vec::new())
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let creator = cluster.node("creator");
+    let outcome = crate::runtime::test_hooks::probe_package_sync_as_key_for_test(
+        &endpoint,
+        cluster.address("creator"),
+        creator,
+        workspace,
+        PACKAGE,
+    )
+    .await;
+    assert_eq!(outcome, ProbeOutcome::Refused(Refusal::NotAuthorized));
+    let (operations, refused) = crate::membership_sync::session::probe_membership_sync(
+        &endpoint,
+        cluster.address("creator"),
+        workspace,
+        Vec::new(),
+    )
+    .await;
+    assert!(operations.is_empty());
+    assert!(refused);
+    let receiver = super::super::RuntimeSyncReceiver {
+        state: std::sync::Arc::downgrade(&creator.state),
+        clock: std::sync::Arc::clone(&creator.clock),
+        demand: std::sync::Arc::clone(&creator.membership_demand),
+        health: std::sync::Arc::clone(&creator.health),
+    };
+    use crate::synchronization::SyncReceiver;
+    assert!(matches!(
+        receiver.protection_bundle_for(workspace, PACKAGE, agent),
+        Err(crate::synchronization::SyncRejection::NotMember)
+    ));
+    // Records flow both ways, so each side issues the other a Protection Grant.
+    cluster
+        .node("member")
+        .replicate_records_to_address_for_test(
+            workspace,
+            PACKAGE,
+            cluster.address("creator"),
+            cluster.identity("creator"),
+        )
+        .await
+        .unwrap();
+    cluster
+        .node("member")
+        .append_record(workspace, PACKAGE, "message.post", b"from member")
+        .unwrap();
+    cluster
+        .node("creator")
+        .replicate_records_to_address_for_test(
+            workspace,
+            PACKAGE,
+            cluster.address("member"),
+            cluster.identity("member"),
+        )
+        .await
+        .unwrap();
+
+    let installations = BTreeSet::from([cluster.identity("creator"), member_identity]);
+    for name in ["creator", "member"] {
+        let node = cluster.node(name);
+        let recipients = {
+            let state = node.state.lock().unwrap();
+            let projection = state.memberships.get(&workspace).unwrap();
+            assert!(
+                projection.contains_member(agent),
+                "{name} counts the Agent as a Member"
+            );
+            assert_eq!(
+                projection
+                    .installation_members()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                installations,
+                "{name} addresses exactly the Installation keys"
+            );
+            let mut statement = state
+                .connection
+                .prepare(
+                    "SELECT DISTINCT recipient_public_identity FROM protection_control_operations
+                     WHERE operation_kind = 'grant'",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .map(|row| {
+                    crate::PublicIdentity::from_bytes(row.unwrap().try_into().unwrap()).unwrap()
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(!recipients.is_empty(), "{name} holds at least one grant");
+        assert!(
+            recipients.is_subset(&installations),
+            "{name}: every grant recipient is an Installation key"
+        );
+        assert!(
+            !recipients.contains(&agent),
+            "{name}: no grant targets the Agent key"
+        );
+        let peers = node
+            .scheduler_snapshot_for_test()
+            .into_iter()
+            .map(|peer| peer.peer)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            peers.is_subset(&installations),
+            "{name}: the scheduler dials Installation keys only"
+        );
+        assert!(
+            !peers.contains(&agent),
+            "{name}: the Agent key is never a peer"
+        );
+    }
+
+    // The creator's own Person group independently claims the same key. It
+    // depends only on its group attachment, not on the member's Agent add.
+    // The conflict must cancel any subscribed session for the effective key
+    // rather than promote it as a second admission.
+    let creator = cluster.node("creator");
+    let attachment = creator
+        .export_membership_operations_for_tests(workspace)
+        .iter()
+        .map(|bytes| crate::membership::authenticate(bytes).unwrap())
+        .find(|operation| matches!(operation.action, MembershipAction::AttachPerson { .. }))
+        .unwrap()
+        .id;
+    let session = creator.state.lock().unwrap().peer_sessions.subscribe(agent);
+    let competing = {
+        let state = creator.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        let group = projection
+            .person_group(cluster.identity("creator"))
+            .unwrap();
+        MembershipEnvelope::sign(
+            &state.secret_key,
+            workspace,
+            creator.clock.now_unix_ms(),
+            MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof: AgentKeyProof::sign(
+                    &agent_secret,
+                    workspace,
+                    group,
+                    cluster.identity("creator"),
+                )
+                .unwrap(),
+            },
+            vec![attachment],
+        )
+        .unwrap()
+    };
+    assert!(
+        creator
+            .apply_membership_envelope(competing.canonical_bytes())
+            .unwrap()
+            .accepted
+    );
+    assert!(
+        session.has_changed().unwrap(),
+        "conflict cancels the effective key's sessions"
+    );
+    cluster
+        .replicate_membership("creator", "member", workspace)
+        .await;
+    for name in ["creator", "member"] {
+        let node = cluster.node(name);
+        let state = node.state.lock().unwrap();
+        let projection = state.memberships.get(&workspace).unwrap();
+        assert!(!projection.contains_member(agent));
+        assert!(!projection.installation_members().contains(&agent));
+        let grants: i64 = state.connection.query_row(
+            "SELECT COUNT(*) FROM protection_control_operations WHERE operation_kind = 'grant' AND recipient_public_identity = ?1",
+            [agent.as_bytes().as_slice()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(grants, 0, "no grant to the conflicted key");
+        assert!(
+            !node
+                .scheduler_snapshot_for_test()
+                .iter()
+                .any(|peer| peer.peer == agent)
+        );
+    }
+    let (operations, refused) = crate::membership_sync::session::probe_membership_sync(
+        &endpoint,
+        cluster.address("creator"),
+        workspace,
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        operations.is_empty(),
+        "a former Agent-only key receives no membership"
+    );
+    assert!(refused);
+    endpoint.close().await;
     cluster.finish().await;
 }

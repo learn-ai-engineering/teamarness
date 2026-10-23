@@ -104,6 +104,14 @@ fn client_router() -> Router<()> {
                 "sealedRecord": String::from_utf8_lossy(&appended.sealed_record),
             }))
         })
+        .request("fixture.append_agent", |context, _: Empty| async move {
+            let log = RecordLog::from_initialization(
+                context.initialization(),
+                context.capabilities().clone(),
+            )?;
+            let appended = log.append_with_principal("fixture/v1", b"canonical", Some(&hex(64, 1))).await?;
+            Ok(serde_json::json!({"author": appended.author}))
+        })
         .request("fixture.open_batch", |context, request: OpenBatch| async move {
             let log = RecordLog::from_initialization(
                 context.initialization(),
@@ -218,6 +226,26 @@ async fn append_decodes_a_committed_result() {
         .unwrap_err();
     assert_eq!(error.code(), "package.invalid_capability_response");
     assert!(!error.retryable());
+    harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_log_1_0_sdk_rejects_agent_selector_before_host_call() {
+    let directory = tempfile::tempdir().unwrap();
+    let scripted =
+        ScriptedCapability::new().calls(|_, _| panic!("1.0 selector must not reach host"));
+    let mut harness = start(
+        client_router(),
+        vec![(record_log::IDENTITY, scripted.clone())],
+        &directory,
+    )
+    .await;
+    let error = harness
+        .request("fixture.append_agent", empty())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "package.invalid_capability_request");
+    assert!(scripted.recorded_calls().is_empty());
     harness.shutdown().await.unwrap();
 }
 

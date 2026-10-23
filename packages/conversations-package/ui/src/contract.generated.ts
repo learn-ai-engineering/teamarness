@@ -43,14 +43,6 @@ export type Message = {
   readonly "position": Position;
 };
 
-export type Names = {
-  readonly "available": boolean;
-  readonly "cursor": Revision;
-  readonly "part"?: number;
-  readonly "parts"?: number;
-  readonly "persons": readonly PersonName[];
-};
-
 export type Page = {
   readonly "epoch": Epoch;
   readonly "messages": readonly Message[];
@@ -65,14 +57,24 @@ export type PendingRow = {
   readonly "status": "pending" | "unavailable";
 };
 
-export type PersonName = {
+export type Position = string;
+
+export type Principal = {
   readonly "fingerprint": string;
   readonly "identity": string;
+  readonly "kind": "person" | "agent";
   readonly "name": string | null;
-  readonly "personId": string;
+  readonly "principalId": string;
+  readonly "stewardPrincipalId": string | null;
 };
 
-export type Position = string;
+export type Principals = {
+  readonly "available": boolean;
+  readonly "cursor": Revision;
+  readonly "part"?: number;
+  readonly "parts"?: number;
+  readonly "principals": readonly Principal[];
+};
 
 export type Resolved = {
   readonly "messages": readonly Message[];
@@ -126,6 +128,6 @@ export type ConversationsContract = {
   };
   readonly subscriptions: {
     readonly "conversations.changes": { readonly request: Record<string, never>; readonly event: Snapshot };
-    readonly "conversations.names": { readonly request: Record<string, never>; readonly event: Names };
+    readonly "conversations.principals": { readonly request: Record<string, never>; readonly event: Principals };
   };
 };

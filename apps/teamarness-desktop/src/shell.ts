@@ -44,6 +44,9 @@ type WorkspaceActions = Readonly<{
   createWorkspace(name: string, personName: string): Promise<void>;
   joinWorkspace(invitation: string, personName: string): Promise<void>;
   rename(workspaceId: string, name: string): Promise<void>;
+  addAgent(workspaceId: string, name: string): Promise<void>;
+  removeAgent(workspaceId: string, agentId: string): Promise<void>;
+  renameAgent(workspaceId: string, agentId: string, name: string): Promise<void>;
   copyInvitation(workspaceId: string): Promise<void>;
   refreshMembership(workspaceId: string): Promise<void>;
   retry(): Promise<void>;
@@ -284,12 +287,33 @@ export class Shell {
         const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-person-name");
         if (name) void this.options.workspaceActions.rename(workspaceId, name.value);
       });
+      this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#add-agent")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#agent-name");
+        if (name) void this.options.workspaceActions.addAgent(workspaceId, name.value);
+      });
+      this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-remove-agent]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const member = this.workspacePresentation?.workspace?.members[Number(button.dataset.removeAgent)];
+          if (member?.canRemoveAgent && member.agentId) void this.options.workspaceActions.removeAgent(workspaceId, member.agentId);
+        });
+      });
+      this.shellFrame.shellScreen.querySelectorAll<HTMLFormElement>("[data-rename-agent]").forEach((form) => {
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          const member = this.workspacePresentation?.workspace?.members[Number(form.dataset.renameAgent)];
+          const name = form.querySelector<HTMLInputElement>("input");
+          if (member?.canRenameAgent && member.agentId && name) void this.options.workspaceActions.renameAgent(workspaceId, member.agentId, name.value);
+        });
+      });
       this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#copy-invitation")?.addEventListener("click", () => {
         void this.options.workspaceActions.copyInvitation(workspaceId);
       });
-      this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#refresh-membership")?.addEventListener("click", () => {
-        void this.options.workspaceActions.refreshMembership(workspaceId);
-      });
+      for (const selector of ["#refresh-membership", "#retry-membership-refresh"]) {
+        this.shellFrame.shellScreen.querySelector<HTMLButtonElement>(selector)?.addEventListener("click", () => {
+          void this.options.workspaceActions.refreshMembership(workspaceId);
+        });
+      }
     }
     this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => {
       void this.options.workspaceActions.retry();

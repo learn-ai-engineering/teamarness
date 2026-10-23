@@ -19,9 +19,10 @@ use crate::{
     MembershipSnapshot, MembershipSnapshotDigest, MembershipVersion, PublicIdentity, WorkspaceId,
 };
 
+use super::authority;
 use super::{
-    AdmissionProof, AuthId, MembershipAction, MembershipEnvelope, OperationAdapter, authenticate,
-    authenticate_canonical_copy, validate_context,
+    AdmissionProof, AuthId, Ledger, MembershipAction, MembershipEnvelope, OperationAdapter,
+    authenticate, authenticate_canonical_copy, validate_context,
 };
 
 const VERSION_DOMAIN: &[u8] = b"teamarness.membership-version/v1";
@@ -35,6 +36,12 @@ type WorkspaceAnchor = (WorkspaceId, PublicIdentity, MembershipOperationId, Vec<
 type FutureRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>);
 type CreationRequestEvidence = (Vec<u8>, String, i64, Vec<u8>, Vec<u8>, String);
 
+pub(crate) type PrincipalAnchor = (
+    MembershipOperationId,
+    PublicIdentity,
+    Option<(MembershipOperationId, PublicIdentity)>,
+);
+
 #[derive(Clone)]
 pub(crate) struct WorkspaceProjection {
     pub(super) workspace_id: WorkspaceId,
@@ -42,6 +49,12 @@ pub(crate) struct WorkspaceProjection {
     pub(super) genesis_id: MembershipOperationId,
     pub(super) operations: BTreeMap<MembershipOperationId, MembershipEnvelope>,
     snapshot: MembershipSnapshot,
+    /// Every key ever added as an Agent key. Agent keys are Members but never
+    /// peers: grants, key demands and sessions address Installation keys only.
+    agent_keys: BTreeSet<PublicIdentity>,
+    /// Keys with multiple independently accepted admission anchors. This is
+    /// derived from signed facts, not the order in which peers saw them.
+    conflicted_keys: BTreeSet<PublicIdentity>,
 }
 
 impl WorkspaceProjection {
@@ -49,48 +62,87 @@ impl WorkspaceProjection {
         self.snapshot.clone()
     }
 
+    /// The current Members that are Installation keys: the creator and every
+    /// admitted Person's key. These are the only keys that connect, receive
+    /// Protection Grants, or are asked for Content Keys.
+    pub(crate) fn installation_members(&self) -> Vec<PublicIdentity> {
+        self.snapshot
+            .members()
+            .iter()
+            .map(MemberSnapshot::identity)
+            .filter(|identity| self.contains_installation_member(*identity))
+            .collect()
+    }
+
+    /// The currently admitted Person key group managed by `identity`, if any.
+    pub(crate) fn person_group(&self, identity: PublicIdentity) -> Option<MembershipOperationId> {
+        let revoked = self
+            .operations
+            .values()
+            .filter_map(|operation| match &operation.action {
+                MembershipAction::Revoke { group, .. } => Some(*group),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        self.operations
+            .values()
+            .filter_map(|operation| match &operation.action {
+                MembershipAction::Admit { target, proof } if *target == identity => {
+                    Some(proof.claim.create_person.id)
+                }
+                MembershipAction::AttachPerson { group } if operation.author == identity => {
+                    Some(*group)
+                }
+                _ => None,
+            })
+            .find(|group| !revoked.contains(group))
+    }
+
+    pub(crate) fn principal_anchors(&self) -> Vec<PrincipalAnchor> {
+        let mut result = Vec::new();
+        for operation in self.operations.values() {
+            if matches!(operation.action, MembershipAction::CreatePerson { .. })
+                && self.person_group(operation.author) == Some(operation.id)
+                && self.contains_member(operation.author)
+                && !self.conflicted_keys.contains(&operation.author)
+            {
+                result.push((operation.id, operation.author, None));
+            }
+        }
+        for operation in self.operations.values() {
+            if let MembershipAction::AddAgentKey { group, agent, .. } = operation.action
+                && self.contains_member(agent)
+                && !self.conflicted_keys.contains(&agent)
+                && let Some((_, steward, _)) = result.iter().find(|(id, _, _)| *id == group)
+            {
+                result.push((operation.id, agent, Some((group, *steward))));
+            }
+        }
+        result
+    }
+
+    /// Includes accepted anchors no longer in the current roster.
+    pub(crate) fn principal_history(&self) -> Vec<crate::principals::PrincipalId> {
+        self.operations
+            .values()
+            .filter_map(|operation| match operation.action {
+                MembershipAction::CreatePerson { .. } => {
+                    Some(crate::principals::derive(self.workspace_id, operation.id))
+                }
+                MembershipAction::AddAgentKey { .. } => Some(crate::principals::derive_agent(
+                    self.workspace_id,
+                    operation.id,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
     }
     pub(crate) fn genesis_id(&self) -> MembershipOperationId {
         self.genesis_id
-    }
-    pub(crate) fn first_admission(
-        &self,
-        identity: PublicIdentity,
-    ) -> Option<MembershipOperationId> {
-        let admissions = self.operations.values().filter(|operation| {
-            matches!(&operation.action,
-                MembershipAction::Admit { target, .. } if *target == identity)
-        });
-        // A later accepted admission can have the same authored timestamp and
-        // a smaller content hash. Causal order, not hash order, anchors the
-        // first Person; tie-break only genuinely concurrent first admissions.
-        admissions
-            .min_by_key(|operation| {
-                let mut pending = operation.dependencies.clone();
-                let mut visited = BTreeSet::new();
-                let mut earlier_admissions = 0;
-                while let Some(id) = pending.pop() {
-                    if !visited.insert(id) {
-                        continue;
-                    }
-                    if let Some(ancestor) = self.operations.get(&id) {
-                        if matches!(&ancestor.action,
-                        MembershipAction::Admit { target, .. } if *target == identity)
-                        {
-                            earlier_admissions += 1;
-                        }
-                        pending.extend_from_slice(&ancestor.dependencies);
-                    }
-                }
-                (
-                    earlier_admissions,
-                    operation.authored_at_unix_ms,
-                    operation.id,
-                )
-            })
-            .map(|operation| operation.id)
     }
     pub(crate) fn has_admission_for_token(
         &self,
@@ -112,12 +164,31 @@ impl WorkspaceProjection {
             .any(|member| member.identity() == identity)
     }
 
+    pub(crate) fn contains_installation_member(&self, identity: PublicIdentity) -> bool {
+        self.contains_member(identity) && !self.agent_keys.contains(&identity)
+    }
+
+    pub(crate) fn has_person_history(&self, identity: PublicIdentity) -> bool {
+        self.creator == identity
+            || self.operations.values().any(|operation| {
+                matches!(&operation.action, MembershipAction::Admit { target, .. } if *target == identity)
+                    || matches!(&operation.action, MembershipAction::AttachPerson { .. } if operation.author == identity)
+            })
+    }
+
+    pub(crate) fn has_unrevoked_person_conflict(&self, identity: PublicIdentity) -> bool {
+        self.conflicted_keys.contains(&identity) && self.person_group(identity).is_some()
+    }
+
     pub(crate) fn has_membership_history(&self, identity: PublicIdentity) -> bool {
         self.creator == identity
             || self.operations.values().any(|operation| {
                 matches!(
                     &operation.action,
                     MembershipAction::Admit { target, .. } if *target == identity
+                ) || matches!(
+                    &operation.action,
+                    MembershipAction::AddAgentKey { agent, .. } if *agent == identity
                 )
             })
     }
@@ -146,6 +217,8 @@ impl WorkspaceProjection {
                     .map(|identity| MemberSnapshot::new(identity, MembershipRole::Member))
                     .collect(),
             ),
+            agent_keys: BTreeSet::new(),
+            conflicted_keys: BTreeSet::new(),
         }
     }
 
@@ -178,14 +251,48 @@ pub(crate) struct AppliedMembership {
 
 /// Derives the reported change from a membership action. A `create` action
 /// starts a workspace and reports no change.
+pub(crate) fn effective_change_from_action(
+    action: &MembershipAction,
+    snapshot: &MembershipSnapshot,
+) -> Option<MembershipChange> {
+    if matches!(
+        action,
+        MembershipAction::Admit { .. } | MembershipAction::AddAgentKey { .. }
+    ) && let Some(subject) = action.subject()
+        && !snapshot
+            .members()
+            .iter()
+            .any(|member| member.identity() == subject)
+    {
+        return Some(MembershipChange::Revoked { member: subject });
+    }
+    change_from_action(action)
+}
+
 pub(crate) fn change_from_action(action: &MembershipAction) -> Option<MembershipChange> {
     match action {
-        MembershipAction::Create => None,
+        MembershipAction::Create
+        | MembershipAction::CreatePerson { .. }
+        | MembershipAction::AttachPerson { .. } => None,
         MembershipAction::Admit { target, .. } => {
             Some(MembershipChange::Admitted { member: *target })
         }
-        MembershipAction::Revoke { target } => Some(MembershipChange::Revoked { member: *target }),
+        MembershipAction::Revoke { target, .. } => {
+            Some(MembershipChange::Revoked { member: *target })
+        }
+        MembershipAction::AddAgentKey { agent, .. } => {
+            Some(MembershipChange::Admitted { member: *agent })
+        }
+        MembershipAction::RemoveAgentKey { agent, .. } => {
+            Some(MembershipChange::Revoked { member: *agent })
+        }
     }
+}
+
+/// Whether a parked operation is a Person group create that waits for the
+/// operation attaching it, rather than for its own timestamp.
+fn is_waiting_person_create(envelope: &MembershipEnvelope, creator: PublicIdentity) -> bool {
+    matches!(envelope.action, MembershipAction::CreatePerson { .. }) && envelope.author != creator
 }
 
 pub(crate) fn recover(
@@ -214,6 +321,16 @@ pub(crate) fn maintain_quarantine(
         let pending_ids = rows
             .iter()
             .filter_map(|(id, _, _, _, _)| operation_id(id).ok())
+            .collect::<BTreeSet<_>>();
+        // Parked group creates resolve through their dependents, so they do not
+        // hold back the operations that depend on them.
+        let waiting_creates = rows
+            .iter()
+            .filter_map(|(id, _, _, _, bytes)| {
+                let envelope = authenticate(bytes).ok()?;
+                let creator = projections.get(&envelope.workspace_id)?.creator;
+                is_waiting_person_create(&envelope, creator).then(|| operation_id(id).ok())?
+            })
             .collect::<BTreeSet<_>>();
         let mut progressed = false;
 
@@ -252,8 +369,13 @@ pub(crate) fn maintain_quarantine(
                 progressed = true;
                 continue;
             };
+            if is_waiting_person_create(&envelope, projection.creator) {
+                continue;
+            }
             let unresolved = envelope.dependencies.iter().any(|dependency| {
-                !projection.operations.contains_key(dependency) && pending_ids.contains(dependency)
+                !projection.operations.contains_key(dependency)
+                    && pending_ids.contains(dependency)
+                    && !waiting_creates.contains(dependency)
             });
             if unresolved {
                 continue;
@@ -281,6 +403,46 @@ pub(crate) fn maintain_quarantine(
             return Ok(applied);
         }
     }
+}
+
+pub(crate) struct LocalAgentAdd<'a> {
+    pub(crate) id: crate::PrincipalId,
+    pub(crate) author: PublicIdentity,
+    pub(crate) secret: &'a SecretKey,
+    pub(crate) name: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalAgentAddBoundary {
+    BeforeName,
+    BeforeCommit,
+    AfterCommit,
+}
+
+pub(crate) fn apply_local_agent_add(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    envelope: MembershipEnvelope,
+    now_unix_ms: i64,
+    local: LocalAgentAdd<'_>,
+    limits: BootstrapLimits,
+    fault: impl FnMut(LocalAgentAddBoundary) -> Result<(), StorageError>,
+) -> Result<AppliedMembership, MembershipError> {
+    if !matches!(&envelope.action, MembershipAction::AddAgentKey { agent, .. } if agent.as_bytes() == local.secret.public().as_bytes())
+        || local.id != crate::principals::derive_agent(envelope.workspace_id, envelope.id)
+    {
+        return Err(MembershipError::AuthorizationRejected);
+    }
+    apply_authenticated_inner(
+        connection,
+        projections,
+        envelope,
+        now_unix_ms,
+        None,
+        limits,
+        Some(local),
+        fault,
+    )
 }
 
 pub(crate) fn apply_canonical(
@@ -434,10 +596,15 @@ pub(crate) fn validate_bootstrap(
     let MembershipAction::Admit { target, proof } = &admission.action else {
         return Err(crate::OnboardingError::InvalidBootstrap);
     };
+    let group_create = projection
+        .operations
+        .get(&claim.create_person.id)
+        .ok_or(crate::OnboardingError::InvalidBootstrap)?;
     if admission.author != token.inviter
         || *target != local_identity
         || proof.claim.bytes != claim.bytes
         || proof.claim.token.bytes != token.bytes
+        || group_create.canonical_bytes() != claim.create_person.canonical_bytes()
         || projection.snapshot.version() != response.membership_version
         || !projection.contains_member(local_identity)
     {
@@ -584,10 +751,7 @@ pub(crate) fn import_bootstrap_with_fault(
                     insert_identity_subject(&transaction, envelope)?;
                     ensure_import_deadline(deadline)?;
                     insert_transition(&transaction, expected, envelope.id)?;
-                    imported_member_change |= matches!(
-                        envelope.action,
-                        MembershipAction::Admit { .. } | MembershipAction::Revoke { .. }
-                    );
+                    imported_member_change |= envelope.action.changes_roster();
                     candidate = expected.clone();
                 }
                 (candidate, true)
@@ -668,7 +832,7 @@ pub(crate) fn import_bootstrap_with_fault(
         write_member_snapshot(&transaction, &imported_projection, deadline)?;
         import_boundary(&mut fault, ImportBoundary::MemberSnapshot, deadline)?;
         if imported_member_change {
-            crate::person_names::edit::advance_generation(&transaction, response.workspace_id)
+            crate::principals::edit::advance_generation(&transaction, response.workspace_id)
                 .map_err(|_| crate::OnboardingError::LocalConflict)?;
         }
     }
@@ -823,14 +987,12 @@ fn insert_identity_subject(
             [envelope.author.as_bytes().as_slice()],
         )
         .map_err(|_| crate::OnboardingError::LocalConflict)?;
-    if let MembershipAction::Admit { target, .. } | MembershipAction::Revoke { target } =
-        &envelope.action
-    {
+    if let Some(subject) = envelope.action.subject() {
         transaction
             .execute(
                 "INSERT INTO identity_subjects (installation_public_identity, human_identity_id)
                  VALUES (?1, NULL) ON CONFLICT(installation_public_identity) DO NOTHING",
-                [target.as_bytes().as_slice()],
+                [subject.as_bytes().as_slice()],
             )
             .map_err(|_| crate::OnboardingError::LocalConflict)?;
     }
@@ -1070,6 +1232,35 @@ pub(crate) fn redeem_invitation_with_fault_and_limits(
         return Err(InvitationError::NotManager);
     }
 
+    // The invitee's group create and its admission commit together: the
+    // group create first, so the admission can depend on it.
+    let create_person = claim.create_person.clone();
+    let mut candidate_operations = projection.operations.clone();
+    let mut stages = Vec::new();
+    let with_group = if projection.operations.contains_key(&create_person.id) {
+        projection.clone()
+    } else {
+        let group_context = dependency_context(&transaction, projection, &create_person)
+            .map_err(InvitationError::Membership)?;
+        validate_context(
+            &create_person,
+            projection.workspace_id,
+            projection.genesis_id,
+            &group_context,
+            now_unix_ms,
+        )
+        .map_err(InvitationError::Membership)?;
+        candidate_operations.insert(create_person.id, create_person.clone());
+        let with_group = replay(
+            projection.workspace_id,
+            projection.creator,
+            projection.genesis_id,
+            candidate_operations.clone(),
+        )
+        .map_err(InvitationError::Membership)?;
+        stages.push((create_person.clone(), with_group.clone()));
+        with_group
+    };
     let envelope = MembershipEnvelope::sign(
         secret_key,
         claim.token.workspace_id,
@@ -1080,10 +1271,10 @@ pub(crate) fn redeem_invitation_with_fault_and_limits(
                 claim: claim.clone(),
             }),
         },
-        projection.heads(),
+        with_group.heads(),
     )
     .map_err(InvitationError::Membership)?;
-    let dependency_context = dependency_context(&transaction, projection, &envelope)
+    let dependency_context = dependency_context(&transaction, &with_group, &envelope)
         .map_err(InvitationError::Membership)?;
     validate_context(
         &envelope,
@@ -1093,7 +1284,6 @@ pub(crate) fn redeem_invitation_with_fault_and_limits(
         now_unix_ms,
     )
     .map_err(InvitationError::Membership)?;
-    let mut candidate_operations = projection.operations.clone();
     candidate_operations.insert(envelope.id, envelope.clone());
     let candidate = replay(
         projection.workspace_id,
@@ -1103,6 +1293,10 @@ pub(crate) fn redeem_invitation_with_fault_and_limits(
     )
     .map_err(InvitationError::Membership)?;
 
+    for (staged_envelope, staged) in &stages {
+        persist_candidate_rows(&transaction, staged_envelope, staged)
+            .map_err(InvitationError::Membership)?;
+    }
     persist_candidate_rows(&transaction, &envelope, &candidate)
         .map_err(InvitationError::Membership)?;
     // Encode the exact candidate bootstrap before spending the invitation or committing.
@@ -1244,6 +1438,32 @@ fn apply_authenticated_with_limits(
     future_id: Option<MembershipOperationId>,
     limits: BootstrapLimits,
 ) -> Result<AppliedMembership, MembershipError> {
+    apply_authenticated_inner(
+        connection,
+        projections,
+        envelope,
+        now_unix_ms,
+        future_id,
+        limits,
+        None,
+        |_| Ok(()),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "local admission adds a typed persistence payload and fault boundary to authenticated acceptance"
+)]
+fn apply_authenticated_inner(
+    connection: &mut Connection,
+    projections: &mut BTreeMap<WorkspaceId, WorkspaceProjection>,
+    envelope: MembershipEnvelope,
+    now_unix_ms: i64,
+    future_id: Option<MembershipOperationId>,
+    limits: BootstrapLimits,
+    local: Option<LocalAgentAdd<'_>>,
+    mut fault: impl FnMut(LocalAgentAddBoundary) -> Result<(), StorageError>,
+) -> Result<AppliedMembership, MembershipError> {
     let projection = projections
         .get(&envelope.workspace_id)
         .ok_or(MembershipError::WorkspaceNotFound)?;
@@ -1258,12 +1478,12 @@ fn apply_authenticated_with_limits(
         return Ok(applied_result(projection, &envelope, false, false));
     }
 
-    let dependency_context = dependency_context(connection, projection, &envelope)?;
+    let context = dependency_context(connection, projection, &envelope)?;
     match validate_context(
         &envelope,
         projection.workspace_id,
         projection.genesis_id,
-        &dependency_context,
+        &context,
         now_unix_ms,
     ) {
         Err(MembershipError::FutureTimestamp) if future_id.is_none() => {
@@ -1273,8 +1493,36 @@ fn apply_authenticated_with_limits(
         Err(error) => return Err(error),
         Ok(()) => {}
     }
+    // A Person group create by anyone but the creator grants nothing on its
+    // own and enters the accepted set only with the operation that attaches
+    // it. Alone it is parked, like an operation whose time has not come.
+    if is_waiting_person_create(&envelope, projection.creator) && future_id.is_none() {
+        store_future(connection, &envelope)?;
+        return Ok(applied_result(projection, &envelope, false, true));
+    }
 
+    // Parked group creates this operation depends on come along with it.
+    let parked = parked_person_creates(connection, projection, &envelope)?;
     let mut candidate_operations = projection.operations.clone();
+    let mut stages = Vec::with_capacity(parked.len());
+    for parked_envelope in &parked {
+        let parked_context = dependency_context(connection, projection, parked_envelope)?;
+        validate_context(
+            parked_envelope,
+            projection.workspace_id,
+            projection.genesis_id,
+            &parked_context,
+            now_unix_ms,
+        )?;
+        candidate_operations.insert(parked_envelope.id, parked_envelope.clone());
+        let staged = replay(
+            projection.workspace_id,
+            projection.creator,
+            projection.genesis_id,
+            candidate_operations.clone(),
+        )?;
+        stages.push((parked_envelope.clone(), staged));
+    }
     candidate_operations.insert(envelope.id, envelope.clone());
     let candidate = replay(
         projection.workspace_id,
@@ -1283,10 +1531,49 @@ fn apply_authenticated_with_limits(
         candidate_operations,
     )?;
 
-    persist_candidate(connection, &envelope, &candidate, future_id, limits)?;
+    let mut released = parked.iter().map(|parked| parked.id).collect::<Vec<_>>();
+    released.extend(future_id);
+    persist_candidate(
+        connection, &stages, &envelope, &candidate, &released, limits, local, &mut fault,
+    )?;
     let result = applied_result(&candidate, &envelope, true, false);
     projections.insert(envelope.workspace_id, candidate);
     Ok(result)
+}
+
+/// The parked Person group creates among `envelope`'s dependencies, so an
+/// attachment that arrives after the group create it depends on can take the
+/// create into the accepted set with it. Any other missing dependency is
+/// reported by replay as usual.
+fn parked_person_creates(
+    connection: &Connection,
+    projection: &WorkspaceProjection,
+    envelope: &MembershipEnvelope,
+) -> Result<Vec<MembershipEnvelope>, MembershipError> {
+    let mut parked = Vec::new();
+    for id in &envelope.dependencies {
+        if projection.operations.contains_key(id) {
+            continue;
+        }
+        let future: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT canonical_envelope FROM future_membership_operations
+                 WHERE operation_id = ?1 AND rejection_reason IS NULL",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+        let Some(bytes) = future else {
+            continue;
+        };
+        let dependency = authenticate(&bytes)?;
+        if dependency.id == *id && is_waiting_person_create(&dependency, projection.creator) {
+            parked.push(dependency);
+        }
+    }
+    parked.sort_by_key(|dependency| dependency.id);
+    Ok(parked)
 }
 
 fn applied_result(
@@ -1301,7 +1588,7 @@ fn applied_result(
         snapshot_digest: snapshot_digest(&projection.snapshot),
         accepted,
         quarantined,
-        change: change_from_action(&envelope.action),
+        change: effective_change_from_action(&envelope.action, &projection.snapshot),
         author: envelope.author,
     }
 }
@@ -1471,7 +1758,7 @@ fn load_dependencies(
     Ok(dependencies)
 }
 
-pub(super) fn replay(
+pub(crate) fn replay(
     workspace_id: WorkspaceId,
     creator: PublicIdentity,
     genesis_id: MembershipOperationId,
@@ -1549,7 +1836,10 @@ fn replay_until(
                 })
                 .collect::<Vec<_>>();
             validate_context(operation, workspace_id, genesis_id, &dependencies, i64::MAX)?;
-            validate_phase_one(operation, creator, &operations, deadline)?;
+            let ancestry = Ledger::ancestry_of(operation, &operations, || {
+                ensure_membership_deadline(deadline)
+            })?;
+            authority::authorize(operation, creator, &ancestry)?;
             state = MembershipCrdt::process(state, &OperationAdapter(operation.clone()))
                 .map_err(|_| MembershipError::AuthorizationRejected)?;
             processed.insert(id);
@@ -1557,6 +1847,46 @@ fn replay_until(
     }
 
     ensure_membership_deadline(deadline)?;
+    // Count independently accepted admission anchors, even when one branch
+    // has since been removed. A revocation cannot resurrect the other claim.
+    let mut admitted = BTreeSet::new();
+    let mut conflicted_keys = BTreeSet::new();
+    for operation in operations.values() {
+        let key = match &operation.action {
+            MembershipAction::Admit { target, .. } => Some(*target),
+            MembershipAction::AttachPerson { .. } => Some(operation.author),
+            MembershipAction::AddAgentKey { agent, .. } => Some(*agent),
+            _ => None,
+        };
+        if let Some(key) = key
+            && key != creator
+            && !admitted.insert(key)
+        {
+            conflicted_keys.insert(key);
+        }
+    }
+    let conflicted_stewards = operations
+        .values()
+        .filter_map(|operation| match &operation.action {
+            MembershipAction::Admit { target, proof } if conflicted_keys.contains(target) => {
+                Some(proof.claim.create_person.id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let ineffective_agents = operations
+        .values()
+        .filter_map(|operation| match &operation.action {
+            MembershipAction::AddAgentKey { group, agent, .. }
+                if conflicted_stewards.contains(group) =>
+            {
+                Some(*agent)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    // The snapshot flattens every nested Person group: each effective key is
+    // a Member, and only the creator holds manage access.
     let mut members = Vec::new();
     for (id, access) in state.members(AuthId::workspace(workspace_id)) {
         ensure_membership_deadline(deadline)?;
@@ -1565,6 +1895,9 @@ fn replay_until(
         };
         let identity =
             PublicIdentity::from_bytes(bytes).map_err(|_| MembershipError::InvalidRole)?;
+        if conflicted_keys.contains(&identity) || ineffective_agents.contains(&identity) {
+            continue;
+        }
         let role = if access.is_manage() {
             MembershipRole::Manager
         } else if access.is_write() {
@@ -1590,72 +1923,16 @@ fn replay_until(
     let version = membership_version(workspace_id, genesis_id, operations.keys().copied());
     let snapshot =
         MembershipSnapshot::new(workspace_id, MembershipEpoch::new(epoch), version, members);
+    let agent_keys = authority::agent_keys(&operations);
     Ok(WorkspaceProjection {
         workspace_id,
         creator,
         genesis_id,
         operations,
         snapshot,
+        agent_keys,
+        conflicted_keys,
     })
-}
-
-fn validate_phase_one(
-    operation: &MembershipEnvelope,
-    creator: PublicIdentity,
-    operations: &BTreeMap<MembershipOperationId, MembershipEnvelope>,
-    deadline: Option<std::time::Instant>,
-) -> Result<(), MembershipError> {
-    if operation.author != creator {
-        return Err(MembershipError::NotManager);
-    }
-    match &operation.action {
-        MembershipAction::Create => Err(MembershipError::ConflictingGenesis),
-        MembershipAction::Admit { target, proof } => {
-            if proof.claim.token.inviter != operation.author
-                || proof.claim.token.workspace_id != operation.workspace_id
-                || proof.claim.token.issued_at_unix_ms > operation.authored_at_unix_ms
-                || proof.claim.token.expires_at_unix_ms < operation.authored_at_unix_ms
-                || proof.claim.invitee != *target
-            {
-                return Err(MembershipError::InvalidAdmissionProof);
-            }
-            if causal_ancestry_contains_revoke(operation, *target, operations, deadline)? {
-                return Err(MembershipError::CausalReadmission);
-            }
-            Ok(())
-        }
-        MembershipAction::Revoke { target } => {
-            if *target == creator {
-                return Err(MembershipError::CannotRevokeManager);
-            }
-            Ok(())
-        }
-    }
-}
-
-fn causal_ancestry_contains_revoke(
-    operation: &MembershipEnvelope,
-    target: PublicIdentity,
-    operations: &BTreeMap<MembershipOperationId, MembershipEnvelope>,
-    deadline: Option<std::time::Instant>,
-) -> Result<bool, MembershipError> {
-    let mut pending = operation.dependencies.clone();
-    let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        ensure_membership_deadline(deadline)?;
-        if !visited.insert(id) {
-            continue;
-        }
-        let Some(ancestor) = operations.get(&id) else {
-            continue;
-        };
-        if matches!(ancestor.action, MembershipAction::Revoke { target: revoked } if revoked == target)
-        {
-            return Ok(true);
-        }
-        pending.extend(ancestor.dependencies.iter().copied());
-    }
-    Ok(false)
 }
 
 fn dependency_context(
@@ -1699,20 +1976,51 @@ fn dependency_context(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "membership persistence also stages local custody and name in its one transaction"
+)]
 fn persist_candidate(
     connection: &mut Connection,
+    stages: &[(MembershipEnvelope, WorkspaceProjection)],
     envelope: &MembershipEnvelope,
     candidate: &WorkspaceProjection,
-    future_id: Option<MembershipOperationId>,
+    released_future_ids: &[MembershipOperationId],
     limits: BootstrapLimits,
+    local: Option<LocalAgentAdd<'_>>,
+    fault: &mut impl FnMut(LocalAgentAddBoundary) -> Result<(), StorageError>,
 ) -> Result<(), MembershipError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| MembershipError::Storage(StorageError::Database))?;
+    for (staged_envelope, staged) in stages {
+        persist_candidate_rows(&transaction, staged_envelope, staged)?;
+    }
     persist_candidate_rows(&transaction, envelope, candidate)?;
+    if let Some(local) = local {
+        crate::principals::agent_keys::store(
+            &transaction,
+            envelope.workspace_id,
+            local.id,
+            local.secret,
+        )
+        .map_err(MembershipError::Storage)?;
+        fault(LocalAgentAddBoundary::BeforeName).map_err(MembershipError::Storage)?;
+        crate::principals::set_id_in_transaction(
+            &transaction,
+            candidate,
+            local.author,
+            local.id,
+            local.name,
+        )
+        .map_err(|error| match error {
+            crate::PersonNameError::Storage(storage) => MembershipError::Storage(storage),
+            _ => MembershipError::AuthorizationRejected,
+        })?;
+    }
     // Every accepted mutation must leave a complete onboarding bootstrap encodable.
     encode_current_bootstrap_with_limits(&transaction, candidate, candidate.genesis_id, limits)?;
-    if let Some(id) = future_id {
+    for id in released_future_ids {
         transaction
             .execute(
                 "DELETE FROM future_membership_dependencies WHERE operation_id = ?1",
@@ -1726,25 +2034,26 @@ fn persist_candidate(
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
+    fault(LocalAgentAddBoundary::BeforeCommit).map_err(MembershipError::Storage)?;
     transaction
         .commit()
+        .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))?;
+    fault(LocalAgentAddBoundary::AfterCommit)
         .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))
 }
 
-fn persist_candidate_rows(
+pub(crate) fn persist_candidate_rows(
     transaction: &Transaction<'_>,
     envelope: &MembershipEnvelope,
     candidate: &WorkspaceProjection,
 ) -> Result<(), MembershipError> {
     // Both direct membership acceptance and invitation redemption use this
     // transaction. Never commit a roster change without its name invalidation.
-    if matches!(
-        envelope.action,
-        MembershipAction::Admit { .. } | MembershipAction::Revoke { .. }
-    ) {
-        crate::person_names::edit::advance_generation(transaction, envelope.workspace_id).map_err(
+    crate::principals::refresh(transaction, candidate).map_err(MembershipError::Storage)?;
+    if envelope.action.changes_roster() {
+        crate::principals::edit::advance_generation(transaction, envelope.workspace_id).map_err(
             |error| match error {
-                crate::person_names::edit::EditError::Storage(storage) => {
+                crate::principals::edit::EditError::Storage(storage) => {
                     MembershipError::Storage(storage)
                 }
                 _ => MembershipError::Storage(StorageError::CorruptWorkspace),
@@ -1779,14 +2088,12 @@ fn persist_candidate_rows(
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
-    if let MembershipAction::Admit { target, .. } | MembershipAction::Revoke { target } =
-        &envelope.action
-    {
+    for subject in std::iter::once(envelope.author).chain(envelope.action.subject()) {
         transaction
             .execute(
                 "INSERT INTO identity_subjects (installation_public_identity, human_identity_id)
                  VALUES (?1, NULL) ON CONFLICT(installation_public_identity) DO NOTHING",
-                [target.as_bytes().as_slice()],
+                [subject.as_bytes().as_slice()],
             )
             .map_err(|_| MembershipError::Storage(StorageError::Database))?;
     }
@@ -1923,6 +2230,7 @@ fn repair_all_derived(
         .map_err(|_| StorageError::Database)?;
     for projection in projections.values() {
         write_derived(&transaction, projection).map_err(membership_to_storage)?;
+        crate::principals::refresh(&transaction, projection)?;
     }
     transaction
         .commit()
@@ -2109,7 +2417,7 @@ fn remove_future(
         .map_err(|_| MembershipError::Storage(StorageError::UncertainOutcome))
 }
 
-fn membership_version(
+pub(crate) fn membership_version(
     workspace_id: WorkspaceId,
     genesis_id: MembershipOperationId,
     operation_ids: impl IntoIterator<Item = MembershipOperationId>,
@@ -2139,11 +2447,17 @@ pub(crate) fn snapshot_digest(snapshot: &MembershipSnapshot) -> MembershipSnapsh
     MembershipSnapshotDigest::from_bytes(*Hash::digest(bytes).as_bytes())
 }
 
-fn action_tag(action: &MembershipAction) -> i64 {
+/// The stored action discriminator. Roster-changing actions are 1, 2, 5 and 6;
+/// the subscription loader keys on that set.
+pub(crate) fn action_tag(action: &MembershipAction) -> i64 {
     match action {
         MembershipAction::Create => 0,
         MembershipAction::Admit { .. } => 1,
         MembershipAction::Revoke { .. } => 2,
+        MembershipAction::CreatePerson { .. } => 3,
+        MembershipAction::AttachPerson { .. } => 4,
+        MembershipAction::AddAgentKey { .. } => 5,
+        MembershipAction::RemoveAgentKey { .. } => 6,
     }
 }
 
@@ -2186,6 +2500,10 @@ fn terminal_reason(error: &MembershipError) -> &'static str {
         MembershipError::CausalReadmission => "causal re-admission",
         MembershipError::CannotRevokeManager => "cannot revoke manager",
         MembershipError::AuthorizationRejected => "authorization rejected",
+        MembershipError::UnknownPersonGroup => "unknown person group",
+        MembershipError::PersonNotAdmitted => "person group not admitted",
+        MembershipError::DuplicateMemberKey => "duplicate member key",
+        MembershipError::AgentKeyCannotAuthor => "agent key cannot author",
         _ => "invalid membership operation",
     }
 }
@@ -2225,7 +2543,8 @@ mod tests {
         let mut projections = recover(&mut connection, 1_100).unwrap();
         let member = SecretKey::from_bytes(&[61; 32]);
         let manager_token = sign_token(&manager, workspace.id(), 1_000, 2_000, [1; 32]).unwrap();
-        let manager_claim = sign_claim(&member, &manager_token).unwrap();
+        let genesis = projections[&workspace.id()].genesis_id;
+        let manager_claim = sign_claim(&member, &manager_token, genesis).unwrap();
         redeem_invitation(
             &mut connection,
             &mut projections,
@@ -2239,7 +2558,7 @@ mod tests {
 
         let member_token = sign_token(&member, workspace.id(), 1_101, 2_000, [2; 32]).unwrap();
         let target = SecretKey::from_bytes(&[62; 32]);
-        let member_claim = sign_claim(&target, &member_token).unwrap();
+        let member_claim = sign_claim(&target, &member_token, genesis).unwrap();
         assert_eq!(
             redeem_invitation(
                 &mut connection,
@@ -2288,7 +2607,8 @@ mod tests {
             )
             .unwrap();
             let invitee = SecretKey::from_bytes(&[u8::try_from(index + 41).unwrap(); 32]);
-            let claim = sign_claim(&invitee, &token).unwrap();
+            let genesis = projections[&workspace.id()].genesis_id;
+            let claim = sign_claim(&invitee, &token, genesis).unwrap();
 
             let result = redeem_invitation_with_fault(
                 &mut connection,
@@ -2310,13 +2630,14 @@ mod tests {
                 },
             );
             assert!(result.is_err());
+            // Genesis, the creator's group create and its attachment: epoch 2.
             assert_eq!(
                 projections[&workspace.id()].snapshot.epoch(),
-                MembershipEpoch::new(0)
+                MembershipEpoch::new(2)
             );
 
             if boundary == RedemptionBoundary::BeforeCommit {
-                assert_eq!(count_redemption_rows(&connection), (0, 0, 0));
+                assert_eq!(count_redemption_rows(&connection), (0, 0, 2));
                 let accepted = redeem_invitation(
                     &mut connection,
                     &mut projections,
@@ -2327,13 +2648,14 @@ mod tests {
                 )
                 .unwrap();
                 assert!(accepted.applied.accepted);
-                assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
+                // The invitee's group create and its admission: two more epochs.
+                assert_eq!(count_redemption_rows(&connection), (1, 1, 4));
             } else {
                 assert_eq!(
                     result.unwrap_err(),
                     InvitationError::Storage(StorageError::UncertainOutcome)
                 );
-                assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
+                assert_eq!(count_redemption_rows(&connection), (1, 1, 4));
                 let committed_id: Vec<u8> = connection
                     .query_row(
                         "SELECT admission_operation_id FROM used_invitation_nonces",
@@ -2348,7 +2670,7 @@ mod tests {
                 projections = recover(&mut connection, 1_100).unwrap();
                 assert_eq!(
                     projections[&workspace.id()].snapshot.epoch(),
-                    MembershipEpoch::new(1)
+                    MembershipEpoch::new(4)
                 );
                 assert_eq!(
                     redeem_invitation(
@@ -2374,7 +2696,7 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(recovered_id, committed_id);
-                assert_eq!(count_redemption_rows(&connection), (1, 1, 1));
+                assert_eq!(count_redemption_rows(&connection), (1, 1, 4));
             }
 
             drop(connection);

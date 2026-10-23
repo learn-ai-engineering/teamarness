@@ -1,5 +1,5 @@
 import { isPackageRequestError, packageErrorCode, type TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Availability, ConversationsContract, Names } from "./contract.generated";
+import type { Availability, ConversationsContract, Principals } from "./contract.generated";
 import type {
   ConversationChannel,
   ConversationMessage,
@@ -20,7 +20,7 @@ export interface ControllerState {
   readonly selectedSlug: string | null;
   readonly selectedCanHide: boolean;
   readonly messages: readonly ConversationMessage[];
-  readonly names: Names;
+  readonly principals: Principals;
   readonly hasMore: boolean;
   readonly nextBefore: string | null;
   readonly loading: boolean;
@@ -179,7 +179,7 @@ export class ConversationsController {
   private openDirty = false;
   private historyGeneration = 0;
   private historyRebuilding = false;
-  private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
+  private pendingPrincipals: { cursor: string; parts: number; nextPart: number; principals: Principals["principals"] } | null = null;
   private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
@@ -195,7 +195,7 @@ export class ConversationsController {
       selectedSlug: null,
       selectedCanHide: false,
       messages: [],
-      names: { available: false, cursor: "0", persons: [] },
+      principals: { available: false, cursor: "0", principals: [] },
       hasMore: false,
       nextBefore: null,
       loading: true,
@@ -221,28 +221,28 @@ export class ConversationsController {
   }
 
   /** A profile cursor invalidates presentation, never Message authorship or history. */
-  applyNames(names: Names): void {
+  applyPrincipals(principals: Principals): void {
     if (this.disposed) return;
-    if (!names.available) {
-      this.pendingNames = null;
-      this._state = { ...this._state, names: { available: false, cursor: "0", persons: [] } };
+    if (!principals.available) {
+      this.pendingPrincipals = null;
+      this._state = { ...this._state, principals: { available: false, cursor: "0", principals: [] } };
       this.notify();
       return;
     }
-    if (this._state.names.available && BigInt(names.cursor) < BigInt(this._state.names.cursor)) return;
-    if (names.part !== undefined && names.parts !== undefined) {
-      if (names.part === 0) this.pendingNames = { cursor: names.cursor, parts: names.parts, nextPart: 0, persons: [] };
-      const pending = this.pendingNames;
-      if (!pending || pending.cursor !== names.cursor || pending.parts !== names.parts
-        || names.part !== pending.nextPart) return;
-      this.pendingNames = { ...pending, nextPart: pending.nextPart + 1, persons: [...pending.persons, ...names.persons] };
-      if (names.part !== names.parts - 1) return;
-      names = { available: true, cursor: names.cursor, persons: this.pendingNames.persons };
-      this.pendingNames = null;
+    if (this._state.principals.available && BigInt(principals.cursor) < BigInt(this._state.principals.cursor)) return;
+    if (principals.part !== undefined && principals.parts !== undefined) {
+      if (principals.part === 0) this.pendingPrincipals = { cursor: principals.cursor, parts: principals.parts, nextPart: 0, principals: [] };
+      const pending = this.pendingPrincipals;
+      if (!pending || pending.cursor !== principals.cursor || pending.parts !== principals.parts
+        || principals.part !== pending.nextPart) return;
+      this.pendingPrincipals = { ...pending, nextPart: pending.nextPart + 1, principals: [...pending.principals, ...principals.principals] };
+      if (principals.part !== principals.parts - 1) return;
+      principals = { available: true, cursor: principals.cursor, principals: this.pendingPrincipals.principals };
+      this.pendingPrincipals = null;
     } else {
-      this.pendingNames = null;
+      this.pendingPrincipals = null;
     }
-    this._state = { ...this._state, names };
+    this._state = { ...this._state, principals };
     this.notify();
   }
 

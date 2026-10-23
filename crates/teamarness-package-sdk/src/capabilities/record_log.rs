@@ -210,6 +210,7 @@ pub enum RecordLogEvent {
 pub struct RecordLog {
     client: CapabilityClient,
     grant: String,
+    minor: u16,
 }
 
 impl RecordLog {
@@ -224,6 +225,10 @@ impl RecordLog {
     ) -> Result<Self, BackendError> {
         Ok(Self {
             grant: grant_for(initialization, IDENTITY)?,
+            minor: initialization
+                .capability(IDENTITY)
+                .ok_or_else(super::not_granted)?
+                .minor,
             client,
         })
     }
@@ -239,20 +244,39 @@ impl RecordLog {
         purpose: &str,
         canonical: &[u8],
     ) -> Result<AppendResult, BackendError> {
+        self.append_with_principal(purpose, canonical, None).await
+    }
+
+    /// Appends as a locally bound Agent (record-log 1.1 only).
+    pub async fn append_with_principal(
+        &self,
+        purpose: &str,
+        canonical: &[u8],
+        principal: Option<&str>,
+    ) -> Result<AppendResult, BackendError> {
+        if let Some(id) = principal
+            && (self.minor < 1 || !is_lower_hex(id, 64))
+        {
+            return Err(invalid_request());
+        }
         check_purpose(purpose)?;
         if canonical.is_empty() || canonical.len() > MAX_CANONICAL_BYTES {
             return Err(invalid_request());
         }
         let answer = self
             .client
-            .call(
-                &self.grant,
-                "append",
-                object([
-                    ("purpose", JsonValue::String(purpose.to_owned())),
-                    ("canonical", JsonValue::String(encode_base64(canonical))),
-                ]),
-            )
+            .call(&self.grant, "append", {
+                let mut fields = serde_json::Map::new();
+                fields.insert("purpose".into(), JsonValue::String(purpose.to_owned()));
+                fields.insert(
+                    "canonical".into(),
+                    JsonValue::String(encode_base64(canonical)),
+                );
+                if let Some(id) = principal {
+                    fields.insert("principal".into(), JsonValue::String(id.to_owned()));
+                }
+                JsonValue::Object(fields)
+            })
             .await?;
         if string_field(&answer, "durability")? != "committed" {
             return Err(invalid_response());

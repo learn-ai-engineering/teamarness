@@ -24,11 +24,15 @@ The system SHALL support an Installation Display Name for the local Installation
 
 ## TEAM.SYS.ID-R06 — Device vs Human Identity
 
-The membership log SHALL accommodate both device-scoped and future human-scoped identity. The initial implementation SHALL treat each device as a first-class member. The schema SHALL reserve space for a human identity layer that groups multiple device identities.
+The membership log SHALL accommodate both device-scoped and human-scoped identity. A Workspace Person SHALL be a key group nested in the Workspace group, managed by the Person's Installation key and holding the Person's Agent Identities (ADR 0023). The initial implementation SHALL attach one Installation key to each Person; grouping multiple Installations under one Person SHALL reuse the same key group without changing the Person's Principal ID.
 
-## TEAM.SYS.ID-R09 — Workspace Person Names
+## TEAM.SYS.ID-R09 — Principal Names
 
-Each current Member SHALL have a Workspace-local opaque Person ID anchored to its accepted genesis or admission, distinct from its Installation identity. A current Installation may set only its own Workspace Person Name. Names SHALL be non-unique Unicode text (including emoji), nonblank after trimming, without control characters, and at most 64 grapheme clusters and 256 UTF-8 bytes. Missing names SHALL present a fingerprint fallback, not the Installation Display Name. A name change SHALL NOT grant membership authority or advance the membership epoch or version. Current names and a separate durable profile cursor SHALL remain available after restart and peer synchronization without Package activation (ADR 0022).
+Each current Workspace Principal SHALL have a Workspace-local opaque Principal ID, distinct from any key: a Workspace Person's ID SHALL be derived from its accepted key group create operation, and a Workspace Agent's ID from the accepted operation that first added its key, under separate domain tags. A Person's name edit SHALL be signed by that Person's Installation key; an Agent's name edit SHALL be signed by its Steward's Installation key, and no other key SHALL rename a Principal. Names SHALL be non-unique Unicode text (including emoji), nonblank after trimming, without control characters, and at most 64 grapheme clusters and 256 UTF-8 bytes. Missing names SHALL present a fingerprint fallback, not the Installation Display Name. A name change SHALL NOT grant membership authority or advance the membership epoch or version. Current Principals, their names, and a separate durable profile cursor SHALL remain available after restart and peer synchronization without Package activation (ADR 0023).
+
+## TEAM.SYS.ID-R10 — Agent Identity
+
+When a Workspace Person adds a Workspace Agent, the Steward's Installation SHALL generate the Agent's Ed25519 keypair and SHALL custody its secret under the same rules as the Installation secret (`TEAM.SYS.ID-R01`, ADR 0017). The Agent secret SHALL NOT be exposed through any Teamarness API, Semantic Capability, log, diagnostic, Workspace Invitation, or user interface, and SHALL be cleared from memory after use on a best-effort basis. The Agent Identity SHALL sign records only: it SHALL NOT author membership operations or name edits, SHALL NOT open or accept peer connections, and SHALL NOT receive Protection Grants. Core SHALL sign a record with an Agent Identity only for a Package Instance bound to that Agent on the same Installation.
 
 ## TEAM.SYS.ID-R07 — Private Data Directory
 

@@ -88,7 +88,7 @@ async fn existing_remote_message_keeps_author_while_person_name_changes() {
         .execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
             mount: bob_mount.clone(),
             subscription: subscription.clone(),
-            operation: "conversations.names".into(),
+            operation: "conversations.principals".into(),
             payload: object([]),
         }))
         .await
@@ -105,13 +105,14 @@ async fn existing_remote_message_keeps_author_while_person_name_changes() {
         let PackageValue::Object(fields) = payload else {
             return false;
         };
-        let Some(PackageValue::Array(persons)) = fields.get("persons") else {
+        let Some(PackageValue::Array(principals)) = fields.get("principals") else {
             return false;
         };
-        persons.iter().any(|person| {
-            matches!(person, PackageValue::Object(person)
-            if person.get("identity") == Some(&PackageValue::String(author.clone()))
-            && person.get("name") == Some(&PackageValue::String(expected.into())))
+        principals.iter().any(|principal| {
+            matches!(principal, PackageValue::Object(principal)
+            if principal.get("identity") == Some(&PackageValue::String(author.clone()))
+            && principal.get("kind") == Some(&PackageValue::String("person".into()))
+            && principal.get("name") == Some(&PackageValue::String(expected.into())))
         })
     };
     let saw_initial = tokio::time::timeout(Duration::from_secs(30), async {

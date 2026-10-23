@@ -81,8 +81,11 @@ pub(crate) struct RuntimeState {
     /// membership stream waits instead of polling.
     membership_epochs: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
     profile_generations: BTreeMap<WorkspaceId, tokio::sync::watch::Sender<u64>>,
+    name_replay_scans: BTreeMap<WorkspaceId, principal_sync::ReplayScan>,
     #[cfg(test)]
     person_name_open_error_once: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    principal_sync_init_faults: u8,
     next_subscriber_id: u64,
     pub(crate) poisoned: bool,
 }
@@ -186,8 +189,11 @@ impl CoreRuntime {
             record_heads,
             membership_epochs: BTreeMap::new(),
             profile_generations: BTreeMap::new(),
+            name_replay_scans: BTreeMap::new(),
             #[cfg(test)]
             person_name_open_error_once: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
         }));
@@ -199,7 +205,7 @@ impl CoreRuntime {
                     .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
                 let workspaces: Vec<_> = locked.memberships.keys().copied().collect();
                 for workspace in workspaces {
-                    person_name_sync::initialize(&mut locked, workspace)
+                    principal_sync::initialize(&mut locked, workspace)
                         .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
                 }
                 Ok(())
@@ -352,7 +358,7 @@ impl Drop for CoreRuntime {
 mod identity;
 mod membership;
 mod onboarding;
-pub(crate) mod person_name_sync;
+pub(crate) mod principal_sync;
 mod records;
 mod replication;
 mod subscription;
@@ -367,6 +373,8 @@ pub use subscription::MembershipSubscription;
 pub(crate) use test_hooks::ProbeOutcome;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_hooks::RuntimeStateHold;
+#[cfg(feature = "test-hooks")]
+pub use test_hooks::{AgentAddFaultForTests, MembershipApplyOutcomeForTests};
 pub use types::*;
 
 // `test_hooks` reaches this through `use super::*`; nothing else in `runtime` needs it.

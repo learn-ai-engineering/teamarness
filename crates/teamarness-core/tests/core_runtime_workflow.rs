@@ -29,7 +29,8 @@ async fn public_runtime_local_workflow_is_network_independent_and_survives_reope
 
     let snapshot = runtime.membership_snapshot(workspace.id()).unwrap();
     assert_eq!(snapshot.workspace_id(), workspace.id());
-    assert_eq!(snapshot.epoch(), MembershipEpoch::new(0));
+    // Genesis plus the creator's own key group create and attachment.
+    assert_eq!(snapshot.epoch(), MembershipEpoch::new(2));
     assert_eq!(snapshot.members().len(), 1);
     assert_eq!(snapshot.members()[0].identity(), identity);
     assert_eq!(snapshot.members()[0].role(), MembershipRole::Manager);

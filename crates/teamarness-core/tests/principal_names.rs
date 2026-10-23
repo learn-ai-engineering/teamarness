@@ -6,7 +6,7 @@ use teamarness_core::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 fn directory() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "person-names-{}-{}",
+        "principal-names-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
@@ -15,9 +15,9 @@ fn durable_name(path: &std::path::Path, workspace: WorkspaceId) -> String {
     rusqlite::Connection::open(path.join("core.sqlite3"))
         .unwrap()
         .query_row(
-            "SELECT name FROM workspace_person_names n WHERE hex(n.workspace_id) = ?1
-             AND (EXISTS (SELECT 1 FROM pending_person_name_edits p WHERE p.workspace_id=n.workspace_id AND p.person_id=n.person_id)
-               OR EXISTS (SELECT 1 FROM workspace_person_name_winners w WHERE w.workspace_id=n.workspace_id AND w.person_id=n.person_id))",
+            "SELECT name FROM principal_names n WHERE hex(n.workspace_id) = ?1
+             AND (EXISTS (SELECT 1 FROM pending_principal_name_edits p WHERE p.workspace_id=n.workspace_id AND p.principal_id=n.principal_id)
+               OR EXISTS (SELECT 1 FROM principal_name_winners w WHERE w.workspace_id=n.workspace_id AND w.principal_id=n.principal_id))",
             [workspace.to_string().to_uppercase()],
             |row| row.get(0),
         )
@@ -243,7 +243,7 @@ async fn forged_person_anchor_is_rejected_without_changing_membership() {
     // The public IDs are text; use hex decoding in SQLite to target the row.
     connection
         .execute(
-            "UPDATE workspace_person_names SET anchor_operation_id = ?1 WHERE hex(person_id) = ?2",
+            "UPDATE principal_names SET anchor_operation_id = ?1 WHERE hex(principal_id) = ?2",
             rusqlite::params![
                 [99_u8; 32].as_slice(),
                 person.id().to_string().to_uppercase()

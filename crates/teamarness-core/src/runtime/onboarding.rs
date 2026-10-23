@@ -20,6 +20,18 @@ impl CoreRuntime {
         issued_at_unix_ms: i64,
         expires_at_unix_ms: i64,
     ) -> Result<InvitationToken, InvitationError> {
+        self.issue_invitation_with_genesis_at(workspace_id, issued_at_unix_ms, expires_at_unix_ms)
+            .map(|(token, _)| token)
+    }
+
+    /// Issues a token together with the Workspace genesis identifier the
+    /// transfer value carries for the joiner's group create.
+    pub(super) fn issue_invitation_with_genesis_at(
+        &self,
+        workspace_id: WorkspaceId,
+        issued_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<(InvitationToken, MembershipOperationId), InvitationError> {
         let mut state = self.lock_invitation_state()?;
         self.maintain_and_publish(&mut state, issued_at_unix_ms)
             .map_err(InvitationError::Membership)?;
@@ -48,7 +60,10 @@ impl CoreRuntime {
             expires_at_unix_ms,
             nonce,
         )?;
-        Ok(InvitationToken::from_verified(&token))
+        Ok((
+            InvitationToken::from_verified(&token),
+            projection.genesis_id(),
+        ))
     }
 
     /// Creates a fixed-lifetime opaque invitation after endpoint readiness succeeds.
@@ -62,8 +77,8 @@ impl CoreRuntime {
         #[cfg(test)]
         self.transport.pause_after_invitation_readiness().await;
         let issued_at_unix_ms = self.clock.now_unix_ms();
-        let token = self
-            .issue_invitation_at(
+        let (token, genesis_id) = self
+            .issue_invitation_with_genesis_at(
                 workspace_id,
                 issued_at_unix_ms,
                 issued_at_unix_ms.saturating_add(INVITATION_LIFETIME_MS),
@@ -72,8 +87,9 @@ impl CoreRuntime {
         let verified = token
             .verified()
             .map_err(fault!(crate::OnboardingError::Authentication))?;
-        let invitation = crate::WorkspaceInvitation::from_parts(&verified, operation.address())
-            .map_err(|_| crate::OnboardingError::InvalidInput);
+        let invitation =
+            crate::WorkspaceInvitation::from_parts(&verified, genesis_id, operation.address())
+                .map_err(|_| crate::OnboardingError::InvalidInput);
         drop(operation);
         invitation
     }
@@ -97,7 +113,7 @@ impl CoreRuntime {
         invitation: &crate::WorkspaceInvitation,
         name: &str,
     ) -> Result<(WorkspaceSummary, MembershipSnapshot), crate::OnboardingError> {
-        crate::person_names::validate(name).map_err(|_| crate::OnboardingError::InvalidInput)?;
+        crate::principals::validate(name).map_err(|_| crate::OnboardingError::InvalidInput)?;
         let verified = invitation
             .verified()
             .map_err(|_| crate::OnboardingError::InvalidInput)?;
@@ -115,7 +131,7 @@ impl CoreRuntime {
             if let Some(projection) = state.memberships.get(&workspace)
                 && projection
                     .has_admission_for_token(PublicIdentity(state.secret_key.public()), &token)
-                && let Ok(Some(person)) = crate::person_names::lookup(
+                && let Ok(Some(person)) = crate::principals::lookup(
                     &state.connection,
                     projection,
                     PublicIdentity(state.secret_key.public()),
@@ -124,7 +140,7 @@ impl CoreRuntime {
             {
                 return Ok(current.to_owned());
             }
-            crate::person_names::stage_join(&mut state.connection, workspace, &token, &requested)
+            crate::principals::stage_join(&mut state.connection, workspace, &token, &requested)
                 .map_err(|error| match error {
                     crate::PersonNameError::Storage(StorageError::UncertainOutcome) => {
                         state.poisoned = true;
@@ -166,7 +182,7 @@ impl CoreRuntime {
         if !projection.has_admission_for_token(self.public_identity, token) {
             return Ok(None);
         }
-        crate::person_names::finish_join(
+        crate::principals::finish_join(
             &mut state.connection,
             &projection,
             self.public_identity,
@@ -179,7 +195,7 @@ impl CoreRuntime {
             crate::OnboardingError::UncertainStorageOutcome
         })?;
         if requested != original {
-            crate::person_names::set(
+            crate::principals::set(
                 &mut state.connection,
                 &projection,
                 self.public_identity,
@@ -192,8 +208,8 @@ impl CoreRuntime {
                 crate::OnboardingError::UncertainStorageOutcome
             })?;
         }
-        person_name_sync::publish_generation(&state, workspace);
-        person_name_sync::initialize(&mut state, workspace)
+        principal_sync::publish_generation(&state, workspace);
+        principal_sync::initialize(&mut state, workspace)
             .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
         let summary = crate::workspace::list(&state.connection)
             .map_err(|_| crate::OnboardingError::LocalConflict)?
@@ -288,6 +304,7 @@ impl CoreRuntime {
         Self::ensure_join_deadline(deadline)?;
         let state = Arc::clone(&self.state);
         let token = verified.token.clone();
+        let genesis_id = verified.genesis_id;
         let claim = tokio::task::spawn_blocking(move || {
             let state = match crate::blocking::lock_until(&state, deadline) {
                 Ok(state) => state,
@@ -313,7 +330,7 @@ impl CoreRuntime {
             if matches!(local_creator, Some(creator) if creator != token.inviter.as_bytes()) {
                 return Err(crate::OnboardingError::LocalConflict);
             }
-            crate::invitation::sign_claim(&state.secret_key, &token)
+            crate::invitation::sign_claim(&state.secret_key, &token, genesis_id)
                 .map_err(map_invitation_onboarding_error)
         })
         .await
@@ -357,15 +374,17 @@ impl CoreRuntime {
         import_validated_bootstrap_locked(state, bootstrap, deadline, fault)
     }
 
-    /// Creates proof that this installation claims the supplied invitation.
+    /// Creates proof that this installation claims the supplied invitation,
+    /// anchoring its own group create on the Workspace genesis.
     #[allow(dead_code)]
     pub(crate) fn create_invitation_claim(
         &self,
         token: &InvitationToken,
+        genesis_id: MembershipOperationId,
     ) -> Result<InvitationClaim, InvitationError> {
         let token = token.verified()?;
         let state = self.lock_invitation_state()?;
-        let claim = crate::invitation::sign_claim(&state.secret_key, &token)?;
+        let claim = crate::invitation::sign_claim(&state.secret_key, &token, genesis_id)?;
         Ok(InvitationClaim::from_verified(&claim))
     }
 
@@ -504,8 +523,8 @@ fn import_validated_bootstrap_locked(
             state
                 .memberships
                 .insert(snapshot.workspace_id(), imported.projection);
-            person_name_sync::publish_generation(&state, snapshot.workspace_id());
-            person_name_sync::initialize(&mut state, snapshot.workspace_id())
+            principal_sync::publish_generation(&state, snapshot.workspace_id());
+            principal_sync::initialize(&mut state, snapshot.workspace_id())
                 .map_err(fault!(crate::OnboardingError::UncertainStorageOutcome))?;
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 state.poisoned = true;

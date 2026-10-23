@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-workspace-agent"
+description = "Enables the add_workspace_agent command without any pre-configured scope."
+commands.allow = ["add_workspace_agent"]
+
+[[permission]]
+identifier = "deny-add-workspace-agent"
+description = "Denies the add_workspace_agent command without any pre-configured scope."
+commands.deny = ["add_workspace_agent"]

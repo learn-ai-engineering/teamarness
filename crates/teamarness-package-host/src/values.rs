@@ -31,10 +31,10 @@ impl fmt::Display for ValueParseError {
 
 impl std::error::Error for ValueParseError {}
 
-// Keep in sync with Core's private synchronization::PERSON_NAME_SCOPE. The
+// Keep in sync with Core's private synchronization::PRINCIPALS_SCOPE. The
 // colon is outside the historical Package Identity grammar, but valid in Core
 // record and peer codecs; this is never an admissible Package Identity.
-pub(crate) const RESERVED_PERSON_NAME_SCOPE: &str = "internal:teamarness.person-names";
+pub(crate) const RESERVED_PRINCIPALS_SCOPE: &str = "internal:teamarness.principals";
 
 /// A stable lowercase reverse-DNS Package Identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ impl FromStr for PackageIdentity {
     type Err = ValueParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value != RESERVED_PERSON_NAME_SCOPE
+        if value != RESERVED_PRINCIPALS_SCOPE
             && teamarness_package_contract::identity::is_valid_package_identity(value)
         {
             Ok(Self(value.to_owned()))

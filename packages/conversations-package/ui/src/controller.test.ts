@@ -38,21 +38,21 @@ async function failedSwitch(rejection: unknown): Promise<ConversationsController
   return controller;
 }
 
-describe("Workspace Person names", () => {
+describe("Workspace Principals", () => {
   it("assembles a bounded roster at one cursor before relabeling signed authors, then replaces it on rename", () => {
     const controller = new ConversationsController(classifiedClient(null), () => undefined);
-    const alice = { identity: "alice", personId: "p1", name: "Alice", fingerprint: "alice" };
-    const bob = { identity: "bob", personId: "p2", name: "Bob", fingerprint: "bob" };
-    controller.applyNames({ available: true, cursor: "1", persons: [alice], part: 0, parts: 2 });
-    expect(controller.state.names.available).toBe(false);
-    controller.applyNames({ available: true, cursor: "1", persons: [bob], part: 1, parts: 2 });
-    expect(controller.state.names.persons).toEqual([alice, bob]);
-    controller.applyNames({ available: true, cursor: "2", persons: [{ ...alice, name: "Renamed" }], part: 0, parts: 2 });
-    expect(controller.state.names.persons).toEqual([alice, bob]);
-    controller.applyNames({ available: true, cursor: "1", persons: [bob], part: 1, parts: 2 });
-    expect(controller.state.names.persons).toEqual([alice, bob]);
-    controller.applyNames({ available: true, cursor: "2", persons: [bob], part: 1, parts: 2 });
-    expect(controller.state.names.persons).toEqual([{ ...alice, name: "Renamed" }, bob]);
+    const alice = { identity: "alice", principalId: "p1", kind: "person" as const, stewardPrincipalId: null, name: "Alice", fingerprint: "alice" };
+    const bob = { identity: "bob", principalId: "p2", kind: "person" as const, stewardPrincipalId: null, name: "Bob", fingerprint: "bob" };
+    controller.applyPrincipals({ available: true, cursor: "1", principals: [alice], part: 0, parts: 2 });
+    expect(controller.state.principals.available).toBe(false);
+    controller.applyPrincipals({ available: true, cursor: "1", principals: [bob], part: 1, parts: 2 });
+    expect(controller.state.principals.principals).toEqual([alice, bob]);
+    controller.applyPrincipals({ available: true, cursor: "2", principals: [{ ...alice, name: "Renamed" }], part: 0, parts: 2 });
+    expect(controller.state.principals.principals).toEqual([alice, bob]);
+    controller.applyPrincipals({ available: true, cursor: "1", principals: [bob], part: 1, parts: 2 });
+    expect(controller.state.principals.principals).toEqual([alice, bob]);
+    controller.applyPrincipals({ available: true, cursor: "2", principals: [bob], part: 1, parts: 2 });
+    expect(controller.state.principals.principals).toEqual([{ ...alice, name: "Renamed" }, bob]);
   });
   it("relabels an existing remote Message on rename without changing its signed author", async () => {
     const fake = delayedClient();
@@ -61,12 +61,12 @@ describe("Workspace Person names", () => {
     await Promise.resolve();
     fake.pending[0]!.reply.resolve({ messages: [message(1)], epoch, revision: "0" });
     await initial;
-    controller.applyNames({ available: true, cursor: "1", persons: [{ identity: "alice", personId: "p1", name: "🌿 Alice", fingerprint: "alice" }] });
+    controller.applyPrincipals({ available: true, cursor: "1", principals: [{ identity: "alice", principalId: "p1", kind: "person" as const, stewardPrincipalId: null, name: "🌿 Alice", fingerprint: "alice" }] });
     expect(controller.state.messages[0]?.author).toBe("alice");
-    expect(controller.state.names.persons[0]?.name).toBe("🌿 Alice");
-    controller.applyNames({ available: true, cursor: "2", persons: [{ identity: "alice", personId: "p1", name: "Alice 🌻", fingerprint: "alice" }] });
-    controller.applyNames({ available: true, cursor: "1", persons: [] });
-    expect(controller.state.names.persons[0]?.name).toBe("Alice 🌻");
+    expect(controller.state.principals.principals[0]?.name).toBe("🌿 Alice");
+    controller.applyPrincipals({ available: true, cursor: "2", principals: [{ identity: "alice", principalId: "p1", kind: "person" as const, stewardPrincipalId: null, name: "Alice 🌻", fingerprint: "alice" }] });
+    controller.applyPrincipals({ available: true, cursor: "1", principals: [] });
+    expect(controller.state.principals.principals[0]?.name).toBe("Alice 🌻");
     expect(controller.state.messages[0]?.author).toBe("alice");
   });
 });

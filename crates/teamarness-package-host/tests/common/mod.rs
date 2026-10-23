@@ -128,9 +128,9 @@ pub fn write_node_package_with_capabilities(
             "fixture.membership_credit": {"request": {}, "response": {}},
             "fixture.membership_events": {"request": {}, "response": {}},
             "fixture.membership_open": {"request": {}, "response": {}},
-            "fixture.person_names_open": {"request": {}, "response": {}},
-            "fixture.person_names_close": {"request": {}, "response": {}},
-            "fixture.person_names_events": {"request": {}, "response": {}},
+            "fixture.principals_open": {"request": {}, "response": {}},
+            "fixture.principals_close": {"request": {}, "response": {}},
+            "fixture.principals_events": {"request": {}, "response": {}},
             "fixture.stderr": {"request": {}, "response": {}},
             "fixture.typed": {"request": {"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}, "response": {}}
         },

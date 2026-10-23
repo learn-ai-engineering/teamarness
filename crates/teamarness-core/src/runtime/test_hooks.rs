@@ -7,6 +7,31 @@
 
 use super::*;
 
+/// Test-only admission failure boundary; no production caller can select one.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAddFaultForTests {
+    BeforeName,
+    BeforeCommit,
+    AfterCommit,
+    BootstrapBound,
+    PostCommitInitialization,
+}
+
+/// What applying a canonical membership operation through a test hook did.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipApplyOutcomeForTests {
+    /// The operation entered the accepted set; this is the snapshot after it.
+    Accepted(MembershipSnapshot),
+    /// The operation is parked until its time or its attachment arrives.
+    Quarantined,
+    /// The operation was already accepted.
+    Duplicate,
+}
+
 /// What a raw package-synchronization probe observed.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +39,39 @@ pub(crate) enum ProbeOutcome {
     Refused(crate::synchronization::Refusal),
     Welcomed { operations_received: usize },
     Failed(String),
+}
+
+/// Probes the real inbound package gate using an endpoint with a separately
+/// held key; the fake receiver only supplies the probe's outbound side.
+#[cfg(test)]
+pub(super) async fn probe_package_sync_as_key_for_test(
+    endpoint: &iroh::Endpoint,
+    address: iroh_base::EndpointAddr,
+    responder: &CoreRuntime,
+    workspace: WorkspaceId,
+    package: &str,
+) -> ProbeOutcome {
+    let result = crate::synchronization::network_handler::outbound_log_session(
+        endpoint,
+        address,
+        Arc::new(ProbeReceiver),
+        crate::synchronization::PeerSessions::new(),
+        Arc::clone(&responder.health),
+        workspace,
+        package.to_owned(),
+        responder.public_identity,
+        responder.session_limits,
+    )
+    .await;
+    match result {
+        Ok(report) => ProbeOutcome::Welcomed {
+            operations_received: report.outcomes.applied,
+        },
+        Err(crate::synchronization::LogSessionError::Refused(reason)) => {
+            ProbeOutcome::Refused(reason)
+        }
+        Err(error) => ProbeOutcome::Failed(error.to_string()),
+    }
 }
 
 /// Serves this Installation's real operations plus a fixed set of extras.
@@ -331,8 +389,10 @@ impl RuntimeState {
             record_heads: Arc::default(),
             membership_epochs: BTreeMap::new(),
             profile_generations: BTreeMap::new(),
+            name_replay_scans: BTreeMap::new(),
             #[cfg(test)]
             person_name_open_error_once: false,
+            principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
         }
@@ -439,13 +499,14 @@ impl CoreRuntime {
         issued_at_unix_ms: i64,
         expires_at_unix_ms: i64,
     ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
-        let token = self
-            .issue_invitation_at(workspace_id, issued_at_unix_ms, expires_at_unix_ms)
+        let (token, genesis_id) = self
+            .issue_invitation_with_genesis_at(workspace_id, issued_at_unix_ms, expires_at_unix_ms)
             .map_err(map_invitation_onboarding_error)?;
         crate::WorkspaceInvitation::from_parts(
             &token
                 .verified()
                 .map_err(|_| crate::OnboardingError::Authentication)?,
+            genesis_id,
             self.transport.endpoint_address(),
         )
         .map_err(|_| crate::OnboardingError::InvalidInput)
@@ -463,8 +524,12 @@ impl CoreRuntime {
             .state
             .lock()
             .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
-        let claim = crate::invitation::sign_claim(&state.secret_key, &invitation.token)
-            .map_err(map_invitation_onboarding_error)?;
+        let claim = crate::invitation::sign_claim(
+            &state.secret_key,
+            &invitation.token,
+            invitation.genesis_id,
+        )
+        .map_err(map_invitation_onboarding_error)?;
         Ok(InvitationClaim::from_verified(&claim))
     }
 
@@ -510,8 +575,12 @@ impl CoreRuntime {
                 .state
                 .lock()
                 .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
-            crate::invitation::sign_claim(&state.secret_key, &invitation.token)
-                .map_err(map_invitation_onboarding_error)?
+            crate::invitation::sign_claim(
+                &state.secret_key,
+                &invitation.token,
+                invitation.genesis_id,
+            )
+            .map_err(map_invitation_onboarding_error)?
         };
         let bootstrap = crate::membership::projection::validate_bootstrap(
             response,
@@ -545,8 +614,12 @@ impl CoreRuntime {
                 .state
                 .lock()
                 .map_err(|_| crate::OnboardingError::UncertainStorageOutcome)?;
-            crate::invitation::sign_claim(&state.secret_key, &invitation.token)
-                .map_err(map_invitation_onboarding_error)?
+            crate::invitation::sign_claim(
+                &state.secret_key,
+                &invitation.token,
+                invitation.genesis_id,
+            )
+            .map_err(map_invitation_onboarding_error)?
         };
         let bootstrap = crate::membership::projection::validate_bootstrap(
             response,
@@ -1182,7 +1255,8 @@ impl CoreRuntime {
             )
             .expect("the local Installation manages the workspace");
         let verified = token.verified().expect("a freshly issued token verifies");
-        let claim = crate::invitation::sign_claim(&secret, &verified)
+        let genesis_id = self.genesis_id_for_test(workspace_id);
+        let claim = crate::invitation::sign_claim(&secret, &verified, genesis_id)
             .expect("the generated identity can claim");
         self.admit_and_export_with_limits_for_test(
             &InvitationClaim::from_verified(&claim),
@@ -1192,6 +1266,151 @@ impl CoreRuntime {
         )
         .expect("the admission commits");
         member
+    }
+
+    /// The local Installation's secret key bytes, so a test in another crate
+    /// can author operations as this Installation. Never part of the
+    /// application API: the feature is enabled only from dev-dependencies.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn installation_secret_for_tests(&self) -> [u8; 32] {
+        self.state
+            .lock()
+            .expect("test runtime state")
+            .secret_key
+            .to_bytes()
+    }
+
+    /// Applies one canonical membership operation through the production path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the replay or storage error the production path reports.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn apply_membership_operation_for_tests(
+        &self,
+        canonical_envelope: &[u8],
+    ) -> Result<MembershipApplyOutcomeForTests, MembershipError> {
+        let applied = self.apply_membership_envelope(canonical_envelope)?;
+        Ok(if applied.accepted {
+            MembershipApplyOutcomeForTests::Accepted(applied.snapshot)
+        } else if applied.quarantined {
+            MembershipApplyOutcomeForTests::Quarantined
+        } else {
+            MembershipApplyOutcomeForTests::Duplicate
+        })
+    }
+
+    /// The current causal heads of one Workspace's accepted operation set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Workspace is unknown.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn membership_heads_for_tests(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Vec<MembershipOperationId> {
+        self.state
+            .lock()
+            .expect("test runtime state")
+            .memberships
+            .get(&workspace_id)
+            .expect("the workspace is known")
+            .heads()
+    }
+
+    /// The genesis operation identifier of one Workspace.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Workspace is unknown.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn genesis_id_for_tests(&self, workspace_id: WorkspaceId) -> MembershipOperationId {
+        self.genesis_id_for_test(workspace_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn genesis_id_for_test(&self, workspace_id: WorkspaceId) -> MembershipOperationId {
+        self.state
+            .lock()
+            .expect("test runtime state")
+            .memberships
+            .get(&workspace_id)
+            .expect("the workspace is known")
+            .genesis_id()
+    }
+
+    /// The currently admitted Person key group managed by `identity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Workspace is unknown.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn person_group_for_tests(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: PublicIdentity,
+    ) -> Option<MembershipOperationId> {
+        self.state
+            .lock()
+            .expect("test runtime state")
+            .memberships
+            .get(&workspace_id)
+            .expect("the workspace is known")
+            .person_group(identity)
+    }
+
+    /// The current Members that are Installation keys: the peers this
+    /// Installation connects to, grants keys to, and demands keys from.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Workspace is unknown.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn installation_members_for_tests(&self, workspace_id: WorkspaceId) -> Vec<PublicIdentity> {
+        self.state
+            .lock()
+            .expect("test runtime state")
+            .memberships
+            .get(&workspace_id)
+            .expect("the workspace is known")
+            .installation_members()
+    }
+
+    /// Every accepted operation of one Workspace in a causal order, as the
+    /// replication protocol would send them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Workspace is unknown.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn export_membership_operations_for_tests(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Vec<Vec<u8>> {
+        let state = self.state.lock().expect("test runtime state");
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .expect("the workspace is known");
+        let all = crate::membership::replication::operation_ids(projection)
+            .into_iter()
+            .collect();
+        crate::membership::replication::export_causal(projection, &all)
+            .expect("the accepted set exports within bounds")
     }
 
     /// Injects what the last session with `peer` saw, so a test can reach an
@@ -1346,8 +1565,19 @@ impl CoreRuntime {
             SecretKey::generate().to_bytes(),
         )
         .map_err(map_invitation_onboarding_error)?;
-        crate::WorkspaceInvitation::from_parts(&token, self.transport.endpoint_address())
-            .map_err(|_| crate::OnboardingError::InvalidInput)
+        // A test may ask for an invitation to a Workspace this Installation
+        // does not hold; the genesis is then unknown and stands in as zero.
+        let genesis_id = state
+            .memberships
+            .get(&workspace_id)
+            .map(crate::membership::WorkspaceProjection::genesis_id)
+            .unwrap_or_else(|| MembershipOperationId::digest(b"unknown workspace"));
+        crate::WorkspaceInvitation::from_parts(
+            &token,
+            genesis_id,
+            self.transport.endpoint_address(),
+        )
+        .map_err(|_| crate::OnboardingError::InvalidInput)
     }
 
     #[cfg(test)]

@@ -143,7 +143,7 @@ struct Descriptor {
 enum CapabilityKind {
     WorkspaceContext,
     Membership,
-    PersonNames,
+    Principals,
     Signing,
     ImmutableRecordLog,
     #[cfg(test)]
@@ -170,6 +170,7 @@ pub(crate) struct CapabilityScope {
 #[derive(Clone)]
 struct BoundGrant {
     descriptor: Descriptor,
+    minor: u16,
     package_identity: PackageIdentity,
     workspace_id: WorkspaceId,
     installation: InstallationPublicIdentity,
@@ -203,7 +204,7 @@ impl GenerationCapabilities {
         generation: u64,
         limiter: CoreCallLimiter,
     ) -> Result<Arc<Self>, PackageErrorCode> {
-        if scope.package_identity.as_str() == crate::values::RESERVED_PERSON_NAME_SCOPE {
+        if scope.package_identity.as_str() == crate::values::RESERVED_PRINCIPALS_SCOPE {
             return Err(PackageErrorCode::InvalidPackageIdentity);
         }
         let registry = Registry::production();
@@ -218,6 +219,7 @@ impl GenerationCapabilities {
                 grant.clone(),
                 BoundGrant {
                     descriptor,
+                    minor,
                     package_identity: scope.package_identity.clone(),
                     workspace_id: scope.workspace_id.clone(),
                     installation: scope.installation.clone(),
@@ -277,10 +279,11 @@ impl GenerationCapabilities {
                 self.workspace_context(method, object, started).await
             }
             CapabilityKind::Membership => self.membership(method, object, started).await,
-            CapabilityKind::PersonNames => self.person_names(method, object, started).await,
+            CapabilityKind::Principals => self.principals(method, object, started).await,
             CapabilityKind::Signing => self.signing(method, object, started).await,
             CapabilityKind::ImmutableRecordLog => {
-                self.immutable_record(method, object, started).await
+                self.immutable_record(method, object, grant.minor, started)
+                    .await
             }
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
@@ -314,7 +317,7 @@ impl GenerationCapabilities {
                 None
             };
         let after_profile_cursor =
-            if grant.descriptor.kind == CapabilityKind::PersonNames && method == "subscribe" {
+            if grant.descriptor.kind == CapabilityKind::Principals && method == "subscribe" {
                 exact_fields(object, &["grant", "method", "afterCursor"])?;
                 Some(decimal_field(object, "afterCursor")?)
             } else {
@@ -354,8 +357,8 @@ impl GenerationCapabilities {
                     self.cancelled.subscribe(),
                 ));
             }
-            CapabilityKind::PersonNames => {
-                tokio::spawn(run_person_name_stream(
+            CapabilityKind::Principals => {
+                tokio::spawn(run_principal_stream(
                     core,
                     core_workspace,
                     stream_id,
@@ -518,7 +521,7 @@ impl GenerationCapabilities {
         }
     }
 
-    async fn person_names(
+    async fn principals(
         &self,
         method: &str,
         object: &Map<String, Value>,
@@ -531,18 +534,45 @@ impl GenerationCapabilities {
             "current" => {
                 exact_fields(object, &["method"])?;
                 self.limiter
-                    .run(started, move || person_name_snapshot(&core, workspace))
+                    .run(started, move || principal_snapshot(&core, workspace))
                     .await?
             }
             "lookup" => {
-                exact_fields(object, &["method", "identity"])?;
-                let identity = PublicIdentity::from_str(string_field(object, "identity")?)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                self.limiter.run(started, move || {
-                    let person = core.workspace_person(workspace, identity)
+                let principal_id = if object.contains_key("principalId") {
+                    exact_fields(object, &["method", "principalId"])?;
+                    Some(
+                        teamarness_core::PrincipalId::from_str(string_field(
+                            object,
+                            "principalId",
+                        )?)
+                        .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?,
+                    )
+                } else {
+                    exact_fields(object, &["method", "identity"])?;
+                    None
+                };
+                let identity = if principal_id.is_none() {
+                    Some(
+                        PublicIdentity::from_str(string_field(object, "identity")?)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?,
+                    )
+                } else {
+                    None
+                };
+                self.limiter
+                    .run(started, move || {
+                        let principal = if let Some(id) = principal_id {
+                            core.principal(workspace, id)
+                        } else {
+                            core.workspace_principal(
+                                workspace,
+                                identity.expect("validated identity"),
+                            )
+                        }
                         .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
-                    Ok(json!({"person":person.map(|person| person_name_value(identity, &person))}))
-                }).await?
+                        Ok(json!({"principal":principal.as_ref().map(principal_value)}))
+                    })
+                    .await?
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
@@ -552,6 +582,7 @@ impl GenerationCapabilities {
         &self,
         method: &str,
         object: &Map<String, Value>,
+        minor: u16,
         started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
         let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
@@ -560,7 +591,20 @@ impl GenerationCapabilities {
         let core = Arc::clone(&self.core);
         match method {
             "append" => {
-                exact_fields(object, &["method", "purpose", "canonical"])?;
+                if minor == 0 {
+                    exact_fields(object, &["method", "purpose", "canonical"])?;
+                } else if object.contains_key("principal") {
+                    exact_fields(object, &["method", "purpose", "canonical", "principal"])?;
+                } else {
+                    exact_fields(object, &["method", "purpose", "canonical"])?;
+                }
+                let principal = object
+                    .get("principal")
+                    .map(|_| {
+                        teamarness_core::PrincipalId::from_str(string_field(object, "principal")?)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
+                    })
+                    .transpose()?;
                 let purpose = validated_purpose(string_field(object, "purpose")?)?.to_owned();
                 let canonical = decode_bounded(
                     string_field(object, "canonical")?,
@@ -569,7 +613,9 @@ impl GenerationCapabilities {
                 self.limiter
                     .run(started, move || {
                         let record = core
-                            .append_record(workspace, &package, &purpose, &canonical)
+                            .append_record_as_principal(
+                                workspace, &package, &purpose, &canonical, principal,
+                            )
                             .map_err(sync_error)?;
                         Ok(json!({
                             "recordId": record.record_id().to_string(),
@@ -805,11 +851,11 @@ impl Registry {
             kind: CapabilityKind::Membership,
         });
         registry.register(Descriptor {
-            family: CapabilityFamily::new("teamarness.person-names"),
+            family: CapabilityFamily::new("teamarness.principals"),
             major: 1,
             min_minor: 0,
             max_minor: 0,
-            kind: CapabilityKind::PersonNames,
+            kind: CapabilityKind::Principals,
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.signing"),
@@ -822,7 +868,7 @@ impl Registry {
             family: CapabilityFamily::new("teamarness.synchronization.immutable-record-log"),
             major: 1,
             min_minor: 0,
-            max_minor: 0,
+            max_minor: 1,
             kind: CapabilityKind::ImmutableRecordLog,
         });
         registry
@@ -904,36 +950,41 @@ async fn await_credit(
     true
 }
 
-fn person_name_value(identity: PublicIdentity, person: &teamarness_core::WorkspacePerson) -> Value {
+fn principal_value(principal: &teamarness_core::WorkspacePrincipal) -> Value {
     json!({
-        "identity": identity.to_string(),
-        "personId": person.id().to_string(),
-        "name": person.name(),
-        "fingerprint": person.fingerprint(),
+        "principalId":principal.id().to_string(),
+        "kind":match principal.kind() {
+            teamarness_core::PrincipalKind::Person => "person",
+            teamarness_core::PrincipalKind::Agent => "agent",
+        },
+        "stewardPrincipalId":principal.steward_principal_id().map(|id| id.to_string()),
+        "keys":principal.keys().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "name":principal.name(),
+        "fingerprint":principal.fingerprint(),
     })
 }
 
-fn person_name_snapshot(
+fn principal_snapshot(
     core: &CoreRuntime,
     workspace: teamarness_core::WorkspaceId,
 ) -> Result<Value, PackageErrorCode> {
-    let (cursor, persons) = core
-        .person_name_snapshot(workspace)
+    let (cursor, principals) = core
+        .principals_snapshot(workspace)
         .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
-    if persons.len() > 1024 {
+    if principals.len() > 1024 {
         return Err(PackageErrorCode::CapabilityUnavailable);
     }
     Ok(json!({
-        "workspaceId": workspace.to_string(),
-        "cursor": cursor.to_string(),
-        "persons": persons.iter().map(|(identity, person)| person_name_value(*identity, person)).collect::<Vec<_>>(),
+        "workspaceId":workspace.to_string(),
+        "cursor":cursor.to_string(),
+        "principals":principals.iter().map(principal_value).collect::<Vec<_>>(),
     }))
 }
 
 // A profile cursor invalidates a snapshot; it is not a replay ledger. A lagging
 // consumer receives the latest bounded snapshot and resumes at its cursor.
 #[allow(clippy::too_many_arguments)]
-async fn run_person_name_stream(
+async fn run_principal_stream(
     core: Arc<CoreRuntime>,
     workspace: teamarness_core::WorkspaceId,
     stream_id: String,
@@ -946,7 +997,7 @@ async fn run_person_name_stream(
 ) {
     let watch_core = core.clone();
     let opened =
-        tokio::task::spawn_blocking(move || watch_core.subscribe_person_names(workspace)).await;
+        tokio::task::spawn_blocking(move || watch_core.subscribe_principals(workspace)).await;
     let mut changes = match opened {
         Ok(Ok(receiver)) => receiver,
         _ => {
@@ -982,7 +1033,7 @@ async fn run_person_name_stream(
         }
         let snapshot_core = core.clone();
         let snapshot =
-            tokio::task::spawn_blocking(move || person_name_snapshot(&snapshot_core, workspace))
+            tokio::task::spawn_blocking(move || principal_snapshot(&snapshot_core, workspace))
                 .await;
         let Ok(Ok(snapshot)) = snapshot else {
             break;
@@ -1119,6 +1170,7 @@ fn sync_error(error: teamarness_core::SynchronizationError) -> PackageErrorCode 
         | teamarness_core::SynchronizationError::ScopeQuarantined => {
             PackageErrorCode::CapabilityUnavailable
         }
+        teamarness_core::SynchronizationError::PrincipalNotBound => PackageErrorCode::PrincipalNotBound,
         teamarness_core::SynchronizationError::WorkspaceNotFound
         | teamarness_core::SynchronizationError::InvalidInput
         | teamarness_core::SynchronizationError::WrongScope

@@ -65,7 +65,9 @@ async fn create_workspace_persists_one_immutable_manager_genesis() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (1, 1, 0, 1, "Complete".to_owned()));
+    // One workspace; genesis plus the creator's group create and attachment;
+    // epoch 2; one snapshot row for the creator.
+    assert_eq!(durable, (1, 3, 2, 1, "Complete".to_owned()));
     let role: i64 = connection
         .query_row(
             "SELECT role FROM membership_snapshot_members WHERE workspace_id = ?1",
@@ -116,7 +118,26 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
         )
         .unwrap();
     connection
-        .execute_batch("DROP TRIGGER membership_operations_no_delete;")
+        .execute_batch(
+            "DROP TRIGGER membership_operations_no_delete;
+             DROP TRIGGER membership_dependencies_no_delete;
+             DROP TRIGGER membership_transitions_no_delete;",
+        )
+        .unwrap();
+    // The creator's group create and attachment depend on genesis and each
+    // other, so the dependency and transition rows go before the operations.
+    connection
+        .execute(
+            "DELETE FROM membership_transitions WHERE workspace_id = ?1",
+            [workspace.id().to_string_bytes()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM membership_dependencies WHERE operation_id IN
+                 (SELECT operation_id FROM membership_operations WHERE workspace_id = ?1)",
+            [workspace.id().to_string_bytes()],
+        )
         .unwrap();
     connection
         .execute(
@@ -160,7 +181,7 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
     let connection = database(&directory);
     let recovered_bytes: Vec<u8> = connection
         .query_row(
-            "SELECT canonical_envelope FROM membership_operations WHERE workspace_id = ?1",
+            "SELECT canonical_envelope FROM membership_operations WHERE workspace_id = ?1 AND action = 0",
             [workspace.id().to_string_bytes()],
             |row| row.get(0),
         )
@@ -177,7 +198,7 @@ async fn pending_creation_rolls_forward_without_changing_genesis_bytes() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts, (1, 1, 1));
+    assert_eq!(counts, (1, 3, 1));
 
     drop(connection);
     recovered.shutdown().await.unwrap();
@@ -242,4 +263,64 @@ fn hex_bytes(value: &str) -> Vec<u8> {
         .step_by(2)
         .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
         .collect()
+}
+
+/// Verifies: TEAM.SYS.MEM-R09. The creator's own key group create and its
+/// attachment are committed beside genesis, recovered byte-identically when
+/// creation is interrupted, and counted by the bootstrap bound.
+#[tokio::test]
+async fn creation_commits_the_creator_group_beside_genesis_and_counts_it_in_the_bootstrap() {
+    use teamarness_core::{MembershipEpoch, MembershipRole};
+
+    let directory = private_data_directory("creator-group");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    let creator = runtime.public_identity();
+    let workspace = runtime.create_workspace("Creator group").unwrap().id();
+
+    let snapshot = runtime.membership_snapshot(workspace).unwrap();
+    assert_eq!(snapshot.epoch(), MembershipEpoch::new(2));
+    assert_eq!(snapshot.members().len(), 1);
+    assert_eq!(snapshot.members()[0].role(), MembershipRole::Manager);
+    let group = runtime
+        .person_group_for_tests(workspace, creator)
+        .expect("the creator holds an attached key group");
+    let operations = runtime.export_membership_operations_for_tests(workspace);
+    assert_eq!(operations.len(), 3, "genesis, group create, attachment");
+    assert_eq!(
+        teamarness_core::test_authoring::operation_id(&operations[1]),
+        group
+    );
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let connection = database(&directory);
+    let (operation_rows, transition_rows, actions): (i64, i64, String) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM membership_operations WHERE workspace_id = ?1),
+                (SELECT COUNT(*) FROM membership_transitions WHERE workspace_id = ?1),
+                (SELECT group_concat(action, ',') FROM
+                    (SELECT action FROM membership_operations WHERE workspace_id = ?1
+                     ORDER BY action))",
+            [workspace.to_string_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((operation_rows, transition_rows), (3, 2));
+    assert_eq!(actions, "0,3,4", "create, create person, attach person");
+    drop(connection);
+
+    // The same material survives reopen unchanged.
+    let reopened = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
+    assert_eq!(
+        reopened.export_membership_operations_for_tests(workspace),
+        operations
+    );
+    assert_eq!(reopened.membership_snapshot(workspace).unwrap(), snapshot);
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+    fs::remove_dir_all(directory).unwrap();
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { PACKAGE_REQUEST_ERROR_KIND, isPackageRequestError, packageErrorCode } from "./index";
+import { PACKAGE_REQUEST_ERROR_KIND, describePackageError, isPackageRequestError, packageErrorCode } from "./index";
 import type { PackageRequestError, PackageValue } from "./index";
 import {
   createFakePackageClient,
@@ -25,6 +25,13 @@ describe("createPackageRequestError", () => {
     expect(packageErrorCode(owned)).toBe("demo.rejected");
     expect(owned.packageError?.retryable).toBe(true);
     expect(owned.packageError?.details.reason).toBe("no");
+
+    const unbound = createPackageRequestError({
+      code: "principal_not_bound", stage: "capability", recovery: "correct_package_source",
+    });
+    expect(isPackageRequestError(unbound)).toBe(true);
+    expect(packageErrorCode(unbound)).toBeNull();
+    expect(describePackageError(unbound)).toBe("principal_not_bound (capability)");
   });
 });
 
