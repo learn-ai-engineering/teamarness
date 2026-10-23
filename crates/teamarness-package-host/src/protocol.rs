@@ -937,6 +937,17 @@ async fn writer_task<W>(
     }
 }
 
+#[derive(Default)]
+struct PendingStreamOpens(BTreeMap<String, tokio::task::JoinHandle<()>>);
+
+impl Drop for PendingStreamOpens {
+    fn drop(&mut self) {
+        for task in self.0.values() {
+            task.abort();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reader_task<R>(
     mut input: R,
@@ -954,6 +965,7 @@ async fn reader_task<R>(
     R: AsyncRead + Unpin,
 {
     let mut initialized = Some(initialized);
+    let mut opening_streams = PendingStreamOpens::default();
     loop {
         let frame = match read_frame(&mut input).await {
             Ok(frame) => frame,
@@ -964,6 +976,9 @@ async fn reader_task<R>(
                 return;
             }
         };
+        // Completed opens no longer need an abort handle. Live pending opens are
+        // bounded by the process stream classifier; a close aborts its own task.
+        opening_streams.0.retain(|_, task| !task.is_finished());
         // One classifier, before every branch. There is no side of `observe` on
         // which an adapter can hold its own idea of which races are tolerable,
         // and no frame kind that reaches its adapter without being classified.
@@ -1161,37 +1176,45 @@ async fn reader_task<R>(
                 let topic = frame
                     .field("topic")
                     .and_then(Value::as_str)
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .to_owned();
                 let initial_credit = frame
                     .field("initialCredit")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
                 let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
-                if let Err(code) = capabilities
-                    .open_stream(
-                        id.clone(),
-                        topic,
-                        initial_credit,
-                        &payload,
-                        HostStreamSender {
-                            writer: writer.clone(),
-                            state: state.clone(),
-                        },
-                    )
-                    .await
-                {
-                    let response = json!({
-                        "kind":"stream_close", "streamId":id,
-                        "code":capability_code(code)
-                    });
-                    // The Package is waiting for this stream to end, so the
-                    // rejection waits for lane capacity rather than being
-                    // dropped with the generation reported as exited.
-                    if writer.send_waiting(response, true).await.is_err() {
-                        let _ = failure.send(Some(PackageErrorCode::ProcessExited));
-                        return;
+                let handler = capabilities.clone();
+                let task_writer = writer.clone();
+                let task_state = state.clone();
+                let task_failure = failure.clone();
+                let stream_id = id.clone();
+                // Provider activation and stream setup can wait much longer than
+                // this Consumer's health probe. The classified open owns one
+                // bounded stream task, never the process reader.
+                let task = tokio::spawn(async move {
+                    if let Err(code) = handler
+                        .open_stream(
+                            stream_id.clone(),
+                            &topic,
+                            initial_credit,
+                            &payload,
+                            HostStreamSender {
+                                writer: task_writer.clone(),
+                                state: task_state,
+                            },
+                        )
+                        .await
+                    {
+                        let response = json!({
+                            "kind":"stream_close", "streamId":stream_id,
+                            "code":capability_code(code)
+                        });
+                        if task_writer.send_waiting(response, true).await.is_err() {
+                            let _ = task_failure.send(Some(PackageErrorCode::ProcessExited));
+                        }
                     }
-                }
+                });
+                opening_streams.0.insert(id, task);
             }
             FrameKind::Credit => {
                 let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
@@ -1214,6 +1237,16 @@ async fn reader_task<R>(
                 };
                 if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
                     route.terminate(stream_end(&frame));
+                } else if let Some(task) = opening_streams.0.remove(stream_id) {
+                    // Settle cancellation before closing the route: the open
+                    // must not register a Provider stream after close returns.
+                    task.abort();
+                    let handler = capabilities.clone();
+                    let stream_id = stream_id.to_owned();
+                    tokio::spawn(async move {
+                        let _ = task.await;
+                        handler.close_stream(&stream_id).await;
+                    });
                 } else {
                     capabilities.close_stream(stream_id).await;
                 }

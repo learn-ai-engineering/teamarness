@@ -125,7 +125,15 @@ impl PortBroker {
         // Serialize only this event port's first open. Activation can itself
         // call unrelated Ports, so never hold the global fan-out registry over
         // activation or the Provider writer's stream-open send.
-        if actor.snapshot().await.lifecycle == crate::LifecycleState::Admitted {
+        if matches!(
+            actor.snapshot().await.lifecycle,
+            crate::LifecycleState::Admitted
+                | crate::LifecycleState::Activating
+                | crate::LifecycleState::Recovering
+        ) {
+            // A concurrent first subscriber may already be activating the
+            // on-demand Provider. Wait on its lifecycle gate rather than
+            // treating that in-progress generation as exited.
             actor.activate().await.map_err(|failure| failure.code)?;
         }
         let open_lock = self

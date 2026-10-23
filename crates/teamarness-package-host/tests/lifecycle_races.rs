@@ -521,6 +521,198 @@ async fn every_in_flight_capability_call_is_answered_behind_a_slow_pipe() {
 }
 
 /// SF2-002: Rule 1's third verdict, under the congestion that triggers it.
+/// A stalled Provider stream open must not block the Consumer's process reader.
+#[tokio::test]
+async fn stalled_port_stream_open_does_not_block_unrelated_ping_or_call() {
+    use tokio::sync::Notify;
+
+    struct StalledOpen {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    impl host_protocol::CapabilityHandler for StalledOpen {
+        fn call<'a>(
+            &'a self,
+            _grant: Option<&'a str>,
+            _payload: &'a Value,
+            _started: Arc<AtomicBool>,
+            _id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn open_stream<'a>(
+            &'a self,
+            _id: String,
+            _topic: &'a str,
+            _credit: u64,
+            _payload: &'a Value,
+            _output: HostStreamSender,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        > {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Err(PackageErrorCode::PortUnavailable)
+            })
+        }
+        fn add_credit<'a>(
+            &'a self,
+            _id: &'a str,
+            _amount: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+        fn close_stream<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (client, mut package) = connect(
+        Arc::new(StalledOpen {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        4096,
+    );
+    package
+        .send(json!({
+            "kind":"stream_open", "id":"p:slow-port", "topic":"capability.stream",
+            "initialCredit":32, "payload":{}
+        }))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the Provider open began");
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        package.round_trip("p:independent"),
+    )
+    .await
+    .expect("an unrelated capability call proceeds");
+    let probe_client = client.clone();
+    let probe = tokio::spawn(async move { probe_client.health_probe().await });
+    let ping = tokio::time::timeout(Duration::from_millis(500), package.next_frame())
+        .await
+        .expect("the Host health probe is emitted");
+    assert_eq!(ping.kind(), FrameKind::Ping);
+    package
+        .send(json!({
+            "kind":"pong", "nonce":ping.field("nonce").and_then(Value::as_str).unwrap()
+        }))
+        .await;
+    tokio::time::timeout(Duration::from_millis(500), probe)
+        .await
+        .expect("the reader accepts pong before Provider activation ends")
+        .unwrap()
+        .unwrap();
+    release.notify_one();
+    let close = tokio::time::timeout(Duration::from_secs(2), package.next_frame())
+        .await
+        .expect("failed open closes only its stream");
+    assert_eq!(close.kind(), FrameKind::StreamClose);
+    assert_eq!(
+        close.field("streamId").and_then(Value::as_str),
+        Some("p:slow-port")
+    );
+    assert_eq!(client.failure(), None);
+}
+
+/// Closing a pending open cancels it without waiting for Provider activation.
+#[tokio::test]
+async fn closing_a_pending_port_open_retires_only_that_stream() {
+    use tokio::sync::Notify;
+
+    struct PendingOpen {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        closed: Arc<Notify>,
+    }
+    impl host_protocol::CapabilityHandler for PendingOpen {
+        fn call<'a>(
+            &'a self,
+            _grant: Option<&'a str>,
+            _payload: &'a Value,
+            _started: Arc<AtomicBool>,
+            _id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn open_stream<'a>(
+            &'a self,
+            _id: String,
+            _topic: &'a str,
+            _credit: u64,
+            _payload: &'a Value,
+            _output: HostStreamSender,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        > {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        }
+        fn add_credit<'a>(
+            &'a self,
+            _id: &'a str,
+            _amount: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+        fn close_stream<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            self.closed.notify_one();
+            Box::pin(async {})
+        }
+    }
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let closed = Arc::new(Notify::new());
+    let (client, mut package) = connect(
+        Arc::new(PendingOpen {
+            entered: entered.clone(),
+            release: release.clone(),
+            closed: closed.clone(),
+        }),
+        4096,
+    );
+    package
+        .send(json!({"kind":"stream_open", "id":"p:pending",
+        "topic":"capability.stream", "initialCredit":32, "payload":{}}))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    package
+        .send(json!({"kind":"stream_close", "streamId":"p:pending"}))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), closed.notified())
+        .await
+        .expect("the pending open was canceled and closed");
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), package.round_trip("p:after-close"))
+        .await
+        .expect("the generation remains usable");
+    assert_eq!(client.failure(), None);
+}
+
 /// An outer timeout cannot certify a command safe to retry while its detached
 /// Provider task can still reach the writer after that verdict.
 #[tokio::test]

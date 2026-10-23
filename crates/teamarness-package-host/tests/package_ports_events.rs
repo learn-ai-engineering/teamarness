@@ -94,6 +94,26 @@ async fn stats(host: &PackageHost, mount: &UiMountId, id: usize) -> Value {
     .await
 }
 
+/// Stream opens run independently of the Consumer reader. Wait for each
+/// observable Host registration before emitting a live-only Provider fact.
+async fn wait_subscribed(
+    observations: &mut teamarness_package_host::PortObservations,
+    consumer: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = observations.recv().await.expect("Port observation");
+            if event.stage == teamarness_package_host::PortStage::Subscribed
+                && event.consumer_package == consumer
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Consumer stream registered before Provider emission");
+}
+
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
@@ -205,10 +225,12 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
         "an event never wakes a dormant Consumer"
     );
     let b = mount(&host, key("com.example.consumer-b")).await;
+    let mut readiness = host.observe_ports();
     assert_eq!(
         request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await["opened"],
         true
     );
+    wait_subscribed(&mut readiness, "com.example.consumer-b").await;
     assert_eq!(stats(&host, &p, 2).await["opens"], 1);
     for order in 2..=3 {
         assert_eq!(
@@ -360,7 +382,9 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
     let a = mount(&host, key("com.example.consumer-a")).await;
     let b = mount(&host, key("com.example.consumer-b")).await;
     request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await;
+    let mut readiness = host.observe_ports();
     request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await;
+    wait_subscribed(&mut readiness, "com.example.consumer-b").await;
     common::eventually(Duration::from_secs(4), "Provider active", || {
         let host = &host;
         async move {
@@ -475,7 +499,9 @@ async fn slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progre
     let a = mount(&host, key("com.example.consumer-a")).await;
     let b = mount(&host, key("com.example.consumer-b")).await;
     request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await;
+    let mut readiness = host.observe_ports();
     request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await;
+    wait_subscribed(&mut readiness, "com.example.consumer-b").await;
     common::eventually(Duration::from_secs(4), "Provider active", || {
         let host = &host;
         async move {
@@ -726,7 +752,9 @@ async fn replacing_provider_generation_revokes_streams_without_replay() {
     let a = mount(&host, key("com.example.consumer-a")).await;
     let b = mount(&host, key("com.example.consumer-b")).await;
     request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await;
+    let mut readiness = host.observe_ports();
     request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await;
+    wait_subscribed(&mut readiness, "com.example.consumer-b").await;
     common::eventually(Duration::from_secs(4), "Provider active", || {
         let host = &host;
         async move {
