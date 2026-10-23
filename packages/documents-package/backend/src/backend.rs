@@ -80,6 +80,8 @@ struct BodyHub {
     qualified: Arc<AtomicBool>,
     identity_index_complete: Arc<AtomicBool>,
     identity_lookup_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes conflict-marker commits with recovery event publication, never across I/O.
+    publication_gate: Arc<Mutex<()>>,
 }
 
 impl BodyHub {
@@ -218,6 +220,68 @@ impl BodyHub {
                 body.editable(),
             )
         })
+    }
+
+    fn publish_recovery(
+        &self,
+        request: &RecoverRequest,
+        author: &str,
+        looked_up: &Result<IdentityLookups, BackendError>,
+        foreign_ids: &HashSet<&str>,
+    ) -> Result<JsonValue, BackendError> {
+        let _publication = self.publication_gate.lock().unwrap();
+        if self
+            .store
+            .identity_conflicted(&request.document_id)
+            .map_err(|_| storage_failed())?
+        {
+            let revision = self.with_body(&request.document_id, |body| body.revision());
+            let mut event = json!({"documentId":request.document_id,
+                    "revision":revision.to_string(),"editable":false,"text":"",
+                    "reason":"identity_conflict","transferId":request.transfer_id});
+            event["requestStatuses"] = json!(
+                request
+                    .request_ids
+                    .iter()
+                    .map(|id| json!({
+                        "requestId":id,"inclusion":"unresolved","durability":"unresolved"
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            let _ = self.events.send(event);
+            return Ok(
+                json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}),
+            );
+        }
+        let (revision, text, editable, statuses) = self.with_body(&request.document_id, |body| {
+                let statuses: Vec<JsonValue> = request.request_ids.iter().map(|id| {
+                    match body.identity(id).filter(|known| known.author == *author) {
+                        Some(known) => json!({"requestId":id,"inclusion":if body.editable() { "included" } else { "unresolved" },"durability": if known.durable { "durable" } else { "pending" }}),
+                        None if looked_up.is_ok() && !foreign_ids.contains(id.as_str()) && self.qualified.load(Ordering::Acquire) && body.editable() => json!({"requestId":id,"inclusion":"absent","durability":"unresolved"}),
+                        None => json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"}),
+                    }
+                }).collect();
+                (body.revision(), if body.editable() { body.text().to_owned() } else { String::new() }, body.editable(), statuses)
+            });
+        let mut events = full_text_events_bounded(
+            &request.document_id,
+            revision,
+            &text,
+            editable,
+            TEXT_EVENT_BUDGET - 2048,
+        );
+        for (index, event) in events.iter_mut().enumerate() {
+            event["transferId"] = json!(request.transfer_id);
+            if index == 0 {
+                event["requestStatuses"] = json!(statuses);
+            }
+        }
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(
+            json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}),
+        )
     }
 
     // The request frame is bounded even when the subscription must deliver the text in parts.
@@ -467,6 +531,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 qualified: Arc::new(AtomicBool::new(false)),
                 identity_index_complete: Arc::new(AtomicBool::new(false)),
                 identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+                publication_gate: Arc::new(Mutex::new(())),
             };
             rehydrate(&store, &log, &hub, &cancellation).await?;
 
@@ -660,46 +725,19 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 return Err(invalid_request());
             }
             let hub = &context.state().hub;
-            if context.state().store.identity_conflicted(&request.document_id).map_err(|_| storage_failed())? {
-                let mut event = hub.text_events(&request.document_id).remove(0);
-                event["transferId"] = json!(request.transfer_id);
-                event["requestStatuses"] = json!(request.request_ids.iter().map(|id| json!({
-                    "requestId":id,"inclusion":"unresolved","durability":"unresolved"
-                })).collect::<Vec<_>>());
-                let revision = event["revision"].clone();
-                let _ = hub.events.send(event);
-                return Ok(json!({"documentId":request.document_id,"revision":revision,"transferId":request.transfer_id}));
-            }
             let author = &context.state().installation;
             let looked_up = lookup_identities(&context.state().log, &context.state().store, hub, &request.request_ids).await;
             let mut foreign_ids = HashSet::new();
             if let Ok(found) = &looked_up {
-                for (id, (document, owner, digest)) in found {
+                for (id, (document, owner, digest, durable)) in found {
                     if document == &request.document_id && owner == author {
-                        hub.remember_identity(document, id, owner, *digest, true);
+                        hub.remember_identity(document, id, owner, *digest, *durable);
                     } else {
                         foreign_ids.insert(id.as_str());
                     }
                 }
             }
-            // All fields, including ID status, are one body-lock snapshot.
-            let (revision, text, editable, statuses) = hub.with_body(&request.document_id, |body| {
-                let statuses: Vec<JsonValue> = request.request_ids.iter().map(|id| {
-                    match body.identity(id).filter(|known| known.author == *author) {
-                        Some(known) => json!({"requestId":id,"inclusion":if body.editable() { "included" } else { "unresolved" },"durability": if known.durable { "durable" } else { "pending" }}),
-                        None if looked_up.is_ok() && !foreign_ids.contains(id.as_str()) && hub.qualified.load(Ordering::Acquire) && body.editable() => json!({"requestId":id,"inclusion":"absent","durability":"unresolved"}),
-                        None => json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"}),
-                    }
-                }).collect();
-                (body.revision(), if body.editable() { body.text().to_owned() } else { String::new() }, body.editable(), statuses)
-            });
-            let mut events = full_text_events_bounded(&request.document_id, revision, &text, editable, TEXT_EVENT_BUDGET - 2048);
-            for (index, event) in events.iter_mut().enumerate() {
-                event["transferId"] = json!(request.transfer_id);
-                if index == 0 { event["requestStatuses"] = json!(statuses); }
-            }
-            for event in events { let _ = hub.events.send(event); }
-            Ok(json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}))
+            hub.publish_recovery(&request, author, &looked_up, &foreign_ids)
         },
     )
     .request(
@@ -724,11 +762,11 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&(base, &request.ops)).map_err(|_| invalid_request())?).into();
             let _identity_guard = hub.identity_lookup_lock.lock().await;
             let found = lookup_identities(&context.state().log, &context.state().store, &hub, std::slice::from_ref(&request.request_id)).await?;
-            if let Some((old_document, old_author, old_digest)) = found.get(&request.request_id) {
+            if let Some((old_document, old_author, old_digest, durable)) = found.get(&request.request_id) {
                 if old_document != &document || old_author != &author || old_digest != &digest {
                     return Err(invalid_request());
                 }
-                hub.remember_identity(&document, &request.request_id, &author, digest, true);
+                hub.remember_identity(&document, &request.request_id, &author, digest, *durable);
             }
             // A new ID is absent only after the fenced, gap-free from-start replay and
             // successful opening of every relevant prior edit.
@@ -1150,6 +1188,8 @@ fn open_batches(
     })
 }
 
+type IdentityLookups = HashMap<String, (String, String, [u8; 32], bool)>;
+
 /// Read only the exact indexed sealed row to confirm a local retry's immutable digest.
 /// A missing row remains unresolved until the qualified replay and all opens succeed.
 async fn lookup_identities(
@@ -1157,12 +1197,18 @@ async fn lookup_identities(
     store: &DocumentStore,
     hub: &BodyHub,
     ids: &[String],
-) -> Result<HashMap<String, (String, String, [u8; 32])>, BackendError> {
+) -> Result<IdentityLookups, BackendError> {
     let mut found = HashMap::new();
     for id in ids {
         if let Some(cached) = hub.lock().iter().find_map(|(document, body)| {
-            body.identity(id)
-                .map(|known| (document.clone(), known.author.clone(), known.digest))
+            body.identity(id).map(|known| {
+                (
+                    document.clone(),
+                    known.author.clone(),
+                    known.digest,
+                    known.durable,
+                )
+            })
         }) {
             found.insert(id.clone(), cached);
             continue;
@@ -1215,7 +1261,7 @@ async fn lookup_identities(
         {
             return Err(error("documents.document_pending", true));
         }
-        found.insert(id.clone(), (document, author, payload_digest));
+        found.insert(id.clone(), (document, author, payload_digest, true));
     }
     Ok(found)
 }
@@ -1289,7 +1335,11 @@ async fn import_edit_rows(
                             payload_digest,
                             update,
                         }) => {
-                            match hub.store.index_opened_edit(row, &record.canonical) {
+                            let indexed = {
+                                let _publication = hub.publication_gate.lock().unwrap();
+                                hub.store.index_opened_edit(row, &record.canonical)
+                            };
+                            match indexed {
                                 Ok(false) => {
                                     // A newly opened collision invalidates a previously visible body.
                                     for affected in hub
@@ -1473,6 +1523,7 @@ async fn append(
     let id = appended.record_id.as_str().to_owned();
     let ingested = context
         .blocking(move |_| {
+            let _publication = state.hub.publication_gate.lock().unwrap();
             state
                 .store
                 .ingest_with_commit(
@@ -1569,10 +1620,13 @@ async fn reopen_metadata(
                                     .insert(row.record_id.clone());
                                 continue;
                             }
-                            if !store
-                                .index_opened_edit(row, &record.canonical)
-                                .map_err(|_| storage_failed())?
-                            {
+                            let indexed = {
+                                let _publication = hub.publication_gate.lock().unwrap();
+                                store
+                                    .index_opened_edit(row, &record.canonical)
+                                    .map_err(|_| storage_failed())?
+                            };
+                            if !indexed {
                                 hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
                                 for affected in
                                     store.conflicted_documents().map_err(|_| storage_failed())?
@@ -1585,9 +1639,12 @@ async fn reopen_metadata(
                             }
                         }
                         if deferred {
-                            let ingested = store
-                                .retry_deferred(&row.record_id, &record.canonical)
-                                .map_err(|_| storage_failed())?;
+                            let ingested = {
+                                let _publication = hub.publication_gate.lock().unwrap();
+                                store
+                                    .retry_deferred(&row.record_id, &record.canonical)
+                                    .map_err(|_| storage_failed())?
+                            };
                             hub.apply_edits(&ingested.edits);
                         } else {
                             store
@@ -1643,6 +1700,7 @@ async fn rehydrate(
                         && record.purpose == row.purpose
                         && record.signature == row.signature =>
                 {
+                    let _publication = hub.publication_gate.lock().unwrap();
                     store
                         .index_opened_edit(row, &record.canonical)
                         .map_err(|_| storage_failed())?;
@@ -1763,6 +1821,14 @@ where
             if appended {
                 let saved_revision = hub.with_body(document, |body| body.last_request_revision());
                 if let Some(saved_revision) = saved_revision {
+                    let _publication = hub.publication_gate.lock().unwrap();
+                    if hub
+                        .store
+                        .identity_conflicted(document)
+                        .map_err(|_| storage_failed())?
+                    {
+                        return Err(error("documents.identity_conflict", false));
+                    }
                     let mut events = hub.text_events(document);
                     if let Some(last) = events.last_mut() {
                         last["savedRevision"] = json!(saved_revision.to_string());
@@ -1827,7 +1893,9 @@ async fn append_edit(
         .map_err(|cause| capability_error(purpose, cause))?;
     let store = hub.store.clone();
     let changes = changes.clone();
+    let publication_gate = hub.publication_gate.clone();
     let ingested = tokio::task::spawn_blocking(move || {
+        let _publication = publication_gate.lock().unwrap();
         store
             .ingest_with_commit(
                 appended.record_id.as_str(),
@@ -1992,27 +2060,22 @@ impl RecordLogSink for DocumentsSink {
     }
 
     fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
-        if matches!(
-            DomainRecord::decode(&record.canonical),
-            Ok(DomainRecord::IdentifiedDocumentEdit { .. })
-        ) && !self.hub.identity_index_complete.load(Ordering::Acquire)
-        {
-            return Err(error("documents.document_pending", true));
-        }
-        let ingested = self
-            .store
-            .ingest_with_commit(
-                record.record_id.as_str(),
-                record.order_key.as_str(),
-                &record.author,
-                &record.purpose,
-                &record.signature,
-                &record.canonical,
-                &record.sealed_record,
-                Some(record.cursor.as_str()),
-                &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
-            )
-            .map_err(|_| storage_failed())?;
+        let ingested = {
+            let _publication = self.hub.publication_gate.lock().unwrap();
+            self.store
+                .ingest_with_commit(
+                    record.record_id.as_str(),
+                    record.order_key.as_str(),
+                    &record.author,
+                    &record.purpose,
+                    &record.signature,
+                    &record.canonical,
+                    &record.sealed_record,
+                    Some(record.cursor.as_str()),
+                    &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
+                )
+                .map_err(|_| storage_failed())?
+        };
         if let IngestResult::IdentityConflict(ref document) = ingested.result {
             eprintln!("documents identity conflict quarantined: document={document}");
             for affected in self
@@ -2239,6 +2302,7 @@ mod tests {
             qualified: Arc::new(AtomicBool::new(false)),
             identity_index_complete: Arc::new(AtomicBool::new(false)),
             identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            publication_gate: Arc::new(Mutex::new(())),
         };
         let mut alice = DocumentBody::new(1);
         let mut bob = DocumentBody::new(2);
@@ -2304,6 +2368,7 @@ mod tests {
             qualified: Arc::new(AtomicBool::new(false)),
             identity_index_complete: Arc::new(AtomicBool::new(false)),
             identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            publication_gate: Arc::new(Mutex::new(())),
         };
         let mut source = DocumentBody::new(1);
         source
@@ -2660,6 +2725,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_lookup_interleaved_with_conflict_never_publishes_chunked_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = start(directory.path(), scripted_log()).await;
+        let document = hex(64, 2);
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        for (seed, record) in [
+            (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
+            (
+                2,
+                DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+            ),
+        ] {
+            assert!(stream.send(record_frame(seed, "bob", &record)).await);
+        }
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 2).as_str()),
+            "metadata",
+        )
+        .await;
+        let (events, mut receiver) = broadcast::channel(64);
+        let hub = BodyHub {
+            store: store.clone(),
+            bodies: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            flush: Arc::new(Notify::new()),
+            append_locks: Arc::new(Mutex::new(HashMap::new())),
+            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
+            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
+            peer: 5,
+            qualified: Arc::new(AtomicBool::new(true)),
+            identity_index_complete: Arc::new(AtomicBool::new(true)),
+            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            publication_gate: Arc::new(Mutex::new(())),
+        };
+        hub.with_body(&document, |body| {
+            body.apply(&[TextOp::Insert {
+                insert: "A".repeat(180 * 1024),
+            }])
+            .unwrap();
+        });
+        let request_id = hex(32, 9);
+        let request = RecoverRequest {
+            document_id: document.clone(),
+            transfer_id: hex(32, 55),
+            request_ids: vec![request_id.clone()],
+        };
+        let (release, pending_lookup) = tokio::sync::oneshot::channel::<()>();
+        let publishing = tokio::spawn(async move {
+            pending_lookup.await.unwrap();
+            hub.publish_recovery(&request, ALICE, &Ok(HashMap::new()), &HashSet::new())
+                .unwrap();
+        });
+        let mut source = DocumentBody::new(91);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "signed".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        for seed in [3, 4] {
+            let signed = DomainRecord::identified_document_edit(
+                "bob",
+                &document,
+                &request_id,
+                &[seed as u8; 32],
+                update.clone(),
+            )
+            .unwrap();
+            assert!(stream.send(record_frame(seed, "bob", &signed)).await);
+            wait_until(
+                || store.cursor().unwrap().as_deref() == Some(hex(50, seed).as_str()),
+                "signed edit",
+            )
+            .await;
+        }
+        assert!(store.identity_conflicted(&document).unwrap());
+        while receiver.try_recv().is_ok() {}
+        release.send(()).unwrap();
+        publishing.await.unwrap();
+        let published: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(!published.is_empty());
+        assert!(
+            published
+                .iter()
+                .all(|event| event["reason"] == "identity_conflict"
+                    && event["text"] == ""
+                    && event.get("chunk").is_none()
+                    && event["editable"] == false)
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn sink_quarantines_evicted_remote_id_and_keeps_later_records_live() {
         let directory = tempfile::tempdir().unwrap();
         let session = start(directory.path(), scripted_log()).await;
@@ -2879,6 +3045,81 @@ mod tests {
             .unwrap();
         assert_eq!(pending["editable"], false);
         assert_eq!(pending["text"], "");
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let other = hex(64, 5);
+        assert!(
+            stream
+                .send(record_frame(
+                    5,
+                    "bob",
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap()
+                ))
+                .await
+        );
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 5).as_str()),
+            "other Document create",
+        )
+        .await;
+        let mut source = DocumentBody::new(92);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "live".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let identified =
+            DomainRecord::identified_document_edit("bob", &other, &hex(32, 15), &[3; 32], update)
+                .unwrap();
+        assert!(stream.send(record_frame(6, "bob", &identified)).await);
+        assert!(
+            stream
+                .send(record_frame(
+                    7,
+                    "bob",
+                    &DomainRecord::collection_rename("bob", &hex(64, 1), "Later").unwrap()
+                ))
+                .await
+        );
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 7).as_str()),
+            "cursor past unrelated identified edit",
+        )
+        .await;
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&other].text(),
+            "live"
+        );
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap();
+        session
+            .harness
+            .request(
+                "documents.document.recover",
+                json!({"documentId":document,"transferId":hex(32, 16),"requestIds":[hex(32, 17)]}),
+            )
+            .await
+            .unwrap();
+        let unresolved = loop {
+            let event = text.next_event().await.unwrap().unwrap();
+            if event["transferId"] == hex(32, 16) {
+                break event;
+            }
+        };
+        assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
+        text.close().await;
         access.store(true, Ordering::SeqCst);
         let stream = session.scripted.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
@@ -3422,6 +3663,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_never_certifies_pending_identity_before_or_after_failed_append() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let failing = fail.clone();
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                .map(|_| json!({"status":"waiting_for_history_access"})).collect::<Vec<_>>()})),
+            "append" if payload["purpose"] == "document.edit" && failing.load(Ordering::SeqCst) => Err(error("unavailable", true)),
+            "append" => {
+                let seed = next.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"recordId":hex(64, seed),"orderKey":hex(82, seed),
+                    "author":ALICE,"signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}))
+            },
+            _ => Err(error("unavailable", false)),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted).await;
+        qualify_empty_history(&session).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({"name":"Plans"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"Draft"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap();
+        let id = hex(32, 31);
+        let request = json!({"documentId":document,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]});
+        let editing = session
+            .harness
+            .start_request("documents.document.edit", request.clone())
+            .await;
+        wait_until(
+            || {
+                session
+                    .handles
+                    .bodies
+                    .lock()
+                    .unwrap()
+                    .get(&document)
+                    .and_then(|body| body.identity(&id))
+                    .is_some()
+            },
+            "pending identity",
+        )
+        .await;
+        let recover = |transfer: u64| json!({"documentId":document,"transferId":hex(32,transfer),"requestIds":[id]});
+        session
+            .harness
+            .request("documents.document.recover", recover(40))
+            .await
+            .unwrap();
+        let before = loop {
+            let event = text.next_event().await.unwrap().unwrap();
+            if event["transferId"] == hex(32, 40) {
+                break event;
+            }
+        };
+        assert_eq!(before["requestStatuses"][0]["inclusion"], "included");
+        assert_eq!(before["requestStatuses"][0]["durability"], "pending");
+        assert!(editing.result().await.is_err());
+        session
+            .harness
+            .request("documents.document.recover", recover(41))
+            .await
+            .unwrap();
+        let failed = loop {
+            let event = text.next_event().await.unwrap().unwrap();
+            if event["transferId"] == hex(32, 41) {
+                break event;
+            }
+        };
+        assert_eq!(failed["requestStatuses"][0]["durability"], "pending");
+        fail.store(false, Ordering::SeqCst);
+        session
+            .harness
+            .request("documents.document.edit", request)
+            .await
+            .unwrap();
+        session
+            .harness
+            .request("documents.document.recover", recover(42))
+            .await
+            .unwrap();
+        let saved = loop {
+            let event = text.next_event().await.unwrap().unwrap();
+            if event["transferId"] == hex(32, 42) {
+                break event;
+            }
+        };
+        assert_eq!(saved["requestStatuses"][0]["durability"], "durable");
+        text.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn edit_failure_is_retryable_and_retries_without_duplicate_operations() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let fail = Arc::new(AtomicBool::new(true));
@@ -3821,6 +4175,7 @@ mod tests {
             qualified: Arc::new(AtomicBool::new(false)),
             identity_index_complete: Arc::new(AtomicBool::new(false)),
             identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            publication_gate: Arc::new(Mutex::new(())),
         };
         let text = "x".repeat(150 * 1024);
         hub.with_body("doc", |body| {
@@ -3883,6 +4238,7 @@ mod tests {
             qualified: Arc::new(AtomicBool::new(false)),
             identity_index_complete: Arc::new(AtomicBool::new(false)),
             identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            publication_gate: Arc::new(Mutex::new(())),
         };
         hub.with_body("doc", |body| {
             body.apply(&[TextOp::Insert {

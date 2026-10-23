@@ -51,14 +51,14 @@ None of that exists today and none of it is needed: there is no install base, no
 
 ## Consequences
 
-- Every capability grant names a family and a version. Immutable-record-log 1.1 adds a credited `replay_end` event only for negotiated 1.1 streams. A 1.0 consumer never receives it; a 1.1 Package that requires the barrier refuses a 1.0-only Host rather than inferring completion from health. A new family is additive, so the record log's successors cost existing Packages nothing.
+- Every capability grant names a family and a version. A new family is additive, so the record log's successors cost existing Packages nothing.
 - Author-visible breaks are limited to the three lines named here, and each is recorded as an ADR.
 - A new `availability` state or `open` status for the immutable record log is a major version of that family. The SDK needs no change for this decision; its refusal of an unknown value is the behaviour this ADR ratifies.
 - The deprecation window is a promise about the first breaking change, not a mechanism that exists. Whoever lands that change builds it.
 
 ## Evidence
 
-- `crates/teamarness-package-host/src/capability.rs` — capability descriptors, families, negotiation, and per-generation append admission/drain before replacement (a timed-out Core closure still counts until exit); `negotiates_the_highest_common_minor`, `unknown_capability_family_is_not_a_version_error`, `adding_a_capability_family_does_not_change_lifecycle_or_ui_contracts`, `capability_limits_match_contract_schemas`.
+- `crates/teamarness-package-host/src/capability.rs` — capability descriptors, families, and negotiation; `negotiates_the_highest_common_minor`, `unknown_capability_family_is_not_a_version_error`, `adding_a_capability_family_does_not_change_lifecycle_or_ui_contracts`, `capability_limits_match_contract_schemas`.
 - `crates/teamarness-package-contract/src/manifest.rs` — `CapabilityRequest`'s declared family and accepted minor range, and the `manifest.capability_range` rule.
 - `contracts/package-capabilities/v1/README.md` — "Families and versions", the normative statement of the additive-minor rule.
 - `contracts/package-process/v1/README.md` — the protocol's own version and limits.

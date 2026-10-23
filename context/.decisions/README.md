@@ -28,6 +28,10 @@ This index is the one place that lists every decision's status, its supersession
 | [0018](0018-package-seam-versioning.md) | Package seam versioning | accepted (2026-09-19) | – | – | In the ADR | Refines 0007 and 0008 (seam versioning); three version lines, family-plus-version negotiation, additive families, intended deprecation window |
 | [0019](0019-lifecycle-verdicts-and-derived-bounds.md) | Lifecycle verdicts and derived bounds | accepted (2026-09-20) | – | – | In the ADR | Refines 0007, 0016 and 0018; three frame verdicts in one classifier, bounded tombstones, every internal bound derived from the contract constant it serves |
 | [0020](0020-subscription-driven-content-key-acquisition.md) | Subscription-driven Content Key acquisition | accepted (2026-09-22) | – | – | In the ADR | Refines 0008 (first-key bootstrap trigger), 0009 and 0014 (durable synchronization work); preserves 0013 grant authority |
+| [0021](0021-fair-class-selection-under-scheduler-cap.md) | Fair class selection under the synchronization cap | accepted (2026-09-23) | – | – | In the ADR | Refines 0014 and 0020 |
+| [0022](0022-workspace-person-names.md) | Workspace Person names are Core-owned, not a Profile Package | accepted (2026-10-11) | – | – | In the ADR | Refines 0003, 0004, 0008/0009 and 0018 |
+| [0023](0023-documents-on-immutable-record-log.md) | Documents are Package-owned Loro updates on the immutable record log | accepted (2026-10-21) | – | – | In the ADR | Refines 0002, 0008/0009, 0018, and 0022; consumes 1.1 as recorded in 0024 |
+| [0024](0024-qualified-record-replay-and-generation-fence.md) | Qualified immutable-record replay and Package generation append fence | accepted (2026-10-23) | – | – | In the ADR | Refines 0018 (additive minor), 0008/0009 (replay), and 0019 (generation retirement); see 0023 for Documents usage |
 
 ### Former file names
 
