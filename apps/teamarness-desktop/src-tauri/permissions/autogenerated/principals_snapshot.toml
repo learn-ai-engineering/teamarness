@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-principals-snapshot"
+description = "Enables the principals_snapshot command without any pre-configured scope."
+commands.allow = ["principals_snapshot"]
+
+[[permission]]
+identifier = "deny-principals-snapshot"
+description = "Denies the principals_snapshot command without any pre-configured scope."
+commands.deny = ["principals_snapshot"]

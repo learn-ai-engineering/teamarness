@@ -305,6 +305,8 @@ textarea:focus-visible {
 .member-row strong,
 .member-row small { display: block; }
 .member-row small { margin-top: 0.2rem; color: var(--teamarness-color-text-muted); }
+.member-actions { display: grid; justify-items: end; gap: 0.4rem; }
+.member-actions form { display: grid; gap: 0.3rem; }
 .member-role { flex: none; color: var(--teamarness-color-text-muted); font-size: 0.85rem; font-weight: 700; }
 .empty-state { padding: 0.8rem 0; color: var(--teamarness-color-text-muted); }
 .error { color: var(--teamarness-color-danger); }

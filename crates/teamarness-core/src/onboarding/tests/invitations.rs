@@ -63,11 +63,13 @@ async fn issue_claim_redeem_and_reopen_preserve_the_complete_proof() {
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     let transition = issuer.redeem_invitation(&claim).unwrap();
 
     assert_eq!(transition.workspace_id(), workspace.id());
-    assert_eq!(transition.epoch(), MembershipEpoch::new(1));
+    assert_eq!(transition.epoch(), MembershipEpoch::new(4));
     let snapshot = issuer.membership_snapshot(workspace.id()).unwrap();
     assert_eq!(snapshot.members().len(), 2);
     assert!(snapshot.members().iter().any(|member| {
@@ -152,7 +154,9 @@ async fn invalid_expiry_wrong_issuer_wrong_workspace_and_malformed_proofs_are_re
     let invitee = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&invitee_directory))
         .await
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
 
     assert_eq!(
         invitee.redeem_invitation(&claim).unwrap_err(),
@@ -202,7 +206,9 @@ async fn an_expired_token_is_not_consumed() {
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 5)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     // negative-wait: waits past the invitation's wall-clock expiry.
     std::thread::sleep(std::time::Duration::from_millis(20));
 
@@ -221,7 +227,7 @@ async fn an_expired_token_is_not_consumed() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts, (0, 0, 0));
+    assert_eq!(counts, (0, 0, 2));
 
     drop(connection);
     invitee.shutdown().await.unwrap();
@@ -247,7 +253,9 @@ async fn an_admitted_non_manager_cannot_issue_an_invitation() {
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer.redeem_invitation(&claim).unwrap();
     issuer.shutdown().await.unwrap();
     drop(issuer);

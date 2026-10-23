@@ -1318,6 +1318,7 @@ fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::OutcomeUncertain => "outcome_unknown",
         PackageErrorCode::ProcessExited => "provider_exited",
         PackageErrorCode::BackendError => "provider_error",
+        PackageErrorCode::PrincipalNotBound => "principal_not_bound",
         _ => "capability_request_invalid",
     }
 }

@@ -22,7 +22,11 @@ async fn production_log_sync_grants_scope_converges_and_survives_restart() {
     let workspace = a.create_workspace("Production sync").unwrap();
     let package = "teamarness.test";
     let invitation = a
-        .create_workspace_invitation_for_test(workspace.id(), 1, 60_000)
+        .create_workspace_invitation_for_test(
+            workspace.id(),
+            workspace.created_at_unix_ms(),
+            60_000,
+        )
         .unwrap();
     let b = CoreRuntime::open_with_clock_and_readiness(b_config.clone(), clock(), true)
         .await
@@ -333,7 +337,7 @@ async fn invalid_remote_sequence_isolated_before_journal_commit() {
     let invitation = a
         .create_workspace_invitation_for_test(
             workspace.id(),
-            1,
+            workspace.created_at_unix_ms(),
             SystemClock.now_unix_ms().saturating_add(60_000),
         )
         .unwrap();

@@ -137,9 +137,10 @@ pub fn write_node_package_with_capabilities(
             "fixture.port_event_stats": {"request": {}, "response": {}},
             "fixture.port_cancel": {"request": {}, "response": {}},
             "fixture.port_events": {"request": {}, "response": {}},
-            "fixture.person_names_open": {"request": {}, "response": {}},
-            "fixture.person_names_close": {"request": {}, "response": {}},
-            "fixture.person_names_events": {"request": {}, "response": {}},
+            "fixture.principals_open": {"request": {}, "response": {}},
+            "fixture.principals_close": {"request": {}, "response": {}},
+            "fixture.principals_events": {"request": {}, "response": {}},
+
             "fixture.stderr": {"request": {}, "response": {}},
             "fixture.typed": {"request": {"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}, "response": {}}
         },

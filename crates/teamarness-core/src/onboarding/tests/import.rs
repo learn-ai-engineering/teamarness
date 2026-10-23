@@ -502,7 +502,7 @@ async fn named_join_intent_survives_import_fault_and_recovers_one_admission() {
         {
             let mut connection = Connection::open(joiner_directory.join("core.sqlite3")).unwrap();
             assert_eq!(
-                crate::person_names::stage_join(
+                crate::principals::stage_join(
                     &mut connection,
                     workspace,
                     verified.token.id.as_bytes(),

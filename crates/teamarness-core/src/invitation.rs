@@ -4,8 +4,11 @@ use iroh_base::{SecretKey, Signature};
 use p2panda_core::Hash;
 
 use crate::error::{InvitationError, ValueParseError};
-use crate::membership::{INSTALLATION_TAG, WORKSPACE_TAG};
-use crate::{PublicIdentity, WorkspaceId};
+use crate::membership::envelope::CREATE_PERSON_ENVELOPE_BYTES;
+use crate::membership::{
+    INSTALLATION_TAG, MembershipAction, MembershipEnvelope, PERSON_GROUP_TAG, WORKSPACE_TAG,
+};
+use crate::{MembershipOperationId, PublicIdentity, WorkspaceId};
 
 const VERSION: u8 = 1;
 const MEMBER_ACCESS: u8 = 1;
@@ -13,7 +16,10 @@ const TOKEN_DOMAIN: &str = "teamarness.invitation/v1";
 const CLAIM_DOMAIN: &str = "teamarness.invitation-claim/v1";
 const TOKEN_UNSIGNED_LEN: usize = 100;
 const TOKEN_LEN: usize = TOKEN_UNSIGNED_LEN + 32 + 64;
-const CLAIM_LEN: usize = 1 + 2 + TOKEN_LEN + 1 + 32 + 64;
+/// version | token length | token | PERSON_GROUP_TAG | invitee | envelope
+/// length | the invitee-signed `create person` envelope | signature.
+pub(crate) const CLAIM_LEN: usize =
+    1 + 2 + TOKEN_LEN + 1 + 32 + 2 + CREATE_PERSON_ENVELOPE_BYTES + 64;
 
 /// An opaque, transferable signed invitation token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +40,13 @@ pub(crate) struct VerifiedInvitationToken {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// A claim carries the invitee's signed `create person` operation, so the
+/// issuer can commit the Person's key group together with its admission.
 #[derive(Clone)]
 pub(crate) struct VerifiedInvitationClaim {
     pub(crate) token: VerifiedInvitationToken,
     pub(crate) invitee: PublicIdentity,
+    pub(crate) create_person: MembershipEnvelope,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -120,21 +129,51 @@ pub(crate) fn sign_token(
     decode_token(&bytes)
 }
 
+/// Signs a claim for `token`, embedding the invitee's `create person` operation.
+///
+/// The group create depends on the Workspace genesis and is timestamped at the
+/// token's issue time, so a retry of the same invitation produces the identical
+/// claim bytes and the issuer can recover the same admission.
 pub(crate) fn sign_claim(
     secret_key: &SecretKey,
     token: &VerifiedInvitationToken,
+    genesis_id: MembershipOperationId,
+) -> Result<VerifiedInvitationClaim, InvitationError> {
+    let create_person = MembershipEnvelope::sign(
+        secret_key,
+        token.workspace_id,
+        token.issued_at_unix_ms,
+        MembershipAction::CreatePerson {
+            creator: token.inviter,
+        },
+        vec![genesis_id],
+    )
+    .map_err(|_| InvitationError::Malformed)?;
+    sign_claim_with_create_person(secret_key, token, &create_person)
+}
+
+/// Signs a claim around an already signed `create person` envelope. Tests use
+/// this to build claims whose embedded group create is not the invitee's own.
+pub(crate) fn sign_claim_with_create_person(
+    secret_key: &SecretKey,
+    token: &VerifiedInvitationToken,
+    create_person: &MembershipEnvelope,
 ) -> Result<VerifiedInvitationClaim, InvitationError> {
     let invitee = PublicIdentity::from_bytes(*secret_key.public().as_bytes())
         .map_err(|_| InvitationError::InvalidRole)?;
-    let payload = claim_signature_payload(token.id, invitee);
+    let payload = claim_signature_payload(token.id, invitee, create_person.id);
     let signature = crate::identity::sign(secret_key, CLAIM_DOMAIN, &payload)
         .map_err(|_| InvitationError::InvalidClaimSignature)?;
+    let envelope = create_person.canonical_bytes();
+    let envelope_len = u16::try_from(envelope.len()).map_err(|_| InvitationError::DecodeLimit)?;
     let mut bytes = Vec::with_capacity(CLAIM_LEN);
     bytes.push(VERSION);
     bytes.extend_from_slice(&(TOKEN_LEN as u16).to_be_bytes());
     bytes.extend_from_slice(&token.bytes);
-    bytes.push(INSTALLATION_TAG);
+    bytes.push(PERSON_GROUP_TAG);
     bytes.extend_from_slice(invitee.as_bytes());
+    bytes.extend_from_slice(&envelope_len.to_be_bytes());
+    bytes.extend_from_slice(envelope);
     bytes.extend_from_slice(&signature.to_bytes());
     decode_claim(&bytes)
 }
@@ -223,29 +262,55 @@ pub(crate) fn decode_claim(bytes: &[u8]) -> Result<VerifiedInvitationClaim, Invi
     }
     let token_end = 3 + token_length;
     let token = decode_token(&bytes[3..token_end])?;
-    if bytes[token_end] != INSTALLATION_TAG {
+    if bytes[token_end] != PERSON_GROUP_TAG {
         return Err(InvitationError::InvalidRole);
     }
     let invitee_end = token_end + 1 + 32;
     let invitee = PublicIdentity::from_bytes(copy_array(&bytes[token_end + 1..invitee_end]))
         .map_err(|_| InvitationError::Malformed)?;
-    let signature = Signature::from_bytes(&copy_array(&bytes[invitee_end..]));
-    let payload = claim_signature_payload(token.id, invitee);
+    let envelope_length =
+        u16::from_be_bytes(copy_array(&bytes[invitee_end..invitee_end + 2])) as usize;
+    if envelope_length != CREATE_PERSON_ENVELOPE_BYTES {
+        return Err(InvitationError::DecodeLimit);
+    }
+    let envelope_start = invitee_end + 2;
+    let envelope_end = envelope_start + envelope_length;
+    let create_person = MembershipEnvelope::decode(&bytes[envelope_start..envelope_end])
+        .map_err(|_| InvitationError::Malformed)?;
+    // The embedded operation must be the invitee's own group create for this
+    // Workspace, anchored on exactly one dependency (the genesis).
+    if !matches!(create_person.action, MembershipAction::CreatePerson { creator } if creator == token.inviter)
+        || create_person.workspace_id != token.workspace_id
+        || create_person.dependencies.len() != 1
+    {
+        return Err(InvitationError::Malformed);
+    }
+    if create_person.author != invitee {
+        return Err(InvitationError::ClaimTargetMismatch);
+    }
+    let signature = Signature::from_bytes(&copy_array(&bytes[envelope_end..]));
+    let payload = claim_signature_payload(token.id, invitee, create_person.id);
     crate::identity::verify(invitee.as_public_key(), CLAIM_DOMAIN, &payload, &signature)
         .map_err(|_| InvitationError::InvalidClaimSignature)?;
 
     Ok(VerifiedInvitationClaim {
         token,
         invitee,
+        create_person,
         bytes: bytes.to_vec(),
     })
 }
 
-fn claim_signature_payload(token_id: Hash, invitee: PublicIdentity) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(65);
+fn claim_signature_payload(
+    token_id: Hash,
+    invitee: PublicIdentity,
+    create_person: MembershipOperationId,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32 + 1 + 32 + 32);
     bytes.extend_from_slice(token_id.as_bytes());
-    bytes.push(INSTALLATION_TAG);
+    bytes.push(PERSON_GROUP_TAG);
     bytes.extend_from_slice(invitee.as_bytes());
+    bytes.extend_from_slice(create_person.as_bytes());
     bytes
 }
 
@@ -263,6 +328,10 @@ mod tests {
         SecretKey::from_bytes(&[byte; 32])
     }
 
+    fn genesis() -> MembershipOperationId {
+        MembershipOperationId::digest(b"genesis")
+    }
+
     #[test]
     fn token_and_claim_round_trip_and_reject_tampering() {
         let token = sign_token(
@@ -273,12 +342,24 @@ mod tests {
             [9; 32],
         )
         .unwrap();
-        let claim = sign_claim(&secret(8), &token).unwrap();
+        let claim = sign_claim(&secret(8), &token, genesis()).unwrap();
+        assert_eq!(claim.bytes.len(), CLAIM_LEN);
+        assert_eq!(claim.create_person.author, claim.invitee);
+        assert!(
+            matches!(claim.create_person.action, MembershipAction::CreatePerson { creator } if creator == token.inviter)
+        );
+        assert_eq!(claim.create_person.dependencies, vec![genesis()]);
+        assert_eq!(claim.create_person.authored_at_unix_ms, 1_000);
 
         let encoded_token = InvitationToken::from_verified(&token);
         let encoded_claim = InvitationClaim::from_verified(&claim);
         assert_eq!(encoded_token.verified().unwrap().id, token.id);
         assert_eq!(encoded_claim.verified().unwrap().invitee, claim.invitee);
+        // A retry regenerates byte-identical claim material.
+        assert_eq!(
+            sign_claim(&secret(8), &token, genesis()).unwrap().bytes,
+            claim.bytes
+        );
 
         let mut tampered = token.bytes.clone();
         tampered[70] ^= 1;
@@ -297,6 +378,63 @@ mod tests {
         assert!(matches!(
             decode_claim(&tampered),
             Err(InvitationError::InvalidClaimSignature)
+        ));
+    }
+
+    #[test]
+    fn claim_rejects_a_group_create_by_another_key_or_of_another_shape() {
+        let workspace = WorkspaceId::from_bytes([3; 16]);
+        let token = sign_token(&secret(7), workspace, 1_000, 2_000, [9; 32]).unwrap();
+        let foreign = MembershipEnvelope::sign(
+            &secret(9),
+            workspace,
+            1_000,
+            MembershipAction::CreatePerson {
+                creator: token.inviter,
+            },
+            vec![genesis()],
+        )
+        .unwrap();
+        assert!(matches!(
+            sign_claim_with_create_person(&secret(8), &token, &foreign),
+            Err(InvitationError::ClaimTargetMismatch)
+        ));
+        let other_workspace = MembershipEnvelope::sign(
+            &secret(8),
+            WorkspaceId::from_bytes([4; 16]),
+            1_000,
+            MembershipAction::CreatePerson {
+                creator: token.inviter,
+            },
+            vec![genesis()],
+        )
+        .unwrap();
+        assert!(matches!(
+            sign_claim_with_create_person(&secret(8), &token, &other_workspace),
+            Err(InvitationError::Malformed)
+        ));
+        let not_a_create = MembershipEnvelope::sign(
+            &secret(8),
+            workspace,
+            1_000,
+            MembershipAction::AttachPerson { group: genesis() },
+            vec![genesis()],
+        )
+        .unwrap();
+        assert!(sign_claim_with_create_person(&secret(8), &token, &not_a_create).is_err());
+        let wrong_inviter = MembershipEnvelope::sign(
+            &secret(8),
+            workspace,
+            1_000,
+            MembershipAction::CreatePerson {
+                creator: PublicIdentity::from_bytes(*secret(9).public().as_bytes()).unwrap(),
+            },
+            vec![genesis()],
+        )
+        .unwrap();
+        assert!(matches!(
+            sign_claim_with_create_person(&secret(8), &token, &wrong_inviter),
+            Err(InvitationError::Malformed)
         ));
     }
 
@@ -333,9 +471,9 @@ mod tests {
             Err(InvitationError::DecodeLimit)
         ));
 
-        let claim = sign_claim(&secret(8), &token).unwrap();
+        let claim = sign_claim(&secret(8), &token, genesis()).unwrap();
         let mut bytes = claim.bytes.clone();
-        bytes[3 + TOKEN_LEN] = WORKSPACE_TAG;
+        bytes[3 + TOKEN_LEN] = INSTALLATION_TAG;
         assert!(matches!(
             decode_claim(&bytes),
             Err(InvitationError::InvalidRole)
@@ -347,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_token_and_claim_golden_vectors_are_stable() {
+    fn canonical_token_golden_vector_is_stable() {
         let token = sign_token(
             &secret(7),
             WorkspaceId::from_bytes([3; 16]),
@@ -356,7 +494,6 @@ mod tests {
             [9; 32],
         )
         .unwrap();
-        let claim = sign_claim(&secret(8), &token).unwrap();
         assert_eq!(
             hex_encode(&token.bytes),
             "01020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03"
@@ -364,10 +501,6 @@ mod tests {
         assert_eq!(
             token.id.to_string(),
             "390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d417"
-        );
-        assert_eq!(
-            hex_encode(&claim.bytes),
-            "0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca511c5aeb0f1f776e59dea0e74c30ee2d1eae9a0eb75c2167d6f7e37683103e2635e528ef81502b64ad857773766eef6de1282266792da0f519f26320f6461c06"
         );
     }
 
@@ -383,7 +516,7 @@ mod tests {
                 [seed.wrapping_mul(17); 32],
             )
             .unwrap();
-            let claim = sign_claim(&secret(seed + 32), &token).unwrap();
+            let claim = sign_claim(&secret(seed + 32), &token, genesis()).unwrap();
 
             let token_text = InvitationToken::from_verified(&token);
             let parsed_token = InvitationToken::from_str(token_text.encoded()).unwrap();

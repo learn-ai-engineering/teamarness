@@ -348,8 +348,8 @@ async function serve() {
   const capabilityGrants = new Map();
   const pendingCapabilityCalls = new Map();
   const membershipEvents = [];
-  const personNameEvents = [];
-  let personNameStream;
+  const principalEvents = [];
+  let principalStream;
   let membershipStream;
   // Events consumed on the current membership stream that credit has already
   // been released for. The contract lets a sender release credit only for work
@@ -404,8 +404,8 @@ async function serve() {
         const requestId = pendingCapabilityCalls.get(frame.id);
         pendingCapabilityCalls.delete(frame.id);
         send({ kind: "response", id: requestId, payload: frame.kind === "response" ? { result: frame.payload } : { error: frame.code, retryable: frame.retryable ?? false, outcomeUncertain: frame.outcomeUncertain ?? false, details: frame.details ?? {} } });
-      } else if (frame.kind === "event" && frame.streamId === personNameStream) {
-        personNameEvents.push(frame.payload);
+      } else if (frame.kind === "event" && frame.streamId === principalStream) {
+        principalEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === membershipStream) {
         membershipEvents.push(frame.payload);
       } else if (frame.kind === "event" && frame.streamId === immutableStream) {
@@ -483,18 +483,18 @@ async function serve() {
       } else if (frame.kind === "stream_close" && uiStreams.has(frame.streamId)) {
         if (providerEventStreams.delete(frame.streamId)) providerEventCloses += 1;
         uiStreams.delete(frame.streamId);
-      } else if (frame.kind === "request" && frame.operation === "fixture.person_names_open") {
+      } else if (frame.kind === "request" && frame.operation === "fixture.principals_open") {
         capabilitySequence += 1;
-        personNameStream = `p:person-names-${capabilitySequence}`;
-        send({ kind: "stream_open", id: personNameStream, topic: "capability.stream", initialCredit: 32,
-          payload: { grant: capabilityGrants.get("teamarness.person-names"), method: "subscribe", afterCursor: frame.payload.afterCursor } });
-        send({ kind: "response", id: frame.id, payload: { streamId: personNameStream } });
-      } else if (frame.kind === "request" && frame.operation === "fixture.person_names_close") {
-        if (personNameStream) send({ kind: "stream_close", streamId: personNameStream, code: "closed" });
-        personNameStream = undefined;
+        principalStream = `p:principals-${capabilitySequence}`;
+        send({ kind: "stream_open", id: principalStream, topic: "capability.stream", initialCredit: 32,
+          payload: { grant: capabilityGrants.get("teamarness.principals"), method: "subscribe", afterCursor: frame.payload.afterCursor } });
+        send({ kind: "response", id: frame.id, payload: { streamId: principalStream } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.principals_close") {
+        if (principalStream) send({ kind: "stream_close", streamId: principalStream, code: "closed" });
+        principalStream = undefined;
         send({ kind: "response", id: frame.id, payload: { closed: true } });
-      } else if (frame.kind === "request" && frame.operation === "fixture.person_names_events") {
-        send({ kind: "response", id: frame.id, payload: { events: personNameEvents } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.principals_events") {
+        send({ kind: "response", id: frame.id, payload: { events: principalEvents } });
       } else if (frame.kind === "request" && frame.operation === "fixture.membership_open") {
         capabilitySequence += 1;
         membershipStream = `p:membership-${capabilitySequence}`;
@@ -538,7 +538,8 @@ async function serve() {
           kind: "request", id, operation: "capability.call",
           grant: frame.payload.grant ?? capabilityGrants.get(immutableCapability),
           deadlineUnixMs: frame.deadlineUnixMs,
-          payload: { method: "append", purpose: frame.payload.purpose, canonical: frame.payload.canonical },
+          payload: { method: "append", purpose: frame.payload.purpose, canonical: frame.payload.canonical,
+            ...(frame.payload.principal === undefined ? {} : { principal: frame.payload.principal }) },
         });
       } else if (frame.kind === "request" && ["fixture.immutable_open", "fixture.record_open"].includes(frame.operation)) {
         capabilitySequence += 1;

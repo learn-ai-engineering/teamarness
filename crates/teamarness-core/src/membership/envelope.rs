@@ -4,35 +4,214 @@ use p2panda_core::Hash;
 use crate::encoding::ByteReader;
 use crate::error::MembershipError;
 use crate::invitation::{VerifiedInvitationClaim, decode_claim};
-use crate::membership::{INSTALLATION_TAG, WORKSPACE_TAG};
+use crate::membership::{INSTALLATION_TAG, PERSON_GROUP_TAG, WORKSPACE_TAG};
 use crate::{MembershipOperationId, PublicIdentity, WorkspaceId};
 
 const VERSION: u8 = 1;
 const CREATE_TAG: u8 = 0;
 const ADMIT_TAG: u8 = 1;
 const REVOKE_TAG: u8 = 2;
+const CREATE_PERSON_TAG: u8 = 3;
+const ATTACH_PERSON_TAG: u8 = 4;
+const ADD_AGENT_KEY_TAG: u8 = 5;
+const REMOVE_AGENT_KEY_TAG: u8 = 6;
 const MEMBER_ACCESS: u8 = 1;
 const DOMAIN: &str = "teamarness.membership-operation/v1";
+/// The Agent key signs this domain over `workspace || person_group || steward`
+/// to prove possession and bind itself to one Person's group.
+const AGENT_KEY_PROOF_DOMAIN: &str = "teamarness.agent-key-proof/v1";
 const MAX_DEPENDENCIES: usize = 64;
 const MAX_ADMISSION_PROOF_BYTES: usize = 1_024;
 const MAX_UNSIGNED_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_ENVELOPE_BYTES: usize = 4 + MAX_UNSIGNED_BYTES + 32 + 64;
+/// A `create person` operation with one dependency has this exact canonical
+/// width: header (1 + 1 + 16 + 1 + 32 + 8), action tag, dependency count and
+/// one dependency, then the identifier and signature.
+pub(crate) const CREATE_PERSON_ENVELOPE_BYTES: usize = 4 + (59 + 1 + 1 + 32 + 2 + 32) + 32 + 64;
 
 #[derive(Clone)]
 pub(crate) struct AdmissionProof {
     pub(crate) claim: VerifiedInvitationClaim,
 }
 
+/// Proof that the Agent key is held by whoever adds it: the Agent key signs the
+/// Workspace, the Person group it joins, and the Steward key that adds it.
+#[derive(Clone)]
+pub(crate) struct AgentKeyProof {
+    signature: Signature,
+}
+
+impl AgentKeyProof {
+    pub(crate) fn sign(
+        agent_secret: &SecretKey,
+        workspace_id: WorkspaceId,
+        group: MembershipOperationId,
+        steward: PublicIdentity,
+    ) -> Result<Self, MembershipError> {
+        let payload = Self::payload(workspace_id, group, steward);
+        let signature = crate::identity::sign(agent_secret, AGENT_KEY_PROOF_DOMAIN, &payload)
+            .map_err(|_| MembershipError::InvalidAdmissionProof)?;
+        Ok(Self { signature })
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; 64]) -> Self {
+        Self {
+            signature: Signature::from_bytes(&bytes),
+        }
+    }
+
+    pub(crate) fn to_bytes(&self) -> [u8; 64] {
+        self.signature.to_bytes()
+    }
+
+    pub(crate) fn verify(
+        &self,
+        agent: PublicIdentity,
+        workspace_id: WorkspaceId,
+        group: MembershipOperationId,
+        steward: PublicIdentity,
+    ) -> Result<(), MembershipError> {
+        let payload = Self::payload(workspace_id, group, steward);
+        crate::identity::verify(
+            agent.as_public_key(),
+            AGENT_KEY_PROOF_DOMAIN,
+            &payload,
+            &self.signature,
+        )
+        .map_err(|_| MembershipError::InvalidAdmissionProof)
+    }
+
+    fn payload(
+        workspace_id: WorkspaceId,
+        group: MembershipOperationId,
+        steward: PublicIdentity,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16 + 32 + 32);
+        bytes.extend_from_slice(workspace_id.as_bytes());
+        bytes.extend_from_slice(group.as_bytes());
+        bytes.extend_from_slice(steward.as_bytes());
+        bytes
+    }
+}
+
+/// One membership action. Workspace-group actions (`Create`, `Admit`,
+/// `AttachPerson`, `Revoke`) need manage authority on the Workspace group;
+/// Person-group actions (`CreatePerson`, `AddAgentKey`, `RemoveAgentKey`) are
+/// authored by the Person's own Installation key inside its key group.
 #[derive(Clone)]
 pub(crate) enum MembershipAction {
     Create,
+    /// Adds the invitee's Person group, carried in the claim, to the Workspace.
     Admit {
         target: PublicIdentity,
         proof: Box<AdmissionProof>,
     },
+    /// Removes the Person group `group`, whose Installation key is `target`.
     Revoke {
         target: PublicIdentity,
+        group: MembershipOperationId,
     },
+    /// Creates the author's own key group; the group is this operation's ID.
+    CreatePerson {
+        creator: PublicIdentity,
+    },
+    /// Adds the creator's own Person group to the Workspace beside genesis.
+    AttachPerson {
+        group: MembershipOperationId,
+    },
+    /// Adds an Agent key to the author's Person group with its proof of possession.
+    AddAgentKey {
+        group: MembershipOperationId,
+        agent: PublicIdentity,
+        proof: AgentKeyProof,
+    },
+    /// Removes an Agent key from the author's Person group.
+    RemoveAgentKey {
+        group: MembershipOperationId,
+        agent: PublicIdentity,
+    },
+}
+
+impl MembershipAction {
+    /// The key whose membership this action changes, if any.
+    pub(crate) fn subject(&self) -> Option<PublicIdentity> {
+        match self {
+            Self::Create | Self::CreatePerson { .. } | Self::AttachPerson { .. } => None,
+            Self::Admit { target, .. } | Self::Revoke { target, .. } => Some(*target),
+            Self::AddAgentKey { agent, .. } | Self::RemoveAgentKey { agent, .. } => Some(*agent),
+        }
+    }
+
+    /// Whether this action changes who is a current Member.
+    pub(crate) fn changes_roster(&self) -> bool {
+        matches!(
+            self,
+            Self::Admit { .. }
+                | Self::Revoke { .. }
+                | Self::AddAgentKey { .. }
+                | Self::RemoveAgentKey { .. }
+        )
+    }
+
+    /// Field-level equality, used to confirm a parsed copy against its bytes.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Create, Self::Create) => true,
+            (Self::CreatePerson { creator: left }, Self::CreatePerson { creator: right }) => {
+                left == right
+            }
+            (
+                Self::Admit {
+                    target: left_target,
+                    proof: left_proof,
+                },
+                Self::Admit {
+                    target: right_target,
+                    proof: right_proof,
+                },
+            ) => left_target == right_target && left_proof.claim.bytes == right_proof.claim.bytes,
+            (
+                Self::Revoke {
+                    target: left_target,
+                    group: left_group,
+                },
+                Self::Revoke {
+                    target: right_target,
+                    group: right_group,
+                },
+            ) => left_target == right_target && left_group == right_group,
+            (Self::AttachPerson { group: left }, Self::AttachPerson { group: right }) => {
+                left == right
+            }
+            (
+                Self::AddAgentKey {
+                    group: left_group,
+                    agent: left_agent,
+                    proof: left_proof,
+                },
+                Self::AddAgentKey {
+                    group: right_group,
+                    agent: right_agent,
+                    proof: right_proof,
+                },
+            ) => {
+                left_group == right_group
+                    && left_agent == right_agent
+                    && left_proof.to_bytes() == right_proof.to_bytes()
+            }
+            (
+                Self::RemoveAgentKey {
+                    group: left_group,
+                    agent: left_agent,
+                },
+                Self::RemoveAgentKey {
+                    group: right_group,
+                    agent: right_agent,
+                },
+            ) => left_group == right_group && left_agent == right_agent,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -111,13 +290,27 @@ impl MembershipEnvelope {
         }
         crate::identity::verify(author.as_public_key(), DOMAIN, &unsigned_bytes, &signature)
             .map_err(|_| MembershipError::InvalidSignature)?;
-        if let MembershipAction::Admit { target, proof } = &action {
-            if proof.claim.invitee != *target {
-                return Err(MembershipError::AdmissionTargetMismatch);
+        match &action {
+            MembershipAction::Admit { target, proof } => {
+                if proof.claim.invitee != *target {
+                    return Err(MembershipError::AdmissionTargetMismatch);
+                }
+                if proof.claim.token.workspace_id != workspace_id
+                    || proof.claim.create_person.workspace_id != workspace_id
+                {
+                    return Err(MembershipError::MalformedAction);
+                }
             }
-            if proof.claim.token.workspace_id != workspace_id {
-                return Err(MembershipError::MalformedAction);
+            MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof,
+            } => {
+                // The proof binds the Agent key to this Workspace, this group
+                // and this Steward before any authority is considered.
+                proof.verify(*agent, workspace_id, *group, author)?;
             }
+            _ => {}
         }
         Ok(Self {
             workspace_id,
@@ -169,10 +362,43 @@ fn encode_unsigned(
             bytes.extend_from_slice(&(proof.claim.bytes.len() as u16).to_be_bytes());
             bytes.extend_from_slice(&proof.claim.bytes);
         }
-        MembershipAction::Revoke { target } => {
+        MembershipAction::Revoke { target, group } => {
             bytes.push(REVOKE_TAG);
             bytes.push(INSTALLATION_TAG);
             bytes.extend_from_slice(target.as_bytes());
+            bytes.push(PERSON_GROUP_TAG);
+            bytes.extend_from_slice(group.as_bytes());
+        }
+        MembershipAction::CreatePerson { creator } => {
+            bytes.push(CREATE_PERSON_TAG);
+            bytes.push(INSTALLATION_TAG);
+            bytes.extend_from_slice(creator.as_bytes());
+        }
+        MembershipAction::AttachPerson { group } => {
+            bytes.push(ATTACH_PERSON_TAG);
+            bytes.push(PERSON_GROUP_TAG);
+            bytes.extend_from_slice(group.as_bytes());
+            bytes.push(MEMBER_ACCESS);
+        }
+        MembershipAction::AddAgentKey {
+            group,
+            agent,
+            proof,
+        } => {
+            bytes.push(ADD_AGENT_KEY_TAG);
+            bytes.push(PERSON_GROUP_TAG);
+            bytes.extend_from_slice(group.as_bytes());
+            bytes.push(INSTALLATION_TAG);
+            bytes.extend_from_slice(agent.as_bytes());
+            bytes.push(MEMBER_ACCESS);
+            bytes.extend_from_slice(&proof.to_bytes());
+        }
+        MembershipAction::RemoveAgentKey { group, agent } => {
+            bytes.push(REMOVE_AGENT_KEY_TAG);
+            bytes.push(PERSON_GROUP_TAG);
+            bytes.extend_from_slice(group.as_bytes());
+            bytes.push(INSTALLATION_TAG);
+            bytes.extend_from_slice(agent.as_bytes());
         }
     }
     bytes.extend_from_slice(&(dependencies.len() as u16).to_be_bytes());
@@ -217,11 +443,7 @@ fn decode_unsigned(
     let action = match reader.byte()? {
         CREATE_TAG => MembershipAction::Create,
         ADMIT_TAG => {
-            if reader.byte()? != INSTALLATION_TAG {
-                return Err(MembershipError::InvalidRole);
-            }
-            let target = PublicIdentity::from_bytes(reader.array()?)
-                .map_err(|_| MembershipError::MalformedAction)?;
+            let target = reader.installation()?;
             if reader.byte()? != MEMBER_ACCESS {
                 return Err(MembershipError::MalformedAction);
             }
@@ -237,12 +459,37 @@ fn decode_unsigned(
             }
         }
         REVOKE_TAG => {
-            if reader.byte()? != INSTALLATION_TAG {
-                return Err(MembershipError::InvalidRole);
+            let target = reader.installation()?;
+            let group = reader.person_group()?;
+            MembershipAction::Revoke { target, group }
+        }
+        CREATE_PERSON_TAG => MembershipAction::CreatePerson {
+            creator: reader.installation()?,
+        },
+        ATTACH_PERSON_TAG => {
+            let group = reader.person_group()?;
+            if reader.byte()? != MEMBER_ACCESS {
+                return Err(MembershipError::MalformedAction);
             }
-            let target = PublicIdentity::from_bytes(reader.array()?)
-                .map_err(|_| MembershipError::MalformedAction)?;
-            MembershipAction::Revoke { target }
+            MembershipAction::AttachPerson { group }
+        }
+        ADD_AGENT_KEY_TAG => {
+            let group = reader.person_group()?;
+            let agent = reader.installation()?;
+            if reader.byte()? != MEMBER_ACCESS {
+                return Err(MembershipError::MalformedAction);
+            }
+            let proof = AgentKeyProof::from_bytes(reader.array()?);
+            MembershipAction::AddAgentKey {
+                group,
+                agent,
+                proof,
+            }
+        }
+        REMOVE_AGENT_KEY_TAG => {
+            let group = reader.person_group()?;
+            let agent = reader.installation()?;
+            MembershipAction::RemoveAgentKey { group, agent }
         }
         _ => return Err(MembershipError::MalformedAction),
     };
@@ -306,6 +553,24 @@ impl<'a> Reader<'a> {
         self.0.take(length).ok_or(MembershipError::MalformedAction)
     }
 
+    /// A tagged Installation key.
+    fn installation(&mut self) -> Result<PublicIdentity, MembershipError> {
+        if self.byte()? != INSTALLATION_TAG {
+            return Err(MembershipError::InvalidRole);
+        }
+        PublicIdentity::from_bytes(self.array()?).map_err(|_| MembershipError::MalformedAction)
+    }
+
+    /// A tagged Person group identifier.
+    fn person_group(&mut self) -> Result<MembershipOperationId, MembershipError> {
+        if self.byte()? != PERSON_GROUP_TAG {
+            return Err(MembershipError::InvalidRole);
+        }
+        Ok(MembershipOperationId::from_hash(Hash::from_bytes(
+            self.array()?,
+        )))
+    }
+
     const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -322,6 +587,10 @@ mod tests {
 
     fn secret(byte: u8) -> SecretKey {
         SecretKey::from_bytes(&[byte; 32])
+    }
+
+    fn identity(byte: u8) -> PublicIdentity {
+        PublicIdentity::from_bytes(*secret(byte).public().as_bytes()).unwrap()
     }
 
     use crate::encoding::hex_encode as hex;
@@ -359,6 +628,24 @@ mod tests {
         assert_eq!(
             hex(envelope.canonical_bytes()),
             "0000007e01020505050505050505050505050505050501ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c000000000000002a00000210e5cf3d3c8a4f9f3468c8cc58eea84892a22fdadbc1acb22410190044c1d55317762fddd969a453925d65717ac3eea21320b66b54342fde15128d6caf21215f3aa8a2aad82029a0ed923a103cfe2512a694d3fb2596bfdd0b2653dca120bc4eb427746d74a3f2543710173899733a358082ba89c2366a4ccb6d52382782a0e4e521c20399c77505f95b7b5df70614f4ea1e3c6a7b87ef3a357c5398e79f0b00"
+        );
+    }
+
+    #[test]
+    fn create_person_with_one_dependency_has_the_declared_fixed_width() {
+        let envelope = MembershipEnvelope::sign(
+            &secret(4),
+            WorkspaceId::from_bytes([5; 16]),
+            42,
+            MembershipAction::CreatePerson {
+                creator: identity(4),
+            },
+            vec![MembershipOperationId::digest(b"genesis")],
+        )
+        .unwrap();
+        assert_eq!(
+            envelope.canonical_bytes().len(),
+            CREATE_PERSON_ENVELOPE_BYTES
         );
     }
 
@@ -430,37 +717,32 @@ mod tests {
 
     #[test]
     fn admit_requires_a_complete_authenticated_target_bound_proof() {
-        let token = sign_token(
-            &secret(7),
-            WorkspaceId::from_bytes([3; 16]),
-            1_000,
-            2_000,
-            [9; 32],
-        )
-        .unwrap();
-        let claim = sign_claim(&secret(8), &token).unwrap();
+        let workspace = WorkspaceId::from_bytes([3; 16]);
+        let genesis = MembershipOperationId::digest(b"genesis");
+        let token = sign_token(&secret(7), workspace, 1_000, 2_000, [9; 32]).unwrap();
+        let claim = sign_claim(&secret(8), &token, genesis).unwrap();
         let target = claim.invitee;
         let proof = Box::new(AdmissionProof { claim });
         let envelope = MembershipEnvelope::sign(
             &secret(7),
-            WorkspaceId::from_bytes([3; 16]),
+            workspace,
             1_100,
             MembershipAction::Admit { target, proof },
-            vec![MembershipOperationId::digest(b"genesis")],
+            vec![genesis],
         )
         .unwrap();
         assert!(matches!(
             MembershipEnvelope::decode(envelope.canonical_bytes()).unwrap().action,
             MembershipAction::Admit { target: decoded, .. } if decoded == target
         ));
-        let other = PublicIdentity::from_bytes(*secret(9).public().as_bytes()).unwrap();
+        let other = identity(9);
         let proof = Box::new(AdmissionProof {
-            claim: sign_claim(&secret(8), &token).unwrap(),
+            claim: sign_claim(&secret(8), &token, genesis).unwrap(),
         });
         assert!(matches!(
             MembershipEnvelope::sign(
                 &secret(7),
-                WorkspaceId::from_bytes([3; 16]),
+                workspace,
                 1_100,
                 MembershipAction::Admit {
                     target: other,
@@ -473,14 +755,98 @@ mod tests {
     }
 
     #[test]
+    fn add_agent_key_verifies_the_agent_proof_against_workspace_group_and_steward() {
+        let workspace = WorkspaceId::from_bytes([3; 16]);
+        let group = MembershipOperationId::digest(b"group");
+        let steward = secret(7);
+        let agent = secret(21);
+        let proof = AgentKeyProof::sign(&agent, workspace, group, identity(7)).unwrap();
+        let envelope = MembershipEnvelope::sign(
+            &steward,
+            workspace,
+            1_100,
+            MembershipAction::AddAgentKey {
+                group,
+                agent: identity(21),
+                proof: proof.clone(),
+            },
+            vec![group],
+        )
+        .unwrap();
+        let decoded = MembershipEnvelope::decode(envelope.canonical_bytes()).unwrap();
+        assert!(decoded.action.same_as(&envelope.action));
+        assert_eq!(decoded.action.subject(), Some(identity(21)));
+
+        // The same proof under another steward, workspace, group or agent key fails.
+        let other_steward = secret(8);
+        assert!(matches!(
+            MembershipEnvelope::sign(
+                &other_steward,
+                workspace,
+                1_100,
+                MembershipAction::AddAgentKey {
+                    group,
+                    agent: identity(21),
+                    proof: proof.clone(),
+                },
+                vec![group],
+            ),
+            Err(MembershipError::InvalidAdmissionProof)
+        ));
+        assert!(matches!(
+            MembershipEnvelope::sign(
+                &steward,
+                WorkspaceId::from_bytes([4; 16]),
+                1_100,
+                MembershipAction::AddAgentKey {
+                    group,
+                    agent: identity(21),
+                    proof: proof.clone(),
+                },
+                vec![group],
+            ),
+            Err(MembershipError::InvalidAdmissionProof)
+        ));
+        assert!(matches!(
+            MembershipEnvelope::sign(
+                &steward,
+                workspace,
+                1_100,
+                MembershipAction::AddAgentKey {
+                    group: MembershipOperationId::digest(b"other group"),
+                    agent: identity(21),
+                    proof: proof.clone(),
+                },
+                vec![group],
+            ),
+            Err(MembershipError::InvalidAdmissionProof)
+        ));
+        assert!(matches!(
+            MembershipEnvelope::sign(
+                &steward,
+                workspace,
+                1_100,
+                MembershipAction::AddAgentKey {
+                    group,
+                    agent: identity(22),
+                    proof,
+                },
+                vec![group],
+            ),
+            Err(MembershipError::InvalidAdmissionProof)
+        ));
+    }
+
+    #[test]
     fn bounded_generated_envelopes_round_trip_and_reject_malformed_bytes() {
         for seed in 1_u8..=24 {
-            let dependencies = (0..usize::from(seed % 5))
+            let dependencies: Vec<_> = (0..usize::from(seed % 5))
                 .map(|index| MembershipOperationId::digest([seed, index as u8]))
                 .collect();
             let workspace_id = WorkspaceId::from_bytes([seed; 16]);
             let authored_at_unix_ms = i64::from(seed) * 1_000;
-            let action = match seed % 3 {
+            let group = MembershipOperationId::digest([seed, 99]);
+            let action = match seed % 7 {
                 0 => MembershipAction::Create,
                 1 => {
                     let token = sign_token(
@@ -491,17 +857,40 @@ mod tests {
                         [seed; 32],
                     )
                     .unwrap();
-                    let claim = sign_claim(&secret(seed + 32), &token).unwrap();
+                    let claim = sign_claim(
+                        &secret(seed + 32),
+                        &token,
+                        MembershipOperationId::digest([seed, 98]),
+                    )
+                    .unwrap();
                     MembershipAction::Admit {
                         target: claim.invitee,
                         proof: Box::new(AdmissionProof { claim }),
                     }
                 }
-                _ => {
-                    let target =
-                        PublicIdentity::from_bytes(*secret(seed + 32).public().as_bytes()).unwrap();
-                    MembershipAction::Revoke { target }
-                }
+                2 => MembershipAction::Revoke {
+                    target: identity(seed + 32),
+                    group,
+                },
+                3 => MembershipAction::CreatePerson {
+                    creator: identity(seed),
+                },
+                4 => MembershipAction::AttachPerson { group },
+                5 => MembershipAction::AddAgentKey {
+                    group,
+                    agent: identity(seed + 64),
+                    proof: AgentKeyProof::sign(
+                        &secret(seed + 64),
+                        workspace_id,
+                        group,
+                        identity(seed),
+                    )
+                    .unwrap(),
+                },
+                _ => MembershipAction::RemoveAgentKey {
+                    group,
+                    agent: identity(seed + 64),
+                },
             };
             let envelope = MembershipEnvelope::sign(
                 &secret(seed),
@@ -518,6 +907,7 @@ mod tests {
                 envelope.canonical_unsigned_bytes()
             );
             assert_eq!(decoded.id, envelope.id);
+            assert!(decoded.action.same_as(&envelope.action));
 
             let canonical = envelope.canonical_bytes();
             for offset in (0..canonical.len()).step_by((canonical.len() / 13).max(1)) {

@@ -1,4 +1,4 @@
-import { authorLabel, renderMarkdown } from "./markdown";
+import { authorLabel, renderMarkdown, shortenedIdentity } from "./markdown";
 import type { ConversationsController, ControllerState } from "./controller";
 
 const KIT_CLASS = {
@@ -38,7 +38,7 @@ export class ConversationsView {
   private inputRevision = 0;
   private renderedChannelId: string | null = null;
   private renderedMessages: ControllerState["messages"] | null = null;
-  private renderedNames: ControllerState["names"] | null = null;
+  private renderedPrincipals: ControllerState["principals"] | null = null;
   private renderedOldestId: string | null = null;
   private fillTimer: ReturnType<typeof setTimeout> | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -498,9 +498,9 @@ export class ConversationsView {
 
   private renderHistory(state: ControllerState): void {
     if (this.renderedChannelId === state.selectedChannelId && this.renderedMessages === state.messages
-      && this.renderedNames === state.names) return;
+      && this.renderedPrincipals === state.principals) return;
     this.renderedMessages = state.messages;
-    this.renderedNames = state.names;
+    this.renderedPrincipals = state.principals;
     // Messages read oldest at the top, newest at the bottom, and a Channel opens at the newest
     // one (TEAM.SYS.CONV-R08). Once a Member scrolls up, their position is kept.
     const openedChannel = state.selectedChannelId !== this.renderedChannelId;
@@ -545,10 +545,10 @@ export class ConversationsView {
 
     for (const row of previousRows) this.resizeObserver?.unobserve(row);
     this.history.replaceChildren();
-    const names = new Map(state.names.persons.map(person => [person.identity, person.name]));
+    const principals = new Map(state.principals.principals.map(principal => [principal.identity, principal]));
     const counts = new Map<string, number>();
-    for (const person of state.names.persons) {
-      if (person.name) counts.set(person.name, (counts.get(person.name) ?? 0) + 1);
+    for (const principal of state.principals.principals) {
+      if (principal.name) counts.set(principal.name, (counts.get(principal.name) ?? 0) + 1);
     }
     let previousLocal = false;
     for (const message of state.messages) {
@@ -562,7 +562,8 @@ export class ConversationsView {
       const author = document.createElement("button");
       author.type = "button";
       author.className = "message-author";
-      const name = names.get(message.author);
+      const principal = principals.get(message.author);
+      const name = principal?.name;
       author.textContent = authorLabel(message.author, undefined, message.isLocal,
         name, name !== null && name !== undefined && (counts.get(name) ?? 0) > 1);
       author.title = message.author;
@@ -574,11 +575,24 @@ export class ConversationsView {
         author.textContent = message.author;
       });
 
+      row.append(author);
+      if (!message.isLocal && principal?.kind === "agent") {
+        const indicator = document.createElement("span");
+        indicator.className = "message-agent-indicator";
+        indicator.textContent = "Agent";
+        const steward = state.principals.principals.find(candidate =>
+          candidate.kind === "person" && candidate.principalId === principal.stewardPrincipalId);
+        const stewardLabel = document.createElement("span");
+        stewardLabel.className = "message-agent-steward";
+        stewardLabel.textContent = `stewarded by ${steward?.name || shortenedIdentity(steward?.identity ?? principal.stewardPrincipalId ?? message.author)}`;
+        row.append(indicator, stewardLabel);
+      }
+
       const body = document.createElement("div");
       body.className = "message-markdown";
       body.innerHTML = renderMarkdown(message.markdown);
 
-      row.append(author, body);
+      row.append(body);
       this.history.append(row);
       this.resizeObserver?.observe(row);
       if (message.id === focusedAuthorId) author.focus({ preventScroll: true });

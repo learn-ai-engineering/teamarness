@@ -23,8 +23,8 @@ pub(crate) const MAX_REPLICATION_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) enum Disclosure {
     /// A current Member receives every accepted operation it lacks.
     CurrentMember(Vec<Vec<u8>>),
-    /// A former Member receives only the causal closure of the revocations
-    /// that target it, so it can learn and replay its own revocation.
+    /// A former Person receives only the causal closure of its revocations
+    /// and conflict-establishing claims, so it can replay its loss of access.
     FormerMember(Vec<Vec<u8>>),
     /// A peer with no membership history receives nothing at all.
     None,
@@ -127,7 +127,7 @@ pub(crate) fn disclosure(
     peer: PublicIdentity,
     peer_has: &BTreeSet<MembershipOperationId>,
 ) -> Result<Disclosure, MembershipError> {
-    if projection.contains_member(peer) {
+    if projection.contains_installation_member(peer) {
         let subset = projection
             .operations
             .keys()
@@ -138,8 +138,8 @@ pub(crate) fn disclosure(
             projection, &subset,
         )?));
     }
-    if projection.has_membership_history(peer) {
-        let subset = revocation_closure(projection, peer)
+    if projection.has_person_history(peer) {
+        let subset = former_person_closure(projection, peer)
             .into_iter()
             .filter(|id| !peer_has.contains(id))
             .collect();
@@ -150,17 +150,23 @@ pub(crate) fn disclosure(
     Ok(Disclosure::None)
 }
 
-/// Every `Revoke` of `peer` together with its transitive dependencies.
-fn revocation_closure(
+/// Only claims needed to establish the loss of an admitted Person's access,
+/// plus their transitive dependencies. A revoked Person needs its revocation,
+/// not an independent Agent claim made after the revocation.
+fn former_person_closure(
     projection: &WorkspaceProjection,
     peer: PublicIdentity,
 ) -> BTreeSet<MembershipOperationId> {
     let mut closure = BTreeSet::new();
+    let unrevoked_conflict = projection.has_unrevoked_person_conflict(peer);
     let mut pending = projection
         .operations
         .iter()
         .filter(|(_, operation)| {
-            matches!(&operation.action, MembershipAction::Revoke { target } if *target == peer)
+            matches!(&operation.action, MembershipAction::Revoke { target, .. } if *target == peer)
+                || (unrevoked_conflict
+                    && (matches!(&operation.action, MembershipAction::AddAgentKey { agent, .. } if *agent == peer)
+                        || matches!(&operation.action, MembershipAction::Admit { target, .. } if *target == peer)))
         })
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
@@ -240,8 +246,12 @@ mod tests {
             [target; 32],
         )
         .expect("a test invitation token signs");
-        let claim = crate::invitation::sign_claim(&SecretKey::from_bytes(&[target; 32]), &token)
-            .expect("a test invitation claim signs");
+        let claim = crate::invitation::sign_claim(
+            &SecretKey::from_bytes(&[target; 32]),
+            &token,
+            MembershipOperationId::digest(b"genesis"),
+        )
+        .expect("a test invitation claim signs");
         envelope(
             author,
             MembershipAction::Admit {
@@ -269,6 +279,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(2),
+                group: id(2),
             },
             vec![genesis.id],
         );
@@ -276,6 +287,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(3),
+                group: id(3),
             },
             vec![genesis.id],
         );
@@ -283,6 +295,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(4),
+                group: id(4),
             },
             vec![left.id, right.id],
         );
@@ -325,6 +338,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(2),
+                group: id(2),
             },
             vec![genesis.id],
         );
@@ -356,6 +370,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(9),
+                group: id(9),
             },
             vec![genesis.id],
         );
@@ -380,6 +395,7 @@ mod tests {
             1,
             MembershipAction::Revoke {
                 target: identity(2),
+                group: id(2),
             },
             vec![admitted.id],
         );

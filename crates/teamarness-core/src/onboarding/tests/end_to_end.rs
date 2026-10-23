@@ -169,7 +169,7 @@ async fn retry_after_expiry_imports_later_current_state_but_refuses_a_revoked_in
     let workspace = issuer.create_workspace("Current completion").unwrap();
     let now = now_unix_ms();
     let first_invitation = issuer
-        .create_workspace_invitation_for_test(workspace.id(), now, now + 25)
+        .create_workspace_invitation_for_test(workspace.id(), now, now + 200)
         .unwrap();
     let first_claim = first
         .create_claim_for_invitation_test(&first_invitation)
@@ -184,7 +184,7 @@ async fn retry_after_expiry_imports_later_current_state_but_refuses_a_revoked_in
         .unwrap();
     second.join_workspace(&second_invitation).await.unwrap();
     // negative-wait: waits past the first invitation's wall-clock expiry.
-    std::thread::sleep(Duration::from_millis(35));
+    std::thread::sleep(Duration::from_millis(250));
 
     let (_, first_snapshot) = first.join_workspace(&first_invitation).await.unwrap();
     let current = issuer.membership_snapshot(workspace.id()).unwrap();
@@ -288,6 +288,7 @@ async fn every_precommit_rejection_leaves_no_false_local_join() {
     let decoy_address = decoy.endpoint_address_for_test();
     let wrong_peer_invitation = WorkspaceInvitation::from_parts(
         &verified.token,
+        verified.genesis_id,
         EndpointAddr::from_parts(verified.endpoint_addr.id, decoy_address.addrs),
     )
     .unwrap();

@@ -16,30 +16,13 @@ pub(crate) fn authenticate_canonical_copy(
     envelope: &MembershipEnvelope,
 ) -> Result<(), MembershipError> {
     let authenticated = authenticate(envelope.canonical_bytes())?;
-    let action_matches = match (&authenticated.action, &envelope.action) {
-        (MembershipAction::Create, MembershipAction::Create) => true,
-        (
-            MembershipAction::Admit {
-                target: left_target,
-                proof: left_proof,
-            },
-            MembershipAction::Admit {
-                target: right_target,
-                proof: right_proof,
-            },
-        ) => left_target == right_target && left_proof.claim.bytes == right_proof.claim.bytes,
-        (MembershipAction::Revoke { target: left }, MembershipAction::Revoke { target: right }) => {
-            left == right
-        }
-        _ => false,
-    };
     if authenticated.id != envelope.id
         || authenticated.workspace_id != envelope.workspace_id
         || authenticated.author != envelope.author
         || authenticated.authored_at_unix_ms != envelope.authored_at_unix_ms
         || authenticated.dependencies != envelope.dependencies
         || authenticated.signature.to_bytes() != envelope.signature.to_bytes()
-        || !action_matches
+        || !authenticated.action.same_as(&envelope.action)
     {
         return Err(MembershipError::ContentHashMismatch);
     }

@@ -4,11 +4,14 @@ use std::str::FromStr;
 use iroh_base::EndpointAddr;
 use iroh_tickets::endpoint::EndpointTicket;
 
+use crate::MembershipOperationId;
 use crate::error::ValueParseError;
 use crate::invitation::{InvitationToken, VerifiedInvitationToken};
 
 const PREFIX: &str = "teamarness-workspace-v1.";
-const VERSION: u8 = 1;
+/// Payload version 2 adds the Workspace genesis identifier after the token, so
+/// the joiner can anchor its own `create person` operation before it connects.
+const VERSION: u8 = 2;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 const MAX_TICKET_BYTES: usize = 3 * 1024;
@@ -21,6 +24,9 @@ pub struct WorkspaceInvitation(String);
 #[derive(Clone)]
 pub(crate) struct VerifiedWorkspaceInvitation {
     pub(crate) token: VerifiedInvitationToken,
+    /// Unauthenticated until the bootstrap arrives; a wrong value only makes
+    /// the issuer refuse the claim's group create.
+    pub(crate) genesis_id: MembershipOperationId,
     pub(crate) endpoint_addr: EndpointAddr,
 }
 
@@ -33,10 +39,11 @@ impl WorkspaceInvitation {
 
     pub(crate) fn from_parts(
         token: &VerifiedInvitationToken,
+        genesis_id: MembershipOperationId,
         endpoint_addr: EndpointAddr,
     ) -> Result<Self, ValueParseError> {
         let ticket = EndpointTicket::new(endpoint_addr).to_string();
-        let payload = encode_payload(token, &ticket)?;
+        let payload = encode_payload(token, genesis_id, &ticket)?;
         let value = format!("{PREFIX}{}", encode_hex(&payload));
         Self::from_str(&value)
     }
@@ -63,14 +70,16 @@ impl FromStr for WorkspaceInvitation {
 
 fn encode_payload(
     token: &VerifiedInvitationToken,
+    genesis_id: MembershipOperationId,
     ticket: &str,
 ) -> Result<Vec<u8>, ValueParseError> {
     let token_len = u16::try_from(token.bytes.len()).map_err(|_| invalid())?;
     let ticket_len = u16::try_from(ticket.len()).map_err(|_| invalid())?;
-    let mut payload = Vec::with_capacity(1 + 2 + token.bytes.len() + 2 + ticket.len());
+    let mut payload = Vec::with_capacity(1 + 2 + token.bytes.len() + 32 + 2 + ticket.len());
     payload.push(VERSION);
     payload.extend_from_slice(&token_len.to_be_bytes());
     payload.extend_from_slice(&token.bytes);
+    payload.extend_from_slice(genesis_id.as_bytes());
     payload.extend_from_slice(&ticket_len.to_be_bytes());
     payload.extend_from_slice(ticket.as_bytes());
     if payload.len() > MAX_PAYLOAD_BYTES {
@@ -99,6 +108,9 @@ fn decode_transfer(value: &str) -> Result<VerifiedWorkspaceInvitation, ValuePars
         .map_err(|_| invalid())?
         .verified()
         .map_err(|_| invalid())?;
+    let genesis_id = MembershipOperationId::from_hash(p2panda_core::Hash::from_bytes(copy_array(
+        cursor.read(32)?,
+    )));
 
     let ticket_len = usize::from(cursor.read_u16()?);
     if ticket_len > MAX_TICKET_BYTES {
@@ -125,6 +137,7 @@ fn decode_transfer(value: &str) -> Result<VerifiedWorkspaceInvitation, ValuePars
 
     Ok(VerifiedWorkspaceInvitation {
         token,
+        genesis_id,
         endpoint_addr: endpoint_addr.clone(),
     })
 }

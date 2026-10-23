@@ -790,6 +790,7 @@ pub enum SynchronizationError {
     WorkspaceNotFound,
     NotCurrentMember,
     RevokedMember,
+    PrincipalNotBound,
     InvalidInput,
     WrongScope,
     ContentKeyUnavailable,
@@ -807,6 +808,7 @@ impl fmt::Display for SynchronizationError {
             Self::WorkspaceNotFound => "synchronization workspace was not found",
             Self::NotCurrentMember => "only a current workspace member may append",
             Self::RevokedMember => "a revoked workspace member may not append",
+            Self::PrincipalNotBound => "Principal is not bound to this Package Instance",
             Self::InvalidInput => "invalid immutable record input",
             Self::WrongScope => "sealed record belongs to another scope",
             Self::ContentKeyUnavailable => "the package content key has not been received yet",
@@ -843,14 +845,14 @@ impl From<StorageError> for SynchronizationError {
 
 // This exact scope is owned by Core, not by a Package Identity. Peer transport
 // must still accept it for current members; only external API entry points deny it.
-const PERSON_NAME_SCOPE: &str = "internal:teamarness.person-names";
+const PRINCIPALS_SCOPE: &str = "internal:teamarness.principals";
 
-pub(crate) const fn reserved_person_name_scope() -> &'static str {
-    PERSON_NAME_SCOPE
+pub(crate) const fn reserved_principals_scope() -> &'static str {
+    PRINCIPALS_SCOPE
 }
 
 pub(crate) fn is_reserved_record_scope(identity: &str) -> bool {
-    identity == reserved_person_name_scope()
+    identity == reserved_principals_scope()
 }
 
 pub(crate) fn scope_digest(package_identity: &str, workspace_id: WorkspaceId) -> [u8; 32] {
@@ -1364,6 +1366,33 @@ pub(crate) fn append(
     is_creator: bool,
     now_unix_ms: i64,
 ) -> Result<(ImmutableRecord, i64), SynchronizationError> {
+    append_with_signer(
+        conn,
+        secret,
+        secret,
+        workspace,
+        package,
+        purpose,
+        canonical,
+        standing,
+        is_creator,
+        now_unix_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_with_signer(
+    conn: &mut rusqlite::Connection,
+    secret: &SecretKey,
+    signer: &SecretKey,
+    workspace: WorkspaceId,
+    package: &str,
+    purpose: &str,
+    canonical: &[u8],
+    standing: MembershipStanding,
+    is_creator: bool,
+    now_unix_ms: i64,
+) -> Result<(ImmutableRecord, i64), SynchronizationError> {
     match standing {
         MembershipStanding::Current => {}
         // An Installation that was a Member and is not one now was revoked;
@@ -1374,7 +1403,7 @@ pub(crate) fn append(
     if quarantine::is_scope_quarantined(conn, scope_digest(package, workspace))? {
         return Err(SynchronizationError::ScopeQuarantined);
     }
-    let signed = SignedRecordV1::sign(secret, package, workspace, purpose, canonical)
+    let signed = SignedRecordV1::sign(signer, package, workspace, purpose, canonical)
         .map_err(|_| SynchronizationError::InvalidInput)?;
     let scope_exists = conn
         .query_row(
@@ -1457,7 +1486,7 @@ pub(crate) fn append(
     journal_sql::insert_operation(&tx, &row).map_err(fault!(storage_error()))?;
     operation_store::insert(
         &tx,
-        secret,
+        signer,
         scope,
         operation_id,
         record_id,

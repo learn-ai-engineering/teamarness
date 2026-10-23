@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "teamarness.synchronization.immutable-record-log/1.0",
+  "$id": "teamarness.synchronization.immutable-record-log/1.1",
   "title": "Immutable Record Log capability",
   "type": "object",
   "additionalProperties": false,
@@ -24,12 +24,13 @@
     "orderKey": { "type": "string", "pattern": "^[0-9a-f]{82}$" },
     "cursor": { "type": "string", "pattern": "^[0-9a-f]{50}$" },
     "identity": { "type": "string", "minLength": 1 },
+    "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "sealed": { "$ref": "#/$defs/base64url", "minLength": 1, "maxLength": 699051 },
     "append": {
       "type": "object", "additionalProperties": false,
       "required": ["request", "response"],
       "properties": {
-        "request": { "type": "object", "additionalProperties": false, "required": ["purpose", "canonical"], "properties": { "purpose": { "$ref": "#/$defs/purpose" }, "canonical": { "$ref": "#/$defs/base64url", "minLength": 1, "maxLength": 349526 } } },
+        "request": { "type": "object", "additionalProperties": false, "required": ["purpose", "canonical"], "properties": { "purpose": { "$ref": "#/$defs/purpose" }, "canonical": { "$ref": "#/$defs/base64url", "minLength": 1, "maxLength": 349526 }, "principal": { "$ref": "#/$defs/principalId" } } },
         "response": { "type": "object", "additionalProperties": false, "required": ["recordId", "orderKey", "author", "signature", "sealedRecord", "durability"], "properties": { "recordId": { "$ref": "#/$defs/recordId" }, "orderKey": { "$ref": "#/$defs/orderKey" }, "author": { "$ref": "#/$defs/identity" }, "signature": { "$ref": "#/$defs/base64url", "minLength": 1 }, "sealedRecord": { "$ref": "#/$defs/sealed" }, "durability": { "const": "committed" } } }
       }
     },

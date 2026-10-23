@@ -6,15 +6,18 @@ use teamarness_core::WorkspaceInvitation;
 
 const TOKEN: &str = "01020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03";
 const INVITER: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+/// The Workspace genesis identifier the joiner anchors its group create on.
+const GENESIS: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const TICKET: &str = "endpointadveu3dd4kofecv66vihwezoyx4zkr3wv27l464siipou2iui3jcyaqac5uhi5dqom5c6l3smvwgc6jomv4gc3lqnrss4lybab7qaaab4e6a";
-const GOLDEN: &str = "teamarness-workspace-v1.0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d030074656e64706f696e746164766575336464346b6f66656376363676696877657a6f7978347a6b7233777632376c343634736969706f7532697569336a637961716163357568693564716f6d3563366c33736d76776763366a6f6d76346763336c716e727373346c7962616237716161616234653661";
+const GOLDEN: &str = "teamarness-workspace-v1.0200c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d0311111111111111111111111111111111111111111111111111111111111111110074656e64706f696e746164766575336464346b6f66656376363676696877657a6f7978347a6b7233777632376c343634736969706f7532697569336a637961716163357568693564716f6d3563366c33736d76776763366a6f6d76346763336c716e727373346c7962616237716161616234653661";
 
 fn encode_transfer(token: &str, ticket: &str, suffix: &[u8]) -> String {
     let token = decode_hex(token);
     let mut payload = Vec::new();
-    payload.push(1);
+    payload.push(2);
     payload.extend_from_slice(&u16::try_from(token.len()).unwrap().to_be_bytes());
     payload.extend_from_slice(&token);
+    payload.extend_from_slice(&decode_hex(GENESIS));
     payload.extend_from_slice(&u16::try_from(ticket.len()).unwrap().to_be_bytes());
     payload.extend_from_slice(ticket.as_bytes());
     payload.extend_from_slice(suffix);
@@ -46,7 +49,7 @@ fn transfer_rejects_non_canonical_shape_versions_and_trailing_bytes() {
     assert!(WorkspaceInvitation::from_str(&encode_transfer(TOKEN, TICKET, &[0])).is_err());
 
     let mut unsupported = decode_hex(GOLDEN.strip_prefix("teamarness-workspace-v1.").unwrap());
-    unsupported[0] = 2;
+    unsupported[0] = 3;
     let unsupported = format!("teamarness-workspace-v1.{}", encode_hex(&unsupported));
     assert!(WorkspaceInvitation::from_str(&unsupported).is_err());
 
@@ -57,7 +60,7 @@ fn transfer_rejects_non_canonical_shape_versions_and_trailing_bytes() {
             .is_err()
     );
 
-    let ticket_length_offset = 1 + 2 + 196;
+    let ticket_length_offset = 1 + 2 + 196 + 32;
     let ticket_length = u16::try_from(TICKET.len()).unwrap();
     payload = decode_hex(GOLDEN.strip_prefix("teamarness-workspace-v1.").unwrap());
     payload[ticket_length_offset..ticket_length_offset + 2]
@@ -117,4 +120,81 @@ fn decode_hex(value: &str) -> Vec<u8> {
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Verifies: TEAM.SYS.MEM-R09. The joiner's claim carries its own group create;
+/// the issuer commits the group create and the admission together, ships both
+/// in the bootstrap, and a retry recovers the same admission without a second
+/// operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_carries_the_group_create_and_a_retry_recovers_the_same_admission() {
+    use std::fs;
+
+    use teamarness_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch, MembershipRole};
+
+    let root = std::env::temp_dir().join(format!(
+        "teamarness-core-join-group-create-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let issuer = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.join("issuer")))
+        .await
+        .unwrap();
+    let joiner = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.join("joiner")))
+        .await
+        .unwrap();
+    issuer.remember_loopback_peer_for_tests(&joiner);
+    joiner.remember_loopback_peer_for_tests(&issuer);
+    issuer.pause_sync_scheduler_for_tests(true);
+    joiner.pause_sync_scheduler_for_tests(true);
+    let workspace = issuer.create_workspace("Group join").unwrap().id();
+    // Genesis plus the creator's group create and attachment.
+    assert_eq!(
+        issuer
+            .export_membership_operations_for_tests(workspace)
+            .len(),
+        3
+    );
+    let invitation = issuer.create_workspace_invitation(workspace).await.unwrap();
+
+    let (_, joined) = joiner.join_workspace(&invitation).await.unwrap();
+    assert_eq!(joined.epoch(), MembershipEpoch::new(4));
+    assert_eq!(joined.members().len(), 2);
+    assert!(joined.members().iter().any(|member| {
+        member.identity() == joiner.public_identity() && member.role() == MembershipRole::Member
+    }));
+    // The bootstrap shipped the invitee's group create beside its admission.
+    let issuer_operations = issuer.export_membership_operations_for_tests(workspace);
+    assert_eq!(issuer_operations.len(), 5);
+    assert_eq!(
+        joiner.export_membership_operations_for_tests(workspace),
+        issuer_operations
+    );
+    let group = joiner
+        .person_group_for_tests(workspace, joiner.public_identity())
+        .expect("the joiner's key group is admitted");
+    assert_eq!(
+        issuer.person_group_for_tests(workspace, joiner.public_identity()),
+        Some(group)
+    );
+    assert_eq!(
+        issuer.membership_version(workspace).unwrap(),
+        joiner.membership_version(workspace).unwrap()
+    );
+
+    // An exact retry recovers the same admission: no new operation, same version.
+    let (_, retried) = joiner.join_workspace(&invitation).await.unwrap();
+    assert_eq!(retried, joined);
+    assert_eq!(
+        issuer
+            .export_membership_operations_for_tests(workspace)
+            .len(),
+        5
+    );
+
+    issuer.shutdown().await.unwrap();
+    joiner.shutdown().await.unwrap();
+    drop(issuer);
+    drop(joiner);
+    fs::remove_dir_all(root).unwrap();
 }

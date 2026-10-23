@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
+use teamarness_package_sdk::capabilities::principals::{PrincipalSnapshot, Principals};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
@@ -69,7 +69,7 @@ struct Session {
 pub struct ConversationsActive {
     store: ConversationStore,
     log: RecordLog,
-    names: PersonNames,
+    principals: Principals,
     sync: Arc<Mutex<SyncReport>>,
     changes: watch::Sender<u64>,
     /// The Installation this Package Instance belongs to, which decides who may hide a Channel.
@@ -162,11 +162,9 @@ pub(crate) fn router_observing(
             .await?;
             let log = RecordLog::from_initialization(&initialization, capabilities)
                 .map_err(|cause| capability_error("record-log", cause))?;
-            let names = PersonNames::from_initialization(
-                &initialization,
-                activation.capabilities().clone(),
-            )
-            .map_err(|cause| capability_error("person-names", cause))?;
+            let principals =
+                Principals::from_initialization(&initialization, activation.capabilities().clone())
+                    .map_err(|cause| capability_error("principals", cause))?;
             rehydrate(&store, &log, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
@@ -183,7 +181,7 @@ pub(crate) fn router_observing(
             Ok(ConversationsActive {
                 store,
                 log,
-                names,
+                principals,
                 sync,
                 changes,
                 installation: initialization.installation().identity.clone(),
@@ -299,16 +297,16 @@ pub(crate) fn router_observing(
         },
     )
     .subscription(
-        "conversations.names",
+        "conversations.principals",
         |context: Context<ConversationsActive>, _: Empty| async move {
             let (sender, subscription) = event_channel(4);
-            let names = context.state().names.clone();
+            let principals = context.state().principals.clone();
             tokio::spawn(async move {
                 loop {
-                    let mut cursor = match names.current().await {
+                    let mut cursor = match principals.current().await {
                         Ok(snapshot) => {
                             let cursor = snapshot.cursor;
-                            for event in name_snapshots(snapshot) {
+                            for event in principal_snapshots(snapshot) {
                                 if sender.send(event).await.is_err() {
                                     return;
                                 }
@@ -317,7 +315,9 @@ pub(crate) fn router_observing(
                         }
                         Err(_) => {
                             if sender
-                                .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                                .send(
+                                    json!({ "available": false, "cursor": "0", "principals": [] }),
+                                )
                                 .await
                                 .is_err()
                             {
@@ -327,7 +327,7 @@ pub(crate) fn router_observing(
                             continue;
                         }
                     };
-                    if let Ok(mut stream) = names.subscribe(cursor).await {
+                    if let Ok(mut stream) = principals.subscribe(cursor).await {
                         loop {
                             let result = tokio::select! {
                                 result = stream.next() => result,
@@ -340,7 +340,7 @@ pub(crate) fn router_observing(
                                 Some(Ok(snapshot)) => {
                                     if snapshot.cursor >= cursor {
                                         cursor = snapshot.cursor;
-                                        for event in name_snapshots(snapshot) {
+                                        for event in principal_snapshots(snapshot) {
                                             if sender.send(event).await.is_err() {
                                                 stream.close().await;
                                                 return;
@@ -354,7 +354,7 @@ pub(crate) fn router_observing(
                         stream.close().await;
                     }
                     if sender
-                        .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                        .send(json!({ "available": false, "cursor": "0", "principals": [] }))
                         .await
                         .is_err()
                     {
@@ -391,34 +391,39 @@ pub(crate) fn router_observing(
     )
 }
 
-fn name_snapshots(snapshot: PersonNameSnapshot) -> Vec<JsonValue> {
-    // The capability bounds the roster to 1,024 Persons and each name to 256 UTF-8 bytes.
-    // 64 entries leave ample room even for JSON-escaped names under both bridge limits.
-    const PERSONS_PER_EVENT: usize = 64;
-    let persons: Vec<_> = snapshot
-        .persons
+fn principal_snapshots(snapshot: PrincipalSnapshot) -> Vec<JsonValue> {
+    // Capability bounds the roster to 1,024 Principals and each name to 256 bytes.
+    // 64 entries fit the bridge budget even with JSON-escaped names.
+    const PRINCIPALS_PER_EVENT: usize = 64;
+    let principals: Vec<_> = snapshot
+        .principals
         .into_iter()
-        .map(|person| {
+        .map(|principal| {
             json!({
-                "identity": person.identity, "personId": person.person_id,
-                "name": person.name, "fingerprint": person.fingerprint,
+                "identity": principal.keys[0], "principalId": principal.principal_id,
+                "kind": match principal.kind {
+                    teamarness_package_sdk::capabilities::principals::PrincipalKind::Person => "person",
+                    teamarness_package_sdk::capabilities::principals::PrincipalKind::Agent => "agent",
+                },
+                "stewardPrincipalId": principal.steward_principal_id,
+                "name": principal.name, "fingerprint": principal.fingerprint,
             })
         })
         .collect();
-    let parts = persons.len().max(1).div_ceil(PERSONS_PER_EVENT);
-    persons
-        .chunks(PERSONS_PER_EVENT)
+    let parts = principals.len().max(1).div_ceil(PRINCIPALS_PER_EVENT);
+    principals
+        .chunks(PRINCIPALS_PER_EVENT)
         .enumerate()
         .map(|(part, chunk)| {
             json!({
                 "available": true, "cursor": snapshot.cursor.to_string(),
-                "persons": chunk, "part": part, "parts": parts,
+                "principals": chunk, "part": part, "parts": parts,
             })
         })
-        .chain((persons.is_empty()).then(|| {
+        .chain((principals.is_empty()).then(|| {
             json!({
                 "available": true, "cursor": snapshot.cursor.to_string(),
-                "persons": [], "part": 0, "parts": 1,
+                "principals": [], "part": 0, "parts": 1,
             })
         }))
         .collect()
@@ -1007,7 +1012,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
                 .capability(RECORD_LOG, scripted.clone())
-                .capability("teamarness.person-names", ScriptedCapability::new())
+                .capability("teamarness.principals", ScriptedCapability::new())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -2223,26 +2228,28 @@ mod session_tests {
     }
 
     #[test]
-    fn large_person_name_snapshot_reaches_every_author_in_bounded_parts() {
-        use teamarness_package_sdk::capabilities::person_names::PersonName;
-        let snapshot = PersonNameSnapshot {
+    fn large_principal_snapshot_reaches_every_author_in_bounded_parts() {
+        use teamarness_package_sdk::capabilities::principals::{Principal, PrincipalKind};
+        let snapshot = PrincipalSnapshot {
             workspace_id: "a".repeat(32),
             cursor: 1,
-            persons: (0..1024)
-                .map(|n| PersonName {
-                    identity: format!("{n:064x}"),
-                    person_id: format!("{n:064x}"),
+            principals: (0..1024)
+                .map(|n| Principal {
+                    principal_id: format!("{n:064x}"),
+                    kind: PrincipalKind::Person,
+                    steward_principal_id: None,
+                    keys: vec![format!("{n:064x}")],
                     name: Some("🌻".repeat(64)),
                     fingerprint: "a".repeat(12),
                 })
                 .collect(),
         };
-        let events = name_snapshots(snapshot);
+        let events = principal_snapshots(snapshot);
         assert!(events.len() > 1);
         assert_eq!(
             events
                 .iter()
-                .map(|event| event["persons"].as_array().unwrap().len())
+                .map(|event| event["principals"].as_array().unwrap().len())
                 .sum::<usize>(),
             1024
         );
@@ -2252,23 +2259,25 @@ mod session_tests {
             assert_eq!(event["parts"], events.len());
             assert!(serde_json::to_vec(event).unwrap().len() <= HISTORY_REPLY_BUDGET);
         }
-        let escaping = PersonNameSnapshot {
+        let escaping = PrincipalSnapshot {
             workspace_id: "a".repeat(32),
             cursor: 2,
-            persons: (0..1024)
-                .map(|n| PersonName {
-                    identity: format!("{n:064x}"),
-                    person_id: format!("{n:064x}"),
+            principals: (0..1024)
+                .map(|n| Principal {
+                    principal_id: format!("{n:064x}"),
+                    kind: PrincipalKind::Agent,
+                    steward_principal_id: Some("c".repeat(64)),
+                    keys: vec![format!("{n:064x}")],
                     name: Some("\\\"".repeat(128)),
                     fingerprint: "f".repeat(64),
                 })
                 .collect(),
         };
-        let renamed = name_snapshots(escaping);
+        let renamed = principal_snapshots(escaping);
         assert_eq!(
             renamed
                 .iter()
-                .map(|part| part["persons"].as_array().unwrap().len())
+                .map(|part| part["principals"].as_array().unwrap().len())
                 .sum::<usize>(),
             1024
         );
@@ -2277,13 +2286,15 @@ mod session_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn person_name_changes_relabel_without_mutating_signed_message_author() {
+    async fn principal_changes_relabel_without_mutating_signed_message_author() {
         let directory = tempfile::tempdir().unwrap();
-        let names = ScriptedCapability::new().calls(|method, _| match method {
+        let principals = ScriptedCapability::new().calls(|method, _| match method {
             "current" => Ok(
-                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [
-                { "identity": "b".repeat(64), "personId": "c".repeat(64),
-                  "name": "Alice", "fingerprint": "bbbbbbbbbbbb" }
+                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [
+                { "principalId": "c".repeat(64), "kind": "person", "stewardPrincipalId": null,
+                  "keys": ["d".repeat(64)], "name": "Alice", "fingerprint": "dddddddddddd" },
+                { "principalId": "e".repeat(64), "kind": "agent", "stewardPrincipalId": "c".repeat(64),
+                  "keys": ["b".repeat(64)], "name": "Helper", "fingerprint": "bbbbbbbbbbbb" }
             ] }),
             ),
             _ => Err(BackendError::new(
@@ -2299,7 +2310,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory.path())
                 .capability(RECORD_LOG, scripted_log())
-                .capability("teamarness.person-names", names.clone())
+                .capability("teamarness.principals", principals.clone())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -2320,13 +2331,15 @@ mod session_tests {
             )
             .unwrap();
         let mut changes = harness
-            .subscribe("conversations.names", json!({}))
+            .subscribe("conversations.principals", json!({}))
             .await
             .unwrap();
         let first = changes.next_event().await.unwrap().unwrap();
-        wait_for_opens(&names, 1).await;
-        assert_eq!(first["persons"][0]["name"], "Alice");
-        assert_eq!(first["persons"][0]["identity"], signed_author);
+        wait_for_opens(&principals, 1).await;
+        assert_eq!(first["principals"][0]["name"], "Alice");
+        assert_eq!(first["principals"][1]["identity"], signed_author);
+        assert_eq!(first["principals"][1]["kind"], "agent");
+        assert_eq!(first["principals"][1]["stewardPrincipalId"], "c".repeat(64));
         assert_eq!(
             store
                 .message_rows(&hex_id(GENERAL_ID), None, PAGE_SIZE)
@@ -2334,12 +2347,14 @@ mod session_tests {
                 .2,
             signed_author
         );
-        names
+        principals
             .stream()
             .send(
-                json!({"workspaceId": "a".repeat(32), "cursor": "1", "persons": [
-                    { "identity": signed_author, "personId": "c".repeat(64),
-                      "name": "Alice 🌻", "fingerprint": "bbbbbbbbbbbb" }
+                json!({"workspaceId": "a".repeat(32), "cursor": "1", "principals": [
+                    { "principalId": "c".repeat(64), "kind": "person", "stewardPrincipalId": null,
+                      "keys": ["d".repeat(64)], "name": "Alice 🌻", "fingerprint": "dddddddddddd" },
+                    { "principalId": "e".repeat(64), "kind": "agent", "stewardPrincipalId": "c".repeat(64),
+                      "keys": [signed_author], "name": "Helper renamed", "fingerprint": "bbbbbbbbbbbb" }
                 ]}),
             )
             .await;
@@ -2348,7 +2363,8 @@ mod session_tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(renamed["persons"][0]["name"], "Alice 🌻");
+        assert_eq!(renamed["principals"][0]["name"], "Alice 🌻");
+        assert_eq!(renamed["principals"][1]["name"], "Helper renamed");
         assert_eq!(
             store
                 .message_rows(&hex_id(GENERAL_ID), None, PAGE_SIZE)
@@ -2361,10 +2377,12 @@ mod session_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn closing_idle_names_subscription_closes_capability_stream() {
+    async fn closing_idle_principals_subscription_closes_capability_stream() {
         let directory = tempfile::tempdir().unwrap();
-        let names = ScriptedCapability::new().calls(|method, _| match method {
-            "current" => Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [] })),
+        let principals = ScriptedCapability::new().calls(|method, _| match method {
+            "current" => {
+                Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [] }))
+            }
             _ => Err(BackendError::new(
                 "capability_unavailable",
                 false,
@@ -2376,26 +2394,26 @@ mod session_tests {
             .installation(ALICE, "Alice")
             .data_directory(directory.path())
             .capability(RECORD_LOG, scripted_log())
-            .capability("teamarness.person-names", names.clone())
+            .capability("teamarness.principals", principals.clone())
             .start()
             .await;
         harness.activate().await.unwrap();
         let mut subscription = harness
-            .subscribe("conversations.names", json!({}))
+            .subscribe("conversations.principals", json!({}))
             .await
             .unwrap();
         assert_eq!(
             subscription.next_event().await.unwrap().unwrap()["cursor"],
             "0"
         );
-        let stream = names.stream();
+        let stream = principals.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
             .await
             .unwrap();
         subscription.close().await;
         tokio::time::timeout(
             Duration::from_secs(2),
-            wait_until(|| !stream.is_open(), "idle person-names stream closure"),
+            wait_until(|| !stream.is_open(), "idle principals stream closure"),
         )
         .await
         .unwrap();

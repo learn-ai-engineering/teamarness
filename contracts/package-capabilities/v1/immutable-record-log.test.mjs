@@ -13,7 +13,7 @@ test('immutable record capability schema is closed to exactly append subscribe o
   assert.equal(schema.additionalProperties, false);
   assert.deepEqual(schema.properties.methods.properties && Object.keys(schema.properties.methods.properties).sort(), ['append', 'open', 'subscribe']);
   assert.deepEqual(schema.properties.methods.required, ['append', 'subscribe', 'open']);
-  assert.equal(schema.$id, 'teamarness.synchronization.immutable-record-log/1.0');
+  assert.equal(schema.$id, 'teamarness.synchronization.immutable-record-log/1.1');
 });
 
 test('golden fixture records implicit scope and bounded envelope encodings', () => {
@@ -28,6 +28,8 @@ test('contract bounds are explicit even where decoded base64 size needs host val
   const append = schema.$defs.append.properties.request.properties;
   assert.equal(append.purpose.$ref, '#/$defs/purpose');
   assert.equal(append.canonical.$ref, '#/$defs/base64url');
+  assert.equal(append.principal.$ref, '#/$defs/principalId');
+  assert.equal(schema.$defs.principalId.pattern, '^[0-9a-f]{64}$');
   assert.equal(schema.$defs.open.properties.request.properties.sealedRecords.maxItems, 32);
   assert.equal(schema.$defs.open.properties.request.properties.sealedRecords.minItems, 1);
   assert.equal(schema.$defs.stateEvent.properties.pendingRecordCount.pattern, '^(0|[1-9][0-9]*)$');
@@ -44,7 +46,15 @@ test('state and warning events are closed and stable', () => {
   closed(warning.properties, ['kind', 'code']);
   assert.equal(warning.additionalProperties, false);
   assert.equal(warning.properties.code.pattern, '^[a-z][a-z0-9_]{0,63}$');
-  for (const code of ['record_quarantined', 'scope_quarantined', 'membership_revoked']) {
+  for (const code of ['record_quarantined', 'scope_quarantined', 'membership_revoked', 'principal_not_bound']) {
     assert.match(code, new RegExp(warning.properties.code.pattern));
   }
+});
+
+test('append request 1.1 adds principal as an optional selector and keeps 1.0 requests valid', () => {
+  const request = schema.$defs.append.properties.request;
+  assert.equal(request.additionalProperties, false);
+  closed(request.properties, ['purpose', 'canonical', 'principal']);
+  assert.deepEqual(request.required, ['purpose', 'canonical']);
+  assert.equal(request.required.includes('principal'), false);
 });

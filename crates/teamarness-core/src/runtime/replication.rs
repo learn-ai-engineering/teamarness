@@ -64,7 +64,7 @@ fn promote(
                     delivery_sequence,
                 );
                 if crate::synchronization::is_reserved_record_scope(&item.package) {
-                    let _ = super::person_name_sync::reconcile(state, workspace);
+                    let _ = super::principal_sync::reconcile(state, workspace);
                 }
                 applied += 1;
             }
@@ -120,10 +120,10 @@ pub(super) fn after_membership_accepted(
             );
         }
     }
-    if let Err(error) = super::person_name_sync::initialize(state, workspace) {
+    if let Err(error) = super::principal_sync::initialize(state, workspace) {
         eprintln!("Person name scope activation after membership transition failed: {error}");
     }
-    super::person_name_sync::publish_generation(state, workspace);
+    super::principal_sync::publish_generation(state, workspace);
     // Who the peers are changed, so what every subscription of this
     // Workspace's scopes reports may have changed with it.
     crate::synchronization::record_subscription::bump_workspace_scopes(state, workspace);

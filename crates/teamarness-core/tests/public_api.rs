@@ -94,6 +94,7 @@ async fn external_consumers_cannot_cross_the_runtime_boundary() {
     let target = temporary_directory();
     let cases = [
         ("secret_key.rs", "SecretKey"),
+        ("agent_secret_key.rs", "agent_secret_key"),
         ("raw_secret_bytes.rs", "secret_key"),
         ("serialized_secret.rs", "serialize_secret_key"),
         ("raw_identity_bytes.rs", "as_bytes"),

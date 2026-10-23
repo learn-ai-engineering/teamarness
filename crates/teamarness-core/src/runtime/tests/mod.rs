@@ -82,14 +82,18 @@ pub(super) fn runtime_heads(
         .heads()
 }
 
+/// An admission as the issuer commits it: the invitee's group create (which
+/// depends on the genesis) and the admission that depends on `dependencies`
+/// plus that group create.
 pub(super) fn admit(
     manager: &SecretKey,
     invitee: &SecretKey,
     workspace_id: WorkspaceId,
+    genesis: MembershipOperationId,
     timestamp: i64,
-    dependencies: Vec<MembershipOperationId>,
+    mut dependencies: Vec<MembershipOperationId>,
     nonce: u8,
-) -> MembershipEnvelope {
+) -> (MembershipEnvelope, MembershipEnvelope) {
     let token = sign_token(
         manager,
         workspace_id,
@@ -98,9 +102,11 @@ pub(super) fn admit(
         [nonce; 32],
     )
     .unwrap();
-    let claim = sign_claim(invitee, &token).unwrap();
+    let claim = sign_claim(invitee, &token, genesis).unwrap();
     let target = claim.invitee;
-    MembershipEnvelope::sign(
+    let create_person = claim.create_person.clone();
+    dependencies.push(create_person.id);
+    let admission = MembershipEnvelope::sign(
         manager,
         workspace_id,
         timestamp,
@@ -110,7 +116,23 @@ pub(super) fn admit(
         },
         dependencies,
     )
-    .unwrap()
+    .unwrap();
+    (create_person, admission)
+}
+
+/// The genesis identifier of a runtime's Workspace.
+pub(super) fn runtime_genesis(
+    runtime: &CoreRuntime,
+    workspace_id: WorkspaceId,
+) -> MembershipOperationId {
+    runtime
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .memberships
+        .get(&workspace_id)
+        .unwrap()
+        .genesis_id()
 }
 
 pub(super) struct AdjustableClock(pub(super) Arc<AtomicI64>);

@@ -29,6 +29,8 @@ button, input, textarea { font: inherit; }
 .message.message--local { border-left-color: var(--teamarness-color-accent); }
 .message--local-continuation.message { margin-top: 0; }
 .message-author { display: block; padding: 0; color: var(--teamarness-color-text); background: transparent; border: 0; cursor: pointer; font-size: .86rem; font-weight: 700; text-align: left; }
+.message-agent-indicator { display: inline-block; padding: .1rem .4rem; border-radius: .4rem; background: var(--teamarness-color-surface, #eee); font-size: .72rem; font-weight: 700; }
+.message-agent-steward { margin-left: .4rem; font-size: .76rem; color: var(--teamarness-color-text); }
 .message-author:hover { text-decoration: underline; }
 .message-markdown { line-height: 1.55; overflow-wrap: anywhere; }
 .message-markdown p { margin: .15rem 0 .4rem; }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rename-workspace-principal"
+description = "Enables the rename_workspace_principal command without any pre-configured scope."
+commands.allow = ["rename_workspace_principal"]
+
+[[permission]]
+identifier = "deny-rename-workspace-principal"
+description = "Denies the rename_workspace_principal command without any pre-configured scope."
+commands.deny = ["rename_workspace_principal"]

@@ -32,11 +32,15 @@ A command rejected before the Provider writer accepts its frame is certain. Afte
 
 A Package opens `capability.stream` with its membership grant, method `subscribe`, and `afterEpoch`. Transition events contain the Core epoch, membership version, cause operation ID, and snapshot digest. Stream credit bounds delivery. The host drops its Core subscription when credit or writer capacity runs out and reopens after the last delivered epoch. Core transitions also know the admitted or revoked Installation and the author; the 1.0 event does not carry them. A later minor version will.
 
-## `teamarness.person-names` 1.0
+## `teamarness.principals` 1.0
 
-This additive, Package-neutral presentation capability is scoped by its grant to one Workspace. `current` returns `{workspaceId, cursor, persons}`; each Person contains `identity` (source Installation), opaque `personId`, nullable `name`, and an identity fingerprint. `lookup` accepts a current Installation identity and returns `{person}` or `{person:null}` for a nonmember; a missing name is not a membership error. The current roster comes from Core, not from the Package. Names are non-unique, bounded Unicode text; authorization remains in `teamarness.membership` 1.0, which is unchanged.
+This Package-neutral presentation capability is scoped by its grant to one Workspace. It delivers Workspace Principals: the Workspace Persons and Workspace Agents whose keys Canonical Membership authorizes. It replaces the names capability of ADR 0022, which no longer exists (ADR 0023).
 
-A `capability.stream` with method `subscribe` and decimal-string `afterCursor` emits the latest bounded snapshot when the independent durable profile generation changes. The cursor is a coalescing invalidation token, **not** a replay ledger, membership epoch or immutable-record cursor: subscribe first, read `current`, and refetch after a gap or restart. A cursor ahead of Core's profile generation closes with `cursor_invalid`. Each event consumes stream credit. The closed schema and limits are in `person-names.schema.json`.
+`current` returns `{workspaceId, cursor, principals}`. Each Principal row contains an opaque `principalId`, `kind` (`person` or `agent`), `stewardPrincipalId` (the Steward's Principal ID for an agent, `null` for a person), `keys` (the Principal's current signing keys as 64-hex identities; exactly one in version 1), nullable `name`, and a fingerprint (the first 12 hex characters of its current signing key). `lookup` accepts exactly one of `identity` (a current member key) or `principalId` and returns `{principal}` or `{principal:null}` when no current Principal matches; a missing name is not a membership error. The current roster comes from Core, not from the Package. Names are non-unique, bounded Unicode text; a Person names itself and a Steward names its Agents. Authorization remains in `teamarness.membership` 1.0, which is unchanged: an Agent appears there as a Member with role `Member`, and a Package that needs kind or steward resolves them here.
+
+Attribution is the record author resolved to its Principal: a Package looks up the signer key and reads `kind` and `stewardPrincipalId` from the row. No request or record carries an acting-Principal claim.
+
+A `capability.stream` with method `subscribe` and decimal-string `afterCursor` emits the latest bounded snapshot when the independent durable profile generation changes. The cursor is a coalescing invalidation token, **not** a replay ledger, membership epoch or immutable-record cursor: subscribe first, read `current`, and refetch after a gap or restart. A cursor ahead of Core's profile generation closes with `cursor_invalid`. Each event consumes stream credit. The closed schema and limits are in `principals.schema.json`.
 
 ## `teamarness.signing` 1.0
 
@@ -53,12 +57,15 @@ The signed envelope is binary and length-delimited:
 
 Signatures and payloads use unpadded base64url. Private keys and signing-context selection never cross the process boundary.
 
-## `teamarness.synchronization.immutable-record-log` 1.0
+## `teamarness.synchronization.immutable-record-log` 1.1
 
 This generic capability provides one encrypted, append-only record set for the
 implicit Package Identity, Workspace, Installation, and Package Process
 generation selected by its grant. Requests never repeat those scope selectors.
 The closed machine-readable contract is `immutable-record-log.schema.json`.
+
+Minor 1.1 adds one optional `append` field, `principal`. A Package that
+negotiates 1.0 sends 1.0 requests and is unaffected.
 
 ### `append`
 
@@ -69,8 +76,20 @@ The closed machine-readable contract is `immutable-record-log.schema.json`.
 `purpose` is visible ASCII of 1–64 bytes. `canonical` is 1–262,144 decoded
 bytes. Success is returned only after a local durable commit and has the shape
 `{recordId, orderKey, author, signature, sealedRecord, durability:"committed"}`.
-The operation is content-idempotent within its granted scope, so an uncertain
-retry returns the original committed result.
+The operation is content-idempotent within its granted scope and author, so an
+uncertain retry returns the original committed result.
+
+Without `principal`, Core signs with the Installation key and `author` is the
+Installation identity. With `principal` (a 64-hex Principal ID, 1.1 only), Core
+signs with that Workspace Agent's key and `author` is the Agent's key, when and
+only when the calling Package Instance is bound to that Agent on this
+Installation. Any other `principal`, including a Person, an Agent bound to
+another Package Instance, an unbound Agent or an unknown ID, fails with the
+error code `principal_not_bound` and commits nothing. The binding is local
+Installation state and is never replicated; one Agent is bound to at most one
+Package Instance. The Agent's key never crosses the capability boundary. Peers
+accept the record because the Agent's key is in membership history, and a
+reader resolves the author to its Principal through `teamarness.principals`.
 
 ### `subscribe`
 

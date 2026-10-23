@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/principals.schema.json",
+  "title": "Workspace Principals capability 1.0",
+  "description": "Presentation and attribution lookup, never membership authority. A row is one Workspace Principal: a person or an agent. Attribution is the signer key resolved to its Principal through keys. The cursor is a durable coalescing profile generation, not a membership epoch or record cursor. Resume by refetching the latest snapshot.",
+  "$defs": {
+    "cursor": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "workspaceId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "principal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["principalId", "kind", "stewardPrincipalId", "keys", "name", "fingerprint"],
+      "properties": {
+        "principalId": { "$ref": "#/$defs/principalId" },
+        "kind": { "enum": ["person", "agent"] },
+        "stewardPrincipalId": { "anyOf": [{ "$ref": "#/$defs/principalId" }, { "type": "null" }] },
+        "keys": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/identity" } },
+        "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+        "fingerprint": { "type": "string", "minLength": 1, "maxLength": 64 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "agent" } } },
+          "then": { "properties": { "stewardPrincipalId": { "$ref": "#/$defs/principalId" } } },
+          "else": { "properties": { "stewardPrincipalId": { "type": "null" } } }
+        }
+      ]
+    },
+    "snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["workspaceId", "cursor", "principals"],
+      "properties": {
+        "workspaceId": { "$ref": "#/$defs/workspaceId" },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "principals": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/principal" } }
+      }
+    },
+    "currentCall": { "type": "object", "additionalProperties": false, "required": ["method"], "properties": { "method": { "const": "current" } } },
+    "lookupCall": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method"],
+      "properties": { "method": { "const": "lookup" }, "identity": { "$ref": "#/$defs/identity" }, "principalId": { "$ref": "#/$defs/principalId" } },
+      "oneOf": [{ "required": ["identity"] }, { "required": ["principalId"] }]
+    },
+    "lookupResult": { "type": "object", "additionalProperties": false, "required": ["principal"], "properties": { "principal": { "anyOf": [{ "$ref": "#/$defs/principal" }, { "type": "null" }] } } },
+    "subscribe": { "type": "object", "additionalProperties": false, "required": ["grant", "method", "afterCursor"], "properties": { "grant": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" }, "method": { "const": "subscribe" }, "afterCursor": { "$ref": "#/$defs/cursor" } } }
+  }
+}

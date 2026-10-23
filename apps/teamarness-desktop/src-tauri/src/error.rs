@@ -28,6 +28,8 @@ pub enum BridgeErrorCode {
     /// itself is usable; some of its Packages are not.
     PackageReconciliation,
     Shutdown,
+    NotSteward,
+    PrincipalNotBound,
 }
 
 impl BridgeError {
@@ -81,8 +83,11 @@ impl From<PersonNameError> for BridgeError {
     fn from(value: PersonNameError) -> Self {
         match value {
             PersonNameError::InvalidName
+            | PersonNameError::InvalidPackageIdentity
             | PersonNameError::WorkspaceNotFound
-            | PersonNameError::NotOwnPerson => Self::invalid_input(),
+            | PersonNameError::AgentNotFound => Self::invalid_input(),
+            PersonNameError::NotOwnPerson => Self::new(BridgeErrorCode::NotSteward, false),
+            PersonNameError::Membership(error) => error.into(),
             PersonNameError::Storage(error) => error.into(),
         }
     }
@@ -129,6 +134,28 @@ mod tests {
     use teamarness_package_host::{DiagnosticId, PackageErrorStage, RecoveryAction};
 
     #[test]
+    fn maps_principal_agent_errors_without_claiming_a_retryable_failure() {
+        assert_eq!(
+            BridgeError::from(PersonNameError::InvalidPackageIdentity),
+            BridgeError::invalid_input()
+        );
+        assert_eq!(
+            BridgeError::from(PersonNameError::AgentNotFound),
+            BridgeError::invalid_input()
+        );
+        assert_eq!(
+            BridgeError::from(PersonNameError::Membership(MembershipError::NotManager)),
+            BridgeError::new(BridgeErrorCode::InvalidBootstrap, false)
+        );
+        assert_eq!(
+            BridgeError::from(PersonNameError::Membership(MembershipError::Storage(
+                StorageError::UncertainOutcome
+            ))),
+            BridgeError::new(BridgeErrorCode::UncertainStorageOutcome, false)
+        );
+    }
+
+    #[test]
     fn maps_every_public_onboarding_error_to_the_shared_fixture() {
         let errors = [
             OnboardingError::InvalidInput,
@@ -149,7 +176,21 @@ mod tests {
             "../../contracts/fixtures/bridge-contract.json"
         ))
         .unwrap();
-        assert_eq!(actual, fixture["errors"]);
+        assert_eq!(
+            actual.as_array().unwrap().as_slice(),
+            &fixture["errors"].as_array().unwrap()[..errors.len()]
+        );
+        assert_eq!(
+            serde_json::to_value([
+                BridgeError::from(PersonNameError::NotOwnPerson),
+                BridgeError::new(BridgeErrorCode::PrincipalNotBound, false),
+            ])
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .as_slice(),
+            &fixture["errors"].as_array().unwrap()[errors.len()..]
+        );
     }
 
     /// A reconcile failure that is not a Host shutdown must not tell the person

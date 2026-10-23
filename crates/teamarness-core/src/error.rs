@@ -203,6 +203,15 @@ pub enum MembershipError {
     CannotRevokeManager,
     /// p2panda rejected the authenticated operation.
     AuthorizationRejected,
+    /// The named Person key group is not in the operation's causal ancestry or
+    /// was not created by the key the operation claims.
+    UnknownPersonGroup,
+    /// A Person-group action names a group that is not currently admitted.
+    PersonNotAdmitted,
+    /// The key is already a current Member through the creator role or a group.
+    DuplicateMemberKey,
+    /// An Agent key authored a membership operation.
+    AgentKeyCannotAuthor,
     /// Durable storage failed while processing canonical membership.
     Storage(StorageError),
 }
@@ -233,6 +242,10 @@ impl fmt::Display for MembershipError {
             Self::MemberNotFound => "workspace member is not currently active",
             Self::CannotRevokeManager => "the version-1 creator manager cannot be revoked",
             Self::AuthorizationRejected => "membership operation was rejected by authorization",
+            Self::UnknownPersonGroup => "the Person key group is unknown at this causal position",
+            Self::PersonNotAdmitted => "the Person key group is not currently admitted",
+            Self::DuplicateMemberKey => "the key is already a current member",
+            Self::AgentKeyCannotAuthor => "an Agent key cannot author membership operations",
             Self::Storage(error) => return error.fmt(formatter),
         })
     }
