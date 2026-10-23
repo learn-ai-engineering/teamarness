@@ -15,8 +15,13 @@ use crate::{BackendError, object};
 /// answering slowly reports its own `deadline_exceeded` first.
 pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(11);
 
-pub(crate) type PendingCapabilities =
-    Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<JsonValue, BackendError>>>>>;
+pub(crate) type PendingCapabilities = Arc<Mutex<BTreeMap<String, PendingCapability>>>;
+
+pub(crate) struct PendingCapability {
+    pub(crate) sender: oneshot::Sender<Result<JsonValue, BackendError>>,
+    pub(crate) command: bool,
+}
+
 pub(crate) type CapabilityStreams = Arc<Mutex<BTreeMap<String, CapabilityStreamRoute>>>;
 
 pub(crate) struct CapabilityStreamRoute {
@@ -328,7 +333,10 @@ impl CapabilityClient {
             .saturating_add(10_000)
             .to_string();
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), sender);
+        self.pending
+            .lock()
+            .await
+            .insert(id.clone(), PendingCapability { sender, command });
         let value = object([
             ("kind", JsonValue::String("request".into())),
             ("id", JsonValue::String(id.clone())),
@@ -342,7 +350,7 @@ impl CapabilityClient {
             return Err(unavailable());
         }
         match tokio::time::timeout(CALL_DEADLINE, receiver).await {
-            Ok(answer) => answer.unwrap_or_else(|_| Err(unavailable())),
+            Ok(answer) => answer.unwrap_or_else(|_| Err(unavailable_after_enqueue(command))),
             Err(_) => {
                 // The caller stops waiting here, so the request is retired
                 // here: the host always answers, and its late first terminal
@@ -371,8 +379,10 @@ impl CapabilityClient {
 /// Package task holding a client must not wait forever.
 pub(crate) async fn fail_all(pending: &PendingCapabilities, streams: &CapabilityStreams) {
     let waiting = std::mem::take(&mut *pending.lock().await);
-    for (_, sender) in waiting {
-        let _ = sender.send(Err(unavailable()));
+    for (_, pending) in waiting {
+        let _ = pending
+            .sender
+            .send(Err(unavailable_after_enqueue(pending.command)));
     }
     let routes = std::mem::take(&mut *streams.lock().await);
     for (_, route) in routes {
@@ -396,9 +406,137 @@ fn unavailable() -> BackendError {
     )
 }
 
+fn unavailable_after_enqueue(command: bool) -> BackendError {
+    if command {
+        BackendError::new(
+            "outcome_unknown",
+            false,
+            JsonValue::Object(Default::default()),
+        )
+        .with_outcome_uncertain(true)
+    } else {
+        unavailable()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_loss_after_command_enqueue_is_uncertain_but_query_loss_is_retryable() {
+        let (writer, _control, mut data) = PriorityWriter::channels();
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let streams = Arc::new(Mutex::new(BTreeMap::new()));
+        let client = CapabilityClient::new(
+            Arc::new(writer),
+            pending.clone(),
+            streams.clone(),
+            Arc::new(Mutex::new(
+                teamarness_package_protocol::ContractState::default(),
+            )),
+        );
+        let command = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call(
+                        "Z3JhbnQx",
+                        "invoke",
+                        serde_json::json!({
+                            "contract":"fixture.messages", "port":"message.post",
+                            "kind":"command", "request":{}
+                        }),
+                    )
+                    .await
+            }
+        });
+        data.recv().await.expect("the command entered the writer");
+        let query = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call(
+                        "Z3JhbnQx",
+                        "invoke",
+                        serde_json::json!({
+                            "contract":"fixture.messages", "port":"message.list",
+                            "kind":"query", "request":{}
+                        }),
+                    )
+                    .await
+            }
+        });
+        data.recv().await.expect("the query entered the writer");
+        fail_all(&pending, &streams).await;
+        let command_error = command.await.unwrap().unwrap_err();
+        assert!(command_error.outcome_uncertain());
+        assert!(!command_error.retryable());
+        let query_error = query.await.unwrap().unwrap_err();
+        assert_eq!(query_error.code(), "host_unavailable");
+        assert!(!query_error.outcome_uncertain());
+        assert!(query_error.retryable());
+    }
+
+    #[tokio::test]
+    async fn closed_pending_receiver_after_command_enqueue_is_uncertain() {
+        let (writer, _control, mut data) = PriorityWriter::channels();
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let client = CapabilityClient::new(
+            Arc::new(writer),
+            pending.clone(),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(
+                teamarness_package_protocol::ContractState::default(),
+            )),
+        );
+        let command = tokio::spawn(async move {
+            client
+                .call(
+                    "Z3JhbnQx",
+                    "invoke",
+                    serde_json::json!({
+                        "contract":"fixture.messages", "port":"message.post",
+                        "kind":"command", "request":{}
+                    }),
+                )
+                .await
+        });
+        data.recv().await.expect("writer accepted the command");
+        pending.lock().await.clear();
+        let failure = command.await.unwrap().unwrap_err();
+        assert_eq!(failure.code(), "outcome_unknown");
+        assert!(failure.outcome_uncertain());
+        assert!(!failure.retryable());
+    }
+
+    #[tokio::test]
+    async fn refused_command_writer_remains_certain() {
+        let (writer, _control, data) = PriorityWriter::channels();
+        drop(data);
+        let client = CapabilityClient::new(
+            Arc::new(writer),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(
+                teamarness_package_protocol::ContractState::default(),
+            )),
+        );
+        let failure = client
+            .call(
+                "Z3JhbnQx",
+                "invoke",
+                serde_json::json!({
+                    "contract":"fixture.messages", "port":"message.post",
+                    "kind":"command", "request":{}
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "host_unavailable");
+        assert!(!failure.outcome_uncertain());
+        assert!(failure.retryable());
+    }
 
     // Verifies: TEAM.SYS.PKG-R14
     #[tokio::test]

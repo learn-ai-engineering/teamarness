@@ -1097,11 +1097,11 @@ async fn reader_task<R>(
                         }
                     };
                     // The answer waits for control-lane capacity: a congested
-                    // lane is backpressure, and dropping the answer would leave
-                    // this request with no terminal frame at all. Congestion
-                    // that outlasts the call deadline is answered for that one
-                    // request id with a typed retryable error, never by tearing
-                    // the generation down.
+                    // Lane congestion may replace the computed answer. Preserve
+                    // uncertainty if the Provider already accepted a command.
+                    let accepted_command = method == "invoke"
+                        && payload.get("kind").and_then(Value::as_str) == Some("command")
+                        && started.load(std::sync::atomic::Ordering::Acquire);
                     let delivered = match tokio::time::timeout(
                         limits.capability_call,
                         writer.send_waiting(response, true),
@@ -1113,10 +1113,17 @@ async fn reader_task<R>(
                     };
                     if let Err(wire) = delivered {
                         if wire.code == PackageErrorCode::Overloaded {
-                            let overloaded = json!({
-                                "kind":"error", "id":answered, "code":"overloaded",
-                                "retryable":true, "details":{}
-                            });
+                            let overloaded = if accepted_command {
+                                json!({
+                                    "kind":"error", "id":answered, "code":"outcome_unknown",
+                                    "retryable":false, "outcomeUncertain":true, "details":{}
+                                })
+                            } else {
+                                json!({
+                                    "kind":"error", "id":answered, "code":"overloaded",
+                                    "retryable":true, "details":{}
+                                })
+                            };
                             // The typed error is still this request's one
                             // terminal frame, so it is owed. It goes on the
                             // reserve rather than on the budget the answer it
@@ -2064,20 +2071,22 @@ mod tests {
     /// The reserve holds the frame it exists for: a typed terminal `error` for
     /// an id of the contract's maximum length.
     #[test]
-    fn an_overloaded_answer_fits_its_reserve() {
+    fn terminal_answers_fit_their_reserve() {
         let longest = format!("p:{}", "a".repeat(MAX_ID_BYTES - 2));
         assert_eq!(longest.len(), MAX_ID_BYTES);
-        let overloaded = frame(json!({
-            "kind":"error", "id":longest, "code":"overloaded",
-            "retryable":true, "details":{}
-        }));
-        let encoded = teamarness_package_protocol::encode_frame(&overloaded)
-            .expect("encoded frame")
-            .len();
-        assert!(
-            encoded <= TERMINAL_ERROR_BYTES,
-            "the reserve holds {TERMINAL_ERROR_BYTES} bytes per answer, the frame needs {encoded}"
-        );
+        for value in [
+            json!({"kind":"error", "id":longest, "code":"overloaded", "retryable":true, "details":{}}),
+            json!({"kind":"error", "id":longest, "code":"outcome_unknown", "retryable":false,
+                "outcomeUncertain":true, "details":{}}),
+        ] {
+            let encoded = teamarness_package_protocol::encode_frame(&frame(value))
+                .expect("encoded frame")
+                .len();
+            assert!(
+                encoded <= TERMINAL_ERROR_BYTES,
+                "the reserve holds {TERMINAL_ERROR_BYTES} bytes per answer, the frame needs {encoded}"
+            );
+        }
     }
 
     fn frame(value: Value) -> Frame {

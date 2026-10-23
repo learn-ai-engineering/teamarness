@@ -540,7 +540,7 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
             &'a self,
             _grant: Option<&'a str>,
             payload: &'a Value,
-            _started: Arc<AtomicBool>,
+            started: Arc<AtomicBool>,
             _consumer_id: &'a str,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
@@ -549,6 +549,10 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
                 .get("bytes")
                 .and_then(Value::as_u64)
                 .expect("the test sizes the answer") as usize;
+            if payload.get("kind").and_then(Value::as_str) == Some("command") {
+                // Simulate Provider writer acceptance before its reply.
+                started.store(true, Ordering::Release);
+            }
             Box::pin(async move { Ok(json!({"canonical":"A".repeat(bytes)})) })
         }
 
@@ -611,7 +615,9 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
                 "kind":"request", "id":format!("p:slow-{index}"),
                 "operation":"capability.call", "grant":"Z3JhbnQx",
                 "deadlineUnixMs":"9007199254740998",
-                "payload":{"method":"open","bytes":answer_bytes}
+                "payload":{"method":if index < 2 { "open" } else { "invoke" },
+                    "kind":if index < 2 { "query" } else { "command" },
+                    "bytes":answer_bytes}
             }))
             .await;
     }
@@ -621,6 +627,7 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let mut answered = std::collections::BTreeMap::new();
+    let mut uncertain_fallbacks = 0;
     let collected = tokio::time::timeout(Duration::from_secs(30), async {
         while answered.len() < CALLS {
             let frame = package.next_frame().await;
@@ -640,11 +647,26 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
                 .unwrap_or("response")
                 .to_owned();
             if code == "overloaded" {
+                assert!(
+                    id == "p:slow-0" || id == "p:slow-1",
+                    "only unaccepted work is retryable"
+                );
                 assert_eq!(
                     frame.field("retryable").and_then(Value::as_bool),
-                    Some(true),
-                    "the third verdict is retryable"
+                    Some(true)
                 );
+            }
+            if code == "outcome_unknown" {
+                assert!(!matches!(id.as_str(), "p:slow-0" | "p:slow-1"));
+                assert_eq!(
+                    frame.field("outcomeUncertain").and_then(Value::as_bool),
+                    Some(true)
+                );
+                assert_eq!(
+                    frame.field("retryable").and_then(Value::as_bool),
+                    Some(false)
+                );
+                uncertain_fallbacks += 1;
             }
             assert!(
                 answered.insert(id, code).is_none(),
@@ -659,8 +681,8 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
         answered.len()
     );
     assert!(
-        answered.values().any(|code| code == "overloaded"),
-        "congestion that outlasts the deadline is answered `overloaded`: {answered:?}"
+        uncertain_fallbacks > 0,
+        "accepted commands under congestion need uncertain fallbacks: {answered:?}"
     );
     assert_eq!(
         client.failure(),

@@ -212,7 +212,7 @@ pub(crate) async fn run(
                         // The classifier has already decided this frame. A call
                         // whose caller stopped waiting has no correlation entry
                         // left, and the answer is simply dropped.
-                        let Some(sender) = pending_capabilities.lock().await.remove(&id) else {
+                        let Some(pending) = pending_capabilities.lock().await.remove(&id) else {
                             continue;
                         };
                         let result = if frame.kind() == FrameKind::Response {
@@ -224,7 +224,7 @@ pub(crate) async fn run(
                                 frame.field("details").cloned().unwrap_or_else(empty_object),
                             ).with_outcome_uncertain(frame.field("outcomeUncertain").and_then(JsonValue::as_bool).unwrap_or(false)))
                         };
-                        let _ = sender.send(result);
+                        let _ = pending.sender.send(result);
                     }
                     FrameKind::Ping => {
                         writer.control(object([
