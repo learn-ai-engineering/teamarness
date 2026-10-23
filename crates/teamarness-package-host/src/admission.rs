@@ -299,7 +299,19 @@ pub(crate) fn admit(
             diagnostics.extend(trial_diagnostics);
             break (eligible, providers, remaining);
         }
-        for identity in invalid_winners {
+        // Replace one contested invalid winner first. Other winners may only be
+        // invalid because they depend on it; a rival can make them viable on retry.
+        let contested = providers.iter().find_map(|(contract, winner)| {
+            (invalid_winners.contains(winner)
+                && claims[contract]
+                    .iter()
+                    .any(|rival| rival != winner && candidates.contains_key(rival)))
+            .then(|| winner.clone())
+        });
+        let evicted: Vec<_> = contested
+            .map(|winner| vec![winner])
+            .unwrap_or_else(|| invalid_winners.into_iter().collect());
+        for identity in evicted {
             if let Some(reason) = trial_diagnostics
                 .iter()
                 .find(|error| error.affected_package.as_ref() == Some(&identity))

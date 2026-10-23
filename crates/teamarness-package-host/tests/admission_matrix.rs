@@ -950,6 +950,87 @@ fn dependency_invalid_incumbent_yields_to_a_viable_provider_on_reopen() {
 
 // Verifies: TEAM.SYS.PKG-R13
 #[test]
+fn rival_breaks_provisional_cycle_without_discarding_dependent_provider() {
+    let fixture = Fixture::new();
+    fixture.add_application("alpha", "com.example.alpha", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.alpha"]
+    );
+    fixture.add_application("beta", "com.example.beta", "1.0.0");
+    fixture.add_application("delta", "com.example.delta", "1.0.0");
+    fixture.add_application("consumer", "com.example.consumer", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.x", 1)],
+        vec![consumed(
+            "com.example.y",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("delta"),
+        vec![provided("com.example.y", 1)],
+        vec![consumed(
+            "com.example.x",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.y",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let reopened = admit(&fixture.config()).unwrap();
+    assert_eq!(
+        package_ids(&reopened),
+        vec![
+            "com.example.beta",
+            "com.example.consumer",
+            "com.example.delta"
+        ]
+    );
+    assert_eq!(
+        reopened.graph[&"com.example.delta".parse().unwrap()][0].provider,
+        Some("com.example.beta".parse().unwrap())
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec![
+            "com.example.beta",
+            "com.example.consumer",
+            "com.example.delta"
+        ]
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
 fn additive_provider_minor_negotiates_highest_minor_in_consumers_range() {
     let fixture = Fixture::new();
     fixture.add_application("provider", "com.example.provider", "1.0.0");
