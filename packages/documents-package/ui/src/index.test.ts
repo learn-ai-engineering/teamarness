@@ -339,14 +339,122 @@ describe("Documents mount", () => {
 
     const textarea = rootNode.querySelector(".editor-textarea") as HTMLTextAreaElement;
     textarea.setSelectionRange(0, 4);
-    ([...rootNode.querySelectorAll(".comment-compose-actions button")].find((b) => b.textContent === "Quote selection") as HTMLButtonElement).click();
-    expect(rootNode.querySelector(".comment-quote--draft")?.textContent).toContain("# Q4");
     const input = rootNode.querySelector(".comment-input") as HTMLTextAreaElement;
+    input.dispatchEvent(new Event('focus'));
+    expect(rootNode.querySelector(".comment-quote--draft")?.textContent).toContain("Commenting on highlighted text");
+    expect(rootNode.querySelector(".comment-quote--draft")?.textContent).toContain("# Q4");
+    expect(rootNode.querySelector('.comment-compose-actions button')?.textContent).toBe('Comment');
     input.value = "Agree";
     (rootNode.querySelector(".comment-compose") as HTMLFormElement).requestSubmit();
     await tick();
     expect(added).toEqual([{ documentId: doc, markdown: "Agree", quote: "# Q4" }]);
     expect(input.value).toBe("");
+    await unmount();
+  });
+
+  it("captures only a nonempty editor selection on composer focus, caps it, and clears it on deselection or X", async () => {
+    const added: unknown[] = [];
+    const fake = createFakePackageClient({ requests: {
+      "documents.snapshot": () => snapshot(),
+      "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+      "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
+    }, subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined } });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    const text = `  ${'x'.repeat(2100)}  `;
+    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text });
+    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+    const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
+    const form = root.querySelector('.comment-compose') as HTMLFormElement;
+    editor.focus();
+    editor.setSelectionRange(0, text.length);
+    // happy-dom does not focus controls inside a detached ShadowRoot; dispatch the browser focus event.
+    composer.dispatchEvent(new Event('focus'));
+    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Commenting on highlighted text');
+    expect(root.querySelector('.comment-quote--draft span:last-of-type')?.textContent).toBe('x'.repeat(2048));
+    expect(root.querySelector('[aria-label="Clear quote"]')).not.toBeNull();
+    expect(root.querySelector('[aria-label="Quote selection"]')).toBeNull();
+    // The browser may retain an editor selection after focus moves; capture uses the editor, not window selection.
+    composer.value = 'Quoted';
+    form.requestSubmit();
+    await tick();
+    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Quoted', quote: 'x'.repeat(2048) });
+    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
+    editor.focus();
+    editor.setSelectionRange(2, 5);
+    composer.dispatchEvent(new Event('focus'));
+    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('xxx');
+    editor.focus();
+    editor.setSelectionRange(4, 4);
+    composer.dispatchEvent(new Event('focus'));
+    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
+    composer.value = 'Collapsed';
+    form.requestSubmit();
+    await tick();
+    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Collapsed' });
+    editor.focus();
+    editor.setSelectionRange(2, 5);
+    composer.dispatchEvent(new Event('focus'));
+    (root.querySelector('[aria-label="Clear quote"]') as HTMLButtonElement).click();
+    expect(editor.selectionStart).toBe(editor.selectionEnd);
+    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
+    editor.focus();
+    composer.dispatchEvent(new Event('focus'));
+    composer.value = 'Cleared';
+    form.requestSubmit();
+    await tick();
+    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Cleared' });
+    await unmount();
+  });
+
+  it("clears quote and reply on Document switch, but retains them and composer draft after failed post", async () => {
+    const other = '4'.repeat(64);
+    const parent = '5'.repeat(64);
+    const current = { ...snapshot(), documents: [...snapshot().documents,
+      { id: other, collectionId: planning, title: 'Other', archived: false }] };
+    const added: unknown[] = [];
+    let fail = true;
+    const fake = createFakePackageClient({ requests: {
+      "documents.snapshot": () => current,
+      "documents.document.open": (payload) => ({ documentId: (payload as { documentId: string }).documentId, revision: '0', editable: true, text: 'Selected text' }),
+      "documents.comments": (payload) => ({ comments: (payload as { documentId: string }).documentId === doc
+        ? [{ id: parent, documentId: doc, author: 'me', position: '01', resolved: false, isLocal: true, markdown: 'Parent' }] : [] }),
+      "documents.comment.add": (payload) => { added.push(payload); if (fail) throw Object.assign(new Error('failed'),
+        { kind: 'teamarness.package-request-error', code: 'documents.invalid_markdown' });
+        return { ok: true as const, id: 'd'.repeat(64) }; },
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    const root = document.createElement('div').attachShadow({ mode: 'open' });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Selected text' });
+    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+    const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
+    editor.focus();
+    editor.setSelectionRange(0, 8);
+    (root.querySelector('.comment button') as HTMLButtonElement).click();
+    composer.dispatchEvent(new Event('focus'));
+    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Replying to a comment');
+    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Selected');
+    composer.value = 'Still writing';
+    (root.querySelector('.comment-compose') as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Still writing', quote: 'Selected', parentId: parent });
+    expect(root.querySelector('.comment-input')).toBe(composer);
+    expect(composer.value).toBe('Still writing');
+    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Selected');
+    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Replying to a comment');
+    (root.querySelectorAll('.document-title')[1] as HTMLButtonElement).click();
+    await tick();
+    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
+    expect(root.querySelector('.comment-input')).toBe(composer);
+    expect(editor.value).toBe('Selected text');
+    fail = false;
+    (root.querySelector('.comment-compose') as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(added.at(-1)).toEqual({ documentId: other, markdown: 'Still writing' });
     await unmount();
   });
 

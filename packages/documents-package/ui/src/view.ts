@@ -122,6 +122,7 @@ export class DocumentsView {
   private readonly controller: DocumentsController;
   private draftQuote: string | null = null;
   private replyTo: string | null = null;
+  private composerDocumentId: string | null = null;
   private readonly expanded = new Set<string>();
   private selectedCollectionId: string | null = null;
   private leftOpen = true;
@@ -266,33 +267,34 @@ export class DocumentsView {
     this.commentQuote = document.createElement("blockquote");
     this.commentQuote.className = "comment-quote comment-quote--draft";
     this.commentQuote.hidden = true;
-    const quoteButton = button("Quote selection", KIT.secondary, () => {
-      const start = this.textarea.selectionStart;
-      const end = this.textarea.selectionEnd;
-      const selected = this.textarea.value.slice(start, end).trim();
-      this.draftQuote = selected ? selected.slice(0, 2048) : null;
-      this.renderComposer();
-    });
     this.commentInput = document.createElement("textarea");
     this.commentInput.className = `${KIT.input} comment-input`;
     this.commentInput.rows = 3;
     this.commentInput.maxLength = 32768;
     this.commentInput.placeholder = "Add a comment (Markdown)";
     this.commentInput.setAttribute("aria-label", "New comment");
+    this.commentInput.addEventListener("focus", () => {
+      if (this.controller.state.openDocumentId === null || !this.controller.openEditor
+        || this.textarea.hidden || this.textarea.disabled) return;
+      const selected = this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd).trim();
+      this.draftQuote = selected ? selected.slice(0, 2048) : null;
+      this.renderComposer();
+    });
     this.commentSubmit = document.createElement("button");
     this.commentSubmit.type = "submit";
     this.commentSubmit.className = KIT.primary;
     this.commentSubmit.textContent = "Comment";
     const composeActions = document.createElement("div");
     composeActions.className = "comment-compose-actions";
-    composeActions.append(quoteButton, this.commentSubmit);
+    composeActions.append(this.commentSubmit);
     this.commentForm.append(this.commentQuote, this.commentInput, composeActions);
     this.commentForm.addEventListener("submit", (event) => {
       event.preventDefault();
       const markdown = this.commentInput.value.trim();
       if (!markdown) return;
+      const documentId = controller.state.openDocumentId;
       void controller.addComment(markdown, this.draftQuote, this.replyTo).then((ok) => {
-        if (ok) {
+        if (ok && controller.state.openDocumentId === documentId) {
           this.commentInput.value = "";
           this.draftQuote = null;
           this.replyTo = null;
@@ -335,17 +337,21 @@ export class DocumentsView {
       const reply = document.createElement("span");
       reply.className = "comment-reply-to";
       reply.textContent = "Replying to a comment";
-      this.commentQuote.append(reply);
+      this.commentQuote.append(reply, icon("x", "Clear reply", () => {
+        this.replyTo = null;
+        this.renderComposer();
+      }));
     }
     if (this.draftQuote !== null) {
+      const cue = document.createElement("span");
+      cue.className = "comment-quote-cue";
+      cue.textContent = "Commenting on highlighted text";
       const quote = document.createElement("span");
+      quote.className = "comment-quote-excerpt";
       quote.textContent = this.draftQuote;
-      this.commentQuote.append(quote);
-    }
-    if (!this.commentQuote.hidden) {
-      this.commentQuote.append(button("Clear", KIT.secondary, () => {
+      this.commentQuote.append(cue, quote, icon("x", "Clear quote", () => {
         this.draftQuote = null;
-        this.replyTo = null;
+        this.textarea.setSelectionRange(this.textarea.selectionEnd, this.textarea.selectionEnd);
         this.renderComposer();
       }));
     }
@@ -470,7 +476,12 @@ export class DocumentsView {
   }
 
   render(): void {
-    const { snapshot, busy, error, showArchived } = this.controller.state;
+    const { snapshot, busy, error, showArchived, openDocumentId } = this.controller.state;
+    if (this.composerDocumentId !== openDocumentId) {
+      this.composerDocumentId = openDocumentId;
+      this.draftQuote = null;
+      this.replyTo = null;
+    }
     this.status.textContent = AVAILABILITY_LABEL[snapshot.availability];
     this.archivedToggle.checked = showArchived;
     this.warnings.replaceChildren(

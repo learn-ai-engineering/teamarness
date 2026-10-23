@@ -53,6 +53,8 @@ button, input, select, textarea { font: inherit; }
 .comment-author { font-weight: 650; color: var(--teamarness-color-text); }
 .comment-quote { margin: .3rem 0; padding: .2rem .6rem; border-left: 3px solid var(--teamarness-color-accent); color: var(--teamarness-color-text-muted); font-size: .85rem; white-space: pre-wrap; }
 .comment-quote--draft { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.comment-quote-cue { font-weight: 650; color: var(--teamarness-color-text); }
+.comment-quote-excerpt { min-width: 0; max-height: 5rem; overflow: auto; overflow-wrap: anywhere; }
 .comment-body > :first-child { margin-top: .2rem; }
 .comment-body > :last-child { margin-bottom: .2rem; }
 .comment-body--pending { color: var(--teamarness-color-text-muted); font-style: italic; }
