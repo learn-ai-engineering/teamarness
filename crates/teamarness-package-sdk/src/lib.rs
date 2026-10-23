@@ -120,7 +120,9 @@ impl BackendError {
         self.outcome_uncertain
     }
 
-    pub(crate) fn with_outcome_uncertain(mut self, uncertain: bool) -> Self {
+    /// Marks a dispatched command's error as possibly committed. This also forbids retry.
+    #[must_use]
+    pub fn with_outcome_uncertain(mut self, uncertain: bool) -> Self {
         self.outcome_uncertain = uncertain;
         if uncertain {
             self.retryable = false;

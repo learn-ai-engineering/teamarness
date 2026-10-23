@@ -36,6 +36,7 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
         cause.retryable(),
         json!({ "causeCode": cause.code() }),
     )
+    .with_outcome_uncertain(cause.outcome_uncertain())
 }
 /// What the Package tells the UI about synchronization.
 ///
@@ -561,11 +562,16 @@ async fn append(
                 )
                 .map_err(|_| storage_failed())
         })
-        .await?;
+        .await
+        .map_err(|failure| failure.with_outcome_uncertain(true))?;
     match outcome {
         IngestResult::Applied | IngestResult::Duplicate => {}
-        IngestResult::Deferred(_) => return Err(error("conversations.deferred", true)),
-        IngestResult::Quarantined(_) => return Err(error("conversations.rejected", false)),
+        IngestResult::Deferred(_) => {
+            return Err(error("conversations.deferred", false).with_outcome_uncertain(true));
+        }
+        IngestResult::Quarantined(_) => {
+            return Err(error("conversations.rejected", false).with_outcome_uncertain(true));
+        }
     }
     Ok(json!({ "ok": true }))
 }
@@ -1256,6 +1262,60 @@ mod session_tests {
             .unwrap();
         assert!(session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap() > 0);
         events.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn uncertain_log_append_failure_remains_uncertain_at_port_boundary() {
+        let cause =
+            BackendError::new("outcome_unknown", false, json!({})).with_outcome_uncertain(true);
+        let failure = super::capability_error("message.post", cause);
+        assert!(failure.outcome_uncertain());
+        assert!(!failure.retryable());
+    }
+
+    #[tokio::test]
+    async fn committed_post_with_failed_local_projection_is_uncertain_and_not_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let store = session.store();
+        let before = session
+            .scripted
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| call.method == "append")
+            .count();
+        store.fail_next_ingest_for_test();
+        let failure = session
+            .harness
+            .request(
+                "teamarness.port.command.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":0,
+                    "port":"message.post", "actor":{"kind":"person","identity":ALICE},
+                    "request":{"channelId":hex_id(GENERAL_ID),"markdown":"committed once"}
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "conversations.storage_failed");
+        assert!(
+            failure.outcome_uncertain(),
+            "the append returned a durable commit"
+        );
+        assert!(
+            !failure.retryable(),
+            "replaying could duplicate the committed post"
+        );
+        assert_eq!(
+            session
+                .scripted
+                .recorded_calls()
+                .into_iter()
+                .filter(|call| call.method == "append")
+                .count(),
+            before + 1,
+        );
         session.harness.shutdown().await.unwrap();
     }
 

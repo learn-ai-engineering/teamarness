@@ -288,6 +288,17 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     })).await;
     assert_eq!(owned["error"], "provider_error");
     assert_eq!(owned["details"]["provider"]["code"], "fixture.rejected");
+    let committed = request(&host, &mount, "committed-error", "fixture.capability", serde_json::json!({
+        "capability":"teamarness.package-ports","method":"invoke",
+        "arguments":{"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"committed_error"}}
+    })).await;
+    assert_eq!(committed["error"], "provider_error");
+    assert_eq!(
+        committed["details"]["provider"]["code"],
+        "fixture.committed"
+    );
+    assert_eq!(committed["outcomeUncertain"], true);
+    assert_eq!(committed["retryable"], false);
     let forged = request(&host, &mount, "forged", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
         "arguments":{"contract":"com.example.messages","port":"message.post","kind":"command",

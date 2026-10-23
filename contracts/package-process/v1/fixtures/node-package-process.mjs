@@ -615,6 +615,9 @@ async function serve() {
           send({ kind: "response", id: frame.id, payload: { accepted: "not a boolean" } });
         } else if (frame.payload.request.text === "provider_error") {
           send({ kind: "error", id: frame.id, code: "fixture.rejected", retryable: false, details: { reason: "fixture" } });
+        } else if (frame.payload.request.text === "committed_error") {
+          send({ kind: "error", id: frame.id, code: "fixture.committed", retryable: false,
+            outcomeUncertain: true, details: { reason: "post_commit_projection" } });
         } else {
           send({ kind: "response", id: frame.id, payload: frame.operation === "teamarness.port.query.v1"
             ? { accepted: true, actor: frame.payload.actor } : { accepted: true } });

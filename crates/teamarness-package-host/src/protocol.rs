@@ -1547,9 +1547,21 @@ impl ProcessClient {
                 Err(error)
             }
             Err(_) => {
-                self.send_cancel(&id).await?;
+                if let Err(mut error) = self.send_cancel(&id).await {
+                    // The command crossed the writer before cancellation failed. Retire
+                    // its id and do not claim that the failed cancel undid its effect.
+                    self.state.lock().await.retire_request(&id);
+                    self.pending.lock().await.remove(&id);
+                    error.outcome_uncertain |= state_changing;
+                    return Err(error);
+                }
                 match tokio::time::timeout(Duration::from_millis(500), &mut receiver).await {
-                    Ok(Ok(result)) => result,
+                    Ok(Ok(result)) => result.map_err(|mut error| {
+                        // Even a Provider-owned or overloaded error arriving after the
+                        // deadline cannot prove that a dispatched command did not commit.
+                        error.outcome_uncertain |= state_changing;
+                        error
+                    }),
                     _ => {
                         // Retire before the adapter entry goes, in that order
                         // and for the same reason as `cancel`: between the two
@@ -1809,6 +1821,96 @@ mod tests {
             "a committed acknowledgement is not owed twice: the repeat takes \
              the ignore verdict (CF-002), releasing no credit"
         );
+    }
+
+    /// A late cancellation acknowledgement does not undo an accepted command.
+    #[tokio::test]
+    async fn timed_out_command_with_grace_error_is_uncertain() {
+        let (input, _peer) = tokio::io::duplex(64);
+        let client = start(input, tokio::io::sink());
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_inner(
+                        "h:late-command".into(),
+                        "teamarness.port.command.v1",
+                        None,
+                        crate::PackageValue::Object(Default::default()),
+                        Duration::from_millis(20),
+                        true,
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        // The injected terminal arrives after the request deadline, inside the
+        // explicit 500 ms cancellation grace. This delay tests that timing edge.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let sender = client
+            .pending
+            .lock()
+            .await
+            .remove("h:late-command")
+            .expect("the dispatched request is still awaiting grace");
+        sender
+            .send(Err(WireFailure::new(PackageErrorCode::Cancelled)))
+            .expect("the request is still waiting");
+        let failure = request.await.unwrap().unwrap_err();
+        assert_eq!(failure.code, PackageErrorCode::Cancelled);
+        assert!(failure.outcome_uncertain);
+    }
+
+    #[tokio::test]
+    async fn refused_cancel_after_command_dispatch_is_uncertain_and_retires_id() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (input, _peer) = tokio::io::duplex(64);
+        let client = start(input, tokio::io::sink());
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let request = tokio::spawn({
+            let client = client.clone();
+            let dispatched = dispatched.clone();
+            async move {
+                client
+                    .request_inner(
+                        "h:cancel-refused".into(),
+                        "teamarness.port.command.v1",
+                        None,
+                        crate::PackageValue::Object(Default::default()),
+                        Duration::from_millis(100),
+                        true,
+                        Some(dispatched),
+                        None,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !dispatched.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer accepted the command");
+        let _block = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .writer
+                .data_bytes
+                .clone()
+                .acquire_many_owned(super::DATA_BYTES as u32),
+        )
+        .await
+        .expect("writer releases accepted request bytes")
+        .unwrap();
+        let failure = request.await.unwrap().unwrap_err();
+        assert_eq!(failure.code, PackageErrorCode::Overloaded);
+        assert!(failure.outcome_uncertain);
+        assert!(!client.pending.lock().await.contains_key("h:cancel-refused"));
     }
 
     /// A refused writer enqueue is certain: it must not publish a Provider join.

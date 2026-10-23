@@ -451,13 +451,17 @@ fn terminal(id: &str, result: Result<JsonValue, BackendError>) -> JsonValue {
 }
 
 fn error_frame(id: &str, error: &BackendError) -> JsonValue {
-    object([
+    let mut frame = object([
         ("kind", JsonValue::String("error".into())),
         ("id", JsonValue::String(id.into())),
         ("code", JsonValue::String(error.code.clone())),
         ("retryable", JsonValue::Bool(error.retryable)),
         ("details", error.details.clone()),
-    ])
+    ]);
+    if error.outcome_uncertain() {
+        frame["outcomeUncertain"] = JsonValue::Bool(true);
+    }
+    frame
 }
 
 fn stream_close(stream_id: &str, code: &str) -> JsonValue {
@@ -491,6 +495,17 @@ mod tests {
 
     fn frame(value: JsonValue) -> Frame {
         Frame::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn uncertain_author_error_is_a_nonretryable_wire_error() {
+        let error = BackendError::new("fixture.committed", true, empty_object())
+            .with_outcome_uncertain(true);
+        let value = terminal("p:command", Err(error));
+        assert_eq!(value["outcomeUncertain"], true);
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["code"], "fixture.committed");
+        Frame::try_from(value).expect("the uncertain error is a valid Process frame");
     }
 
     // Verifies: TEAM.SYS.PKG-R14
