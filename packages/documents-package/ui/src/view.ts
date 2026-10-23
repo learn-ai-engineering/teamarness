@@ -27,6 +27,26 @@ function button(label: string, className: string, onClick: () => void): HTMLButt
   return element;
 }
 
+const ICON_PATHS = {
+  plus: "M12 5v14 M5 12h14", x: "M5 5l14 14 M19 5L5 19",
+  chevron: "m9 18 6-6-6-6", more: "M5 12h.01 M12 12h.01 M19 12h.01",
+  panel: "M4 4h16v16H4z M9 4v16", comments: "M4 4h16v16H4z M15 4v16",
+} as const;
+
+function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void): HTMLButtonElement {
+  const control = button("", "documents-icon", onClick);
+  control.setAttribute("aria-label", label);
+  control.title = label;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", ICON_PATHS[name]);
+  svg.append(path);
+  control.append(svg);
+  return control;
+}
+
 /** A one-field form built once; the view only patches its disabled state. */
 function inlineForm(options: {
   label: string;
@@ -80,14 +100,17 @@ export class DocumentsView {
   private readonly collectionList: HTMLUListElement;
   private readonly collectionForm: ReturnType<typeof inlineForm>;
   private readonly documentForm: ReturnType<typeof inlineForm>;
-  private readonly panelHeader: HTMLElement;
-  private readonly documentList: HTMLUListElement;
   private readonly archivedToggle: HTMLInputElement;
   private readonly editorPane: HTMLElement;
   private readonly editorTitle: HTMLElement;
   private readonly editorStatus: HTMLElement;
   private readonly textarea: HTMLTextAreaElement;
-  private readonly closeButton: HTMLButtonElement;
+  private readonly rail: HTMLElement;
+  private readonly shell: HTMLElement;
+  private readonly leftHandle: HTMLElement;
+  private readonly rightHandle: HTMLElement;
+  private readonly showNavigation: HTMLButtonElement;
+  private readonly commentsToggle: HTMLButtonElement;
   private readonly previewButton: HTMLButtonElement;
   private readonly preview: HTMLElement;
   private readonly commentsPanel: HTMLElement;
@@ -99,8 +122,27 @@ export class DocumentsView {
   private readonly controller: DocumentsController;
   private draftQuote: string | null = null;
   private replyTo: string | null = null;
-  private renamingDocumentId: string | null = null;
-  private renamingCollection = false;
+  private readonly expanded = new Set<string>();
+  private selectedCollectionId: string | null = null;
+  private leftOpen = true;
+  private commentsOpen = true;
+  private createTarget: string | null = null;
+  private activeMenu: HTMLElement | null = null;
+  private activeMenuButton: HTMLButtonElement | null = null;
+  private renameForm: ReturnType<typeof inlineForm> | null = null;
+  private renameTarget: string | null = null;
+  private readonly onOutsideClick = (event: Event): void => {
+    if (this.activeMenu && !event.composedPath().includes(this.activeMenu)
+      && !event.composedPath().includes(this.activeMenuButton as EventTarget)) this.dismissMenu();
+  };
+  private readonly onEscape = (event: Event): void => {
+    if ((event as KeyboardEvent).key === "Escape" && this.activeMenu) {
+      const trigger = this.activeMenuButton;
+      this.dismissMenu();
+      trigger?.focus();
+      (event as KeyboardEvent).preventDefault();
+    }
+  };
 
   constructor(root: ShadowRoot | HTMLElement, controller: DocumentsController, title: string) {
     this.controller = controller;
@@ -115,13 +157,23 @@ export class DocumentsView {
     this.status = document.createElement("p");
     this.status.className = "availability";
     this.status.setAttribute("role", "status");
+    this.showNavigation = icon("panel", "Show navigation", () => { this.leftOpen = true; this.renderRails(); });
+    this.showNavigation.hidden = true;
+    this.commentsToggle = icon("comments", "Hide Comments", () => {
+      this.commentsOpen = !this.commentsOpen;
+      this.renderRails();
+    });
+    this.commentsToggle.classList.add("comments-toggle");
+    const headerActions = document.createElement("div");
+    headerActions.className = "documents-header-actions";
+    headerActions.append(this.showNavigation, this.commentsToggle);
     const archivedLabel = document.createElement("label");
     archivedLabel.className = "archived-toggle";
     this.archivedToggle = document.createElement("input");
     this.archivedToggle.type = "checkbox";
     this.archivedToggle.addEventListener("change", () => controller.toggleArchived());
     archivedLabel.append(this.archivedToggle, document.createTextNode(" Show archived"));
-    header.append(heading, this.status, archivedLabel);
+    header.append(heading, this.status, headerActions);
 
     this.warnings = document.createElement("div");
     this.warnings.className = "documents-warnings";
@@ -130,42 +182,48 @@ export class DocumentsView {
     this.error.setAttribute("role", "alert");
     this.error.hidden = true;
 
-    const shell = document.createElement("div");
-    shell.className = "documents-shell";
+    this.shell = document.createElement("div");
+    this.shell.className = "documents-shell";
 
-    const rail = document.createElement("aside");
-    rail.className = "collection-rail";
-    rail.setAttribute("aria-label", "Collections");
+    this.rail = document.createElement("aside");
+    this.rail.className = "collection-rail";
+    this.rail.setAttribute("aria-label", "Collections and Documents");
+    const railHeader = document.createElement("div");
+    railHeader.className = "collection-rail-header";
     const railHeading = document.createElement("h2");
     railHeading.textContent = "Collections";
+    const hideNavigation = icon("panel", "Hide navigation", () => { this.leftOpen = false; this.renderRails(); });
+    const addCollection = icon("plus", "Add Collection", () => {
+      this.createTarget = "collection";
+      this.render();
+      this.collectionForm.input.focus();
+    });
+    railHeader.append(hideNavigation, railHeading, archivedLabel, addCollection);
     this.collectionList = document.createElement("ul");
     this.collectionList.className = "collection-list";
     this.collectionForm = inlineForm({
-      label: "New Collection name",
-      placeholder: "New Collection",
-      submitLabel: "Add",
-      maxLength: 128,
-      className: "collection-create",
-      onSubmit: (name) => controller.createCollection(name),
+      label: "New Collection name", placeholder: "New Collection", submitLabel: "Add",
+      maxLength: 128, className: "collection-create",
+      onSubmit: async (name) => {
+        const ok = await controller.createCollection(name);
+        if (ok) { this.createTarget = null; this.render(); }
+        return ok;
+      },
     });
-    rail.append(railHeading, this.collectionList, this.collectionForm.form);
-
-    const panel = document.createElement("section");
-    panel.className = "documents-panel";
-    this.panelHeader = document.createElement("div");
-    this.panelHeader.className = "documents-panel-header";
-    this.documentList = document.createElement("ul");
-    this.documentList.className = "document-list";
-    this.documentList.setAttribute("aria-label", "Documents");
     this.documentForm = inlineForm({
-      label: "New Document title",
-      placeholder: "New Document title",
-      submitLabel: "Create",
-      maxLength: 256,
-      className: "document-create",
-      onSubmit: (title) => controller.createDocument(title),
+      label: "New Document title", placeholder: "New Document title", submitLabel: "Create",
+      maxLength: 256, className: "document-create",
+      onSubmit: async (title) => {
+        const ok = await controller.createDocument(title);
+        if (ok) { this.createTarget = null; this.render(); }
+        return ok;
+      },
     });
-    panel.append(this.panelHeader, this.documentList, this.documentForm.form);
+    this.collectionForm.form.append(icon("x", "Cancel", () => { this.createTarget = null; this.render(); }));
+    this.documentForm.form.append(icon("x", "Cancel", () => { this.createTarget = null; this.render(); }));
+    this.rail.append(railHeader, this.collectionList);
+    this.leftHandle = this.resizeHandle("left");
+    this.rightHandle = this.resizeHandle("right");
 
     // --- editor pane (built once; shown when a Document is open) ---
     this.editorPane = document.createElement("section");
@@ -180,8 +238,7 @@ export class DocumentsView {
     this.editorStatus.setAttribute("role", "status");
     this.previewButton = button("Preview", KIT.secondary, () => controller.togglePreview());
     this.previewButton.setAttribute("aria-pressed", "false");
-    this.closeButton = button("Close", KIT.secondary, () => { void controller.closeDocument(); });
-    editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton, this.closeButton);
+    editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton);
     this.preview = document.createElement("article");
     this.preview.className = "editor-preview";
     this.preview.setAttribute("aria-label", "Rendered document");
@@ -244,10 +301,11 @@ export class DocumentsView {
       });
     });
     this.commentsPanel.append(commentsHeading, this.commentList, this.commentForm);
-    this.editorPane.append(this.commentsPanel);
-
-    shell.append(rail, panel, this.editorPane);
-    this.page.append(header, this.warnings, this.error, shell);
+    this.shell.append(this.rail, this.leftHandle, this.editorPane, this.rightHandle, this.commentsPanel);
+    this.page.append(header, this.warnings, this.error, this.shell);
+    root.addEventListener("click", this.onOutsideClick);
+    root.addEventListener("keydown", this.onEscape);
+    document.addEventListener("click", this.onOutsideClick);
     root.append(this.page);
   }
 
@@ -382,8 +440,10 @@ export class DocumentsView {
   private renderEditor(): void {
     const open = this.controller.openDocument;
     const editor = this.controller.openEditor;
-    this.editorPane.hidden = open === null;
-    if (open === null) return;
+    this.editorPane.hidden = false;
+    this.commentsPanel.hidden = open === null || !this.commentsOpen;
+    this.rightHandle.hidden = this.commentsPanel.hidden;
+    if (open === null) { this.editorTitle.textContent = "Choose a Document"; this.textarea.hidden = true; this.preview.hidden = true; return; }
     this.renderComments();
     this.editorTitle.textContent = open.title;
     if (!editor) {
@@ -424,86 +484,190 @@ export class DocumentsView {
     this.error.hidden = error === null;
     this.error.textContent = error ?? "";
     this.collectionForm.submit.disabled = busy;
-    this.renderCollections();
-    this.renderPanel();
+    const selected = this.controller.state.selectedCollectionId;
+    if (selected !== this.selectedCollectionId) {
+      this.selectedCollectionId = selected;
+      if (selected) this.expanded.add(selected);
+    }
     this.documentForm.submit.disabled = busy || this.controller.selectedCollection === null;
-    this.documentForm.form.hidden = this.controller.selectedCollection === null;
+    this.renderCollections();
     this.renderEditor();
+    this.renderRails();
   }
 
   dispose(): void {
+    this.page.getRootNode().removeEventListener("click", this.onOutsideClick);
+    this.page.getRootNode().removeEventListener("keydown", this.onEscape);
+    document.removeEventListener("click", this.onOutsideClick);
     this.page.remove();
   }
 
-  private renderCollections(): void {
-    const selected = this.controller.state.selectedCollectionId;
-    this.collectionList.replaceChildren(
-      ...this.controller.visibleCollections.map((collection) => {
-        const item = document.createElement("li");
-        const select = button(collection.name, "collection-button", () => {
-          this.renamingCollection = false;
-          this.controller.selectCollection(collection.id);
-        });
-        if (collection.archived) select.classList.add("is-archived");
-        if (collection.id === selected) select.setAttribute("aria-current", "page");
-        item.append(select);
-        return item;
-      }),
-    );
+  private renderRails(): void {
+    this.rail.hidden = !this.leftOpen;
+    this.leftHandle.hidden = !this.leftOpen;
+    this.showNavigation.hidden = this.leftOpen;
+    this.commentsToggle.setAttribute("aria-label", this.commentsOpen ? "Hide Comments" : "Show Comments");
+    this.commentsToggle.title = this.commentsOpen ? "Hide Comments" : "Show Comments";
+    this.commentsToggle.setAttribute("aria-pressed", String(this.commentsOpen));
+    const showComments = this.commentsOpen && this.controller.openDocument !== null;
+    this.commentsPanel.hidden = !showComments;
+    this.rightHandle.hidden = !showComments;
   }
 
-  private renderPanel(): void {
-    const collection = this.controller.selectedCollection;
-    this.panelHeader.replaceChildren();
-    if (collection === null) {
-      const empty = document.createElement("p");
-      empty.className = "documents-empty";
-      empty.textContent = this.controller.state.snapshot.collections.length === 0
-        ? "Create a Collection to start adding documents."
-        : "Select a Collection.";
-      this.panelHeader.append(empty);
-      this.documentList.replaceChildren();
-      return;
-    }
-    const busy = this.controller.state.busy;
-    if (this.renamingCollection) {
-      const rename = inlineForm({
-        label: "Collection name",
-        placeholder: "Collection name",
-        submitLabel: "Save",
-        maxLength: 128,
-        className: "collection-rename",
-        onSubmit: async (name) => {
-          const ok = await this.controller.renameCollection(collection.id, name);
-          if (ok) this.renamingCollection = false;
-          this.render();
-          return ok;
-        },
+  private resizeHandle(side: "left" | "right"): HTMLElement {
+    const handle = document.createElement("div");
+    handle.className = `${side}-resizer documents-resizer`;
+    handle.setAttribute("role", "separator");
+    handle.setAttribute("aria-label", side === "left" ? "Resize navigation" : "Resize Comments");
+    handle.setAttribute("aria-orientation", "vertical");
+    handle.tabIndex = 0;
+    let start = 0;
+    let width = 0;
+    const variable = side === "left" ? "--left-width" : "--right-width";
+    const current = () => parseInt(this.shell.style.getPropertyValue(variable), 10) || (side === "left" ? 250 : 300);
+    const set = (value: number) => {
+      const max = Math.min(440, Math.max(190, this.shell.clientWidth - 320));
+      this.shell.style.setProperty(variable, `${Math.max(190, Math.min(max, value))}px`);
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      start = event.clientX;
+      width = current();
+      handle.setPointerCapture?.(event.pointerId);
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!handle.hasPointerCapture?.(event.pointerId)) return;
+      set(width + (event.clientX - start) * (side === "left" ? 1 : -1));
+    });
+    handle.addEventListener("pointerup", (event) => {
+      if (handle.hasPointerCapture?.(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    });
+    handle.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      set(current() + (event.key === "ArrowRight" ? 20 : -20) * (side === "left" ? 1 : -1));
+    });
+    return handle;
+  }
+
+  private dismissMenu(): void {
+    this.activeMenu?.remove();
+    this.activeMenuButton?.setAttribute("aria-expanded", "false");
+    this.activeMenu = null;
+    this.activeMenuButton = null;
+  }
+
+  private menu(row: HTMLElement, trigger: HTMLButtonElement, actions: HTMLElement): void {
+    trigger.setAttribute("aria-haspopup", "menu");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.addEventListener("click", () => {
+      if (this.activeMenuButton === trigger) { this.dismissMenu(); return; }
+      this.dismissMenu();
+      row.append(actions);
+      this.activeMenu = actions;
+      this.activeMenuButton = trigger;
+      trigger.setAttribute("aria-expanded", "true");
+      (actions.querySelector("button") as HTMLButtonElement | null)?.focus();
+    });
+  }
+
+  private startRename(kind: "collection" | "document", id: string, value: string): void {
+    this.dismissMenu();
+    this.renameTarget = `${kind}:${id}`;
+    const rename = inlineForm({
+      label: kind === "collection" ? "Collection name" : "Document title",
+      placeholder: kind === "collection" ? "Collection name" : "Document title",
+      submitLabel: "Save", maxLength: kind === "collection" ? 128 : 256,
+      className: kind === "collection" ? "collection-rename" : "document-rename",
+      onSubmit: async (name) => {
+        const ok = await (kind === "collection" ? this.controller.renameCollection(id, name) : this.controller.renameDocument(id, name));
+        if (ok) { this.renameTarget = null; this.renameForm = null; }
+        this.render();
+        return ok;
+      },
+    });
+    rename.input.value = value;
+    rename.form.append(icon("x", "Cancel", () => {
+      this.renameTarget = null;
+      this.renameForm = null;
+      this.render();
+    }));
+    this.renameForm = rename;
+    this.render();
+    rename.input.focus();
+  }
+
+  private renderCollections(): void {
+    this.dismissMenu();
+    const selected = this.controller.state.selectedCollectionId;
+    const rows = this.controller.visibleCollections.map((collection) => {
+      const item = document.createElement("li");
+      item.className = "collection-group";
+      const row = document.createElement("div");
+      row.className = "tree-row";
+      if (collection.archived) row.classList.add("is-archived");
+      const expanded = this.expanded.has(collection.id);
+      const expand = icon("chevron", `${expanded ? "Collapse" : "Expand"} ${collection.name}`, () => {
+        if (expanded) this.expanded.delete(collection.id);
+        else this.expanded.add(collection.id);
+        this.render();
       });
-      rename.input.value = collection.name;
-      rename.form.append(button("Cancel", KIT.secondary, () => { this.renamingCollection = false; this.render(); }));
-      this.panelHeader.append(rename.form);
-    } else {
-      const name = document.createElement("h2");
-      name.className = "collection-name";
-      name.textContent = collection.name + (collection.archived ? " (archived)" : "");
+      expand.setAttribute("aria-expanded", String(expanded));
+      expand.classList.toggle("is-expanded", expanded);
+      const select = button(collection.name, "collection-button", () => {
+        if (this.controller.state.selectedCollectionId !== collection.id) this.expanded.add(collection.id);
+        this.controller.selectCollection(collection.id);
+      });
+      if (collection.id === selected) select.setAttribute("aria-current", "page");
+      const add = icon("plus", `Add Document to ${collection.name}`, () => {
+        this.controller.selectCollection(collection.id);
+        this.expanded.add(collection.id);
+        this.createTarget = collection.id;
+        this.render();
+        this.documentForm.input.focus();
+      });
+      const trigger = icon("more", `Actions for ${collection.name}`, () => {});
       const actions = document.createElement("div");
-      actions.className = "collection-actions";
+      actions.className = "collection-actions action-menu";
+      actions.setAttribute("role", "menu");
       actions.append(
-        button("Rename", KIT.secondary, () => { this.renamingCollection = true; this.render(); }),
-        collection.archived
-          ? button("Restore", KIT.secondary, () => { void this.controller.restoreCollection(collection.id); })
-          : button("Archive", KIT.secondary, () => { void this.controller.archiveCollection(collection.id); }),
+        button("Rename", KIT.secondary, () => this.startRename("collection", collection.id, collection.name)),
+        button(collection.archived ? "Restore" : "Archive", KIT.secondary, () => {
+          this.dismissMenu();
+          void (collection.archived ? this.controller.restoreCollection(collection.id) : this.controller.archiveCollection(collection.id));
+        }),
       );
-      for (const control of actions.querySelectorAll("button")) control.disabled = busy;
-      this.panelHeader.append(name, actions);
-    }
-    this.documentList.replaceChildren(...this.controller.visibleDocuments.map((d) => this.documentRow(d, collection)));
-    if (this.controller.visibleDocuments.length === 0) {
-      const empty = document.createElement("li");
-      empty.className = "documents-empty";
-      empty.textContent = "No documents yet.";
-      this.documentList.append(empty);
+      for (const control of actions.querySelectorAll("button")) control.disabled = this.controller.state.busy;
+      this.menu(item, trigger, actions);
+      row.append(expand, select, add, trigger);
+      item.append(row);
+      if (this.renameTarget === `collection:${collection.id}` && this.renameForm) item.append(this.renameForm.form);
+      if (expanded) {
+        const list = document.createElement("ul");
+        list.className = "document-list";
+        list.setAttribute("aria-label", `Documents in ${collection.name}`);
+        const documents = this.controller.state.snapshot.documents.filter((d) =>
+          d.collectionId === collection.id && (this.controller.state.showArchived || !d.archived));
+        list.append(...documents.map((d) => this.documentRow(d, collection)));
+        if (!documents.length) {
+          const empty = document.createElement("li");
+          empty.className = "documents-empty";
+          empty.textContent = "No documents yet.";
+          list.append(empty);
+        }
+        if (this.createTarget === collection.id) {
+          const create = document.createElement("li");
+          create.append(this.documentForm.form);
+          list.append(create);
+        }
+        item.append(list);
+      }
+      return item;
+    });
+    this.collectionList.replaceChildren(...rows);
+    if (this.createTarget === "collection") {
+      const create = document.createElement("li");
+      create.append(this.collectionForm.form);
+      this.collectionList.prepend(create);
     }
   }
 
@@ -511,37 +675,26 @@ export class DocumentsView {
     const row = document.createElement("li");
     row.className = "document-row";
     if (document_.archived) row.classList.add("is-archived");
-    const busy = this.controller.state.busy;
-    if (this.renamingDocumentId === document_.id) {
-      const rename = inlineForm({
-        label: "Document title",
-        placeholder: "Document title",
-        submitLabel: "Save",
-        maxLength: 256,
-        className: "document-rename",
-        onSubmit: async (title) => {
-          const ok = await this.controller.renameDocument(document_.id, title);
-          if (ok) this.renamingDocumentId = null;
-          this.render();
-          return ok;
-        },
-      });
-      rename.input.value = document_.title;
-      rename.form.append(button("Cancel", KIT.secondary, () => { this.renamingDocumentId = null; this.render(); }));
-      row.append(rename.form);
+    if (this.renameTarget === `document:${document_.id}` && this.renameForm) {
+      row.append(this.renameForm.form);
       return row;
     }
     const title = button(document_.title + (document_.archived ? " (archived)" : ""), "document-title", () => {
+      this.controller.selectCollection(collection.id);
+      this.expanded.add(collection.id);
       void this.controller.openDocumentById(document_.id);
     });
     if (this.controller.state.openDocumentId === document_.id) title.setAttribute("aria-current", "true");
+    const trigger = icon("more", `Actions for ${document_.title}`, () => {});
     const actions = document.createElement("div");
-    actions.className = "document-actions";
+    actions.className = "document-actions action-menu";
+    actions.setAttribute("role", "menu");
     actions.append(
-      button("Rename", KIT.secondary, () => { this.renamingDocumentId = document_.id; this.render(); }),
-      document_.archived
-        ? button("Restore", KIT.secondary, () => { void this.controller.restoreDocument(document_.id); })
-        : button("Archive", KIT.secondary, () => { void this.controller.archiveDocument(document_.id); }),
+      button("Rename", KIT.secondary, () => this.startRename("document", document_.id, document_.title)),
+      button(document_.archived ? "Restore" : "Archive", KIT.secondary, () => {
+        this.dismissMenu();
+        void (document_.archived ? this.controller.restoreDocument(document_.id) : this.controller.archiveDocument(document_.id));
+      }),
     );
     const destinations = this.controller.state.snapshot.collections.filter((c) => !c.archived && c.id !== collection.id);
     if (destinations.length > 0) {
@@ -559,13 +712,14 @@ export class DocumentsView {
         move.append(option);
       }
       move.addEventListener("change", () => {
-        if (move.value) void this.controller.moveDocument(document_.id, move.value);
+        if (move.value) { this.dismissMenu(); void this.controller.moveDocument(document_.id, move.value); }
       });
-      move.disabled = busy;
+      move.disabled = this.controller.state.busy;
       actions.append(move);
     }
-    for (const control of actions.querySelectorAll("button")) control.disabled = busy;
-    row.append(title, actions);
+    for (const control of actions.querySelectorAll("button")) control.disabled = this.controller.state.busy;
+    this.menu(row, trigger, actions);
+    row.append(title, trigger);
     return row;
   }
 }

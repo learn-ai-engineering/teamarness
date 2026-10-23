@@ -38,9 +38,11 @@ function backend(current: () => DocumentsSnapshot) {
       "documents.collection.create": record("documents.collection.create"),
       "documents.collection.rename": record("documents.collection.rename"),
       "documents.collection.archive": record("documents.collection.archive"),
+      "documents.collection.restore": record("documents.collection.restore"),
       "documents.document.create": record("documents.document.create"),
       "documents.document.rename": record("documents.document.rename"),
       "documents.document.archive": record("documents.document.archive"),
+      "documents.document.restore": record("documents.document.restore"),
       "documents.document.move": record("documents.document.move"),
     },
     subscriptions: { "documents.changes": () => undefined },
@@ -61,7 +63,11 @@ describe("Documents mount", () => {
     expect(root.querySelector("[role=status]")?.textContent).toBe("Up to date");
     expect(texts(root, ".collection-button")).toEqual(["Planning"]);
     expect(root.querySelector(".collection-button")?.getAttribute("aria-current")).toBe("page");
+    expect(root.querySelector(".collection-list .document-title")?.textContent).toBe("Q4 plan");
+    expect(root.querySelector(".documents-panel")).toBeNull();
     expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
+    expect(root.querySelector('.collection-create')).toBeNull();
+    expect(root.querySelector('.document-create')).toBeNull();
     const toggle = root.querySelector(".archived-toggle input") as HTMLInputElement;
     toggle.checked = true;
     toggle.dispatchEvent(new Event("change"));
@@ -75,6 +81,7 @@ describe("Documents mount", () => {
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
 
+    (root.querySelector('[aria-label="Add Collection"]') as HTMLButtonElement).click();
     const collectionInput = root.querySelector(".collection-create input") as HTMLInputElement;
     collectionInput.value = "  Roadmap ";
     (root.querySelector(".collection-create") as HTMLFormElement).requestSubmit();
@@ -82,6 +89,7 @@ describe("Documents mount", () => {
     expect(calls.at(-1)).toEqual({ operation: "documents.collection.create", payload: { name: "Roadmap" } });
     expect(collectionInput.value).toBe("");
 
+    (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
     const documentInput = root.querySelector(".document-create input") as HTMLInputElement;
     documentInput.value = "Hiring plan";
     (root.querySelector(".document-create") as HTMLFormElement).requestSubmit();
@@ -91,6 +99,7 @@ describe("Documents mount", () => {
       payload: { collectionId: planning, title: "Hiring plan" },
     });
 
+    (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
     const renameButton = [...root.querySelectorAll(".document-actions button")].find((b) => b.textContent === "Rename") as HTMLButtonElement;
     renameButton.click();
     const renameInput = root.querySelector(".document-rename input") as HTMLInputElement;
@@ -101,6 +110,7 @@ describe("Documents mount", () => {
     expect(calls.at(-1)).toEqual({ operation: "documents.document.rename", payload: { documentId: doc, title: "Q4 plan v2" } });
     expect(root.querySelector(".document-rename")).toBeNull();
 
+    (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
     const archiveButton = [...root.querySelectorAll(".document-actions button")].find((b) => b.textContent === "Archive") as HTMLButtonElement;
     archiveButton.click();
     await tick();
@@ -125,8 +135,10 @@ describe("Documents mount", () => {
     expect(texts(root, ".collection-button")).toEqual(["Planning", "Research"]);
     expect(root.querySelector(".collection-button")?.getAttribute("aria-current")).toBe("page");
     expect(texts(root, ".document-title")).toEqual(["Q4 plan", "OKRs"]);
+    (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
     expect(root.querySelector(".document-move")).not.toBeNull();
     // A Collection this Installation created is selected once its record is listed.
+    (root.querySelector('[aria-label="Add Collection"]') as HTMLButtonElement).click();
     const input = root.querySelector(".collection-create input") as HTMLInputElement;
     input.value = "Mine";
     (root.querySelector(".collection-create") as HTMLFormElement).requestSubmit();
@@ -135,7 +147,7 @@ describe("Documents mount", () => {
     current = { ...current, collections: [...current.collections, { id: "9".repeat(64), name: "Mine", archived: false }] };
     await fake.emit("documents.changes", current);
     expect(root.querySelector(".collection-button[aria-current=page]")?.textContent).toBe("Mine");
-    expect(texts(root, ".document-title")).toEqual([]);
+    expect(texts(root, ".document-title")).toEqual(["Q4 plan", "OKRs"]);
     expect(texts(root, ".documents-empty")).toEqual(["No documents yet."]);
     await unmount();
   });
@@ -160,7 +172,7 @@ describe("Documents mount", () => {
     toggle.dispatchEvent(new Event("change"));
     expect(texts(root, ".collection-button")).toContain("Planning");
     ([...root.querySelectorAll(".collection-button")].find((button) => button.textContent === "Planning") as HTMLButtonElement).click();
-    expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
+    expect(texts(root, ".document-title")).toEqual(["Q4 plan", "New plan"]);
     await unmount();
   });
 
@@ -200,9 +212,8 @@ describe("Documents mount", () => {
     await fake.emit("documents.document.text", { documentId: doc, revision: "2", editable: true, origin: "remote", delta: [{ insert: "> intro\n" }] });
     expect(textarea.value).toBe("> intro\n# Q4\n- hire\n");
     expect(textarea.selectionStart).toBe(20);
-    ([...root.querySelectorAll(".editor-header button")].find((b) => b.textContent === "Close") as HTMLButtonElement).click();
-    await tick();
-    expect(pane.hidden).toBe(true);
+    expect(texts(root, ".editor-header button")).not.toContain("Close");
+    expect(pane.hidden).toBe(false);
     await unmount();
   });
 
@@ -408,6 +419,130 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("expands independent Collection branches and opens a nested Document with its Collection selected", async () => {
+    const research = "4".repeat(64);
+    const other = "5".repeat(64);
+    const current = { ...snapshot(), collections: [...snapshot().collections, { id: research, name: "Research", archived: false }],
+      documents: [...snapshot().documents, { id: other, collectionId: research, title: "Notes", archived: false }] };
+    const { fake } = backend(() => current);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
+    (root.querySelector('[aria-label="Expand Research"]') as HTMLButtonElement).click();
+    expect(texts(root, ".document-title")).toEqual(["Q4 plan", "Notes"]);
+    (root.querySelector('[aria-label="Collapse Planning"]') as HTMLButtonElement).click();
+    expect(texts(root, ".document-title")).toEqual(["Notes"]);
+    (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
+    expect(root.querySelector('.collection-button[aria-current="page"]')?.textContent).toBe("Planning");
+    expect(root.querySelector('.document-create')).not.toBeNull();
+    (root.querySelector('.document-create button[aria-label="Cancel"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.document-title')].find((b) => b.textContent === 'Notes') as HTMLButtonElement).click();
+    await tick();
+    expect(root.querySelector('.collection-button[aria-current="page"]')?.textContent).toBe("Research");
+    expect(texts(root, ".document-title")).toEqual(["Q4 plan", "Notes"]);
+    await unmount();
+  });
+
+  it("dismisses menus, preserves rename input on snapshot, and routes restore and move", async () => {
+    const research = "4".repeat(64);
+    const current = { ...snapshot(), collections: [...snapshot().collections, { id: research, name: "Research", archived: false }],
+      documents: [...snapshot().documents, { id: "5".repeat(64), collectionId: planning, title: "Past", archived: true }] };
+    const { fake, calls } = backend(() => current);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    const actions = () => root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement;
+    actions().click();
+    expect(root.querySelector('.document-actions')).not.toBeNull();
+    root.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(root.querySelector('.document-actions')).toBeNull();
+    expect(actions().getAttribute('aria-expanded')).toBe('false');
+    actions().click();
+    document.body.click();
+    expect(root.querySelector('.document-actions')).toBeNull();
+    actions().click();
+    (root.querySelector('.document-actions button') as HTMLButtonElement).click();
+    const input = root.querySelector('.document-rename input') as HTMLInputElement;
+    expect(input.value).toBe('Q4 plan');
+    input.value = 'Still typing';
+    await fake.emit('documents.changes', current);
+    expect(root.querySelector('.document-rename input')).toBe(input);
+    expect(input.value).toBe('Still typing');
+    (root.querySelector('.document-rename button[aria-label="Cancel"]') as HTMLButtonElement).click();
+    expect(root.querySelector('.document-rename')).toBeNull();
+    actions().click();
+    const move = root.querySelector('.document-move') as HTMLSelectElement;
+    move.value = research;
+    move.dispatchEvent(new Event('change'));
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.move', payload: { documentId: doc, collectionId: research } });
+    const toggle = root.querySelector('.archived-toggle input') as HTMLInputElement;
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change'));
+    (root.querySelector('[aria-label="Actions for Past"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.document-row.is-archived .document-actions button')].find((b) => b.textContent === 'Restore') as HTMLButtonElement).click();
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.restore', payload: { documentId: '5'.repeat(64) } });
+    (root.querySelector('[aria-label="Actions for Old"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.collection-actions button')].find((b) => b.textContent === 'Restore') as HTMLButtonElement).click();
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.collection.restore', payload: { collectionId: archive } });
+    (root.querySelector('[aria-label="Actions for Planning"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.collection-actions button')].find((b) => b.textContent === 'Rename') as HTMLButtonElement).click();
+    const collectionName = root.querySelector('.collection-rename input') as HTMLInputElement;
+    expect(collectionName.value).toBe('Planning');
+    collectionName.value = 'Editing';
+    await fake.emit('documents.changes', current);
+    expect(root.querySelector('.collection-rename input')).toBe(collectionName);
+    (root.querySelector('.collection-rename button[aria-label="Cancel"]') as HTMLButtonElement).click();
+    expect(root.querySelector('.collection-rename')).toBeNull();
+    (root.querySelector('[aria-label="Actions for Planning"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.collection-actions button')].find((b) => b.textContent === 'Archive') as HTMLButtonElement).click();
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.collection.archive', payload: { collectionId: planning } });
+    await unmount();
+  });
+
+  it("toggles and resizes both rails without replacing the editor or composer", async () => {
+    const fake = createFakePackageClient({ requests: {
+      "documents.snapshot": () => snapshot(),
+      "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+    }, subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined } });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Draft' });
+    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+    const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
+    composer.value = 'Pending comment';
+    expect(root.querySelectorAll('.comments-toggle')).toHaveLength(1);
+    expect(root.querySelector('.editor-status')?.textContent).toBe('Saved');
+    expect(root.querySelector('.editor-pane .comments-panel')).toBeNull();
+    (root.querySelector('[aria-label="Hide navigation"]') as HTMLButtonElement).click();
+    expect((root.querySelector('.collection-rail') as HTMLElement).hidden).toBe(true);
+    (root.querySelector('[aria-label="Show navigation"]') as HTMLButtonElement).click();
+    (root.querySelector('[aria-label="Hide Comments"]') as HTMLButtonElement).click();
+    expect((root.querySelector('.comments-panel') as HTMLElement).hidden).toBe(true);
+    (root.querySelector('[aria-label="Show Comments"]') as HTMLButtonElement).click();
+    const handle = root.querySelector('.left-resizer') as HTMLElement;
+    handle.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 1, clientX: 200, bubbles: true }));
+    handle.dispatchEvent(new PointerEvent('pointermove', { pointerId: 1, clientX: 240, bubbles: true }));
+    handle.dispatchEvent(new PointerEvent('pointerup', { pointerId: 1, bubbles: true }));
+    expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--left-width')).toBe('190px');
+    const rightHandle = root.querySelector('.right-resizer') as HTMLElement;
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--right-width')).toBe('190px');
+    await fake.emit('documents.changes', snapshot());
+    expect(root.querySelector('.editor-textarea')).toBe(editor);
+    expect(editor.value).toBe('Draft');
+    expect(root.querySelector('.comment-input')).toBe(composer);
+    expect(composer.value).toBe('Pending comment');
+    (root.querySelector('.editor-header button') as HTMLButtonElement).click();
+    expect(root.querySelector('.editor-preview')?.textContent?.trim()).toBe('Draft');
+    expect(root.querySelector('.editor-header button')?.textContent).toBe('Edit');
+    await unmount();
+  });
+
   it("surfaces a request error without losing the listing", async () => {
     const fake = createFakePackageClient({
       requests: {
@@ -420,6 +555,7 @@ describe("Documents mount", () => {
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('[aria-label="Add Collection"]') as HTMLButtonElement).click();
     const input = root.querySelector(".collection-create input") as HTMLInputElement;
     input.value = "x";
     (root.querySelector(".collection-create") as HTMLFormElement).requestSubmit();
