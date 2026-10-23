@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use loro::{ExportMode, LoroDoc, VersionVector};
+use loro::{ExportMode, LoroDoc, LoroError, VersionVector};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::MAX_UPDATE;
@@ -47,6 +47,34 @@ pub(crate) enum BodyError {
     Loro,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportFailureCategory {
+    IncompatibleEncoding,
+    DecodeOrChecksum,
+    Other,
+}
+
+impl ImportFailureCategory {
+    pub(crate) fn from_error(error: &LoroError) -> Self {
+        match error {
+            LoroError::IncompatibleFutureEncodingError(_) => Self::IncompatibleEncoding,
+            LoroError::DecodeVersionVectorError
+            | LoroError::DecodeError(_)
+            | LoroError::DecodeDataCorruptionError
+            | LoroError::DecodeChecksumMismatchError => Self::DecodeOrChecksum,
+            _ => Self::Other,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::IncompatibleEncoding => "incompatible_encoding",
+            Self::DecodeOrChecksum => "decode_or_checksum",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Why a flush produced bytes: the caller appends each returned update as one record.
 pub(crate) struct Flushed {
     pub(crate) updates: Vec<Vec<u8>>,
@@ -60,9 +88,68 @@ pub(crate) struct EditIdentity {
     pub(crate) durable: bool,
 }
 
+struct AppliedBaseline {
+    doc: LoroDoc,
+    text: String,
+    pending_updates: Vec<Vec<u8>>,
+}
+
+impl Clone for AppliedBaseline {
+    fn clone(&self) -> Self {
+        Self {
+            doc: self.doc.fork(),
+            text: self.text.clone(),
+            pending_updates: self.pending_updates.clone(),
+        }
+    }
+}
+
+impl AppliedBaseline {
+    fn new() -> Self {
+        Self {
+            doc: LoroDoc::new(),
+            text: String::new(),
+            pending_updates: Vec::new(),
+        }
+    }
+
+    fn import_candidate(&self, update: &[u8]) -> Result<Self, ImportFailureCategory> {
+        let mut candidate = self.clone();
+        for buffered in &candidate.pending_updates {
+            candidate
+                .doc
+                .import(buffered)
+                .map_err(|cause| ImportFailureCategory::from_error(&cause))?;
+        }
+        let status = candidate
+            .doc
+            .import(update)
+            .map_err(|cause| ImportFailureCategory::from_error(&cause))?;
+        let mut pending = Vec::new();
+        for buffered in std::mem::take(&mut candidate.pending_updates) {
+            if candidate
+                .doc
+                .import(&buffered)
+                .map_err(|cause| ImportFailureCategory::from_error(&cause))?
+                .pending
+                .is_some()
+            {
+                pending.push(buffered);
+            }
+        }
+        if status.pending.is_some() {
+            pending.push(update.to_vec());
+        }
+        candidate.pending_updates = pending;
+        candidate.text = candidate.doc.get_text(CONTAINER).to_string();
+        Ok(candidate)
+    }
+}
+
 pub(crate) struct DocumentBody {
     doc: LoroDoc,
     text: String,
+    applied: AppliedBaseline,
     /// Increments on every change the UI can observe, local or remote.
     revision: u64,
     /// The version already appended as records; exports start here.
@@ -79,6 +166,8 @@ pub(crate) struct DocumentBody {
     waiting_deferred: bool,
     /// Loro has received a sealed update whose causal prerequisites are still missing.
     pending_history: bool,
+    /// Forks omit Loro's buffered, causally pending updates; replay them into each candidate.
+    pending_updates: Vec<Vec<u8>>,
     /// A conservative estimate of the pending export size, so a keystroke never exports.
     pending_estimate: usize,
     /// Last request identity allows retry after a failed append without reapplying its ops.
@@ -96,6 +185,7 @@ impl DocumentBody {
         Self {
             doc,
             text: String::new(),
+            applied: AppliedBaseline::new(),
             revision: 0,
             appended: VersionVector::default(),
             staged_version: VersionVector::default(),
@@ -104,6 +194,7 @@ impl DocumentBody {
             unopened: 0,
             waiting_deferred: false,
             pending_history: false,
+            pending_updates: Vec::new(),
             pending_estimate: 0,
             last_request: None,
             pending_request_id: None,
@@ -114,6 +205,9 @@ impl DocumentBody {
 
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+    pub(crate) fn applied_text(&self) -> &str {
+        &self.applied.text
     }
     pub(crate) fn revision(&self) -> u64 {
         self.revision
@@ -204,6 +298,7 @@ impl DocumentBody {
         let mut candidate = Self {
             doc: self.doc.fork(),
             text: self.text.clone(),
+            applied: self.applied.clone(),
             revision: self.revision,
             appended: self.appended.clone(),
             staged_version: self.staged_version.clone(),
@@ -212,6 +307,7 @@ impl DocumentBody {
             unopened: self.unopened,
             waiting_deferred: self.waiting_deferred,
             pending_history: self.pending_history,
+            pending_updates: self.pending_updates.clone(),
             pending_estimate: 0,
             last_request: self.last_request.clone(),
             pending_request_id: None,
@@ -316,28 +412,94 @@ impl DocumentBody {
         Ok(ops.to_vec())
     }
 
-    /// Imports one update from a record and returns the delta the UI should apply, or `None`
-    /// when the text did not change (already known, or its dependencies are still pending).
-    pub(crate) fn import(&mut self, update: &[u8]) -> Result<Option<Vec<TextOp>>, BodyError> {
-        let before = self.text.clone();
-        let status = self.doc.import(update).map_err(|_| BodyError::Loro)?;
-        self.pending_history = status.pending.is_some();
-        let after = self.doc.get_text(CONTAINER).to_string();
-        // A remote update never advances what this peer has appended, but the remote ops are
-        // now part of the version the next export is taken from; exclude them explicitly.
-        self.appended = merge_remote(&self.appended, &self.doc.oplog_vv(), self.doc.peer_id());
-        self.staged_version = merge_remote(
-            &self.staged_version,
-            &self.doc.oplog_vv(),
-            self.doc.peer_id(),
+    /// Build an isolated candidate; the caller publishes it only after the sealed row and
+    /// its import disposition commit. A failed import leaves the live body untouched.
+    pub(crate) fn import_candidate(
+        &self,
+        update: &[u8],
+    ) -> Result<(Self, Option<Vec<TextOp>>), ImportFailureCategory> {
+        let mut candidate = Self {
+            doc: self.doc.fork(),
+            text: self.text.clone(),
+            applied: self.applied.clone(),
+            revision: self.revision,
+            appended: self.appended.clone(),
+            staged_version: self.staged_version.clone(),
+            pending_since: self.pending_since,
+            staged: self.staged.clone(),
+            unopened: self.unopened,
+            waiting_deferred: self.waiting_deferred,
+            pending_history: self.pending_history,
+            pending_updates: self.pending_updates.clone(),
+            pending_estimate: self.pending_estimate,
+            last_request: self.last_request.clone(),
+            pending_request_id: self.pending_request_id.clone(),
+            identities: self.identities.clone(),
+            identity_order: self.identity_order.clone(),
+        };
+        candidate
+            .doc
+            .set_peer_id(self.doc.peer_id())
+            .map_err(|_| ImportFailureCategory::Other)?;
+        // Classify the actual import error, not a failed envelope decode or pending status.
+        let before = candidate.text.clone();
+        for buffered in &candidate.pending_updates {
+            candidate
+                .doc
+                .import(buffered)
+                .map_err(|cause| ImportFailureCategory::from_error(&cause))?;
+        }
+        let status = candidate
+            .doc
+            .import(update)
+            .map_err(|cause| ImportFailureCategory::from_error(&cause))?;
+        let mut still_pending = Vec::new();
+        for buffered in std::mem::take(&mut candidate.pending_updates) {
+            let result = candidate
+                .doc
+                .import(&buffered)
+                .map_err(|cause| ImportFailureCategory::from_error(&cause))?;
+            if result.pending.is_some() {
+                still_pending.push(buffered);
+            }
+        }
+        candidate.pending_updates = still_pending;
+        if status.pending.is_some() {
+            candidate.pending_updates.push(update.to_vec());
+        }
+        candidate.pending_history = !candidate.pending_updates.is_empty();
+        candidate.applied = self.applied.import_candidate(update)?;
+        let after = candidate.doc.get_text(CONTAINER).to_string();
+        candidate.appended = merge_remote(
+            &candidate.appended,
+            &candidate.doc.oplog_vv(),
+            candidate.doc.peer_id(),
+        );
+        candidate.staged_version = merge_remote(
+            &candidate.staged_version,
+            &candidate.doc.oplog_vv(),
+            candidate.doc.peer_id(),
         );
         let delta = diff(&before, &after);
-        self.text = after;
-        if delta.is_empty() {
-            return Ok(None);
+        candidate.text = after;
+        if !delta.is_empty() {
+            candidate.revision += 1;
         }
-        self.revision += 1;
-        Ok(Some(delta))
+        Ok((candidate, (!delta.is_empty()).then_some(delta)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_import(&self, update: &[u8]) -> Result<(), ImportFailureCategory> {
+        self.import_candidate(update).map(|_| ())
+    }
+
+    /// Imports one update from a record and returns the delta the UI should apply, or `None`
+    /// when the text did not change (already known, or its dependencies are still pending).
+    #[cfg(test)]
+    pub(crate) fn import(&mut self, update: &[u8]) -> Result<Option<Vec<TextOp>>, BodyError> {
+        let (candidate, delta) = self.import_candidate(update).map_err(|_| BodyError::Loro)?;
+        *self = candidate;
+        Ok(delta)
     }
 
     /// Takes the local edits that are due as one or more update payloads, oldest first.
@@ -596,8 +758,10 @@ mod tests {
         let mut reader = DocumentBody::new(9);
         assert_eq!(reader.import(&second[0]).unwrap(), None);
         assert_eq!(reader.text(), "");
+        assert_eq!(reader.applied_text(), "");
         assert!(reader.import(&first[0]).unwrap().is_some());
         assert_eq!(reader.text(), "one two");
+        assert_eq!(reader.applied_text(), "one two");
         assert_eq!(reader.revision(), 1);
     }
 
@@ -680,6 +844,10 @@ mod tests {
     fn malformed_import_preserves_nonempty_cached_text() {
         let mut body = DocumentBody::new(1);
         apply_text(&mut body, 0, "keep me");
+        assert_eq!(
+            body.preview_import(b"not loro"),
+            Err(ImportFailureCategory::DecodeOrChecksum)
+        );
         assert_eq!(body.import(b"not loro"), Err(BodyError::Loro));
         assert_eq!(body.text(), "keep me");
     }

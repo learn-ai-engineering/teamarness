@@ -263,8 +263,9 @@ export class DocumentsView {
   private syncTextarea(caret: { start: number; end: number } | null): void {
     const editor = this.controller.openEditor;
     if (!editor) return;
-    if (this.textarea.value !== editor.value) {
-      this.textarea.value = editor.value;
+    const visible = editor.current.reason === "import_failure" ? editor.current.text : editor.value;
+    if (this.textarea.value !== visible) {
+      this.textarea.value = visible;
       if (caret) this.textarea.setSelectionRange(caret.start, caret.end);
     }
   }
@@ -394,14 +395,18 @@ export class DocumentsView {
     this.textarea.disabled = !editable;
     this.editorStatus.textContent = reason === "identity_conflict"
       ? "Conflicting edit history — document unavailable. Unsaved draft remains only in this window."
-      : error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
+      : reason === "import_failure"
+        ? `Incomplete edit history — read only. Last known-good text; record ${editor.current.diagnosticRecordId ?? "unknown"}. Unsaved draft remains only in this window.`
+        : error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
+    this.editorStatus.classList.toggle("editor-status-failure", reason === "import_failure");
     this.syncTextarea(null);
     const preview = this.controller.state.preview;
     this.previewButton.setAttribute("aria-pressed", String(preview));
     this.previewButton.textContent = preview ? "Edit" : "Preview";
     this.textarea.hidden = preview;
     this.preview.hidden = !preview;
-    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? "" : renderMarkdown(editor.value);
+    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? ""
+      : renderMarkdown(reason === "import_failure" ? editor.current.text : editor.value);
   }
 
   render(): void {

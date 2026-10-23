@@ -77,7 +77,8 @@ export type EditorState = Readonly<{
   text: string;
   revision: string;
   editable: boolean;
-  reason?: "identity_conflict";
+  reason?: "identity_conflict" | "import_failure";
+  diagnosticRecordId?: string;
   /** An edit request is in flight; further changes wait for its acknowledgement. */
   sending: boolean;
   /** The Backend refused the last edit with a message to show. */
@@ -97,8 +98,9 @@ export class DocumentEditor {
   private recoveryId: string | null = null;
   private chunkLimit = 8192;
   private inFlightText: string | null = null;
+  private inFlightBase: string | null = null;
   private savedRevision: string | null = null;
-  private transfer: { revision: string; editable: boolean; chunks: number; parts: string[]; transferId?: string; requestStatuses?: TextEvent["requestStatuses"] } | null = null;
+  private transfer: { revision: string; editable: boolean; chunks: number; parts: string[]; transferId?: string; requestStatuses?: TextEvent["requestStatuses"]; reason?: TextEvent["reason"]; diagnosticRecordId?: string } | null = null;
   private abandonedRevision: string | null = null;
   private readonly resync: () => void;
   private readonly send: (documentId: string, baseRevision: string, ops: TextOp[], requestId: string) => Promise<{ revision: string }>;
@@ -116,6 +118,7 @@ export class DocumentEditor {
       revision: initial.revision,
       editable: initial.editable,
       reason: initial.reason,
+      diagnosticRecordId: initial.diagnosticRecordId,
       sending: false,
       error: null,
     };
@@ -160,12 +163,19 @@ export class DocumentEditor {
       this.retry = null;
       this.activeRequestId = null;
       this.inFlightText = null;
+      this.inFlightBase = null;
       this.state = { ...this.state, text: "", revision: event.revision, editable: false,
         reason: "identity_conflict", sending: false, error: null };
       this.announce();
       return caret;
     }
     if (this.state.reason === "identity_conflict") return caret;
+    if (this.state.reason === "import_failure" && event.reason !== "import_failure") return caret;
+    if (event.reason === "import_failure") {
+      this.state = { ...this.state, reason: "import_failure", diagnosticRecordId: event.diagnosticRecordId,
+        editable: false, sending: false, error: "This Document has incomplete edit history." };
+      this.announce();
+    }
     if (Number(event.revision) < Number(this.state.revision)) return caret;
     if (event.text === undefined && event.transfer === undefined && Number(event.revision) <= Number(this.state.revision)) return caret;
     if (event.transfer === "begin") {
@@ -173,7 +183,8 @@ export class DocumentEditor {
       this.abandonedRevision = null;
       this.transfer = event.chunks !== undefined && event.chunks > 0
         ? { revision: event.revision, editable: event.editable, chunks: event.chunks, parts: [],
-          transferId: event.transferId, requestStatuses: event.requestStatuses } : null;
+          transferId: event.transferId, requestStatuses: event.requestStatuses,
+          reason: event.reason, diagnosticRecordId: event.diagnosticRecordId } : null;
       if (this.transfer === null) this.requestResync(event.revision);
       return caret;
     }
@@ -195,7 +206,9 @@ export class DocumentEditor {
       if (transfer.parts.length !== transfer.chunks) { this.requestResync(event.revision); return caret; }
       return this.receive({ documentId: event.documentId, revision: event.revision,
         editable: transfer.editable, text: transfer.parts.join(""), savedRevision: event.savedRevision,
-        transferId: transfer.transferId, requestStatuses: transfer.requestStatuses, requestId: event.requestId }, caret);
+        transferId: transfer.transferId, requestStatuses: transfer.requestStatuses,
+        reason: transfer.reason, diagnosticRecordId: transfer.diagnosticRecordId,
+        requestId: event.requestId }, caret);
     }
     if (event.text === undefined && Number(event.revision) > Number(this.state.revision) + 1) {
       this.transfer = null;
@@ -208,13 +221,14 @@ export class DocumentEditor {
       const active = this.activeRequestId;
       const status = event.transferId === this.recoveryId
         ? event.requestStatuses?.find((entry) => entry.requestId === active) : undefined;
-      if (active !== null && status === undefined && event.requestId !== active) {
+      if (active !== null && status === undefined && event.requestId !== active
+        && event.reason !== "import_failure") {
         // A full broadcast from another editor has no provenance for our request.
         // Preserve the draft; only an identified recovery can decide inclusion.
         this.requestResync(event.revision);
         return caret;
       }
-      if (active !== null && status?.inclusion === "unresolved") {
+      if (active !== null && status?.inclusion === "unresolved" && event.reason !== "import_failure") {
         this.state = { ...this.state, error: "The edit could not be saved." };
         this.announce();
         return caret;
@@ -225,15 +239,19 @@ export class DocumentEditor {
       const pendingBase = included && this.inFlightText !== null ? this.inFlightText : base;
       const applied = diffOps(pendingBase, event.text);
       this.state = { ...this.state, text: event.text, revision: event.revision, editable: event.editable };
-      this.draft = previousDraft === pendingBase || previousDraft === event.text
-        ? event.text : applyOps(event.text, rebase(diffOps(pendingBase, previousDraft), applied));
+      this.draft = event.reason === "import_failure" && active !== null && this.inFlightBase !== null
+        ? applyOps(event.text, rebase(diffOps(this.inFlightBase, previousDraft),
+          diffOps(this.inFlightBase, event.text)))
+        : previousDraft === pendingBase || previousDraft === event.text
+          ? event.text : applyOps(event.text, rebase(diffOps(pendingBase, previousDraft), applied));
       if (event.savedRevision !== undefined) this.savedRevision = event.savedRevision;
       if (status?.inclusion === "absent") {
         this.retry = null;
         this.activeRequestId = null;
         this.inFlightText = null;
         this.state = { ...this.state, sending: false, error: null };
-      } else if (active !== null && (status?.durability === "durable" || event.requestId === active && event.savedRevision !== undefined)) {
+      } else if (active !== null && (status?.inclusion === "included" && status.durability === "durable"
+        || event.requestId === active && event.savedRevision !== undefined && event.editable)) {
         this.retry = null;
         this.activeRequestId = null;
         this.inFlightText = null;
@@ -283,14 +301,16 @@ export class DocumentEditor {
     if (ops.length === 0) return;
     const id = this.retry?.id ?? newRequestId();
     const base = this.retry?.base ?? this.state.revision;
+    const baseText = this.state.text;
     const sent = this.retry?.text ?? applyOps(this.state.text, ops);
     this.state = { ...this.state, sending: true, error: null };
     this.activeRequestId = id;
     this.inFlightText = sent;
+    this.inFlightBase = baseText;
     this.announce();
     try {
       const { revision } = await this.send(this.state.documentId, base, ops, id);
-      if (this.state.reason === "identity_conflict") return;
+      if (this.state.reason === "identity_conflict" || this.state.reason === "import_failure") return;
       this.retry = null;
       this.activeRequestId = null;
       this.inFlightText = null;
@@ -298,7 +318,7 @@ export class DocumentEditor {
         ? { ...this.state, sending: false }
         : { ...this.state, text: sent, revision, sending: false };
     } catch (error) {
-      if (this.state.reason === "identity_conflict") return;
+      if (this.state.reason === "identity_conflict" || this.state.reason === "import_failure") return;
       if (this.activeRequestId === null) {
         this.retry = null;
         this.inFlightText = null;

@@ -128,7 +128,7 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -338,7 +338,7 @@ mod store_tests {
                 ).unwrap();
             }
             let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;").unwrap();
+            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;").unwrap();
             drop(connection);
             let store = DocumentStore::open(&path).unwrap();
             let mut rows = store.identity_candidates().unwrap();
@@ -397,7 +397,7 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -473,6 +473,89 @@ mod store_tests {
             "a conflicted target cannot import even its original deferred edit"
         );
         assert_eq!(store.cursor().unwrap(), Some(hex(50, 8)));
+    }
+
+    #[test]
+    fn import_failure_marker_rolls_back_with_sealed_row_identity_and_cursor() {
+        let f = fixture();
+        let document = hex(64, 2);
+        let id = hex(32, 9);
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+        );
+        ingest(
+            &f.store,
+            2,
+            ALICE,
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Doc").unwrap(),
+        );
+        let cursor = f.store.cursor().unwrap();
+        let edit = DomainRecord::identified_document_edit(
+            ALICE,
+            &document,
+            &id,
+            &[7; 32],
+            b"not loro".to_vec(),
+        )
+        .unwrap();
+        f.store.inner.lock().unwrap().conn.execute_batch(
+            "CREATE TRIGGER deny_import_failure BEFORE INSERT ON document_import_failures BEGIN SELECT RAISE(FAIL, 'injected'); END;"
+        ).unwrap();
+        assert!(
+            f.store
+                .ingest_with_import(
+                    &hex(64, 3),
+                    &hex(82, 3),
+                    ALICE,
+                    edit.kind(),
+                    "sig",
+                    &edit.encode(),
+                    b"sealed",
+                    Some(&hex(50, 3)),
+                    &|| {},
+                    &|_, _, _, _, _, _| Some("decode_or_checksum")
+                )
+                .is_err()
+        );
+        assert_eq!(f.store.cursor().unwrap(), cursor);
+        assert_eq!(f.store.record_count().unwrap(), 2);
+        assert!(f.store.edit_identity(&id).unwrap().is_none());
+        assert!(f.store.import_failure(&document).unwrap().is_none());
+        f.store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER deny_import_failure;")
+            .unwrap();
+        let ingested = f
+            .store
+            .ingest_with_import(
+                &hex(64, 3),
+                &hex(82, 3),
+                ALICE,
+                edit.kind(),
+                "sig",
+                &edit.encode(),
+                b"sealed",
+                Some(&hex(50, 3)),
+                &|| {},
+                &|_, _, _, _, _, _| Some("decode_or_checksum"),
+            )
+            .unwrap();
+        assert_eq!(
+            ingested.result,
+            IngestResult::ImportFailure(document.clone())
+        );
+        assert_eq!(f.store.cursor().unwrap(), Some(hex(50, 3)));
+        assert!(f.store.edit_identity(&id).unwrap().is_some());
+        assert_eq!(
+            f.store.import_failure(&document).unwrap(),
+            Some((hex(64, 3), "decode_or_checksum".into()))
+        );
     }
 
     #[test]

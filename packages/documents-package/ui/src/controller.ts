@@ -97,7 +97,8 @@ export class DocumentsController {
     void this.refreshComments();
     if (this._state.openDocumentId !== null && this.editor !== null
       && !this.editor.current.editable && !this.editor.assembling
-      && this.editor.current.reason !== "identity_conflict") {
+      && this.editor.current.reason !== "identity_conflict"
+      && this.editor.current.reason !== "import_failure") {
       void this.retryOpen(this._state.openDocumentId, this.openSequence);
     }
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);

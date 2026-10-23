@@ -489,6 +489,41 @@ describe("DocumentEditor", () => {
     expect(sends).toBe(1);
   });
 
+  it("restores the applied baseline after a coalescing preview fails without erasing the draft", () => {
+    const editor = new DocumentEditor(event({ revision: "1", text: "good" }), () => new Promise(() => {}), () => {});
+    editor.input("good draft");
+    const id = editor.outstandingIds[0]!;
+    editor.receive(event({ revision: "2", origin: "local", requestId: id,
+      delta: [{ retain: 4 }, { insert: " draft" }] }), null);
+    editor.receive(event({ revision: "2", text: "good", editable: false, reason: "import_failure",
+      diagnosticRecordId: "b".repeat(64) }), null);
+    expect(editor.current.text).toBe("good");
+    expect(editor.value).toBe("good draft");
+    editor.beginRecovery("a".repeat(32));
+    editor.receive(event({ revision: "2", text: "good", editable: false, reason: "import_failure",
+      diagnosticRecordId: "b".repeat(64), transferId: "a".repeat(32),
+      requestStatuses: [{ requestId: id, inclusion: "unresolved", durability: "unresolved" }] }), null);
+    expect(editor.current.text).toBe("good");
+    expect(editor.value).toBe("good draft");
+    expect(editor.outstandingIds).toEqual([id]);
+    expect(editor.current.editable).toBe(false);
+  });
+
+  it("keeps an outstanding draft on import failure even if the sealed edit is durable", () => {
+    const editor = new DocumentEditor(event({ revision: "0", text: "good" }), () => new Promise(() => {}), () => {});
+    editor.input("good draft");
+    const id = editor.outstandingIds[0]!;
+    editor.beginRecovery("a".repeat(32));
+    editor.receive(event({ revision: "0", text: "good", editable: false,
+      reason: "import_failure", diagnosticRecordId: "b".repeat(64), transferId: "a".repeat(32),
+      requestStatuses: [{ requestId: id, inclusion: "unresolved", durability: "durable" }] }), null);
+    expect(editor.current.reason).toBe("import_failure");
+    expect(editor.current.diagnosticRecordId).toBe("b".repeat(64));
+    expect(editor.value).toBe("good draft");
+    expect(editor.outstandingIds).toEqual([id]);
+    expect(editor.current.editable).toBe(false);
+  });
+
   it("replaces everything on a full-text event and clamps the caret", () => {
     const editor = new DocumentEditor(event({ revision: "1", text: "old text" }), async () => ({ revision: "2" }), () => {});
     const caret = editor.receive(event({ revision: "5", text: "new", editable: false }), { start: 7, end: 8 });

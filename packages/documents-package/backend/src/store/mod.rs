@@ -11,6 +11,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::domain::{DomainRecord, quarantine};
 use projection::WAITING;
 
+pub(crate) type ImportClassifier<'a> =
+    dyn Fn(&str, &str, &str, Option<&str>, usize, &[u8]) -> Option<&'static str> + 'a;
+
 #[derive(Debug)]
 pub enum StoreError {
     Storage,
@@ -79,6 +82,7 @@ pub enum IngestResult {
     Deferred(String),
     Quarantined(String),
     IdentityConflict(String),
+    ImportFailure(String),
 }
 
 /// What one ingest committed, plus every body update it made applicable: the record's own
@@ -225,6 +229,42 @@ impl DocumentStore {
                 |row| row.get(0),
             )
             .map_err(rerr)
+    }
+
+    pub fn import_failure(&self, document: &str) -> Result<Option<(String, String)>, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT record_id,category FROM document_import_failures WHERE document_id=?1",
+                [document],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(rerr)
+    }
+
+    pub fn import_failure_ordinal(&self, document: &str) -> Result<Option<u64>, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.query_row(
+            "SELECT r.ingestion_ordinal FROM document_import_failures f JOIN records r ON r.record_id=f.record_id WHERE f.document_id=?1",
+            [document], |row| row.get::<_, i64>(0).map(|value| value as u64),
+        ).optional().map_err(rerr)
+    }
+
+    /// For pre-v6 history discovered during activation, before the body is published.
+    pub fn mark_import_failure(
+        &self,
+        document: &str,
+        record_id: &str,
+        category: &str,
+    ) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.execute(
+            "INSERT OR IGNORE INTO document_import_failures(document_id,record_id,category) VALUES(?1,?2,?3)",
+            params![document, record_id, category],
+        ).map_err(rerr)?;
+        Ok(())
     }
 
     pub fn conflicted_documents(&self) -> Result<Vec<String>, StoreError> {
@@ -376,6 +416,34 @@ impl DocumentStore {
         cursor: Option<&str>,
         on_commit: &dyn Fn(),
     ) -> Result<Ingested, StoreError> {
+        self.ingest_with_import(
+            record_id,
+            order_key,
+            author,
+            purpose,
+            signature,
+            canonical,
+            sealed,
+            cursor,
+            on_commit,
+            &|_, _, _, _, _, _| None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ingest_with_import(
+        &self,
+        record_id: &str,
+        order_key: &str,
+        author: &str,
+        purpose: &str,
+        signature: &str,
+        canonical: &[u8],
+        sealed: &[u8],
+        cursor: Option<&str>,
+        on_commit: &dyn Fn(),
+        classify: &ImportClassifier<'_>,
+    ) -> Result<Ingested, StoreError> {
         let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
         let parsed = DomainRecord::decode(canonical);
         let mut inner = lock(&self.inner)?;
@@ -475,7 +543,7 @@ impl DocumentStore {
                 drop(inner);
                 let mut edits = Vec::new();
                 if let Some(target) = created {
-                    self.retry_for_target(&target, on_commit, &mut edits)?;
+                    self.retry_for_target(&target, on_commit, &mut edits, classify)?;
                     self.commit_delivery_cursor(cursor)?;
                 }
                 return Ok(Ingested {
@@ -505,7 +573,7 @@ impl DocumentStore {
                 params![record_id, order_key, author, purpose, signature, sealed, cursor, ordinal],
             )
             .map_err(rerr)?;
-        let outcome = match parsed {
+        let mut outcome = match parsed {
             Ok(domain) => {
                 if let DomainRecord::IdentifiedDocumentEdit {
                     author: owner,
@@ -532,7 +600,7 @@ impl DocumentStore {
                 let outcome =
                     projection::project_domain(&transaction, record_id, order_key, author, &domain)
                         .map_err(rerr)?;
-                if matches!(outcome.result, IngestResult::Quarantined(_))
+                if matches!(outcome.result, IngestResult::Quarantined(ref code) if code != "import_failure")
                     && let DomainRecord::IdentifiedDocumentEdit { request_id, .. } = &domain
                 {
                     transaction
@@ -552,6 +620,27 @@ impl DocumentStore {
                 }
             }
         };
+        if let Some((document, update)) = &outcome.edit
+            && let Some(category) = classify(
+                record_id,
+                document,
+                author,
+                match DomainRecord::decode(canonical) {
+                    Ok(DomainRecord::IdentifiedDocumentEdit { request_id, .. }) => Some(request_id),
+                    _ => None,
+                }
+                .as_deref(),
+                sealed.len(),
+                update,
+            )
+        {
+            transaction.execute(
+                    "INSERT OR IGNORE INTO document_import_failures(document_id,record_id,category) VALUES(?1,?2,?3)",
+                    params![document, record_id, category],
+                ).map_err(rerr)?;
+            outcome.result = IngestResult::ImportFailure(document.clone());
+            outcome.edit = None;
+        }
         if outcome.created.is_some() {
             transaction
                 .execute(
@@ -583,7 +672,7 @@ impl DocumentStore {
         let mut edits: Vec<(String, Vec<u8>)> = outcome.edit.into_iter().collect();
         drop(inner);
         if let Some(target) = created {
-            self.retry_for_target(&target, on_commit, &mut edits)?;
+            self.retry_for_target(&target, on_commit, &mut edits, classify)?;
             self.commit_delivery_cursor(cursor)?;
         }
         Ok(Ingested { result, edits })
@@ -607,6 +696,7 @@ impl DocumentStore {
         target: &str,
         on_commit: &dyn Fn(),
         edits: &mut Vec<(String, Vec<u8>)>,
+        classify: &ImportClassifier<'_>,
     ) -> Result<(), StoreError> {
         let mut inner = lock(&self.inner)?;
         let mut waiting: Vec<(String, DomainRecord)> = inner
@@ -634,9 +724,37 @@ impl DocumentStore {
         keyed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         for (order_key, record_id, author, domain) in keyed {
             let transaction = inner.conn.transaction().map_err(rerr)?;
-            let outcome =
+            let mut outcome =
                 projection::project_domain(&transaction, &record_id, &order_key, &author, &domain)
                     .map_err(rerr)?;
+            if let Some((document, update)) = &outcome.edit
+                && let Some(category) = classify(
+                    &record_id,
+                    document,
+                    &author,
+                    match &domain {
+                        DomainRecord::IdentifiedDocumentEdit { request_id, .. } => {
+                            Some(request_id.as_str())
+                        }
+                        _ => None,
+                    },
+                    transaction
+                        .query_row(
+                            "SELECT length(sealed_record) FROM records WHERE record_id=?1",
+                            [&record_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(rerr)?,
+                    update,
+                )
+            {
+                transaction.execute(
+                        "INSERT OR IGNORE INTO document_import_failures(document_id,record_id,category) VALUES(?1,?2,?3)",
+                        params![document, record_id, category],
+                    ).map_err(rerr)?;
+                outcome.result = IngestResult::ImportFailure(document.clone());
+                outcome.edit = None;
+            }
             transaction.commit().map_err(rerr)?;
             on_commit();
             if let Some((id, order, text)) = outcome.text {
@@ -654,7 +772,7 @@ impl DocumentStore {
             if let Some(created) = outcome.created {
                 // A deferred Document create can itself unblock its dependants.
                 drop(inner);
-                self.retry_for_target(&created, on_commit, edits)?;
+                self.retry_for_target(&created, on_commit, edits, classify)?;
                 inner = lock(&self.inner)?;
             }
         }
@@ -752,6 +870,16 @@ impl DocumentStore {
         record_id: &str,
         canonical: &[u8],
     ) -> Result<Ingested, StoreError> {
+        self.retry_deferred_with_import(record_id, canonical, &|| {}, &|_, _, _, _, _, _| None)
+    }
+
+    pub(crate) fn retry_deferred_with_import(
+        &self,
+        record_id: &str,
+        canonical: &[u8],
+        on_commit: &dyn Fn(),
+        classify: &ImportClassifier<'_>,
+    ) -> Result<Ingested, StoreError> {
         let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
         let Ok(domain) = DomainRecord::decode(canonical) else {
             return Ok(Ingested {
@@ -786,7 +914,7 @@ impl DocumentStore {
             inner.deferred.insert(record_id.to_owned(), domain);
         }
         let mut edits = Vec::new();
-        self.retry_for_target(&target, &|| {}, &mut edits)?;
+        self.retry_for_target(&target, on_commit, &mut edits, classify)?;
         let inner = lock(&self.inner)?;
         let code: Option<String> = inner
             .conn
@@ -796,7 +924,9 @@ impl DocumentStore {
                 |row| row.get(0),
             )
             .map_err(rerr)?;
+        drop(inner);
         let result = match code.as_deref() {
+            None if self.import_failure(&target)?.is_some() => IngestResult::ImportFailure(target),
             None => IngestResult::Applied,
             Some(WAITING) => IngestResult::Deferred(WAITING.into()),
             Some(code) => IngestResult::Quarantined(code.to_owned()),
@@ -819,16 +949,6 @@ impl DocumentStore {
                 DomainRecord::EDIT_KIND
             )),
         }
-    }
-
-    /// Identity conflicts have a document-local guard and must not prevent qualified
-    /// negative-ID proof for an unrelated Document.
-    pub(crate) fn has_unresolved_projection_warnings(&self) -> Result<bool, StoreError> {
-        let inner = lock(&self.inner)?;
-        inner.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code IS NOT NULL AND quarantine_code NOT IN ('waiting_for_target','request_id_conflict','identity_conflict'))",
-            [], |row| row.get(0),
-        ).map_err(rerr)
     }
 
     pub(crate) fn has_projection_warnings(&self) -> Result<bool, StoreError> {

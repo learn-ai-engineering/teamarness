@@ -232,6 +232,34 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("shows last-good text read-only with an import failure reference without retrying", async () => {
+    let opens = 0;
+    const record = "e".repeat(64);
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.document.open": () => { opens++; return { documentId: doc, revision: "1", editable: false,
+          reason: "import_failure", diagnosticRecordId: record, text: "last good" }; },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    await fake.emit("documents.document.text", { documentId: doc, revision: "1", editable: false,
+      reason: "import_failure", diagnosticRecordId: record, text: "last good" });
+    const textarea = root.querySelector(".editor-textarea") as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(true);
+    expect(textarea.value).toBe("last good");
+    expect(root.querySelector(".editor-status")?.textContent).toContain("Incomplete edit history");
+    expect(root.querySelector(".editor-status")?.textContent).toContain(record);
+    await fake.emit("documents.changes", snapshot());
+    await tick();
+    expect(opens).toBe(1);
+    await unmount();
+  });
+
   it("retries pending history after availability changes and enables the existing editor", async () => {
     let opens = 0;
     const fake = createFakePackageClient({

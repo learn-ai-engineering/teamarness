@@ -19,7 +19,7 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::body::{BodyError, COALESCE_WINDOW, DocumentBody, TextOp};
 use crate::domain::{DomainError, DomainRecord};
-use crate::store::{DocumentStore, IngestResult};
+use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -155,6 +155,153 @@ impl BodyHub {
             .store(bodies_ready && metadata_ready, Ordering::Release);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn publish_import_failure(
+        &self,
+        document: &str,
+        record: &str,
+        author: &str,
+        request: Option<&str>,
+        update_length: usize,
+        sealed_length: usize,
+        category: &str,
+        phase: &str,
+    ) {
+        eprintln!(
+            "{}",
+            json!({
+                "event":"documents.import_failure", "category":category, "documentId":document,
+                "recordId":record, "author":author.chars().take(128).collect::<String>(),
+                "requestId":request, "updateLength":update_length,
+                "sealedLength":sealed_length, "phase":phase,
+            })
+        );
+        let mut events = self.with_body(document, |body| {
+            full_text_events_bounded(
+                document,
+                body.revision(),
+                body.applied_text(),
+                false,
+                TEXT_EVENT_BUDGET - 2048,
+            )
+        });
+        for event in &mut events {
+            event["reason"] = json!("import_failure");
+            event["diagnosticRecordId"] = json!(record);
+        }
+        for event in events {
+            let _ = self.events.send(event);
+        }
+    }
+
+    fn project_with_candidates(
+        &self,
+        phase: &str,
+        on_commit: &dyn Fn(),
+        ingest: impl FnOnce(&dyn Fn(), &ImportClassifier<'_>) -> Result<Ingested, StoreError>,
+    ) -> Result<Ingested, StoreError> {
+        let _publication = self.publication_gate.lock().unwrap();
+        let pending = Mutex::new(Vec::new());
+        let failures = Mutex::new(Vec::new());
+        let classify = |record: &str,
+                        document: &str,
+                        author: &str,
+                        request: Option<&str>,
+                        sealed_length: usize,
+                        update: &[u8]| {
+            match self.with_body(document, |body| body.import_candidate(update)) {
+                Ok((candidate, delta)) => {
+                    pending
+                        .lock()
+                        .unwrap()
+                        .push((document.to_owned(), candidate, delta));
+                    None
+                }
+                Err(category) => {
+                    failures.lock().unwrap().push((
+                        document.to_owned(),
+                        record.to_owned(),
+                        author.to_owned(),
+                        request.map(str::to_owned),
+                        update.len(),
+                        sealed_length,
+                        category.as_str(),
+                    ));
+                    Some(category.as_str())
+                }
+            }
+        };
+        let publish = || {
+            for (document, candidate, delta) in pending.lock().unwrap().drain(..) {
+                let revision = candidate.revision();
+                let editable = candidate.editable();
+                let text = candidate.text().to_owned();
+                self.with_body(&document, |body| *body = candidate);
+                if let Some(delta) = delta
+                    && editable
+                {
+                    let event = json!({"documentId":document,"revision":revision.to_string(),
+                        "origin":"remote","delta":delta,"editable":editable});
+                    if event.to_string().len() > TEXT_EVENT_BUDGET {
+                        for event in full_text_events(&document, revision, &text, editable) {
+                            let _ = self.events.send(event);
+                        }
+                    } else {
+                        let _ = self.events.send(event);
+                    }
+                }
+            }
+            for (document, record, author, request, update_length, sealed_length, category) in
+                failures.lock().unwrap().drain(..)
+            {
+                self.publish_import_failure(
+                    &document,
+                    &record,
+                    &author,
+                    request.as_deref(),
+                    update_length,
+                    sealed_length,
+                    category,
+                    phase,
+                );
+            }
+            on_commit();
+        };
+        ingest(&publish, &classify)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_record(
+        &self,
+        record_id: &str,
+        order_key: &str,
+        author: &str,
+        purpose: &str,
+        signature: &str,
+        canonical: &[u8],
+        sealed: &[u8],
+        cursor: Option<&str>,
+        on_commit: &dyn Fn(),
+    ) -> Result<Ingested, StoreError> {
+        self.project_with_candidates("live", on_commit, |publish, classify| {
+            self.store.ingest_with_import(
+                record_id, order_key, author, purpose, signature, canonical, sealed, cursor,
+                publish, classify,
+            )
+        })
+    }
+
+    fn retry_deferred_record(
+        &self,
+        record_id: &str,
+        canonical: &[u8],
+    ) -> Result<Ingested, StoreError> {
+        self.project_with_candidates("replay", &|| {}, |publish, classify| {
+            self.store
+                .retry_deferred_with_import(record_id, canonical, publish, classify)
+        })
+    }
+
     fn append_lock(&self, document: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.append_locks
             .lock()
@@ -164,7 +311,8 @@ impl BodyHub {
             .clone()
     }
 
-    /// Imports body updates a store ingest made applicable and publishes their deltas.
+    /// Exercises body publication independently of store ingestion in body-event tests.
+    #[cfg(test)]
     fn apply_edits(&self, edits: &[(String, Vec<u8>)]) {
         for (document, update) in edits {
             if self.store.identity_conflicted(document).unwrap_or(true) {
@@ -194,6 +342,67 @@ impl BodyHub {
         }
     }
 
+    fn import_opened_update(
+        &self,
+        row: &crate::store::StoredRecord,
+        document: &str,
+        update: &[u8],
+        request_id: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let _publication = self.publication_gate.lock().unwrap();
+        if self
+            .store
+            .identity_conflicted(document)
+            .map_err(|_| storage_failed())?
+        {
+            return Ok(());
+        }
+        if let Some(failure_ordinal) = self
+            .store
+            .import_failure_ordinal(document)
+            .map_err(|_| storage_failed())?
+            && row.ingestion_ordinal >= failure_ordinal
+        {
+            return Ok(());
+        }
+        let imported = self.with_body(document, |body| body.import_candidate(update));
+        if let Err(category) = imported {
+            self.store
+                .mark_import_failure(document, &row.record_id, category.as_str())
+                .map_err(|_| storage_failed())?;
+            self.publish_import_failure(
+                document,
+                &row.record_id,
+                &row.author,
+                request_id,
+                update.len(),
+                row.sealed_record.len(),
+                category.as_str(),
+                "replay",
+            );
+            return Ok(());
+        }
+        if let Ok((candidate, delta)) = imported {
+            let revision = candidate.revision();
+            let editable = candidate.editable();
+            self.with_body(document, |body| *body = candidate);
+            if let Some(delta) = delta
+                && editable
+            {
+                let event = json!({"documentId":document,"revision":revision.to_string(),
+                    "origin":"remote","delta":delta,"editable":editable});
+                if event.to_string().len() > TEXT_EVENT_BUDGET {
+                    for event in self.text_events(document) {
+                        let _ = self.events.send(event);
+                    }
+                } else {
+                    let _ = self.events.send(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn text_events(&self, document: &str) -> Vec<JsonValue> {
         match self.store.identity_conflicted(document) {
             Ok(true) => {
@@ -211,6 +420,32 @@ impl BodyHub {
                 ];
             }
             Ok(false) => {}
+        }
+        match self.store.import_failure(document) {
+            Err(_) => {
+                let revision = self.with_body(document, |body| body.revision());
+                return vec![
+                    json!({"documentId":document, "revision":revision.to_string(),
+                    "editable":false, "text":""}),
+                ];
+            }
+            Ok(None) => {}
+            Ok(Some((record_id, _))) => {
+                return self.with_body(document, |body| {
+                    let mut events = full_text_events_bounded(
+                        document,
+                        body.revision(),
+                        body.applied_text(),
+                        false,
+                        TEXT_EVENT_BUDGET - 2048,
+                    );
+                    for event in &mut events {
+                        event["reason"] = json!("import_failure");
+                        event["diagnosticRecordId"] = json!(record_id);
+                    }
+                    events
+                });
+            }
         }
         self.with_body(document, |body| {
             full_text_events(
@@ -253,6 +488,29 @@ impl BodyHub {
                 json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}),
             );
         }
+        if let Some((record_id, _)) = self
+            .store
+            .import_failure(&request.document_id)
+            .map_err(|_| storage_failed())?
+        {
+            let mut events = self.text_events(&request.document_id);
+            for (index, event) in events.iter_mut().enumerate() {
+                event["transferId"] = json!(request.transfer_id);
+                if index == 0 {
+                    event["requestStatuses"] = json!(request.request_ids.iter().map(|id|
+                        json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"})
+                    ).collect::<Vec<_>>());
+                }
+            }
+            for event in events {
+                let _ = self.events.send(event);
+            }
+            let revision = self.with_body(&request.document_id, |body| body.revision());
+            return Ok(
+                json!({"documentId":request.document_id,"revision":revision.to_string(),
+                "transferId":request.transfer_id,"diagnosticRecordId":record_id}),
+            );
+        }
         let (revision, text, editable, statuses) = self.with_body(&request.document_id, |body| {
                 let statuses: Vec<JsonValue> = request.request_ids.iter().map(|id| {
                     match body.identity(id).filter(|known| known.author == *author) {
@@ -288,7 +546,14 @@ impl BodyHub {
     fn open_response(&self, document: &str) -> JsonValue {
         let first = self.text_events(document).remove(0);
         if first["transfer"] == "begin" {
-            json!({ "documentId": document, "revision": first["revision"], "editable": first["editable"] })
+            let mut response = json!({ "documentId": document, "revision": first["revision"], "editable": first["editable"] });
+            if let Some(reason) = first.get("reason") {
+                response["reason"] = reason.clone();
+            }
+            if let Some(id) = first.get("diagnosticRecordId") {
+                response["diagnosticRecordId"] = id.clone();
+            }
+            response
         } else {
             first
         }
@@ -755,6 +1020,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             if context.state().store.identity_conflicted(&document).map_err(|_| storage_failed())? {
                 return Err(error("documents.identity_conflict", false));
             }
+            if context.state().store.import_failure(&document).map_err(|_| storage_failed())?.is_some() {
+                return Err(error("documents.import_failure", false));
+            }
             if request.request_id.len() != 32 || !request.request_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
                 return Err(invalid_request());
             }
@@ -778,6 +1046,10 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             // One ID cannot name a request on another Document or Installation.
             if hub.lock().iter().any(|(id, body)| id != &document && body.identity(&request.request_id).is_some()) {
                 return Err(invalid_request());
+            }
+            let _publication = hub.publication_gate.lock().unwrap();
+            if hub.store.import_failure(&document).map_err(|_| storage_failed())?.is_some() {
+                return Err(error("documents.import_failure", false));
             }
             let (revision, delta, editable, is_retry) = hub.with_body(&document, |body| {
                 if !body.editable() {
@@ -823,6 +1095,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     let _ = hub.events.send(event);
                 }
             }
+            drop(_publication);
             // Keep the draft visible during the coalescing window, but never acknowledge it
             // until every export in this request has reached the Core record log.
             if !is_retry {
@@ -1327,7 +1600,7 @@ async fn import_edit_rows(
                     match DomainRecord::decode(&record.canonical) {
                         Ok(DomainRecord::DocumentEdit {
                             document, update, ..
-                        }) => hub.apply_edits(&[(document, update)]),
+                        }) => hub.import_opened_update(row, &document, &update, None)?,
                         Ok(DomainRecord::IdentifiedDocumentEdit {
                             author,
                             document,
@@ -1360,7 +1633,7 @@ async fn import_edit_rows(
                                 }
                                 Ok(true) => {}
                             }
-                            hub.apply_edits(&[(document.clone(), update)]);
+                            hub.import_opened_update(row, &document, &update, Some(&request_id))?;
                             hub.remember_identity(
                                 &document,
                                 &request_id,
@@ -1523,10 +1796,9 @@ async fn append(
     let id = appended.record_id.as_str().to_owned();
     let ingested = context
         .blocking(move |_| {
-            let _publication = state.hub.publication_gate.lock().unwrap();
             state
-                .store
-                .ingest_with_commit(
+                .hub
+                .ingest_record(
                     appended.record_id.as_str(),
                     appended.order_key.as_str(),
                     &appended.author,
@@ -1544,11 +1816,12 @@ async fn append(
                 .map_err(|_| storage_failed())
         })
         .await?;
-    context.state().hub.apply_edits(&ingested.edits);
     match ingested.result {
         IngestResult::Applied | IngestResult::Duplicate => {}
         IngestResult::Deferred(_) => return Err(error("documents.deferred", true)),
-        IngestResult::Quarantined(_) | IngestResult::IdentityConflict(_) => {
+        IngestResult::Quarantined(_)
+        | IngestResult::IdentityConflict(_)
+        | IngestResult::ImportFailure(_) => {
             return Err(error("documents.rejected", false));
         }
     }
@@ -1639,13 +1912,8 @@ async fn reopen_metadata(
                             }
                         }
                         if deferred {
-                            let ingested = {
-                                let _publication = hub.publication_gate.lock().unwrap();
-                                store
-                                    .retry_deferred(&row.record_id, &record.canonical)
-                                    .map_err(|_| storage_failed())?
-                            };
-                            hub.apply_edits(&ingested.edits);
+                            hub.retry_deferred_record(&row.record_id, &record.canonical)
+                                .map_err(|_| storage_failed())?;
                         } else {
                             store
                                 .remember_opened(&row.record_id, &row.order_key, &record.canonical)
@@ -1757,7 +2025,14 @@ fn start_flusher(
                 .lock()
                 .iter()
                 .filter(|(id, body)| {
-                    body.has_pending() && !hub.store.identity_conflicted(id).unwrap_or(true)
+                    body.has_pending()
+                        && !hub.store.identity_conflicted(id).unwrap_or(true)
+                        && hub
+                            .store
+                            .import_failure(id)
+                            .is_ok_and(|failure| failure.is_none())
+                        && (body.pending_request_id().is_none()
+                            || hub.qualified.load(Ordering::Acquire))
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -1813,10 +2088,34 @@ where
         {
             return Err(error("documents.identity_conflict", false));
         }
-        let next = hub.with_body(document, |body| {
-            body.flush(Instant::now(), force)
-                .and_then(|flushed| flushed.updates.into_iter().next())
-        });
+        if hub
+            .store
+            .import_failure(document)
+            .map_err(|_| storage_failed())?
+            .is_some()
+        {
+            return Err(error("documents.import_failure", false));
+        }
+        let next = {
+            let _publication = hub.publication_gate.lock().unwrap();
+            if hub.with_body(document, |body| body.pending_request_id().is_some())
+                && !hub.qualified.load(Ordering::Acquire)
+            {
+                return Err(error("documents.document_pending", true));
+            }
+            if hub
+                .store
+                .import_failure(document)
+                .map_err(|_| storage_failed())?
+                .is_some()
+            {
+                return Err(error("documents.import_failure", false));
+            }
+            hub.with_body(document, |body| {
+                body.flush(Instant::now(), force)
+                    .and_then(|flushed| flushed.updates.into_iter().next())
+            })
+        };
         let Some(update) = next else {
             if appended {
                 let saved_revision = hub.with_body(document, |body| body.last_request_revision());
@@ -1828,6 +2127,14 @@ where
                         .map_err(|_| storage_failed())?
                     {
                         return Err(error("documents.identity_conflict", false));
+                    }
+                    if hub
+                        .store
+                        .import_failure(document)
+                        .map_err(|_| storage_failed())?
+                        .is_some()
+                    {
+                        return Err(error("documents.import_failure", false));
                     }
                     let mut events = hub.text_events(document);
                     if let Some(last) = events.last_mut() {
@@ -1853,6 +2160,16 @@ where
             .map_err(|_| storage_failed())?
         {
             return Err(error("documents.identity_conflict", false));
+        }
+        let _publication = hub.publication_gate.lock().unwrap();
+        if hub
+            .store
+            .import_failure(document)
+            .map_err(|_| storage_failed())?
+            .is_some()
+        {
+            hub.with_body(document, DocumentBody::append_succeeded);
+            return Err(error("documents.import_failure", false));
         }
         completed_id = id;
         hub.with_body(document, DocumentBody::append_succeeded);
@@ -1887,17 +2204,17 @@ async fn append_edit(
     }
     let purpose = record.kind();
     let canonical = record.encode();
-    let appended = log
-        .append(purpose, &canonical)
-        .await
-        .map_err(|cause| capability_error(purpose, cause))?;
-    let store = hub.store.clone();
+    let appended = log.append(purpose, &canonical).await.map_err(|cause| {
+        if identity.is_some() && cause.retryable() {
+            hub.qualified.store(false, Ordering::Release);
+        }
+        capability_error(purpose, cause)
+    })?;
     let changes = changes.clone();
-    let publication_gate = hub.publication_gate.clone();
+    let classifier = hub.clone();
     let ingested = tokio::task::spawn_blocking(move || {
-        let _publication = publication_gate.lock().unwrap();
-        store
-            .ingest_with_commit(
+        classifier
+            .ingest_record(
                 appended.record_id.as_str(),
                 appended.order_key.as_str(),
                 &appended.author,
@@ -1917,7 +2234,22 @@ async fn append_edit(
         Ok(Ok(ingested)) => {
             if matches!(ingested.result, IngestResult::IdentityConflict(_)) {
                 hub.qualified.store(false, Ordering::Release);
+                hub.with_body(document, DocumentBody::append_succeeded);
                 return Err(error("documents.request_id_conflict", false));
+            }
+            if matches!(
+                ingested.result,
+                IngestResult::ImportFailure(_) | IngestResult::Quarantined(_)
+            ) || hub
+                .store
+                .import_failure(document)
+                .map_or(true, |failure| failure.is_some())
+            {
+                hub.with_body(document, DocumentBody::append_succeeded);
+                for event in hub.text_events(document) {
+                    let _ = hub.events.send(event);
+                }
+                return Err(error("documents.import_failure", false));
             }
             if hub.store.identity_conflicted(document).unwrap_or(true) {
                 return Err(error("documents.identity_conflict", false));
@@ -1925,27 +2257,25 @@ async fn append_edit(
             if let Some((id, digest)) = &identity {
                 hub.remember_identity(document, id, author, *digest, true);
             }
-            let others: Vec<(String, Vec<u8>)> = ingested
-                .edits
-                .into_iter()
-                .filter(|(target, _)| target != document)
-                .collect();
-            hub.apply_edits(&others);
+            // Ingest installed successful candidates only after the store committed.
         }
         Ok(Err(cause)) => {
             if let Some((id, digest)) = &identity {
                 hub.remember_identity(document, id, author, *digest, true);
             }
+            hub.with_body(document, DocumentBody::append_succeeded);
             eprintln!(
                 "documents edit projection failure after append: {}",
                 cause.code()
             );
+            return Err(cause);
         }
-        Err(cause) => {
+        Err(_) => {
             if let Some((id, digest)) = &identity {
                 hub.remember_identity(document, id, author, *digest, true);
             }
-            eprintln!("documents edit projection task failed after append: {cause}");
+            hub.with_body(document, DocumentBody::append_succeeded);
+            return Err(storage_failed());
         }
     }
     Ok(())
@@ -2060,22 +2390,20 @@ impl RecordLogSink for DocumentsSink {
     }
 
     fn ingest(&self, record: &RecordEvent) -> Result<(), BackendError> {
-        let ingested = {
-            let _publication = self.hub.publication_gate.lock().unwrap();
-            self.store
-                .ingest_with_commit(
-                    record.record_id.as_str(),
-                    record.order_key.as_str(),
-                    &record.author,
-                    &record.purpose,
-                    &record.signature,
-                    &record.canonical,
-                    &record.sealed_record,
-                    Some(record.cursor.as_str()),
-                    &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
-                )
-                .map_err(|_| storage_failed())?
-        };
+        let ingested = self
+            .hub
+            .ingest_record(
+                record.record_id.as_str(),
+                record.order_key.as_str(),
+                &record.author,
+                &record.purpose,
+                &record.signature,
+                &record.canonical,
+                &record.sealed_record,
+                Some(record.cursor.as_str()),
+                &|| self.changes.send_modify(|x| *x = x.saturating_add(1)),
+            )
+            .map_err(|_| storage_failed())?;
         if let IngestResult::IdentityConflict(ref document) = ingested.result {
             eprintln!("documents identity conflict quarantined: document={document}");
             for affected in self
@@ -2105,10 +2433,9 @@ impl RecordLogSink for DocumentsSink {
                 .map_err(|_| storage_failed())?;
             return Ok(());
         }
-        self.hub.apply_edits(&ingested.edits);
         if matches!(
             ingested.result,
-            IngestResult::Applied | IngestResult::Duplicate
+            IngestResult::Applied | IngestResult::Duplicate | IngestResult::ImportFailure(_)
         ) {
             self.store
                 .note_replayed(record.record_id.as_str())
@@ -2136,20 +2463,16 @@ impl RecordLogSink for DocumentsSink {
     }
 
     fn on_qualified_replay(&self, _boundary: &ReplayEnd) {
-        let complete = self.store.replayed_previous_projection().unwrap_or(false)
-            && !self.store.has_deferred_records().unwrap_or(true)
-            && !self
-                .store
-                .has_unresolved_projection_warnings()
-                .unwrap_or(true)
-            && self.hub.identity_index_complete.load(Ordering::Acquire);
-        let bodies = self.hub.lock();
+        // Core's gap-free prefix is independent of unrelated Documents' ability to open
+        // their sealed edits. The local/recovery paths additionally require the target
+        // Document's own body and identity history to be ready before proving absence.
         self.hub.qualified.store(
-            complete
-                && self.hub.waiting_metadata.lock().unwrap().is_empty()
-                && bodies.values().all(DocumentBody::editable),
+            self.store.replayed_previous_projection().unwrap_or(false),
             Ordering::Release,
         );
+        if self.hub.qualified.load(Ordering::Acquire) {
+            self.hub.flush.notify_one();
+        }
     }
 
     fn on_replay_invalidated(&self) {
@@ -2963,6 +3286,652 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_remote_edit_during_coalescing_preserves_applied_baseline_not_unsaved_preview()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        qualify_empty_history(&session).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({"name":"Plan"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"Doc"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut source = DocumentBody::new(94);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "good".into(),
+            }])
+            .unwrap();
+        let valid = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let stream = session.scripted.stream();
+        assert!(
+            stream
+                .send(record_frame(
+                    8,
+                    "bob",
+                    &DomainRecord::document_edit("bob", &document, valid).unwrap()
+                ))
+                .await
+        );
+        wait_until(
+            || {
+                session
+                    .handles
+                    .bodies
+                    .lock()
+                    .unwrap()
+                    .get(&document)
+                    .is_some_and(|body| body.text() == "good")
+            },
+            "applied text",
+        )
+        .await;
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap();
+        let request = session
+            .harness
+            .start_request(
+                "documents.document.edit",
+                json!({
+                    "documentId":document,"baseRevision":"1","requestId":hex(32, 55),
+                    "ops":[{"retain":4},{"insert":" draft"}]
+                }),
+            )
+            .await;
+        wait_until(
+            || session.handles.bodies.lock().unwrap()[&document].text() == "good draft",
+            "local preview",
+        )
+        .await;
+        let bad = DomainRecord::identified_document_edit(
+            "bob",
+            &document,
+            &hex(32, 56),
+            &[1; 32],
+            b"not loro".to_vec(),
+        )
+        .unwrap();
+        assert!(stream.send(record_frame(9, "bob", &bad)).await);
+        wait_until(
+            || {
+                session
+                    .handles
+                    .store
+                    .import_failure(&document)
+                    .unwrap()
+                    .is_some()
+            },
+            "invalid disposition",
+        )
+        .await;
+        let opened = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(
+            opened["text"], "good",
+            "an unappended preview is not authoritative last-good text"
+        );
+        assert_eq!(opened["reason"], "import_failure");
+        assert!(request.result().await.is_err());
+        let mut saved = false;
+        while let Ok(Some(Ok(event))) =
+            tokio::time::timeout(Duration::from_millis(20), text.next_event()).await
+        {
+            saved |= event.get("savedRevision").is_some();
+        }
+        assert!(
+            !saved,
+            "a delayed append cannot publish Saved after invalidation"
+        );
+        text.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_invalid_loro_edit_retains_last_good_text_without_certifying_inclusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let document = hex(64, 2);
+        for (seed, record) in [
+            (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
+            (
+                2,
+                DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+            ),
+        ] {
+            assert!(stream.send(record_frame(seed, "bob", &record)).await);
+        }
+        let store = session.handles.store.clone();
+        wait_until(|| store.document_exists(&document).unwrap(), "document").await;
+        let mut source = DocumentBody::new(91);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "good".into(),
+            }])
+            .unwrap();
+        let good = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let first = DomainRecord::document_edit("bob", &document, good).unwrap();
+        assert!(stream.send(record_frame(3, "bob", &first)).await);
+        wait_until(
+            || {
+                session
+                    .handles
+                    .bodies
+                    .lock()
+                    .unwrap()
+                    .get(&document)
+                    .is_some_and(|b| b.text() == "good")
+            },
+            "good body",
+        )
+        .await;
+        let bad_id = hex(32, 77);
+        let bad = DomainRecord::identified_document_edit(
+            "bob",
+            &document,
+            &bad_id,
+            &[7; 32],
+            b"not loro".to_vec(),
+        )
+        .unwrap();
+        assert!(stream.send(record_frame(4, "bob", &bad)).await);
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 4).as_str()),
+            "invalid edit cursor",
+        )
+        .await;
+        let opened = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        assert_eq!(opened["text"], "good");
+        assert_eq!(opened["diagnosticRecordId"], hex(64, 4));
+        assert_eq!(
+            store.import_failure(&document).unwrap(),
+            Some((hex(64, 4), "decode_or_checksum".into()))
+        );
+        let mut subscription = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = subscription.next_event().await.unwrap();
+        session
+            .harness
+            .request(
+                "documents.document.recover",
+                json!({
+                    "documentId":document,"transferId":hex(32, 90),"requestIds":[bad_id]
+                }),
+            )
+            .await
+            .unwrap();
+        let recovery = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = subscription.next_event().await.unwrap().unwrap();
+                if event["transferId"] == hex(32, 90) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovery["reason"], "import_failure");
+        assert_eq!(recovery["requestStatuses"][0]["inclusion"], "unresolved");
+        subscription.close().await;
+        assert_eq!(store.edit_identity(&bad_id).unwrap().unwrap().0, hex(64, 4));
+        source
+            .apply(&[
+                TextOp::Retain { retain: 4 },
+                TextOp::Insert {
+                    insert: " later".into(),
+                },
+            ])
+            .unwrap();
+        let later = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        assert!(
+            stream
+                .send(record_frame(
+                    5,
+                    "bob",
+                    &DomainRecord::document_edit("bob", &document, later).unwrap()
+                ))
+                .await
+        );
+        let other = hex(64, 6);
+        assert!(
+            stream
+                .send(record_frame(
+                    6,
+                    "bob",
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap()
+                ))
+                .await
+        );
+        let mut other_body = DocumentBody::new(93);
+        other_body
+            .apply(&[TextOp::Insert {
+                insert: "live".into(),
+            }])
+            .unwrap();
+        let other_update = other_body
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        assert!(
+            stream
+                .send(record_frame(
+                    7,
+                    "bob",
+                    &DomainRecord::document_edit("bob", &other, other_update).unwrap()
+                ))
+                .await
+        );
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 7).as_str()),
+            "unrelated edit cursor",
+        )
+        .await;
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            "good"
+        );
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&other].text(),
+            "live"
+        );
+        assert_eq!(store.record_count().unwrap(), 7);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_invalid_edit_is_marked_when_its_document_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let document = hex(64, 4);
+        assert!(
+            stream
+                .send(record_frame(
+                    1,
+                    "bob",
+                    &DomainRecord::collection_create("bob", "Plan").unwrap()
+                ))
+                .await
+        );
+        let edit = DomainRecord::identified_document_edit(
+            "bob",
+            &document,
+            &hex(32, 8),
+            &[2; 32],
+            b"not loro".to_vec(),
+        )
+        .unwrap();
+        assert!(stream.send(record_frame(2, "bob", &edit)).await);
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 2).as_str()),
+            "deferred edit cursor",
+        )
+        .await;
+        assert!(store.import_failure(&document).unwrap().is_none());
+        assert!(
+            stream
+                .send(record_frame(
+                    4,
+                    "bob",
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Doc").unwrap()
+                ))
+                .await
+        );
+        wait_until(
+            || store.import_failure(&document).unwrap().is_some(),
+            "deferred import disposition",
+        )
+        .await;
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 4).as_str()),
+            "create cursor after deferred disposition",
+        )
+        .await;
+        assert_eq!(
+            store.import_failure(&document).unwrap().unwrap().0,
+            hex(64, 2)
+        );
+        let opened = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activation_migrates_old_invalid_edit_before_exposing_last_good_text() {
+        for old_version in [4, 5] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("documents.sqlite3");
+            let document = hex(64, 2);
+            let other = hex(64, 3);
+            let mut body = DocumentBody::new(91);
+            body.apply(&[TextOp::Insert {
+                insert: "last good".into(),
+            }])
+            .unwrap();
+            let valid = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+            let records = [
+                DomainRecord::collection_create("bob", "Plan").unwrap(),
+                DomainRecord::document_create("bob", &hex(64, 1), "Doc").unwrap(),
+                DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap(),
+                DomainRecord::document_edit("bob", &document, valid).unwrap(),
+                DomainRecord::identified_document_edit(
+                    "bob",
+                    &document,
+                    &hex(32, 11),
+                    &[7; 32],
+                    b"not loro".to_vec(),
+                )
+                .unwrap(),
+            ];
+            let store = DocumentStore::open(&path).unwrap();
+            let encoded: Vec<(String, String)> = records
+                .iter()
+                .map(|record| {
+                    (
+                        record.kind().to_owned(),
+                        URL_SAFE_NO_PAD.encode(record.encode()),
+                    )
+                })
+                .collect();
+            for (index, record) in records.iter().enumerate() {
+                let seed = index as u64 + 1;
+                store
+                    .ingest(
+                        &hex(64, seed),
+                        &hex(82, seed),
+                        "bob",
+                        record.kind(),
+                        "c2ln",
+                        &record.encode(),
+                        &[seed as u8],
+                        None,
+                    )
+                    .unwrap();
+            }
+            drop(store);
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            if old_version == 4 {
+                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;").unwrap();
+            } else {
+                connection
+                    .execute_batch("DROP TABLE document_import_failures; PRAGMA user_version=5;")
+                    .unwrap();
+            }
+            drop(connection);
+            let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+                "open" => Ok(json!({"results":payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                    let seed = URL_SAFE_NO_PAD.decode(sealed.as_str().unwrap()).unwrap()[0] as usize;
+                    let (purpose, canonical) = &encoded[seed - 1];
+                    json!({"status":"ready","recordId":hex(64,seed as u64),"orderKey":hex(82,seed as u64),
+                        "author":"bob","purpose":purpose,"signature":"c2ln","canonical":canonical})
+                }).collect::<Vec<_>>()})),
+                _ => Err(error("unavailable", false)),
+            });
+            let mut session = start(directory.path(), scripted).await;
+            let opened = session
+                .harness
+                .request("documents.document.open", json!({"documentId":document}))
+                .await
+                .unwrap();
+            assert_eq!(opened["text"], "last good");
+            assert_eq!(opened["reason"], "import_failure");
+            assert_eq!(opened["editable"], false);
+            assert_eq!(
+                session
+                    .handles
+                    .store
+                    .import_failure(&document)
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                hex(64, 5)
+            );
+            let healthy = session
+                .harness
+                .request("documents.document.open", json!({"documentId":other}))
+                .await
+                .unwrap();
+            assert_eq!(healthy["editable"], true);
+            session.harness.shutdown().await.unwrap();
+            let store = DocumentStore::open(&path).unwrap();
+            assert_eq!(
+                store.import_failure(&document).unwrap().unwrap().0,
+                hex(64, 5)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_core_prefix_allows_local_edit_on_open_document_while_another_is_unopened() {
+        let directory = tempfile::tempdir().unwrap();
+        let collection = hex(64, 1);
+        let unavailable = hex(64, 2);
+        let healthy = hex(64, 3);
+        let mut source = DocumentBody::new(91);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "private".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &collection, "Unavailable").unwrap(),
+            DomainRecord::document_create("bob", &collection, "Healthy").unwrap(),
+            DomainRecord::identified_document_edit(
+                "bob",
+                &unavailable,
+                &hex(32, 8),
+                &[3; 32],
+                update,
+            )
+            .unwrap(),
+        ];
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        for (index, record) in records.iter().enumerate() {
+            let seed = index as u64 + 1;
+            store
+                .ingest(
+                    &hex(64, seed),
+                    &hex(82, seed),
+                    "bob",
+                    record.kind(),
+                    "c2ln",
+                    &record.encode(),
+                    &[seed as u8],
+                    None,
+                )
+                .unwrap();
+        }
+        drop(store);
+        let encoded: Vec<(String, String)> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.kind().to_owned(),
+                    URL_SAFE_NO_PAD.encode(record.encode()),
+                )
+            })
+            .collect();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(json!({"results": payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                let seed = URL_SAFE_NO_PAD.decode(sealed.as_str().unwrap()).unwrap()[0] as usize;
+                if seed == 4 { json!({"status":"waiting_for_history_access"}) }
+                else {
+                    let (purpose, canonical) = &encoded[seed - 1];
+                    json!({"status":"ready","recordId":hex(64, seed as u64),
+                        "orderKey":hex(82, seed as u64),"author":"bob","purpose":purpose,
+                        "signature":"c2ln","canonical":canonical})
+                }
+            }).collect::<Vec<_>>() })),
+            "append" => Ok(json!({"recordId":hex(64, 100),"orderKey":hex(82, 100),
+                "author":ALICE,"signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"})),
+            _ => Err(error("unavailable", false)),
+        });
+        let mut session = start(directory.path(), scripted).await;
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&unavailable].unopened(),
+            1
+        );
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        for (index, record) in records.iter().enumerate() {
+            assert!(
+                stream
+                    .send(record_frame(index as u64 + 1, "bob", record))
+                    .await
+            );
+        }
+        assert!(
+            stream
+                .send(json!({"kind":"replay_end", "cursor":hex(50, 4), "gapFree":true}))
+                .await
+        );
+        let store = session.handles.store.clone();
+        wait_until(
+            || session.handles.qualified.load(Ordering::Acquire),
+            "Core prefix",
+        )
+        .await;
+        let edited = session
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({
+                    "documentId":healthy,"baseRevision":"0","requestId":hex(32, 99),
+                    "ops":[{"insert":"healthy"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited["revision"], "1");
+        wait_until(
+            || store.edit_identity(&hex(32, 99)).unwrap().is_some(),
+            "healthy append",
+        )
+        .await;
+        let mut subscription = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":unavailable}))
+            .await
+            .unwrap();
+        let _ = subscription.next_event().await.unwrap();
+        session
+            .harness
+            .request(
+                "documents.document.recover",
+                json!({
+                    "documentId":unavailable,"transferId":hex(32, 91),"requestIds":[hex(32, 92)]
+                }),
+            )
+            .await
+            .unwrap();
+        let unresolved = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = subscription.next_event().await.unwrap().unwrap();
+                if event["transferId"] == hex(32, 91) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
+        subscription.close().await;
+        let mut incoming = DocumentBody::new(92);
+        incoming
+            .apply(&[TextOp::Insert {
+                insert: "remote".into(),
+            }])
+            .unwrap();
+        let update = incoming
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let edit =
+            DomainRecord::identified_document_edit("bob", &healthy, &hex(32, 98), &[6; 32], update)
+                .unwrap();
+        assert!(stream.send(record_frame(5, "bob", &edit)).await);
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 5).as_str()),
+            "healthy incoming cursor",
+        )
+        .await;
+        assert!(
+            session.handles.bodies.lock().unwrap()[&healthy]
+                .text()
+                .contains("remote")
+        );
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&unavailable].unopened(),
+            1
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unopenable_deferred_identity_hides_applied_body_until_collision_is_known() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("documents.sqlite3");
@@ -3018,7 +3987,7 @@ mod tests {
             ).unwrap();
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;").unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -3205,7 +4174,7 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
@@ -3754,6 +4723,23 @@ mod tests {
         };
         assert_eq!(failed["requestStatuses"][0]["durability"], "pending");
         fail.store(false, Ordering::SeqCst);
+        let premature = session
+            .harness
+            .request("documents.document.edit", request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(premature.code(), "documents.document_pending");
+        let stream = session.scripted.stream();
+        assert!(
+            stream
+                .send(json!({"kind":"replay_end","cursor":hex(50, 50),"gapFree":true}))
+                .await
+        );
+        wait_until(
+            || session.handles.qualified.load(Ordering::Acquire),
+            "new Core prefix",
+        )
+        .await;
         session
             .harness
             .request("documents.document.edit", request)
@@ -3837,6 +4823,17 @@ mod tests {
         );
         assert!(session.handles.bodies.lock().unwrap()[&document].has_pending());
         fail.store(false, Ordering::SeqCst);
+        let stream = session.scripted.stream();
+        assert!(
+            stream
+                .send(json!({"kind":"replay_end","cursor":hex(50, 60),"gapFree":true}))
+                .await
+        );
+        wait_until(
+            || session.handles.qualified.load(Ordering::Acquire),
+            "retry prefix",
+        )
+        .await;
         let handles = session.handles.clone();
         let waiting_document = document.clone();
         wait_until(
@@ -3877,11 +4874,16 @@ mod tests {
                 .is_err()
         );
         assert!(session.handles.bodies.lock().unwrap()[&document].has_pending());
+        wait_until(
+            || !session.handles.qualified.load(Ordering::Acquire),
+            "uncertain append invalidates prefix",
+        )
+        .await;
         fail.store(false, Ordering::SeqCst);
         session.harness.dispose().await.unwrap();
         assert!(
-            !session.handles.bodies.lock().unwrap()[&document].has_pending(),
-            "graceful dispose drains outstanding edits"
+            session.handles.bodies.lock().unwrap()[&document].has_pending(),
+            "shutdown does not reappend an uncertain edit without a new Core prefix"
         );
         text.close().await;
         session.harness.shutdown().await.unwrap();

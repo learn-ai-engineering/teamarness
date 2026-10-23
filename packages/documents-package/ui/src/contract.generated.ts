@@ -98,10 +98,11 @@ export type TextEvent = {
   readonly "chunkIndex"?: number;
   readonly "chunks"?: number;
   readonly "delta"?: readonly TextOp[];
+  readonly "diagnosticRecordId"?: RecordId;
   readonly "documentId": RecordId;
   readonly "editable": boolean;
   readonly "origin"?: "local" | "remote";
-  readonly "reason"?: "identity_conflict";
+  readonly "reason"?: "identity_conflict" | "import_failure";
   readonly "requestId"?: RequestId;
   readonly "requestStatuses"?: readonly RequestStatus[];
   readonly "revision": Revision;

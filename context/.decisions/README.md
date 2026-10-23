@@ -32,6 +32,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0022](0022-workspace-person-names.md) | Workspace Person names are Core-owned, not a Profile Package | accepted (2026-10-11) | – | – | In the ADR | Refines 0003, 0004, 0008/0009 and 0018 |
 | [0023](0023-documents-on-immutable-record-log.md) | Documents are Package-owned Loro updates on the immutable record log | accepted (2026-10-21) | – | – | In the ADR | Refines 0002, 0008/0009, 0018, and 0022; consumes 1.1 as recorded in 0024 |
 | [0024](0024-qualified-record-replay-and-generation-fence.md) | Qualified immutable-record replay and Package generation append fence | accepted (2026-10-23) | – | – | In the ADR | Refines 0018 (additive minor), 0008/0009 (replay), and 0019 (generation retirement); see 0023 for Documents usage |
+| [0025](0025-document-import-failure.md) | A durable body edit may be unapplied on one Installation | accepted (2026-10-23) | – | – | In the ADR | Refines 0023/0024; local fail-loud import disposition, last-good incomplete text, no remote ACK or automatic repair |
 
 ### Former file names
 

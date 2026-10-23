@@ -16,6 +16,7 @@ button, input, select, textarea { font: inherit; }
 .editor-header { display: flex; flex: none; align-items: center; gap: .6rem; border-bottom: 1px solid var(--teamarness-color-border); padding: .6rem 1rem; }
 .editor-title { flex: 1; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; }
 .editor-status { color: var(--teamarness-color-text-muted); font-size: .8rem; }
+.editor-status-failure { color: #a32020; font-weight: 700; border: 2px solid currentColor; padding: .5rem; }
 .editor-textarea { flex: 1; min-height: 0; width: 100%; resize: none; border: 0; border-radius: 0; padding: 1rem 1.2rem; font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .95rem; line-height: 1.5; }
 .collection-rail { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--teamarness-color-border); background: color-mix(in srgb, var(--teamarness-color-panel) 80%, var(--teamarness-color-background)); }
 .collection-rail h2 { margin: 0; padding: .85rem .8rem .45rem 1.2rem; color: var(--teamarness-color-text-muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }

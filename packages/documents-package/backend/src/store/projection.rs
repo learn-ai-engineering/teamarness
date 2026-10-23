@@ -228,6 +228,14 @@ pub(crate) fn project_domain(
             if !document_exists(tx, document)? {
                 return ProjectionOutcome::deferred(tx, record_id, domain);
             }
+            let failed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM document_import_failures WHERE document_id=?1)",
+                [document],
+                |row| row.get(0),
+            )?;
+            if failed {
+                return ProjectionOutcome::quarantined(tx, record_id, "import_failure");
+            }
             clear(tx, record_id)?;
             Ok(ProjectionOutcome {
                 edit: Some((document.clone(), update.clone())),
