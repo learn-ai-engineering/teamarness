@@ -86,6 +86,7 @@ pub(crate) struct EditIdentity {
     pub(crate) digest: [u8; 32],
     pub(crate) revision: u64,
     pub(crate) durable: bool,
+    pub(crate) projection_pending: bool,
 }
 
 struct AppliedBaseline {
@@ -244,6 +245,12 @@ impl DocumentBody {
         self.identities.get(id)
     }
 
+    pub(crate) fn set_projection_pending(&mut self, id: &str, pending: bool) {
+        if let Some(known) = self.identities.get_mut(id) {
+            known.projection_pending = pending;
+        }
+    }
+
     pub(crate) fn remember_identity(
         &mut self,
         id: String,
@@ -279,6 +286,7 @@ impl DocumentBody {
                     digest,
                     revision: self.revision,
                     durable,
+                    projection_pending: false,
                 },
             );
         }

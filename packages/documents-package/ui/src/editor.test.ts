@@ -476,6 +476,23 @@ describe("DocumentEditor", () => {
     expect(editor.current.text).toBe(editor.value);
   });
 
+  it("durable but unprojected recovery keeps the outstanding ID and unsaved draft", async () => {
+    let sends = 0;
+    const editor = new DocumentEditor(event({ revision: "0", text: "good" }),
+      () => { sends++; return new Promise(() => {}); }, () => {});
+    editor.input("good draft");
+    const id = editor.outstandingIds[0]!;
+    editor.receive(recovered(editor, { revision: "1", text: "good draft", savedRevision: "1" },
+      "unresolved", "durable"), null);
+    expect(editor.outstandingIds).toEqual([id]);
+    expect(editor.value).toBe("good draft");
+    expect(editor.current.error).not.toBeNull();
+    expect(sends).toBe(1);
+    editor.receive(recovered(editor, { revision: "1", text: "good draft", savedRevision: "1" },
+      "included", "durable"), null);
+    expect(editor.outstandingIds).toEqual([]);
+  });
+
   it("unresolved identified recovery keeps a draft unsaved and never resends guessed bytes", async () => {
     let sends = 0;
     const editor = new DocumentEditor(event({ revision: "0", text: "abc" }),

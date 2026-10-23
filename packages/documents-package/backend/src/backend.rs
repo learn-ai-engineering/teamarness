@@ -84,6 +84,25 @@ struct BodyHub {
     publication_gate: Arc<Mutex<()>>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn import_failure_diagnostic(
+    document: &str,
+    record: &str,
+    author: &str,
+    request: Option<&str>,
+    update_length: usize,
+    sealed_length: usize,
+    category: &str,
+    phase: &str,
+) -> JsonValue {
+    json!({
+        "event":"documents.import_failure", "category":category, "documentId":document,
+        "recordId":record, "author":author.chars().take(128).collect::<String>(),
+        "requestId":request, "updateLength":update_length,
+        "sealedLength":sealed_length, "phase":phase,
+    })
+}
+
 impl BodyHub {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, DocumentBody>> {
         self.bodies
@@ -169,12 +188,16 @@ impl BodyHub {
     ) {
         eprintln!(
             "{}",
-            json!({
-                "event":"documents.import_failure", "category":category, "documentId":document,
-                "recordId":record, "author":author.chars().take(128).collect::<String>(),
-                "requestId":request, "updateLength":update_length,
-                "sealedLength":sealed_length, "phase":phase,
-            })
+            import_failure_diagnostic(
+                document,
+                record,
+                author,
+                request,
+                update_length,
+                sealed_length,
+                category,
+                phase
+            )
         );
         let mut events = self.with_body(document, |body| {
             full_text_events_bounded(
@@ -514,7 +537,7 @@ impl BodyHub {
         let (revision, text, editable, statuses) = self.with_body(&request.document_id, |body| {
                 let statuses: Vec<JsonValue> = request.request_ids.iter().map(|id| {
                     match body.identity(id).filter(|known| known.author == *author) {
-                        Some(known) => json!({"requestId":id,"inclusion":if body.editable() { "included" } else { "unresolved" },"durability": if known.durable { "durable" } else { "pending" }}),
+                        Some(known) => json!({"requestId":id,"inclusion":if body.editable() && !known.projection_pending { "included" } else { "unresolved" },"durability": if known.durable { "durable" } else { "pending" }}),
                         None if looked_up.is_ok() && !foreign_ids.contains(id.as_str()) && self.qualified.load(Ordering::Acquire) && body.editable() => json!({"requestId":id,"inclusion":"absent","durability":"unresolved"}),
                         None => json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"}),
                     }
@@ -1081,6 +1104,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     Err(BodyError::Loro) => Err(error("documents.edit_failed", true)),
                 }
             })?;
+            if is_retry && hub.with_body(&document, |body| body.identity(&request.request_id).is_some_and(|known| known.projection_pending)) {
+                return Err(error("documents.document_pending", true));
+            }
             if !is_retry {
                 hub.flush.notify_one();
                 let event = json!({
@@ -1473,7 +1499,7 @@ async fn lookup_identities(
 ) -> Result<IdentityLookups, BackendError> {
     let mut found = HashMap::new();
     for id in ids {
-        if let Some(cached) = hub.lock().iter().find_map(|(document, body)| {
+        let cached = hub.lock().iter().find_map(|(document, body)| {
             body.identity(id).map(|known| {
                 (
                     document.clone(),
@@ -1482,10 +1508,7 @@ async fn lookup_identities(
                     known.durable,
                 )
             })
-        }) {
-            found.insert(id.clone(), cached);
-            continue;
-        }
+        });
         let reader = store.clone();
         let key = id.clone();
         let row = tokio::task::spawn_blocking(move || reader.indexed_edit_record(&key))
@@ -1499,6 +1522,9 @@ async fn lookup_identities(
                 .is_some()
             {
                 return Err(error("documents.document_pending", true));
+            }
+            if let Some(cached) = cached {
+                found.insert(id.clone(), cached);
             }
             continue;
         };
@@ -2210,6 +2236,14 @@ async fn append_edit(
         }
         capability_error(purpose, cause)
     })?;
+    // From the moment Core accepts the bytes until projection commits, recovery must not
+    // mistake the local preview for an imported body. A replay may commit while SQLite
+    // projection is in flight; only that commit may clear this flag.
+    if let Some((id, digest)) = &identity {
+        let _publication = hub.publication_gate.lock().unwrap();
+        hub.remember_identity(document, id, author, *digest, true);
+        hub.with_body(document, |body| body.set_projection_pending(id, true));
+    }
     let changes = changes.clone();
     let classifier = hub.clone();
     let ingested = tokio::task::spawn_blocking(move || {
@@ -2256,13 +2290,11 @@ async fn append_edit(
             }
             if let Some((id, digest)) = &identity {
                 hub.remember_identity(document, id, author, *digest, true);
+                hub.with_body(document, |body| body.set_projection_pending(id, false));
             }
             // Ingest installed successful candidates only after the store committed.
         }
         Ok(Err(cause)) => {
-            if let Some((id, digest)) = &identity {
-                hub.remember_identity(document, id, author, *digest, true);
-            }
             hub.with_body(document, DocumentBody::append_succeeded);
             eprintln!(
                 "documents edit projection failure after append: {}",
@@ -2271,9 +2303,6 @@ async fn append_edit(
             return Err(cause);
         }
         Err(_) => {
-            if let Some((id, digest)) = &identity {
-                hub.remember_identity(document, id, author, *digest, true);
-            }
             hub.with_body(document, DocumentBody::append_succeeded);
             return Err(storage_failed());
         }
@@ -2454,6 +2483,11 @@ impl RecordLogSink for DocumentsSink {
         {
             self.hub
                 .remember_identity(&document, &request_id, &author, payload_digest, true);
+            if matches!(ingested.result, IngestResult::Applied) {
+                self.hub.with_body(&document, |body| {
+                    body.set_projection_pending(&request_id, false)
+                });
+            }
         }
         Ok(())
     }
@@ -4336,7 +4370,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(received["requestStatuses"][0]["inclusion"], "included");
-        assert_eq!(received["requestStatuses"][1]["inclusion"], "absent");
+        assert_eq!(
+            received["requestStatuses"][1]["inclusion"], "unresolved",
+            "an unopenable indexed row cannot certify other IDs absent"
+        );
         assert_eq!(store.edit_identity(&id).unwrap().unwrap().0, hex(64, 3));
         text.close().await;
         session.harness.shutdown().await.unwrap();
@@ -4631,6 +4668,374 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R05 — diagnostics exclude body bytes and payload digests.
+    #[test]
+    fn import_failure_diagnostic_has_only_bounded_provenance_fields() {
+        let diagnostic = import_failure_diagnostic(
+            &hex(64, 1),
+            &hex(64, 2),
+            &"a".repeat(200),
+            Some(&hex(32, 3)),
+            42,
+            64,
+            "decode_or_checksum",
+            "replay",
+        );
+        let fields: Vec<_> = diagnostic
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "author",
+                "category",
+                "documentId",
+                "event",
+                "phase",
+                "recordId",
+                "requestId",
+                "sealedLength",
+                "updateLength"
+            ]
+        );
+        assert_eq!(diagnostic["author"].as_str().unwrap().len(), 128);
+        assert!(diagnostic.get("payloadDigest").is_none());
+        assert!(diagnostic.get("body").is_none());
+        assert!(diagnostic.get("canonical").is_none());
+        assert!(diagnostic.get("sealedRecord").is_none());
+        assert_eq!(diagnostic["updateLength"], 42);
+        assert_eq!(diagnostic["sealedLength"], 64);
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — Core durability does not prove local body inclusion.
+    #[tokio::test]
+    async fn post_append_projection_failure_remains_unresolved_until_replay() {
+        let appended = Arc::new(Mutex::new(Vec::<(u64, String, String)>::new()));
+        let saved = appended.clone();
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "append" => {
+                let seed = next.fetch_add(1, Ordering::SeqCst);
+                saved.lock().unwrap().push((seed, payload["purpose"].as_str().unwrap().to_owned(),
+                    payload["canonical"].as_str().unwrap().to_owned()));
+                Ok(json!({"recordId":hex(64,seed),"orderKey":hex(82,seed),
+                    "author":ALICE,"signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}))
+            }
+            "open" => Ok(json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                .map(|_| json!({"status":"waiting_for_history_access"})).collect::<Vec<_>>()})),
+            _ => Err(error("unavailable", false)),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted).await;
+        qualify_empty_history(&session).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({"name":"Plan"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"Draft"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut text = session
+            .harness
+            .subscribe("documents.document.text", json!({"documentId":document}))
+            .await
+            .unwrap();
+        let _ = text.next_event().await.unwrap();
+        let store = session.handles.store.clone();
+        store.inner.lock().unwrap().conn.execute_batch(
+            "CREATE TRIGGER fail_edit_projection BEFORE INSERT ON records WHEN NEW.purpose='document.edit' BEGIN SELECT RAISE(FAIL, 'injected'); END;"
+        ).unwrap();
+        let id = hex(32, 83);
+        let request = json!({"documentId":document,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]});
+        assert_eq!(
+            session
+                .harness
+                .request("documents.document.edit", request.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.storage_failed"
+        );
+        assert_eq!(
+            appended.lock().unwrap().len(),
+            3,
+            "Core accepted exactly one edit"
+        );
+        assert!(store.edit_identity(&id).unwrap().is_none());
+        let recover =
+            |seed| json!({"documentId":document,"transferId":hex(32,seed),"requestIds":[id]});
+        session
+            .harness
+            .request("documents.document.recover", recover(84))
+            .await
+            .unwrap();
+        let before = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = text.next_event().await.unwrap().unwrap();
+                if event["transferId"] == hex(32, 84) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(before["requestStatuses"][0]["durability"], "durable");
+        assert_eq!(before["requestStatuses"][0]["inclusion"], "unresolved");
+        assert_eq!(
+            session
+                .harness
+                .request("documents.document.edit", request.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.document_pending"
+        );
+        assert_eq!(appended.lock().unwrap().len(), 3, "retry must not reappend");
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER fail_edit_projection")
+            .unwrap();
+        let (_, purpose, canonical) = appended.lock().unwrap()[2].clone();
+        let record = DomainRecord::decode(&URL_SAFE_NO_PAD.decode(canonical).unwrap()).unwrap();
+        assert_eq!(record.kind(), purpose);
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(102, ALICE, &record))
+                .await
+        );
+        wait_until(
+            || store.edit_identity(&id).unwrap().is_some(),
+            "replayed edit projection",
+        )
+        .await;
+        session
+            .harness
+            .request("documents.document.recover", recover(85))
+            .await
+            .unwrap();
+        let after = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = text.next_event().await.unwrap().unwrap();
+                if event["transferId"] == hex(32, 85) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(after["requestStatuses"][0]["inclusion"], "included");
+        assert_eq!(after["requestStatuses"][0]["durability"], "durable");
+        assert_eq!(appended.lock().unwrap().len(), 3);
+        text.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — an indexed foreign ID overrides a pending cached retry.
+    #[tokio::test]
+    async fn cached_pending_retry_checks_indexed_foreign_document_after_eviction() {
+        let directory = tempfile::tempdir().unwrap();
+        let indexed = Arc::new(Mutex::new(None::<(String, String)>));
+        let opener = indexed.clone();
+        let openable = Arc::new(AtomicBool::new(false));
+        let allow_open = openable.clone();
+        let appends = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let appended = appends.clone();
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "append" => {
+                let seed = 100 + appended.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"recordId":hex(64,seed),"orderKey":hex(82,seed),
+                    "author":ALICE,"signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}))
+            }
+            "open" => Ok(json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                .map(|_| match (&*opener.lock().unwrap(), allow_open.load(Ordering::SeqCst)) {
+                    (Some((purpose, canonical)), true) => json!({"status":"ready",
+                        "recordId":hex(64,400),"orderKey":hex(82,400),"author":ALICE,
+                        "signature":"c2ln","purpose":purpose,"canonical":canonical}),
+                    _ => json!({"status":"waiting_for_history_access"}),
+                }).collect::<Vec<_>>()})),
+            _ => Err(error("unavailable", false)),
+        });
+        let mut session = start(directory.path(), scripted).await;
+        qualify_empty_history(&session).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({"name":"Plan"}))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let a = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"A"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let b = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"B"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .harness
+            .request("documents.document.open", json!({"documentId":a}))
+            .await
+            .unwrap();
+        session
+            .harness
+            .request("documents.document.open", json!({"documentId":b}))
+            .await
+            .unwrap();
+        let id = hex(32, 91);
+        let digest: [u8; 32] = Sha256::digest(
+            serde_json::to_vec(&(
+                0_u64,
+                vec![TextOp::Insert {
+                    insert: "draft".into(),
+                }],
+            ))
+            .unwrap(),
+        )
+        .into();
+        session
+            .handles
+            .bodies
+            .lock()
+            .unwrap()
+            .get_mut(&b)
+            .unwrap()
+            .remember_identity(id.clone(), ALICE.into(), digest, false)
+            .unwrap();
+        let mut source = DocumentBody::new(71);
+        source
+            .apply(&[TextOp::Insert {
+                insert: "on A".into(),
+            }])
+            .unwrap();
+        let update = source
+            .flush(Instant::now(), true)
+            .unwrap()
+            .updates
+            .remove(0);
+        let record =
+            DomainRecord::identified_document_edit(ALICE, &a, &id, &[5; 32], update).unwrap();
+        *indexed.lock().unwrap() = Some((
+            record.kind().to_owned(),
+            URL_SAFE_NO_PAD.encode(record.encode()),
+        ));
+        let store = session.handles.store.clone();
+        store
+            .ingest(
+                &hex(64, 400),
+                &hex(82, 400),
+                ALICE,
+                record.kind(),
+                "c2ln",
+                &record.encode(),
+                b"sealed",
+                None,
+            )
+            .unwrap();
+        session
+            .handles
+            .bodies
+            .lock()
+            .unwrap()
+            .get_mut(&a)
+            .unwrap()
+            .remember_identity(id.clone(), ALICE.into(), [5; 32], true)
+            .unwrap();
+        for seed in 0..=crate::body::MAX_RECENT_IDENTITIES {
+            session
+                .handles
+                .bodies
+                .lock()
+                .unwrap()
+                .get_mut(&a)
+                .unwrap()
+                .remember_identity(format!("{:032x}", seed + 1000), ALICE.into(), [0; 32], true)
+                .unwrap();
+        }
+        assert!(
+            session.handles.bodies.lock().unwrap()[&a]
+                .identity(&id)
+                .is_none()
+        );
+        assert!(
+            session.handles.bodies.lock().unwrap()[&b]
+                .identity(&id)
+                .is_some()
+        );
+        // The scripted opener cannot authenticate this row: fail closed instead of accepting B's cache.
+        let result = session
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({
+                    "documentId":b,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(result.code(), "documents.document_pending");
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            3,
+            "unopenable row cannot cause an append"
+        );
+        openable.store(true, Ordering::SeqCst);
+        let rejected = session
+            .harness
+            .request(
+                "documents.document.edit",
+                json!({
+                    "documentId":b,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), "documents.invalid_request");
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            3,
+            "known foreign ID must not append"
+        );
+        assert!(!store.identity_conflicted(&a).unwrap());
+        assert!(!store.identity_conflicted(&b).unwrap());
+        session.harness.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn recover_never_certifies_pending_identity_before_or_after_failed_append() {
         let fail = Arc::new(AtomicBool::new(true));
@@ -4767,6 +5172,8 @@ mod tests {
         let fail = Arc::new(AtomicBool::new(true));
         let failure = fail.clone();
         let appended = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let accepted = Arc::new(Mutex::new(None::<(u64, String)>));
+        let saved = accepted.clone();
         let scripted = ScriptedCapability::new().calls(move |method, payload| {
             if method == "append" && payload["purpose"] == "document.edit"
                 && failure.load(Ordering::SeqCst) {
@@ -4774,9 +5181,17 @@ mod tests {
             }
             match method {
                 "open" => Ok(json!({ "results": (0..payload["sealedRecords"].as_array().map_or(0, Vec::len))
-                    .map(|_| json!({ "status": "waiting_for_history_access" })).collect::<Vec<_>>() })),
+                    .map(|_| match &*saved.lock().unwrap() {
+                        Some((seed, canonical)) => json!({"status":"ready", "recordId":hex(64,*seed),
+                            "orderKey":hex(82,*seed), "author":ALICE, "signature":"c2ln",
+                            "purpose":"document.edit", "canonical":canonical}),
+                        None => json!({"status":"waiting_for_history_access"}),
+                    }).collect::<Vec<_>>() })),
                 "append" => {
                     let seed = appended.fetch_add(1, Ordering::SeqCst);
+                    if payload["purpose"] == "document.edit" {
+                        *saved.lock().unwrap() = Some((seed, payload["canonical"].as_str().unwrap().to_owned()));
+                    }
                     Ok(json!({ "recordId": hex(64, seed), "orderKey": hex(82, seed),
                         "author": ALICE, "signature": "c2ln", "sealedRecord": "c2VhbGVk",
                         "durability": "committed" }))
