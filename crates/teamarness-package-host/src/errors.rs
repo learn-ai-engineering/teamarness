@@ -51,6 +51,7 @@ pub enum PackageErrorCode {
     UiContractViolation,
     PortContractViolation,
     PortProviderConflict,
+    PortGraphSearchLimit,
     PortContractMissing,
     PortMissing,
     PortVersionMismatch,

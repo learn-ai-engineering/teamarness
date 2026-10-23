@@ -201,126 +201,71 @@ pub(crate) fn admit(
             }
         }
     }
-    // Conflict selection is provisional until required dependencies have settled. A
-    // graph-invalid winner must not permanently displace a viable rival on reopen.
-    let mut candidates = eligible;
-    let (mut eligible, providers, remaining) = loop {
-        let mut eligible = candidates.clone();
-        let mut trial_diagnostics = Vec::new();
-        let mut providers = BTreeMap::new();
-        // BTreeMap order is stable regardless of registration order. A still-valid
-        // incumbent wins over a newly installed, lexically earlier contender.
-        loop {
-            providers.clear();
-            let mut losers = BTreeSet::new();
-            for (contract, all_candidates) in &claims {
-                let mut contenders: Vec<_> = all_candidates
-                    .iter()
-                    .filter(|candidate| eligible.contains_key(*candidate))
-                    .cloned()
-                    .collect();
-                if contenders.is_empty() {
-                    continue;
-                }
-                contenders.sort_by_key(|id| {
-                    let source = eligible[id].0.source;
-                    (matches!(source, PackageSourceKind::Local), id.clone())
-                });
-                let winner = incumbent
-                    .get(contract)
-                    .and_then(|id| contenders.iter().find(|candidate| candidate.as_str() == id))
-                    .cloned()
-                    .unwrap_or_else(|| contenders[0].clone());
-                losers.extend(
-                    contenders
-                        .into_iter()
-                        .filter(|candidate| *candidate != winner),
-                );
-                providers.insert(contract.clone(), winner);
-            }
-            if losers.is_empty() {
-                break;
-            }
-            for candidate in losers {
-                eligible.remove(&candidate);
-                trial_diagnostics.push(diagnostic(
-                    PackageErrorCode::PortProviderConflict,
-                    PackageErrorStage::Admission,
-                    Some(candidate),
-                ));
-            }
+    let (providers, limited) = select_provider_graph(&eligible, &claims, &incumbent);
+    let selected: BTreeSet<_> = providers.values().cloned().collect();
+    let claimants: BTreeSet<_> = claims.values().flatten().cloned().collect();
+    let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
+    remaining.retain(|id| !claimants.contains(id) || selected.contains(id));
+    // Preserve the original cycle verdict when every candidate in a required cycle
+    // must be discarded; the final empty graph alone cannot reveal that cause.
+    let preferred = preferred_providers(&eligible, &claims, &incumbent);
+    let preferred_cycles = required_cycle_members(&eligible, &preferred);
+    for identity in required_cycle_members(&eligible, &providers) {
+        remaining.remove(&identity);
+    }
+    settle_required(&eligible, &providers, &mut remaining);
+    for identity in &claimants {
+        if selected.contains(identity) {
+            continue;
         }
-
-        let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
-        // Reject required cycles before propagating missing dependencies.
-        for identity in required_cycle_members(&eligible, &providers) {
-            remaining.remove(&identity);
-            trial_diagnostics.push(diagnostic(
-                PackageErrorCode::PortDependencyCycle,
+        let code = if limited.contains(identity) {
+            PackageErrorCode::PortGraphSearchLimit
+        } else {
+            let missing = eligible[identity]
+                .1
+                .manifest
+                .consumed_ports
+                .iter()
+                .filter(|request| request.required)
+                .find_map(|request| {
+                    resolve(request, &providers, &eligible, &remaining).unavailable
+                });
+            let has_winner = claims.iter().any(|(contract, candidates)| {
+                candidates.contains(identity) && providers.contains_key(contract)
+            });
+            if preferred_cycles.contains(identity) && !has_winner {
+                PackageErrorCode::PortDependencyCycle
+            } else {
+                missing.unwrap_or(PackageErrorCode::PortProviderConflict)
+            }
+        };
+        diagnostics.push(diagnostic(
+            code,
+            PackageErrorStage::Admission,
+            Some(identity.clone()),
+        ));
+    }
+    for identity in eligible
+        .keys()
+        .filter(|identity| !claimants.contains(*identity))
+    {
+        if !remaining.contains(identity) {
+            let code = eligible[identity]
+                .1
+                .manifest
+                .consumed_ports
+                .iter()
+                .filter(|request| request.required)
+                .find_map(|request| resolve(request, &providers, &eligible, &remaining).unavailable)
+                .unwrap_or(PackageErrorCode::PortDependencyCycle);
+            diagnostics.push(diagnostic(
+                code,
                 PackageErrorStage::Admission,
-                Some(identity),
+                Some(identity.clone()),
             ));
         }
-        loop {
-            let failures: Vec<_> = remaining
-                .iter()
-                .filter_map(|identity| {
-                    let admission = &eligible[identity].1;
-                    admission
-                        .manifest
-                        .consumed_ports
-                        .iter()
-                        .filter(|request| request.required)
-                        .find_map(|request| {
-                            resolve(request, &providers, &eligible, &remaining)
-                                .unavailable
-                                .map(|code| (identity.clone(), code))
-                        })
-                })
-                .collect();
-            if failures.is_empty() {
-                break;
-            }
-            for (identity, code) in failures {
-                remaining.remove(&identity);
-                trial_diagnostics.push(diagnostic(
-                    code,
-                    PackageErrorStage::Admission,
-                    Some(identity),
-                ));
-            }
-        }
-        let invalid_winners: BTreeSet<_> = providers
-            .values()
-            .filter(|identity| !remaining.contains(*identity))
-            .cloned()
-            .collect();
-        if invalid_winners.is_empty() {
-            diagnostics.extend(trial_diagnostics);
-            break (eligible, providers, remaining);
-        }
-        // Replace one contested invalid winner first. Other winners may only be
-        // invalid because they depend on it; a rival can make them viable on retry.
-        let contested = providers.iter().find_map(|(contract, winner)| {
-            (invalid_winners.contains(winner)
-                && claims[contract]
-                    .iter()
-                    .any(|rival| rival != winner && candidates.contains_key(rival)))
-            .then(|| winner.clone())
-        });
-        let evicted: Vec<_> = contested
-            .map(|winner| vec![winner])
-            .unwrap_or_else(|| invalid_winners.into_iter().collect());
-        for identity in evicted {
-            if let Some(reason) = trial_diagnostics
-                .iter()
-                .find(|error| error.affected_package.as_ref() == Some(&identity))
-            {
-                diagnostics.push(reason.clone());
-            }
-            candidates.remove(&identity);
-        }
-    };
+    }
+    let mut eligible = eligible;
     let graph = remaining
         .iter()
         .map(|identity| {
@@ -396,6 +341,281 @@ pub(crate) fn admit(
         graph,
         catalog,
     })
+}
+
+type Eligible = BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>;
+const MAX_GRAPH_STATES: usize = 4_096;
+
+fn preferred_providers(
+    eligible: &Eligible,
+    claims: &BTreeMap<String, Vec<PackageIdentity>>,
+    incumbent: &BTreeMap<String, String>,
+) -> BTreeMap<String, PackageIdentity> {
+    claims
+        .iter()
+        .map(|(contract, candidates)| {
+            let mut candidates = candidates.clone();
+            candidates.sort_by_key(|id| {
+                (
+                    incumbent
+                        .get(contract)
+                        .is_none_or(|choice| choice != id.as_str()),
+                    matches!(eligible[id].0.source, PackageSourceKind::Local),
+                    id.clone(),
+                )
+            });
+            (contract.clone(), candidates[0].clone())
+        })
+        .collect()
+}
+
+fn settle_required(
+    eligible: &Eligible,
+    providers: &BTreeMap<String, PackageIdentity>,
+    remaining: &mut BTreeSet<PackageIdentity>,
+) {
+    loop {
+        let failures: Vec<_> = remaining
+            .iter()
+            .filter(|identity| {
+                eligible[*identity]
+                    .1
+                    .manifest
+                    .consumed_ports
+                    .iter()
+                    .filter(|request| request.required)
+                    .any(|request| {
+                        resolve(request, providers, eligible, remaining)
+                            .unavailable
+                            .is_some()
+                    })
+            })
+            .cloned()
+            .collect();
+        if failures.is_empty() {
+            break;
+        }
+        for identity in failures {
+            remaining.remove(&identity);
+        }
+    }
+}
+
+fn viable_selection(
+    eligible: &Eligible,
+    claims: &BTreeMap<String, Vec<PackageIdentity>>,
+    component: &[String],
+    providers: &BTreeMap<String, PackageIdentity>,
+) -> bool {
+    let selected: BTreeSet<_> = providers.values().cloned().collect();
+    // A Package cannot provide one of its contracts after losing another claim.
+    if component.iter().any(|contract| {
+        claims[contract]
+            .iter()
+            .any(|id| selected.contains(id) && providers.get(contract) != Some(id))
+    }) {
+        return false;
+    }
+    let claimants: BTreeSet<_> = component
+        .iter()
+        .flat_map(|contract| claims[contract].iter().cloned())
+        .collect();
+    let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
+    remaining.retain(|id| !claimants.contains(id) || selected.contains(id));
+    for identity in required_cycle_members(eligible, providers) {
+        remaining.remove(&identity);
+    }
+    settle_required(eligible, providers, &mut remaining);
+    selected.is_subset(&remaining)
+}
+
+struct GraphSearch<'a> {
+    eligible: &'a Eligible,
+    claims: &'a BTreeMap<String, Vec<PackageIdentity>>,
+    options: Vec<(String, Vec<Option<PackageIdentity>>)>,
+    incumbent: &'a BTreeMap<String, String>,
+    incumbent_total: usize,
+    states: usize,
+    exhausted: bool,
+    best: Option<BTreeMap<String, PackageIdentity>>,
+    best_count: usize,
+}
+
+impl GraphSearch<'_> {
+    fn visit(
+        &mut self,
+        index: usize,
+        retained: usize,
+        chosen: &mut BTreeMap<String, PackageIdentity>,
+    ) {
+        if self.exhausted || self.best.is_some() && self.best_count == self.incumbent_total {
+            return;
+        }
+        if self.states == MAX_GRAPH_STATES {
+            self.exhausted = true;
+            return;
+        }
+        self.states += 1;
+        if self.best.is_some()
+            && retained
+                + self.options[index..]
+                    .iter()
+                    .filter(|(contract, _)| self.incumbent.contains_key(contract))
+                    .count()
+                <= self.best_count
+        {
+            return;
+        }
+        if index == self.options.len() {
+            let component: Vec<_> = self
+                .options
+                .iter()
+                .map(|(contract, _)| contract.clone())
+                .collect();
+            if viable_selection(self.eligible, self.claims, &component, chosen) {
+                self.best_count = retained;
+                self.best = Some(chosen.clone());
+            }
+            return;
+        }
+        let (contract, candidates) = self.options[index].clone();
+        for candidate in candidates {
+            if let Some(id) = &candidate {
+                chosen.insert(contract.clone(), id.clone());
+            }
+            let next = retained
+                + usize::from(candidate.as_ref().is_some_and(|id| {
+                    self.incumbent
+                        .get(&contract)
+                        .is_some_and(|old| old == id.as_str())
+                }));
+            self.visit(index + 1, next, chosen);
+            chosen.remove(&contract);
+            if self.exhausted || self.best.is_some() && self.best_count == self.incumbent_total {
+                return;
+            }
+        }
+    }
+}
+
+fn select_provider_graph(
+    eligible: &Eligible,
+    claims: &BTreeMap<String, Vec<PackageIdentity>>,
+    incumbent: &BTreeMap<String, String>,
+) -> (BTreeMap<String, PackageIdentity>, BTreeSet<PackageIdentity>) {
+    // Dependency edges are undirected for search isolation: the Package claiming Y
+    // may require X even when no claimant for X names Y.
+    let mut adjacent: BTreeMap<String, BTreeSet<String>> = claims
+        .keys()
+        .map(|contract| (contract.clone(), BTreeSet::new()))
+        .collect();
+    for (_, admission) in eligible.values() {
+        let provided: Vec<_> = admission
+            .manifest
+            .port_contract
+            .iter()
+            .flat_map(|document| document.contracts.iter().map(|item| item.identity.clone()))
+            .collect();
+        let related: Vec<_> = provided
+            .iter()
+            .cloned()
+            .chain(
+                admission
+                    .manifest
+                    .consumed_ports
+                    .iter()
+                    .filter(|item| item.required && claims.contains_key(&item.identity))
+                    .map(|item| item.identity.clone()),
+            )
+            .collect();
+        for contract in &provided {
+            for other in &related {
+                adjacent
+                    .get_mut(contract)
+                    .expect("provided contract has a claim")
+                    .insert(other.clone());
+                adjacent
+                    .get_mut(other)
+                    .expect("required contract has a claim")
+                    .insert(contract.clone());
+            }
+        }
+    }
+    let mut unvisited: BTreeSet<_> = claims.keys().cloned().collect();
+    let mut providers = BTreeMap::new();
+    let mut limited = BTreeSet::new();
+    while let Some(start) = unvisited.pop_first() {
+        let mut stack = vec![start];
+        let mut component = BTreeSet::new();
+        while let Some(contract) = stack.pop() {
+            for other in &adjacent[&contract] {
+                if unvisited.remove(other) {
+                    stack.push(other.clone());
+                }
+            }
+            component.insert(contract);
+        }
+        let component: Vec<_> = component.into_iter().collect();
+        if component.iter().all(|contract| claims[contract].len() == 1) {
+            let chosen: BTreeMap<_, _> = component
+                .iter()
+                .map(|contract| (contract.clone(), claims[contract][0].clone()))
+                .collect();
+            let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
+            for identity in required_cycle_members(eligible, &chosen) {
+                remaining.remove(&identity);
+            }
+            settle_required(eligible, &chosen, &mut remaining);
+            providers.extend(
+                chosen
+                    .into_iter()
+                    .filter(|(_, identity)| remaining.contains(identity)),
+            );
+            continue;
+        }
+        let mut options = Vec::new();
+        for contract in &component {
+            let mut candidates = claims[contract].clone();
+            candidates.sort_by_key(|id| {
+                (
+                    incumbent.get(contract).is_none_or(|old| old != id.as_str()),
+                    matches!(eligible[id].0.source, PackageSourceKind::Local),
+                    id.clone(),
+                )
+            });
+            let mut choices: Vec<_> = candidates.into_iter().map(Some).collect();
+            choices.push(None);
+            options.push((contract.clone(), choices));
+        }
+        let incumbent_total = options
+            .iter()
+            .filter(|(contract, choices)| {
+                incumbent
+                    .get(contract)
+                    .is_some_and(|old| choices.iter().flatten().any(|id| id.as_str() == old))
+            })
+            .count();
+        let mut search = GraphSearch {
+            eligible,
+            claims,
+            options,
+            incumbent,
+            incumbent_total,
+            states: 0,
+            exhausted: false,
+            best: None,
+            best_count: 0,
+        };
+        search.visit(0, 0, &mut BTreeMap::new());
+        if search.exhausted {
+            for contract in &component {
+                limited.extend(claims[contract].iter().cloned());
+            }
+        } else if let Some(winners) = search.best {
+            providers.extend(winners);
+        }
+    }
+    (providers, limited)
 }
 
 fn resolve(
@@ -623,7 +843,8 @@ fn diagnostic(
         PackageErrorCode::InvalidRegistration
         | PackageErrorCode::DuplicateIdentity
         | PackageErrorCode::OverrideRequired
-        | PackageErrorCode::TrustEvidenceMissing => RecoveryAction::CorrectRegistration,
+        | PackageErrorCode::TrustEvidenceMissing
+        | PackageErrorCode::PortGraphSearchLimit => RecoveryAction::CorrectRegistration,
         PackageErrorCode::DataDirectoryPermission => RecoveryAction::RestorePermissions,
         _ => RecoveryAction::CorrectPackageSource,
     };

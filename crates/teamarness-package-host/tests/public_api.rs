@@ -300,6 +300,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::UiContractViolation,
         PackageErrorCode::PortContractViolation,
         PackageErrorCode::PortProviderConflict,
+        PackageErrorCode::PortGraphSearchLimit,
         PackageErrorCode::PortContractMissing,
         PackageErrorCode::PortMissing,
         PackageErrorCode::PortVersionMismatch,
@@ -314,7 +315,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 53);
+    assert_eq!(codes.len(), 54);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -357,6 +358,7 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::UiContractViolation
             | PackageErrorCode::PortContractViolation
             | PackageErrorCode::PortProviderConflict
+            | PackageErrorCode::PortGraphSearchLimit
             | PackageErrorCode::PortContractMissing
             | PackageErrorCode::PortMissing
             | PackageErrorCode::PortVersionMismatch
