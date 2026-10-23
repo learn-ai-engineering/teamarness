@@ -158,6 +158,12 @@ impl EventSender {
             .map_err(|_| SdkError::ParentClosed)
     }
 
+    /// Sends a Port event with any JSON root value over the object-only process frame.
+    /// Use this for a non-object Port event; ordinary UI events still require objects.
+    pub async fn send_port_value(&self, payload: JsonValue) -> Result<(), SdkError> {
+        self.send(ports::encode_port_value(payload)).await
+    }
+
     /// Closes the event stream with a Package-owned error.
     pub async fn fail(&self, error: BackendError) -> Result<(), SdkError> {
         self.sender

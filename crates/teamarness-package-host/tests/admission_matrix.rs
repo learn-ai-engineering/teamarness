@@ -1276,11 +1276,38 @@ fn multi_contract_claim_is_rejected_as_one_package_when_invalid() {
 fn graph_search_limit_isolates_contested_component_and_preserves_metadata() {
     let fixture = Fixture::new();
     fixture.add_application("unrelated", "com.example.unrelated", "1.0.0");
+    declare_ports(
+        &fixture.application.join("unrelated"),
+        vec![provided("com.example.independent", 1)],
+        vec![],
+    );
+    fixture.add_application("a00", "com.example.a00", "1.0.0");
+    declare_ports(
+        &fixture.application.join("a00"),
+        vec![provided("com.example.port00", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.a00", "com.example.unrelated"]
+    );
+    let store = host_store::HostStore::open(fixture.config().private_data_directory()).unwrap();
+    let incumbents = store.port_providers().unwrap();
+    assert_eq!(
+        incumbents.get("com.example.port00"),
+        Some(&"com.example.a00".to_owned())
+    );
+    assert_eq!(
+        incumbents.get("com.example.independent"),
+        Some(&"com.example.unrelated".to_owned())
+    );
     for index in 0..12 {
         for rival in ["a", "b"] {
             let id = format!("com.example.{rival}{index:02}");
             let directory = format!("{rival}{index:02}");
-            fixture.add_application(&directory, &id, "1.0.0");
+            if index != 0 || rival != "a" {
+                fixture.add_application(&directory, &id, "1.0.0");
+            }
             declare_ports(
                 &fixture.application.join(&directory),
                 vec![provided(&format!("com.example.port{index:02}"), 1)],
@@ -1304,10 +1331,10 @@ fn graph_search_limit_isolates_contested_component_and_preserves_metadata() {
             .count(),
         24
     );
-    let store = host_store::HostStore::open(fixture.config().private_data_directory()).unwrap();
-    assert!(store.port_providers().unwrap().is_empty());
+    assert_eq!(store.port_providers().unwrap(), incumbents);
     let second = admit(&fixture.config()).unwrap();
     assert_eq!(codes(&report), codes(&second));
+    assert_eq!(store.port_providers().unwrap(), incumbents);
 }
 
 // Verifies: TEAM.SYS.PKG-R13

@@ -41,9 +41,15 @@ pub struct CapabilitySubscription {
     streams: CapabilityStreams,
     state: SharedState,
     closed: bool,
+    port_values: bool,
 }
 
 impl CapabilitySubscription {
+    pub(crate) fn with_port_values(mut self) -> Self {
+        self.port_values = true;
+        self
+    }
+
     /// Receives one event, returning `None` after the host closes the stream.
     pub async fn recv(&mut self) -> Option<Result<JsonValue, BackendError>> {
         let event = self.receiver.recv().await;
@@ -57,7 +63,15 @@ impl CapabilitySubscription {
                 ]))
                 .await;
         }
-        event
+        event.map(|result| {
+            result.map(|value| {
+                if self.port_values {
+                    crate::ports::decode_port_value(value)
+                } else {
+                    value
+                }
+            })
+        })
     }
 
     /// Receives one event and the credit it consumed, so the caller decides when to ask for more.
@@ -69,7 +83,11 @@ impl CapabilitySubscription {
     ) -> Option<Result<(JsonValue, StreamCredit), BackendError>> {
         match self.receiver.recv().await? {
             Ok(payload) => Some(Ok((
-                payload,
+                if self.port_values {
+                    crate::ports::decode_port_value(payload)
+                } else {
+                    payload
+                },
                 StreamCredit {
                     id: self.id.clone(),
                     writer: self.writer.clone(),
@@ -222,6 +240,7 @@ impl CapabilityClient {
             streams: self.streams.clone(),
             state: self.state.clone(),
             closed: false,
+            port_values: false,
         })
     }
 

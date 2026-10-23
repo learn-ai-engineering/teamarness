@@ -292,6 +292,7 @@ impl GenerationCapabilities {
                         self.generation,
                     )
                     .await
+                    .map(crate::protocol::encode_port_value)
                     .map_err(|failure| CapabilityFailure {
                         code: if failure.outcome_uncertain
                             && matches!(

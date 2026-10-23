@@ -314,7 +314,12 @@ impl UiEventRoute {
                 .validate_event(&self.operation, &payload)
                 .map_err(|_| PackageErrorCode::UiContractViolation)?,
             EventContract::Port { schemas, contract } => schemas
-                .validate(contract, &self.operation, "event", &value)
+                .validate(
+                    contract,
+                    &self.operation,
+                    "event",
+                    decode_port_value(&value),
+                )
                 .map_err(|_| PackageErrorCode::PortEventInvalid)?,
         }
         let encoded =
@@ -1303,6 +1308,27 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::EventLagged => "event_lagged",
         PackageErrorCode::PortEventInvalid => "port_event_invalid",
         _ => "protocol_violation",
+    }
+}
+
+// Only non-object Port values need an object envelope on Process 1.0 frames.
+// The two-field shape is reserved for Port routing, not a caller identity claim.
+pub(crate) fn encode_port_value(value: Value) -> Value {
+    if value.is_object() {
+        value
+    } else {
+        json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value})
+    }
+}
+
+pub(crate) fn decode_port_value(value: &Value) -> &Value {
+    let Some(fields) = value.as_object() else {
+        return value;
+    };
+    if fields.len() == 2 && fields.get("$teamarnessPortEnvelope") == Some(&Value::from(1)) {
+        fields.get("$teamarnessPortValue").unwrap_or(value)
+    } else {
+        value
     }
 }
 

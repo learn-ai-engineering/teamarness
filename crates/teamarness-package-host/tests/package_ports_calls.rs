@@ -35,6 +35,41 @@ fn declare(fixture: &common::Fixture, directory: &str, provided: bool) {
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
 
+fn declare_non_object_ports(fixture: &common::Fixture) {
+    let provider = fixture.config.application_root().join("provider");
+    let path = provider.join("ports.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    document["contracts"][0]["major"] = 2.into();
+    document["contracts"][0]["ports"].as_array_mut().unwrap().extend([
+        serde_json::json!({"name":"message.title","kind":"query","description":"Read a title", "request":{"type":"object","additionalProperties":false},"response":{"type":"string"}}),
+        serde_json::json!({"name":"message.title_watch","kind":"query","description":"Watch title parts", "request":{"type":"object","additionalProperties":false},"event":{"type":"array","items":{"type":"integer"}}}),
+    ]);
+    let bytes = serde_json::to_vec(&document).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let manifest_path = provider.join("teamarness.package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["portContract"]["sha256"] = common::digest(&bytes).into();
+    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let consumer = fixture
+        .config
+        .application_root()
+        .join("consumer/teamarness.package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&consumer).unwrap()).unwrap();
+    manifest["consumedPorts"][0]["major"] = 2.into();
+    manifest["consumedPorts"][0]["ports"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!({"name":"message.title","kind":"query"}),
+            serde_json::json!({"name":"message.title_watch","kind":"query"}),
+        ]);
+    fs::write(consumer, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
 async fn mount(host: &PackageHost, key: PackageInstanceKey) -> UiMountId {
     match host
         .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
@@ -370,6 +405,73 @@ fn port_attempts(root: &std::path::Path) -> usize {
         }
     }
     total
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn major_two_port_values_round_trip_through_object_only_frames() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+        &[serde_json::json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    declare(&fixture, "provider", true);
+    declare(&fixture, "consumer", false);
+    declare_non_object_ports(&fixture);
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = host
+        .snapshot()
+        .await
+        .instances
+        .into_iter()
+        .find(|slot| slot.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key;
+    let mount = mount(&host, consumer).await;
+    let title = request(&host, &mount, "title", "fixture.capability", serde_json::json!({
+        "capability":"teamarness.package-ports","method":"invoke",
+        "arguments":{"contract":"com.example.messages","port":"message.title","kind":"query","request":{}}
+    })).await;
+    assert_eq!(title["result"]["$teamarnessPortEnvelope"], 1);
+    assert_eq!(title["result"]["$teamarnessPortValue"], "hello");
+    let object = request(&host, &mount, "object", "fixture.capability", serde_json::json!({
+        "capability":"teamarness.package-ports","method":"invoke",
+        "arguments":{"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+    })).await;
+    assert_eq!(object["result"]["accepted"], true);
+    let opened = request(
+        &host,
+        &mount,
+        "open-title",
+        "fixture.port_open",
+        serde_json::json!({"port":"message.title_watch"}),
+    )
+    .await;
+    assert_eq!(opened["opened"], true);
+    let mut next = 0;
+    common::eventually(
+        std::time::Duration::from_secs(3),
+        "non-object Port event",
+        || {
+            next += 1;
+            let host = &host;
+            let mount = mount.clone();
+            async move {
+                let events = request(
+                    host,
+                    &mount,
+                    &format!("title-events-{next}"),
+                    "fixture.port_events",
+                    serde_json::json!({}),
+                )
+                .await;
+                events["events"][0]["$teamarnessPortValue"] == serde_json::json!([1, 2])
+                    && events["closeCode"] == "completed"
+            }
+        },
+    )
+    .await;
 }
 
 // Verifies: TEAM.SYS.PKG-R14

@@ -124,6 +124,23 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
             Ok(serde_json::json!({"actor": identity}))
         },
     )
+    .port_request(
+        "com.example.messages",
+        "message.title",
+        "query",
+        |_context, _actor, _: Empty| async move { Ok("hello".to_owned()) },
+    )
+    .port_event(
+        "com.example.messages",
+        "message.title_changed",
+        |_context, _actor| async move {
+            let (sender, subscription) = event_channel(2);
+            tokio::spawn(async move {
+                let _ = sender.send_port_value(serde_json::json!([1, 2])).await;
+            });
+            Ok(subscription)
+        },
+    )
     .port_event(
         "com.example.messages",
         "message.created",
@@ -225,7 +242,7 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
     session
         .request("h:activate", "lifecycle.activate", "{}")
         .await;
-    let envelope = r#"{"contract":"com.example.messages","major":1,"minor":0,"port":"message.post","actor":{"kind":"person","identity":"installation1"},"request":{}}"#;
+    let envelope = r#"{"contract":"com.example.messages","major":2,"minor":0,"port":"message.post","actor":{"kind":"person","identity":"installation1"},"request":{}}"#;
     let response = session
         .request("h:port", "teamarness.port.command.v1", envelope)
         .await;
@@ -235,7 +252,7 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
         r#"{"contract":"com.example.messages","major":1,"minor":0,"port":"message.post","actor":{"kind":"agent","identity":"someone"},"request":{}}"#).await;
     assert_eq!(forged.field("code").unwrap(), "package.invalid_payload");
     write_json(&mut session.host_write,
-        r#"{"kind":"stream_open","id":"h:live","topic":"teamarness.port.query.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":1,"minor":0,"port":"message.watch","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+        r#"{"kind":"stream_open","id":"h:live","topic":"teamarness.port.query.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":2,"minor":0,"port":"message.watch","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
     let event = read_frame(&mut session.host_read).await;
     assert_eq!(event.kind(), FrameKind::Event);
     assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
@@ -244,7 +261,7 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
         FrameKind::StreamClose
     );
     write_json(&mut session.host_write,
-        r#"{"kind":"stream_open","id":"h:event","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":1,"minor":0,"port":"message.created","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+        r#"{"kind":"stream_open","id":"h:event","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":2,"minor":0,"port":"message.created","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
     let event = read_frame(&mut session.host_read).await;
     assert_eq!(event.kind(), FrameKind::Event);
     assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
@@ -256,6 +273,43 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
         .request("h:after-event", "fixture.add", r#"{"a":2,"b":3}"#)
         .await;
     assert_eq!(response.field("payload").unwrap()["sum"], 5);
+    session.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_object_port_outputs_are_encoded_without_changing_ui_frames() {
+    let mut session = start(counting_router(Arc::new(Hooks::default()))).await;
+    session
+        .request("h:activate", "lifecycle.activate", "{}")
+        .await;
+    let response = session.request("h:title", "teamarness.port.query.v1",
+        r#"{"contract":"com.example.messages","major":2,"minor":0,"port":"message.title","actor":{"kind":"person","identity":"installation1"},"request":{}}"#).await;
+    assert_eq!(response.kind(), FrameKind::Response);
+    assert_eq!(
+        response.field("payload").unwrap()["$teamarnessPortEnvelope"],
+        1
+    );
+    assert_eq!(
+        response.field("payload").unwrap()["$teamarnessPortValue"],
+        "hello"
+    );
+    write_json(&mut session.host_write,
+        r#"{"kind":"stream_open","id":"h:title-event","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":2,"minor":0,"port":"message.title_changed","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+    let event = read_frame(&mut session.host_read).await;
+    assert_eq!(event.kind(), FrameKind::Event);
+    assert_eq!(
+        event.field("payload").unwrap()["$teamarnessPortValue"],
+        serde_json::json!([1, 2])
+    );
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::StreamClose
+    );
+    let ui = session
+        .request("h:ui", "fixture.add", r#"{"a":2,"b":3}"#)
+        .await;
+    assert_eq!(ui.field("payload").unwrap()["sum"], 5);
     session.finish().await;
 }
 

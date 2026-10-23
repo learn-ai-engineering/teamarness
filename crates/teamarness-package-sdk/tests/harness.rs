@@ -211,6 +211,9 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
             assert_eq!(payload, empty());
             Ok(serde_json::json!({"contracts":[]}))
         }
+        "invoke" if payload["port"] == "message.title" => {
+            Ok(serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"hello"}))
+        }
         "invoke" => {
             assert_eq!(payload["contract"], "com.example.messages");
             assert_eq!(payload["port"], "message.post");
@@ -236,6 +239,7 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
                 serde_json::json!({"text":"hello"}),
             )
             .await?;
+        let title = client.query("com.example.messages", "message.title", empty()).await?;
         let mut query = client
             .live_query("com.example.messages", "message.watch", empty())
             .await?;
@@ -244,7 +248,7 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
         let mut events = client.subscribe_event("com.example.messages", "message.created").await?;
         let created = events.recv().await.unwrap()?;
         events.close().await;
-        Ok(serde_json::json!({"available":available,"result":result,"event":event,"created":created}))
+        Ok(serde_json::json!({"available":available,"result":result,"title":title,"event":event,"created":created}))
     });
     let mut harness = HarnessBuilder::new(router.into_backend())
         .data_directory(directory.path())
@@ -254,7 +258,11 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
     harness.activate().await.unwrap();
     let pending = harness.start_request("fixture.ports", empty()).await;
     let sender = scripted.stream();
-    assert!(sender.send(serde_json::json!({"order":1})).await);
+    assert!(
+        sender
+            .send(serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":[1,2]}))
+            .await
+    );
     for _ in 0..200 {
         if scripted.recorded_opens().len() == 2 {
             break;
@@ -263,12 +271,17 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(scripted.recorded_opens().len(), 2);
-    assert!(sender.send(serde_json::json!({"order":2})).await);
+    assert!(
+        sender
+            .send(serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"changed"}))
+            .await
+    );
     let answer = pending.result().await.unwrap();
     assert_eq!(answer["result"]["accepted"], true);
-    assert_eq!(answer["event"]["order"], 1);
-    assert_eq!(answer["created"]["order"], 2);
-    assert_eq!(scripted.recorded_calls().len(), 2);
+    assert_eq!(answer["title"], "hello");
+    assert_eq!(answer["event"], serde_json::json!([1, 2]));
+    assert_eq!(answer["created"], "changed");
+    assert_eq!(scripted.recorded_calls().len(), 3);
     assert_eq!(scripted.recorded_opens()[1]["kind"], "event");
     assert_eq!(scripted.recorded_opens()[1]["port"], "message.created");
     harness.shutdown().await.unwrap();

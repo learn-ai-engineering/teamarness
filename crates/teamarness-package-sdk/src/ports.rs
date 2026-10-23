@@ -69,6 +69,7 @@ impl PortClient {
                 }),
             )
             .await
+            .map(decode_port_value)
     }
 
     /// A one-to-one consumer-initiated query stream, not an event subscription.
@@ -86,6 +87,7 @@ impl PortClient {
                 }),
             )
             .await
+            .map(CapabilitySubscription::with_port_values)
     }
 
     /// Explicitly observes live Provider events; a declaration alone never subscribes.
@@ -100,7 +102,30 @@ impl PortClient {
                 serde_json::json!({"contract":contract,"port":port,"kind":"event"}),
             )
             .await
+            .map(CapabilitySubscription::with_port_values)
     }
+}
+
+// Package Process 1.0 carries object payloads. Only non-object Port values
+// need this Port-specific object envelope; ordinary object Port values keep
+// their existing wire representation.
+pub(crate) fn encode_port_value(value: JsonValue) -> JsonValue {
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value})
+    }
+}
+
+pub(crate) fn decode_port_value(value: JsonValue) -> JsonValue {
+    if let JsonValue::Object(ref fields) = value
+        && fields.len() == 2
+        && fields.get("$teamarnessPortEnvelope") == Some(&JsonValue::from(1))
+        && fields.contains_key("$teamarnessPortValue")
+    {
+        return fields["$teamarnessPortValue"].clone();
+    }
+    value
 }
 
 #[derive(Deserialize)]

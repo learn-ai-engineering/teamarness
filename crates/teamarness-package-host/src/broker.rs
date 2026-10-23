@@ -356,6 +356,7 @@ impl PortBroker {
                 });
             })
             .await?;
+        let result = crate::protocol::decode_port_value(&result).clone();
         schemas
             .validate(contract, port, "response", &result)
             .map_err(|_| {

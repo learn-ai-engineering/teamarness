@@ -344,17 +344,14 @@ impl<S: Send + Sync + 'static> Router<S> {
                 Box::pin(async move {
                     let envelope: ProviderEnvelope =
                         serde_json::from_value(payload).map_err(|_| invalid_payload())?;
-                    if envelope.major != 1 {
+                    if envelope.major == 0 {
                         return Err(invalid_payload());
                     }
                     let request: Req =
                         serde_json::from_value(envelope.request).map_err(|_| invalid_payload())?;
                     let answer = handler(context, envelope.actor, request).await?;
                     let answer = serde_json::to_value(answer).map_err(|_| invalid_response())?;
-                    if !answer.is_object() {
-                        return Err(invalid_response());
-                    }
-                    Ok(answer)
+                    Ok(crate::ports::encode_port_value(answer))
                 })
             }),
         );
@@ -387,7 +384,7 @@ impl<S: Send + Sync + 'static> Router<S> {
                 Box::pin(async move {
                     let envelope: ProviderEnvelope =
                         serde_json::from_value(payload).map_err(|_| invalid_payload())?;
-                    if envelope.major != 1 || envelope.request != serde_json::json!({}) {
+                    if envelope.major == 0 || envelope.request != serde_json::json!({}) {
                         return Err(invalid_payload());
                     }
                     handler(context, envelope.actor).await
@@ -424,7 +421,7 @@ impl<S: Send + Sync + 'static> Router<S> {
                 Box::pin(async move {
                     let envelope: ProviderEnvelope =
                         serde_json::from_value(payload).map_err(|_| invalid_payload())?;
-                    if envelope.major != 1 {
+                    if envelope.major == 0 {
                         return Err(invalid_payload());
                     }
                     let request: Req =
