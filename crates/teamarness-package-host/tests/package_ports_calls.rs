@@ -44,6 +44,9 @@ fn declare_non_object_ports(fixture: &common::Fixture) {
     document["contracts"][0]["ports"].as_array_mut().unwrap().extend([
         serde_json::json!({"name":"message.title","kind":"query","description":"Read a title", "request":{"type":"object","additionalProperties":false},"response":{"type":"string"}}),
         serde_json::json!({"name":"message.title_watch","kind":"query","description":"Watch title parts", "request":{"type":"object","additionalProperties":false},"event":{"type":"array","items":{"type":"integer"}}}),
+        serde_json::json!({"name":"message.marker","kind":"query","description":"Read a literal envelope-shaped object", "request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}),
+        serde_json::json!({"name":"message.marker_watch","kind":"query","description":"Watch literal envelope-shaped objects", "request":{"type":"object","additionalProperties":false},"event":{"type":"object"}}),
+        serde_json::json!({"name":"message.large_watch","kind":"query","description":"Watch a maximum-sized value", "request":{"type":"object","additionalProperties":false},"event":{"type":"string"}}),
     ]);
     let bytes = serde_json::to_vec(&document).unwrap();
     fs::write(&path, &bytes).unwrap();
@@ -66,6 +69,9 @@ fn declare_non_object_ports(fixture: &common::Fixture) {
         .extend([
             serde_json::json!({"name":"message.title","kind":"query"}),
             serde_json::json!({"name":"message.title_watch","kind":"query"}),
+            serde_json::json!({"name":"message.marker","kind":"query"}),
+            serde_json::json!({"name":"message.marker_watch","kind":"query"}),
+            serde_json::json!({"name":"message.large_watch","kind":"query"}),
         ]);
     fs::write(consumer, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
@@ -440,6 +446,14 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
         "arguments":{"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
     })).await;
     assert_eq!(object["result"]["accepted"], true);
+    let marker = request(&host, &mount, "marker", "fixture.capability", serde_json::json!({
+        "capability":"teamarness.package-ports","method":"invoke",
+        "arguments":{"contract":"com.example.messages","port":"message.marker","kind":"query","request":{}}
+    })).await;
+    assert_eq!(
+        marker["result"]["$teamarnessPortValue"],
+        serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"})
+    );
     let opened = request(
         &host,
         &mount,
@@ -467,6 +481,61 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
                 )
                 .await;
                 events["events"][0]["$teamarnessPortValue"] == serde_json::json!([1, 2])
+                    && events["closeCode"] == "completed"
+            }
+        },
+    )
+    .await;
+    let opened = request(
+        &host,
+        &mount,
+        "open-marker",
+        "fixture.port_open",
+        serde_json::json!({"port":"message.marker_watch"}),
+    )
+    .await;
+    assert_eq!(opened["opened"], true);
+    let mut next = 0;
+    common::eventually(std::time::Duration::from_secs(3), "literal marker Port event", || {
+        next += 1;
+        let host = &host;
+        let mount = mount.clone();
+        async move {
+            let events = request(host, &mount, &format!("marker-events-{next}"),
+                "fixture.port_events", serde_json::json!({})).await;
+            events["events"][0]["$teamarnessPortValue"] ==
+                serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"})
+                && events["closeCode"] == "completed"
+        }
+    }).await;
+    let opened = request(
+        &host,
+        &mount,
+        "open-large",
+        "fixture.port_open",
+        serde_json::json!({"port":"message.large_watch"}),
+    )
+    .await;
+    assert_eq!(opened["opened"], true);
+    let mut next = 0;
+    common::eventually(
+        std::time::Duration::from_secs(3),
+        "maximum logical Port event",
+        || {
+            next += 1;
+            let host = &host;
+            let mount = mount.clone();
+            async move {
+                let events = request(
+                    host,
+                    &mount,
+                    &format!("large-events-{next}"),
+                    "fixture.port_events",
+                    serde_json::json!({"summary":true}),
+                )
+                .await;
+                events["count"] == 1
+                    && events["firstLength"] == 262142
                     && events["closeCode"] == "completed"
             }
         },

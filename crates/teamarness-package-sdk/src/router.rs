@@ -656,7 +656,10 @@ impl<S: Send + Sync + 'static> Backend for RouterBackend<S> {
                     .get(&(envelope.contract.as_str(), envelope.port.as_str()))
                     .ok_or_else(|| unknown("package.unknown_port"))?
                     .clone();
-                return handler(self.context(&request).await?, request.payload).await;
+                let mut subscription =
+                    handler(self.context(&request).await?, request.payload).await?;
+                subscription.port_values = true;
+                return Ok(subscription);
             }
             let Some(handler) = self.subscriptions.get(request.operation.as_str()).cloned() else {
                 return Err(unknown("package.unknown_subscription"));

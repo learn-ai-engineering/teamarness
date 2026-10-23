@@ -285,6 +285,9 @@ pub(crate) async fn run(
                                 permit.forget();
                                 match event {
                                     Ok(payload) => {
+                                        let payload = if subscription.port_values {
+                                            crate::ports::encode_port_value(payload)
+                                        } else { payload };
                                         sequence += 1;
                                         if writer.data(object([
                                             ("kind", JsonValue::String("event".into())),

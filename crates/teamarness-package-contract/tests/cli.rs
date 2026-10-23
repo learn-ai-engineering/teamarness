@@ -234,6 +234,16 @@ fn source_mode_checks_port_contracts_and_reports_grammar_as_notes() {
     assert!(output.status.success(), "{}", stdout(&output));
     let parsed: Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert!(!parsed["notes"].as_array().unwrap().is_empty());
+    #[cfg(unix)]
+    {
+        fs::write(temp.path().join("port-target.json"), &bytes).unwrap();
+        fs::remove_file(temp.path().join("ports.json")).unwrap();
+        std::os::unix::fs::symlink("port-target.json", temp.path().join("ports.json")).unwrap();
+        let output = validate(&["source", &temp.path().to_string_lossy()]);
+        assert!(!output.status.success());
+        assert!(stdout(&output).contains("port_contract.missing"));
+        fs::remove_file(temp.path().join("ports.json")).unwrap();
+    }
     fs::write(temp.path().join("ports.json"), vec![b' '; 1024 * 1024 + 1]).unwrap();
     let output = validate(&["source", &temp.path().to_string_lossy()]);
     assert!(!output.status.success());

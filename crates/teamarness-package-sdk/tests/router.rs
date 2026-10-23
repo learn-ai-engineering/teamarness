@@ -130,6 +130,25 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
         "query",
         |_context, _actor, _: Empty| async move { Ok("hello".to_owned()) },
     )
+    .port_request(
+        "com.example.messages",
+        "message.marker",
+        "query",
+        |_context, _actor, _: Empty| async move {
+            Ok(serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"}))
+        },
+    )
+    .port_event(
+        "com.example.messages",
+        "message.marker_changed",
+        |_context, _actor| async move {
+            let (sender, subscription) = event_channel(2);
+            tokio::spawn(async move {
+                let _ = sender.send(serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"})).await;
+            });
+            Ok(subscription)
+        },
+    )
     .port_event(
         "com.example.messages",
         "message.title_changed",
@@ -247,7 +266,10 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
         .request("h:port", "teamarness.port.command.v1", envelope)
         .await;
     assert_eq!(response.kind(), FrameKind::Response);
-    assert_eq!(response.field("payload").unwrap()["actor"], "installation1");
+    assert_eq!(
+        response.field("payload").unwrap()["$teamarnessPortValue"]["actor"],
+        "installation1"
+    );
     let forged = session.request("h:forged", "teamarness.port.command.v1",
         r#"{"contract":"com.example.messages","major":1,"minor":0,"port":"message.post","actor":{"kind":"agent","identity":"someone"},"request":{}}"#).await;
     assert_eq!(forged.field("code").unwrap(), "package.invalid_payload");
@@ -255,7 +277,10 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
         r#"{"kind":"stream_open","id":"h:live","topic":"teamarness.port.query.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":2,"minor":0,"port":"message.watch","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
     let event = read_frame(&mut session.host_read).await;
     assert_eq!(event.kind(), FrameKind::Event);
-    assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
+    assert_eq!(
+        event.field("payload").unwrap()["$teamarnessPortValue"]["actor"],
+        "installation1"
+    );
     assert_eq!(
         read_frame(&mut session.host_read).await.kind(),
         FrameKind::StreamClose
@@ -264,7 +289,10 @@ async fn generic_port_router_preserves_typed_host_actor_and_stream_query() {
         r#"{"kind":"stream_open","id":"h:event","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":2,"minor":0,"port":"message.created","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
     let event = read_frame(&mut session.host_read).await;
     assert_eq!(event.kind(), FrameKind::Event);
-    assert_eq!(event.field("payload").unwrap()["actor"], "installation1");
+    assert_eq!(
+        event.field("payload").unwrap()["$teamarnessPortValue"]["actor"],
+        "installation1"
+    );
     assert_eq!(
         read_frame(&mut session.host_read).await.kind(),
         FrameKind::StreamClose
@@ -301,6 +329,24 @@ async fn non_object_port_outputs_are_encoded_without_changing_ui_frames() {
     assert_eq!(
         event.field("payload").unwrap()["$teamarnessPortValue"],
         serde_json::json!([1, 2])
+    );
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::StreamClose
+    );
+    let marker = session.request("h:marker", "teamarness.port.query.v1",
+        r#"{"contract":"com.example.messages","major":2,"minor":0,"port":"message.marker","actor":{"kind":"person","identity":"installation1"},"request":{}}"#).await;
+    assert_eq!(
+        marker.field("payload").unwrap()["$teamarnessPortValue"],
+        serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"})
+    );
+    write_json(&mut session.host_write,
+        r#"{"kind":"stream_open","id":"h:marker-event","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"contract":"com.example.messages","major":2,"minor":0,"port":"message.marker_changed","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+    let marker_event = read_frame(&mut session.host_read).await;
+    assert_eq!(marker_event.kind(), FrameKind::Event);
+    assert_eq!(
+        marker_event.field("payload").unwrap()["$teamarnessPortValue"],
+        serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"})
     );
     assert_eq!(
         read_frame(&mut session.host_read).await.kind(),

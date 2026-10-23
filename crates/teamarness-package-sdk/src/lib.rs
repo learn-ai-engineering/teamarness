@@ -158,10 +158,13 @@ impl EventSender {
             .map_err(|_| SdkError::ParentClosed)
     }
 
-    /// Sends a Port event with any JSON root value over the object-only process frame.
-    /// Use this for a non-object Port event; ordinary UI events still require objects.
+    /// Sends any JSON Port value. The Port router wraps it for the object-only frame.
+    /// Ordinary UI events still require objects through [`Self::send`].
     pub async fn send_port_value(&self, payload: JsonValue) -> Result<(), SdkError> {
-        self.send(ports::encode_port_value(payload)).await
+        self.sender
+            .send(Ok(payload))
+            .await
+            .map_err(|_| SdkError::ParentClosed)
     }
 
     /// Closes the event stream with a Package-owned error.
@@ -176,13 +179,20 @@ impl EventSender {
 /// Receiving half consumed by the SDK dispatcher.
 pub struct EventSubscription {
     pub(crate) receiver: mpsc::Receiver<Result<JsonValue, BackendError>>,
+    pub(crate) port_values: bool,
 }
 
 /// Creates a bounded event adapter. Capacity is clamped to 1 through 32.
 #[must_use]
 pub fn event_channel(capacity: usize) -> (EventSender, EventSubscription) {
     let (sender, receiver) = mpsc::channel(capacity.clamp(1, 32));
-    (EventSender { sender }, EventSubscription { receiver })
+    (
+        EventSender { sender },
+        EventSubscription {
+            receiver,
+            port_values: false,
+        },
+    )
 }
 
 /// Package-owned lifecycle, request, and event implementation.

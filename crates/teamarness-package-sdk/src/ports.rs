@@ -106,15 +106,10 @@ impl PortClient {
     }
 }
 
-// Package Process 1.0 carries object payloads. Only non-object Port values
-// need this Port-specific object envelope; ordinary object Port values keep
-// their existing wire representation.
+// A Provider SDK always wraps Port values. In particular, an object equal to
+// the reserved transport shape must not be mistaken for an envelope itself.
 pub(crate) fn encode_port_value(value: JsonValue) -> JsonValue {
-    if value.is_object() {
-        value
-    } else {
-        serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value})
-    }
+    serde_json::json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value})
 }
 
 pub(crate) fn decode_port_value(value: JsonValue) -> JsonValue {

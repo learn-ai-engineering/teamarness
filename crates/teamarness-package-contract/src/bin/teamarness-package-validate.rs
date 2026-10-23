@@ -152,6 +152,25 @@ fn run(arguments: &[String]) -> Result<Report, String> {
     }
 }
 
+fn read_source_port(root: &Path, relative: &str) -> std::io::Result<Vec<u8>> {
+    let mut path = root.to_path_buf();
+    // parse_manifest already checked normalization. Match directory Admission's
+    // no-symlink policy for every declared path component in source mode too.
+    for part in relative.split('/') {
+        path.push(part);
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(std::io::Error::other("port contract symlink"));
+        }
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("port contract not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn validate_source(root: &Path) -> Report {
     let mut report = Report::default();
     match std::fs::read(root.join(MANIFEST_NAME)) {
@@ -163,11 +182,7 @@ fn validate_source(root: &Path) -> Report {
             Err(error) => report.push(MANIFEST_NAME, error),
             Ok(document) => {
                 if let Some(path) = document.port_contract_path() {
-                    let bytes = std::fs::File::open(root.join(path)).and_then(|file| {
-                        let mut bytes = Vec::new();
-                        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-                        Ok(bytes)
-                    });
+                    let bytes = read_source_port(root, path);
                     match bytes {
                         Ok(bytes) => match compile_port_contracts(&bytes) {
                             Ok(compiled) => report.notes.extend(compiled.warnings),

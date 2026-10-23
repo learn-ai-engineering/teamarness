@@ -1155,7 +1155,8 @@ mod session_tests {
                 envelope("message.page", person.clone(), page_request.clone()),
             )
             .await
-            .unwrap();
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
         let mut events = session
             .harness
             .subscribe(
@@ -1210,7 +1211,7 @@ mod session_tests {
                 )
                 .await
                 .unwrap(),
-            json!({"ok":true})
+            json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":{"ok":true}})
         );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), events.next_event())
@@ -1218,7 +1219,7 @@ mod session_tests {
                 .unwrap()
                 .unwrap()
                 .unwrap(),
-            json!({})
+            json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":{}})
         );
         assert_eq!(
             session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap(),
@@ -1231,7 +1232,8 @@ mod session_tests {
                 envelope("message.page", person.clone(), page_request.clone()),
             )
             .await
-            .unwrap();
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
         assert_eq!(page["pending"].as_array().unwrap().len(), 1);
         assert_ne!(page["revision"], initial["revision"]);
         let ui = session

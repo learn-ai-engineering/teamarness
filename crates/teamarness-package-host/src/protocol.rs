@@ -30,6 +30,9 @@ const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
 /// bounds the count, so a budget derived from anything else would refuse an
 /// event the classifier had already admitted.
 const UI_EVENT_BYTES: usize = INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES;
+// The fixed transport envelope adds only its field names and punctuation to a Port value.
+const PORT_ENVELOPE_OVERHEAD: usize =
+    r#"{"$teamarnessPortEnvelope":1,"$teamarnessPortValue":}"#.len();
 
 /// Events the Shell acknowledges with one `ack`.
 ///
@@ -275,10 +278,15 @@ impl UiEventRoute {
     fn new_internal(contract: EventContract, operation: String) -> (Arc<Self>, UiEventReceiver) {
         let (events, receiver) = mpsc::channel(UI_EVENT_CAPACITY);
         let (terminal, terminal_receiver) = watch::channel(None);
+        let port_overhead = if matches!(&contract, EventContract::Port { .. }) {
+            INITIAL_STREAM_CREDIT * PORT_ENVELOPE_OVERHEAD
+        } else {
+            0
+        };
         let route = Arc::new(Self {
             events,
             terminal,
-            bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES)),
+            bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES + port_overhead)),
             state: Mutex::new(UiEventRouteState {
                 highest_delivered: 0,
                 highest_acknowledged: 0,
@@ -324,7 +332,17 @@ impl UiEventRoute {
         }
         let encoded =
             serde_json::to_vec(&payload).map_err(|_| PackageErrorCode::UiContractViolation)?;
-        if encoded.len() > MAX_UI_PAYLOAD_BYTES {
+        let (logical_bytes, wire_limit) = if matches!(&self.contract, EventContract::Port { .. }) {
+            (
+                serde_json::to_vec(decode_port_value(&value))
+                    .map_err(|_| PackageErrorCode::PortEventInvalid)?
+                    .len(),
+                MAX_UI_PAYLOAD_BYTES + PORT_ENVELOPE_OVERHEAD,
+            )
+        } else {
+            (encoded.len(), MAX_UI_PAYLOAD_BYTES)
+        };
+        if logical_bytes > MAX_UI_PAYLOAD_BYTES || encoded.len() > wire_limit {
             return Err(match &self.contract {
                 EventContract::Ui(_) => PackageErrorCode::UiContractViolation,
                 EventContract::Port { .. } => PackageErrorCode::PortEventInvalid,
@@ -1311,25 +1329,25 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
     }
 }
 
-// Only non-object Port values need an object envelope on Process 1.0 frames.
-// The two-field shape is reserved for Port routing, not a caller identity claim.
+// Process 1.0 requires object payloads. Escape the reserved envelope shape
+// itself as well as non-object Port values, so decoding changes no valid value.
 pub(crate) fn encode_port_value(value: Value) -> Value {
-    if value.is_object() {
+    if value.is_object() && port_value_content(&value).is_none() {
         value
     } else {
         json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value})
     }
 }
 
+fn port_value_content(value: &Value) -> Option<&Value> {
+    let fields = value.as_object()?;
+    (fields.len() == 2 && fields.get("$teamarnessPortEnvelope") == Some(&Value::from(1)))
+        .then(|| fields.get("$teamarnessPortValue"))
+        .flatten()
+}
+
 pub(crate) fn decode_port_value(value: &Value) -> &Value {
-    let Some(fields) = value.as_object() else {
-        return value;
-    };
-    if fields.len() == 2 && fields.get("$teamarnessPortEnvelope") == Some(&Value::from(1)) {
-        fields.get("$teamarnessPortValue").unwrap_or(value)
-    } else {
-        value
-    }
+    port_value_content(value).unwrap_or(value)
 }
 
 pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
