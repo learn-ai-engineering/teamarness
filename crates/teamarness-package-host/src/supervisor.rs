@@ -56,6 +56,7 @@ pub(crate) struct CallEnvironment {
 
 #[derive(Clone)]
 pub(crate) struct ProcessSpec {
+    pub(crate) authority: crate::authority::AuthorityGeneration,
     pub(crate) template: ProcessTemplate,
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) workspace_name: String,
@@ -85,6 +86,7 @@ pub(crate) async fn spawn(
     generation: u64,
     recovering: bool,
 ) -> Result<ProcessGeneration, WireFailure> {
+    let authority = spec.authority.advance().await.map_err(WireFailure::new)?;
     let capabilities = GenerationCapabilities::bind(
         spec.core.clone(),
         CapabilityScope {
@@ -97,6 +99,7 @@ pub(crate) async fn spawn(
         generation,
         spec.calls.limiter.clone(),
         spec.broker.clone(),
+        authority,
     )
     .map_err(WireFailure::new)?;
     // Reading and hashing the Backend executable is blocking file work.
@@ -426,6 +429,7 @@ mod tests {
             .unwrap(),
         );
         let spec = ProcessSpec {
+            authority: crate::authority::AuthorityGeneration::default(),
             template: ProcessTemplate {
                 package_identity: "dev.teamarness.orphan".parse().unwrap(),
                 package_version: "1.0.0".into(),

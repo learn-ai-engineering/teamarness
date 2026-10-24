@@ -28,6 +28,13 @@ const _: () = {
 };
 
 pub(crate) struct PortBroker {
+    authority_generations:
+        std::sync::Mutex<BTreeMap<PackageInstanceKey, crate::authority::AuthorityGeneration>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) binding_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) actor_pause: std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
     observations: broadcast::Sender<PortObservation>,
     consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
@@ -55,6 +62,11 @@ impl PortBroker {
         contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(feature = "test-hooks")]
+            actor_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            binding_pause: std::sync::Mutex::new(None),
+            authority_generations: std::sync::Mutex::new(BTreeMap::new()),
             graph,
             observations: crate::port_observation::channel(),
             consumed,
@@ -72,6 +84,47 @@ impl PortBroker {
         })
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_command_actor(
+        &self,
+        package: &PackageIdentity,
+        object: &Map<String, Value>,
+    ) {
+        let pause = {
+            let mut pending = self.actor_pause.lock().expect("test pause poisoned");
+            if object.get("kind").and_then(Value::as_str) == Some("command")
+                && pending
+                    .as_ref()
+                    .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_binding_write(&self, package: &PackageIdentity) {
+        let pause = {
+            let mut pending = self.binding_pause.lock().expect("test pause poisoned");
+            if pending
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
     pub(crate) fn observe(&self) -> PortObservations {
         self.observations.subscribe()
     }
@@ -79,6 +132,19 @@ impl PortBroker {
     fn record(&self, observation: PortObservation) {
         // `send` refuses if nobody subscribed, and never waits for a slow receiver.
         let _ = self.observations.send(observation);
+    }
+
+    /// Host-lifetime ownership survives any InstanceActor/ProcessSpec reconstruction.
+    pub(crate) fn authority_generation(
+        &self,
+        key: &PackageInstanceKey,
+    ) -> crate::authority::AuthorityGeneration {
+        self.authority_generations
+            .lock()
+            .expect("authority registry poisoned")
+            .entry(key.clone())
+            .or_default()
+            .clone()
     }
 
     pub(crate) fn register(&self, key: PackageInstanceKey, actor: &Arc<InstanceActor>) {

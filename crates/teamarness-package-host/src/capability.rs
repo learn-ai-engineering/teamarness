@@ -191,6 +191,7 @@ pub(crate) struct AdvertisedGrant {
 }
 
 pub(crate) struct GenerationCapabilities {
+    authority: crate::authority::GenerationAuthority,
     core: Arc<CoreRuntime>,
     limiter: CoreCallLimiter,
     scope: CapabilityScope,
@@ -210,6 +211,7 @@ impl GenerationCapabilities {
         generation: u64,
         limiter: CoreCallLimiter,
         broker: std::sync::Weak<crate::broker::PortBroker>,
+        authority: crate::authority::GenerationAuthority,
     ) -> Result<Arc<Self>, PackageErrorCode> {
         if scope.package_identity.as_str() == crate::values::RESERVED_PRINCIPALS_SCOPE {
             return Err(PackageErrorCode::InvalidPackageIdentity);
@@ -242,6 +244,7 @@ impl GenerationCapabilities {
         }
         let (cancelled, _) = watch::channel(false);
         Ok(Arc::new(Self {
+            authority,
             core,
             limiter,
             scope,
@@ -286,6 +289,10 @@ impl GenerationCapabilities {
                     .availability(&self.scope.package_identity, &self.scope.workspace_id)
                     .await),
                 "invoke" => {
+                    #[cfg(feature = "test-hooks")]
+                    broker
+                        .pause_command_actor(&self.scope.package_identity, object)
+                        .await;
                     let actor = self
                         .port_actor()
                         .await
@@ -725,6 +732,14 @@ impl GenerationCapabilities {
             .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
         let package = self.scope.package_identity.as_str().to_owned();
         let core = Arc::clone(&self.core);
+        #[cfg(feature = "test-hooks")]
+        if matches!(method, "bind" | "unbind")
+            && let Some(broker) = self.broker.upgrade()
+        {
+            broker
+                .pause_binding_write(&self.scope.package_identity)
+                .await;
+        }
         match method {
             "current" => {
                 exact_fields(object, &["method"])?;
@@ -774,8 +789,8 @@ impl GenerationCapabilities {
                 let id =
                     teamarness_core::PrincipalId::from_str(string_field(object, "principalId")?)
                         .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                self.limiter
-                    .run(started, move || {
+                self.authority
+                    .run(&self.limiter, started, move || {
                         core.bind_agent_package(workspace, id, &package)
                             .map_err(binding_error)?;
                         current_binding(&core, workspace, &package)
@@ -784,8 +799,8 @@ impl GenerationCapabilities {
             }
             "unbind" => {
                 exact_fields(object, &["method"])?;
-                self.limiter
-                    .run(started, move || {
+                self.authority
+                    .run(&self.limiter, started, move || {
                         core.unbind_agent_package(workspace, &package)
                             .map_err(binding_error)?;
                         Ok(json!({"agent":Value::Null}))
@@ -806,8 +821,8 @@ impl GenerationCapabilities {
             .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
         let package = self.scope.package_identity.as_str().to_owned();
         let core = Arc::clone(&self.core);
-        self.limiter
-            .run(Arc::new(AtomicBool::new(false)), move || {
+        self.authority
+            .run(&self.limiter, Arc::new(AtomicBool::new(false)), move || {
                 let person = json!({"kind":"person","identity":core.public_identity().to_string()});
                 let Some(agent) = core
                     .bound_agent(workspace, &package)
@@ -1983,10 +1998,102 @@ mod tests {
             1,
             limiter,
             std::sync::Weak::new(),
+            crate::authority::AuthorityGeneration::default()
+                .advance()
+                .await
+                .unwrap(),
         )
         .unwrap();
         let grant = capabilities.advertised()[0].grant.clone();
         (capabilities, grant)
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R13
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replaced_generation_rejects_late_actor_bind_and_unbind() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Arc::new(
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(
+                directory.path().join("core"),
+            ))
+            .await
+            .unwrap(),
+        );
+        let workspace = core.create_workspace("Authority generations").unwrap();
+        let a = core.add_agent(workspace.id(), "Scout").unwrap();
+        let b = core.add_agent(workspace.id(), "Other").unwrap();
+        let package: PackageIdentity = "dev.teamarness.fixture".parse().unwrap();
+        let key = crate::PackageInstanceKey::new(
+            package.clone(),
+            WorkspaceId::new(workspace.id().to_string()).unwrap(),
+        );
+        let broker =
+            crate::broker::PortBroker::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let scope = CapabilityScope {
+            package_identity: package.clone(),
+            workspace_id: key.workspace_id.clone(),
+            workspace_name: "test".into(),
+            installation: InstallationPublicIdentity::new(core.public_identity().to_string())
+                .unwrap(),
+        };
+        let old = GenerationCapabilities::bind(
+            core.clone(),
+            scope.clone(),
+            &[],
+            1,
+            CoreCallLimiter::new(),
+            Arc::downgrade(&broker),
+            broker.authority_generation(&key).advance().await.unwrap(),
+        )
+        .unwrap();
+        core.bind_agent_package(workspace.id(), a, package.as_str())
+            .unwrap();
+        assert_eq!(old.port_actor().await.unwrap()["principal"], a.to_string());
+        // Re-fetch as a fresh ProcessSpec constructor would, even with a reset process counter.
+        let new = GenerationCapabilities::bind(
+            core.clone(),
+            scope,
+            &[],
+            1,
+            CoreCallLimiter::new(),
+            Arc::downgrade(&broker),
+            broker.authority_generation(&key).advance().await.unwrap(),
+        )
+        .unwrap();
+        new.agent_binding(
+            "bind",
+            json!({"method":"bind","principalId":b.to_string()})
+                .as_object()
+                .unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            old.port_actor().await.unwrap_err(),
+            PackageErrorCode::Cancelled
+        );
+        for (method, request) in [
+            ("bind", json!({"method":"bind","principalId":a.to_string()})),
+            ("unbind", json!({"method":"unbind"})),
+        ] {
+            assert_eq!(
+                old.agent_binding(
+                    method,
+                    request.as_object().unwrap(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .await
+                .unwrap_err(),
+                PackageErrorCode::Cancelled
+            );
+            assert_eq!(
+                core.bound_agent(workspace.id(), package.as_str()).unwrap(),
+                Some(b)
+            );
+        }
+        assert_eq!(new.port_actor().await.unwrap()["principal"], b.to_string());
+        core.shutdown().await.unwrap();
     }
 
     fn append_request() -> Value {

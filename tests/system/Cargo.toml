@@ -36,7 +36,7 @@ sha2.workspace = true
 # the default suite reaches no public relay. It is a dev-dependency: the
 # feature never ships in the application.
 teamarness-core = { path = "../../crates/teamarness-core", features = ["test-hooks"] }
-teamarness-package-host = { path = "../../crates/teamarness-package-host" }
+teamarness-package-host = { path = "../../crates/teamarness-package-host", features = ["test-hooks"] }
 teamarness-package-protocol = { path = "../../crates/teamarness-package-protocol" }
 tempfile.workspace = true
 # `net` is for the stub completion endpoint the Agent reply flow binds on loopback.

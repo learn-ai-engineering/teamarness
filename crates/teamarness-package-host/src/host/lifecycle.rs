@@ -538,6 +538,7 @@ pub(crate) async fn prepare_instance(
         .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?
         .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))?;
     let spec = supervisor::ProcessSpec {
+        authority: broker.authority_generation(&key),
         template: template.clone(),
         workspace_id,
         workspace_name: workspace.name().to_owned(),

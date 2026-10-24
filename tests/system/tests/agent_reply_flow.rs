@@ -567,3 +567,248 @@ async fn the_agent_replies_once_when_addressed_across_two_profiles() {
     bob_core.shutdown().await.unwrap();
     alice_core.shutdown().await.unwrap();
 }
+
+/// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.CONV-R18
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn enqueued_reply_keeps_old_actor_during_rebind() {
+    use teamarness_package_host::{PackageHostCommand, UiRequest, UiRequestId};
+    let (endpoint, requests) = stub_endpoint().await;
+    let app = harness::StagedApplication::new();
+    let core = open_core(Addressing::Loopback, &app.root.path().join("core")).await;
+    let workspace = core.create_workspace("Actor fence").unwrap();
+    let a = core.add_agent(workspace.id(), "Scout").unwrap();
+    let b = core.add_agent(workspace.id(), "Other").unwrap();
+    let a_key = core.principal(workspace.id(), a).unwrap().unwrap().keys()[0].to_string();
+    let b_key = core.principal(workspace.id(), b).unwrap().unwrap().keys()[0].to_string();
+    let private = app.root.path().join("host");
+    register_agent(&private);
+    let host = open_host(&app.application_path, private, core.clone()).await;
+    let key = |package: &str| {
+        PackageInstanceKey::new(
+            package.parse().unwrap(),
+            WorkspaceId::new(workspace.id().to_string()).unwrap(),
+        )
+    };
+    let mount = open_mount(&host, &key(PACKAGE_ID)).await;
+    let conversations = ConversationClient {
+        host: &host,
+        mount: &mount,
+    };
+    let agent_mount = open_mount(&host, &key(AGENT_PACKAGE_ID)).await;
+    let agent = ConversationClient {
+        host: &host,
+        mount: &agent_mount,
+    };
+    agent
+        .request(
+            "settings",
+            "agent.settings.set",
+            object([(
+                "settings",
+                object([
+                    ("endpointBaseUrl", PackageValue::String(endpoint)),
+                    ("model", PackageValue::String("stub/model".into())),
+                    ("systemPrompt", PackageValue::String(String::new())),
+                    ("contextMessages", PackageValue::Unsigned(0)),
+                ]),
+            )]),
+        )
+        .await;
+    agent
+        .request(
+            "key",
+            "agent.key.set",
+            object([("apiKey", PackageValue::String(KEY.into()))]),
+        )
+        .await;
+    agent
+        .request(
+            "bind-a",
+            "agent.binding.set",
+            object([("principalId", PackageValue::String(a.to_string()))]),
+        )
+        .await;
+    // Wait for this Channel's baseline, not just creation of the progress file.
+    assert!(
+        poll_until(Duration::from_secs(15), || async {
+            progress(app.root.path()).is_some_and(|value| value["channels"][GENERAL_ID].is_object())
+        })
+        .await
+    );
+    let pause = host.pause_next_command_actor_for_tests(AGENT_PACKAGE_ID.parse().unwrap());
+    conversations
+        .post_message("mention-a", GENERAL_ID, "@Scout hello")
+        .await;
+    tokio::time::timeout(Duration::from_secs(15), pause.paused())
+        .await
+        .expect("post reached Host before actor read");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let result = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: agent_mount.clone(),
+            request: UiRequestId::new("bind-b-held").unwrap(),
+            operation: "agent.binding.set".into(),
+            payload: object([("principalId", PackageValue::String(b.to_string()))]),
+        }))
+        .await;
+    // Release even on RED, then prove actual signed attribution rather than just local task state.
+    pause.resume();
+    assert!(
+        poll_until(Duration::from_secs(15), || async {
+            general(&conversations, "reply")
+                .await
+                .iter()
+                .any(|row| row["markdown"] == REPLY)
+        })
+        .await
+    );
+    let rows = general(&conversations, "attribution").await;
+    assert!(
+        rows.iter()
+            .any(|row| row["markdown"] == REPLY && row["author"] == a_key),
+        "old reply lost A attribution: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["markdown"] == REPLY && row["author"] == b_key),
+        "A text posted as B"
+    );
+    assert!(
+        result.is_err(),
+        "pending dispatch must refuse binding mutation"
+    );
+    assert_eq!(
+        core.bound_agent(workspace.id(), AGENT_PACKAGE_ID).unwrap(),
+        Some(a)
+    );
+    // Projection visibility can precede the Port terminal reaching the Agent. Retry only
+    // its explicitly retryable pending-dispatch refusal, never an uncertain mutation.
+    let mut attempt = 0;
+    assert!(
+        poll_until(Duration::from_secs(15), || {
+            attempt += 1;
+            let request = UiRequestId::new(format!("bind-b-terminal-{attempt}")).unwrap();
+            let mount = agent_mount.clone();
+            let host = &host;
+            async move {
+                match host
+                    .execute(PackageHostCommand::UiRequest(UiRequest {
+                        mount,
+                        request,
+                        operation: "agent.binding.set".into(),
+                        payload: object([("principalId", PackageValue::String(b.to_string()))]),
+                    }))
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(error) => {
+                        let cause = error.package_error.expect("Package-owned pending refusal");
+                        assert_eq!(cause.code, "agent.post_failed");
+                        assert!(cause.retryable, "uncertainty must not be retried");
+                        false
+                    }
+                }
+            }
+        })
+        .await,
+        "safe terminal never released dispatch ownership"
+    );
+    assert_eq!(
+        core.bound_agent(workspace.id(), AGENT_PACKAGE_ID).unwrap(),
+        Some(b)
+    );
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}
+
+/// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn cancelled_binding_waiter_cannot_reopen_dispatch_early() {
+    use teamarness_package_host::{CancelUiRequest, PackageHostCommand, UiRequest, UiRequestId};
+    let app = harness::StagedApplication::new();
+    let core = open_core(Addressing::Loopback, &app.root.path().join("core")).await;
+    let workspace = core.create_workspace("Binding owner").unwrap();
+    let a = core.add_agent(workspace.id(), "Scout").unwrap();
+    let b = core.add_agent(workspace.id(), "Other").unwrap();
+    let private = app.root.path().join("host");
+    register_agent(&private);
+    let host = open_host(&app.application_path, private, core.clone()).await;
+    let key = PackageInstanceKey::new(
+        AGENT_PACKAGE_ID.parse().unwrap(),
+        WorkspaceId::new(workspace.id().to_string()).unwrap(),
+    );
+    let mount = open_mount(&host, &key).await;
+    let agent = ConversationClient {
+        host: &host,
+        mount: &mount,
+    };
+    agent
+        .request(
+            "bind-a",
+            "agent.binding.set",
+            object([("principalId", PackageValue::String(a.to_string()))]),
+        )
+        .await;
+    let pause = host.pause_next_binding_write_for_tests(AGENT_PACKAGE_ID.parse().unwrap());
+    let binding_host = host.clone();
+    let binding_mount = mount.clone();
+    let pending = tokio::spawn(async move {
+        binding_host
+            .execute(PackageHostCommand::UiRequest(UiRequest {
+                mount: binding_mount,
+                request: UiRequestId::new("cancel-bind-b").unwrap(),
+                operation: "agent.binding.set".into(),
+                payload: object([("principalId", PackageValue::String(b.to_string()))]),
+            }))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(15), pause.paused())
+        .await
+        .unwrap();
+    host.execute(PackageHostCommand::CancelUiRequest(CancelUiRequest {
+        mount: mount.clone(),
+        request: UiRequestId::new("cancel-bind-b").unwrap(),
+    }))
+    .await
+    .unwrap();
+    assert!(pending.await.unwrap().is_err());
+    // A round trip through the SDK reader ensures the preceding cancel has been handled.
+    agent
+        .request("after-cancel", "agent.status.get", object([]))
+        .await;
+    let clear_host = host.clone();
+    let clear_mount = mount.clone();
+    let mut clear = tokio::spawn(async move {
+        clear_host
+            .execute(PackageHostCommand::UiRequest(UiRequest {
+                mount: clear_mount,
+                request: UiRequestId::new("clear-after-cancel").unwrap(),
+                operation: "agent.binding.clear".into(),
+                payload: object([]),
+            }))
+            .await
+    });
+    let overtook = tokio::time::timeout(Duration::from_millis(150), &mut clear).await;
+    pause.resume();
+    assert!(
+        overtook.is_err(),
+        "cancelled UI waiter released the binding transition before Core outcome"
+    );
+    clear.await.unwrap().unwrap();
+    assert_eq!(
+        core.bound_agent(workspace.id(), AGENT_PACKAGE_ID).unwrap(),
+        None
+    );
+    let status = serde_json::to_value(
+        agent
+            .request("final-status", "agent.status.get", object([]))
+            .await,
+    )
+    .unwrap();
+    assert!(status["agent"].is_null());
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}
