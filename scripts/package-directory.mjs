@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 export async function stagePackageDirectory({
   manifestPath,
   contractPath,
+  portContractPath,
   backendPath,
   uiEntrypointPath,
   uiAssets = [],
@@ -21,6 +22,8 @@ export async function stagePackageDirectory({
   manifest.ui.entrypoint.size = entrypoint.length;
   manifest.ui.entrypoint.sha256 = digest(entrypoint);
   manifest.ui.contract.sha256 = digest(contract);
+  const portContract = manifest.portContract && await readFile(portContractPath ?? join(dirname(manifestPath), manifest.portContract.path));
+  if (portContract) manifest.portContract.sha256 = digest(portContract);
   if (manifest.ui.assets.length !== uiAssets.length) {
     throw new Error("Every UI asset must have one build input");
   }
@@ -45,6 +48,11 @@ export async function stagePackageDirectory({
     await writeFile(join(outputDirectory, asset.path), asset.bytes, { mode: 0o600 });
   }
   await writeFile(join(outputDirectory, manifest.ui.contract.path), contract, { mode: 0o600 });
+  if (portContract) {
+    const destination = join(outputDirectory, manifest.portContract.path);
+    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+    await writeFile(destination, portContract, { mode: 0o600 });
+  }
   await writeFile(
     join(outputDirectory, "teamarness.package.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
@@ -61,6 +69,7 @@ export async function verifyPackageDirectory(directory) {
     { ...manifest.ui.entrypoint, mode: 0o600 },
     ...manifest.ui.assets.map(({ path, size, sha256 }) => ({ path, size, sha256, mode: 0o600 })),
     { ...manifest.ui.contract, size: undefined, mode: 0o600 },
+    ...(manifest.portContract ? [{ ...manifest.portContract, size: undefined, mode: 0o600 }] : []),
   ];
   for (const declaration of declarations) {
     const path = join(directory, declaration.path);
@@ -92,6 +101,7 @@ export async function compareDeclaredPackageBytes(leftDirectory, rightDirectory)
     { ...manifest.ui.entrypoint },
     ...manifest.ui.assets.map(({ path, size, sha256 }) => ({ path, size, sha256 })),
     { ...manifest.ui.contract, size: undefined },
+    ...(manifest.portContract ? [{ ...manifest.portContract, size: undefined }] : []),
   ];
   let totalBytes = 0;
   for (const declaration of declarations) {

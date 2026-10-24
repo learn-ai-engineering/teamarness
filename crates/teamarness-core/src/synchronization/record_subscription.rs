@@ -658,10 +658,8 @@ impl RecordSubscription {
         let peers = projection
             .map(|projection| {
                 projection
-                    .snapshot()
-                    .members()
-                    .iter()
-                    .map(crate::MemberSnapshot::identity)
+                    .installation_members()
+                    .into_iter()
                     .filter(|member| *member != self.local)
                     .collect()
             })

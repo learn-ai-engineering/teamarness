@@ -33,9 +33,9 @@ export async function mount(
     throw error;
   }
   let disposed = false;
-  let nameRetry: ReturnType<typeof setTimeout> | undefined;
-  let nameSubscription: Awaited<ReturnType<typeof client.subscribe>> | null = null;
-  let nameRetryDelay = 1000;
+  let principalRetry: ReturnType<typeof setTimeout> | undefined;
+  let principalSubscription: Awaited<ReturnType<typeof client.subscribe>> | null = null;
+  let principalRetryDelay = 1000;
   let view: ConversationsView | undefined;
   const controller = new ConversationsController(client, () => {
     if (!disposed) view?.render();
@@ -58,47 +58,47 @@ export async function mount(
 
     await controller.catchUpAfterSubscribe();
 
-    // Names are optional presentation: a name stream failure must not prevent Messages.
-    const scheduleNameRetry = () => {
-      if (disposed || nameRetry !== undefined) return;
-      nameSubscription = null;
-      nameRetry = setTimeout(() => {
-        nameRetry = undefined;
-        void openNames();
-      }, nameRetryDelay);
-      nameRetryDelay = Math.min(nameRetryDelay * 2, 30_000);
+    // Principals are optional presentation: a Principal stream failure must not prevent Messages.
+    const schedulePrincipalRetry = () => {
+      if (disposed || principalRetry !== undefined) return;
+      principalSubscription = null;
+      principalRetry = setTimeout(() => {
+        principalRetry = undefined;
+        void openPrincipals();
+      }, principalRetryDelay);
+      principalRetryDelay = Math.min(principalRetryDelay * 2, 30_000);
     };
-    const openNames = async (): Promise<void> => {
+    const openPrincipals = async (): Promise<void> => {
       let terminated = false;
       try {
-        const opened = await client.subscribe("conversations.names", {}, (names) => {
+        const opened = await client.subscribe("conversations.principals", {}, (principals) => {
           if (!disposed) {
-            nameRetryDelay = 1000;
-            controller.applyNames(names);
+            principalRetryDelay = 1000;
+            controller.applyPrincipals(principals);
           }
         }, { onTerminated: () => {
           terminated = true;
-          scheduleNameRetry();
+          schedulePrincipalRetry();
         } });
         if (disposed || terminated) await opened.close();
-        else nameSubscription = opened;
+        else principalSubscription = opened;
       } catch {
-        scheduleNameRetry();
+        schedulePrincipalRetry();
       }
     };
-    await openNames();
+    await openPrincipals();
 
     return async () => {
       if (disposed) return;
       disposed = true;
-      if (nameRetry) clearTimeout(nameRetry);
+      if (principalRetry) clearTimeout(principalRetry);
       controller.dispose();
       view?.dispose();
       try {
         try {
           await subscription.close();
         } finally {
-          await nameSubscription?.close();
+          await principalSubscription?.close();
         }
       } finally {
         cleanupStyles();
@@ -107,7 +107,7 @@ export async function mount(
     };
   } catch (error) {
     disposed = true;
-    if (nameRetry) clearTimeout(nameRetry);
+    if (principalRetry) clearTimeout(principalRetry);
     controller.dispose();
     view?.dispose();
     cleanupStyles();

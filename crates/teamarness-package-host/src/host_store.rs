@@ -100,6 +100,9 @@ impl HostStore {
         connection
             .execute_batch(include_str!("../migrations/0001_package_host.sql"))
             .map_err(fault!(storage_failure()))?;
+        connection
+            .execute_batch(include_str!("../migrations/0002_port_providers.sql"))
+            .map_err(fault!(storage_failure()))?;
         Ok(Self { connection })
     }
 
@@ -172,6 +175,32 @@ impl HostStore {
                 ],
             )
             .map_err(fault!(storage_failure()))?;
+        Ok(())
+    }
+
+    pub(crate) fn port_providers(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, String>, HostStoreFailure> {
+        let mut statement = self.connection.prepare(
+            "SELECT contract_identity, package_identity FROM port_providers ORDER BY contract_identity"
+        ).map_err(fault!(storage_failure()))?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(fault!(storage_failure()))?
+            .collect::<Result<_, _>>()
+            .map_err(fault!(storage_failure()))
+    }
+
+    pub(crate) fn record_port_provider(
+        &self,
+        contract: &str,
+        package: &str,
+    ) -> Result<(), HostStoreFailure> {
+        self.connection.execute(
+            "INSERT INTO port_providers(contract_identity, package_identity) VALUES (?1, ?2)
+             ON CONFLICT(contract_identity) DO UPDATE SET package_identity = excluded.package_identity",
+            params![contract, package],
+        ).map_err(fault!(storage_failure()))?;
         Ok(())
     }
 

@@ -65,11 +65,12 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     installation,
     workspaces: [workspace],
     memberships: { [workspace.id]: membership },
-    personNames: {},
+    principals: {},
     activeWorkspaceId: workspace.id,
     loading: false,
     error: null,
     notice: null,
+    membershipRefreshUnavailable: null,
     ...change,
   };
 }

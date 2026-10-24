@@ -54,12 +54,18 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         .await
         .unwrap();
     let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
-    for index in 0..33 {
-        let joiner = common::open_core(fixture._root.path().join(format!("joiner-{index}"))).await;
-        common::introduce(&fixture.core, &joiner);
-        let invitation = common::invite(&fixture.core, workspace.id()).await;
-        joiner.join_workspace(&invitation).await.unwrap();
-        joiner.shutdown().await.unwrap();
+    // Seventeen admissions and sixteen revocations produce 33 roster events,
+    // enough to exhaust the 32-credit window. Issuer-local admissions avoid
+    // the unrelated retry traffic from unreachable loopback joiners.
+    let members = (0..17)
+        .map(|_| {
+            fixture
+                .core
+                .admit_unreachable_member_for_tests(workspace.id())
+        })
+        .collect::<Vec<_>>();
+    for member in members.into_iter().take(16) {
+        fixture.core.revoke_member(workspace.id(), member).unwrap();
     }
 
     let instance = host.snapshot().await.instances[0].key.clone();
@@ -77,7 +83,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         &mount,
         "open-one",
         "fixture.membership_open",
-        object([("afterEpoch", PackageValue::String("0".into()))]),
+        object([("afterEpoch", PackageValue::String("2".into()))]),
     )
     .await;
     let first = tokio::time::timeout(Duration::from_secs(5), async {
@@ -111,7 +117,11 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         };
         assert_eq!(
             event.get("epoch"),
-            Some(&PackageValue::String((index + 1).to_string()))
+            Some(&PackageValue::String(if index < 17 {
+                (2 * index + 4).to_string()
+            } else {
+                (index + 20).to_string()
+            }))
         );
         assert!(
             matches!(event.get("membershipVersion"), Some(PackageValue::String(value)) if value.len() == 64)
@@ -171,7 +181,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
         &mount,
         "open-two",
         "fixture.membership_open",
-        object([("afterEpoch", PackageValue::String("33".into()))]),
+        object([("afterEpoch", PackageValue::String("52".into()))]),
     )
     .await;
     // settle: lets the reopened subscription deliver before its events are read.

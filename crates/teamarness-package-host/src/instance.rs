@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::Mutex;
 
+use crate::broker::RoutePermits;
+use crate::protocol::PortQueryStream;
+use teamarness_package_contract::port_contract::{CompiledPortContracts, PortKind};
 use teamarness_package_protocol::TOMBSTONE_CAPACITY;
 
 use crate::capability::AppendFence;
@@ -74,6 +77,11 @@ impl InstanceActor {
 
     pub(crate) async fn activate(self: &Arc<Self>) -> Result<(), WireFailure> {
         let _gate = self.lifecycle_gate.lock().await;
+        match self.state.lock().await.lifecycle {
+            LifecycleState::Active => return Ok(()),
+            LifecycleState::Admitted => {}
+            _ => return Err(WireFailure::new(PackageErrorCode::InvalidLifecycleState)),
+        }
         self.start_generation(false, true).await
     }
 
@@ -232,6 +240,7 @@ impl InstanceActor {
         };
         match lifecycle {
             LifecycleState::Active => Ok(()),
+            LifecycleState::Admitted => self.start_generation(false, true).await,
             LifecycleState::Suspended => {
                 let process =
                     process.ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
@@ -423,8 +432,171 @@ impl InstanceActor {
             })
     }
 
+    pub(crate) fn identity(&self) -> &crate::PackageIdentity {
+        &self.key.package_identity
+    }
+
     pub(crate) fn workspace_name(&self) -> &str {
         &self.spec.workspace_name
+    }
+
+    pub(crate) async fn port_request<F: FnOnce(String, u64) + Send + 'static>(
+        self: &Arc<Self>,
+        kind: PortKind,
+        payload: PackageValue,
+        permits: RoutePermits,
+        dispatched: Arc<std::sync::atomic::AtomicBool>,
+        on_assignment: F,
+    ) -> Result<serde_json::Value, WireFailure> {
+        // The gate also waits for a concurrent first-use activation; a snapshot
+        // of Activating is not a Provider exit.
+        self.activate().await?;
+        let (process, id, generation) = {
+            let mut state = self.state.lock().await;
+            if state.lifecycle != LifecycleState::Active {
+                return Err(WireFailure::new(PackageErrorCode::ProcessExited));
+            }
+            let process = state
+                .process
+                .clone()
+                .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
+            state.next_wire_id = state.next_wire_id.saturating_add(1);
+            let id = format!("h:port-{}-{}", state.generation, state.next_wire_id);
+            (process, id, state.generation)
+        };
+        let provider = process
+            .port_routes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        // The task owns the permits even when the requesting Package cancels or exits.
+        tokio::spawn(async move {
+            let _permits = (permits, provider);
+            if let Some(code) = process.client.failure() {
+                return Err(WireFailure::new(code));
+            }
+            let assigned_id = id.clone();
+            let on_dispatch: Box<dyn FnOnce() + Send> =
+                Box::new(move || on_assignment(assigned_id, generation));
+            match kind {
+                PortKind::Command => {
+                    process
+                        .client
+                        .request_port(
+                            id,
+                            "teamarness.port.command.v1",
+                            payload,
+                            dispatched,
+                            on_dispatch,
+                        )
+                        .await
+                }
+                PortKind::Query => {
+                    process
+                        .client
+                        .request_observed(id, "teamarness.port.query.v1", payload, on_dispatch)
+                        .await
+                }
+                PortKind::Event => Err(WireFailure::new(PackageErrorCode::PortUngranted)),
+            }
+        })
+        .await
+        .map_err(|_| WireFailure::new(PackageErrorCode::ProcessExited))?
+    }
+
+    pub(crate) async fn port_event_stream(
+        self: &Arc<Self>,
+        payload: PackageValue,
+        schemas: Arc<CompiledPortContracts>,
+        contract: String,
+        port: String,
+    ) -> Result<PortQueryStream, WireFailure> {
+        self.activate().await?;
+        let (process, id, generation) = {
+            let mut state = self.state.lock().await;
+            if state.lifecycle != LifecycleState::Active {
+                return Err(WireFailure::new(PackageErrorCode::ProcessExited));
+            }
+            let process = state
+                .process
+                .clone()
+                .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
+            state.next_wire_id = state.next_wire_id.saturating_add(1);
+            let id = format!("h:port-event-{}-{}", state.generation, state.next_wire_id);
+            (process, id, state.generation)
+        };
+        let provider = process
+            .port_routes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        let receiver = process
+            .client
+            .open_port_stream(
+                id.clone(),
+                "teamarness.port.event.v1",
+                payload,
+                schemas,
+                contract,
+                port,
+            )
+            .await?;
+        Ok(PortQueryStream {
+            generation,
+            receiver,
+            client: process.client.clone(),
+            id,
+            _route: Box::new(()),
+            _provider: provider,
+        })
+    }
+
+    pub(crate) async fn port_query_stream(
+        self: &Arc<Self>,
+        payload: PackageValue,
+        schemas: Arc<CompiledPortContracts>,
+        contract: String,
+        port: String,
+        permits: RoutePermits,
+    ) -> Result<PortQueryStream, WireFailure> {
+        self.activate().await?;
+        let (process, id, generation) = {
+            let mut state = self.state.lock().await;
+            if state.lifecycle != LifecycleState::Active {
+                return Err(WireFailure::new(PackageErrorCode::ProcessExited));
+            }
+            let process = state
+                .process
+                .clone()
+                .ok_or_else(|| WireFailure::new(PackageErrorCode::ProcessExited))?;
+            state.next_wire_id = state.next_wire_id.saturating_add(1);
+            let id = format!("h:port-stream-{}-{}", state.generation, state.next_wire_id);
+            (process, id, state.generation)
+        };
+        let provider = process
+            .port_routes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WireFailure::new(PackageErrorCode::Overloaded))?;
+        let receiver = process
+            .client
+            .open_port_stream(
+                id.clone(),
+                "teamarness.port.query.v1",
+                payload,
+                schemas,
+                contract,
+                port,
+            )
+            .await?;
+        Ok(PortQueryStream {
+            generation,
+            receiver,
+            client: process.client.clone(),
+            id,
+            _route: Box::new(permits),
+            _provider: provider,
+        })
     }
 
     pub(crate) async fn request(

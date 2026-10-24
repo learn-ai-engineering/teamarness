@@ -44,6 +44,11 @@ pub(crate) struct LoadedManifest {
     pub(crate) backend: VerifiedFile,
     pub(crate) ui: LoadedUi,
     pub(crate) capabilities: Vec<CapabilityRequirement>,
+    pub(crate) consumed_ports: Vec<contract::ConsumedContract>,
+    pub(crate) activation: contract::ActivationPolicy,
+    pub(crate) port_contract:
+        Option<std::sync::Arc<teamarness_package_contract::port_contract::CompiledPortContracts>>,
+    pub(crate) port_contract_digest: Option<String>,
     pub(crate) manifest_digest: String,
 }
 
@@ -60,6 +65,10 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
         backend: loaded.backend,
         ui: loaded.ui,
         capabilities: loaded.capabilities,
+        consumed_ports: loaded.consumed_ports,
+        activation: loaded.activation,
+        port_contract: loaded.port_contract,
+        port_contract_digest: loaded.port_contract_digest,
         manifest_digest: loaded.manifest_digest,
     })
 }
@@ -74,6 +83,7 @@ pub(crate) const fn host_code(code: ContractErrorCode) -> PackageErrorCode {
         ContractErrorCode::ArtifactMissing => PackageErrorCode::ArtifactMissing,
         ContractErrorCode::ArtifactChanged => PackageErrorCode::ArtifactChanged,
         ContractErrorCode::UiEntrypointMissing => PackageErrorCode::UiEntrypointMissing,
+        ContractErrorCode::PortContractViolation => PackageErrorCode::PortContractViolation,
         // `SmokeFailed` belongs to the author validator and never reaches admission; the Host
         // treats it, like a contract violation, as a UI contract failure.
         ContractErrorCode::UiContractViolation | ContractErrorCode::SmokeFailed => {

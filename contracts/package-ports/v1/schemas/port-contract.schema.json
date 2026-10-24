@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-ports/v1/port-contract.schema.json",
+  "$defs": {
+    "port": {
+      "type": "object",
+      "required": [
+        "name",
+        "kind",
+        "description"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
+        },
+        "kind": {
+          "enum": [
+            "command",
+            "query",
+            "event"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request": {},
+        "response": {},
+        "event": {}
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "command"
+            }
+          },
+          "required": [
+            "request",
+            "response"
+          ],
+          "not": {
+            "required": [
+              "event"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "query"
+            }
+          },
+          "required": [
+            "request",
+            "response"
+          ],
+          "not": {
+            "required": [
+              "event"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "query"
+            }
+          },
+          "required": [
+            "request",
+            "event"
+          ],
+          "not": {
+            "required": [
+              "response"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "event"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "request"
+                ]
+              },
+              {
+                "required": [
+                  "response"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "$defs",
+    "contracts"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "$defs": {
+      "type": "object"
+    },
+    "contracts": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "required": [
+          "identity",
+          "major",
+          "minor",
+          "description",
+          "ports"
+        ],
+        "properties": {
+          "identity": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 128,
+            "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+          },
+          "major": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "minor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "ports": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/$defs/port"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

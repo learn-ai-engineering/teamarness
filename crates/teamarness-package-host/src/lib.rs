@@ -6,6 +6,9 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod broker;
+mod port_observation;
+pub use port_observation::{PortObservation, PortObservations, PortStage};
 mod capability;
 mod catalog;
 mod commands;
@@ -27,6 +30,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, watch};
 
+pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome, ReadUiResource,
@@ -50,6 +54,20 @@ pub use crate::values::{
 };
 
 use crate::errors::host_error;
+
+/// Complete read-only port declaration metadata for authoring tools, separate from UI snapshots
+/// and from the generation-bound, availability-filtered runtime view.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoringCatalogEntry {
+    pub package: PackageCatalogEntry,
+    pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
+    pub definitions: serde_json::Map<String, serde_json::Value>,
+    pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+    pub availability: Vec<PortAvailability>,
+    pub diagnostics: Vec<PackageErrorEnvelope>,
+}
+
 use crate::subscriptions::PackageHostSubscriptionKind;
 
 /// Actor facade for admitted and supervised Package Instances.
@@ -67,6 +85,13 @@ struct PackageHostInner {
     core: Arc<teamarness_core::CoreRuntime>,
     templates: Vec<supervisor::ProcessTemplate>,
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
+    authoring_catalog: Vec<AuthoringCatalogEntry>,
+    port_graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    port_broker: Arc<broker::PortBroker>,
+    port_contracts: BTreeMap<
+        PackageIdentity,
+        Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+    >,
     reconciliation: Mutex<()>,
     mount_management: Mutex<()>,
 }
@@ -114,6 +139,27 @@ impl PackageHost {
             instances: snapshots,
             diagnostics,
         }
+    }
+
+    /// Returns the installed, admitted declarations without starting any Provider.
+    /// Includes installation-wide admission diagnostics and optional availability.
+    pub fn authoring_catalog(&self) -> Vec<AuthoringCatalogEntry> {
+        let mut entries = self.inner.authoring_catalog.clone();
+        for entry in &mut entries {
+            if let Some(availability) = self.inner.port_graph.get(&entry.package.identity) {
+                entry.availability = availability.clone();
+            }
+            if let Some(compiled) = self.inner.port_contracts.get(&entry.package.identity) {
+                entry.definitions = compiled.definitions.clone();
+            }
+        }
+        entries
+    }
+
+    /// Opt in to bounded, process-local Port routing observations. A slow receiver reports lag.
+    /// Observations are diagnostic only and cannot establish whether a command committed.
+    pub fn observe_ports(&self) -> PortObservations {
+        self.inner.port_broker.observe()
     }
 
     /// Claims a coalesced host-state subscription or one open UI event route.

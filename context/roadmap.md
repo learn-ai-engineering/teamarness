@@ -52,7 +52,7 @@ Started on 2026-09-14. Core now owns the first generic Package-scoped Synchroniz
 
 ### Phase 5 - Membership Management and Hardening
 
-Workspace leave, manager assignment and transfer, member removal controls, revocation-driven Content Key rotation (a new Content Key Generation per revocation), and epoch transitions visible to packages. Content Key rotation SHALL grant a newly admitted Member the earlier Content Key Generations of each Package scope, so they read the existing history (`TEAM.SYS.CONV-R12`). Phase 5 introduces multiple Workspace administrators — a small group (for example three or four Members) who can admit and revoke Members and perform other Workspace administration. Version 1's single Manager, the Workspace creator, is a scope limit, not the intended model (ADR 0013). Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations. Workspace-specific names for one Installation per Person are delivered by the incremental Member names workstream (see **Planned follow-up workstreams** and `TEAM-DQ8`); grouping multiple devices under one Person remains Phase 5 design work. Membership replication and synchronization peer authorization are delivered by ADR 0013; adding a membership action tag requires a new membership-sync protocol version, not a new envelope version. Package Instance lifecycle on leave and revocation (`TEAM-DQ9`) is decided in this phase: today the Package Host never disposes an Instance.
+Workspace leave, manager assignment and transfer, member removal controls, revocation-driven Content Key rotation (a new Content Key Generation per revocation), and epoch transitions visible to packages. Content Key rotation SHALL grant a newly admitted Member the earlier Content Key Generations of each Package scope, so they read the existing history (`TEAM.SYS.CONV-R12`). Phase 5 introduces multiple Workspace administrators — a small group (for example three or four Members) who can admit and revoke Members and perform other Workspace administration. Version 1's single Manager, the Workspace creator, is a scope limit, not the intended model (ADR 0013). Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations; ADR 0023 already models a Workspace Person as a key group, so this work attaches further Installation keys to that group. Workspace-specific names for one Installation per Person were delivered by the Member names workstream and generalized to Principal Names by the Workspace Principals workstream (see **Current work** and `TEAM-DQ8`); grouping multiple devices under one Person remains Phase 5 design work. Membership replication and synchronization peer authorization are delivered by ADR 0013; adding a membership action tag requires a new membership-sync protocol version, not a new envelope version. Package Instance lifecycle on leave and revocation (`TEAM-DQ9`) is decided in this phase: today the Package Host never disposes an Instance.
 
 **Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member reads the existing history, and packages rotate keys after membership transitions.
 
@@ -70,6 +70,16 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Workspace Principals (complete)
+
+Verified on 2026-10-23 on branch `don-smith/agent_invite`, workstream `agent-invite`. ADR 0023 (accepted 2026-10-21) defines Workspace Principals: a Workspace Person is a key group nested in the Workspace group, a Workspace Agent is a Principal whose key the Steward's Installation custodies, and attribution is the signer key resolved to its Principal. The workstream replaces the names capability of ADR 0022 with `teamarness.principals` 1.0, adds the optional `principal` selector to `teamarness.synchronization.immutable-record-log` 1.1, lets any Member add an Agent by name from the Shell without a Manager, lists Agents with their Steward, and shows Agent authors in Conversations. The agent runtime Package, cross-Package reads, and Shell-driven Package binding are the next workstream.
+
+**Outcome:** Every Member sees a Workspace Agent with its name and Steward on every Installation, and a bound Package Instance appends records as that Agent.
+
+**Depends on:** Member names.
+
+The final source passed the full repository check and an exact-range review with no P0 or P1 findings. Don verified create, invite, join, Agent management and naming, two-profile synchronization, restart persistence, and Person-authored Conversations on the final source. Person revocation and Agent-authored Message composition have no supported desktop route; Core, Host, and UI tests cover their respective seams. See the `agent-invite` Verify artifacts for the five retained P2 notes and the intermittent Core test failure.
+
 The architecture review and the Shell and Package UI polish workstream are closed and merged. Phase 5 remains next for the core roadmap. The Conversations UI overhaul is complete and verified locally on the isolated `conversations-ui-overhaul` branch at `793b42f`. It adds automatic older history, Package-local projection replay, explicit history-access retry, and stable reading position. Full Cargo and npm checks and exact-range independent review pass with no P0/P1; three P2 follow-ups remain. The developer accepted a limited two-instance desktop check because long-history and other fixtures were unavailable. Those checks are not recorded as passed. An earlier blocked lifecycle journal attempt remains audit debt, not a product defect. The developer approved integration into local `main`; no push is authorized.
 
 ### Shell and Package UI polish (complete)
@@ -84,7 +94,7 @@ Branch `architecture-review`, merged to `main` on 2026-09-22. Reviewed the whole
 
 ### Phase 7 - Documents Package
 
-Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Package (`packages/documents-package`) owns Collections, Documents, Comments, and a collaborative plain-text Markdown body replicated as Loro updates on the immutable record log, with no Core change (ADR 0023). Automated qualification covers record convergence in any order, deferral and quarantine, Loro import order independence, coalesced and bounded edit records, restart replay, and the UI edit and comment flows. The separate `documents-layout` workstream completed its layout, quoting, and minimal-controls changes with a passing scoped review, automated checks, and developer two-instance UI observations. The overall Package Verify remains failed on SF-701 and SF-702, accepted only for internal evaluation. Two-second visibility across separate networks, offline merge, and late join were not reported as passed. An existing Member's app-closed metadata catch-up observation is deferred in [DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md).
+Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Package (`packages/documents-package`) owns Collections, Documents, Comments, and a collaborative plain-text Markdown body replicated as Loro updates on the immutable record log, with no Documents-specific Core change (ADR 0027). Automated qualification covers record convergence in any order, deferral and quarantine, Loro import order independence, coalesced and bounded edit records, restart replay, and the UI edit and comment flows. The separate `documents-layout` workstream completed its layout, quoting, and minimal-controls changes with a passing scoped review, automated checks, and developer two-instance UI observations. The overall Package Verify remains failed on SF-701 and SF-702, accepted only for internal evaluation. Two-second visibility across separate networks, offline merge, and late join were not reported as passed. An existing Member's app-closed metadata catch-up observation is deferred in [DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md).
 
 **Outcome:** Two team members on separate networks edit a planning document together and discuss it in comments that stay with the document (vision success criterion 4).
 
@@ -100,8 +110,8 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
-- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0023).
-- Document log compaction via the reserved `document.snapshot` record kind (ADR 0023).
+- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0027).
+- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027).
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
@@ -117,7 +127,7 @@ Identified on 2026-09-17 during Scope of the UI polish workstream. Each needs it
 
 ### Member names
 
-Incremental delivery on `feature/member-names`: Core-owned Workspace Person IDs and authenticated names, generic `teamarness.person-names` capability, Shell controls and Conversations author presentation. Automated Phase 4 verification is pending independent review and final two-instance desktop Verify; this is not merged into `main`. Resolves `TEAM-DQ8` for one Installation per Person when verified; multi-device grouping remains separate Phase 5 work.
+Incremental delivery on `feature/member-names`: Core-owned Workspace Person IDs and authenticated names, generic `teamarness.person-names` capability, Shell controls and Conversations author presentation. Merged into `main`; resolves `TEAM-DQ8` for one Installation per Person. Superseded in part by ADR 0023, which replaces the capability with `teamarness.principals` (see **Current work**). Multi-device grouping remains separate Phase 5 work.
 
 **Depends on:** membership synchronization delivered by the architecture review.
 
@@ -136,6 +146,34 @@ The Conversations Package UI redesign and history-continuity replacement are com
 ### Conversations history maintenance (unscheduled)
 
 If prioritized, start a separate Scope for these nonblocking review findings: make the advancing-page mount fixture supply a valid open watermark (`SM-007`); avoid one redundant terminal delta request (`SF-006`); and restore the no-request assertion for malformed Channel slugs (`SM-008`). Retest the accepted but unavailable long-history, theme, resize, keyboard-error, and pending-access desktop cases when safe fixtures exist. If an issue appears, open a new workstream rather than rewriting the accepted manual result. Real Message time provenance also needs a separate Scope before dates or times can be shown; no timestamp was fabricated in this workstream.
+
+### Package platform direction (recorded 2026-10-21)
+
+A design conversation on 2026-10-21 compared Teamarness with a thin-shell, package-host application model (WebAssembly components, typed ports, drop-in installation, per-package updates) and a biological membrane analogy. Reading the conversation against the context tree found that most of the "membrane" already exists at the Host seam: manifest-declared capability families negotiated per activation (ADR 0018), closed-schema UI contracts with requests and subscriptions, a Shell-owned UI contract (ADR 0015), and host-brokered calls. Two gaps remain: a Package cannot offer commands, queries, or events to another Package, and there is no Package signing, endorsement, or update distribution. Once Core owns Packages' seams, almost all later development is Package authoring, so these seams decide how far Package work can be parallelized.
+
+The agreed sequence is four workstreams. Each needs its own Scope.
+
+#### Package interface
+
+Implementation in progress: the declaration, admission, scoped broker, and live event phases are committed on `package-interface`. The final source-built Conversations proof, local observations, documentation, and full verification are in progress. ADR 0026 records the Host-brokered interface.
+
+A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract exposes a Person-only post, read-only page, and live coalescible invalidation. The Host derives actor context, but cannot delegate another Package's Agent signing key. Agent runtime, Instance binding, and Agent-authored posts need a separate Agent Package workstream. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
+
+#### Data format versioning
+
+An ADR that governs the stored-record seam separately from the live Host seam that ADR 0018 governs. Synced records are signed by peers that cannot be asked to stop, so an old reader must tolerate additive fields and degrade visibly, never reject or fork. Today the Conversations and Documents canonical codecs are positional and reject trailing bytes, and the pinned Loro CRDT will make its encoding part of the Documents format. Scheduled early because there is no install base yet, which makes the rule cheapest now.
+
+#### WebAssembly Package class
+
+Re-evaluate ADR 0006's deferral. Its blocking reason, Package-owned Tokio and Iroh work, was removed by ADR 0007 when Core took ownership of transport and replication, and WASI 0.3 with component-model async has since shipped. The open question is Package-local state without native SQLite or `gix`. Agent Packages holding an Agent key with the user's ambient authority (ADR 0023) are the motivating case for a stronger execution boundary. Outcome: an ADR introducing a second Package class, or a dated re-deferral with explicit criteria.
+
+#### Package distribution and per-Instance restart
+
+Author signature over the Package artifact, a team endorsement of an exact digest and capability set recorded in the membership log, a Host-owned update feed per Package (The Update Framework's threat list as the checklist, Packages never fetch their own updates), a consolidated installed-Packages view with permission diffs, and restarting one Package Instance without restarting the application. Depends on the code-signing work under Later.
+
+### Workspace Principal maintenance (unscheduled)
+
+Start a separate Scope if sustained name-delivery or membership churn becomes an ordinary workload. Two bounded deferred-name replay schedules can starve an eligible name while churn continues; finite backlogs converge. That Scope should also decide whether to use or retire the unused deferred-reference target index. A smaller Core maintenance change can reuse one clock sample for local Agent removal. Clarify the ontology's Agent Identity keypair wording without changing key custody. Diagnose the intermittent `names_converge_without_package_instance_after_restart` test failure before changing a deadline or claiming that a passing retry fixed it. The `agent-invite` final Verify report owns the evidence; these are follow-ups, not unverified passes or blockers to the completed supported flow.
 
 ## Maintenance rule
 

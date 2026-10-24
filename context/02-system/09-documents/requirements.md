@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.DOCS`
 
-The Documents Package (`dev.teamarness.documents`) provides Workspace Collections, Documents, and Comments. See ADR 0023.
+The Documents Package (`dev.teamarness.documents`) provides Workspace Collections, Documents, and Comments. See ADR 0027.
 
 ## TEAM.SYS.DOCS-R01 — Package Boundary
 
@@ -36,7 +36,7 @@ A current Member SHALL be able to add a Comment of 1 byte to 32 KiB of Markdown 
 
 ## TEAM.SYS.DOCS-R08 — Authorship Presentation
 
-Records SHALL store author Installation identities, never names. The UI SHALL label authors by current Workspace Person Name through `teamarness.person-names`, update labels after rename, and fall back to an inspectable identity. An agent Workspace Person SHALL be labelled the same way.
+Records SHALL store author signing identities, never names. The UI SHALL label authors by current Workspace Principal Name through `teamarness.principals`, update labels after rename, and fall back to an inspectable signing identity. Workspace Person and Workspace Agent authors SHALL use the same lookup.
 
 ## TEAM.SYS.DOCS-R09 — Bounds
 

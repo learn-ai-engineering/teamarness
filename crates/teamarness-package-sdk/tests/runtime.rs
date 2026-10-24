@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use teamarness_package_protocol::{FrameKind, JsonValue};
 use teamarness_package_sdk::{
     Backend, BackendError, BackendRequest, CancellationToken, EventSubscription, Package, SdkError,
+    port_observation::ProviderPortStage,
 };
 use tokio::sync::Mutex;
 
@@ -175,6 +176,51 @@ async fn shutdown(mut session: Session) {
     );
     drop(session.host_write);
     session.service.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn port_observations_are_opt_in_bounded_and_payload_free() {
+    let (host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let (package, mut observed) = Package::builder(Arc::new(Fixture::default())).observe_ports();
+    let service = tokio::spawn(package.serve_io(sdk_read, sdk_write));
+    write_json(&mut host_write, INITIALIZE).await;
+    let mut session = Session {
+        host_read,
+        host_write,
+        service,
+    };
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    let sentinel = "secret-markdown-not-in-observations";
+    write_json(&mut session.host_write, &format!(
+        r#"{{"kind":"request","id":"h:port-1-9","operation":"teamarness.port.command.v1","deadlineUnixMs":"{}","payload":{{"markdown":"{sentinel}"}}}}"#, deadline_in(Duration::from_secs(8))
+    )).await;
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::Response
+    );
+    let received = observed.recv().await.unwrap();
+    let completed = observed.recv().await.unwrap();
+    assert_eq!(received.provider_id, "h:port-1-9");
+    assert_eq!(received.stage, ProviderPortStage::Received);
+    assert_eq!(completed.stage, ProviderPortStage::Completed);
+    assert!(!format!("{received:?}{completed:?}").contains(sentinel));
+    assert!(observed.try_recv().is_err());
+    write_json(&mut session.host_write,
+        r#"{"kind":"stream_open","id":"h:port-event-1-10","topic":"teamarness.port.event.v1","initialCredit":32,"payload":{"markdown":"secret-stream"}}"#).await;
+    assert_eq!(
+        read_frame(&mut session.host_read).await.kind(),
+        FrameKind::StreamClose
+    );
+    let failed = observed.recv().await.unwrap();
+    assert_eq!(failed.provider_id, "h:port-event-1-10");
+    assert_eq!(failed.stage, ProviderPortStage::Failed);
+    assert_eq!(failed.code.as_deref(), Some("unsupported_stream"));
+    assert!(!format!("{failed:?}").contains("secret-stream"));
+    shutdown(session).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

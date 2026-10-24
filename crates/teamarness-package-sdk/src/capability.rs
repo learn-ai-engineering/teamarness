@@ -15,8 +15,13 @@ use crate::{BackendError, object};
 /// answering slowly reports its own `deadline_exceeded` first.
 pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(11);
 
-pub(crate) type PendingCapabilities =
-    Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<JsonValue, BackendError>>>>>;
+pub(crate) type PendingCapabilities = Arc<Mutex<BTreeMap<String, PendingCapability>>>;
+
+pub(crate) struct PendingCapability {
+    pub(crate) sender: oneshot::Sender<Result<JsonValue, BackendError>>,
+    pub(crate) command: bool,
+}
+
 pub(crate) type CapabilityStreams = Arc<Mutex<BTreeMap<String, CapabilityStreamRoute>>>;
 
 pub(crate) struct CapabilityStreamRoute {
@@ -41,9 +46,15 @@ pub struct CapabilitySubscription {
     streams: CapabilityStreams,
     state: SharedState,
     closed: bool,
+    port_values: bool,
 }
 
 impl CapabilitySubscription {
+    pub(crate) fn with_port_values(mut self) -> Self {
+        self.port_values = true;
+        self
+    }
+
     /// Receives one event, returning `None` after the host closes the stream.
     pub async fn recv(&mut self) -> Option<Result<JsonValue, BackendError>> {
         let event = self.receiver.recv().await;
@@ -57,7 +68,15 @@ impl CapabilitySubscription {
                 ]))
                 .await;
         }
-        event
+        event.map(|result| {
+            result.map(|value| {
+                if self.port_values {
+                    crate::ports::decode_port_value(value)
+                } else {
+                    value
+                }
+            })
+        })
     }
 
     /// Receives one event and the credit it consumed, so the caller decides when to ask for more.
@@ -69,7 +88,11 @@ impl CapabilitySubscription {
     ) -> Option<Result<(JsonValue, StreamCredit), BackendError>> {
         match self.receiver.recv().await? {
             Ok(payload) => Some(Ok((
-                payload,
+                if self.port_values {
+                    crate::ports::decode_port_value(payload)
+                } else {
+                    payload
+                },
                 StreamCredit {
                     id: self.id.clone(),
                     writer: self.writer.clone(),
@@ -221,6 +244,7 @@ impl CapabilityClient {
             streams: self.streams.clone(),
             state: self.state.clone(),
             closed: false,
+            port_values: false,
         })
     }
 
@@ -237,13 +261,22 @@ impl CapabilityClient {
         payload: JsonValue,
     ) -> Result<(), &'static str> {
         let mut routes = streams.lock().await;
-        let Some(route) = routes.get_mut(id) else {
+        let Some(route) = routes.get(id) else {
             return Ok(());
         };
-        route
-            .sender
-            .try_send(Ok(payload))
-            .map_err(|_| "event_lagged")
+        if route.sender.try_send(Ok(payload)).is_err() {
+            let route = routes.remove(id).expect("stream was present");
+            // Preserve already accepted events, then report the local overflow.
+            // Waiting for queue space on the reader would stall the entire session.
+            tokio::spawn(async move {
+                let _ = route
+                    .sender
+                    .send(Err(BackendError::new("event_lagged", false, object([]))))
+                    .await;
+            });
+            return Err("event_lagged");
+        }
+        Ok(())
     }
 
     pub(crate) async fn close_stream(
@@ -254,7 +287,11 @@ impl CapabilityClient {
         if let Some(route) = streams.lock().await.remove(id)
             && let Some(error) = error
         {
-            let _ = route.sender.send(Err(error)).await;
+            // The terminal follows accepted events, but a full stream must not
+            // suspend the session reader (or another stream's close).
+            tokio::spawn(async move {
+                let _ = route.sender.send(Err(error)).await;
+            });
         }
     }
 
@@ -285,6 +322,8 @@ impl CapabilityClient {
                 JsonValue::Object(Default::default()),
             ));
         }
+        let command =
+            method == "invoke" && input.get("kind").and_then(JsonValue::as_str) == Some("command");
         let id = format!("p:{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let deadline = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -293,7 +332,10 @@ impl CapabilityClient {
             .saturating_add(10_000)
             .to_string();
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), sender);
+        self.pending
+            .lock()
+            .await
+            .insert(id.clone(), PendingCapability { sender, command });
         let value = object([
             ("kind", JsonValue::String("request".into())),
             ("id", JsonValue::String(id.clone())),
@@ -307,7 +349,7 @@ impl CapabilityClient {
             return Err(unavailable());
         }
         match tokio::time::timeout(CALL_DEADLINE, receiver).await {
-            Ok(answer) => answer.unwrap_or_else(|_| Err(unavailable())),
+            Ok(answer) => answer.unwrap_or_else(|_| Err(unavailable_after_enqueue(command))),
             Err(_) => {
                 // The caller stops waiting here, so the request is retired
                 // here: the host always answers, and its late first terminal
@@ -316,10 +358,15 @@ impl CapabilityClient {
                 self.pending.lock().await.remove(&id);
                 self.state.lock().await.retire_request(&id);
                 Err(BackendError::new(
-                    "deadline_exceeded",
-                    true,
+                    if command {
+                        "outcome_unknown"
+                    } else {
+                        "deadline_exceeded"
+                    },
+                    !command,
                     JsonValue::Object(Default::default()),
-                ))
+                )
+                .with_outcome_uncertain(command))
             }
         }
     }
@@ -331,12 +378,18 @@ impl CapabilityClient {
 /// Package task holding a client must not wait forever.
 pub(crate) async fn fail_all(pending: &PendingCapabilities, streams: &CapabilityStreams) {
     let waiting = std::mem::take(&mut *pending.lock().await);
-    for (_, sender) in waiting {
-        let _ = sender.send(Err(unavailable()));
+    for (_, pending) in waiting {
+        let _ = pending
+            .sender
+            .send(Err(unavailable_after_enqueue(pending.command)));
     }
     let routes = std::mem::take(&mut *streams.lock().await);
     for (_, route) in routes {
-        let _ = route.sender.send(Err(unavailable())).await;
+        // A retained full receiver must not hold process shutdown open. The
+        // terminal follows accepted events if that Consumer later drains them.
+        tokio::spawn(async move {
+            let _ = route.sender.send(Err(unavailable())).await;
+        });
     }
 }
 
@@ -354,4 +407,196 @@ fn unavailable() -> BackendError {
         true,
         JsonValue::Object(Default::default()),
     )
+}
+
+fn unavailable_after_enqueue(command: bool) -> BackendError {
+    if command {
+        BackendError::new(
+            "outcome_unknown",
+            false,
+            JsonValue::Object(Default::default()),
+        )
+        .with_outcome_uncertain(true)
+    } else {
+        unavailable()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_full_retained_stream() {
+        let (sender, mut receiver) = mpsc::channel(INITIAL_STREAM_CREDIT);
+        for sequence in 0..INITIAL_STREAM_CREDIT {
+            sender
+                .try_send(Ok(serde_json::json!({"sequence":sequence})))
+                .unwrap();
+        }
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let streams = Arc::new(Mutex::new(BTreeMap::from([(
+            "p:full".to_owned(),
+            CapabilityStreamRoute { sender },
+        )])));
+        tokio::time::timeout(Duration::from_millis(100), fail_all(&pending, &streams))
+            .await
+            .expect("shutdown cannot depend on a Consumer draining the queue");
+        for sequence in 0..INITIAL_STREAM_CREDIT {
+            assert_eq!(
+                receiver.recv().await.unwrap().unwrap()["sequence"],
+                sequence
+            );
+        }
+        assert_eq!(
+            receiver.recv().await.unwrap().unwrap_err().code(),
+            "host_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_loss_after_command_enqueue_is_uncertain_but_query_loss_is_retryable() {
+        let (writer, _control, mut data) = PriorityWriter::channels();
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let streams = Arc::new(Mutex::new(BTreeMap::new()));
+        let client = CapabilityClient::new(
+            Arc::new(writer),
+            pending.clone(),
+            streams.clone(),
+            Arc::new(Mutex::new(
+                teamarness_package_protocol::ContractState::default(),
+            )),
+        );
+        let command = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call(
+                        "Z3JhbnQx",
+                        "invoke",
+                        serde_json::json!({
+                            "contract":"fixture.messages", "port":"message.post",
+                            "kind":"command", "request":{}
+                        }),
+                    )
+                    .await
+            }
+        });
+        data.recv().await.expect("the command entered the writer");
+        let query = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call(
+                        "Z3JhbnQx",
+                        "invoke",
+                        serde_json::json!({
+                            "contract":"fixture.messages", "port":"message.list",
+                            "kind":"query", "request":{}
+                        }),
+                    )
+                    .await
+            }
+        });
+        data.recv().await.expect("the query entered the writer");
+        fail_all(&pending, &streams).await;
+        let command_error = command.await.unwrap().unwrap_err();
+        assert!(command_error.outcome_uncertain());
+        assert!(!command_error.retryable());
+        let query_error = query.await.unwrap().unwrap_err();
+        assert_eq!(query_error.code(), "host_unavailable");
+        assert!(!query_error.outcome_uncertain());
+        assert!(query_error.retryable());
+    }
+
+    #[tokio::test]
+    async fn closed_pending_receiver_after_command_enqueue_is_uncertain() {
+        let (writer, _control, mut data) = PriorityWriter::channels();
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let client = CapabilityClient::new(
+            Arc::new(writer),
+            pending.clone(),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(
+                teamarness_package_protocol::ContractState::default(),
+            )),
+        );
+        let command = tokio::spawn(async move {
+            client
+                .call(
+                    "Z3JhbnQx",
+                    "invoke",
+                    serde_json::json!({
+                        "contract":"fixture.messages", "port":"message.post",
+                        "kind":"command", "request":{}
+                    }),
+                )
+                .await
+        });
+        data.recv().await.expect("writer accepted the command");
+        pending.lock().await.clear();
+        let failure = command.await.unwrap().unwrap_err();
+        assert_eq!(failure.code(), "outcome_unknown");
+        assert!(failure.outcome_uncertain());
+        assert!(!failure.retryable());
+    }
+
+    #[tokio::test]
+    async fn refused_command_writer_remains_certain() {
+        let (writer, _control, data) = PriorityWriter::channels();
+        drop(data);
+        let client = CapabilityClient::new(
+            Arc::new(writer),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(
+                teamarness_package_protocol::ContractState::default(),
+            )),
+        );
+        let failure = client
+            .call(
+                "Z3JhbnQx",
+                "invoke",
+                serde_json::json!({
+                    "contract":"fixture.messages", "port":"message.post",
+                    "kind":"command", "request":{}
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "host_unavailable");
+        assert!(!failure.outcome_uncertain());
+        assert!(failure.retryable());
+    }
+
+    // Verifies: TEAM.SYS.PKG-R14
+    #[tokio::test]
+    async fn inbound_event_lag_retires_only_its_stream_after_accepted_events() {
+        // Inject one slot instead of the full published credit window to exercise
+        // a locally lagged adapter without violating the wire classifier.
+        const LAG_TEST_QUEUE: usize = INITIAL_STREAM_CREDIT / INITIAL_STREAM_CREDIT;
+        let (slow, mut slow_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        let (peer, mut peer_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        let streams = Arc::new(Mutex::new(BTreeMap::from([
+            ("p:slow".to_owned(), CapabilityStreamRoute { sender: slow }),
+            ("p:peer".to_owned(), CapabilityStreamRoute { sender: peer }),
+        ])));
+        CapabilityClient::event(&streams, "p:slow", serde_json::json!({"order":1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            CapabilityClient::event(&streams, "p:slow", serde_json::json!({"order":2})).await,
+            Err("event_lagged")
+        );
+        CapabilityClient::event(&streams, "p:peer", serde_json::json!({"order":2}))
+            .await
+            .unwrap();
+        assert_eq!(slow_rx.recv().await.unwrap().unwrap()["order"], 1);
+        assert_eq!(
+            slow_rx.recv().await.unwrap().unwrap_err().code(),
+            "event_lagged"
+        );
+        assert_eq!(peer_rx.recv().await.unwrap().unwrap()["order"], 2);
+        assert!(streams.lock().await.contains_key("p:peer"));
+    }
 }

@@ -37,7 +37,9 @@ fn admit(issuer: &CoreRuntime, invitee: &CoreRuntime, workspace_id: crate::Works
     let token = issuer
         .issue_invitation(workspace_id, now_unix_ms() + 60_000)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace_id))
+        .unwrap();
     issuer.redeem_invitation(&claim).unwrap();
 }
 
@@ -66,10 +68,14 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
     let first_token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let first_claim = invitee_a.create_invitation_claim(&first_token).unwrap();
+    let first_claim = invitee_a
+        .create_invitation_claim(&first_token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     issuer.redeem_invitation(&first_claim).unwrap();
     let first = live.next_transition().unwrap().unwrap();
-    assert_eq!(first.epoch(), MembershipEpoch::new(1));
+    // Genesis, the creator's group create and attachment occupy epochs 0..=2;
+    // the invitee's group create is epoch 3 and its admission epoch 4.
+    assert_eq!(first.epoch(), MembershipEpoch::new(4));
     assert_eq!(
         first.version(),
         issuer.membership_version(workspace.id()).unwrap()
@@ -83,7 +89,7 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
             .query_row("SELECT COUNT(*) FROM membership_transitions", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        1
+        4
     );
 
     assert_eq!(
@@ -94,7 +100,7 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
     );
     assert_eq!(
         issuer.membership_snapshot(workspace.id()).unwrap().epoch(),
-        MembershipEpoch::new(1)
+        MembershipEpoch::new(4)
     );
 
     admit(&issuer, &invitee_b, workspace.id());
@@ -103,8 +109,10 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
         .unwrap();
     let second = live.next_transition().unwrap().unwrap();
     let third = live.next_transition().unwrap().unwrap();
-    assert_eq!(second.epoch(), MembershipEpoch::new(2));
-    assert_eq!(third.epoch(), MembershipEpoch::new(3));
+    // The second admission is epoch 6 (after its group create at 5); the
+    // revocation is epoch 7. Group creates cause no transition of their own.
+    assert_eq!(second.epoch(), MembershipEpoch::new(6));
+    assert_eq!(third.epoch(), MembershipEpoch::new(7));
 
     let connection = database(&issuer_directory);
     let rows: i64 = connection
@@ -114,12 +122,12 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
         .unwrap();
     let digest: String = connection
         .query_row(
-            "SELECT lower(hex(snapshot_digest)) FROM membership_transitions WHERE epoch = 3",
+            "SELECT lower(hex(snapshot_digest)) FROM membership_transitions WHERE epoch = 7",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(rows, 3);
+    assert_eq!(rows, 7);
     assert_eq!(digest, third.snapshot_digest().to_string());
     drop(connection);
     drop(live);
@@ -132,21 +140,21 @@ async fn durable_and_live_transitions_resume_in_order_without_startup_duplicates
     let mut from_zero = reopened
         .subscribe_membership(workspace.id(), MembershipEpoch::new(0))
         .unwrap();
-    for epoch in 1..=3 {
+    for epoch in [4, 6, 7] {
         assert_eq!(
             from_zero.next_transition().unwrap().unwrap().epoch(),
             MembershipEpoch::new(epoch)
         );
     }
-    let mut from_two = reopened
-        .subscribe_membership(workspace.id(), MembershipEpoch::new(2))
+    let mut from_six = reopened
+        .subscribe_membership(workspace.id(), MembershipEpoch::new(6))
         .unwrap();
     assert_eq!(
-        from_two.next_transition().unwrap().unwrap().epoch(),
-        MembershipEpoch::new(3)
+        from_six.next_transition().unwrap().unwrap().epoch(),
+        MembershipEpoch::new(7)
     );
 
-    drop(from_two);
+    drop(from_six);
     drop(from_zero);
     reopened.shutdown().await.unwrap();
     drop(reopened);
@@ -175,7 +183,9 @@ async fn listener_registration_racing_a_commit_is_gap_free_and_slow_delivery_is_
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
 
     let subscribing = Arc::clone(&issuer);
     let workspace_id = workspace.id();

@@ -16,5 +16,6 @@ teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
 tokio.workspace = true
 
 [dev-dependencies]
+teamarness-package-contract = { path = "../../../crates/teamarness-package-contract" }
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk", features = ["testing"] }
 tempfile.workspace = true

@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::diag::fault;
 use crate::error::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 15;
+const LATEST_SCHEMA_VERSION: i64 = 18;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_core.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_workspaces_membership.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_invitations.sql");
@@ -20,8 +20,25 @@ const MIGRATION_0013: &str = include_str!("../../migrations/0013_scope_key_deman
 
 const MIGRATION_0014: &str = include_str!("../../migrations/0014_person_names.sql");
 const MIGRATION_0015: &str = include_str!("../../migrations/0015_person_name_edits.sql");
+const MIGRATION_0016: &str = include_str!("../../migrations/0016_membership_action_vocabulary.sql");
+const MIGRATION_0017: &str = include_str!("../../migrations/0017_principals.sql");
+const MIGRATION_0018: &str = include_str!("../../migrations/0018_deferred_principal_names.sql");
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
+    // A batch may rebuild a table that other tables reference (0016 does), and
+    // SQLite can only drop such a table while foreign keys are off. The pragma
+    // cannot change inside a transaction, so it brackets the whole run.
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .map_err(fault!(StorageError::Database))?;
+    let result = apply_batches(connection);
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(fault!(StorageError::Database))?;
+    result
+}
+
+fn apply_batches(connection: &mut Connection) -> Result<(), StorageError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(fault!(StorageError::Database))?;
@@ -106,6 +123,21 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StorageError> {
     if current_version < 15 {
         transaction
             .execute_batch(MIGRATION_0015)
+            .map_err(fault!(StorageError::Migration))?;
+    }
+    if current_version < 16 {
+        transaction
+            .execute_batch(MIGRATION_0016)
+            .map_err(fault!(StorageError::Migration))?;
+    }
+    if current_version < 17 {
+        transaction
+            .execute_batch(MIGRATION_0017)
+            .map_err(fault!(StorageError::Migration))?;
+    }
+    if current_version < 18 {
+        transaction
+            .execute_batch(MIGRATION_0018)
             .map_err(fault!(StorageError::Migration))?;
     }
     transaction

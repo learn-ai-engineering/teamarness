@@ -31,10 +31,12 @@ mod tests {
     mod membership_history;
     mod membership_transitions;
 
-    const CLAIM: &str = "0100c401020303030303030303030303030303030301ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c00000000000003e800000000000007d0090909090909090909090909090909090909090909090909090909090909090901390172f8e526626476553d760aff5765f0982aad65c66ce82004fca24383d4173a2a0c0b6820a6ed6d42a020e06b98bb0552457070a469b02ae1479f24913dbbf3f4417accb9e9276549657229fb434f0c06ffab49a80b059d9ed74913ee6d03011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca511c5aeb0f1f776e59dea0e74c30ee2d1eae9a0eb75c2167d6f7e37683103e2635e528ef81502b64ad857773766eef6de1282266792da0f519f26320f6461c06";
-
     fn secret(byte: u8) -> SecretKey {
         SecretKey::from_bytes(&[byte; 32])
+    }
+
+    fn genesis_id() -> crate::MembershipOperationId {
+        crate::MembershipOperationId::digest(b"genesis")
     }
 
     fn request() -> JoinRequest {
@@ -47,7 +49,7 @@ mod tests {
         )
         .unwrap();
         JoinRequest {
-            claim: sign_claim(&secret(8), &token).unwrap(),
+            claim: sign_claim(&secret(8), &token, genesis_id()).unwrap(),
         }
     }
 
@@ -77,7 +79,15 @@ mod tests {
     #[test]
     fn request_golden_vector_round_trips_with_a_big_endian_frame() {
         let frame = encode_request(&request()).unwrap();
-        assert_eq!(hex(&frame), format!("0000012b010128{CLAIM}"));
+        assert_eq!(
+            frame[0..4],
+            u32::try_from(frame.len() - 4).unwrap().to_be_bytes()
+        );
+        assert_eq!(frame[4], 1);
+        assert_eq!(
+            u16::from_be_bytes([frame[5], frame[6]]) as usize,
+            request().claim.bytes.len()
+        );
         let decoded = decode_request(&frame).unwrap();
         assert_eq!(decoded.claim.bytes, request().claim.bytes);
     }

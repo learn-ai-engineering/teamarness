@@ -242,3 +242,26 @@ fn reports_a_missing_target_and_a_missing_artifact() {
     assert_eq!(error.code, ContractErrorCode::ArtifactMissing);
     assert_eq!(error.rule, "manifest.artifact_missing");
 }
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn activation_policy_is_closed_and_legacy_default_is_eager() {
+    use teamarness_package_contract::manifest::ActivationPolicy;
+    for (patch, policy) in [
+        (json!({}), ActivationPolicy::Eager),
+        (json!({"activation":"eager"}), ActivationPolicy::Eager),
+        (
+            json!({"activation":"on_demand"}),
+            ActivationPolicy::OnDemand,
+        ),
+    ] {
+        let document = parse_manifest(&serde_json::to_vec(&manifest(patch)).unwrap()).unwrap();
+        assert_eq!(document.activation, policy);
+    }
+    for value in [json!(null), json!("lazy"), json!(true), json!("OnDemand")] {
+        assert_eq!(
+            reject(json!({"activation":value})).code,
+            ContractErrorCode::ManifestMalformed
+        );
+    }
+}

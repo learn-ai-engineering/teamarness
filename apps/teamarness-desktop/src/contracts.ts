@@ -15,6 +15,9 @@ export type MemberRole = "member" | "manager";
 export type Member = Readonly<{
   identity: string;
   role: MemberRole;
+  principalId: string;
+  kind: "person" | "agent";
+  stewardPrincipalId: string | null;
 }>;
 
 export type Membership = Readonly<{
@@ -24,17 +27,19 @@ export type Membership = Readonly<{
   members: readonly Member[];
 }>;
 
-export type WorkspacePerson = Readonly<{
-  identity: string;
-  personId: string;
+export type WorkspacePrincipal = Readonly<{
+  principalId: string;
+  kind: "person" | "agent";
+  stewardPrincipalId: string | null;
+  keys: readonly string[];
   name: string | null;
   fingerprint: string;
 }>;
 
-export type PersonNameSnapshot = Readonly<{
+export type PrincipalsSnapshot = Readonly<{
   workspaceId: string;
   cursor: string;
-  persons: readonly WorkspacePerson[];
+  principals: readonly WorkspacePrincipal[];
 }>;
 
 export type WorkspaceState = Readonly<{
@@ -60,7 +65,9 @@ export type BridgeErrorCode =
   | "admission_no_longer_current"
   | "uncertain_storage_outcome"
   | "package_reconciliation"
-  | "shutdown";
+  | "shutdown"
+  | "not_steward"
+  | "principal_not_bound";
 
 export type BridgeError = Readonly<{
   code: BridgeErrorCode;

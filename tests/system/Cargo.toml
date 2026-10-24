@@ -17,12 +17,17 @@ publish = false
 name = "conversations-backend-under-test"
 path = "../../packages/conversations-package/backend/src/main.rs"
 
+[[bin]]
+name = "conversations-port-consumer-under-test"
+path = "src/bin/conversations_port_consumer.rs"
+
 [dependencies]
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
+teamarness-package-sdk = { path = "../../crates/teamarness-package-sdk" }
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 sha2.workspace = true
 # `test-hooks` is what binds an Installation's Iroh endpoint to loopback, so
 # the default suite reaches no public relay. It is a dev-dependency: the

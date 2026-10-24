@@ -146,43 +146,43 @@ fn code(temp: &TempDir) -> teamarness_package_host::PackageErrorCode {
 }
 
 #[test]
-fn reserved_person_name_identity_cannot_be_selected_by_manifest() {
+fn reserved_principal_identity_cannot_be_selected_by_manifest() {
     let temp = valid_package();
     write_manifest(
         &temp,
-        serde_json::json!({"identity": "internal:teamarness.person-names"}),
+        serde_json::json!({"identity": "internal:teamarness.principals"}),
     );
     assert_eq!(code(&temp), PackageErrorCode::InvalidPackageIdentity);
     assert!(
         !teamarness_package_contract::identity::is_valid_package_identity(
-            "internal:teamarness.person-names"
+            "internal:teamarness.principals"
         )
     );
     assert!(
-        "internal:teamarness.person-names"
+        "internal:teamarness.principals"
             .parse::<PackageIdentity>()
             .is_err()
     );
     assert!(
         teamarness_package_contract::identity::is_valid_package_identity(
-            "internal.teamarness.person-names"
+            "internal.teamarness.principals"
         )
     );
     assert!(
-        "internal.teamarness.person-names"
+        "internal.teamarness.principals"
             .parse::<PackageIdentity>()
             .is_ok()
     );
     write_manifest(
         &temp,
-        serde_json::json!({"identity": "internal.teamarness.person-names"}),
+        serde_json::json!({"identity": "internal.teamarness.principals"}),
     );
     assert_eq!(
         manifest::load(temp.path(), "aarch64-apple-darwin")
             .unwrap()
             .identity
             .as_str(),
-        "internal.teamarness.person-names"
+        "internal.teamarness.principals"
     );
 }
 
@@ -468,4 +468,154 @@ fn restricted_contract_rejects_remote_executable_and_recursive_schemas() {
         )
         .is_ok()
     );
+}
+
+// Verifies: TEAM.SYS.PKG-R12
+#[test]
+fn port_declarations_are_loaded_with_schema_metadata_and_digest_checks() {
+    let temp = valid_package();
+    let bytes = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/package-ports/v1/fixtures/version-1-0.json"
+    ))
+    .unwrap();
+    fs::write(temp.path().join("ports.json"), &bytes).unwrap();
+    let consume = serde_json::json!([{"identity":"dev.example.conversations","major":1,"minMinor":0,"maxMinor":1,"ports":[{"name":"conversation.list","kind":"query"}]}]);
+    write_manifest(
+        &temp,
+        serde_json::json!({"portContract":{"path":"ports.json","sha256":digest(&bytes)},"consumedPorts":consume}),
+    );
+    let loaded = manifest::load(temp.path(), "aarch64-apple-darwin").unwrap();
+    assert_eq!(
+        loaded.port_contract.as_ref().unwrap().contracts[0]
+            .ports
+            .len(),
+        3
+    );
+    assert!(
+        loaded.port_contract.as_ref().unwrap().contracts[0].ports[0]
+            .request
+            .is_some()
+    );
+    assert_eq!(loaded.consumed_ports[0].ports[0].name, "conversation.list");
+    assert_eq!(
+        loaded.port_contract_digest.as_deref(),
+        Some(digest(&bytes).as_str())
+    );
+
+    fs::write(temp.path().join("ports.json"), b"{}").unwrap();
+    assert_eq!(code(&temp), PackageErrorCode::ArtifactChanged);
+    fs::write(temp.path().join("ports.json"), &bytes).unwrap();
+    write_manifest(
+        &temp,
+        serde_json::json!({"portContract":{"path":"ui/contract.json","sha256":digest(&bytes)}}),
+    );
+    assert_eq!(code(&temp), PackageErrorCode::ManifestMalformed);
+    write_manifest(
+        &temp,
+        serde_json::json!({"consumedPorts":[{"identity":"dev.example.conversations","major":1,"minMinor":0,"maxMinor":0,"ports":[{"name":"conversation.list","kind":"query"},{"name":"conversation.list","kind":"command"}]}]}),
+    );
+    assert_eq!(code(&temp), PackageErrorCode::ManifestMalformed);
+}
+
+// Verifies: TEAM.SYS.PKG-R12
+#[tokio::test]
+async fn authoring_catalog_is_static_complete_and_absent_from_ui_snapshot() {
+    use std::sync::Arc;
+    use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+    use teamarness_package_host::{
+        InstallationPublicIdentity, PackageHost, PackageHostCommand, PackageHostConfig,
+        ShutdownHost,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let application = root.path().join("application");
+    let private = root.path().join("private");
+    fs::create_dir(&application).unwrap();
+    fs::create_dir(&private).unwrap();
+    let temp = valid_package();
+    let mut document: serde_json::Value = serde_json::from_slice(
+        &fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/package-ports/v1/fixtures/version-1-0.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    document["$defs"]["message"] = serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false});
+    document["contracts"][0]["ports"][0]["request"] = serde_json::json!({"$ref":"#/$defs/message"});
+    let bytes = serde_json::to_vec(&document).unwrap();
+    fs::write(temp.path().join("ports.json"), &bytes).unwrap();
+    write_manifest(
+        &temp,
+        serde_json::json!({"portContract":{"path":"ports.json","sha256":digest(&bytes)},"consumedPorts":[{"identity":"dev.example.conversations","major":1,"minMinor":0,"maxMinor":1,"required":false,"ports":[{"name":"conversation.list","kind":"query"}]}]}),
+    );
+    fs::rename(temp.path(), application.join("one")).unwrap();
+    let index = application.join("application-packages.v1.json");
+    fs::write(
+        &index,
+        br#"{"schemaVersion":1,"packages":[{"directory":"one"}]}"#,
+    )
+    .unwrap();
+    let core = Arc::new(
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
+            .await
+            .unwrap(),
+    );
+    let installation = InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap();
+    let host = PackageHost::open(
+        PackageHostConfig::new(&application, &index, &private, installation),
+        core,
+    )
+    .await
+    .unwrap();
+    let catalog = host.authoring_catalog();
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].provided[0].ports.len(), 3);
+    assert_eq!(catalog[0].definitions["message"]["type"], "object");
+    assert!(catalog[0].provided[0].ports[0].request.is_some());
+    let catalog_json = serde_json::to_value(&catalog).unwrap();
+    assert_eq!(
+        catalog_json[0]["provided"][0]["ports"][0]["request"]["$ref"],
+        "#/$defs/message"
+    );
+    assert_eq!(catalog[0].consumed[0].ports[0].name, "conversation.list");
+    assert_eq!(host.snapshot().await.packages.len(), 1);
+    let snapshot_json = serde_json::to_string(&host.snapshot().await).unwrap();
+    assert!(!snapshot_json.contains("conversation.send"));
+    host.execute(PackageHostCommand::Shutdown(ShutdownHost {}))
+        .await
+        .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R12
+#[test]
+fn port_file_symlink_oversize_and_invalid_schema_fail_locally() {
+    let temp = valid_package();
+    let bytes = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/package-ports/v1/fixtures/version-1-0.json"
+    ))
+    .unwrap();
+    fs::write(temp.path().join("ports.json"), &bytes).unwrap();
+    write_manifest(
+        &temp,
+        serde_json::json!({"portContract":{"path":"ports.json","sha256":digest(&bytes)}}),
+    );
+    fs::remove_file(temp.path().join("ports.json")).unwrap();
+    symlink("ui/contract.json", temp.path().join("ports.json")).unwrap();
+    assert_eq!(code(&temp), PackageErrorCode::PortContractViolation);
+    fs::remove_file(temp.path().join("ports.json")).unwrap();
+    fs::write(temp.path().join("ports.json"), vec![b' '; 1024 * 1024 + 1]).unwrap();
+    assert_eq!(code(&temp), PackageErrorCode::PortContractViolation);
+    let mut invalid: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    invalid["contracts"][0]["ports"][0]["request"] =
+        serde_json::json!({"$ref":"https://example.com/invalid"});
+    let invalid = serde_json::to_vec(&invalid).unwrap();
+    fs::write(temp.path().join("ports.json"), &invalid).unwrap();
+    write_manifest(
+        &temp,
+        serde_json::json!({"portContract":{"path":"ports.json","sha256":digest(&invalid)}}),
+    );
+    assert_eq!(code(&temp), PackageErrorCode::PortContractViolation);
 }

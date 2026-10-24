@@ -1,7 +1,7 @@
-# 0025 — A durable body edit may be unapplied on one Installation
+# 0029 — A durable body edit may be unapplied on one Installation
 
 **Status:** accepted (2026-10-23)
-**Refines:** ADR 0023 (Documents body import and invalid-history presentation), ADR 0024 (Package checks after qualified local replay).
+**Refines:** ADR 0027 (Documents body import and invalid-history presentation), ADR 0028 (Package checks after qualified local replay).
 
 ## Context
 

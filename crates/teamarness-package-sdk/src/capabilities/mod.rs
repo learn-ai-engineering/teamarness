@@ -6,7 +6,7 @@
 //! half-decoded value.
 
 pub mod membership;
-pub mod person_names;
+pub mod principals;
 pub mod record_log;
 pub mod signing;
 pub mod workspace_context;

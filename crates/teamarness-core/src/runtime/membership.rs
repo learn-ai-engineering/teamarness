@@ -56,11 +56,19 @@ impl CoreRuntime {
         if !current.contains_member(member) {
             return Err(MembershipError::MemberNotFound);
         }
+        // Revocation removes the Person's key group. An Agent key has no group
+        // of its own; its removal is a Person-group action (Phase 3).
+        let group = current
+            .person_group(member)
+            .ok_or(MembershipError::UnknownPersonGroup)?;
         let envelope = crate::membership::MembershipEnvelope::sign(
             secret_key,
             workspace_id,
             now_unix_ms,
-            crate::membership::MembershipAction::Revoke { target: member },
+            crate::membership::MembershipAction::Revoke {
+                target: member,
+                group,
+            },
             current.heads(),
         )?;
         match crate::membership::projection::apply_canonical_with_limits(

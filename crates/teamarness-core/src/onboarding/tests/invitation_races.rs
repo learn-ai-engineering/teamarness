@@ -43,7 +43,9 @@ async fn concurrent_exact_redemption_recovers_one_shared_admission() {
     let token = issuer
         .issue_invitation(workspace.id(), now_unix_ms() + 60_000)
         .unwrap();
-    let claim = invitee.create_invitation_claim(&token).unwrap();
+    let claim = invitee
+        .create_invitation_claim(&token, issuer.genesis_id_for_test(workspace.id()))
+        .unwrap();
     let other_issuer = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
     let barrier = Arc::new(Barrier::new(2));
 
@@ -82,9 +84,9 @@ async fn concurrent_exact_redemption_recovers_one_shared_admission() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts, (1, 1, 1));
+    assert_eq!(counts, (1, 1, 4));
     let transition = results.into_iter().next().unwrap().unwrap();
-    assert_eq!(transition.epoch(), MembershipEpoch::new(1));
+    assert_eq!(transition.epoch(), MembershipEpoch::new(4));
 
     drop(connection);
     issuer.shutdown().await.unwrap();

@@ -982,6 +982,12 @@ fn terminal_of(frame: &Frame) -> Result<JsonValue, BackendError> {
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false),
             frame.field("details").cloned().unwrap_or_else(empty),
+        )
+        .with_outcome_uncertain(
+            frame
+                .field("outcomeUncertain")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
         ))
     }
 }

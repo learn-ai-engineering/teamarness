@@ -14,6 +14,7 @@ pub mod error;
 pub mod identity;
 pub mod json;
 pub mod manifest;
+pub mod port_contract;
 pub mod smoke;
 pub mod ui_contract;
 

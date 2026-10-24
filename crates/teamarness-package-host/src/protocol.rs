@@ -30,6 +30,9 @@ const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
 /// bounds the count, so a budget derived from anything else would refuse an
 /// event the classifier had already admitted.
 const UI_EVENT_BYTES: usize = INITIAL_STREAM_CREDIT * MAX_UI_PAYLOAD_BYTES;
+// The fixed transport envelope adds only its field names and punctuation to a Port value.
+const PORT_ENVELOPE_OVERHEAD: usize =
+    r#"{"$teamarnessPortEnvelope":1,"$teamarnessPortValue":}"#.len();
 
 /// Events the Shell acknowledges with one `ack`.
 ///
@@ -185,8 +188,25 @@ pub(crate) struct UiEventRoute {
     terminal: watch::Sender<Option<StreamEnd>>,
     bytes: Arc<Semaphore>,
     state: Mutex<UiEventRouteState>,
-    contract: Arc<AdmittedUi>,
+    contract: EventContract,
     operation: String,
+}
+
+enum EventContract {
+    Ui(Arc<AdmittedUi>),
+    Port {
+        schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        contract: String,
+    },
+}
+
+pub(crate) struct PortQueryStream {
+    pub(crate) generation: u64,
+    pub(crate) receiver: UiEventReceiver,
+    pub(crate) client: ProcessClient,
+    pub(crate) id: String,
+    pub(crate) _route: Box<dyn Send + Sync>,
+    pub(crate) _provider: OwnedSemaphorePermit,
 }
 
 /// What the route owes its subscriber, and nothing about the wire.
@@ -209,7 +229,9 @@ impl UiEventReceiver {
             let terminal = self.terminal.borrow().clone();
             if let Some(end) = terminal {
                 // A Package-owned end, like a completion, drains what the Package already sent.
-                if matches!(end, StreamEnd::Completed | StreamEnd::Package(_)) {
+                if matches!(end, StreamEnd::Completed | StreamEnd::Package(_))
+                    || matches!(self.route.contract, EventContract::Port { .. })
+                {
                     match self.events.try_recv() {
                         Ok(event) => {
                             self.route.mark_delivered(event.sequence).await;
@@ -241,13 +263,30 @@ impl UiEventReceiver {
 }
 
 impl UiEventRoute {
+    fn new_port(
+        schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        contract: String,
+        operation: String,
+    ) -> (Arc<Self>, UiEventReceiver) {
+        Self::new_internal(EventContract::Port { schemas, contract }, operation)
+    }
+
     fn new(contract: Arc<AdmittedUi>, operation: String) -> (Arc<Self>, UiEventReceiver) {
+        Self::new_internal(EventContract::Ui(contract), operation)
+    }
+
+    fn new_internal(contract: EventContract, operation: String) -> (Arc<Self>, UiEventReceiver) {
         let (events, receiver) = mpsc::channel(UI_EVENT_CAPACITY);
         let (terminal, terminal_receiver) = watch::channel(None);
+        let port_overhead = if matches!(&contract, EventContract::Port { .. }) {
+            INITIAL_STREAM_CREDIT * PORT_ENVELOPE_OVERHEAD
+        } else {
+            0
+        };
         let route = Arc::new(Self {
             events,
             terminal,
-            bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES)),
+            bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES + port_overhead)),
             state: Mutex::new(UiEventRouteState {
                 highest_delivered: 0,
                 highest_acknowledged: 0,
@@ -275,16 +314,39 @@ impl UiEventRoute {
     /// byte budget both hold the whole credit window, and credit returns only
     /// for an event the subscriber has acknowledged.
     fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
-        let payload: PackageValue =
-            serde_json::from_value(value).map_err(|_| PackageErrorCode::UiContractViolation)?;
-        self.contract
-            .contract
-            .validate_event(&self.operation, &payload)
+        let payload: PackageValue = serde_json::from_value(value.clone())
             .map_err(|_| PackageErrorCode::UiContractViolation)?;
+        match &self.contract {
+            EventContract::Ui(contract) => contract
+                .contract
+                .validate_event(&self.operation, &payload)
+                .map_err(|_| PackageErrorCode::UiContractViolation)?,
+            EventContract::Port { schemas, contract } => schemas
+                .validate(
+                    contract,
+                    &self.operation,
+                    "event",
+                    decode_port_value(&value),
+                )
+                .map_err(|_| PackageErrorCode::PortEventInvalid)?,
+        }
         let encoded =
             serde_json::to_vec(&payload).map_err(|_| PackageErrorCode::UiContractViolation)?;
-        if encoded.len() > MAX_UI_PAYLOAD_BYTES {
-            return Err(PackageErrorCode::UiContractViolation);
+        let (logical_bytes, wire_limit) = if matches!(&self.contract, EventContract::Port { .. }) {
+            (
+                serde_json::to_vec(decode_port_value(&value))
+                    .map_err(|_| PackageErrorCode::PortEventInvalid)?
+                    .len(),
+                MAX_UI_PAYLOAD_BYTES + PORT_ENVELOPE_OVERHEAD,
+            )
+        } else {
+            (encoded.len(), MAX_UI_PAYLOAD_BYTES)
+        };
+        if logical_bytes > MAX_UI_PAYLOAD_BYTES || encoded.len() > wire_limit {
+            return Err(match &self.contract {
+                EventContract::Ui(_) => PackageErrorCode::UiContractViolation,
+                EventContract::Port { .. } => PackageErrorCode::PortEventInvalid,
+            });
         }
         let permits =
             u32::try_from(encoded.len()).map_err(|_| PackageErrorCode::UiContractViolation)?;
@@ -638,10 +700,11 @@ impl Writer {
 }
 
 /// A failed capability call, and whether its state change may still land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapabilityFailure {
     pub(crate) code: PackageErrorCode,
     pub(crate) outcome_uncertain: bool,
+    pub(crate) package_error: Option<PackageOwnedError>,
 }
 
 impl CapabilityFailure {
@@ -649,6 +712,7 @@ impl CapabilityFailure {
         Self {
             code,
             outcome_uncertain: false,
+            package_error: None,
         }
     }
 }
@@ -671,6 +735,7 @@ pub(crate) trait CapabilityHandler: Send + Sync {
         grant: Option<&'a str>,
         payload: &'a Value,
         started: Arc<std::sync::atomic::AtomicBool>,
+        consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     >;
@@ -712,6 +777,7 @@ impl CapabilityHandler for RejectCapabilities {
         _grant: Option<&'a str>,
         _payload: &'a Value,
         _started: Arc<std::sync::atomic::AtomicBool>,
+        _consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
@@ -871,6 +937,26 @@ async fn writer_task<W>(
     }
 }
 
+struct PendingStreamOpen {
+    task: tokio::task::JoinHandle<()>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct PendingStreamOpens(BTreeMap<String, PendingStreamOpen>);
+
+impl Drop for PendingStreamOpens {
+    fn drop(&mut self) {
+        // Provider activation is not cancellation-safe: an open already in
+        // lifecycle startup must settle and reap/register its child. Its task
+        // owns a permit and closes any route it creates after this reader ends.
+        for open in self.0.values() {
+            open.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reader_task<R>(
     mut input: R,
@@ -888,6 +974,8 @@ async fn reader_task<R>(
     R: AsyncRead + Unpin,
 {
     let mut initialized = Some(initialized);
+    let mut opening_streams = PendingStreamOpens::default();
+    let pending_open_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_EACH_DIRECTION));
     loop {
         let frame = match read_frame(&mut input).await {
             Ok(frame) => frame,
@@ -898,6 +986,9 @@ async fn reader_task<R>(
                 return;
             }
         };
+        // Completed opens no longer need an abort handle. Live pending opens are
+        // bounded by the process stream classifier; a close aborts its own task.
+        opening_streams.0.retain(|_, open| !open.task.is_finished());
         // One classifier, before every branch. There is no side of `observe` on
         // which an adapter can hold its own idea of which races are tolerable,
         // and no frame kind that reaches its adapter without being classified.
@@ -981,7 +1072,7 @@ async fn reader_task<R>(
                     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let result = tokio::time::timeout(
                         limits.capability_call,
-                        capabilities.call(grant.as_deref(), &payload, started.clone()),
+                        capabilities.call(grant.as_deref(), &payload, started.clone(), &id),
                     )
                     .await
                     .unwrap_or_else(|_| {
@@ -990,8 +1081,15 @@ async fn reader_task<R>(
                             // A state-changing call whose Core work had already
                             // begun may still commit. `append` is content
                             // idempotent, so the Package can retry it.
-                            outcome_uncertain: method == "append"
-                                && started.load(std::sync::atomic::Ordering::Acquire),
+                            outcome_uncertain: (method == "invoke"
+                                && payload.get("kind").and_then(Value::as_str)
+                                    == Some("command"))
+                                // Port work may own a detached task that can dispatch
+                                // *after* this outer timeout. Without a fence, a
+                                // certain timeout would invite a duplicate write.
+                                || (method == "append"
+                                    && started.load(std::sync::atomic::Ordering::Acquire)),
+                            package_error: None,
                         })
                     });
                     let response = match result {
@@ -999,7 +1097,10 @@ async fn reader_task<R>(
                         Err(failure) => {
                             let mut details = json!({
                                 "kind":"error", "id":id,
-                                "code":capability_code(failure.code),
+                                "code":if failure.outcome_uncertain && method == "invoke"
+                                    && failure.code == PackageErrorCode::DeadlineExceeded {
+                                    "outcome_unknown"
+                                } else { capability_code(failure.code) },
                                 "retryable":matches!(
                                     failure.code,
                                     PackageErrorCode::Overloaded
@@ -1007,20 +1108,32 @@ async fn reader_task<R>(
                                 ),
                                 "details":{}
                             });
+                            if let Some(provider) = failure.package_error
+                                && let Some(object) = details.as_object_mut()
+                            {
+                                object.insert("details".to_owned(), json!({"provider":provider}));
+                            }
                             if failure.outcome_uncertain
                                 && let Some(object) = details.as_object_mut()
                             {
                                 object.insert("outcomeUncertain".to_owned(), Value::Bool(true));
+                                if method == "invoke" {
+                                    object.insert("retryable".to_owned(), Value::Bool(false));
+                                }
                             }
                             details
                         }
                     };
                     // The answer waits for control-lane capacity: a congested
-                    // lane is backpressure, and dropping the answer would leave
-                    // this request with no terminal frame at all. Congestion
-                    // that outlasts the call deadline is answered for that one
-                    // request id with a typed retryable error, never by tearing
-                    // the generation down.
+                    // Lane congestion may replace the computed answer. Preserve
+                    // uncertainty if the Provider already accepted a command.
+                    let accepted_command = method == "invoke"
+                        && payload.get("kind").and_then(Value::as_str) == Some("command")
+                        && (started.load(std::sync::atomic::Ordering::Acquire)
+                            || response
+                                .get("outcomeUncertain")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false));
                     let delivered = match tokio::time::timeout(
                         limits.capability_call,
                         writer.send_waiting(response, true),
@@ -1032,10 +1145,17 @@ async fn reader_task<R>(
                     };
                     if let Err(wire) = delivered {
                         if wire.code == PackageErrorCode::Overloaded {
-                            let overloaded = json!({
-                                "kind":"error", "id":answered, "code":"overloaded",
-                                "retryable":true, "details":{}
-                            });
+                            let overloaded = if accepted_command {
+                                json!({
+                                    "kind":"error", "id":answered, "code":"outcome_unknown",
+                                    "retryable":false, "outcomeUncertain":true, "details":{}
+                                })
+                            } else {
+                                json!({
+                                    "kind":"error", "id":answered, "code":"overloaded",
+                                    "retryable":true, "details":{}
+                                })
+                            };
                             // The typed error is still this request's one
                             // terminal frame, so it is owed. It goes on the
                             // reserve rather than on the budget the answer it
@@ -1053,6 +1173,11 @@ async fn reader_task<R>(
                     }
                 });
             }
+            FrameKind::Cancel => {
+                // The classifier retired the caller's wait. Port dispatch has its own task and
+                // keeps the request/byte permits until Provider work ends; no command is replayed.
+                // A late answer is ignored by the classifier on both peers.
+            }
             FrameKind::StreamOpen => {
                 let Some(id) = frame.field("id").and_then(Value::as_str).map(str::to_owned) else {
                     let _ = failure.send(Some(PackageErrorCode::MalformedFrame));
@@ -1061,37 +1186,68 @@ async fn reader_task<R>(
                 let topic = frame
                     .field("topic")
                     .and_then(Value::as_str)
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .to_owned();
                 let initial_credit = frame
                     .field("initialCredit")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
                 let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
-                if let Err(code) = capabilities
-                    .open_stream(
-                        id.clone(),
-                        topic,
-                        initial_credit,
-                        &payload,
-                        HostStreamSender {
-                            writer: writer.clone(),
-                            state: state.clone(),
-                        },
-                    )
-                    .await
-                {
-                    let response = json!({
-                        "kind":"stream_close", "streamId":id,
-                        "code":capability_code(code)
-                    });
-                    // The Package is waiting for this stream to end, so the
-                    // rejection waits for lane capacity rather than being
-                    // dropped with the generation reported as exited.
-                    if writer.send_waiting(response, true).await.is_err() {
+                let Ok(slot) = pending_open_slots.clone().try_acquire_owned() else {
+                    // The classifier accepts distinct stream IDs without a
+                    // per-process count ceiling. Refuse excess adapter work
+                    // without waiting on a slow Provider from the reader.
+                    if writer
+                        .control(json!({
+                            "kind":"stream_close", "streamId":id, "code":"overloaded"
+                        }))
+                        .await
+                        .is_err()
+                    {
                         let _ = failure.send(Some(PackageErrorCode::ProcessExited));
                         return;
                     }
-                }
+                    continue;
+                };
+                let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let task_closed = closed.clone();
+                let handler = capabilities.clone();
+                let task_writer = writer.clone();
+                let task_state = state.clone();
+                let task_failure = failure.clone();
+                let stream_id = id.clone();
+                // Provider activation and stream setup can wait much longer than
+                // this Consumer's health probe. The classified open owns one
+                // bounded stream task, never the process reader.
+                let task = tokio::spawn(async move {
+                    let _slot = slot;
+                    let result = handler
+                        .open_stream(
+                            stream_id.clone(),
+                            &topic,
+                            initial_credit,
+                            &payload,
+                            HostStreamSender {
+                                writer: task_writer.clone(),
+                                state: task_state,
+                            },
+                        )
+                        .await;
+                    if task_closed.load(std::sync::atomic::Ordering::Acquire) {
+                        handler.close_stream(&stream_id).await;
+                    } else if let Err(code) = result {
+                        let response = json!({
+                            "kind":"stream_close", "streamId":stream_id,
+                            "code":capability_code(code)
+                        });
+                        if task_writer.send_waiting(response, true).await.is_err() {
+                            let _ = task_failure.send(Some(PackageErrorCode::ProcessExited));
+                        }
+                    }
+                });
+                opening_streams
+                    .0
+                    .insert(id, PendingStreamOpen { task, closed });
             }
             FrameKind::Credit => {
                 let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
@@ -1115,6 +1271,13 @@ async fn reader_task<R>(
                 if let Some(route) = ui_event_routes.lock().await.remove(stream_id) {
                     route.terminate(stream_end(&frame));
                 } else {
+                    if let Some(open) = opening_streams.0.remove(stream_id) {
+                        // A close does not cancel Provider activation. If the
+                        // open registers a route later, its owned task closes
+                        // it after startup settles. Its permit remains held.
+                        open.closed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                     capabilities.close_stream(stream_id).await;
                 }
             }
@@ -1238,16 +1401,47 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
     match code {
         PackageErrorCode::UiContractViolation => "ui_contract_violation",
         PackageErrorCode::EventLagged => "event_lagged",
+        PackageErrorCode::PortEventInvalid => "port_event_invalid",
         _ => "protocol_violation",
     }
 }
 
-fn capability_code(code: PackageErrorCode) -> &'static str {
+// Process 1.0 requires object payloads. Escape the reserved envelope shape
+// itself as well as non-object Port values, so decoding changes no valid value.
+pub(crate) fn encode_port_value(value: Value) -> Value {
+    if value.is_object() && port_value_content(&value).is_none() {
+        value
+    } else {
+        json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value})
+    }
+}
+
+fn port_value_content(value: &Value) -> Option<&Value> {
+    let fields = value.as_object()?;
+    (fields.len() == 2 && fields.get("$teamarnessPortEnvelope") == Some(&Value::from(1)))
+        .then(|| fields.get("$teamarnessPortValue"))
+        .flatten()
+}
+
+pub(crate) fn decode_port_value(value: &Value) -> &Value {
+    port_value_content(value).unwrap_or(value)
+}
+
+pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
     match code {
         PackageErrorCode::CapabilityUnavailable => "capability_unavailable",
         PackageErrorCode::CapabilityVersionUnsupported => "capability_version_unsupported",
         PackageErrorCode::DeadlineExceeded => "deadline_exceeded",
         PackageErrorCode::Overloaded => "overloaded",
+        PackageErrorCode::PortUnavailable => "port_unavailable",
+        PackageErrorCode::PortUngranted => "ungranted_port",
+        PackageErrorCode::PortRequestInvalid => "port_request_invalid",
+        PackageErrorCode::PortResponseInvalid => "port_response_invalid",
+        PackageErrorCode::PortEventInvalid => "port_event_invalid",
+        PackageErrorCode::OutcomeUncertain => "outcome_unknown",
+        PackageErrorCode::ProcessExited => "provider_exited",
+        PackageErrorCode::BackendError => "provider_error",
+        PackageErrorCode::PrincipalNotBound => "principal_not_bound",
         _ => "capability_request_invalid",
     }
 }
@@ -1264,6 +1458,35 @@ fn protocol_code(error: teamarness_package_protocol::ProtocolError) -> PackageEr
 }
 
 impl ProcessClient {
+    pub(crate) async fn open_port_stream(
+        &self,
+        id: String,
+        topic: &str,
+        payload: PackageValue,
+        schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+        contract: String,
+        port: String,
+    ) -> Result<UiEventReceiver, WireFailure> {
+        let (route, receiver) = UiEventRoute::new_port(schemas, contract, port);
+        self.ui_event_routes
+            .lock()
+            .await
+            .insert(id.clone(), route.clone());
+        if let Err(error) = self
+            .writer
+            .control(json!({
+                "kind":"stream_open", "id":id, "topic":topic,
+                "initialCredit":INITIAL_STREAM_CREDIT, "payload":package_value_to_json(payload)
+            }))
+            .await
+        {
+            self.ui_event_routes.lock().await.remove(&id);
+            route.terminate(StreamEnd::Host(error.code));
+            return Err(error);
+        }
+        Ok(receiver)
+    }
+
     pub(crate) async fn initialize(&self, value: Value) -> Result<Frame, WireFailure> {
         self.writer.control(value).await?;
         let receiver = self
@@ -1287,6 +1510,73 @@ impl ProcessClient {
         deadline: Duration,
         state_changing: bool,
     ) -> Result<Value, WireFailure> {
+        self.request_inner(
+            id,
+            operation,
+            mount,
+            payload,
+            deadline,
+            state_changing,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_observed(
+        &self,
+        id: String,
+        operation: &str,
+        payload: PackageValue,
+        on_dispatch: Box<dyn FnOnce() + Send>,
+    ) -> Result<Value, WireFailure> {
+        self.request_inner(
+            id,
+            operation,
+            None,
+            payload,
+            Duration::from_secs(8),
+            false,
+            None,
+            Some(on_dispatch),
+        )
+        .await
+    }
+
+    pub(crate) async fn request_port(
+        &self,
+        id: String,
+        operation: &str,
+        payload: PackageValue,
+        dispatched: Arc<std::sync::atomic::AtomicBool>,
+        on_dispatch: Box<dyn FnOnce() + Send>,
+    ) -> Result<Value, WireFailure> {
+        self.request_inner(
+            id,
+            operation,
+            None,
+            payload,
+            Duration::from_secs(8),
+            true,
+            Some(dispatched),
+            Some(on_dispatch),
+        )
+        .await
+    }
+
+    // The legacy mount request and a port call share one writer-acceptance boundary.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_inner(
+        &self,
+        id: String,
+        operation: &str,
+        mount: Option<&str>,
+        payload: PackageValue,
+        deadline: Duration,
+        state_changing: bool,
+        dispatched: Option<Arc<std::sync::atomic::AtomicBool>>,
+        on_dispatch: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Value, WireFailure> {
         if self.pending.lock().await.len() >= MAX_IN_FLIGHT_EACH_DIRECTION {
             return Err(WireFailure::new(PackageErrorCode::Overloaded));
         }
@@ -1306,14 +1596,49 @@ impl ProcessClient {
         if let Some(mount) = mount {
             value["mountId"] = Value::String(mount.to_owned());
         }
-        self.writer.data(value).await?;
+        if let Err(error) = self.writer.data(value).await {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        if let Some(dispatched) = dispatched {
+            dispatched.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(on_dispatch) = on_dispatch {
+            on_dispatch();
+        }
         match tokio::time::timeout(deadline, &mut receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(WireFailure::new(PackageErrorCode::ProcessExited)),
+            Ok(Ok(result)) => result.map_err(|mut error| {
+                if state_changing
+                    && !matches!(
+                        error.code,
+                        PackageErrorCode::BackendError | PackageErrorCode::Overloaded
+                    )
+                {
+                    error.outcome_uncertain = true;
+                }
+                error
+            }),
+            Ok(Err(_)) => {
+                let mut error = WireFailure::new(PackageErrorCode::ProcessExited);
+                error.outcome_uncertain = state_changing;
+                Err(error)
+            }
             Err(_) => {
-                self.send_cancel(&id).await?;
+                if let Err(mut error) = self.send_cancel(&id).await {
+                    // The command crossed the writer before cancellation failed. Retire
+                    // its id and do not claim that the failed cancel undid its effect.
+                    self.state.lock().await.retire_request(&id);
+                    self.pending.lock().await.remove(&id);
+                    error.outcome_uncertain |= state_changing;
+                    return Err(error);
+                }
                 match tokio::time::timeout(Duration::from_millis(500), &mut receiver).await {
-                    Ok(Ok(result)) => result,
+                    Ok(Ok(result)) => result.map_err(|mut error| {
+                        // Even a Provider-owned or overloaded error arriving after the
+                        // deadline cannot prove that a dispatched command did not commit.
+                        error.outcome_uncertain |= state_changing;
+                        error
+                    }),
                     _ => {
                         // Retire before the adapter entry goes, in that order
                         // and for the same reason as `cancel`: between the two
@@ -1575,6 +1900,145 @@ mod tests {
         );
     }
 
+    /// A late cancellation acknowledgement does not undo an accepted command.
+    #[tokio::test]
+    async fn timed_out_command_with_grace_error_is_uncertain() {
+        let (input, _peer) = tokio::io::duplex(64);
+        let client = start(input, tokio::io::sink());
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_inner(
+                        "h:late-command".into(),
+                        "teamarness.port.command.v1",
+                        None,
+                        crate::PackageValue::Object(Default::default()),
+                        Duration::from_millis(20),
+                        true,
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        // The injected terminal arrives after the request deadline, inside the
+        // explicit 500 ms cancellation grace. This delay tests that timing edge.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let sender = client
+            .pending
+            .lock()
+            .await
+            .remove("h:late-command")
+            .expect("the dispatched request is still awaiting grace");
+        sender
+            .send(Err(WireFailure::new(PackageErrorCode::Cancelled)))
+            .expect("the request is still waiting");
+        let failure = request.await.unwrap().unwrap_err();
+        assert_eq!(failure.code, PackageErrorCode::Cancelled);
+        assert!(failure.outcome_uncertain);
+    }
+
+    #[tokio::test]
+    async fn refused_cancel_after_command_dispatch_is_uncertain_and_retires_id() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (input, _peer) = tokio::io::duplex(64);
+        let client = start(input, tokio::io::sink());
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let request = tokio::spawn({
+            let client = client.clone();
+            let dispatched = dispatched.clone();
+            async move {
+                client
+                    .request_inner(
+                        "h:cancel-refused".into(),
+                        "teamarness.port.command.v1",
+                        None,
+                        crate::PackageValue::Object(Default::default()),
+                        Duration::from_millis(100),
+                        true,
+                        Some(dispatched),
+                        None,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !dispatched.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer accepted the command");
+        let _block = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .writer
+                .data_bytes
+                .clone()
+                .acquire_many_owned(super::DATA_BYTES as u32),
+        )
+        .await
+        .expect("writer releases accepted request bytes")
+        .unwrap();
+        let failure = request.await.unwrap().unwrap_err();
+        assert_eq!(failure.code, PackageErrorCode::Overloaded);
+        assert!(failure.outcome_uncertain);
+        assert!(!client.pending.lock().await.contains_key("h:cancel-refused"));
+    }
+
+    /// A refused writer enqueue is certain: it must not publish a Provider join.
+    #[tokio::test]
+    async fn refused_port_writer_does_not_publish_dispatch_for_command_or_query() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (input, _peer) = tokio::io::duplex(64);
+        let client = start(input, tokio::io::sink());
+        let _block = client
+            .writer
+            .data_bytes
+            .clone()
+            .try_acquire_many_owned(super::DATA_BYTES as u32)
+            .unwrap();
+        for kind in ["command", "query"] {
+            let observed = Arc::new(AtomicBool::new(false));
+            let flag = observed.clone();
+            let on_dispatch: Box<dyn FnOnce() + Send> = Box::new(move || {
+                flag.store(true, Ordering::Release);
+            });
+            let result = if kind == "command" {
+                client
+                    .request_port(
+                        format!("h:refused-{kind}"),
+                        "teamarness.port.command.v1",
+                        crate::PackageValue::Object(Default::default()),
+                        Arc::new(AtomicBool::new(false)),
+                        on_dispatch,
+                    )
+                    .await
+            } else {
+                client
+                    .request_observed(
+                        format!("h:refused-{kind}"),
+                        "teamarness.port.query.v1",
+                        crate::PackageValue::Object(Default::default()),
+                        on_dispatch,
+                    )
+                    .await
+            };
+            assert_eq!(result.unwrap_err().code, PackageErrorCode::Overloaded);
+            assert!(
+                !observed.load(Ordering::Acquire),
+                "{kind} published a refused route"
+            );
+        }
+    }
+
     fn ui_contract() -> std::sync::Arc<crate::ui::AdmittedUi> {
         std::sync::Arc::new(crate::ui::AdmittedUi {
             cache: crate::ui::UiCacheRecord {
@@ -1677,20 +2141,22 @@ mod tests {
     /// The reserve holds the frame it exists for: a typed terminal `error` for
     /// an id of the contract's maximum length.
     #[test]
-    fn an_overloaded_answer_fits_its_reserve() {
+    fn terminal_answers_fit_their_reserve() {
         let longest = format!("p:{}", "a".repeat(MAX_ID_BYTES - 2));
         assert_eq!(longest.len(), MAX_ID_BYTES);
-        let overloaded = frame(json!({
-            "kind":"error", "id":longest, "code":"overloaded",
-            "retryable":true, "details":{}
-        }));
-        let encoded = teamarness_package_protocol::encode_frame(&overloaded)
-            .expect("encoded frame")
-            .len();
-        assert!(
-            encoded <= TERMINAL_ERROR_BYTES,
-            "the reserve holds {TERMINAL_ERROR_BYTES} bytes per answer, the frame needs {encoded}"
-        );
+        for value in [
+            json!({"kind":"error", "id":longest, "code":"overloaded", "retryable":true, "details":{}}),
+            json!({"kind":"error", "id":longest, "code":"outcome_unknown", "retryable":false,
+                "outcomeUncertain":true, "details":{}}),
+        ] {
+            let encoded = teamarness_package_protocol::encode_frame(&frame(value))
+                .expect("encoded frame")
+                .len();
+            assert!(
+                encoded <= TERMINAL_ERROR_BYTES,
+                "the reserve holds {TERMINAL_ERROR_BYTES} bytes per answer, the frame needs {encoded}"
+            );
+        }
     }
 
     fn frame(value: Value) -> Frame {

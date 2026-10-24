@@ -38,7 +38,7 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 **Status:** Resolved (2026-09-12, design).
 
-**Decision:** Phase 1 treats installations as first-class members. The internal p2panda adapter uses tagged installation and workspace identifiers and keeps nested groups private, leaving room for a later human group of installation identities without changing installation keys.
+**Decision:** Phase 1 treats installations as first-class members. The internal p2panda adapter uses tagged installation and workspace identifiers and keeps nested groups private, leaving room for a later human group of installation identities without changing installation keys. ADR 0023 uses that room: a Workspace Person is a nested key group that holds its Installation key and its Agent Identities.
 
 **Rationale:** Iroh identifies installations, and Phase 1 has no device-management or human-key protocol. Pretending that a device key identifies a human would make the first schema misleading. The p2panda group model leaves a later grouping path, but human identity remains separate Phase 5 design work. See `context/.decisions/0004-p2panda-membership-dag.md`.
 
@@ -76,11 +76,11 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## TEAM-DQ8 - Recognizable remote-member names
 
-**Status:** decided for one Installation per Workspace Person in ADR 0022; delivery on `feature/member-names` awaits independent review and two-instance Verify.
+**Status:** decided for one Installation per Workspace Person in ADR 0022 and delivered; generalized to Workspace Principals by ADR 0023 (2026-10-21).
 
-A Member chooses a Unicode Workspace Person Name at create/join and may rename only their own Person. Core signs and synchronizes names separately from Canonical Membership. Shell and Packages consume the same current-name projection through `teamarness.person-names` 1.0; absent, duplicate, or temporarily stale names retain a fingerprint and inspectable full Installation Public Identity. Names do not grant membership and are not Installation Display Names. Conversations relabels existing Messages on rename without modifying their signed author identities. Other Workspace names remain independent.
+A Member chooses a Unicode Workspace Person Name at create/join and may rename only their own Person; a Steward names its Workspace Agents. Core signs and synchronizes names separately from Canonical Membership. Shell and Packages consume the same current projection through `teamarness.principals` 1.0, which carries each Principal's kind, Steward, current keys and name; absent, duplicate, or temporarily stale names retain a fingerprint and an inspectable full author identity. Names do not grant membership and are not Installation Display Names. Conversations relabels existing Messages on rename without modifying their signed author identities. Other Workspace names remain independent.
 
-**Still open for Phase 5:** Group multiple Installation identities under one stable Workspace Person without changing its ID or name; specify authorized name writers and conflict rules for multiple devices. Historical at-message-time names and cryptographic secrecy after revocation are not delivered by this workstream.
+**Still open for Phase 5:** Attach multiple Installation identities to one Workspace Person's key group without changing its ID or name; specify authorized name writers and conflict rules for multiple devices. Historical at-message-time names and cryptographic secrecy after revocation are not delivered by this workstream.
 
 ---
 

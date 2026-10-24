@@ -1,4 +1,4 @@
-# 0024 — Qualified immutable-record replay and Package generation append fence
+# 0028 — Qualified immutable-record replay and Package generation append fence
 
 **Status:** accepted (2026-10-23)
 **Refines:** ADR 0018 (additive Semantic Capability minor versions), ADR 0008/0009 (immutable-record replay and synchronization), ADR 0019 (Package lifecycle).

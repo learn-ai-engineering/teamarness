@@ -2,13 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
+use teamarness_package_sdk::capabilities::principals::{PrincipalSnapshot, Principals};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
 };
 use teamarness_package_sdk::{
-    BackendError, CancellationToken, Context, Empty, Router, event_channel,
+    BackendError, CancellationToken, Context, Empty, Router, event_channel, ports::PortActor,
 };
 use tokio::sync::watch;
 
@@ -36,6 +36,7 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
         cause.retryable(),
         json!({ "causeCode": cause.code() }),
     )
+    .with_outcome_uncertain(cause.outcome_uncertain())
 }
 /// What the Package tells the UI about synchronization.
 ///
@@ -69,7 +70,7 @@ struct Session {
 pub struct ConversationsActive {
     store: ConversationStore,
     log: RecordLog,
-    names: PersonNames,
+    principals: Principals,
     sync: Arc<Mutex<SyncReport>>,
     changes: watch::Sender<u64>,
     /// The Installation this Package Instance belongs to, which decides who may hide a Channel.
@@ -162,11 +163,9 @@ pub(crate) fn router_observing(
             .await?;
             let log = RecordLog::from_initialization(&initialization, capabilities)
                 .map_err(|cause| capability_error("record-log", cause))?;
-            let names = PersonNames::from_initialization(
-                &initialization,
-                activation.capabilities().clone(),
-            )
-            .map_err(|cause| capability_error("person-names", cause))?;
+            let principals =
+                Principals::from_initialization(&initialization, activation.capabilities().clone())
+                    .map_err(|cause| capability_error("principals", cause))?;
             rehydrate(&store, &log, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
@@ -183,7 +182,7 @@ pub(crate) fn router_observing(
             Ok(ConversationsActive {
                 store,
                 log,
-                names,
+                principals,
                 sync,
                 changes,
                 installation: initialization.installation().identity.clone(),
@@ -243,24 +242,7 @@ pub(crate) fn router_observing(
     .request(
         "conversations.message.post",
         |context: Context<ConversationsActive>, request: PostRequest| async move {
-            let channel = decode_id(&request.channel_id)
-                .ok_or_else(|| error("conversations.invalid_request", false))?;
-            let state = context.state().clone();
-            let active = context
-                .blocking(move |_| {
-                    state
-                        .store
-                        .channel_is_active(&hex_id(channel))
-                        .map_err(|_| storage_failed())
-                })
-                .await?;
-            if !active {
-                return Err(error("conversations.channel_hidden", false));
-            }
-            let author = context.state().installation.clone();
-            let record = DomainRecord::message_post(channel, &author, request.markdown)
-                .map_err(|_| error("conversations.invalid_markdown", false))?;
-            append(&context, "message.post", record).await
+            post(&context, request).await
         },
     )
     .request(
@@ -298,17 +280,48 @@ pub(crate) fn router_observing(
             resolve(&context, request).await
         },
     )
-    .subscription(
-        "conversations.names",
-        |context: Context<ConversationsActive>, _: Empty| async move {
-            let (sender, subscription) = event_channel(4);
-            let names = context.state().names.clone();
+    .port_request(
+        "dev.teamarness.conversations", "message.post", "command",
+        |context: Context<ConversationsActive>, actor: PortActor, request: PostRequest| async move {
+            authorize_person(&context, actor)?;
+            post(&context, request).await
+        },
+    )
+    .port_request(
+        "dev.teamarness.conversations", "message.page", "query",
+        |context: Context<ConversationsActive>, _actor: PortActor, request: PageRequest| async move {
+            page(&context, request).await
+        },
+    )
+    .port_event(
+        "dev.teamarness.conversations", "messages.changed",
+        |context: Context<ConversationsActive>, _actor: PortActor| async move {
+            let (sender, subscription) = event_channel(1);
+            let mut revisions = context.state().changes.subscribe();
             tokio::spawn(async move {
                 loop {
-                    let mut cursor = match names.current().await {
+                    tokio::select! {
+                        result = revisions.changed() => {
+                            if result.is_err() || sender.send(json!({})).await.is_err() { break; }
+                        }
+                        () = sender.closed() => break,
+                    }
+                }
+            });
+            Ok(subscription)
+        },
+    )
+    .subscription(
+        "conversations.principals",
+        |context: Context<ConversationsActive>, _: Empty| async move {
+            let (sender, subscription) = event_channel(4);
+            let principals = context.state().principals.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut cursor = match principals.current().await {
                         Ok(snapshot) => {
                             let cursor = snapshot.cursor;
-                            for event in name_snapshots(snapshot) {
+                            for event in principal_snapshots(snapshot) {
                                 if sender.send(event).await.is_err() {
                                     return;
                                 }
@@ -317,7 +330,9 @@ pub(crate) fn router_observing(
                         }
                         Err(_) => {
                             if sender
-                                .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                                .send(
+                                    json!({ "available": false, "cursor": "0", "principals": [] }),
+                                )
                                 .await
                                 .is_err()
                             {
@@ -327,7 +342,7 @@ pub(crate) fn router_observing(
                             continue;
                         }
                     };
-                    if let Ok(mut stream) = names.subscribe(cursor).await {
+                    if let Ok(mut stream) = principals.subscribe(cursor).await {
                         loop {
                             let result = tokio::select! {
                                 result = stream.next() => result,
@@ -340,7 +355,7 @@ pub(crate) fn router_observing(
                                 Some(Ok(snapshot)) => {
                                     if snapshot.cursor >= cursor {
                                         cursor = snapshot.cursor;
-                                        for event in name_snapshots(snapshot) {
+                                        for event in principal_snapshots(snapshot) {
                                             if sender.send(event).await.is_err() {
                                                 stream.close().await;
                                                 return;
@@ -354,7 +369,7 @@ pub(crate) fn router_observing(
                         stream.close().await;
                     }
                     if sender
-                        .send(json!({ "available": false, "cursor": "0", "persons": [] }))
+                        .send(json!({ "available": false, "cursor": "0", "principals": [] }))
                         .await
                         .is_err()
                     {
@@ -391,34 +406,39 @@ pub(crate) fn router_observing(
     )
 }
 
-fn name_snapshots(snapshot: PersonNameSnapshot) -> Vec<JsonValue> {
-    // The capability bounds the roster to 1,024 Persons and each name to 256 UTF-8 bytes.
-    // 64 entries leave ample room even for JSON-escaped names under both bridge limits.
-    const PERSONS_PER_EVENT: usize = 64;
-    let persons: Vec<_> = snapshot
-        .persons
+fn principal_snapshots(snapshot: PrincipalSnapshot) -> Vec<JsonValue> {
+    // Capability bounds the roster to 1,024 Principals and each name to 256 bytes.
+    // 64 entries fit the bridge budget even with JSON-escaped names.
+    const PRINCIPALS_PER_EVENT: usize = 64;
+    let principals: Vec<_> = snapshot
+        .principals
         .into_iter()
-        .map(|person| {
+        .map(|principal| {
             json!({
-                "identity": person.identity, "personId": person.person_id,
-                "name": person.name, "fingerprint": person.fingerprint,
+                "identity": principal.keys[0], "principalId": principal.principal_id,
+                "kind": match principal.kind {
+                    teamarness_package_sdk::capabilities::principals::PrincipalKind::Person => "person",
+                    teamarness_package_sdk::capabilities::principals::PrincipalKind::Agent => "agent",
+                },
+                "stewardPrincipalId": principal.steward_principal_id,
+                "name": principal.name, "fingerprint": principal.fingerprint,
             })
         })
         .collect();
-    let parts = persons.len().max(1).div_ceil(PERSONS_PER_EVENT);
-    persons
-        .chunks(PERSONS_PER_EVENT)
+    let parts = principals.len().max(1).div_ceil(PRINCIPALS_PER_EVENT);
+    principals
+        .chunks(PRINCIPALS_PER_EVENT)
         .enumerate()
         .map(|(part, chunk)| {
             json!({
                 "available": true, "cursor": snapshot.cursor.to_string(),
-                "persons": chunk, "part": part, "parts": parts,
+                "principals": chunk, "part": part, "parts": parts,
             })
         })
-        .chain((persons.is_empty()).then(|| {
+        .chain((principals.is_empty()).then(|| {
             json!({
                 "available": true, "cursor": snapshot.cursor.to_string(),
-                "persons": [], "part": 0, "parts": 1,
+                "principals": [], "part": 0, "parts": 1,
             })
         }))
         .collect()
@@ -472,6 +492,41 @@ impl ConversationsActive {
     }
 }
 
+fn authorize_person(
+    context: &Context<ConversationsActive>,
+    actor: PortActor,
+) -> Result<(), BackendError> {
+    match actor {
+        PortActor::Person { identity } if identity == context.state().installation => Ok(()),
+        _ => Err(error("conversations.actor_unauthorized", false)),
+    }
+}
+
+async fn post(
+    context: &Context<ConversationsActive>,
+    request: PostRequest,
+) -> Result<JsonValue, BackendError> {
+    let channel = decode_id(&request.channel_id)
+        .ok_or_else(|| error("conversations.invalid_request", false))?;
+    let state = context.state().clone();
+    let active = context
+        .blocking(move |_| {
+            state
+                .store
+                .channel_is_active(&hex_id(channel))
+                .map_err(|_| storage_failed())
+        })
+        .await?;
+    if !active {
+        return Err(error("conversations.channel_hidden", false));
+    }
+    // The actor never selects the signer: the Core capability signs for this Installation.
+    let author = context.state().installation.clone();
+    let record = DomainRecord::message_post(channel, &author, request.markdown)
+        .map_err(|_| error("conversations.invalid_markdown", false))?;
+    append(context, "message.post", record).await
+}
+
 /// Appends one domain record and projects it locally.
 async fn append(
     context: &Context<ConversationsActive>,
@@ -507,11 +562,16 @@ async fn append(
                 )
                 .map_err(|_| storage_failed())
         })
-        .await?;
+        .await
+        .map_err(|failure| failure.with_outcome_uncertain(true))?;
     match outcome {
         IngestResult::Applied | IngestResult::Duplicate => {}
-        IngestResult::Deferred(_) => return Err(error("conversations.deferred", true)),
-        IngestResult::Quarantined(_) => return Err(error("conversations.rejected", false)),
+        IngestResult::Deferred(_) => {
+            return Err(error("conversations.deferred", false).with_outcome_uncertain(true));
+        }
+        IngestResult::Quarantined(_) => {
+            return Err(error("conversations.rejected", false).with_outcome_uncertain(true));
+        }
     }
     Ok(json!({ "ok": true }))
 }
@@ -1007,7 +1067,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
                 .capability(RECORD_LOG, scripted.clone())
-                .capability("teamarness.person-names", ScriptedCapability::new())
+                .capability("teamarness.principals", ScriptedCapability::new())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -1021,6 +1081,242 @@ mod session_tests {
             handles,
             scripted,
         }
+    }
+
+    #[test]
+    fn public_port_contract_has_exact_closed_bounded_shapes() {
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        assert_eq!(contract.contracts.len(), 1);
+        let provided = &contract.contracts[0];
+        assert_eq!(provided.identity, "dev.teamarness.conversations");
+        assert_eq!(provided.ports.len(), 3);
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "message.post",
+                    "request",
+                    &json!({"channelId":hex_id(GENERAL_ID),"markdown":"hello"})
+                )
+                .is_ok()
+        );
+        for invalid in [
+            json!({"channelId":hex_id(GENERAL_ID),"markdown":""}),
+            json!({"channelId":hex_id(GENERAL_ID),"markdown":"x","actor":"forged"}),
+            json!({"channelId":hex_id(GENERAL_ID),"markdown":"x".repeat(32769)}),
+        ] {
+            assert!(
+                contract
+                    .validate(
+                        "dev.teamarness.conversations",
+                        "message.post",
+                        "request",
+                        &invalid
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "messages.changed",
+                    "event",
+                    &json!({})
+                )
+                .is_ok()
+        );
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "messages.changed",
+                    "event",
+                    &json!({"markdown":"secret"})
+                )
+                .is_err()
+        );
+        const { assert!(HISTORY_REPLY_BUDGET < teamarness_package_protocol::MAX_FRAME_BYTES) };
+    }
+
+    #[tokio::test]
+    async fn ports_share_ui_post_and_read_only_page_and_invalidate_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let envelope = |port: &str, actor: JsonValue, request: JsonValue| {
+            json!({
+                "contract": "dev.teamarness.conversations", "major": 1, "minor": 0,
+                "port": port, "actor": actor, "request": request
+            })
+        };
+        let person = json!({"kind":"person","identity":ALICE});
+        let page_request = json!({"channelId":hex_id(GENERAL_ID)});
+        let initial = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                envelope("message.page", person.clone(), page_request.clone()),
+            )
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        let mut events = session
+            .harness
+            .subscribe(
+                "teamarness.port.event.v1",
+                envelope("messages.changed", person.clone(), json!({})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.next_event())
+                .await
+                .is_err(),
+            "subscription must not emit its current watch value"
+        );
+        let forbidden = session
+            .harness
+            .request(
+                "teamarness.port.command.v1",
+                envelope(
+                    "message.post",
+                    json!({"kind":"person","identity":"stranger"}),
+                    json!({"channelId":hex_id(GENERAL_ID),"markdown":"forbidden"}),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.code(), "conversations.actor_unauthorized");
+        assert!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    envelope(
+                        "message.post",
+                        json!({"kind":"agent","identity":ALICE}),
+                        json!({"channelId":hex_id(GENERAL_ID),"markdown":"forbidden"})
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    envelope(
+                        "message.post",
+                        person.clone(),
+                        json!({"channelId":hex_id(GENERAL_ID),"markdown":"hello"})
+                    )
+                )
+                .await
+                .unwrap(),
+            json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":{"ok":true}})
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":{}})
+        );
+        assert_eq!(
+            session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap(),
+            0
+        );
+        let page = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                envelope("message.page", person.clone(), page_request.clone()),
+            )
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        assert_eq!(page["pending"].as_array().unwrap().len(), 1);
+        assert_ne!(page["revision"], initial["revision"]);
+        let ui = session
+            .harness
+            .request("conversations.channel.page", page_request)
+            .await
+            .unwrap();
+        assert_eq!(page, ui);
+        assert_eq!(
+            session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap(),
+            0
+        );
+        session
+            .harness
+            .request(
+                "conversations.channel.open",
+                json!({"channelId":hex_id(GENERAL_ID)}),
+            )
+            .await
+            .unwrap();
+        assert!(session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap() > 0);
+        events.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn uncertain_log_append_failure_remains_uncertain_at_port_boundary() {
+        let cause =
+            BackendError::new("outcome_unknown", false, json!({})).with_outcome_uncertain(true);
+        let failure = super::capability_error("message.post", cause);
+        assert!(failure.outcome_uncertain());
+        assert!(!failure.retryable());
+    }
+
+    #[tokio::test]
+    async fn committed_post_with_failed_local_projection_is_uncertain_and_not_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let store = session.store();
+        let before = session
+            .scripted
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| call.method == "append")
+            .count();
+        store.fail_next_ingest_for_test();
+        let failure = session
+            .harness
+            .request(
+                "teamarness.port.command.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":0,
+                    "port":"message.post", "actor":{"kind":"person","identity":ALICE},
+                    "request":{"channelId":hex_id(GENERAL_ID),"markdown":"committed once"}
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "conversations.storage_failed");
+        assert!(
+            failure.outcome_uncertain(),
+            "the append returned a durable commit"
+        );
+        assert!(
+            !failure.retryable(),
+            "replaying could duplicate the committed post"
+        );
+        assert_eq!(
+            session
+                .scripted
+                .recorded_calls()
+                .into_iter()
+                .filter(|call| call.method == "append")
+                .count(),
+            before + 1,
+        );
+        session.harness.shutdown().await.unwrap();
     }
 
     impl Session {
@@ -2223,26 +2519,28 @@ mod session_tests {
     }
 
     #[test]
-    fn large_person_name_snapshot_reaches_every_author_in_bounded_parts() {
-        use teamarness_package_sdk::capabilities::person_names::PersonName;
-        let snapshot = PersonNameSnapshot {
+    fn large_principal_snapshot_reaches_every_author_in_bounded_parts() {
+        use teamarness_package_sdk::capabilities::principals::{Principal, PrincipalKind};
+        let snapshot = PrincipalSnapshot {
             workspace_id: "a".repeat(32),
             cursor: 1,
-            persons: (0..1024)
-                .map(|n| PersonName {
-                    identity: format!("{n:064x}"),
-                    person_id: format!("{n:064x}"),
+            principals: (0..1024)
+                .map(|n| Principal {
+                    principal_id: format!("{n:064x}"),
+                    kind: PrincipalKind::Person,
+                    steward_principal_id: None,
+                    keys: vec![format!("{n:064x}")],
                     name: Some("🌻".repeat(64)),
                     fingerprint: "a".repeat(12),
                 })
                 .collect(),
         };
-        let events = name_snapshots(snapshot);
+        let events = principal_snapshots(snapshot);
         assert!(events.len() > 1);
         assert_eq!(
             events
                 .iter()
-                .map(|event| event["persons"].as_array().unwrap().len())
+                .map(|event| event["principals"].as_array().unwrap().len())
                 .sum::<usize>(),
             1024
         );
@@ -2252,23 +2550,25 @@ mod session_tests {
             assert_eq!(event["parts"], events.len());
             assert!(serde_json::to_vec(event).unwrap().len() <= HISTORY_REPLY_BUDGET);
         }
-        let escaping = PersonNameSnapshot {
+        let escaping = PrincipalSnapshot {
             workspace_id: "a".repeat(32),
             cursor: 2,
-            persons: (0..1024)
-                .map(|n| PersonName {
-                    identity: format!("{n:064x}"),
-                    person_id: format!("{n:064x}"),
+            principals: (0..1024)
+                .map(|n| Principal {
+                    principal_id: format!("{n:064x}"),
+                    kind: PrincipalKind::Agent,
+                    steward_principal_id: Some("c".repeat(64)),
+                    keys: vec![format!("{n:064x}")],
                     name: Some("\\\"".repeat(128)),
                     fingerprint: "f".repeat(64),
                 })
                 .collect(),
         };
-        let renamed = name_snapshots(escaping);
+        let renamed = principal_snapshots(escaping);
         assert_eq!(
             renamed
                 .iter()
-                .map(|part| part["persons"].as_array().unwrap().len())
+                .map(|part| part["principals"].as_array().unwrap().len())
                 .sum::<usize>(),
             1024
         );
@@ -2277,13 +2577,15 @@ mod session_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn person_name_changes_relabel_without_mutating_signed_message_author() {
+    async fn principal_changes_relabel_without_mutating_signed_message_author() {
         let directory = tempfile::tempdir().unwrap();
-        let names = ScriptedCapability::new().calls(|method, _| match method {
+        let principals = ScriptedCapability::new().calls(|method, _| match method {
             "current" => Ok(
-                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [
-                { "identity": "b".repeat(64), "personId": "c".repeat(64),
-                  "name": "Alice", "fingerprint": "bbbbbbbbbbbb" }
+                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [
+                { "principalId": "c".repeat(64), "kind": "person", "stewardPrincipalId": null,
+                  "keys": ["d".repeat(64)], "name": "Alice", "fingerprint": "dddddddddddd" },
+                { "principalId": "e".repeat(64), "kind": "agent", "stewardPrincipalId": "c".repeat(64),
+                  "keys": ["b".repeat(64)], "name": "Helper", "fingerprint": "bbbbbbbbbbbb" }
             ] }),
             ),
             _ => Err(BackendError::new(
@@ -2299,7 +2601,7 @@ mod session_tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory.path())
                 .capability(RECORD_LOG, scripted_log())
-                .capability("teamarness.person-names", names.clone())
+                .capability("teamarness.principals", principals.clone())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -2320,13 +2622,15 @@ mod session_tests {
             )
             .unwrap();
         let mut changes = harness
-            .subscribe("conversations.names", json!({}))
+            .subscribe("conversations.principals", json!({}))
             .await
             .unwrap();
         let first = changes.next_event().await.unwrap().unwrap();
-        wait_for_opens(&names, 1).await;
-        assert_eq!(first["persons"][0]["name"], "Alice");
-        assert_eq!(first["persons"][0]["identity"], signed_author);
+        wait_for_opens(&principals, 1).await;
+        assert_eq!(first["principals"][0]["name"], "Alice");
+        assert_eq!(first["principals"][1]["identity"], signed_author);
+        assert_eq!(first["principals"][1]["kind"], "agent");
+        assert_eq!(first["principals"][1]["stewardPrincipalId"], "c".repeat(64));
         assert_eq!(
             store
                 .message_rows(&hex_id(GENERAL_ID), None, PAGE_SIZE)
@@ -2334,12 +2638,14 @@ mod session_tests {
                 .2,
             signed_author
         );
-        names
+        principals
             .stream()
             .send(
-                json!({"workspaceId": "a".repeat(32), "cursor": "1", "persons": [
-                    { "identity": signed_author, "personId": "c".repeat(64),
-                      "name": "Alice 🌻", "fingerprint": "bbbbbbbbbbbb" }
+                json!({"workspaceId": "a".repeat(32), "cursor": "1", "principals": [
+                    { "principalId": "c".repeat(64), "kind": "person", "stewardPrincipalId": null,
+                      "keys": ["d".repeat(64)], "name": "Alice 🌻", "fingerprint": "dddddddddddd" },
+                    { "principalId": "e".repeat(64), "kind": "agent", "stewardPrincipalId": "c".repeat(64),
+                      "keys": [signed_author], "name": "Helper renamed", "fingerprint": "bbbbbbbbbbbb" }
                 ]}),
             )
             .await;
@@ -2348,7 +2654,8 @@ mod session_tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(renamed["persons"][0]["name"], "Alice 🌻");
+        assert_eq!(renamed["principals"][0]["name"], "Alice 🌻");
+        assert_eq!(renamed["principals"][1]["name"], "Helper renamed");
         assert_eq!(
             store
                 .message_rows(&hex_id(GENERAL_ID), None, PAGE_SIZE)
@@ -2361,10 +2668,12 @@ mod session_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn closing_idle_names_subscription_closes_capability_stream() {
+    async fn closing_idle_principals_subscription_closes_capability_stream() {
         let directory = tempfile::tempdir().unwrap();
-        let names = ScriptedCapability::new().calls(|method, _| match method {
-            "current" => Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [] })),
+        let principals = ScriptedCapability::new().calls(|method, _| match method {
+            "current" => {
+                Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [] }))
+            }
             _ => Err(BackendError::new(
                 "capability_unavailable",
                 false,
@@ -2376,26 +2685,26 @@ mod session_tests {
             .installation(ALICE, "Alice")
             .data_directory(directory.path())
             .capability(RECORD_LOG, scripted_log())
-            .capability("teamarness.person-names", names.clone())
+            .capability("teamarness.principals", principals.clone())
             .start()
             .await;
         harness.activate().await.unwrap();
         let mut subscription = harness
-            .subscribe("conversations.names", json!({}))
+            .subscribe("conversations.principals", json!({}))
             .await
             .unwrap();
         assert_eq!(
             subscription.next_event().await.unwrap().unwrap()["cursor"],
             "0"
         );
-        let stream = names.stream();
+        let stream = principals.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
             .await
             .unwrap();
         subscription.close().await;
         tokio::time::timeout(
             Duration::from_secs(2),
-            wait_until(|| !stream.is_open(), "idle person-names stream closure"),
+            wait_until(|| !stream.is_open(), "idle principals stream closure"),
         )
         .await
         .unwrap();

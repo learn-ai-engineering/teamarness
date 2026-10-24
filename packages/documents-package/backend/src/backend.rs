@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use teamarness_package_sdk::capabilities::person_names::{PersonNameSnapshot, PersonNames};
+use teamarness_package_sdk::capabilities::principals::{PrincipalSnapshot, Principals};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, ReplayEnd,
     SessionOptions, SyncState, SyncWarning, run_session_from_start,
@@ -674,7 +674,7 @@ struct Session {
 pub struct DocumentsActive {
     store: DocumentStore,
     log: RecordLog,
-    names: PersonNames,
+    names: Principals,
     sync: Arc<Mutex<SyncReport>>,
     changes: watch::Sender<u64>,
     installation: String,
@@ -803,8 +803,8 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             }).await?;
             let log = RecordLog::from_initialization(&initialization, capabilities.clone())
                 .map_err(|cause| capability_error("record-log", cause))?;
-            let names = PersonNames::from_initialization(&initialization, capabilities)
-                .map_err(|cause| capability_error("person-names", cause))?;
+            let names = Principals::from_initialization(&initialization, capabilities)
+                .map_err(|cause| capability_error("principals", cause))?;
             let installation = initialization.installation().identity.clone();
             let (events, _) = broadcast::channel(256);
             let hub = BodyHub {
@@ -1400,16 +1400,16 @@ async fn require_document(
     }
 }
 
-/// Splits a roster into events of at most 64 Persons, which fit the bridge limits with room.
-fn name_snapshots(snapshot: PersonNameSnapshot) -> Vec<JsonValue> {
+/// Projects each current Principal's signing key into the existing bounded author-name feed.
+fn name_snapshots(snapshot: PrincipalSnapshot) -> Vec<JsonValue> {
     const PERSONS_PER_EVENT: usize = 64;
     let persons: Vec<_> = snapshot
-        .persons
+        .principals
         .into_iter()
-        .map(|person| {
+        .map(|principal| {
             json!({
-                "identity": person.identity, "personId": person.person_id,
-                "name": person.name, "fingerprint": person.fingerprint,
+                "identity": principal.keys[0], "personId": principal.principal_id,
+                "name": principal.name, "fingerprint": principal.fingerprint,
             })
         })
         .collect();
@@ -2843,7 +2843,7 @@ mod tests {
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
                 .capability(RECORD_LOG, scripted.clone())
-                .capability("teamarness.person-names", ScriptedCapability::new())
+                .capability("teamarness.principals", ScriptedCapability::new())
                 .start()
                 .await;
         harness.activate().await.unwrap();
@@ -5985,13 +5985,20 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: AC6 — the names roster is forwarded in bounded parts and the stream closes
-    // with the subscription.
+    // Verifies: AC6 — Person and Agent signing identities are projected from the current
+    // Principal roster, and the stream closes with the subscription.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn names_are_forwarded_and_the_stream_closes_with_the_subscription() {
         let directory = tempfile::tempdir().unwrap();
         let names = ScriptedCapability::new().calls(|method, _| match method {
-            "current" => Ok(json!({ "workspaceId": "a".repeat(32), "cursor": "0", "persons": [] })),
+            "current" => Ok(
+                json!({ "workspaceId": "a".repeat(32), "cursor": "0", "principals": [
+                {"principalId":"b".repeat(64),"kind":"person","stewardPrincipalId":null,
+                    "keys":["c".repeat(64)],"name":"Alice","fingerprint":"cccccccccccc"},
+                {"principalId":"d".repeat(64),"kind":"agent","stewardPrincipalId":"b".repeat(64),
+                    "keys":["e".repeat(64)],"name":"Helper","fingerprint":"eeeeeeeeeeee"}
+            ] }),
+            ),
             _ => Err(BackendError::new(
                 "capability_unavailable",
                 false,
@@ -6004,7 +6011,7 @@ mod tests {
             .installation(ALICE, "Alice")
             .data_directory(directory.path())
             .capability(RECORD_LOG, scripted_log())
-            .capability("teamarness.person-names", names.clone())
+            .capability("teamarness.principals", names.clone())
             .start()
             .await;
         harness.activate().await.unwrap();
@@ -6014,14 +6021,22 @@ mod tests {
             .unwrap();
         let first = subscription.next_event().await.unwrap().unwrap();
         assert_eq!(first["cursor"], "0");
-        assert_eq!(first["persons"], json!([]));
+        assert_eq!(
+            first["persons"],
+            json!([
+                {"identity":"c".repeat(64),"personId":"b".repeat(64),
+                    "name":"Alice","fingerprint":"cccccccccccc"},
+                {"identity":"e".repeat(64),"personId":"d".repeat(64),
+                    "name":"Helper","fingerprint":"eeeeeeeeeeee"}
+            ])
+        );
         assert_eq!(first["parts"], 1);
         let stream = names.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
             .await
             .unwrap();
         subscription.close().await;
-        wait_until(|| !stream.is_open(), "idle person-names stream closure").await;
+        wait_until(|| !stream.is_open(), "idle principals stream closure").await;
         harness.shutdown().await.unwrap();
     }
 }

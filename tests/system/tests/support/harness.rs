@@ -555,6 +555,9 @@ pub fn stage_package(root: &Path) -> PathBuf {
     fs::write(package.join("ui/index.js"), ui).unwrap();
     fs::write(package.join("ui/style.css"), css).unwrap();
     fs::write(package.join("ui-contract.json"), &contract).unwrap();
+    let ports =
+        fs::read(workspace_root().join("packages/conversations-package/ports.json")).unwrap();
+    fs::write(package.join("ports.json"), &ports).unwrap();
     fs::write(
         package.join("teamarness.package.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -569,10 +572,11 @@ pub fn stage_package(root: &Path) -> PathBuf {
                 "assets":[{"path":"ui/style.css","mediaType":"text/css","size":css.len(),"sha256":digest(css)}],
                 "contract":{"path":"ui-contract.json","sha256":digest(&contract)}
             },
+            "portContract":{"path":"ports.json","sha256":digest(&ports)},
             "capabilities":[
                 {"identity":"teamarness.workspace-context","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.membership","major":1,"minMinor":0,"maxMinor":0},
-                {"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0},
+                {"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.signing","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":0,"maxMinor":0}
             ],
@@ -582,7 +586,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
                         "backends.0.size","backends.0.sha256",
                         "ui.entrypoint.size","ui.entrypoint.sha256",
                         "ui.assets.0.size","ui.assets.0.sha256",
-                        "ui.contract.sha256"
+                        "ui.contract.sha256", "portContract.sha256"
                     ]
                 }
             }

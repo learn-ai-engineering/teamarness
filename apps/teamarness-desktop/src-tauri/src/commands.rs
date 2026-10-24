@@ -2,26 +2,28 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use tauri::{State, ipc::Channel};
-use teamarness_core::{WorkspaceId, WorkspaceInvitation};
+use teamarness_core::{PrincipalId, WorkspaceId, WorkspaceInvitation};
 use teamarness_package_host::{PackageHostCommand, ReconcileWorkspaces};
 
 use crate::DesktopState;
 use crate::dto::{
-    InstallationDto, InvitationDto, InvitationSensitivity, MembershipDto, PersonNameSnapshotDto,
-    WorkspaceDto, WorkspacePersonDto, WorkspaceStateDto,
+    InstallationDto, InvitationDto, InvitationSensitivity, MembershipDto, PrincipalsSnapshotDto,
+    WorkspaceDto, WorkspacePrincipalDto, WorkspaceStateDto,
 };
 use crate::error::BridgeError;
 
-pub const COMMAND_NAMES: [&str; 9] = [
+pub const COMMAND_NAMES: [&str; 11] = [
     "installation_details",
     "list_workspaces",
     "create_workspace",
     "create_workspace_invitation",
     "join_workspace",
     "current_membership",
-    "person_name_snapshot",
-    "subscribe_person_names",
-    "set_own_person_name",
+    "principals_snapshot",
+    "subscribe_principals",
+    "rename_workspace_principal",
+    "add_workspace_agent",
+    "remove_workspace_agent",
 ];
 
 async fn blocking<T, F>(state: &DesktopState, operation: F) -> Result<T, BridgeError>
@@ -71,12 +73,10 @@ pub async fn create_workspace(
         let workspace = runtime
             .create_workspace_with_person_name(&name, &person_name)
             .map_err(BridgeError::from)?;
-        let membership = runtime
-            .membership_snapshot(workspace.id())
-            .map_err(BridgeError::from)?;
+        let membership = roster(&runtime, workspace.id())?;
         Ok(WorkspaceStateDto {
             workspace: workspace.into(),
-            membership: membership.into(),
+            membership,
         })
     })
     .await?;
@@ -111,14 +111,14 @@ pub async fn join_workspace(
     let invitation =
         WorkspaceInvitation::from_str(&invitation).map_err(|_| BridgeError::invalid_input())?;
     let runtime = state.runtime()?;
-    let (workspace, membership) = runtime
+    let (workspace, _) = runtime
         .join_workspace_with_person_name(&invitation, &person_name)
         .await
         .map_err(BridgeError::from)?;
     reconcile_packages(&state).await?;
     Ok(WorkspaceStateDto {
+        membership: roster(&runtime, workspace.id())?,
         workspace: workspace.into(),
-        membership: membership.into(),
     })
 }
 
@@ -129,46 +129,44 @@ pub async fn current_membership(
 ) -> Result<MembershipDto, BridgeError> {
     let workspace_id =
         WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    blocking(&state, move |runtime| {
-        runtime
-            .membership_snapshot(workspace_id)
-            .map(MembershipDto::from)
-            .map_err(BridgeError::from)
-    })
-    .await
+    blocking(&state, move |runtime| roster(&runtime, workspace_id)).await
+}
+
+fn roster(
+    runtime: &teamarness_core::CoreRuntime,
+    workspace: WorkspaceId,
+) -> Result<MembershipDto, BridgeError> {
+    let (membership, principals) = runtime
+        .principal_roster(workspace)
+        .map_err(BridgeError::from)?;
+    MembershipDto::from_core(membership, &principals)
 }
 
 fn snapshot_dto(
     workspace: WorkspaceId,
-    snapshot: (
-        u64,
-        Vec<(
-            teamarness_core::PublicIdentity,
-            teamarness_core::WorkspacePerson,
-        )>,
-    ),
-) -> PersonNameSnapshotDto {
-    PersonNameSnapshotDto {
+    snapshot: (u64, Vec<teamarness_core::WorkspacePrincipal>),
+) -> PrincipalsSnapshotDto {
+    PrincipalsSnapshotDto {
         workspace_id: workspace.to_string(),
         cursor: snapshot.0.to_string(),
-        persons: snapshot
+        principals: snapshot
             .1
             .into_iter()
-            .map(|(identity, person)| WorkspacePersonDto::from_core(identity, person))
+            .map(WorkspacePrincipalDto::from)
             .collect(),
     }
 }
 
 #[tauri::command]
-pub async fn person_name_snapshot(
+pub async fn principals_snapshot(
     workspace_id: String,
     state: State<'_, DesktopState>,
-) -> Result<PersonNameSnapshotDto, BridgeError> {
+) -> Result<PrincipalsSnapshotDto, BridgeError> {
     let workspace =
         WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
     blocking(&state, move |runtime| {
         runtime
-            .person_name_snapshot(workspace)
+            .principals_snapshot(workspace)
             .map(|snapshot| snapshot_dto(workspace, snapshot))
             .map_err(BridgeError::from)
     })
@@ -176,7 +174,26 @@ pub async fn person_name_snapshot(
 }
 
 #[tauri::command]
-pub async fn set_own_person_name(
+pub async fn rename_workspace_principal(
+    workspace_id: String,
+    principal_id: String,
+    name: String,
+    state: State<'_, DesktopState>,
+) -> Result<(), BridgeError> {
+    let workspace =
+        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+    let principal =
+        PrincipalId::from_str(&principal_id).map_err(|_| BridgeError::invalid_input())?;
+    blocking(&state, move |runtime| {
+        runtime
+            .rename_principal(workspace, principal, &name)
+            .map_err(BridgeError::from)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn add_workspace_agent(
     workspace_id: String,
     name: String,
     state: State<'_, DesktopState>,
@@ -184,18 +201,52 @@ pub async fn set_own_person_name(
     let workspace =
         WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
     blocking(&state, move |runtime| {
-        runtime
-            .set_own_person_name(workspace, &name)
-            .map_err(BridgeError::from)
+        add_agent_mutation(&runtime, workspace, &name)
     })
     .await
 }
 
+fn add_agent_mutation(
+    runtime: &teamarness_core::CoreRuntime,
+    workspace: WorkspaceId,
+    name: &str,
+) -> Result<(), BridgeError> {
+    runtime
+        .add_agent(workspace, name)
+        .map(|_| ())
+        .map_err(BridgeError::from)
+}
+
 #[tauri::command]
-pub async fn subscribe_person_names(
+pub async fn remove_workspace_agent(
+    workspace_id: String,
+    agent_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<(), BridgeError> {
+    let workspace =
+        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+    let agent = PrincipalId::from_str(&agent_id).map_err(|_| BridgeError::invalid_input())?;
+    blocking(&state, move |runtime| {
+        remove_agent_mutation(&runtime, workspace, agent)
+    })
+    .await
+}
+
+fn remove_agent_mutation(
+    runtime: &teamarness_core::CoreRuntime,
+    workspace: WorkspaceId,
+    agent: PrincipalId,
+) -> Result<(), BridgeError> {
+    runtime
+        .remove_agent(workspace, agent)
+        .map_err(BridgeError::from)
+}
+
+#[tauri::command]
+pub async fn subscribe_principals(
     workspace_id: String,
     after_cursor: String,
-    on_event: Channel<PersonNameStreamEvent>,
+    on_event: Channel<PrincipalsStreamEvent>,
     state: State<'_, DesktopState>,
 ) -> Result<(), BridgeError> {
     let workspace =
@@ -208,24 +259,23 @@ pub async fn subscribe_person_names(
     }
     let runtime = state.runtime()?;
     let watch_runtime = Arc::clone(&runtime);
-    let mut changes = tauri::async_runtime::spawn_blocking(move || {
-        watch_runtime.subscribe_person_names(workspace)
-    })
-    .await
-    .map_err(|_| BridgeError::shutdown())?
-    .map_err(BridgeError::from)?;
+    let mut changes =
+        tauri::async_runtime::spawn_blocking(move || watch_runtime.subscribe_principals(workspace))
+            .await
+            .map_err(|_| BridgeError::shutdown())?
+            .map_err(BridgeError::from)?;
     if *changes.borrow() < after {
         return Err(BridgeError::invalid_input());
     }
     tauri::async_runtime::spawn(async move {
-        forward_person_names(
+        forward_principals(
             &mut changes,
             after,
             || {
                 let runtime = Arc::clone(&runtime);
                 async move {
                     tauri::async_runtime::spawn_blocking(move || {
-                        runtime.person_name_snapshot(workspace)
+                        runtime.principals_snapshot(workspace)
                     })
                     .await
                     .ok()?
@@ -242,20 +292,20 @@ pub async fn subscribe_person_names(
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", content = "snapshot", rename_all = "snake_case")]
-pub enum PersonNameStreamEvent {
-    Snapshot(PersonNameSnapshotDto),
+pub enum PrincipalsStreamEvent {
+    Snapshot(PrincipalsSnapshotDto),
     Terminated,
 }
 
-async fn forward_person_names<F, Read, Send>(
+async fn forward_principals<F, Read, Send>(
     changes: &mut tokio::sync::watch::Receiver<u64>,
     after: u64,
     mut read: F,
     mut send: Send,
 ) where
     F: FnMut() -> Read,
-    Read: std::future::Future<Output = Option<PersonNameSnapshotDto>>,
-    Send: FnMut(PersonNameStreamEvent) -> bool,
+    Read: std::future::Future<Output = Option<PrincipalsSnapshotDto>>,
+    Send: FnMut(PrincipalsStreamEvent) -> bool,
 {
     let mut cursor = after;
     loop {
@@ -272,7 +322,7 @@ async fn forward_person_names<F, Read, Send>(
             };
             if next > cursor {
                 cursor = next;
-                if !send(PersonNameStreamEvent::Snapshot(snapshot)) {
+                if !send(PrincipalsStreamEvent::Snapshot(snapshot)) {
                     break;
                 }
             }
@@ -282,7 +332,7 @@ async fn forward_person_names<F, Read, Send>(
             break;
         }
     }
-    let _ = send(PersonNameStreamEvent::Terminated);
+    let _ = send(PrincipalsStreamEvent::Terminated);
 }
 
 async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
@@ -302,24 +352,103 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn roster_remains_consistent_when_an_agent_is_removed_between_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "shell-roster-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runtime = teamarness_core::CoreRuntime::open_loopback_for_tests(
+            teamarness_core::CoreRuntimeConfig::new(&path),
+        )
+        .await
+        .unwrap();
+        let workspace = runtime
+            .create_workspace_with_person_name("Team", "Owner")
+            .unwrap()
+            .id();
+        let agent = runtime.add_agent(workspace, "Agent").unwrap();
+        let old_membership = runtime.membership_snapshot(workspace).unwrap();
+        runtime.remove_agent(workspace, agent).unwrap();
+        let (_, new_principals) = runtime.principals_snapshot(workspace).unwrap();
+        assert!(MembershipDto::from_core(old_membership, &new_principals).is_err());
+        let current = roster(&runtime, workspace).unwrap();
+        assert_eq!(current.members.len(), 1);
+        assert_eq!(
+            current.epoch,
+            runtime
+                .membership_snapshot(workspace)
+                .unwrap()
+                .epoch()
+                .value()
+                .to_string()
+        );
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_mutation_acknowledges_core_commit_without_a_roster_read() {
+        let path = std::env::temp_dir().join(format!(
+            "shell-agent-ack-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runtime = teamarness_core::CoreRuntime::open_loopback_for_tests(
+            teamarness_core::CoreRuntimeConfig::new(&path),
+        )
+        .await
+        .unwrap();
+        let workspace = runtime
+            .create_workspace_with_person_name("Team", "Owner")
+            .unwrap()
+            .id();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../contracts/fixtures/bridge-contract.json"
+        ))
+        .unwrap();
+        add_agent_mutation(&runtime, workspace, "Agent").unwrap();
+        assert_eq!(
+            serde_json::to_value(()).unwrap(),
+            fixture["agentMutationResponses"]["addWorkspaceAgent"]
+        );
+        let agent = runtime
+            .principal_roster(workspace)
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|principal| principal.kind() == teamarness_core::PrincipalKind::Agent)
+            .unwrap()
+            .id();
+        remove_agent_mutation(&runtime, workspace, agent).unwrap();
+        assert_eq!(
+            serde_json::to_value(()).unwrap(),
+            fixture["agentMutationResponses"]["removeWorkspaceAgent"]
+        );
+        assert!(roster(&runtime, WorkspaceId::from_str(&"0".repeat(32)).unwrap()).is_err());
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn post_start_name_read_failure_signals_termination() {
         let (wake, mut changes) = tokio::sync::watch::channel(1_u64);
         let mut reads = 0;
         let mut events = Vec::new();
-        forward_person_names(
+        forward_principals(
             &mut changes,
             0,
             || {
                 reads += 1;
-                let snapshot = (reads == 1).then(|| PersonNameSnapshotDto {
+                let snapshot = (reads == 1).then(|| PrincipalsSnapshotDto {
                     workspace_id: "a".repeat(32),
                     cursor: "1".into(),
-                    persons: vec![],
+                    principals: vec![],
                 });
                 async move { snapshot }
             },
             |event| {
-                if matches!(event, PersonNameStreamEvent::Snapshot(_)) {
+                if matches!(event, PrincipalsStreamEvent::Snapshot(_)) {
                     wake.send(2).unwrap();
                 }
                 events.push(event);
@@ -331,8 +460,8 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                PersonNameStreamEvent::Snapshot(_),
-                PersonNameStreamEvent::Terminated
+                PrincipalsStreamEvent::Snapshot(_),
+                PrincipalsStreamEvent::Terminated
             ]
         ));
         assert_eq!(
@@ -352,9 +481,11 @@ mod tests {
                 "create_workspace_invitation",
                 "join_workspace",
                 "current_membership",
-                "person_name_snapshot",
-                "subscribe_person_names",
-                "set_own_person_name",
+                "principals_snapshot",
+                "subscribe_principals",
+                "rename_workspace_principal",
+                "add_workspace_agent",
+                "remove_workspace_agent",
             ]
         );
         let registry = COMMAND_NAMES.join(" ");

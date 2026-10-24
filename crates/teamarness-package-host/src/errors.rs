@@ -29,6 +29,7 @@ pub enum PackageErrorCode {
     CapabilityUnavailable,
     CapabilityVersionUnsupported,
     CapabilityRequestInvalid,
+    PrincipalNotBound,
     SpawnFailed,
     HandshakeTimeout,
     HandshakeMismatch,
@@ -48,6 +49,18 @@ pub enum PackageErrorCode {
     ShuttingDown,
     UiEntrypointMissing,
     UiContractViolation,
+    PortContractViolation,
+    PortProviderConflict,
+    PortGraphSearchLimit,
+    PortContractMissing,
+    PortMissing,
+    PortVersionMismatch,
+    PortDependencyCycle,
+    PortUnavailable,
+    PortUngranted,
+    PortRequestInvalid,
+    PortResponseInvalid,
+    PortEventInvalid,
     UiLoadFailed,
     UiException,
     StaleMount,
@@ -201,6 +214,7 @@ pub(crate) fn activation_error(
         PackageErrorCode::CapabilityUnavailable
             | PackageErrorCode::CapabilityVersionUnsupported
             | PackageErrorCode::CapabilityRequestInvalid
+            | PackageErrorCode::PrincipalNotBound
     ) {
         PackageErrorStage::Capability
     } else {

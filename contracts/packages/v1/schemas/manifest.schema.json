@@ -8,83 +8,187 @@
       "maxLength": 128,
       "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
     },
-    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "relativePath": { "type": "string", "pattern": "^[^/\\x00][^\\x00]*[^/\\x00]$" },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^[^/\\x00][^\\x00]*[^/\\x00]$"
+    },
     "range": {
       "type": "object",
-      "required": ["major", "minMinor", "maxMinor"],
+      "required": [
+        "major",
+        "minMinor",
+        "maxMinor"
+      ],
       "properties": {
-        "major": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "minMinor": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "maxMinor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+        "major": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "minMinor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "maxMinor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
       },
       "additionalProperties": false
     },
     "sizedFile": {
       "type": "object",
-      "required": ["path", "size", "sha256"],
+      "required": [
+        "path",
+        "size",
+        "sha256"
+      ],
       "properties": {
-        "path": { "$ref": "#/$defs/relativePath" },
-        "size": { "type": "integer", "minimum": 0, "maximum": 8388608 },
-        "sha256": { "$ref": "#/$defs/digest" }
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8388608
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        }
       },
       "additionalProperties": false
     }
   },
   "type": "object",
-  "required": ["schemaVersion", "identity", "version", "presentation", "protocol", "backends", "ui", "capabilities"],
+  "required": [
+    "schemaVersion",
+    "identity",
+    "version",
+    "presentation",
+    "protocol",
+    "backends",
+    "ui",
+    "capabilities"
+  ],
   "properties": {
-    "schemaVersion": { "const": 1 },
-    "identity": { "$ref": "#/$defs/packageIdentity" },
-    "version": { "type": "string", "minLength": 5 },
+    "schemaVersion": {
+      "const": 1
+    },
+    "identity": {
+      "$ref": "#/$defs/packageIdentity"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 5
+    },
     "presentation": {
       "type": "object",
-      "required": ["displayName"],
-      "properties": { "displayName": { "type": "string", "minLength": 1, "maxLength": 128 } },
+      "required": [
+        "displayName"
+      ],
+      "properties": {
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
       "additionalProperties": false
     },
-    "protocol": { "$ref": "#/$defs/range" },
+    "protocol": {
+      "$ref": "#/$defs/range"
+    },
     "backends": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["target", "path", "size", "sha256"],
+        "required": [
+          "target",
+          "path",
+          "size",
+          "sha256"
+        ],
         "properties": {
-          "target": { "type": "string", "minLength": 1 },
-          "path": { "$ref": "#/$defs/relativePath" },
-          "size": { "type": "integer", "minimum": 0 },
-          "sha256": { "$ref": "#/$defs/digest" }
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "$ref": "#/$defs/digest"
+          }
         },
         "additionalProperties": false
       }
     },
     "ui": {
       "type": "object",
-      "required": ["entrypoint", "assets", "contract"],
+      "required": [
+        "entrypoint",
+        "assets",
+        "contract"
+      ],
       "properties": {
-        "entrypoint": { "$ref": "#/$defs/sizedFile" },
+        "entrypoint": {
+          "$ref": "#/$defs/sizedFile"
+        },
         "assets": {
           "type": "array",
           "maxItems": 64,
           "items": {
             "type": "object",
-            "required": ["path", "mediaType", "size", "sha256"],
+            "required": [
+              "path",
+              "mediaType",
+              "size",
+              "sha256"
+            ],
             "properties": {
-              "path": { "$ref": "#/$defs/relativePath" },
-              "mediaType": { "type": "string", "minLength": 3 },
-              "size": { "type": "integer", "minimum": 0, "maximum": 8388608 },
-              "sha256": { "$ref": "#/$defs/digest" }
+              "path": {
+                "$ref": "#/$defs/relativePath"
+              },
+              "mediaType": {
+                "type": "string",
+                "minLength": 3
+              },
+              "size": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 8388608
+              },
+              "sha256": {
+                "$ref": "#/$defs/digest"
+              }
             },
             "additionalProperties": false
           }
         },
         "contract": {
           "type": "object",
-          "required": ["path", "sha256"],
+          "required": [
+            "path",
+            "sha256"
+          ],
           "properties": {
-            "path": { "$ref": "#/$defs/relativePath" },
-            "sha256": { "$ref": "#/$defs/digest" }
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "sha256": {
+              "$ref": "#/$defs/digest"
+            }
           },
           "additionalProperties": false
         }
@@ -95,19 +199,123 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["identity", "major", "minMinor", "maxMinor"],
+        "required": [
+          "identity",
+          "major",
+          "minMinor",
+          "maxMinor"
+        ],
         "properties": {
-          "identity": { "$ref": "#/$defs/packageIdentity" },
-          "major": { "type": "integer", "minimum": 1, "maximum": 65535 },
-          "minMinor": { "type": "integer", "minimum": 0, "maximum": 65535 },
-          "maxMinor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          "identity": {
+            "$ref": "#/$defs/packageIdentity"
+          },
+          "major": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "minMinor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "maxMinor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
         },
         "additionalProperties": false
       }
     },
     "extensions": {
       "type": "object",
-      "propertyNames": { "$ref": "#/$defs/packageIdentity" }
+      "propertyNames": {
+        "$ref": "#/$defs/packageIdentity"
+      }
+    },
+    "activation": {"enum": ["eager", "on_demand"]},
+    "portContract": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "consumedPorts": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": [
+          "identity",
+          "major",
+          "minMinor",
+          "maxMinor",
+          "ports"
+        ],
+        "properties": {
+          "identity": {
+            "$ref": "#/$defs/packageIdentity"
+          },
+          "major": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "minMinor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "maxMinor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "ports": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "kind"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
+                },
+                "kind": {
+                  "enum": [
+                    "command",
+                    "query",
+                    "event"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

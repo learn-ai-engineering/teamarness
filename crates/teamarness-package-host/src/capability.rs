@@ -12,7 +12,7 @@ use teamarness_core::{
 use teamarness_package_protocol::INITIAL_STREAM_CREDIT;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
-use crate::protocol::{CapabilityFailure, HostStreamSender};
+use crate::protocol::{CapabilityFailure, HostStreamSender, PortQueryStream, StreamEnd};
 use crate::{InstallationPublicIdentity, PackageErrorCode, PackageIdentity, WorkspaceId};
 
 const SIGNING_CONTEXT: &str = "package-signing/v1";
@@ -222,9 +222,10 @@ struct Descriptor {
 enum CapabilityKind {
     WorkspaceContext,
     Membership,
-    PersonNames,
+    Principals,
     Signing,
     ImmutableRecordLog,
+    PackagePorts,
     #[cfg(test)]
     Neutral,
 }
@@ -274,6 +275,7 @@ pub(crate) struct GenerationCapabilities {
     advertised: Vec<AdvertisedGrant>,
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     cancelled: watch::Sender<bool>,
+    broker: std::sync::Weak<crate::broker::PortBroker>,
 }
 
 impl GenerationCapabilities {
@@ -284,8 +286,9 @@ impl GenerationCapabilities {
         generation: u64,
         limiter: CoreCallLimiter,
         append_fence: Arc<AppendFence>,
+        broker: std::sync::Weak<crate::broker::PortBroker>,
     ) -> Result<Arc<Self>, PackageErrorCode> {
-        if scope.package_identity.as_str() == crate::values::RESERVED_PERSON_NAME_SCOPE {
+        if scope.package_identity.as_str() == crate::values::RESERVED_PRINCIPALS_SCOPE {
             return Err(PackageErrorCode::InvalidPackageIdentity);
         }
         let registry = Registry::production();
@@ -325,6 +328,7 @@ impl GenerationCapabilities {
             advertised,
             streams: Arc::new(Mutex::new(BTreeMap::new())),
             cancelled,
+            broker,
         }))
     }
 
@@ -339,7 +343,58 @@ impl GenerationCapabilities {
         grant: Option<&str>,
         payload: &Value,
         started: Arc<AtomicBool>,
+        consumer_id: &str,
     ) -> Result<Value, CapabilityFailure> {
+        let bound = self
+            .bound_grant(grant)
+            .map_err(CapabilityFailure::certain)?;
+        if bound.descriptor.kind == CapabilityKind::PackagePorts {
+            let object = payload
+                .as_object()
+                .ok_or(PackageErrorCode::CapabilityRequestInvalid)
+                .map_err(CapabilityFailure::certain)?;
+            let method = string_field(object, "method").map_err(CapabilityFailure::certain)?;
+            let broker = self
+                .broker
+                .upgrade()
+                .ok_or(PackageErrorCode::CapabilityUnavailable)
+                .map_err(CapabilityFailure::certain)?;
+            return match method {
+                "available" if object.len() == 1 => Ok(broker
+                    .availability(&self.scope.package_identity, &self.scope.workspace_id)
+                    .await),
+                "invoke" => broker
+                    .call(
+                        &self.scope.package_identity,
+                        &self.scope.workspace_id,
+                        &self.core.public_identity().to_string(),
+                        object,
+                        started,
+                        consumer_id,
+                        self.generation,
+                    )
+                    .await
+                    .map(crate::protocol::encode_port_value)
+                    .map_err(|failure| CapabilityFailure {
+                        code: if failure.outcome_uncertain
+                            && matches!(
+                                failure.code,
+                                PackageErrorCode::ProcessExited
+                                    | PackageErrorCode::DeadlineExceeded
+                                    | PackageErrorCode::Cancelled
+                            ) {
+                            PackageErrorCode::OutcomeUncertain
+                        } else {
+                            failure.code
+                        },
+                        outcome_uncertain: failure.outcome_uncertain,
+                        package_error: failure.package_error,
+                    }),
+                _ => Err(CapabilityFailure::certain(
+                    PackageErrorCode::CapabilityRequestInvalid,
+                )),
+            };
+        }
         self.call_inner(grant, payload, started)
             .await
             .map_err(CapabilityFailure::certain)
@@ -361,11 +416,13 @@ impl GenerationCapabilities {
                 self.workspace_context(method, object, started).await
             }
             CapabilityKind::Membership => self.membership(method, object, started).await,
-            CapabilityKind::PersonNames => self.person_names(method, object, started).await,
+            CapabilityKind::Principals => self.principals(method, object, started).await,
             CapabilityKind::Signing => self.signing(method, object, started).await,
             CapabilityKind::ImmutableRecordLog => {
-                self.immutable_record(method, object, started).await
+                self.immutable_record(method, object, grant.minor, started)
+                    .await
             }
+            CapabilityKind::PackagePorts => Err(PackageErrorCode::CapabilityRequestInvalid),
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
         }
@@ -386,6 +443,72 @@ impl GenerationCapabilities {
             .as_object()
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         let grant = self.bound_grant(Some(string_field(object, "grant")?))?;
+        if grant.descriptor.kind == CapabilityKind::PackagePorts {
+            let broker = self
+                .broker
+                .upgrade()
+                .ok_or(PackageErrorCode::CapabilityUnavailable)?;
+            if object.get("kind").and_then(Value::as_str) == Some("event") {
+                let subscription = broker
+                    .subscribe_event(
+                        &self.scope.package_identity,
+                        &self.scope.workspace_id,
+                        &self.core.public_identity().to_string(),
+                        object,
+                        self.generation,
+                    )
+                    .await?;
+                let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
+                let mut streams = self.streams.lock().await;
+                if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
+                    drop(streams);
+                    broker.drop_event_subscription(&subscription).await;
+                    return Err(PackageErrorCode::Overloaded);
+                }
+                drop(streams);
+                broker.record_event_subscription(&subscription, &stream_id);
+                let all_streams = self.streams.clone();
+                let cancelled = self.cancelled.subscribe();
+                tokio::spawn(async move {
+                    broker
+                        .clone()
+                        .run_event_subscription(
+                            stream_id.clone(),
+                            subscription,
+                            receiver,
+                            output,
+                            cancelled,
+                        )
+                        .await;
+                    all_streams.lock().await.remove(&stream_id);
+                });
+                return Ok(());
+            }
+            let query = broker
+                .query_stream(
+                    &self.scope.package_identity,
+                    &self.scope.workspace_id,
+                    &self.core.public_identity().to_string(),
+                    object,
+                )
+                .await?;
+            let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
+            let mut streams = self.streams.lock().await;
+            if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
+                let _ = query.client.stream_close(&query.id).await;
+                return Err(PackageErrorCode::Overloaded);
+            }
+            drop(streams);
+            tokio::spawn(run_port_query(
+                stream_id,
+                query,
+                receiver,
+                output,
+                self.streams.clone(),
+                self.cancelled.subscribe(),
+            ));
+            return Ok(());
+        }
         let method = string_field(object, "method")?;
         let core_workspace =
             teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
@@ -398,7 +521,7 @@ impl GenerationCapabilities {
                 None
             };
         let after_profile_cursor =
-            if grant.descriptor.kind == CapabilityKind::PersonNames && method == "subscribe" {
+            if grant.descriptor.kind == CapabilityKind::Principals && method == "subscribe" {
                 exact_fields(object, &["grant", "method", "afterCursor"])?;
                 Some(decimal_field(object, "afterCursor")?)
             } else {
@@ -438,8 +561,8 @@ impl GenerationCapabilities {
                     self.cancelled.subscribe(),
                 ));
             }
-            CapabilityKind::PersonNames => {
-                tokio::spawn(run_person_name_stream(
+            CapabilityKind::Principals => {
+                tokio::spawn(run_principal_stream(
                     core,
                     core_workspace,
                     stream_id,
@@ -603,7 +726,7 @@ impl GenerationCapabilities {
         }
     }
 
-    async fn person_names(
+    async fn principals(
         &self,
         method: &str,
         object: &Map<String, Value>,
@@ -616,18 +739,45 @@ impl GenerationCapabilities {
             "current" => {
                 exact_fields(object, &["method"])?;
                 self.limiter
-                    .run(started, move || person_name_snapshot(&core, workspace))
+                    .run(started, move || principal_snapshot(&core, workspace))
                     .await?
             }
             "lookup" => {
-                exact_fields(object, &["method", "identity"])?;
-                let identity = PublicIdentity::from_str(string_field(object, "identity")?)
-                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-                self.limiter.run(started, move || {
-                    let person = core.workspace_person(workspace, identity)
+                let principal_id = if object.contains_key("principalId") {
+                    exact_fields(object, &["method", "principalId"])?;
+                    Some(
+                        teamarness_core::PrincipalId::from_str(string_field(
+                            object,
+                            "principalId",
+                        )?)
+                        .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?,
+                    )
+                } else {
+                    exact_fields(object, &["method", "identity"])?;
+                    None
+                };
+                let identity = if principal_id.is_none() {
+                    Some(
+                        PublicIdentity::from_str(string_field(object, "identity")?)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?,
+                    )
+                } else {
+                    None
+                };
+                self.limiter
+                    .run(started, move || {
+                        let principal = if let Some(id) = principal_id {
+                            core.principal(workspace, id)
+                        } else {
+                            core.workspace_principal(
+                                workspace,
+                                identity.expect("validated identity"),
+                            )
+                        }
                         .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
-                    Ok(json!({"person":person.map(|person| person_name_value(identity, &person))}))
-                }).await?
+                        Ok(json!({"principal":principal.as_ref().map(principal_value)}))
+                    })
+                    .await?
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
@@ -637,6 +787,7 @@ impl GenerationCapabilities {
         &self,
         method: &str,
         object: &Map<String, Value>,
+        minor: u16,
         started: Arc<AtomicBool>,
     ) -> Result<Value, PackageErrorCode> {
         let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
@@ -645,7 +796,20 @@ impl GenerationCapabilities {
         let core = Arc::clone(&self.core);
         match method {
             "append" => {
-                exact_fields(object, &["method", "purpose", "canonical"])?;
+                if minor == 0 {
+                    exact_fields(object, &["method", "purpose", "canonical"])?;
+                } else if object.contains_key("principal") {
+                    exact_fields(object, &["method", "purpose", "canonical", "principal"])?;
+                } else {
+                    exact_fields(object, &["method", "purpose", "canonical"])?;
+                }
+                let principal = object
+                    .get("principal")
+                    .map(|_| {
+                        teamarness_core::PrincipalId::from_str(string_field(object, "principal")?)
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
+                    })
+                    .transpose()?;
                 let purpose = validated_purpose(string_field(object, "purpose")?)?.to_owned();
                 let canonical = decode_bounded(
                     string_field(object, "canonical")?,
@@ -654,7 +818,9 @@ impl GenerationCapabilities {
                 self.limiter
                     .run_append(self.append_fence.clone(), started, move || {
                         let record = core
-                            .append_record(workspace, &package, &purpose, &canonical)
+                            .append_record_as_principal(
+                                workspace, &package, &purpose, &canonical, principal,
+                            )
                             .map_err(sync_error)?;
                         Ok(json!({
                             "recordId": record.record_id().to_string(),
@@ -824,10 +990,17 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
         grant: Option<&'a str>,
         payload: &'a Value,
         started: Arc<AtomicBool>,
+        consumer_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, CapabilityFailure>> + Send + 'a>,
     > {
-        Box::pin(GenerationCapabilities::call(self, grant, payload, started))
+        Box::pin(GenerationCapabilities::call(
+            self,
+            grant,
+            payload,
+            started,
+            consumer_id,
+        ))
     }
 
     fn open_stream<'a>(
@@ -890,11 +1063,11 @@ impl Registry {
             kind: CapabilityKind::Membership,
         });
         registry.register(Descriptor {
-            family: CapabilityFamily::new("teamarness.person-names"),
+            family: CapabilityFamily::new("teamarness.principals"),
             major: 1,
             min_minor: 0,
             max_minor: 0,
-            kind: CapabilityKind::PersonNames,
+            kind: CapabilityKind::Principals,
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.signing"),
@@ -902,6 +1075,13 @@ impl Registry {
             min_minor: 0,
             max_minor: 0,
             kind: CapabilityKind::Signing,
+        });
+        registry.register(Descriptor {
+            family: CapabilityFamily::new("teamarness.package-ports"),
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::PackagePorts,
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.synchronization.immutable-record-log"),
@@ -945,7 +1125,7 @@ impl Registry {
 }
 
 #[derive(Clone, Copy)]
-enum StreamCommand {
+pub(crate) enum StreamCommand {
     Credit(u64),
     Close,
 }
@@ -989,36 +1169,89 @@ async fn await_credit(
     true
 }
 
-fn person_name_value(identity: PublicIdentity, person: &teamarness_core::WorkspacePerson) -> Value {
+fn principal_value(principal: &teamarness_core::WorkspacePrincipal) -> Value {
     json!({
-        "identity": identity.to_string(),
-        "personId": person.id().to_string(),
-        "name": person.name(),
-        "fingerprint": person.fingerprint(),
+        "principalId":principal.id().to_string(),
+        "kind":match principal.kind() {
+            teamarness_core::PrincipalKind::Person => "person",
+            teamarness_core::PrincipalKind::Agent => "agent",
+        },
+        "stewardPrincipalId":principal.steward_principal_id().map(|id| id.to_string()),
+        "keys":principal.keys().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "name":principal.name(),
+        "fingerprint":principal.fingerprint(),
     })
 }
 
-fn person_name_snapshot(
+fn principal_snapshot(
     core: &CoreRuntime,
     workspace: teamarness_core::WorkspaceId,
 ) -> Result<Value, PackageErrorCode> {
-    let (cursor, persons) = core
-        .person_name_snapshot(workspace)
+    let (cursor, principals) = core
+        .principals_snapshot(workspace)
         .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
-    if persons.len() > 1024 {
+    if principals.len() > 1024 {
         return Err(PackageErrorCode::CapabilityUnavailable);
     }
     Ok(json!({
-        "workspaceId": workspace.to_string(),
-        "cursor": cursor.to_string(),
-        "persons": persons.iter().map(|(identity, person)| person_name_value(*identity, person)).collect::<Vec<_>>(),
+        "workspaceId":workspace.to_string(),
+        "cursor":cursor.to_string(),
+        "principals":principals.iter().map(principal_value).collect::<Vec<_>>(),
     }))
 }
 
 // A profile cursor invalidates a snapshot; it is not a replay ledger. A lagging
 // consumer receives the latest bounded snapshot and resumes at its cursor.
+async fn run_port_query(
+    id: String,
+    mut query: PortQueryStream,
+    mut commands: mpsc::Receiver<StreamCommand>,
+    output: HostStreamSender,
+    streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let mut credit = MAX_STREAM_CREDIT;
+    let mut sequence = 0;
+    let reason = loop {
+        if *cancelled.borrow()
+            || !drain_commands(&mut commands, &mut credit).await
+            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
+        {
+            break "closed";
+        }
+        tokio::select! {
+            biased;
+            change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
+            command = commands.recv() => match command {
+                Some(StreamCommand::Credit(amount)) => credit += amount,
+                Some(StreamCommand::Close) | None => break "closed",
+            },
+            event = query.receiver.changed() => match event {
+                Ok(event) => {
+                    sequence += 1;
+                    credit -= 1;
+                    let value = match serde_json::to_value(event.payload) {
+                        Ok(value) => value,
+                        Err(_) => break "port_event_invalid",
+                    };
+                    if output.event(&id, sequence, value).await.is_err() { break "process_exited"; }
+                    if query.client.credit(&query.id, 1).await.is_err() { break "process_exited"; }
+                }
+                Err(StreamEnd::Completed) => break "completed",
+                Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
+                Err(StreamEnd::Host(PackageErrorCode::Overloaded)) => break "overloaded",
+                Err(_) => break "provider_exited",
+            },
+        }
+    };
+    let _ = query.client.stream_close(&query.id).await;
+    output.retire(&id).await;
+    streams.lock().await.remove(&id);
+    let _ = output.close(&id, reason).await;
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_person_name_stream(
+async fn run_principal_stream(
     core: Arc<CoreRuntime>,
     workspace: teamarness_core::WorkspaceId,
     stream_id: String,
@@ -1031,7 +1264,7 @@ async fn run_person_name_stream(
 ) {
     let watch_core = core.clone();
     let opened =
-        tokio::task::spawn_blocking(move || watch_core.subscribe_person_names(workspace)).await;
+        tokio::task::spawn_blocking(move || watch_core.subscribe_principals(workspace)).await;
     let mut changes = match opened {
         Ok(Ok(receiver)) => receiver,
         _ => {
@@ -1067,7 +1300,7 @@ async fn run_person_name_stream(
         }
         let snapshot_core = core.clone();
         let snapshot =
-            tokio::task::spawn_blocking(move || person_name_snapshot(&snapshot_core, workspace))
+            tokio::task::spawn_blocking(move || principal_snapshot(&snapshot_core, workspace))
                 .await;
         let Ok(Ok(snapshot)) = snapshot else {
             break;
@@ -1204,6 +1437,7 @@ fn sync_error(error: teamarness_core::SynchronizationError) -> PackageErrorCode 
         | teamarness_core::SynchronizationError::ScopeQuarantined => {
             PackageErrorCode::CapabilityUnavailable
         }
+        teamarness_core::SynchronizationError::PrincipalNotBound => PackageErrorCode::PrincipalNotBound,
         teamarness_core::SynchronizationError::WorkspaceNotFound
         | teamarness_core::SynchronizationError::InvalidInput
         | teamarness_core::SynchronizationError::WrongScope
@@ -1672,6 +1906,7 @@ mod tests {
             1,
             limiter,
             Arc::new(AppendFence::default()),
+            std::sync::Weak::new(),
         )
         .unwrap();
         let grant = capabilities.advertised()[0].grant.clone();
@@ -1742,6 +1977,7 @@ mod tests {
                     Some(&grant),
                     &append_request(),
                     Arc::new(AtomicBool::new(false)),
+                    "p:test",
                 )
                 .await
         });

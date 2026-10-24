@@ -102,20 +102,20 @@ describe("Workspace Person author presentation", () => {
       const source = createFakePackageClient({ requests: {
         "conversations.snapshot": () => snapshot(),
         "conversations.channel.open": () => ({ ...emptyPage(), messages: [{ ...message("old"), author }] }),
-      }, subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined } });
+      }, subscriptions: { "conversations.changes": () => undefined, "conversations.principals": () => undefined } });
       const unmount = await mount(createTestMountContext({ root, client: source.client }));
-      const nameCalls = () => source.calls.filter(({ operation }) => operation === "conversations.names").length;
-      const first = { identity: author, personId: author, name: "Old", fingerprint: "bbbbbbbbbbbb" };
-      await source.emit("conversations.names", { available: true, cursor: "1", persons: [first], part: 0, parts: 1 });
-      await source.emit("conversations.names", { available: true, cursor: "2", persons: [{ ...first, name: "Renamed" }], part: 0, parts: 2 });
+      const nameCalls = () => source.calls.filter(({ operation }) => operation === "conversations.principals").length;
+      const first = { identity: author, principalId: author, kind: "person" as const, stewardPrincipalId: null, name: "Old", fingerprint: "bbbbbbbbbbbb" };
+      await source.emit("conversations.principals", { available: true, cursor: "1", principals: [first], part: 0, parts: 1 });
+      await source.emit("conversations.principals", { available: true, cursor: "2", principals: [{ ...first, name: "Renamed" }], part: 0, parts: 2 });
       expect(root.querySelector(".message-author")?.textContent).toBe("Old");
-      source.terminate("conversations.names", null);
+      source.terminate("conversations.principals", null);
       await vi.advanceTimersByTimeAsync(1000);
       expect(nameCalls()).toBe(2);
-      await source.emit("conversations.names", { available: true, cursor: "2", persons: [{ ...first, name: "Renamed" }], part: 0, parts: 2 });
-      await source.emit("conversations.names", { available: true, cursor: "2", persons: [], part: 1, parts: 2 });
+      await source.emit("conversations.principals", { available: true, cursor: "2", principals: [{ ...first, name: "Renamed" }], part: 0, parts: 2 });
+      await source.emit("conversations.principals", { available: true, cursor: "2", principals: [], part: 1, parts: 2 });
       expect(root.querySelector(".message-author")?.textContent).toBe("Renamed");
-      source.terminate("conversations.names", null);
+      source.terminate("conversations.principals", null);
       await unmount();
       await vi.advanceTimersByTimeAsync(60_000);
       expect(nameCalls()).toBe(2);
@@ -129,7 +129,7 @@ describe("Workspace Person author presentation", () => {
       const source = conversationsBackend();
       let attempts = 0;
       const client: PackageClient = { ...source.client, subscribe: async (...args) => {
-        if (args[0] === "conversations.names" && ++attempts === 1) throw new Error("temporary");
+        if (args[0] === "conversations.principals" && ++attempts === 1) throw new Error("temporary");
         return source.client.subscribe(...args);
       } };
       const unmount = await mount(createTestMountContext({ root, client }));
@@ -148,7 +148,7 @@ describe("Workspace Person author presentation", () => {
         "conversations.snapshot": () => snapshot(),
         "conversations.channel.open": () => emptyPage(),
       },
-      subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined },
+      subscriptions: { "conversations.changes": () => undefined, "conversations.principals": () => undefined },
     });
     let namesClosed = false;
     const client: PackageClient = {
@@ -172,16 +172,16 @@ describe("Workspace Person author presentation", () => {
     const source = createFakePackageClient({ requests: {
       "conversations.snapshot": () => snapshot(),
       "conversations.channel.open": () => ({ ...emptyPage(), messages: [{ ...message("old"), author }] }),
-    }, subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined } });
+    }, subscriptions: { "conversations.changes": () => undefined, "conversations.principals": () => undefined } });
     const unmount = await mount(createTestMountContext({ root, client: source.client }));
-    const persons = Array.from({ length: 1024 }, (_, n) => ({
+    const principals = Array.from({ length: 1024 }, (_, n) => ({
       identity: n === 7 ? author : n.toString(16).padStart(64, "0"),
-      personId: n.toString(16).padStart(64, "0"), name: "🌻".repeat(64), fingerprint: "f".repeat(12),
+      principalId: n.toString(16).padStart(64, "0"), kind: "person" as const, stewardPrincipalId: null, name: "🌻".repeat(64), fingerprint: "f".repeat(12),
     }));
     const publish = async (cursor: string, name: string) => {
-      persons[7] = { ...persons[7]!, name };
-      for (let part = 0; part < 16; part++) await source.emit("conversations.names", {
-        available: true, cursor, part, parts: 16, persons: persons.slice(part * 64, (part + 1) * 64),
+      principals[7] = { ...principals[7]!, name };
+      for (let part = 0; part < 16; part++) await source.emit("conversations.principals", {
+        available: true, cursor, part, parts: 16, principals: principals.slice(part * 64, (part + 1) * 64),
       });
     };
     await publish("1", "Alice");
@@ -207,24 +207,69 @@ describe("Workspace Person author presentation", () => {
           { ...message("alice"), id: "1", author: alice },
         ] }),
       },
-      subscriptions: { "conversations.changes": () => undefined, "conversations.names": () => undefined },
+      subscriptions: { "conversations.changes": () => undefined, "conversations.principals": () => undefined },
     });
     const unmount = await mount(createTestMountContext({ root, client: source.client }));
     const labels = () => [...root.querySelectorAll<HTMLButtonElement>(".message-author")].map(node => node.textContent);
-    const person = (identity: string, name: string | null) => ({ identity, personId: identity,
+    const person = (identity: string, name: string | null) => ({ identity, principalId: identity,
       name, fingerprint: identity.slice(0, 12) });
     expect(labels()).toEqual(["aaaaaaaa…aaaaaa", "bbbbbbbb…bbbbbb", "cccccccc…cccccc", "You"]);
-    await source.emit("conversations.names", { available: true, cursor: "1", persons: [person(alice, "🌿 A"), person(bob, "B")] });
+    await source.emit("conversations.principals", { available: true, cursor: "1", principals: [person(alice, "🌿 A"), person(bob, "B")] });
     expect(labels()).toEqual(["🌿 A", "B", "cccccccc…cccccc", "You"]);
-    await source.emit("conversations.names", { available: true, cursor: "2", persons: [person(alice, "B"), person(bob, "B")] });
+    await source.emit("conversations.principals", { available: true, cursor: "2", principals: [person(alice, "B"), person(bob, "B")] });
     expect(labels()).toEqual(["B · aaaaaaaa…aaaaaa", "B · bbbbbbbb…bbbbbb", "cccccccc…cccccc", "You"]);
-    await source.emit("conversations.names", { available: true, cursor: "1", persons: [person(alice, "old")] });
+    await source.emit("conversations.principals", { available: true, cursor: "1", principals: [person(alice, "old")] });
     expect(labels()[0]).toBe("B · aaaaaaaa…aaaaaa");
     root.querySelector<HTMLButtonElement>(".message-author")!.click();
     expect(labels()[0]).toBe(alice);
-    await source.emit("conversations.names", { available: false, cursor: "0", persons: [] });
+    await source.emit("conversations.principals", { available: false, cursor: "0", principals: [] });
     expect(labels()[0]).toBe("aaaaaaaa…aaaaaa");
     expect(labels()[3]).toBe("You");
+    await unmount();
+  });
+});
+
+describe("Workspace Agent authors", () => {
+  it("resolves the signed Agent key with a sibling indicator and Steward, then relabels without changing authorship", async () => {
+    const root = shadowRoot();
+    const agentKey = "b".repeat(64);
+    const stewardKey = "a".repeat(64);
+    const agentId = "d".repeat(64);
+    const stewardId = "c".repeat(64);
+    const source = createFakePackageClient({ requests: {
+      "conversations.snapshot": () => snapshot(),
+      "conversations.channel.open": () => ({ ...emptyPage(), messages: [
+        { ...message("agent"), author: agentKey },
+        { ...message("own"), author: agentKey, isLocal: true },
+      ] }),
+    }, subscriptions: { "conversations.changes": () => undefined, "conversations.principals": () => undefined } });
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    const rows = () => [root.querySelector<HTMLElement>('.message[data-message-id="agent"]'),
+      root.querySelector<HTMLElement>('.message[data-message-id="own"]')];
+    const steward = { identity: stewardKey, principalId: stewardId, kind: "person" as const,
+      stewardPrincipalId: null, name: "Alice", fingerprint: "aaaa" };
+    const agent = { identity: agentKey, principalId: agentId, kind: "agent" as const,
+      stewardPrincipalId: stewardId, name: "Helper", fingerprint: "bbbb" };
+    await source.emit("conversations.principals", { available: true, cursor: "1", principals: [steward, agent] });
+    expect(rows()[0]?.querySelector(".message-author")?.textContent).toBe("Helper");
+    expect(rows()[0]?.querySelector(".message-agent-indicator")?.textContent).toBe("Agent");
+    expect(rows()[0]?.querySelector(".message-agent-steward")?.textContent).toBe("stewarded by Alice");
+    expect(rows()[1]?.querySelector(".message-author")?.textContent).toBe("You");
+    expect(rows()[1]?.querySelector(".message-agent-indicator")).toBeNull();
+    await source.emit("conversations.principals", { available: true, cursor: "2", principals: [
+      { ...steward, name: "<img src=x onerror=alert(1)>" }, { ...agent, name: "Renamed" },
+    ] });
+    expect(rows()[0]?.querySelector(".message-author")?.textContent).toBe("Renamed");
+    expect(rows()[0]?.querySelector(".message-agent-steward")?.textContent)
+      .toBe("stewarded by <img src=x onerror=alert(1)>");
+    expect(rows()[0]?.querySelector(".message-agent-steward img")).toBeNull();
+    expect(rows()[0]?.querySelector(".message-author")?.getAttribute("title")).toBe(agentKey);
+    await source.emit("conversations.principals", { available: true, cursor: "3", principals: [agent] });
+    expect(rows()[0]?.querySelector(".message-agent-steward")?.textContent)
+      .toBe(`stewarded by ${stewardId.slice(0, 8)}…${stewardId.slice(-6)}`);
+    await source.emit("conversations.principals", { available: false, cursor: "0", principals: [] });
+    expect(rows()[0]?.querySelector(".message-agent-indicator")).toBeNull();
+    expect(rows()[0]?.querySelector(".message-author")?.textContent).toBe("bbbbbbbb…bbbbbb");
     await unmount();
   });
 });

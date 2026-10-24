@@ -515,15 +515,23 @@ async fn catch_up_of_5000_records_converges_across_bounded_sessions() {
         converged.elapsed()
     );
 
-    let reports = cluster.node("a").session_reports_for_test();
+    let a_reports = cluster.node("a").session_reports_for_test();
+    let b_reports = cluster.node("b").session_reports_for_test();
+    let a = cluster.identity("a");
     let b = cluster.identity("b");
-    let truncated = reports
+    // Either peer can initiate the bounded exchange. A push records its own
+    // sent_truncated flag; a B-initiated pull records the peer_truncated flag.
+    let truncated = a_reports
         .iter()
         .filter(|(peer, report)| *peer == b && report.sent_truncated)
-        .count();
+        .count()
+        + b_reports
+            .iter()
+            .filter(|(peer, report)| *peer == a && report.peer_truncated)
+            .count();
     assert!(
         truncated >= 2,
-        "a backlog above one session's bound continues in later sessions: {reports:?}"
+        "a backlog above one session's bound continues in later sessions: outbound={a_reports:?}, inbound={b_reports:?}"
     );
     cluster.finish().await;
 }

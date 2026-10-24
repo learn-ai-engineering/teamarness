@@ -46,7 +46,9 @@ After the first command builds the debug executable, start a second Installation
 npm run dev:instance -- bob
 ```
 
-Each profile owns a distinct Installation identity and `core.sqlite3`. When creating or joining a Workspace, choose a Workspace-specific Person name; members can rename themselves in Workspace settings. Conversations shows remote authors' current names, updates already displayed Messages after rename, and retains an inspectable full Installation Public Identity. Duplicate or missing names keep an identity fallback; your own Messages remain `You`. Two-profile manual rename/restart verification for this incremental workstream is still outstanding. Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
+Each profile owns a distinct Installation identity and `core.sqlite3`. When creating or joining a Workspace, choose a Workspace-specific Person name. You can rename your Person in Workspace settings. Add a Workspace Agent by name in the same settings screen; Core creates and keeps its signing key locally. The Agent appears with its Steward in the member roster. A Steward can rename or remove their Agent, and the Workspace creator can remove another Person's Agent without removing that Person. The creator cannot rename someone else's Agent.
+
+Conversations shows remote authors' current Principal names and updates displayed Messages after a rename. A missing or duplicate name keeps an inspectable author-identity fallback; your own Messages remain **You**. An Agent-authored Message can be signed by a bound Package Instance, but the desktop Shell does not yet offer Agent Package binding or Agent Message composition. Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
 
 An absolute directory is available as an expert override. Arbitrary relative paths are rejected:
 
@@ -78,7 +80,7 @@ cargo clippy --workspace --exclude teamarness-desktop --all-targets --all-featur
 
 The bundled Packages are listed once in `packages/bundled-packages.json`. After editing it, run `node scripts/bundled-packages.mjs --write` and `npm run build`; `npm test` fails while the Tauri bundle configuration or the application index disagrees with the list.
 
-The Core Runtime public API is `teamarness_core::CoreRuntime`. Identity secrets, raw key bytes, SQLite handles, Iroh transport handles, canonical membership bytes, and private membership adapters remain private. The Tauri bridge carries only owned Installation, Workspace, membership, invitation, and stable-error DTOs.
+The Core Runtime public API is `teamarness_core::CoreRuntime`. Identity secrets, raw key bytes, SQLite handles, Iroh transport handles, canonical membership bytes, and private membership adapters remain private. The Tauri bridge carries only owned Installation, Workspace, membership, Principal, invitation, and stable-error DTOs. Agent keys and invitation material do not cross the bridge as Agent-management responses.
 
 ## Current-platform bundles
 
@@ -114,7 +116,7 @@ Invitation values are sensitive bearer admission material. Do not store them, pr
 
 Teamarness stores the Installation secret and Content Keys unencrypted in `core.sqlite3` inside the private data directory (ADR 0017). Any process running as your user, including trusted Package Backends, can read them. Use FileVault and encrypted backups, and keep development profiles out of cloud-synced folders. The Core Runtime refuses a data directory that is a symbolic link, belongs to another user, or holds unrelated files.
 
-Builds from this branch refuse data directories created before it. Reset a development profile with `rm -rf .teamarness-dev/<profile>`, and the packaged app with `rm -rf ~/Library/Application\ Support/dev.teamarness.desktop`.
+The runtime refuses a data directory that still holds retired version-1 protection controls. If a disposable development profile is refused, reset it with `rm -rf .teamarness-dev/<profile>`. For a disposable packaged-app profile, reset `~/Library/Application\ Support/dev.teamarness.desktop`. Back up any data you need before removing a profile.
 
 ## Package development
 

@@ -14,6 +14,8 @@ mod dispatcher;
 mod initialization;
 mod lifecycle;
 mod parent_lifeline;
+pub mod port_observation;
+pub mod ports;
 mod priority_writer;
 mod reader;
 mod router;
@@ -70,6 +72,7 @@ impl BackendRequest {
 pub struct BackendError {
     code: String,
     retryable: bool,
+    outcome_uncertain: bool,
     details: JsonValue,
 }
 
@@ -90,6 +93,7 @@ impl BackendError {
         Self {
             code,
             retryable,
+            outcome_uncertain: false,
             details: if details.is_object() {
                 details
             } else {
@@ -108,6 +112,22 @@ impl BackendError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         self.retryable
+    }
+
+    /// Whether a dispatched command may already have taken effect. Never replay it automatically.
+    #[must_use]
+    pub const fn outcome_uncertain(&self) -> bool {
+        self.outcome_uncertain
+    }
+
+    /// Marks a dispatched command's error as possibly committed. This also forbids retry.
+    #[must_use]
+    pub fn with_outcome_uncertain(mut self, uncertain: bool) -> Self {
+        self.outcome_uncertain = uncertain;
+        if uncertain {
+            self.retryable = false;
+        }
+        self
     }
 
     /// The bounded object the Package attached to this error.
@@ -140,6 +160,15 @@ impl EventSender {
             .map_err(|_| SdkError::ParentClosed)
     }
 
+    /// Sends any JSON Port value. The Port router wraps it for the object-only frame.
+    /// Ordinary UI events still require objects through [`Self::send`].
+    pub async fn send_port_value(&self, payload: JsonValue) -> Result<(), SdkError> {
+        self.sender
+            .send(Ok(payload))
+            .await
+            .map_err(|_| SdkError::ParentClosed)
+    }
+
     /// Closes the event stream with a Package-owned error.
     pub async fn fail(&self, error: BackendError) -> Result<(), SdkError> {
         self.sender
@@ -152,13 +181,20 @@ impl EventSender {
 /// Receiving half consumed by the SDK dispatcher.
 pub struct EventSubscription {
     pub(crate) receiver: mpsc::Receiver<Result<JsonValue, BackendError>>,
+    pub(crate) port_values: bool,
 }
 
 /// Creates a bounded event adapter. Capacity is clamped to 1 through 32.
 #[must_use]
 pub fn event_channel(capacity: usize) -> (EventSender, EventSubscription) {
     let (sender, receiver) = mpsc::channel(capacity.clamp(1, 32));
-    (EventSender { sender }, EventSubscription { receiver })
+    (
+        EventSender { sender },
+        EventSubscription {
+            receiver,
+            port_values: false,
+        },
+    )
 }
 
 /// Package-owned lifecycle, request, and event implementation.
@@ -185,6 +221,8 @@ pub trait Backend: Send + Sync + 'static {
 /// Builder for a Package Backend process service.
 pub struct Package {
     backend: Arc<dyn Backend>,
+    port_observations:
+        Option<tokio::sync::broadcast::Sender<port_observation::ProviderPortObservation>>,
 }
 
 impl Package {
@@ -194,7 +232,10 @@ impl Package {
     where
         B: Backend,
     {
-        Self { backend }
+        Self {
+            backend,
+            port_observations: None,
+        }
     }
 
     /// Creates an SDK service around an already-erased Backend, as [`Router`] does.
@@ -203,7 +244,19 @@ impl Package {
     /// [`Router::into_backend`].
     #[must_use]
     pub fn from_backend(backend: Arc<dyn Backend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            port_observations: None,
+        }
+    }
+
+    /// Opt in to a bounded, read-only diagnostic receiver. Lag reports a dropped observation;
+    /// no Provider request or event ever waits for this receiver.
+    #[must_use]
+    pub fn observe_ports(mut self) -> (Self, port_observation::ProviderPortObservations) {
+        let (sender, receiver) = tokio::sync::broadcast::channel(128);
+        self.port_observations = Some(sender);
+        (self, receiver)
     }
 
     /// Serves the protocol over process stdin and stdout.
@@ -231,6 +284,7 @@ impl Package {
         let package_runtime = tokio::runtime::Handle::current();
         let (result_tx, result_rx) = oneshot::channel();
         let backend = self.backend;
+        let observations = self.port_observations;
         let thread = std::thread::Builder::new()
             .name("teamarness-package-control".to_owned())
             .spawn(move || {
@@ -244,7 +298,8 @@ impl Package {
                         return;
                     }
                 };
-                let outcome = runtime.block_on(control_loop(backend, source, package_runtime));
+                let outcome =
+                    runtime.block_on(control_loop(backend, source, package_runtime, observations));
                 let _ = result_tx.send(outcome);
             })
             .map_err(|_| SdkError::ParentClosed)?;
@@ -269,6 +324,7 @@ async fn control_loop(
     backend: Arc<dyn Backend>,
     source: InputSource,
     package_runtime: tokio::runtime::Handle,
+    observations: Option<tokio::sync::broadcast::Sender<port_observation::ProviderPortObservation>>,
 ) -> Result<(), SdkError> {
     // Opening the process files belongs to the control runtime, so their blocking I/O never lands
     // on a Package worker.
@@ -322,6 +378,7 @@ async fn control_loop(
         streams.clone(),
         package_runtime,
         state,
+        observations,
     )
     .await;
     reader_task.abort();

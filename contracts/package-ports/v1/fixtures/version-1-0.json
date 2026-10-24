@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "$defs": {},
+  "contracts": [
+    {
+      "identity": "dev.example.conversations",
+      "major": 1,
+      "minor": 0,
+      "description": "Conversations interface",
+      "ports": [
+        {
+          "name": "conversation.send",
+          "kind": "command",
+          "description": "Send a message",
+          "request": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "response": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "conversation.list",
+          "kind": "query",
+          "description": "Conversation list",
+          "request": {
+            "type": "object",
+            "additionalProperties": false
+          },
+          "response": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "name": "conversation.sent",
+          "kind": "event",
+          "description": "Message sent",
+          "event": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -278,6 +278,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::CapabilityUnavailable,
         PackageErrorCode::CapabilityVersionUnsupported,
         PackageErrorCode::CapabilityRequestInvalid,
+        PackageErrorCode::PrincipalNotBound,
         PackageErrorCode::SpawnFailed,
         PackageErrorCode::HandshakeTimeout,
         PackageErrorCode::HandshakeMismatch,
@@ -297,12 +298,24 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::ShuttingDown,
         PackageErrorCode::UiEntrypointMissing,
         PackageErrorCode::UiContractViolation,
+        PackageErrorCode::PortContractViolation,
+        PackageErrorCode::PortProviderConflict,
+        PackageErrorCode::PortGraphSearchLimit,
+        PackageErrorCode::PortContractMissing,
+        PackageErrorCode::PortMissing,
+        PackageErrorCode::PortVersionMismatch,
+        PackageErrorCode::PortDependencyCycle,
+        PackageErrorCode::PortUnavailable,
+        PackageErrorCode::PortUngranted,
+        PackageErrorCode::PortRequestInvalid,
+        PackageErrorCode::PortResponseInvalid,
+        PackageErrorCode::PortEventInvalid,
         PackageErrorCode::UiLoadFailed,
         PackageErrorCode::UiException,
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 41);
+    assert_eq!(codes.len(), 54);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -323,6 +336,7 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::CapabilityUnavailable
             | PackageErrorCode::CapabilityVersionUnsupported
             | PackageErrorCode::CapabilityRequestInvalid
+            | PackageErrorCode::PrincipalNotBound
             | PackageErrorCode::SpawnFailed
             | PackageErrorCode::HandshakeTimeout
             | PackageErrorCode::HandshakeMismatch
@@ -342,6 +356,18 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::ShuttingDown
             | PackageErrorCode::UiEntrypointMissing
             | PackageErrorCode::UiContractViolation
+            | PackageErrorCode::PortContractViolation
+            | PackageErrorCode::PortProviderConflict
+            | PackageErrorCode::PortGraphSearchLimit
+            | PackageErrorCode::PortContractMissing
+            | PackageErrorCode::PortMissing
+            | PackageErrorCode::PortVersionMismatch
+            | PackageErrorCode::PortDependencyCycle
+            | PackageErrorCode::PortUnavailable
+            | PackageErrorCode::PortUngranted
+            | PackageErrorCode::PortRequestInvalid
+            | PackageErrorCode::PortResponseInvalid
+            | PackageErrorCode::PortEventInvalid
             | PackageErrorCode::UiLoadFailed
             | PackageErrorCode::UiException
             | PackageErrorCode::StaleMount
@@ -373,6 +399,22 @@ fn public_source_does_not_export_dependency_types() {
 
     let token = UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
     assert_eq!(format!("{token:?}"), "UiResourceToken([redacted])");
+}
+
+#[test]
+fn principal_not_bound_error_keeps_capability_stage_and_recovery() {
+    let envelope = PackageErrorEnvelope::new(
+        PackageErrorCode::PrincipalNotBound,
+        PackageErrorStage::Capability,
+        false,
+        RecoveryAction::CorrectPackageSource,
+        teamarness_package_host::DiagnosticId::new("diag-fixture").unwrap(),
+    );
+    let value = serde_json::to_value(envelope).unwrap();
+    assert_eq!(value["code"], "principal_not_bound");
+    assert_eq!(value["stage"], "capability");
+    assert_eq!(value["retryable"], false);
+    assert_eq!(value["recovery"], "correct_package_source");
 }
 
 #[test]

@@ -89,11 +89,11 @@ fn capability(name: &str, method: &str, arguments: PackageValue) -> PackageValue
 }
 
 #[tokio::test]
-async fn reserved_person_name_package_cannot_be_admitted_or_granted() {
+async fn reserved_principal_package_cannot_be_admitted_or_granted() {
     let fixture = common::Fixture::node_with_capabilities(
         &[
-            ("reserved", "internal:teamarness.person-names"),
-            ("previously-valid", "internal.teamarness.person-names"),
+            ("reserved", "internal:teamarness.principals"),
+            ("previously-valid", "internal.teamarness.principals"),
         ],
         &[serde_json::json!({"identity":"teamarness.immutable-record-log","major":1,"minMinor":0,"maxMinor":0})],
     )
@@ -105,12 +105,12 @@ async fn reserved_person_name_package_cannot_be_admitted_or_granted() {
     assert_eq!(snapshot.packages.len(), 1);
     assert_eq!(
         snapshot.packages[0].identity.as_str(),
-        "internal.teamarness.person-names"
+        "internal.teamarness.principals"
     );
     assert_eq!(snapshot.instances.len(), 1);
     assert_eq!(
         snapshot.instances[0].key.package_identity.as_str(),
-        "internal.teamarness.person-names"
+        "internal.teamarness.principals"
     );
     assert!(
         snapshot
@@ -121,9 +121,9 @@ async fn reserved_person_name_package_cannot_be_admitted_or_granted() {
 }
 
 #[tokio::test]
-async fn person_name_capability_negotiates_only_supported_major_and_minor() {
+async fn principal_capability_negotiates_only_supported_major_and_minor() {
     let requirements = [
-        serde_json::json!({"identity":"teamarness.person-names","major":2,"minMinor":0,"maxMinor":0}),
+        serde_json::json!({"identity":"teamarness.principals","major":2,"minMinor":0,"maxMinor":0}),
     ];
     let fixture = common::Fixture::node_with_capabilities(
         &[("unsupported", "dev.teamarness.unsupported")],
@@ -149,10 +149,10 @@ async fn person_name_capability_negotiates_only_supported_major_and_minor() {
 }
 
 #[tokio::test]
-async fn independent_fixture_reads_person_names_without_membership_authority() {
+async fn independent_fixture_reads_principals_without_membership_authority() {
     let fixture = common::Fixture::node_with_capabilities(
         &[("fixture", "dev.teamarness.fixture")],
-        &[serde_json::json!({"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0})],
+        &[serde_json::json!({"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0})],
     ).await;
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
@@ -162,7 +162,7 @@ async fn independent_fixture_reads_person_names_without_membership_authority() {
         &host,
         mount.clone(),
         "names",
-        capability("teamarness.person-names", "current", object([])),
+        capability("teamarness.principals", "current", object([])),
     )
     .await;
     assert_eq!(
@@ -172,7 +172,7 @@ async fn independent_fixture_reads_person_names_without_membership_authority() {
         ))
     );
     assert!(
-        matches!(result.get("persons"), Some(PackageValue::Array(values)) if values.len() == 1)
+        matches!(result.get("principals"), Some(PackageValue::Array(values)) if values.len() == 1)
     );
     assert_eq!(
         result.get("cursor"),
@@ -182,23 +182,23 @@ async fn independent_fixture_reads_person_names_without_membership_authority() {
     let lookup = call(
         &host,
         mount.clone(),
-        "lookup-name",
+        "lookup-principal",
         capability(
-            "teamarness.person-names",
+            "teamarness.principals",
             "lookup",
             object([("identity", PackageValue::String(identity.clone()))]),
         ),
     )
     .await;
     assert!(
-        matches!(lookup.get("person"), Some(PackageValue::Object(person)) if person.get("identity") == Some(&PackageValue::String(identity)))
+        matches!(lookup.get("principal"), Some(PackageValue::Object(person)) if person.get("keys") == Some(&PackageValue::Array(vec![PackageValue::String(identity)])))
     );
     let invalid = call(
         &host,
         mount,
-        "invalid-name-lookup",
+        "invalid-principal-lookup",
         capability(
-            "teamarness.person-names",
+            "teamarness.principals",
             "lookup",
             object([("identity", PackageValue::String("short".into()))]),
         ),
@@ -211,10 +211,10 @@ async fn independent_fixture_reads_person_names_without_membership_authority() {
 }
 
 #[tokio::test]
-async fn independent_fixture_resumes_person_name_stream_after_rename() {
+async fn independent_fixture_resumes_principal_stream_after_rename() {
     let fixture = common::Fixture::node_with_capabilities(
         &[("fixture", "dev.teamarness.fixture")],
-        &[serde_json::json!({"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0})],
+        &[serde_json::json!({"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0})],
     ).await;
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
@@ -225,7 +225,7 @@ async fn independent_fixture_resumes_person_name_stream_after_rename() {
         &host,
         &mount,
         "names-open",
-        "fixture.person_names_open",
+        "fixture.principals_open",
         object([("afterCursor", PackageValue::String("0".into()))]),
     )
     .await;
@@ -239,7 +239,7 @@ async fn independent_fixture_resumes_person_name_stream_after_rename() {
             &host,
             &mount,
             &format!("names-events-{attempt}"),
-            "fixture.person_names_events",
+            "fixture.principals_events",
             object([]),
         )
         .await;
@@ -247,7 +247,7 @@ async fn independent_fixture_resumes_person_name_stream_after_rename() {
             && let Some(PackageValue::Object(snapshot)) = events.last()
         {
             assert!(
-                matches!(snapshot.get("persons"), Some(PackageValue::Array(persons)) if persons.iter().any(|person| matches!(person, PackageValue::Object(value) if value.get("name") == Some(&PackageValue::String("👩‍💻".into())))))
+                matches!(snapshot.get("principals"), Some(PackageValue::Array(persons)) if persons.iter().any(|person| matches!(person, PackageValue::Object(value) if value.get("name") == Some(&PackageValue::String("👩‍💻".into())))))
             );
             break snapshot.get("cursor").unwrap().clone();
         }
@@ -262,7 +262,7 @@ async fn independent_fixture_resumes_person_name_stream_after_rename() {
         &host,
         &mount,
         "names-close",
-        "fixture.person_names_close",
+        "fixture.principals_close",
         object([]),
     )
     .await;
@@ -270,7 +270,7 @@ async fn independent_fixture_resumes_person_name_stream_after_rename() {
         &host,
         &mount,
         "names-resume",
-        "fixture.person_names_open",
+        "fixture.principals_open",
         object([("afterCursor", cursor.clone())]),
     )
     .await;
@@ -285,7 +285,7 @@ async fn independent_fixture_resumes_person_name_stream_after_rename() {
             &host,
             &mount,
             &format!("names-resumed-{attempt}"),
-            "fixture.person_names_events",
+            "fixture.principals_events",
             object([]),
         )
         .await;
@@ -342,9 +342,10 @@ async fn routes_scoped_workspace_membership_and_signing_calls() {
         capability("teamarness.membership", "current", object([])),
     )
     .await;
+    // Genesis now atomically includes the creator's Person group and attachment.
     assert_eq!(
         current.get("epoch"),
-        Some(&PackageValue::String("0".into()))
+        Some(&PackageValue::String("2".into()))
     );
     assert!(
         matches!(current.get("members"), Some(PackageValue::Array(values)) if values.len() == 1)
@@ -426,6 +427,165 @@ async fn routes_scoped_workspace_membership_and_signing_calls() {
     assert_eq!(
         selector.get("error"),
         Some(&PackageValue::String("capability_request_invalid".into()))
+    );
+}
+
+#[tokio::test]
+async fn bound_agent_append_uses_agent_signer_and_replicates_to_peer() {
+    const FAMILY: &str = "teamarness.synchronization.immutable-record-log";
+    const PACKAGE: &str = "dev.teamarness.fixture";
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", PACKAGE), ("other", "dev.teamarness.other")],
+        &[serde_json::json!({"identity":FAMILY,"major":1,"minMinor":1,"maxMinor":1}),
+          serde_json::json!({"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let peer = common::open_core(fixture._root.path().join("peer")).await;
+    common::introduce(&fixture.core, &peer);
+    peer.join_workspace(&common::invite(&fixture.core, workspace).await)
+        .await
+        .unwrap();
+    let agent = fixture.core.add_agent(workspace, "Test Agent").unwrap();
+    let agent_key = fixture
+        .core
+        .principal(workspace, agent)
+        .unwrap()
+        .unwrap()
+        .keys()[0];
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let request = || {
+        capability(
+            FAMILY,
+            "append",
+            object([
+                ("purpose", PackageValue::String("message.post".into())),
+                ("canonical", PackageValue::String("aGVsbG8".into())),
+                ("principal", PackageValue::String(agent.to_string())),
+            ]),
+        )
+    };
+    let unbound = call(&host, mount.clone(), "agent-unbound", request()).await;
+    assert_eq!(
+        unbound.get("error"),
+        Some(&PackageValue::String("principal_not_bound".into()))
+    );
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, PACKAGE)
+        .unwrap();
+    let other = self::mount(&host, 1).await;
+    let foreign = call(&host, other, "agent-foreign-package", request()).await;
+    assert_eq!(
+        foreign.get("error"),
+        Some(&PackageValue::String("principal_not_bound".into()))
+    );
+    let appended = call(&host, mount.clone(), "agent-bound", request()).await;
+    assert_eq!(
+        appended.get("author"),
+        Some(&PackageValue::String(agent_key.to_string()))
+    );
+    assert_ne!(
+        appended.get("author"),
+        Some(&PackageValue::String(
+            fixture.core.public_identity().to_string()
+        ))
+    );
+    let snapshot = call(
+        &host,
+        mount.clone(),
+        "agent-snapshot",
+        capability("teamarness.principals", "current", object([])),
+    )
+    .await;
+    assert!(
+        matches!(snapshot.get("principals"), Some(PackageValue::Array(rows)) if rows.iter().any(|row|
+        matches!(row, PackageValue::Object(value) if value.get("principalId") == Some(&PackageValue::String(agent.to_string()))
+            && value.get("kind") == Some(&PackageValue::String("agent".into())))))
+    );
+    let by_id = call(
+        &host,
+        mount,
+        "agent-by-id",
+        capability(
+            "teamarness.principals",
+            "lookup",
+            object([("principalId", PackageValue::String(agent.to_string()))]),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(by_id.get("principal"), Some(PackageValue::Object(value)) if
+        value.get("keys") == Some(&PackageValue::Array(vec![PackageValue::String(agent_key.to_string())])))
+    );
+    let expected = appended.get("recordId").cloned().unwrap();
+    common::eventually(
+        std::time::Duration::from_secs(30),
+        "Agent record reaches peer",
+        || async {
+            let Ok(mut stream) = peer.subscribe_records(workspace, PACKAGE, None) else {
+                return false;
+            };
+            let Ok(page) = stream.next_page(32) else {
+                return false;
+            };
+            page.events.iter().any(|event| {
+                PackageValue::String(event.record_id().to_string()) == expected
+                    && event.author() == agent_key
+            })
+        },
+    )
+    .await;
+    peer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn record_log_1_0_rejects_principal_selector_and_removed_family() {
+    const FAMILY: &str = "teamarness.synchronization.immutable-record-log";
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &[serde_json::json!({"identity":FAMILY,"major":1,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let refused = call(
+        &host,
+        mount,
+        "old-minor-selector",
+        capability(
+            FAMILY,
+            "append",
+            object([
+                ("purpose", PackageValue::String("message.post".into())),
+                ("canonical", PackageValue::String("aGVsbG8".into())),
+                ("principal", PackageValue::String("a".repeat(64))),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.get("error"),
+        Some(&PackageValue::String("capability_request_invalid".into()))
+    );
+    let old = common::Fixture::node_with_capabilities(
+        &[("old", "dev.teamarness.old")],
+        &[serde_json::json!({"identity":"teamarness.person-names","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    let old_host = PackageHost::open(old.config.clone(), old.core.clone())
+        .await
+        .unwrap();
+    assert!(
+        old_host
+            .snapshot()
+            .await
+            .diagnostics
+            .iter()
+            .any(|entry| entry.code == PackageErrorCode::CapabilityUnavailable)
     );
 }
 
@@ -923,7 +1083,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
     for name in [
         "workspace-context.schema.json",
         "membership.schema.json",
-        "person-names.schema.json",
+        "principals.schema.json",
         "signing.schema.json",
         "immutable-record-log.schema.json",
         "signing-envelope.golden.json",

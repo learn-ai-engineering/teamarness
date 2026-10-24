@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::cancellation::CancellationToken;
 use crate::capability::{CapabilityClient, CapabilityStreams, PendingCapabilities};
+use crate::port_observation::{self, ProviderPortObservation, ProviderPortStage};
 use crate::priority_writer::{PriorityWriter, SharedState};
 use crate::{Backend, BackendError, BackendRequest, Initialization, SdkError, object};
 
@@ -39,6 +40,7 @@ struct InFlight {
     answered: Arc<AtomicBool>,
 }
 
+#[allow(clippy::too_many_arguments)] // The optional observer adds no work to the seven transport seams.
 pub(crate) async fn run(
     backend: Arc<dyn Backend>,
     writer: Arc<PriorityWriter>,
@@ -47,6 +49,7 @@ pub(crate) async fn run(
     capability_streams: CapabilityStreams,
     package_runtime: Handle,
     state: SharedState,
+    observations: Option<tokio::sync::broadcast::Sender<ProviderPortObservation>>,
 ) -> Result<(), SdkError> {
     let initialize = frames.recv().await.ok_or(SdkError::ParentClosed)?;
     if initialize.kind() != FrameKind::Initialize {
@@ -128,6 +131,8 @@ pub(crate) async fn run(
                                 }
                             }
                         }
+                        let observed = port_observation::operation(&operation);
+                        emit(&observations, observed, &id, ProviderPortStage::Received, None);
                         let request = BackendRequest {
                             operation,
                             payload: frame.field("payload").cloned().ok_or(SdkError::Protocol("malformed_frame"))?,
@@ -143,6 +148,7 @@ pub(crate) async fn run(
                         let task_id = id.clone();
                         let answered = Arc::new(AtomicBool::new(false));
                         let task_answered = answered.clone();
+                        let observer = observations.clone();
                         let task = package_runtime.spawn(async move {
                             let result = if is_lifecycle {
                                 let _barrier = lifecycle.lock().await;
@@ -159,6 +165,10 @@ pub(crate) async fn run(
                             // terminal frame at all. Only a session that has
                             // already ended can fail this send.
                             if !task_answered.swap(true, Ordering::AcqRel) {
+                                let stage = if result.is_ok() { ProviderPortStage::Completed } else { ProviderPortStage::Failed };
+                                let code = result.as_ref().err().map(|error| error.code().to_owned());
+                                let uncertain = result.as_ref().err().is_some_and(BackendError::outcome_uncertain);
+                                emit(&observer, observed, &id, stage, code.map(|code| (code, uncertain)));
                                 let _ = writer.control_waiting(terminal(&id, result)).await;
                             }
                             let _ = done.send(id).await;
@@ -193,7 +203,8 @@ pub(crate) async fn run(
                         .await
                         .is_err()
                         {
-                            return Err(SdkError::Protocol("event_lagged"));
+                            state.lock().await.retire_stream(&id);
+                            writer.control(stream_close(&id, "event_lagged")).await?;
                         }
                     }
                     FrameKind::Response | FrameKind::Error => {
@@ -201,7 +212,7 @@ pub(crate) async fn run(
                         // The classifier has already decided this frame. A call
                         // whose caller stopped waiting has no correlation entry
                         // left, and the answer is simply dropped.
-                        let Some(sender) = pending_capabilities.lock().await.remove(&id) else {
+                        let Some(pending) = pending_capabilities.lock().await.remove(&id) else {
                             continue;
                         };
                         let result = if frame.kind() == FrameKind::Response {
@@ -211,9 +222,9 @@ pub(crate) async fn run(
                                 frame.field("code").and_then(JsonValue::as_str).unwrap_or("capability_error"),
                                 frame.field("retryable").and_then(JsonValue::as_bool).unwrap_or(false),
                                 frame.field("details").cloned().unwrap_or_else(empty_object),
-                            ))
+                            ).with_outcome_uncertain(frame.field("outcomeUncertain").and_then(JsonValue::as_bool).unwrap_or(false)))
                         };
-                        let _ = sender.send(result);
+                        let _ = pending.sender.send(result);
                     }
                     FrameKind::Ping => {
                         writer.control(object([
@@ -236,8 +247,10 @@ pub(crate) async fn run(
                             continue;
                         }
                         let cancellation = CancellationToken::new();
+                        let operation = string_field(&frame, "topic")?;
+                        let observed = port_observation::operation(&operation);
                         let request = BackendRequest {
-                            operation: string_field(&frame, "topic")?,
+                            operation,
                             payload: frame.field("payload").cloned().ok_or(SdkError::Protocol("malformed_frame"))?,
                             initialization: initialization.clone(),
                             capabilities: capabilities.clone(),
@@ -249,16 +262,20 @@ pub(crate) async fn run(
                         let stream_id = id.clone();
                         let credit = Arc::new(Semaphore::new(INITIAL_STREAM_CREDIT));
                         let stream_credit = credit.clone();
+                        let observer = observations.clone();
                         let task = package_runtime.spawn(async move {
                             // The Package's own code reaches the Host, and through it the UI.
                             let mut subscription = match backend.subscribe(request).await {
                                 Ok(subscription) => subscription,
                                 Err(error) => {
+                                    emit(&observer, observed, &stream_id, ProviderPortStage::Failed,
+                                        Some((error.code().to_owned(), error.outcome_uncertain())));
                                     let _ =
                                         writer.data(stream_close(&stream_id, error.code())).await;
                                     return;
                                 }
                             };
+                            emit(&observer, observed, &stream_id, ProviderPortStage::Opened, None);
                             let mut sequence = 0_u64;
                             while let Some(event) = subscription.receiver.recv().await {
                                 let permit = match stream_credit.acquire().await {
@@ -268,6 +285,9 @@ pub(crate) async fn run(
                                 permit.forget();
                                 match event {
                                     Ok(payload) => {
+                                        let payload = if subscription.port_values {
+                                            crate::ports::encode_port_value(payload)
+                                        } else { payload };
                                         sequence += 1;
                                         if writer.data(object([
                                             ("kind", JsonValue::String("event".into())),
@@ -275,13 +295,17 @@ pub(crate) async fn run(
                                             ("sequence", JsonValue::String(sequence.to_string())),
                                             ("payload", payload),
                                         ])).await.is_err() { return; }
+                                        emit(&observer, observed, &stream_id, ProviderPortStage::Event, None);
                                     }
                                     Err(error) => {
+                                        emit(&observer, observed, &stream_id, ProviderPortStage::Failed,
+                                            Some((error.code().to_owned(), error.outcome_uncertain())));
                                         let _ = writer.data(stream_close(&stream_id, error.code())).await;
                                         return;
                                     }
                                 }
                             }
+                            emit(&observer, observed, &stream_id, ProviderPortStage::Closed, None);
                             let _ = writer.data(stream_close(&stream_id, "completed")).await;
                         });
                         streams.insert(id, (task, credit, cancellation));
@@ -327,6 +351,26 @@ pub(crate) async fn run(
                 }
             }
         }
+    }
+}
+
+fn emit(
+    sender: &Option<tokio::sync::broadcast::Sender<ProviderPortObservation>>,
+    operation: Option<&'static str>,
+    provider_id: &str,
+    stage: ProviderPortStage,
+    error: Option<(String, bool)>,
+) {
+    if let (Some(sender), Some(operation)) = (sender, operation) {
+        let (code, outcome_uncertain) =
+            error.map_or((None, false), |(code, uncertain)| (Some(code), uncertain));
+        let _ = sender.send(ProviderPortObservation {
+            provider_id: provider_id.to_owned(),
+            operation,
+            stage,
+            code,
+            outcome_uncertain,
+        });
     }
 }
 
@@ -407,13 +451,17 @@ fn terminal(id: &str, result: Result<JsonValue, BackendError>) -> JsonValue {
 }
 
 fn error_frame(id: &str, error: &BackendError) -> JsonValue {
-    object([
+    let mut frame = object([
         ("kind", JsonValue::String("error".into())),
         ("id", JsonValue::String(id.into())),
         ("code", JsonValue::String(error.code.clone())),
         ("retryable", JsonValue::Bool(error.retryable)),
         ("details", error.details.clone()),
-    ])
+    ]);
+    if error.outcome_uncertain() {
+        frame["outcomeUncertain"] = JsonValue::Bool(true);
+    }
+    frame
 }
 
 fn stream_close(stream_id: &str, code: &str) -> JsonValue {
@@ -426,4 +474,141 @@ fn stream_close(stream_id: &str, code: &str) -> JsonValue {
 
 fn empty_object() -> JsonValue {
     JsonValue::Object(Default::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::priority_writer;
+    use teamarness_package_protocol::{Frame, MAX_WRITER_FRAMES, decode_frame};
+    use tokio::io::{AsyncReadExt, DuplexStream, duplex};
+    use tokio::sync::oneshot;
+
+    async fn read_frame(stream: &mut DuplexStream) -> Frame {
+        let mut prefix = [0; 4];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize + 4];
+        bytes[..4].copy_from_slice(&prefix);
+        stream.read_exact(&mut bytes[4..]).await.unwrap();
+        decode_frame(&bytes).unwrap()
+    }
+
+    fn frame(value: JsonValue) -> Frame {
+        Frame::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn uncertain_author_error_is_a_nonretryable_wire_error() {
+        let error = BackendError::new("fixture.committed", true, empty_object())
+            .with_outcome_uncertain(true);
+        let value = terminal("p:command", Err(error));
+        assert_eq!(value["outcomeUncertain"], true);
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["code"], "fixture.committed");
+        Frame::try_from(value).expect("the uncertain error is a valid Process frame");
+    }
+
+    // Verifies: TEAM.SYS.PKG-R14
+    #[tokio::test]
+    async fn inbound_event_lag_closes_one_stream_and_dispatcher_answers_ping() {
+        let (writer, control, data) = PriorityWriter::channels();
+        let writer = Arc::new(writer);
+        let state = Arc::new(Mutex::new(
+            teamarness_package_protocol::ContractState::default(),
+        ));
+        let (sdk_out, mut host_in) = duplex(4096);
+        let (stop, stopped) = oneshot::channel();
+        let writer_task = tokio::spawn(priority_writer::run(
+            sdk_out,
+            control,
+            data,
+            stopped,
+            state.clone(),
+        ));
+        let (host_frames, frames) = mpsc::channel(MAX_WRITER_FRAMES);
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let streams: CapabilityStreams = Arc::new(Mutex::new(BTreeMap::new()));
+        let task = tokio::spawn(run(
+            crate::Router::stateless().into_backend(),
+            writer.clone(),
+            frames,
+            pending,
+            streams.clone(),
+            Handle::current(),
+            state,
+            None,
+        ));
+        host_frames.send(frame(serde_json::json!({
+            "kind":"initialize","nonce":"bm9uY2U",
+            "package":{"identity":"dev.teamarness.fixture","version":"1.0.0",
+                "manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+            "uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "processGeneration":"1","workspace":{"id":"workspace1","name":"Workspace"},
+            "installation":{"identity":"installation1","displayName":"Installation"},
+            "dataDirectory":{"path":"/tmp/package","continuityId":"Y29udGludWl0eQ"},
+            "protocol":{"major":1,"minor":0},"capabilities":[],
+            "limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,
+                "maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}
+        }))).await.unwrap();
+        assert_eq!(
+            read_frame(&mut host_in).await.kind(),
+            FrameKind::Initialized
+        );
+        for id in ["p:slow", "p:peer"] {
+            writer
+                .control(serde_json::json!({"kind":"stream_open","id":id,
+                "topic":"capability.stream","initialCredit":32,"payload":{}}))
+                .await
+                .unwrap();
+            assert_eq!(read_frame(&mut host_in).await.kind(), FrameKind::StreamOpen);
+        }
+        // The test injects a smaller adapter queue while retaining the wire's
+        // legal 32-event credit. This is the only way a conforming classifier
+        // can expose adapter lag without fabricating a fatal credit violation.
+        const LAG_TEST_QUEUE: usize = INITIAL_STREAM_CREDIT / INITIAL_STREAM_CREDIT;
+        let (slow, mut slow_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        let (peer, mut peer_rx) = mpsc::channel(LAG_TEST_QUEUE);
+        streams.lock().await.extend([
+            (
+                "p:slow".into(),
+                crate::capability::CapabilityStreamRoute { sender: slow },
+            ),
+            (
+                "p:peer".into(),
+                crate::capability::CapabilityStreamRoute { sender: peer },
+            ),
+        ]);
+        for (id, sequence) in [("p:slow", 1), ("p:slow", 2), ("p:peer", 1)] {
+            host_frames
+                .send(frame(serde_json::json!({"kind":"event","streamId":id,
+                "sequence":sequence.to_string(),"payload":{"order":sequence}})))
+                .await
+                .unwrap();
+        }
+        let close = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut host_in))
+            .await
+            .unwrap();
+        assert_eq!(close.kind(), FrameKind::StreamClose);
+        assert_eq!(close.field("streamId").unwrap(), "p:slow");
+        assert_eq!(close.field("code").unwrap(), "event_lagged");
+        assert_eq!(slow_rx.recv().await.unwrap().unwrap()["order"], 1);
+        assert_eq!(
+            slow_rx.recv().await.unwrap().unwrap_err().code(),
+            "event_lagged"
+        );
+        assert_eq!(peer_rx.recv().await.unwrap().unwrap()["order"], 1);
+        host_frames
+            .send(frame(serde_json::json!({"kind":"ping","nonce":"cGVlcg"})))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut host_in))
+            .await
+            .unwrap();
+        assert_eq!(pong.kind(), FrameKind::Pong);
+        drop(host_frames);
+        assert!(matches!(task.await.unwrap(), Err(SdkError::ParentClosed)));
+        let _ = stop.send(());
+        writer_task.await.unwrap().unwrap();
+    }
 }

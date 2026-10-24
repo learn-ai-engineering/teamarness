@@ -14,6 +14,15 @@ pub use teamarness_package_host::{
     RecoveryAction,
 };
 
+pub struct AuthoringCatalogEntry {
+    package: PackageCatalogEntry,
+    provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
+    definitions: serde_json::Map<String, serde_json::Value>,
+    consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+    availability: Vec<admission::PortAvailability>,
+    diagnostics: Vec<PackageErrorEnvelope>,
+}
+
 #[path = "../src/admission.rs"]
 mod admission;
 #[path = "../src/catalog.rs"]
@@ -534,4 +543,831 @@ fn ui_cache_is_digest_addressed_read_only_and_public_snapshot_is_url_neutral() {
         second.admissions[0].ui.cache.admitted_root,
         admitted.ui.cache.admitted_root
     );
+}
+
+fn declare_ports(root: &Path, provided: Vec<serde_json::Value>, consumed: Vec<serde_json::Value>) {
+    let path = root.join("teamarness.package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    if !provided.is_empty() {
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"schemaVersion":1,"$defs":{},"contracts":provided}),
+        )
+        .unwrap();
+        fs::write(root.join("ports.json"), &bytes).unwrap();
+        manifest["portContract"] = serde_json::json!({"path":"ports.json","sha256":digest(&bytes)});
+    }
+    if !consumed.is_empty() {
+        manifest["consumedPorts"] = consumed.into();
+    }
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
+fn provided(identity: &str, minor: u16) -> serde_json::Value {
+    serde_json::json!({"identity":identity,"major":1,"minor":minor,
+        "description":"Provides fixture actions.","ports":[
+            {"name":"fixture.run","kind":"command","description":"Run a fixture action.","request":true,"response":true},
+            {"name":"fixture.read","kind":"query","description":"Read a fixture value.","request":true,"response":true}]})
+}
+
+fn consumed(
+    identity: &str,
+    min: u16,
+    max: u16,
+    required: bool,
+    port: &str,
+    kind: &str,
+) -> serde_json::Value {
+    serde_json::json!({"identity":identity,"major":1,"minMinor":min,"maxMinor":max,
+        "required":required,"ports":[{"name":port,"kind":kind}]})
+}
+
+fn codes(report: &admission::AdmissionReport) -> Vec<(String, PackageErrorCode)> {
+    report
+        .snapshot
+        .diagnostics
+        .iter()
+        .filter_map(|error| Some((error.affected_package.as_ref()?.to_string(), error.code)))
+        .collect()
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn port_graph_is_order_independent_and_keeps_valid_incumbent_on_reopen() {
+    for reverse in [false, true] {
+        let fixture = Fixture::new();
+        let registrations = [
+            ("alpha", "com.example.alpha"),
+            ("beta", "com.example.beta"),
+            ("consumer", "com.example.consumer"),
+            ("unrelated", "com.example.unrelated"),
+        ];
+        for (dir, id) in registrations {
+            fixture.add_application(dir, id, "1.0.0");
+        }
+        for dir in ["alpha", "beta"] {
+            declare_ports(
+                &fixture.application.join(dir),
+                vec![provided("com.example.shared", 2)],
+                vec![],
+            );
+        }
+        declare_ports(
+            &fixture.application.join("consumer"),
+            vec![],
+            vec![consumed(
+                "com.example.shared",
+                1,
+                3,
+                true,
+                "fixture.run",
+                "command",
+            )],
+        );
+        if reverse {
+            let path = fixture.application.join("application-packages.v1.json");
+            let mut index: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            index["packages"].as_array_mut().unwrap().reverse();
+            fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
+        }
+        let first = admit(&fixture.config()).unwrap();
+        assert_eq!(
+            package_ids(&first),
+            vec![
+                "com.example.alpha",
+                "com.example.consumer",
+                "com.example.unrelated"
+            ]
+        );
+        assert!(codes(&first).contains(&(
+            "com.example.beta".into(),
+            PackageErrorCode::PortProviderConflict
+        )));
+        assert_eq!(
+            first.graph[&"com.example.consumer".parse().unwrap()][0].minor,
+            Some(2)
+        );
+        let second = admit(&fixture.config()).unwrap();
+        assert_eq!(package_ids(&second), package_ids(&first));
+        // A valid incumbent outranks an otherwise lexically earlier newcomer.
+        let path = fixture.application.join("beta/teamarness.package.json");
+        let mut broken: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        broken["portContract"]["sha256"] = "0".repeat(64).into();
+        fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
+        let third = admit(&fixture.config()).unwrap();
+        assert_eq!(package_ids(&third), package_ids(&first));
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn graph_diagnoses_required_dependencies_and_keeps_optional_absence() {
+    let fixture = Fixture::new();
+    for (dir, id) in [
+        ("a", "com.example.a"),
+        ("b", "com.example.b"),
+        ("c", "com.example.c"),
+        ("d", "com.example.d"),
+        ("e", "com.example.e"),
+        ("f", "com.example.f"),
+        ("g", "com.example.g"),
+    ] {
+        fixture.add_application(dir, id, "1.0.0");
+    }
+    declare_ports(
+        &fixture.application.join("a"),
+        vec![],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("b"),
+        vec![provided("com.example.bport", 0)],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("c"),
+        vec![],
+        vec![consumed(
+            "com.example.bport",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("d"),
+        vec![],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            false,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("e"),
+        vec![],
+        vec![consumed(
+            "com.example.bport",
+            1,
+            2,
+            false,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("f"),
+        vec![provided("com.example.fport", 0)],
+        vec![consumed(
+            "com.example.gport",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("g"),
+        vec![provided("com.example.gport", 0)],
+        vec![consumed(
+            "com.example.fport",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let report = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&report), vec!["com.example.d", "com.example.e"]);
+    for (id, code) in [
+        ("a", PackageErrorCode::PortContractMissing),
+        ("b", PackageErrorCode::PortContractMissing),
+        ("c", PackageErrorCode::PortContractMissing),
+        ("f", PackageErrorCode::PortDependencyCycle),
+        ("g", PackageErrorCode::PortDependencyCycle),
+    ] {
+        assert!(
+            codes(&report).contains(&(format!("com.example.{id}"), code)),
+            "{id}: {:?}",
+            codes(&report)
+        );
+    }
+    assert_eq!(
+        report.graph[&"com.example.d".parse().unwrap()][0].minor,
+        None
+    );
+    assert_eq!(
+        report.graph[&"com.example.e".parse().unwrap()][0].minor,
+        None
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn graph_distinguishes_missing_port_kind_and_version_and_replaces_invalid_incumbent() {
+    let fixture = Fixture::new();
+    for (dir, id) in [
+        ("provider", "com.example.provider"),
+        ("consumer", "com.example.consumer"),
+        ("version", "com.example.version"),
+        ("kind", "com.example.kind"),
+    ] {
+        fixture.add_application(dir, id, "1.0.0");
+    }
+    declare_ports(
+        &fixture.application.join("provider"),
+        vec![provided("com.example.shared", 2)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            3,
+            true,
+            "fixture.absent",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("version"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            3,
+            4,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("kind"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            3,
+            true,
+            "fixture.run",
+            "event",
+        )],
+    );
+    let report = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&report), vec!["com.example.provider"]);
+    assert!(
+        codes(&report).contains(&("com.example.consumer".into(), PackageErrorCode::PortMissing))
+    );
+    assert!(codes(&report).contains(&(
+        "com.example.version".into(),
+        PackageErrorCode::PortVersionMismatch
+    )));
+    assert!(codes(&report).contains(&("com.example.kind".into(), PackageErrorCode::PortMissing)));
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn incumbent_survives_earlier_newcomer_and_invalid_incumbent_is_replaced() {
+    let fixture = Fixture::new();
+    fixture.add_application("beta", "com.example.beta", "1.0.0");
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.beta"]
+    );
+    fixture.add_application("alpha", "com.example.alpha", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.shared", 2)],
+        vec![],
+    );
+    let reopened = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&reopened), vec!["com.example.beta"]);
+    assert!(codes(&reopened).contains(&(
+        "com.example.alpha".into(),
+        PackageErrorCode::PortProviderConflict
+    )));
+    let path = fixture.application.join("beta/teamarness.package.json");
+    let mut broken: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    broken["portContract"]["sha256"] = "0".repeat(64).into();
+    fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
+    let replaced = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&replaced), vec!["com.example.alpha"]);
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.alpha"]
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn dependency_invalid_incumbent_yields_to_a_viable_provider_on_reopen() {
+    let fixture = Fixture::new();
+    fixture.add_application("beta", "com.example.beta", "1.0.0");
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.beta"]
+    );
+    fixture.add_application("alpha", "com.example.alpha", "1.0.0");
+    fixture.add_application("consumer", "com.example.consumer", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.shared", 1)],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let reopened = admit(&fixture.config()).unwrap();
+    assert_eq!(
+        package_ids(&reopened),
+        vec!["com.example.alpha", "com.example.consumer"]
+    );
+    assert!(codes(&reopened).contains(&(
+        "com.example.beta".into(),
+        PackageErrorCode::PortContractMissing
+    )));
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.alpha", "com.example.consumer"]
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn rival_breaks_provisional_cycle_without_discarding_dependent_provider() {
+    let fixture = Fixture::new();
+    fixture.add_application("alpha", "com.example.alpha", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.alpha"]
+    );
+    fixture.add_application("beta", "com.example.beta", "1.0.0");
+    fixture.add_application("delta", "com.example.delta", "1.0.0");
+    fixture.add_application("consumer", "com.example.consumer", "1.0.0");
+    declare_ports(
+        &fixture.application.join("alpha"),
+        vec![provided("com.example.x", 1)],
+        vec![consumed(
+            "com.example.y",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("beta"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("delta"),
+        vec![provided("com.example.y", 1)],
+        vec![consumed(
+            "com.example.x",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.y",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let reopened = admit(&fixture.config()).unwrap();
+    assert_eq!(
+        package_ids(&reopened),
+        vec![
+            "com.example.beta",
+            "com.example.consumer",
+            "com.example.delta"
+        ]
+    );
+    assert_eq!(
+        reopened.graph[&"com.example.delta".parse().unwrap()][0].provider,
+        Some("com.example.beta".parse().unwrap())
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec![
+            "com.example.beta",
+            "com.example.consumer",
+            "com.example.delta"
+        ]
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn alternative_dependency_preserves_feasible_incumbent_chain() {
+    for reverse in [false, true] {
+        let fixture = Fixture::new();
+        for (dir, id) in [("a", "a"), ("c", "c"), ("d", "d")] {
+            fixture.add_application(dir, &format!("com.example.{id}"), "1.0.0");
+        }
+        declare_ports(
+            &fixture.application.join("a"),
+            vec![provided("com.example.x", 1)],
+            vec![consumed(
+                "com.example.y",
+                0,
+                1,
+                true,
+                "fixture.run",
+                "command",
+            )],
+        );
+        declare_ports(
+            &fixture.application.join("c"),
+            vec![provided("com.example.y", 1)],
+            vec![consumed(
+                "com.example.z",
+                0,
+                1,
+                true,
+                "fixture.run",
+                "command",
+            )],
+        );
+        declare_ports(
+            &fixture.application.join("d"),
+            vec![provided("com.example.z", 1)],
+            vec![],
+        );
+        assert_eq!(
+            package_ids(&admit(&fixture.config()).unwrap()),
+            vec!["com.example.a", "com.example.c", "com.example.d"]
+        );
+        fixture.add_application("b", "com.example.b", "1.0.0");
+        fixture.add_application("e", "com.example.e", "1.0.0");
+        declare_ports(
+            &fixture.application.join("b"),
+            vec![provided("com.example.x", 1)],
+            vec![],
+        );
+        declare_ports(
+            &fixture.application.join("e"),
+            vec![provided("com.example.z", 1)],
+            vec![],
+        );
+        declare_ports(
+            &fixture.application.join("d"),
+            vec![provided("com.example.z", 1)],
+            vec![consumed(
+                "com.example.missing",
+                0,
+                1,
+                true,
+                "fixture.run",
+                "command",
+            )],
+        );
+        if reverse {
+            let path = fixture.application.join("application-packages.v1.json");
+            let mut index: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            index["packages"].as_array_mut().unwrap().reverse();
+            fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
+        }
+        for _ in 0..2 {
+            let report = admit(&fixture.config()).unwrap();
+            assert_eq!(
+                package_ids(&report),
+                vec!["com.example.a", "com.example.c", "com.example.e"]
+            );
+            assert!(codes(&report).contains(&(
+                "com.example.d".into(),
+                PackageErrorCode::PortContractMissing
+            )));
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn two_contested_winners_choose_graph_with_sticky_incumbent() {
+    let fixture = Fixture::new();
+    fixture.add_application("a", "com.example.a", "1.0.0");
+    fixture.add_application("c", "com.example.c", "1.0.0");
+    declare_ports(
+        &fixture.application.join("a"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("c"),
+        vec![provided("com.example.y", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.a", "com.example.c"]
+    );
+    fixture.add_application("b", "com.example.b", "1.0.0");
+    fixture.add_application("d", "com.example.d", "1.0.0");
+    declare_ports(
+        &fixture.application.join("a"),
+        vec![provided("com.example.x", 1)],
+        vec![consumed(
+            "com.example.y",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("c"),
+        vec![provided("com.example.y", 1)],
+        vec![consumed(
+            "com.example.x",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("b"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("d"),
+        vec![provided("com.example.y", 1)],
+        vec![],
+    );
+    for _ in 0..2 {
+        let report = admit(&fixture.config()).unwrap();
+        assert_eq!(package_ids(&report), vec!["com.example.a", "com.example.d"]);
+        assert_eq!(
+            report.graph[&"com.example.a".parse().unwrap()][0].provider,
+            Some("com.example.d".parse().unwrap())
+        );
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn required_edge_connects_components_in_both_directions() {
+    let fixture = Fixture::new();
+    for id in ["a", "b", "c"] {
+        fixture.add_application(id, &format!("com.example.{id}"), "1.0.0");
+    }
+    declare_ports(
+        &fixture.application.join("a"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("b"),
+        vec![provided("com.example.y", 1)],
+        vec![consumed(
+            "com.example.x",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("c"),
+        vec![provided("com.example.y", 1)],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let report = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&report), vec!["com.example.a", "com.example.b"]);
+    assert!(codes(&report).contains(&(
+        "com.example.c".into(),
+        PackageErrorCode::PortContractMissing
+    )));
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn multi_contract_claim_is_rejected_as_one_package_when_invalid() {
+    let fixture = Fixture::new();
+    for id in ["a", "b", "c"] {
+        fixture.add_application(id, &format!("com.example.{id}"), "1.0.0");
+    }
+    declare_ports(
+        &fixture.application.join("a"),
+        vec![provided("com.example.x", 1), provided("com.example.y", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.a", "com.example.b", "com.example.c"]
+    );
+    declare_ports(
+        &fixture.application.join("b"),
+        vec![provided("com.example.x", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("c"),
+        vec![provided("com.example.y", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("a"),
+        vec![provided("com.example.x", 1), provided("com.example.y", 1)],
+        vec![consumed(
+            "com.example.missing",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let report = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&report), vec!["com.example.b", "com.example.c"]);
+    assert!(codes(&report).contains(&(
+        "com.example.a".into(),
+        PackageErrorCode::PortContractMissing
+    )));
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn graph_search_limit_isolates_contested_component_and_preserves_metadata() {
+    let fixture = Fixture::new();
+    fixture.add_application("unrelated", "com.example.unrelated", "1.0.0");
+    declare_ports(
+        &fixture.application.join("unrelated"),
+        vec![provided("com.example.independent", 1)],
+        vec![],
+    );
+    fixture.add_application("a00", "com.example.a00", "1.0.0");
+    declare_ports(
+        &fixture.application.join("a00"),
+        vec![provided("com.example.port00", 1)],
+        vec![],
+    );
+    assert_eq!(
+        package_ids(&admit(&fixture.config()).unwrap()),
+        vec!["com.example.a00", "com.example.unrelated"]
+    );
+    let store = host_store::HostStore::open(fixture.config().private_data_directory()).unwrap();
+    let incumbents = store.port_providers().unwrap();
+    assert_eq!(
+        incumbents.get("com.example.port00"),
+        Some(&"com.example.a00".to_owned())
+    );
+    assert_eq!(
+        incumbents.get("com.example.independent"),
+        Some(&"com.example.unrelated".to_owned())
+    );
+    for index in 0..12 {
+        for rival in ["a", "b"] {
+            let id = format!("com.example.{rival}{index:02}");
+            let directory = format!("{rival}{index:02}");
+            if index != 0 || rival != "a" {
+                fixture.add_application(&directory, &id, "1.0.0");
+            }
+            declare_ports(
+                &fixture.application.join(&directory),
+                vec![provided(&format!("com.example.port{index:02}"), 1)],
+                vec![consumed(
+                    &format!("com.example.port{:02}", (index + 1) % 12),
+                    0,
+                    1,
+                    true,
+                    "fixture.run",
+                    "command",
+                )],
+            );
+        }
+    }
+    let report = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&report), vec!["com.example.unrelated"]);
+    assert_eq!(
+        codes(&report)
+            .iter()
+            .filter(|(_, code)| *code == PackageErrorCode::PortGraphSearchLimit)
+            .count(),
+        24
+    );
+    assert_eq!(store.port_providers().unwrap(), incumbents);
+    let second = admit(&fixture.config()).unwrap();
+    assert_eq!(codes(&report), codes(&second));
+    assert_eq!(store.port_providers().unwrap(), incumbents);
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn additive_provider_minor_negotiates_highest_minor_in_consumers_range() {
+    let fixture = Fixture::new();
+    fixture.add_application("provider", "com.example.provider", "1.0.0");
+    fixture.add_application("consumer", "com.example.consumer", "1.0.0");
+    declare_ports(
+        &fixture.application.join("provider"),
+        vec![provided("com.example.shared", 3)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            1,
+            true,
+            "fixture.read",
+            "query",
+        )],
+    );
+    let report = admit(&fixture.config()).unwrap();
+    assert_eq!(
+        package_ids(&report),
+        vec!["com.example.consumer", "com.example.provider"]
+    );
+    assert_eq!(
+        report.graph[&"com.example.consumer".parse().unwrap()][0].minor,
+        Some(1)
+    );
+    assert!(report.snapshot.diagnostics.is_empty());
 }

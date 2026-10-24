@@ -36,7 +36,7 @@ mod membership;
 mod membership_sync;
 mod network;
 mod onboarding;
-mod person_names;
+mod principals;
 mod storage;
 mod subscription;
 mod synchronization;
@@ -47,12 +47,21 @@ pub use error::{
     StorageError, SubscriptionError, ValueParseError, WorkspaceError,
 };
 pub use membership::MembershipOperationId;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use membership::test_authoring;
 pub use onboarding::WorkspaceInvitation;
-pub use person_names::{PersonNameError, WorkspacePerson, WorkspacePersonId};
+pub use principals::{
+    PersonNameError, PrincipalId, PrincipalKind, WorkspacePerson, WorkspacePersonId,
+    WorkspacePrincipal,
+};
 /// Test observation hooks. See the `test-hooks` feature.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use runtime::RuntimeStateHold;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use runtime::{AgentAddFaultForTests, MembershipApplyOutcomeForTests};
 pub use runtime::{
     CoreRuntime, CoreRuntimeConfig, MemberSnapshot, MembershipChange, MembershipEpoch,
     MembershipRole, MembershipSnapshot, MembershipSnapshotDigest, MembershipSubscription,
