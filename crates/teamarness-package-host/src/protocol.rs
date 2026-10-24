@@ -1442,6 +1442,8 @@ pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::ProcessExited => "provider_exited",
         PackageErrorCode::BackendError => "provider_error",
         PackageErrorCode::PrincipalNotBound => "principal_not_bound",
+        PackageErrorCode::AgentNotStewarded => "agent_not_stewarded",
+        PackageErrorCode::AgentNotFound => "agent_not_found",
         _ => "capability_request_invalid",
     }
 }

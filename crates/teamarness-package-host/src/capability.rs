@@ -25,6 +25,9 @@ pub(crate) const MAX_OPEN_RECORDS: usize = 32;
 pub(crate) const MAX_OPEN_DECODED_BYTES: usize = 512 * 1024;
 /// The largest canonical payload one `append` call may carry.
 pub(crate) const MAX_CANONICAL_DECODED_BYTES: usize = 262_144;
+/// The largest `candidates` answer, matching the `teamarness.principals`
+/// snapshot bound a Workspace roster already honours.
+pub(crate) const MAX_AGENT_CANDIDATES: usize = 1024;
 /// The credit window the contract grants one stream.
 const MAX_STREAM_CREDIT: u64 = INITIAL_STREAM_CREDIT as u64;
 /// The largest record page one blocking read may return.
@@ -144,6 +147,7 @@ enum CapabilityKind {
     WorkspaceContext,
     Membership,
     Principals,
+    AgentBinding,
     Signing,
     ImmutableRecordLog,
     PackagePorts,
@@ -281,33 +285,39 @@ impl GenerationCapabilities {
                 "available" if object.len() == 1 => Ok(broker
                     .availability(&self.scope.package_identity, &self.scope.workspace_id)
                     .await),
-                "invoke" => broker
-                    .call(
-                        &self.scope.package_identity,
-                        &self.scope.workspace_id,
-                        &self.core.public_identity().to_string(),
-                        object,
-                        started,
-                        consumer_id,
-                        self.generation,
-                    )
-                    .await
-                    .map(crate::protocol::encode_port_value)
-                    .map_err(|failure| CapabilityFailure {
-                        code: if failure.outcome_uncertain
-                            && matches!(
-                                failure.code,
-                                PackageErrorCode::ProcessExited
-                                    | PackageErrorCode::DeadlineExceeded
-                                    | PackageErrorCode::Cancelled
-                            ) {
-                            PackageErrorCode::OutcomeUncertain
-                        } else {
-                            failure.code
-                        },
-                        outcome_uncertain: failure.outcome_uncertain,
-                        package_error: failure.package_error,
-                    }),
+                "invoke" => {
+                    let actor = self
+                        .port_actor()
+                        .await
+                        .map_err(CapabilityFailure::certain)?;
+                    broker
+                        .call(
+                            &self.scope.package_identity,
+                            &self.scope.workspace_id,
+                            &actor,
+                            object,
+                            started,
+                            consumer_id,
+                            self.generation,
+                        )
+                        .await
+                        .map(crate::protocol::encode_port_value)
+                        .map_err(|failure| CapabilityFailure {
+                            code: if failure.outcome_uncertain
+                                && matches!(
+                                    failure.code,
+                                    PackageErrorCode::ProcessExited
+                                        | PackageErrorCode::DeadlineExceeded
+                                        | PackageErrorCode::Cancelled
+                                ) {
+                                PackageErrorCode::OutcomeUncertain
+                            } else {
+                                failure.code
+                            },
+                            outcome_uncertain: failure.outcome_uncertain,
+                            package_error: failure.package_error,
+                        })
+                }
                 _ => Err(CapabilityFailure::certain(
                     PackageErrorCode::CapabilityRequestInvalid,
                 )),
@@ -335,6 +345,7 @@ impl GenerationCapabilities {
             }
             CapabilityKind::Membership => self.membership(method, object, started).await,
             CapabilityKind::Principals => self.principals(method, object, started).await,
+            CapabilityKind::AgentBinding => self.agent_binding(method, object, started).await,
             CapabilityKind::Signing => self.signing(method, object, started).await,
             CapabilityKind::ImmutableRecordLog => {
                 self.immutable_record(method, object, grant.minor, started)
@@ -402,11 +413,12 @@ impl GenerationCapabilities {
                 });
                 return Ok(());
             }
+            let actor = self.port_actor().await?;
             let query = broker
                 .query_stream(
                     &self.scope.package_identity,
                     &self.scope.workspace_id,
-                    &self.core.public_identity().to_string(),
+                    &actor,
                     object,
                 )
                 .await?;
@@ -700,6 +712,125 @@ impl GenerationCapabilities {
         }
     }
 
+    /// `teamarness.agent-binding` 1.0: a Package reads and sets its own Agent
+    /// Binding. The grant fixes the Package and Workspace, so no request names
+    /// a Package, and Core enforces stewardship (ADR 0027).
+    async fn agent_binding(
+        &self,
+        method: &str,
+        object: &Map<String, Value>,
+        started: Arc<AtomicBool>,
+    ) -> Result<Value, PackageErrorCode> {
+        let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+        let package = self.scope.package_identity.as_str().to_owned();
+        let core = Arc::clone(&self.core);
+        match method {
+            "current" => {
+                exact_fields(object, &["method"])?;
+                self.limiter
+                    .run(started, move || current_binding(&core, workspace, &package))
+                    .await?
+            }
+            "candidates" => {
+                exact_fields(object, &["method"])?;
+                self.limiter
+                    .run(started, move || {
+                        let bound = core
+                            .bound_agent(workspace, &package)
+                            .map_err(binding_error)?;
+                        let (_, principals) =
+                            core.principals_snapshot(workspace).map_err(binding_error)?;
+                        let own_key = core.public_identity();
+                        let own_person = principals
+                            .iter()
+                            .find(|principal| {
+                                principal.kind() == teamarness_core::PrincipalKind::Person
+                                    && principal.keys().contains(&own_key)
+                            })
+                            .map(teamarness_core::WorkspacePrincipal::id);
+                        let agents = principals
+                            .iter()
+                            .filter(|principal| {
+                                principal.kind() == teamarness_core::PrincipalKind::Agent
+                                    && own_person.is_some()
+                                    && principal.steward_principal_id() == own_person
+                            })
+                            .map(|agent| {
+                                let mut row = bound_agent_value(agent);
+                                row["bound"] = Value::Bool(bound == Some(agent.id()));
+                                row
+                            })
+                            .collect::<Vec<_>>();
+                        if agents.len() > MAX_AGENT_CANDIDATES {
+                            return Err(PackageErrorCode::CapabilityUnavailable);
+                        }
+                        Ok(json!({"agents":agents}))
+                    })
+                    .await?
+            }
+            "bind" => {
+                exact_fields(object, &["method", "principalId"])?;
+                let id =
+                    teamarness_core::PrincipalId::from_str(string_field(object, "principalId")?)
+                        .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                self.limiter
+                    .run(started, move || {
+                        core.bind_agent_package(workspace, id, &package)
+                            .map_err(binding_error)?;
+                        current_binding(&core, workspace, &package)
+                    })
+                    .await?
+            }
+            "unbind" => {
+                exact_fields(object, &["method"])?;
+                self.limiter
+                    .run(started, move || {
+                        core.unbind_agent_package(workspace, &package)
+                            .map_err(binding_error)?;
+                        Ok(json!({"agent":Value::Null}))
+                    })
+                    .await?
+            }
+            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    }
+
+    /// The Host-authored actor for a Port dispatch by this generation: the
+    /// Workspace Agent the calling Package is bound to, otherwise the
+    /// Installation Person (ADR 0027). Read once per dispatch; the lookup
+    /// never marks the command as started, because nothing has reached the
+    /// Provider yet.
+    async fn port_actor(&self) -> Result<Value, PackageErrorCode> {
+        let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+        let package = self.scope.package_identity.as_str().to_owned();
+        let core = Arc::clone(&self.core);
+        self.limiter
+            .run(Arc::new(AtomicBool::new(false)), move || {
+                let person = json!({"kind":"person","identity":core.public_identity().to_string()});
+                let Some(agent) = core
+                    .bound_agent(workspace, &package)
+                    .map_err(binding_error)?
+                else {
+                    return Ok(person);
+                };
+                let Some(principal) = core.principal(workspace, agent).map_err(binding_error)?
+                else {
+                    return Ok(person);
+                };
+                let Some(identity) = principal.keys().first() else {
+                    return Ok(person);
+                };
+                Ok(json!({
+                    "kind":"agent",
+                    "principal":agent.to_string(),
+                    "identity":identity.to_string(),
+                }))
+            })
+            .await?
+    }
+
     async fn immutable_record(
         &self,
         method: &str,
@@ -987,6 +1118,13 @@ impl Registry {
             kind: CapabilityKind::Principals,
         });
         registry.register(Descriptor {
+            family: CapabilityFamily::new("teamarness.agent-binding"),
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::AgentBinding,
+        });
+        registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.signing"),
             major: 1,
             min_minor: 0,
@@ -1115,6 +1253,46 @@ fn principal_snapshot(
         "cursor":cursor.to_string(),
         "principals":principals.iter().map(principal_value).collect::<Vec<_>>(),
     }))
+}
+
+/// One bound-Agent row: the Principal ID, its current signing key and name.
+fn bound_agent_value(agent: &teamarness_core::WorkspacePrincipal) -> Value {
+    json!({
+        "principalId":agent.id().to_string(),
+        "identity":agent.keys().first().map(ToString::to_string),
+        "name":agent.name(),
+    })
+}
+
+/// `{agent}` for the calling Package: `null` when unbound or the bound Agent
+/// is no longer current.
+fn current_binding(
+    core: &CoreRuntime,
+    workspace: teamarness_core::WorkspaceId,
+    package: &str,
+) -> Result<Value, PackageErrorCode> {
+    let agent = core
+        .bound_agent(workspace, package)
+        .map_err(binding_error)?
+        .map(|id| core.principal(workspace, id).map_err(binding_error))
+        .transpose()?
+        .flatten();
+    Ok(json!({"agent":agent.as_ref().map(bound_agent_value)}))
+}
+
+/// Core's binding and registry errors in the capability's own vocabulary.
+fn binding_error(error: teamarness_core::PersonNameError) -> PackageErrorCode {
+    match error {
+        teamarness_core::PersonNameError::NotOwnPerson => PackageErrorCode::AgentNotStewarded,
+        teamarness_core::PersonNameError::AgentNotFound => PackageErrorCode::AgentNotFound,
+        teamarness_core::PersonNameError::InvalidName
+        | teamarness_core::PersonNameError::InvalidPackageIdentity
+        | teamarness_core::PersonNameError::WorkspaceNotFound => {
+            PackageErrorCode::CapabilityRequestInvalid
+        }
+        teamarness_core::PersonNameError::Membership(_)
+        | teamarness_core::PersonNameError::Storage(_) => PackageErrorCode::CapabilityUnavailable,
+    }
 }
 
 // A profile cursor invalidates a snapshot; it is not a replay ledger. A lagging
@@ -2114,6 +2292,10 @@ mod tests {
             "../../../contracts/package-capabilities/v1/signing.schema.json"
         ))
         .unwrap();
+        let agent_binding: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/agent-binding.schema.json"
+        ))
+        .unwrap();
         // base64url without padding, which is how every byte string crosses the capability wire.
         let encoded = |bytes: usize| (bytes * 4).div_ceil(3);
 
@@ -2148,6 +2330,12 @@ mod tests {
         assert_eq!(
             signing["$defs"]["bytes"]["maxLength"].as_u64().unwrap() as usize,
             encoded(MAX_SIGNING_PAYLOAD_BYTES)
+        );
+        assert_eq!(
+            agent_binding["$defs"]["candidatesResult"]["properties"]["agents"]["maxItems"]
+                .as_u64()
+                .unwrap() as usize,
+            MAX_AGENT_CANDIDATES
         );
     }
 }

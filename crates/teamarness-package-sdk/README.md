@@ -73,11 +73,15 @@ The SDK owns the codes that are not about a product: `package.not_active`, `pack
 
 ## Semantic Capabilities
 
-`capabilities::{workspace_context, membership, principals, signing, record_log}` are typed clients over the granted capabilities; each is built from the `Initialization` and the capability client. They decode the capability's own shapes, and answer `package.invalid_capability_response` rather than guessing when a value is not one the contract describes.
+`capabilities::{workspace_context, membership, principals, agent_binding, signing, record_log}` are typed clients over the granted capabilities; each is built from the `Initialization` and the capability client. They decode the capability's own shapes, and answer `package.invalid_capability_response` rather than guessing when a value is not one the contract describes.
 
 `principals::Principals` requires a declared `teamarness.principals` 1.0 grant. `current` returns at most 1,024 current Workspace Principals with ID, kind, steward, signing keys, optional name and fingerprint. `lookup` resolves a current signing key or `lookup_id` resolves its Principal ID; `subscribe(after_cursor)` yields coalesced snapshots with a separate durable profile cursor. A missing name is not a membership failure. Use the cursor to refetch or resume after reconnection; do not store names in signed Package records or use them for authorization.
 
-`record_log::RecordLog::append` signs as the Installation under either negotiated record-log 1.0 or 1.1. `append_with_principal` accepts a Workspace Agent Principal ID only under 1.1; the Host requires a local binding to this Package Instance and returns `principal_not_bound` otherwise. Neither client exposes an Agent secret key.
+`agent_binding::AgentBinding` requires a declared `teamarness.agent-binding` 1.0 grant and configures only the calling Package Instance. `current` returns the bound Agent (Principal ID, current signing key, optional name) or `None`; `candidates` lists the Workspace Agents this Installation stewards with a `bound` flag; `bind(principal_id)` replaces the binding and answers `agent_not_stewarded` or `agent_not_found` when it cannot; `unbind` is idempotent. A binding is Installation-local and reads as absent once the Agent is no longer current.
+
+`record_log::RecordLog::append` signs as the Installation under either negotiated record-log 1.0 or 1.1. `append_with_principal` accepts a Workspace Agent Principal ID only under 1.1; Core signs with that Agent's key when this Installation stewards the Agent and some Package Instance on this Installation is bound to it, whichever Package calls (ADR 0027), and returns `principal_not_bound` otherwise. Neither client exposes an Agent secret key.
+
+On a Port, `ports::PortActor` is the Host-derived actor: `Person { identity }` for an unbound caller, `Agent { principal, identity }` for a caller bound through `teamarness.agent-binding`. A Provider that acts for an Agent passes `principal` to `append_with_principal`; one that only serves Persons refuses the Agent variant with its own error code.
 
 `record_log::run_session` drives a synchronized record log for a Package: it subscribes from the cursor the sink has committed, ingests each record, and only then returns credit, so a record whose ingest fails is redelivered rather than skipped. It resets the cursor once on `cursor_invalid`, reports state and warning events to the sink, and backs off on a retryable failure until its cancellation token fires.
 

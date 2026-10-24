@@ -279,6 +279,8 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::CapabilityVersionUnsupported,
         PackageErrorCode::CapabilityRequestInvalid,
         PackageErrorCode::PrincipalNotBound,
+        PackageErrorCode::AgentNotStewarded,
+        PackageErrorCode::AgentNotFound,
         PackageErrorCode::SpawnFailed,
         PackageErrorCode::HandshakeTimeout,
         PackageErrorCode::HandshakeMismatch,
@@ -315,7 +317,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 54);
+    assert_eq!(codes.len(), 56);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -337,6 +339,8 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::CapabilityVersionUnsupported
             | PackageErrorCode::CapabilityRequestInvalid
             | PackageErrorCode::PrincipalNotBound
+            | PackageErrorCode::AgentNotStewarded
+            | PackageErrorCode::AgentNotFound
             | PackageErrorCode::SpawnFailed
             | PackageErrorCode::HandshakeTimeout
             | PackageErrorCode::HandshakeMismatch
@@ -415,6 +419,26 @@ fn principal_not_bound_error_keeps_capability_stage_and_recovery() {
     assert_eq!(value["stage"], "capability");
     assert_eq!(value["retryable"], false);
     assert_eq!(value["recovery"], "correct_package_source");
+}
+
+#[test]
+fn agent_binding_errors_keep_capability_stage_and_recovery() {
+    for (code, expected) in [
+        (PackageErrorCode::AgentNotStewarded, "agent_not_stewarded"),
+        (PackageErrorCode::AgentNotFound, "agent_not_found"),
+    ] {
+        let envelope = PackageErrorEnvelope::new(
+            code,
+            PackageErrorStage::Capability,
+            false,
+            RecoveryAction::CorrectPackageSource,
+            teamarness_package_host::DiagnosticId::new("diag-fixture").unwrap(),
+        );
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(value["code"], expected);
+        assert_eq!(value["stage"], "capability");
+        assert_eq!(value["retryable"], false);
+    }
 }
 
 #[test]

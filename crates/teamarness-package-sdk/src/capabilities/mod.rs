@@ -5,6 +5,7 @@
 //! not match its schema is `package.invalid_capability_response`: the Package never sees a
 //! half-decoded value.
 
+pub mod agent_binding;
 pub mod membership;
 pub mod principals;
 pub mod record_log;

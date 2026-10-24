@@ -4,12 +4,29 @@ use teamarness_package_protocol::JsonValue;
 
 use crate::{BackendError, CapabilityClient, CapabilitySubscription};
 
-/// Host-authored actor context; v1 only emits an unbound Installation Person.
-/// Agent bindings are integrated when the Core binding API lands.
+/// Host-authored actor context for one Port dispatch; a caller never supplies it.
+///
+/// The Host emits the Installation Person for an unbound caller, and the
+/// Workspace Agent the calling Package Instance is bound to through
+/// `teamarness.agent-binding` otherwise (ADR 0027). `identity` is the actor's
+/// current signing key in both cases; an Agent also carries its Principal ID,
+/// which a Provider passes as `principal` to a record-log 1.1 append so Core
+/// signs with the Agent's key.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PortActor {
     Person { identity: String },
+    Agent { principal: String, identity: String },
+}
+
+impl PortActor {
+    /// The actor's current signing key, whichever kind it is.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        match self {
+            Self::Person { identity } | Self::Agent { identity, .. } => identity,
+        }
+    }
 }
 
 /// A Package's opaque, generation-scoped capability grant, never a Provider selector.
@@ -133,4 +150,47 @@ pub(crate) struct ProviderEnvelope {
     pub(crate) port: String,
     pub(crate) actor: PortActor,
     pub(crate) request: JsonValue,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn actor_round_trips_both_kinds_and_rejects_anything_else() {
+        let person = json!({"kind":"person","identity":"a".repeat(64)});
+        let agent = json!({"kind":"agent","principal":"b".repeat(64),"identity":"c".repeat(64)});
+        let decoded: PortActor = serde_json::from_value(person.clone()).unwrap();
+        assert_eq!(
+            decoded,
+            PortActor::Person {
+                identity: "a".repeat(64)
+            }
+        );
+        assert_eq!(decoded.identity(), "a".repeat(64));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), person);
+        let decoded: PortActor = serde_json::from_value(agent.clone()).unwrap();
+        assert_eq!(
+            decoded,
+            PortActor::Agent {
+                principal: "b".repeat(64),
+                identity: "c".repeat(64)
+            }
+        );
+        assert_eq!(decoded.identity(), "c".repeat(64));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), agent);
+        for rejected in [
+            json!({"kind":"person","identity":"a","principal":"b"}),
+            json!({"kind":"agent","identity":"a"}),
+            json!({"kind":"agent","principal":"b","identity":"a","extra":1}),
+            json!({"kind":"service","identity":"a"}),
+            json!({"identity":"a"}),
+        ] {
+            assert!(
+                serde_json::from_value::<PortActor>(rejected.clone()).is_err(),
+                "{rejected}"
+            );
+        }
+    }
 }

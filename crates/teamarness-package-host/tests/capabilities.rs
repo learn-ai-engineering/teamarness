@@ -543,6 +543,236 @@ async fn bound_agent_append_uses_agent_signer_and_replicates_to_peer() {
     peer.shutdown().await.unwrap();
 }
 
+/// Verifies: TEAM.SYS.PKG-R03 (`teamarness.agent-binding` 1.0, ADR 0027)
+#[tokio::test]
+async fn agent_binding_capability_is_scoped_to_the_calling_package() {
+    const FAMILY: &str = "teamarness.agent-binding";
+    const PACKAGE: &str = "dev.teamarness.fixture";
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", PACKAGE), ("other", "dev.teamarness.other")],
+        &[serde_json::json!({"identity":FAMILY,"major":1,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let peer = common::open_core(fixture._root.path().join("peer")).await;
+    common::introduce(&fixture.core, &peer);
+    peer.join_workspace(&common::invite(&fixture.core, workspace).await)
+        .await
+        .unwrap();
+    let own = fixture.core.add_agent(workspace, "Own Agent").unwrap();
+    let own_key = fixture
+        .core
+        .principal(workspace, own)
+        .unwrap()
+        .unwrap()
+        .keys()[0];
+    let remote = peer.add_agent(workspace, "Remote Agent").unwrap();
+    common::eventually(
+        std::time::Duration::from_secs(30),
+        "the peer's Agent reaches this Installation",
+        || async { fixture.core.principal(workspace, remote).unwrap().is_some() },
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let other = self::mount(&host, 1).await;
+    let bind = |id: String| {
+        capability(
+            FAMILY,
+            "bind",
+            object([("principalId", PackageValue::String(id))]),
+        )
+    };
+
+    // Unbound: `current` is null and `candidates` lists only this
+    // Installation's stewarded Agents, none of them bound.
+    let current = call(
+        &host,
+        mount.clone(),
+        "ab-current-0",
+        capability(FAMILY, "current", object([])),
+    )
+    .await;
+    assert_eq!(current.get("agent"), Some(&PackageValue::Null));
+    let candidates = call(
+        &host,
+        mount.clone(),
+        "ab-candidates-0",
+        capability(FAMILY, "candidates", object([])),
+    )
+    .await;
+    let Some(PackageValue::Array(rows)) = candidates.get("agents") else {
+        panic!("candidates was not an array: {candidates:?}")
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let PackageValue::Object(row) = &rows[0] else {
+        panic!("candidate row was not an object")
+    };
+    assert_eq!(
+        row.get("principalId"),
+        Some(&PackageValue::String(own.to_string()))
+    );
+    assert_eq!(
+        row.get("identity"),
+        Some(&PackageValue::String(own_key.to_string()))
+    );
+    assert_eq!(
+        row.get("name"),
+        Some(&PackageValue::String("Own Agent".into()))
+    );
+    assert_eq!(row.get("bound"), Some(&PackageValue::Boolean(false)));
+
+    // Another Person's Agent, an unknown Agent, a Person, and a request that
+    // names a Package are all refused with stable codes.
+    let stewarded = call(
+        &host,
+        mount.clone(),
+        "ab-bind-remote",
+        bind(remote.to_string()),
+    )
+    .await;
+    assert_eq!(
+        stewarded.get("error"),
+        Some(&PackageValue::String("agent_not_stewarded".into()))
+    );
+    let unknown = call(
+        &host,
+        mount.clone(),
+        "ab-bind-unknown",
+        bind("0".repeat(64)),
+    )
+    .await;
+    assert_eq!(
+        unknown.get("error"),
+        Some(&PackageValue::String("agent_not_found".into()))
+    );
+    let person = fixture
+        .core
+        .workspace_principal(workspace, fixture.core.public_identity())
+        .unwrap()
+        .unwrap()
+        .id();
+    let as_person = call(
+        &host,
+        mount.clone(),
+        "ab-bind-person",
+        bind(person.to_string()),
+    )
+    .await;
+    assert_eq!(
+        as_person.get("error"),
+        Some(&PackageValue::String("agent_not_stewarded".into()))
+    );
+    let named = call(
+        &host,
+        mount.clone(),
+        "ab-bind-named",
+        capability(
+            FAMILY,
+            "bind",
+            object([
+                ("principalId", PackageValue::String(own.to_string())),
+                (
+                    "package",
+                    PackageValue::String("dev.teamarness.other".into()),
+                ),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        named.get("error"),
+        Some(&PackageValue::String("capability_request_invalid".into()))
+    );
+    assert_eq!(
+        fixture
+            .core
+            .bound_agent(workspace, "dev.teamarness.other")
+            .unwrap(),
+        None
+    );
+
+    // Bind: the answer and `current` carry the Agent; `candidates` marks it;
+    // the other Package's binding is untouched.
+    let bound = call(&host, mount.clone(), "ab-bind-own", bind(own.to_string())).await;
+    let Some(PackageValue::Object(agent)) = bound.get("agent") else {
+        panic!("bind did not return the Agent: {bound:?}")
+    };
+    assert_eq!(
+        agent.get("principalId"),
+        Some(&PackageValue::String(own.to_string()))
+    );
+    assert_eq!(
+        agent.get("identity"),
+        Some(&PackageValue::String(own_key.to_string()))
+    );
+    let current = call(
+        &host,
+        mount.clone(),
+        "ab-current-1",
+        capability(FAMILY, "current", object([])),
+    )
+    .await;
+    assert_eq!(current.get("agent"), bound.get("agent"));
+    let candidates = call(
+        &host,
+        mount.clone(),
+        "ab-candidates-1",
+        capability(FAMILY, "candidates", object([])),
+    )
+    .await;
+    assert!(
+        matches!(candidates.get("agents"), Some(PackageValue::Array(rows)) if rows.len() == 1
+        && matches!(&rows[0], PackageValue::Object(row) if row.get("bound") == Some(&PackageValue::Boolean(true))))
+    );
+    let foreign = call(
+        &host,
+        other,
+        "ab-current-other",
+        capability(FAMILY, "current", object([])),
+    )
+    .await;
+    assert_eq!(foreign.get("agent"), Some(&PackageValue::Null));
+    assert_eq!(
+        fixture.core.bound_agent(workspace, PACKAGE).unwrap(),
+        Some(own)
+    );
+
+    // Unbind is idempotent and `current` follows it.
+    for id in ["ab-unbind-1", "ab-unbind-2"] {
+        let unbound = call(
+            &host,
+            mount.clone(),
+            id,
+            capability(FAMILY, "unbind", object([])),
+        )
+        .await;
+        assert_eq!(unbound.get("agent"), Some(&PackageValue::Null));
+    }
+    let current = call(
+        &host,
+        mount.clone(),
+        "ab-current-2",
+        capability(FAMILY, "current", object([])),
+    )
+    .await;
+    assert_eq!(current.get("agent"), Some(&PackageValue::Null));
+    let unknown_method = call(
+        &host,
+        mount,
+        "ab-method",
+        capability(FAMILY, "list", object([])),
+    )
+    .await;
+    assert_eq!(
+        unknown_method.get("error"),
+        Some(&PackageValue::String("capability_request_invalid".into()))
+    );
+    peer.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn record_log_1_0_rejects_principal_selector_and_removed_family() {
     const FAMILY: &str = "teamarness.synchronization.immutable-record-log";
@@ -1086,6 +1316,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
         "workspace-context.schema.json",
         "membership.schema.json",
         "principals.schema.json",
+        "agent-binding.schema.json",
         "signing.schema.json",
         "immutable-record-log.schema.json",
         "signing-envelope.golden.json",

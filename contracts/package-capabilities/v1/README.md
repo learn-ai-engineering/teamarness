@@ -22,7 +22,7 @@ The capability's process response and event frames also require object payloads.
 
 An event subscription is distinct from a live query: explicitly open `capability.stream` with exactly `{grant,contract,port,kind:"event"}` (no request or cursor). The Host opens one Provider upstream for the first subscriber to that Workspace/event Port, validates each event once, and sends ordered live facts to each independently credit-controlled Consumer stream. A declaration never opens a subscription or wakes an inactive Consumer. Late or reconnected subscribers receive no history; use a Provider query or cursor for recovery. Conversations' `messages.changed` is an empty-object, coalescible invalidation; its `message.page` query recovers current state without marking the Channel read. When the last subscriber leaves, the Host closes the upstream. Each subscriber has four queued events (at most four maximum-frame payloads); the Host permits at most 16 subscribers and eight event upstreams globally, at most four subscribers and four upstreams per Provider Instance, and at most 4 MiB / 2 MiB of queued event bytes globally / per Provider Instance. These budgets derive from Package Process 1.0 frame, writer-byte, in-flight and credit constants and remain separate from UI/lifecycle traffic. A slow subscriber ends with `port_subscriber_overflow` **after** its accepted queued events; shared byte exhaustion ends only subscriptions that cannot reserve space with `overloaded`. Invalid Provider event schema ends the affected event streams with `port_event_invalid`, never the process session. Provider exit/replacement revokes old streams (`provider_exited`); reconnection is explicit and does not replay events. The SDK reports inbound `event_lagged` on its one affected stream and keeps other streams and calls usable.
 
-A command rejected before the Provider writer accepts its frame is certain. After acceptance, timeout, exit, cancellation race or an invalid response can conceal a mutation: the Host reports `outcomeUncertain:true` and `retryable:false`. A timeout, cancellation race or Provider exit after dispatch reports `outcome_unknown`; an invalid response reports `port_response_invalid`. A Provider-owned post-commit error can report `provider_error` with the same uncertainty flags. The Host never automatically replays a command. Queries may be retryable but are not automatically replayed. A live query is one-to-one, credit-controlled and not an event subscription. The Provider receives typed Host-authored `{kind:"person",identity:<Installation public identity>}` actor context for an unbound Instance; an Agent actor and cross-Package Agent signing are not supported. Callers cannot submit their own actor context. Conversations accepts a post only from its local Installation Person and lets Core sign it. A future Agent Package may read `message.page` and subscribe to `messages.changed`, but an Agent-authored post requires separate runtime binding and authority work (ADR 0026).
+A command rejected before the Provider writer accepts its frame is certain. After acceptance, timeout, exit, cancellation race or an invalid response can conceal a mutation: the Host reports `outcomeUncertain:true` and `retryable:false`. A timeout, cancellation race or Provider exit after dispatch reports `outcome_unknown`; an invalid response reports `port_response_invalid`. A Provider-owned post-commit error can report `provider_error` with the same uncertainty flags. The Host never automatically replays a command. Queries may be retryable but are not automatically replayed. A live query is one-to-one, credit-controlled and not an event subscription. The Provider receives typed Host-authored actor context, read from the caller's Agent Binding at each command and live-query dispatch: `{kind:"agent",principal:<64-hex Principal ID>,identity:<Agent signing key>}` when the calling Package Instance is bound through `teamarness.agent-binding`, otherwise `{kind:"person",identity:<Installation public identity>}`. An event subscription's shared upstream carries the Person actor. Callers cannot submit their own actor context; a request that carries `actor` or a Workspace selector is `capability_request_invalid`. A Provider that acts for an Agent passes `principal` to a record-log 1.1 `append`, and Core signs under the standing rule below (ADR 0027). A Provider that serves only Persons refuses the Agent kind with its own error code.
 
 ## `teamarness.workspace-context` 1.0
 
@@ -43,6 +43,14 @@ This Package-neutral presentation capability is scoped by its grant to one Works
 Attribution is the record author resolved to its Principal: a Package looks up the signer key and reads `kind` and `stewardPrincipalId` from the row. No request or record carries an acting-Principal claim.
 
 A `capability.stream` with method `subscribe` and decimal-string `afterCursor` emits the latest bounded snapshot when the independent durable profile generation changes. The cursor is a coalescing invalidation token, **not** a replay ledger, membership epoch or immutable-record cursor: subscribe first, read `current`, and refetch after a gap or restart. A cursor ahead of Core's profile generation closes with `cursor_invalid`. Each event consumes stream credit. The closed schema and limits are in `principals.schema.json`.
+
+## `teamarness.agent-binding` 1.0
+
+A Package Instance's own Agent Binding: Installation-local configuration, held by Core and never replicated, that names the Workspace Agent this Package acts as on Ports and in record-log 1.1 appends (ADR 0027). The grant fixes the calling Package and Workspace, so no request names a Package and a Package can never read or change another Package's binding. Only the Steward's Installation can bind: Core requires the Agent's Steward key group to contain this Installation's key.
+
+`current` takes no arguments and returns `{agent}`: `null` when unbound or when the bound Agent is no longer a current Workspace Agent, otherwise `{principalId, identity, name}` with the Agent's 64-hex Principal ID, its current signing key and its nullable name. `candidates` takes no arguments and returns `{agents:[{principalId, identity, name, bound}]}`, at most 1,024 rows: the Workspace Agents this Installation stewards, each marked with whether this Package Instance is bound to it. Other Persons' Agents are never listed. `bind` takes exactly `{principalId}`, replaces this Package Instance's previous binding, and returns the same `{agent}` shape as `current`. `unbind` takes no arguments, is idempotent, and returns `{agent:null}`.
+
+`bind` fails with `agent_not_stewarded` when this Installation does not steward the Principal (including a Person or another Steward's Agent) and with `agent_not_found` when no current Workspace Principal has that ID. A malformed ID or any extra field is `capability_request_invalid`. A binding is cleared when this Installation removes the Agent; a Package observes removal or rename through `teamarness.principals`. The closed schema is `agent-binding.schema.json`.
 
 ## `teamarness.signing` 1.0
 
@@ -84,14 +92,20 @@ uncertain retry returns the original committed result.
 Without `principal`, Core signs with the Installation key and `author` is the
 Installation identity. With `principal` (a 64-hex Principal ID, 1.1 only), Core
 signs with that Workspace Agent's key and `author` is the Agent's key, when and
-only when the calling Package Instance is bound to that Agent on this
-Installation. Any other `principal`, including a Person, an Agent bound to
-another Package Instance, an unbound Agent or an unknown ID, fails with the
-error code `principal_not_bound` and commits nothing. The binding is local
-Installation state and is never replicated; one Agent is bound to at most one
-Package Instance. The Agent's key never crosses the capability boundary. Peers
-accept the record because the Agent's key is in membership history, and a
-reader resolves the author to its Principal through `teamarness.principals`.
+only when the Agent is a current Workspace Agent, this Installation stewards
+it, and at least one Package Instance on this Installation holds an Agent
+Binding to it (`teamarness.agent-binding`). The calling Package need not be the
+bound one: a bound Agent is a local signer for every Package Instance on this
+Installation, which is how a Provider appends for the Agent actor the Host
+derived from its caller (ADR 0027). Any other `principal`, including a Person,
+an Agent with no binding on this Installation, an Agent another Installation
+stewards or an unknown ID, fails with the error code `principal_not_bound` and
+commits nothing. Bindings are local Installation state and are never
+replicated; one Package Instance is bound to at most one Agent, and any number
+of Packages may bind the same Agent. The Agent's key never crosses the
+capability boundary. Peers accept the record because the Agent's key is in
+membership history, and a reader resolves the author to its Principal through
+`teamarness.principals`.
 
 ### `subscribe`
 

@@ -222,7 +222,7 @@ impl PortBroker {
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        installation: &str,
+        actor: &Value,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         consumer_id: &str,
@@ -233,7 +233,7 @@ impl PortBroker {
             .call_inner(
                 caller,
                 workspace,
-                installation,
+                actor,
                 input,
                 dispatched,
                 consumer_id,
@@ -293,7 +293,7 @@ impl PortBroker {
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        installation: &str,
+        actor: &Value,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         consumer_id: &str,
@@ -317,15 +317,16 @@ impl PortBroker {
         let request = input
             .get("request")
             .ok_or_else(|| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
-        let (actor, schemas, major, minor) = self
+        let (provider, schemas, major, minor) = self
             .resolve(caller, workspace, contract, port, kind)
             .map_err(WireFailure::new)?;
         schemas
             .validate(contract, port, "request", request)
             .map_err(|_| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
         let permit = self.permit(request).map_err(WireFailure::new)?;
+        // `actor` is Host-authored from the caller's binding, never from the request.
         let payload = json!({"contract":contract,"major":major,"minor":minor,"port":port,
-            "actor":{"kind":"person","identity":installation},"request":request});
+            "actor":actor,"request":request});
         let payload: PackageValue = serde_json::from_value(payload)
             .map_err(|_| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
         let observations = self.observations.clone();
@@ -333,7 +334,7 @@ impl PortBroker {
         let port_name = port.to_owned();
         let consumer = consumer_id.to_owned();
         let caller_name = caller.as_str().to_owned();
-        let result = actor
+        let result = provider
             .port_request(kind, payload, permit, dispatched, move |id, generation| {
                 *provider_id.lock().expect("port observation poisoned") =
                     Some((id.clone(), generation));
@@ -371,7 +372,7 @@ impl PortBroker {
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        installation: &str,
+        actor: &Value,
         input: &Map<String, Value>,
     ) -> Result<PortQueryStream, PackageErrorCode> {
         if input.len() != 5
@@ -395,7 +396,7 @@ impl PortBroker {
         let request = input
             .get("request")
             .ok_or(PackageErrorCode::PortRequestInvalid)?;
-        let (actor, schemas, major, minor) =
+        let (provider, schemas, major, minor) =
             self.resolve(caller, workspace, contract, port, PortKind::Query)?;
         let descriptor = schemas
             .contracts
@@ -412,10 +413,10 @@ impl PortBroker {
         let permits = self.permit(request)?;
         let payload: PackageValue = serde_json::from_value(
             json!({"contract":contract,"major":major,"minor":minor,"port":port,
-            "actor":{"kind":"person","identity":installation},"request":request}),
+            "actor":actor,"request":request}),
         )
         .map_err(|_| PackageErrorCode::PortRequestInvalid)?;
-        actor
+        provider
             .port_query_stream(
                 payload,
                 schemas,
