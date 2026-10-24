@@ -40,6 +40,7 @@ pub struct HarnessBuilder {
     installation: (String, String),
     data_directory: Option<PathBuf>,
     capabilities: BTreeMap<String, ScriptedCapability>,
+    minors: BTreeMap<String, u16>,
 }
 
 impl HarnessBuilder {
@@ -54,6 +55,7 @@ impl HarnessBuilder {
             installation: ("installation1".to_owned(), "Harness".to_owned()),
             data_directory: None,
             capabilities: BTreeMap::new(),
+            minors: BTreeMap::new(),
         }
     }
 
@@ -92,10 +94,22 @@ impl HarnessBuilder {
         self
     }
 
-    /// Grants one Semantic Capability, answered by a scripted double.
+    /// Grants one Semantic Capability at minor 0, answered by a scripted double.
     #[must_use]
-    pub fn capability(mut self, identity: &str, scripted: ScriptedCapability) -> Self {
+    pub fn capability(self, identity: &str, scripted: ScriptedCapability) -> Self {
+        self.capability_minor(identity, scripted, 0)
+    }
+
+    /// Grants one Semantic Capability at the negotiated `minor` the Host would report.
+    #[must_use]
+    pub fn capability_minor(
+        mut self,
+        identity: &str,
+        scripted: ScriptedCapability,
+        minor: u16,
+    ) -> Self {
         self.capabilities.insert(identity.to_owned(), scripted);
+        self.minors.insert(identity.to_owned(), minor);
         self
     }
 
@@ -132,7 +146,10 @@ impl HarnessBuilder {
                     ("identity", JsonValue::String(identity.clone())),
                     ("grant", JsonValue::String(grant_for(identity))),
                     ("major", JsonValue::from(1_u64)),
-                    ("minor", JsonValue::from(0_u64)),
+                    (
+                        "minor",
+                        JsonValue::from(u64::from(self.minors.get(identity).copied().unwrap_or(0))),
+                    ),
                 ])
             })
             .collect::<Vec<_>>();

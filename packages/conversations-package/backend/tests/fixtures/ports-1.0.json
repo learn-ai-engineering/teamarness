@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "channelId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "message": { "type": "object", "additionalProperties": false, "required": ["id", "position", "author", "markdown", "isLocal"], "properties": {
+      "id": { "type": "string" }, "position": { "type": "string", "minLength": 1 }, "author": { "type": "string" },
+      "markdown": { "type": "string", "maxLength": 32768 }, "isLocal": { "type": "boolean" }
+    } },
+    "pendingRow": { "type": "object", "additionalProperties": false, "required": ["id", "position", "status"], "properties": {
+      "id": { "type": "string" }, "position": { "type": "string", "minLength": 1 },
+      "status": { "type": "string", "enum": ["pending", "unavailable"] }
+    } },
+    "page": { "type": "object", "additionalProperties": false, "required": ["messages", "pending", "epoch", "revision"], "properties": {
+      "messages": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/message" } },
+      "pending": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/pendingRow" } },
+      "epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+      "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+      "nextBefore": { "type": "string", "minLength": 1 }
+    } }
+  },
+  "contracts": [{
+    "identity": "dev.teamarness.conversations", "major": 1, "minor": 0,
+    "description": "Person-authorized Conversations messages and live Workspace projection invalidation.",
+    "ports": [
+      { "name": "message.post", "kind": "command", "description": "Post a Message signed by the local Installation Person; Agent authority is not supported. An uncertain command must not be retried automatically.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "markdown"], "properties": {
+          "channelId": { "$ref": "#/$defs/channelId" }, "markdown": { "type": "string", "minLength": 1, "maxLength": 32768 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["ok"], "properties": { "ok": { "const": true } } }
+      },
+      { "name": "message.page", "kind": "query", "description": "Read a bounded Channel page without marking it read; re-query after missed invalidations.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["channelId"], "properties": {
+          "channelId": { "$ref": "#/$defs/channelId" }, "before": { "type": "string", "minLength": 1 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+        } },
+        "response": { "$ref": "#/$defs/page" }
+      },
+      { "name": "messages.changed", "kind": "event", "description": "Live-only payload-free Workspace projection invalidation. May coalesce; no initial event or replay. Re-query on receipt or reconnection.",
+        "event": { "type": "object", "additionalProperties": false }
+      }
+    ]
+  }]
+}

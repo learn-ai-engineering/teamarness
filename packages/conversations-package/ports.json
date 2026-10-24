@@ -10,6 +10,10 @@
       "id": { "type": "string" }, "position": { "type": "string", "minLength": 1 },
       "status": { "type": "string", "enum": ["pending", "unavailable"] }
     } },
+    "channelSummary": { "type": "object", "additionalProperties": false, "required": ["id", "name"], "properties": {
+      "id": { "$ref": "#/$defs/channelId" },
+      "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 }
+    } },
     "page": { "type": "object", "additionalProperties": false, "required": ["messages", "pending", "epoch", "revision"], "properties": {
       "messages": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/message" } },
       "pending": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/pendingRow" } },
@@ -19,10 +23,10 @@
     } }
   },
   "contracts": [{
-    "identity": "dev.teamarness.conversations", "major": 1, "minor": 0,
-    "description": "Person-authorized Conversations messages and live Workspace projection invalidation.",
+    "identity": "dev.teamarness.conversations", "major": 1, "minor": 1,
+    "description": "Conversations Messages posted by the local Installation Person or a locally bound Workspace Agent, bounded Channel and Message reads, and live Workspace projection invalidation.",
     "ports": [
-      { "name": "message.post", "kind": "command", "description": "Post a Message signed by the local Installation Person; Agent authority is not supported. An uncertain command must not be retried automatically.",
+      { "name": "message.post", "kind": "command", "description": "Post a Message as the Host-derived actor: the local Installation Person, or the Workspace Agent the calling Package Instance is bound to (1.1), whose key then signs the Message. A Person from another Installation is refused. An uncertain command must not be retried automatically.",
         "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "markdown"], "properties": {
           "channelId": { "$ref": "#/$defs/channelId" }, "markdown": { "type": "string", "minLength": 1, "maxLength": 32768 }
         } },
@@ -37,6 +41,12 @@
       },
       { "name": "messages.changed", "kind": "event", "description": "Live-only payload-free Workspace projection invalidation. May coalesce; no initial event or replay. Re-query on receipt or reconnection.",
         "event": { "type": "object", "additionalProperties": false }
+      },
+      { "name": "channel.list", "kind": "query", "description": "List the Channels a Message can be posted to, in creation order with #general first, exactly as this Installation's UI shows them: hidden Channels are excluded. At most 64 Channels are returned (1.1).",
+        "request": { "type": "object", "additionalProperties": false },
+        "response": { "type": "object", "additionalProperties": false, "required": ["channels"], "properties": {
+          "channels": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/channelSummary" } }
+        } }
       }
     ]
   }]

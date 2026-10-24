@@ -149,11 +149,13 @@ async fn real_sdk_consumer_posts_invalidates_recovers_and_converges() {
         .expect("real Conversations appears in the authoring catalog");
     let provided = serde_json::to_value(&provider.provided).unwrap();
     assert_eq!(provided[0]["identity"], PACKAGE_ID);
-    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 3);
+    assert_eq!(provided[0]["minor"], 1);
+    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 4);
     for (name, kind) in [
         ("message.post", "command"),
         ("message.page", "query"),
         ("messages.changed", "event"),
+        ("channel.list", "query"),
     ] {
         assert!(provided[0]["ports"].as_array().unwrap().iter().any(|port| {
             port["name"] == name
