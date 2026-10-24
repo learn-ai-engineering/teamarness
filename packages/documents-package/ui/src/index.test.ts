@@ -176,6 +176,25 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it('does not enable Preview before a Document is open', async () => {
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': () => snapshot(),
+      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: 'Draft' }),
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    const root = document.createElement('div').attachShadow({ mode: 'open' });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    const preview = root.querySelector('.editor-header button') as HTMLButtonElement;
+    expect(preview.disabled).toBe(true);
+    preview.click();
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Draft' });
+    expect(preview.disabled).toBe(false);
+    expect(preview.textContent).toBe('Preview');
+    expect((root.querySelector('.editor-textarea') as HTMLElement).hidden).toBe(false);
+    await unmount();
+  });
+
   it("opens a Document, sends typed edits, and applies a remote delta with the caret moved", async () => {
     const edits: { base: string; ops: unknown }[] = [];
     const fake = createFakePackageClient({
@@ -643,16 +662,31 @@ describe("Documents mount", () => {
     (root.querySelector('[aria-label="Show Comments"]') as HTMLButtonElement).click();
     const shell = root.querySelector('.documents-shell') as HTMLElement;
     Object.defineProperty(shell, 'clientWidth', { configurable: true, value: 1000 });
+    await fake.emit('documents.changes', snapshot());
     const handle = root.querySelector('.left-resizer') as HTMLElement;
+    expect([handle.getAttribute('aria-valuemin'), handle.getAttribute('aria-valuemax'), handle.getAttribute('aria-valuenow')]).toEqual(['190', '320', '250']);
     handle.setPointerCapture = () => { handle.hasPointerCapture = () => true; };
     handle.releasePointerCapture = () => { handle.hasPointerCapture = () => false; };
     handle.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 1, clientX: 200, bubbles: true }));
     handle.dispatchEvent(new PointerEvent('pointermove', { pointerId: 1, clientX: 240, bubbles: true }));
     handle.dispatchEvent(new PointerEvent('pointerup', { pointerId: 1, bubbles: true }));
     expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--left-width')).toBe('290px');
+    expect(handle.getAttribute('aria-valuenow')).toBe('290');
+    handle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    handle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    expect(shell.style.getPropertyValue('--left-width')).toBe('320px');
+    expect(handle.getAttribute('aria-valuenow')).toBe('320');
     const rightHandle = root.querySelector('.right-resizer') as HTMLElement;
     rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
     expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--right-width')).toBe('320px');
+    expect([rightHandle.getAttribute('aria-valuemin'), rightHandle.getAttribute('aria-valuemax'), rightHandle.getAttribute('aria-valuenow')]).toEqual(['190', '360', '320']);
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    expect(shell.style.getPropertyValue('--right-width')).toBe('360px');
+    expect(rightHandle.getAttribute('aria-valuenow')).toBe('360');
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
@@ -670,6 +704,47 @@ describe("Documents mount", () => {
     expect(root.querySelector('.editor-preview')?.textContent?.trim()).toBe('Draft');
     expect(root.querySelector('.editor-header button')?.textContent).toBe('Edit');
     await unmount();
+  });
+
+  it("does not close or clear a newer create draft when an older create request completes", async () => {
+    const research = '4'.repeat(64);
+    const current = { ...snapshot(), collections: [...snapshot().collections,
+      { id: research, name: 'Research', archived: false }] };
+    for (const operation of ['documents.document.create', 'documents.collection.create']) {
+      let complete!: (result: { ok: true; id: string }) => void;
+      const pending = new Promise<{ ok: true; id: string }>((resolve) => { complete = resolve; });
+      const calls: PackageValue[] = [];
+      const fake = createFakePackageClient({ requests: {
+        'documents.snapshot': () => current,
+        [operation]: (payload) => { calls.push(payload); return pending; },
+      }, subscriptions: { 'documents.changes': () => undefined } });
+      const root = document.createElement('div').attachShadow({ mode: 'open' });
+      const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+      if (operation === 'documents.document.create') {
+        (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
+      } else (root.querySelector('[aria-label="Add Collection"]') as HTMLButtonElement).click();
+      const selector = operation === 'documents.document.create' ? '.document-create' : '.collection-create';
+      const input = root.querySelector(`${selector} input`) as HTMLInputElement;
+      input.value = 'Earlier';
+      (root.querySelector(selector) as HTMLFormElement).requestSubmit();
+      await tick();
+      if (operation === 'documents.document.create') {
+        (root.querySelector('[aria-label="Add Document to Research"]') as HTMLButtonElement).click();
+      } else {
+        (root.querySelector(`${selector} [aria-label="Cancel"]`) as HTMLButtonElement).click();
+        (root.querySelector('[aria-label="Add Collection"]') as HTMLButtonElement).click();
+      }
+      expect(root.querySelector(`${selector} input`)).toBe(input);
+      input.value = 'Later draft';
+      input.dispatchEvent(new Event('input'));
+      complete({ ok: true, id: '9'.repeat(64) });
+      await tick();
+      expect(root.querySelector(`${selector} input`)).toBe(input);
+      expect(input.value).toBe('Later draft');
+      expect(calls).toEqual([operation === 'documents.document.create'
+        ? { collectionId: planning, title: 'Earlier' } : { name: 'Earlier' }]);
+      await unmount();
+    }
   });
 
   it("dismisses Add Document when its selected Collection changes before submission", async () => {
@@ -745,6 +820,66 @@ describe("Documents mount", () => {
       await fake.emit('documents.changes', current);
       expect(root.activeElement).toBe(collection);
       expect(collection.value).toBe('A new Collection');
+      await unmount();
+    } finally { host.remove(); }
+  });
+
+  it('posts without a quote after editor deselection and a direct Comment button click', async () => {
+    const added: PackageValue[] = [];
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': () => snapshot(),
+      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: 'Selected text' }),
+      'documents.comment.add': (payload) => { added.push(payload); return { ok: true as const, id: 'd'.repeat(64) }; },
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    try {
+      const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+      (root.querySelector('.document-title') as HTMLButtonElement).click();
+      await tick();
+      await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Selected text' });
+      const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+      const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
+      editor.setSelectionRange(0, 8);
+      composer.focus();
+      expect(root.querySelector('.comment-quote-excerpt')?.textContent).toBe('Selected');
+      editor.focus();
+      editor.setSelectionRange(8, 8);
+      composer.value = 'Ordinary';
+      (root.querySelector('.comment-compose button[type=submit]') as HTMLButtonElement).click();
+      await tick();
+      expect(added).toEqual([{ documentId: doc, markdown: 'Ordinary' }]);
+      await unmount();
+    } finally { host.remove(); }
+  });
+
+  it('retains focus on a quote or reply cue through a pushed snapshot', async () => {
+    const parent = '5'.repeat(64);
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': () => snapshot(),
+      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: 'Selected text' }),
+      'documents.comments': () => ({ comments: [{ id: parent, documentId: doc, author: 'me', position: '01', resolved: false, isLocal: true, markdown: 'Parent' }] }),
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    try {
+      const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+      (root.querySelector('.document-title') as HTMLButtonElement).click();
+      await tick();
+      await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Selected text' });
+      const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+      editor.setSelectionRange(0, 8);
+      (root.querySelector('.comment-input') as HTMLTextAreaElement).dispatchEvent(new Event('focus'));
+      for (const label of ['Clear quote', 'Clear reply']) {
+        if (label === 'Clear reply') (root.querySelector('.comment button') as HTMLButtonElement).click();
+        const control = root.querySelector(`[aria-label="${label}"]`) as HTMLButtonElement;
+        control.focus();
+        expect(root.activeElement).toBe(control);
+        await fake.emit('documents.changes', snapshot());
+        expect(root.activeElement).toBe(root.querySelector(`[aria-label="${label}"]`));
+      }
       await unmount();
     } finally { host.remove(); }
   });

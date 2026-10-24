@@ -68,6 +68,7 @@ function inlineForm(options: {
   maxLength: number;
   className: string;
   onSubmit: (value: string) => Promise<boolean>;
+  currentDraft?: () => number;
 }): { form: HTMLFormElement; input: HTMLInputElement; submit: HTMLButtonElement } {
   const form = document.createElement("form");
   form.className = `${options.className} ${KIT.field}`;
@@ -77,7 +78,8 @@ function inlineForm(options: {
   input.required = true;
   // HTML maxLength counts UTF-16 units, while the published limit counts characters.
   input.maxLength = options.maxLength * 2;
-  input.addEventListener("input", () => input.setCustomValidity(""));
+  let inputRevision = 0;
+  input.addEventListener("input", () => { inputRevision++; input.setCustomValidity(""); });
   input.placeholder = options.placeholder;
   input.setAttribute("aria-label", options.label);
   const submit = document.createElement("button");
@@ -94,8 +96,10 @@ function inlineForm(options: {
       input.reportValidity();
       return;
     }
+    const revision = inputRevision;
+    const draft = options.currentDraft?.();
     void options.onSubmit(value).then((ok) => {
-      if (ok) input.value = "";
+      if (ok && revision === inputRevision && draft === options.currentDraft?.()) input.value = "";
     });
   });
   return { form, input, submit };
@@ -122,6 +126,8 @@ export class DocumentsView {
   private readonly shell: HTMLElement;
   private readonly leftHandle: HTMLElement;
   private readonly rightHandle: HTMLElement;
+  private readonly resizeRanges: Array<() => void> = [];
+  private readonly resizeObserver: ResizeObserver | null;
   private readonly showNavigation: HTMLButtonElement;
   private readonly commentsToggle: HTMLButtonElement;
   private readonly previewButton: HTMLButtonElement;
@@ -141,6 +147,7 @@ export class DocumentsView {
   private leftOpen = true;
   private commentsOpen = true;
   private createTarget: string | null = null;
+  private createGeneration = 0;
   private activeMenu: HTMLElement | null = null;
   private activeMenuButton: HTMLButtonElement | null = null;
   private renameForm: ReturnType<typeof inlineForm> | null = null;
@@ -208,6 +215,7 @@ export class DocumentsView {
     railHeading.textContent = "Collections";
     const hideNavigation = icon("panel", "Hide navigation", () => { this.leftOpen = false; this.renderRails(); });
     const addCollection = icon("plus", "Add Collection", () => {
+      this.createGeneration++;
       this.createTarget = "collection";
       this.render();
       this.collectionForm.input.focus();
@@ -217,26 +225,37 @@ export class DocumentsView {
     this.collectionList.className = "collection-list";
     this.collectionForm = inlineForm({
       label: "New Collection name", placeholder: "New Collection", submitLabel: "Add",
-      maxLength: 128, className: "collection-create",
+      maxLength: 128, className: "collection-create", currentDraft: () => this.createGeneration,
       onSubmit: async (name) => {
+        const generation = this.createGeneration;
         const ok = await controller.createCollection(name);
-        if (ok) { this.createTarget = null; this.render(); }
+        if (ok && generation === this.createGeneration && this.createTarget === "collection") {
+          this.createTarget = null;
+          this.render();
+        }
         return ok;
       },
     });
     this.documentForm = inlineForm({
       label: "New Document title", placeholder: "New Document title", submitLabel: "Create",
-      maxLength: 256, className: "document-create",
+      maxLength: 256, className: "document-create", currentDraft: () => this.createGeneration,
       onSubmit: async (title) => {
-        if (this.createTarget === null || this.createTarget === "collection"
-          || this.createTarget !== controller.state.selectedCollectionId) return false;
+        const target = this.createTarget;
+        const generation = this.createGeneration;
+        if (target === null || target === "collection"
+          || target !== controller.state.selectedCollectionId) return false;
         const ok = await controller.createDocument(title);
-        if (ok) { this.createTarget = null; this.render(); }
+        if (ok && generation === this.createGeneration && this.createTarget === target) {
+          this.createTarget = null;
+          this.render();
+        }
         return ok;
       },
     });
-    this.collectionForm.form.append(icon("x", "Cancel", () => { this.createTarget = null; this.render(); }));
-    this.documentForm.form.append(icon("x", "Cancel", () => { this.createTarget = null; this.render(); }));
+    this.collectionForm.input.addEventListener("input", () => { this.createGeneration++; });
+    this.documentForm.input.addEventListener("input", () => { this.createGeneration++; });
+    this.collectionForm.form.append(icon("x", "Cancel", () => { this.createGeneration++; this.createTarget = null; this.render(); }));
+    this.documentForm.form.append(icon("x", "Cancel", () => { this.createGeneration++; this.createTarget = null; this.render(); }));
     this.rail.append(railHeader, this.collectionList);
     this.leftHandle = this.resizeHandle("left");
     this.rightHandle = this.resizeHandle("right");
@@ -253,6 +272,7 @@ export class DocumentsView {
     this.editorStatus.className = "editor-status";
     this.editorStatus.setAttribute("role", "status");
     this.previewButton = button("Preview", KIT.secondary, () => controller.togglePreview());
+    this.previewButton.disabled = true;
     this.previewButton.setAttribute("aria-pressed", "false");
     editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton);
     this.preview = document.createElement("article");
@@ -266,6 +286,15 @@ export class DocumentsView {
     this.textarea.addEventListener("input", () => {
       controller.openEditor?.input(this.textarea.value);
     });
+    const clearCollapsedQuote = () => {
+      if (this.draftQuote !== null && this.textarea.selectionStart === this.textarea.selectionEnd) {
+        this.draftQuote = null;
+        this.renderComposer();
+      }
+    };
+    this.textarea.addEventListener("select", clearCollapsedQuote);
+    this.textarea.addEventListener("keyup", clearCollapsedQuote);
+    this.textarea.addEventListener("pointerup", clearCollapsedQuote);
     this.editorPane.append(editorHeader, this.textarea, this.preview);
     controller.textListener = (event: TextEvent) => this.onTextEvent(event);
 
@@ -291,8 +320,7 @@ export class DocumentsView {
     this.commentInput.addEventListener("focus", () => {
       if (this.controller.state.openDocumentId === null || !this.controller.openEditor
         || this.textarea.hidden || this.textarea.disabled) return;
-      const selected = this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd);
-      this.draftQuote = boundedQuote(selected);
+      this.draftQuote = this.selectedEditorQuote();
       this.renderComposer();
     });
     this.commentSubmit = document.createElement("button");
@@ -308,6 +336,10 @@ export class DocumentsView {
       const markdown = this.commentInput.value.trim();
       if (!markdown) return;
       const documentId = controller.state.openDocumentId;
+      if (this.draftQuote !== null && this.selectedEditorQuote() === null) {
+        this.draftQuote = null;
+        this.renderComposer();
+      }
       void controller.addComment(markdown, this.draftQuote, this.replyTo).then((ok) => {
         if (ok && controller.state.openDocumentId === documentId) {
           this.commentInput.value = "";
@@ -325,6 +357,10 @@ export class DocumentsView {
     root.addEventListener("keydown", this.onEscape);
     document.addEventListener("click", this.onOutsideClick);
     root.append(this.page);
+    this.resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => {
+      this.resizeRanges.forEach((update) => update());
+    });
+    this.resizeObserver?.observe(this.shell);
   }
 
   /** Routes a text event through the controller with the live caret, then syncs the textarea. */
@@ -346,11 +382,18 @@ export class DocumentsView {
     }
   }
 
+  private selectedEditorQuote(): string | null {
+    return boundedQuote(this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd));
+  }
+
   private collapseEditorSelection(): void {
     this.textarea.setSelectionRange(this.textarea.selectionEnd, this.textarea.selectionEnd);
   }
 
   private renderComposer(): void {
+    const root = this.commentQuote.getRootNode() as ShadowRoot;
+    const focusedCue = this.commentQuote.contains(root.activeElement)
+      ? root.activeElement?.getAttribute("aria-label") : null;
     this.commentQuote.hidden = this.draftQuote === null && this.replyTo === null;
     this.commentQuote.replaceChildren();
     if (this.replyTo !== null) {
@@ -375,6 +418,7 @@ export class DocumentsView {
         this.renderComposer();
       }));
     }
+    if (focusedCue) this.commentQuote.querySelector<HTMLButtonElement>(`[aria-label="${focusedCue}"]`)?.focus();
     this.commentSubmit.disabled = this.controller.state.busy;
   }
 
@@ -467,6 +511,7 @@ export class DocumentsView {
     const open = this.controller.openDocument;
     const editor = this.controller.openEditor;
     this.editorPane.hidden = false;
+    this.previewButton.disabled = open === null;
     this.commentsPanel.hidden = open === null || !this.commentsOpen;
     this.rightHandle.hidden = this.commentsPanel.hidden;
     if (open === null) { this.editorTitle.textContent = "Choose a Document"; this.textarea.hidden = true; this.preview.hidden = true; return; }
@@ -522,6 +567,7 @@ export class DocumentsView {
       if (selected) this.expanded.add(selected);
     }
     if (this.createTarget !== "collection" && this.createTarget !== selected) {
+      if (this.createTarget !== null) this.createGeneration++;
       this.createTarget = null;
       this.documentForm.input.value = "";
     }
@@ -532,6 +578,7 @@ export class DocumentsView {
   }
 
   dispose(): void {
+    this.resizeObserver?.disconnect();
     this.page.getRootNode().removeEventListener("click", this.onOutsideClick);
     this.page.getRootNode().removeEventListener("keydown", this.onEscape);
     document.removeEventListener("click", this.onOutsideClick);
@@ -548,6 +595,7 @@ export class DocumentsView {
     const showComments = this.commentsOpen && this.controller.openDocument !== null;
     this.commentsPanel.hidden = !showComments;
     this.rightHandle.hidden = !showComments;
+    this.resizeRanges.forEach((update) => update());
   }
 
   private resizeHandle(side: "left" | "right"): HTMLElement {
@@ -561,11 +609,25 @@ export class DocumentsView {
     let width = 0;
     const variable = side === "left" ? "--left-width" : "--right-width";
     const current = () => parseInt(this.shell.style.getPropertyValue(variable), 10) || (side === "left" ? 250 : 300);
+    const range = () => {
+      const shellWidth = this.shell.clientWidth;
+      const cap = shellWidth <= 760 ? (side === "left" ? .7 : .75) : (side === "left" ? .32 : .36);
+      const max = Math.max(0, Math.floor(Math.min(440, shellWidth * cap, shellWidth <= 760 ? 440 : shellWidth - 320)));
+      return { min: Math.min(190, max), max };
+    };
+    const updateRange = () => {
+      const { min, max } = range();
+      handle.setAttribute("aria-valuemin", String(min));
+      handle.setAttribute("aria-valuemax", String(max));
+      handle.setAttribute("aria-valuenow", String(Math.max(min, Math.min(max, current()))));
+    };
     const set = (value: number) => {
-      const max = Math.min(440, Math.max(190, this.shell.clientWidth - 320));
-      this.shell.style.setProperty(variable, `${Math.max(190, Math.min(max, value))}px`);
+      const { min, max } = range();
+      this.shell.style.setProperty(variable, `${Math.max(min, Math.min(max, value))}px`);
+      updateRange();
     };
     handle.addEventListener("pointerdown", (event) => {
+      updateRange();
       start = event.clientX;
       width = current();
       handle.setPointerCapture?.(event.pointerId);
@@ -582,6 +644,8 @@ export class DocumentsView {
       event.preventDefault();
       set(current() + (event.key === "ArrowRight" ? 20 : -20) * (side === "left" ? 1 : -1));
     });
+    this.resizeRanges.push(updateRange);
+    updateRange();
     return handle;
   }
 
@@ -665,6 +729,7 @@ export class DocumentsView {
       const add = icon("plus", `Add Document to ${collection.name}`, () => {
         this.controller.selectCollection(collection.id);
         this.expanded.add(collection.id);
+        this.createGeneration++;
         this.createTarget = collection.id;
         this.render();
         this.documentForm.input.focus();
