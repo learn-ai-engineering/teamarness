@@ -9,6 +9,7 @@
 mod backend;
 pub(crate) mod body;
 pub(crate) mod domain;
+pub mod markdown;
 pub(crate) mod store;
 
 pub use backend::{DocumentsActive, router};

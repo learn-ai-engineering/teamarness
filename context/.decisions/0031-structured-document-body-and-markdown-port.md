@@ -1,0 +1,79 @@
+# 0031 — Document bodies are structured Loro trees edited in the UI, with Markdown as the interchange
+
+**Status:** accepted (2026-10-24)
+**Supersedes:** ADR 0027 (Decision, the **Body records** bullet: "Legacy kind 10 remains readable", "The live Loro is changed only after an export on a deep fork fits one record" as applied to backend-made text edits, and "The Loro peer id is derived from the Installation identity"; Rejected alternatives, the bullet "Rich text, a UI-side CRDT, or exact text-range comment anchors" except its exact-range-anchor clause; Consequences, the 256 KiB bullet's "bounded full-text chunks")
+**Refines:** ADR 0026 (a second Person-only Port Contract), ADR 0029 (adds a schema-violation import disposition), ADR 0030 (consumes WebAssembly in frames)
+
+## Context
+
+The Documents body must be edited in rendered form by Members and read and revised as Markdown by other Packages and, later, agents. Concurrent edits from several Installations must converge through Loro on the immutable record log, within its canonical record bound and the 256 KiB UI payload bound, without plaintext persistence.
+
+A rendered editor that merges formatting needs a CRDT that understands document structure. `loro-prosemirror` maps a ProseMirror document onto a Loro tree and requires the editor to be a Loro peer.
+
+Under Loro, two writers that create the same root child container concurrently resolve last-writer-wins, so one side's content vanishes. Two writers that share a peer id silently diverge. A fork taken at an older version and reusing a peer id mints conflicting op ids.
+
+Markdown cannot represent every structured body exactly.
+
+## Decision
+
+**Body model.** A Document body is the Loro tree that `loro-prosemirror` writes for one fixed baseline ProseMirror schema, which the Package UI and backend share. The schema stores no list tightness.
+
+**The UI is a Loro peer.** The Package UI runs `loro-crdt` and `loro-prosemirror` in its frame and sends Loro updates to its backend. The backend imports each UI update into a fork of the applied body and checks four things: the update contains ops only from that session's assigned peer, it fits one record, the resulting tree is valid under the schema, and it respects the local growth budget. Only then does the backend append one record and adopt the fork. A refused update makes the UI session discard its state and reload.
+
+A remote record whose import fails, or leaves the tree schema-invalid, takes ADR 0029's import-failure disposition.
+
+**Genesis.** `document.create` carries the body genesis: the root containers and one empty paragraph, written once by the creating backend. No UI and no later record initializes a body.
+
+**Peer identity.** Every Loro peer is a random 64-bit id allocated by the backend, absent from the Document's version vector. One goes to each UI editor session, each Markdown merge fork and each genesis. Peer ids are never derived and never reused. They carry no authority: records are still signed by the Installation signer.
+
+**Records.** Body edits keep ADR 0027's identified kind-11 envelope (request ID, payload digest, one update) and its identity, recovery and conflict rules. The canonical update bound is 160 KiB, so a base64 update fits one UI message without chunking. A large local paste is split at block boundaries into sequential records. A single block that cannot fit one record is refused before it is committed locally. Kind 10 and plain-text bodies are removed. No Documents existed outside development, and development data is reset.
+
+**Sessions.** A UI editor session loads from a backend-produced snapshot, delivered in bounded chunks, never from replayed record history. It then receives live updates from remote records and other local sessions. Per-person undo uses the binding's undo plugin and never reverts another peer's ops.
+
+**Markdown.** The backend is the single Markdown authority. It exports **Canonical Markdown**: the body as Markdown can carry it, with formatting that Markdown cannot express dropped before writing, so the export always imports back to the body it describes. Content always wins over formatting. The normalisations are a documented contract (`context/02-system/09-documents/markdown-contract.md`).
+
+A Markdown revision merges against an explicit base version. The backend forks at the base with a fresh peer, reconciles by block alignment so unchanged blocks are untouched and changed blocks are edited in place, and imports the result, so concurrent edits since the base merge through Loro. Merging back an unchanged export produces no ops.
+
+**Documents Port Contract 1.0.** It offers:
+
+- `document.list` and `document.markdown` (read-only queries);
+- `document.revise` (a Person-only command whose `baseVersion` is required, where one revise is one record and an over-bound revise changes nothing);
+- `documents.changed` (a live, coalescible invalidation).
+
+A version token is the canonical encoding of Loro frontiers. Authority follows Conversations 1.0 (ADR 0026): the Host-derived Installation Person is checked, and Core signs. Agent-signed revisions wait for the Agent authority decision.
+
+## Rejected alternatives
+
+- **Keeping the backend as the only Loro peer, with the UI sending text operations or ProseMirror steps.** A rendered editor would then rewrite Markdown text, so formatting would not merge and per-person undo could not be built.
+- **Loro version-vector identity instead of request IDs.** Cleaner, but it replaces the recovery, index and conflict machinery that ADRs 0027–0029 qualified, for no new behaviour.
+- **A recordless, deterministic genesis derived from the Document ID.** It makes correctness depend on byte-identical op generation across Loro versions.
+- **UI-chosen peer ids.** The UI can't see the whole version vector, and the backend must enforce the peer restriction anyway.
+- **Markdown conversion in the UI as well.** Two implementations cannot keep one canonical byte-stable form.
+- **A last-writer revise without a base version.** It overwrites newer human text.
+- **Splitting one revise across several records.** Peers can observe a partial revision if a later append fails.
+- **Tiptap.** Its default style injection violates the frame policy, and a fixed shared schema gains little from it.
+
+## Consequences
+
+- The UI bundle carries `loro-crdt` WebAssembly and ProseMirror, about 4.7 MB raw. `loro-crdt` and the Rust `loro` crate must stay at the same exact version, and a qualification test enforces it. `loro-prosemirror` is pre-1.0 and pinned exactly. Committed cross-language fixtures guard the shared schema.
+- Markdown fidelity and merge minimality are properties tested at scale: round-trip, fixed point, content preservation, no-op merge, revision equality, block identity and concurrent survival.
+- Known merge semantics, documented in the contract: an agent's block deletion loses concurrent edits inside that block; moves are a delete plus an insert; a hard-break structure change rebuilds its paragraph; concurrent structural changes to one block can duplicate text.
+- Future log compaction (`document.snapshot`) must keep port base versions resolvable or refuse stale ones explicitly.
+- A Member can still forge another peer's op ids in their own signed records from another Installation. As in ADR 0027, this is not addressed.
+- Exact text-range Comment anchors stay rejected. Quoted excerpts remain.
+
+## Evidence
+
+- `packages/documents-package/` — `backend/src/{body,domain,markdown}`, `ui-contract.json`, `ports.json`, `ui/src/editor/`; `context/02-system/09-documents/requirements.md` and `markdown-contract.md`.
+- Feasibility spike on branch `spike/rendered-document-editing` (`packages/documents-package/prototype-rendered-body/`):
+  - Same-paragraph overlapping-format, offline and two-view convergence passed in WebKit and Chromium.
+  - Concurrent empty-document creation lost one side's text (the genesis race).
+  - Two views sharing a peer silently diverged.
+  - Rust read every binding-written snapshot, and 300 of 300 random Rust-written trees passed the binding's `node.check()`.
+  - Markdown and merge properties held at 60 000 and 20 000 cases.
+  - An ordinary edit was 100–160 B, a 100 KB paste was one 102 551 B update, and a 200 KB document's snapshot was 63 531 B.
+- **Weaknesses.** The spike ran in a local harness, not the packaged WKWebView. IME and composition input were not exercised. The tree layout belongs to a pre-1.0 binding.
+
+### Provenance (non-versioned)
+
+- Workstream `rendered-document-editing`: `scope/20261024T054907Z_rendered-document-editing.md`, `prototype/20261024T062700Z_option-c-feasibility-spike.md`, `design/20261024T070649Z_rendered-document-editing.md`.
