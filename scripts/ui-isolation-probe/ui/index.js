@@ -2,13 +2,18 @@
 //
 // It runs inside a Package UI Frame in the packaged application and reports, in
 // text the packaged smoke can read through Accessibility, whether the frame can
-// reach Tauri, the Shell realm, storage or the network. It also attempts two
-// real command posts through the WKWebView message handler; the smoke checks
-// afterwards that neither of them created a Workspace.
+// reach Tauri, the Shell realm, storage or the network, and whether the frame
+// policy admits WebAssembly while still refusing other dynamic code (ADR 0030).
+// It also attempts two real command posts through the WKWebView message
+// handler; the smoke checks afterwards that neither of them created a Workspace.
 
 const BREACH_FETCH = "ui-isolation-breach-fetch";
 const BREACH_FAKE_KEY = "ui-isolation-breach-fake-key";
 const BREACH_NO_KEY = "ui-isolation-breach-no-key";
+const BREACH_TOP_NAVIGATION = "about:blank#ui-isolation-breach-top";
+
+// The smallest valid WebAssembly module: the magic number and version 1.
+const MINIMAL_WASM_MODULE = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
 async function runCheck(name, check) {
   try {
@@ -25,6 +30,33 @@ function throwsWhenRead(read) {
   } catch {
     return true;
   }
+}
+
+async function wasmInstantiates() {
+  const { instance } = await WebAssembly.instantiate(MINIMAL_WASM_MODULE);
+  return instance instanceof WebAssembly.Instance;
+}
+
+function evalBlocked() {
+  // Indirect eval, so a permissive policy would evaluate in the global scope.
+  return throwsWhenRead(() => (0, eval)("1"));
+}
+
+function functionConstructorBlocked() {
+  return throwsWhenRead(() => new Function("return 1"));
+}
+
+async function topNavigationBlocked() {
+  try {
+    window.top.location.href = BREACH_TOP_NAVIGATION;
+  } catch {
+    return true;
+  }
+  // WebKit may refuse without throwing. An admitted navigation replaces the
+  // Shell document and this frame with it, so no verdict ever renders and the
+  // smoke times out; a frame still running after the wait was not navigated away.
+  await new Promise((resolve) => { setTimeout(resolve, 1_000); });
+  return true;
 }
 
 async function blockedFetch() {
@@ -77,6 +109,8 @@ function attemptMessageHandlerPosts() {
 
 export async function mount(context) {
   const checks = [];
+  // First, so an admitted top navigation tears the frame down before any verdict renders.
+  checks.push(await runCheck("top-navigation-blocked", topNavigationBlocked));
   checks.push(await runCheck("no-tauri-internals", () => typeof window.__TAURI_INTERNALS__ === "undefined"));
   checks.push(await runCheck("no-tauri-global", () => typeof window.__TAURI__ === "undefined"));
   checks.push(await runCheck("no-window-ipc", () => typeof window.ipc === "undefined"));
@@ -85,6 +119,9 @@ export async function mount(context) {
   checks.push(await runCheck("opaque-origin", () => self.origin === "null"));
   checks.push(await runCheck("storage-blocked", () => throwsWhenRead(() => window.localStorage)));
   checks.push(await runCheck("ipc-fetch-blocked", blockedFetch));
+  checks.push(await runCheck("wasm-instantiates", wasmInstantiates));
+  checks.push(await runCheck("eval-blocked", evalBlocked));
+  checks.push(await runCheck("function-constructor-blocked", functionConstructorBlocked));
   checks.push(await runCheck("theme-delivered", () =>
     getComputedStyle(document.documentElement).getPropertyValue("--teamarness-color-accent").trim() !== ""));
   checks.push(await runCheck("bridge-error-envelope", async () => {

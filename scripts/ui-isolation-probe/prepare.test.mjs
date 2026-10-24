@@ -49,6 +49,17 @@ test("prepares a local probe Package whose manifest sizes and digests match its 
     const entrypoint = await readFile(join(packageDirectory, "ui/index.js"), "utf8");
     assert.match(entrypoint, /export async function mount\(context\)/);
     assert.match(entrypoint, /ui-isolation-breach/);
+    for (const check of [
+      "wasm-instantiates",
+      "eval-blocked",
+      "function-constructor-blocked",
+      "ipc-fetch-blocked",
+      "parent-document-blocked",
+      "top-location-blocked",
+      "top-navigation-blocked",
+    ]) {
+      assert.match(entrypoint, new RegExp(`runCheck\\("${check}"`), `${check} probe check`);
+    }
 
     assert.equal((await stat(join(packageDirectory, "backend/package.mjs"))).mode & 0o777, 0o700);
     assert.equal((await stat(join(packageDirectory, "ui/index.js"))).mode & 0o777, 0o600);
