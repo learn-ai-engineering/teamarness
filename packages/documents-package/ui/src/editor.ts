@@ -310,7 +310,10 @@ export class DocumentEditor {
     this.announce();
     try {
       const { revision } = await this.send(this.state.documentId, base, ops, id);
-      if (this.state.reason === "identity_conflict" || this.state.reason === "import_failure") return;
+      // A durable event can settle this request and start the next one before its promise resolves.
+      // Only the request that still owns the in-flight slot may change it or flush again.
+      if (this.activeRequestId !== id || this.state.reason === "identity_conflict"
+        || this.state.reason === "import_failure") return;
       this.retry = null;
       this.activeRequestId = null;
       this.inFlightText = null;
@@ -318,15 +321,9 @@ export class DocumentEditor {
         ? { ...this.state, sending: false }
         : { ...this.state, text: sent, revision, sending: false };
     } catch (error) {
-      if (this.state.reason === "identity_conflict" || this.state.reason === "import_failure") return;
-      if (this.activeRequestId === null) {
-        this.retry = null;
-        this.inFlightText = null;
-        this.state = { ...this.state, sending: false, error: null };
-        this.announce();
-        void this.flush();
-        return;
-      }
+      // A late failure from a settled request must not overwrite a newer send or its draft.
+      if (this.activeRequestId !== id || this.state.reason === "identity_conflict"
+        || this.state.reason === "import_failure") return;
       const code = (error as { code?: unknown } | null)?.code;
       if (code === "documents.stale_revision") {
         // A delta is on its way; it will re-flush once applied.

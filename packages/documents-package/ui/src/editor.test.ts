@@ -125,6 +125,37 @@ describe("DocumentEditor", () => {
     expect(editor.value).toBe("hel");
   });
 
+  it.each(["ACK", "failure"])("does not resend fast typing when a durable echo precedes an old %s", async (outcome) => {
+    const sends: { id: string; base: string; ops: unknown; resolve: (value: { revision: string }) => void;
+      reject: (cause: unknown) => void }[] = [];
+    const editor = new DocumentEditor(event({ revision: "0", text: "" }),
+      (_document, base, ops, id) => new Promise((resolve, reject) => { sends.push({ id, base, ops, resolve, reject }); }), () => {});
+    editor.input("a");
+    editor.input("ab");
+    editor.input("abc");
+    expect(sends).toHaveLength(1);
+    editor.receive(event({ revision: "1", origin: "local", requestId: sends[0]!.id, delta: [{ insert: "a" }] }), null);
+    editor.receive(event({ revision: "1", requestId: sends[0]!.id, text: "a", savedRevision: "1" }), null);
+    expect(sends).toHaveLength(2);
+    expect(sends[1]).toMatchObject({ base: "1", ops: [{ retain: 1 }, { insert: "bc" }] });
+    const secondId = sends[1]!.id;
+    if (outcome === "ACK") sends[0]!.resolve({ revision: "1" });
+    else sends[0]!.reject({ code: "documents.capability_unavailable" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(editor.outstandingIds).toEqual([secondId]);
+    expect(sends).toHaveLength(2);
+    editor.receive(event({ revision: "2", origin: "local", requestId: secondId,
+      delta: [{ retain: 1 }, { insert: "bc" }] }), null);
+    editor.receive(event({ revision: "2", requestId: secondId, text: "abc", savedRevision: "2" }), null);
+    sends[1]!.resolve({ revision: "2" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sends).toHaveLength(2);
+    expect(editor.value).toBe("abc");
+    expect(editor.current.text).toBe("abc");
+  });
+
   it("rebases an unsent draft and the caret over a remote delta", () => {
     const editor = new DocumentEditor(event({ revision: "3", text: "abc" }), () => new Promise(() => {}), () => {});
     editor.input("abcX");
