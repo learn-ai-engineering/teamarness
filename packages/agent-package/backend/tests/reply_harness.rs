@@ -205,11 +205,24 @@ enum PostMode {
     Uncertain,
 }
 
+#[derive(Clone)]
+struct Change {
+    revision: u64,
+    channel: String,
+    kind: &'static str,
+    row: Row,
+}
+
 #[derive(Default)]
 struct ConversationsState {
     channels: Vec<(String, String)>,
     messages: HashMap<String, Vec<Row>>,
     next: u64,
+    changes: Vec<Change>,
+    statuses: HashMap<String, &'static str>,
+    fail_reads: HashMap<String, usize>,
+    epoch: u64,
+    invalid_response: bool,
     /// `(channelId, markdown)` of every `message.post` the harness issued, accepted or not.
     posts: Vec<(String, String)>,
     post_mode: Option<PostMode>,
@@ -228,6 +241,7 @@ impl FakeConversations {
             state.channels.push((GENERAL.into(), "general".into()));
             state.channels.push((SIDE.into(), "side".into()));
             state.post_mode = Some(PostMode::Accept);
+            state.epoch = 1;
         }
         fake
     }
@@ -243,8 +257,51 @@ impl FakeConversations {
             markdown: markdown.into(),
         };
         let position = row.position.clone();
+        let revision = state.next;
+        state.changes.push(Change {
+            revision,
+            channel: channel.into(),
+            kind: "insert",
+            row: row.clone(),
+        });
         state.messages.entry(channel.into()).or_default().push(row);
         position
+    }
+
+    fn append_at(&self, channel: &str, author: &str, markdown: &str, order: u64) {
+        self.append(channel, author, markdown);
+        let mut state = self.state.lock().unwrap();
+        let position = format!("{order:082x}");
+        state
+            .messages
+            .get_mut(channel)
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .position = position.clone();
+        state.changes.last_mut().unwrap().row.position = position;
+    }
+
+    fn fail_once(&self, port: &str) {
+        self.state.lock().unwrap().fail_reads.insert(port.into(), 1);
+    }
+
+    fn remove(&self, channel: &str, position: &str) {
+        let mut state = self.state.lock().unwrap();
+        let rows = state.messages.get_mut(channel).unwrap();
+        let index = rows
+            .iter()
+            .position(|row| row.position == position)
+            .unwrap();
+        let row = rows.remove(index);
+        state.next += 1;
+        let revision = state.next;
+        state.changes.push(Change {
+            revision,
+            channel: channel.into(),
+            kind: "remove",
+            row,
+        });
     }
 
     fn set_post_mode(&self, mode: PostMode) {
@@ -267,7 +324,15 @@ impl FakeConversations {
             }
             assert_eq!(payload["contract"], "dev.teamarness.conversations");
             let request = &payload["request"];
-            match payload["port"].as_str().unwrap_or_default() {
+            let port = payload["port"].as_str().unwrap_or_default();
+            {
+                let mut state = fake.state.lock().unwrap();
+                if let Some(remaining) = state.fail_reads.get_mut(port) && *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(BackendError::new("overloaded", true, empty()));
+                }
+            }
+            match port {
                 "channel.list" => {
                     let state = fake.state.lock().unwrap();
                     let channels = state
@@ -283,7 +348,8 @@ impl FakeConversations {
                     let limit = request["limit"].as_u64().unwrap_or(64) as usize;
                     assert!((1..=64).contains(&limit));
                     let before = request["before"].as_str();
-                    let rows = state.messages.get(channel).cloned().unwrap_or_default();
+                    let mut rows = state.messages.get(channel).cloned().unwrap_or_default();
+                    rows.sort_by(|left, right| left.position.cmp(&right.position));
                     let mut older = rows
                         .iter()
                         .rev()
@@ -298,7 +364,7 @@ impl FakeConversations {
                         }));
                     }
                     let mut response = json!({
-                        "messages": page, "pending": [], "epoch": "1", "revision": "1",
+                        "messages": page, "pending": [], "epoch": format!("{:032x}", state.epoch), "revision": state.next.to_string(),
                     });
                     if older.peek().is_some()
                         && let Some(last) =
@@ -307,6 +373,33 @@ impl FakeConversations {
                         response["nextBefore"] = last["position"].clone();
                     }
                     Ok(response)
+                }
+                "message.changes" => {
+                    let state = fake.state.lock().unwrap();
+                    let channel = request["channelId"].as_str().unwrap();
+                    let after: u64 = request["after"].as_str().unwrap().parse().unwrap();
+                    let limit = request["limit"].as_u64().unwrap_or(32) as usize;
+                    assert!((1..=32).contains(&limit));
+                    if request["epoch"] != format!("{:032x}", state.epoch) || after > state.next {
+                        return Ok(json!({"events":[],"continuation":after.to_string(),"highWater":after.to_string(),"resyncRequired":true}));
+                    }
+                    let events = state.changes.iter().filter(|change| change.channel == channel && change.revision > after)
+                        .take(limit).map(|change| {
+                            let row = &change.row;
+                            let mut event = json!({"revision":change.revision.to_string(),"kind":change.kind,"id":row.id,"position":row.position});
+                            if change.kind == "insert" {
+                                let present = state.messages.get(channel).is_some_and(|rows| rows.iter().any(|current| current.id == row.id));
+                                let status = if present { state.statuses.get(&row.id).copied().unwrap_or("ready") } else { "unavailable" };
+                                event["status"] = json!(status);
+                                if status == "ready" {
+                                    event["message"] = json!({"id":row.id,"position":row.position,"author":row.author,
+                                        "markdown":row.markdown,"isLocal":row.author == STEWARD_KEY});
+                                }
+                            }
+                            event
+                        }).collect::<Vec<_>>();
+                    let continuation = events.last().map_or(state.next.to_string(), |event| event["revision"].as_str().unwrap().to_owned());
+                    Ok(json!({"events":events,"continuation":if state.invalid_response { after.to_string() } else { continuation },"highWater":state.next.to_string()}))
                 }
                 "message.post" => {
                     let channel = request["channelId"].as_str().unwrap_or_default().to_owned();
@@ -342,6 +435,7 @@ impl FakeConversations {
 struct Roster {
     agent_name: Arc<Mutex<String>>,
     bound: Arc<Mutex<bool>>,
+    lookup_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Roster {
@@ -349,6 +443,7 @@ impl Roster {
         Self {
             agent_name: Arc::new(Mutex::new("Scout".into())),
             bound: Arc::new(Mutex::new(false)),
+            lookup_failures: Arc::default(),
         }
     }
 
@@ -388,6 +483,17 @@ impl Roster {
         ScriptedCapability::new().calls(move |method, payload| match method {
             "current" => Ok(roster.snapshot(1)),
             "lookup" => {
+                if roster
+                    .lookup_failures
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |remaining| remaining.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Err(BackendError::new("overloaded", true, empty()));
+                }
                 let identity = payload["identity"].as_str().unwrap_or_default();
                 let found = roster
                     .rows()
@@ -483,6 +589,10 @@ async fn make_ready(fixture: &mut Fixture, stub: &StubEndpoint, context_messages
         .unwrap();
     wait_status(&mut fixture.harness, "ready", None).await;
     fixture.ports.stream().opened().await;
+    wait_until("the Channel baselines", || {
+        page_calls(&fixture.ports, SIDE) >= 1
+    })
+    .await;
 }
 
 /// Polls until `condition` holds or the deadline passes.
@@ -530,12 +640,29 @@ async fn wait_agent_name(harness: &mut Harness, name: &str) {
     }
 }
 
+fn acknowledged(data: &Path, channel: &str) -> Option<u64> {
+    let value: Value =
+        serde_json::from_slice(&std::fs::read(data.join("progress.json")).ok()?).ok()?;
+    value["channels"][channel]["after"].as_u64()
+}
+
 fn page_calls(ports: &ScriptedCapability, channel: &str) -> usize {
     ports
         .recorded_calls()
         .iter()
         .filter(|call| {
             call.payload["port"] == "message.page"
+                && call.payload["request"]["channelId"] == channel
+        })
+        .count()
+}
+
+fn change_calls(ports: &ScriptedCapability, channel: &str) -> usize {
+    ports
+        .recorded_calls()
+        .iter()
+        .filter(|call| {
+            call.payload["port"] == "message.changes"
                 && call.payload["request"]["channelId"] == channel
         })
         .count()
@@ -564,13 +691,13 @@ async fn say(
     position
 }
 
-/// Waits for one full pass after an event: `channel.list` ran and `#general` was paged.
+/// Waits for one catch-up pass after an invalidation, without relying on display paging.
 async fn settle_pass(ports: &ScriptedCapability) {
     let lists = list_calls(ports);
-    let pages = page_calls(ports, GENERAL);
+    let changes = change_calls(ports, GENERAL);
     assert!(ports.stream().send(empty()).await);
     wait_until("a pass to complete", || {
-        list_calls(ports) > lists && page_calls(ports, GENERAL) > pages
+        list_calls(ports) > lists && change_calls(ports, GENERAL) > changes
     })
     .await;
     // negative-wait: a reply would start after the scan; a bounded window is the only way to
@@ -585,13 +712,223 @@ fn assert_no_secret(ports: &ScriptedCapability, data: &Path) {
             "a Port call carries the key"
         );
     }
-    let positions = std::fs::read_to_string(data.join("positions.json")).unwrap();
+    let positions = std::fs::read_to_string(data.join("progress.json")).unwrap();
     assert!(!positions.contains(SECRET));
 }
 
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
+
+// Verifies: TEAM.SYS.CONV-R19
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_late_lower_sort_message_is_answered_once() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    conversations.append_at(GENERAL, STEWARD_KEY, "already observed", 100);
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 20).await;
+    wait_until("initial baseline", || page_calls(&fixture.ports, SIDE) >= 1).await;
+    conversations.append_at(GENERAL, BOB_KEY, "@Scout delivered later", 2);
+    assert!(fixture.ports.stream().send(empty()).await);
+    wait_until("reply to late lower-sort arrival", || {
+        conversations.posts().len() == 1
+    })
+    .await;
+    assert_eq!(stub.request_count(), 1);
+    assert_eq!(conversations.posts()[0].0, GENERAL);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+// Verifies: TEAM.SYS.CONV-R19
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_restart_drains_backlog_without_a_new_notification() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    conversations.append(GENERAL, STEWARD_KEY, "baseline");
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    wait_until("initial baseline", || page_calls(&fixture.ports, SIDE) >= 1).await;
+    fixture.harness.shutdown().await.unwrap();
+    conversations.append(GENERAL, BOB_KEY, "@Scout oldest queued mention");
+    for _ in 0..256 {
+        conversations.append(GENERAL, BOB_KEY, "ordinary queued message");
+    }
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    fixture.harness.activate().await.unwrap();
+    wait_until("oldest backlog mention", || {
+        conversations.posts().len() == 1
+    })
+    .await;
+    let head = conversations.state.lock().unwrap().next;
+    wait_until("all queued revisions, not just the first mention", || {
+        acknowledged(data.path(), GENERAL).is_some_and(|after| after >= head)
+    })
+    .await;
+    assert_eq!(stub.request_count(), 1);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_safe_read_recovers_without_another_event() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 20).await;
+    for (index, port) in ["channel.list", "message.changes", "message.page", "lookup"]
+        .into_iter()
+        .enumerate()
+    {
+        if port == "lookup" {
+            roster
+                .lookup_failures
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            conversations.fail_once(port);
+        }
+        say(
+            &conversations,
+            &fixture.ports,
+            BOB_KEY,
+            "@Scout only notification",
+        )
+        .await;
+        wait_until("reply after safe-read recovery", || {
+            conversations.posts().len() == index + 1
+        })
+        .await;
+        assert_eq!(stub.request_count(), index + 1, "{port}");
+        let head = conversations.state.lock().unwrap().next;
+        wait_until("settled attempt", || {
+            acknowledged(data.path(), GENERAL).is_some_and(|after| after >= head)
+        })
+        .await;
+    }
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_multiple_mentions_across_batches_are_not_abandoned() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    fixture.harness.shutdown().await.unwrap();
+    for index in 0..300 {
+        let text = if [0, 140, 290].contains(&index) {
+            format!("@Scout queued {index}")
+        } else {
+            format!("ordinary {index}")
+        };
+        conversations.append(GENERAL, BOB_KEY, &text);
+    }
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    fixture.harness.activate().await.unwrap();
+    wait_until("all three separated mentions", || {
+        conversations.posts().len() == 3
+    })
+    .await;
+    let head = conversations.state.lock().unwrap().next;
+    wait_until("complete backlog settlement", || {
+        acknowledged(data.path(), GENERAL).is_some_and(|after| after >= head)
+    })
+    .await;
+    assert_eq!(stub.request_count(), 3);
+    for (request, index) in stub.requests().iter().zip([0, 140, 290]) {
+        assert_eq!(
+            request.body["messages"][1]["content"],
+            format!("Bob (person): @Scout queued {index}")
+        );
+    }
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_pending_content_blocks_ack_until_safe_retry_and_removes_never_trigger() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    conversations.append(GENERAL, BOB_KEY, "@Scout unavailable");
+    let removed = conversations.append(GENERAL, BOB_KEY, "@Scout removed");
+    conversations.remove(GENERAL, &removed);
+    conversations.append(GENERAL, BOB_KEY, "@Scout pending");
+    let pending_id = {
+        let mut state = conversations.state.lock().unwrap();
+        let unavailable = state.changes[0].row.id.clone();
+        let pending = state.changes[3].row.id.clone();
+        state.statuses.insert(unavailable, "unavailable");
+        state.statuses.insert(pending.clone(), "pending");
+        pending
+    };
+    conversations.append(GENERAL, BOB_KEY, "@Scout after pending");
+    assert!(fixture.ports.stream().send(empty()).await);
+    wait_until("prefix before pending revision", || {
+        acknowledged(data.path(), GENERAL) == Some(3)
+    })
+    .await;
+    assert_eq!(stub.request_count(), 0);
+    conversations
+        .state
+        .lock()
+        .unwrap()
+        .statuses
+        .remove(&pending_id);
+    // No invalidation: pending-content recovery must schedule its own safe query.
+    wait_until("pending and subsequent mention", || {
+        conversations.posts().len() == 2
+    })
+    .await;
+    assert_eq!(stub.request_count(), 2);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_invalid_epoch_or_continuation_never_replays() {
+    for change_epoch in [true, false] {
+        let data = tempfile::tempdir().unwrap();
+        let stub = StubEndpoint::start().await;
+        let roster = Roster::new();
+        let conversations = FakeConversations::new();
+        let mut fixture = start(data.path(), &roster, &conversations).await;
+        make_ready(&mut fixture, &stub, 0).await;
+        {
+            let mut state = conversations.state.lock().unwrap();
+            if change_epoch {
+                state.epoch += 1;
+            } else {
+                state.invalid_response = true;
+            }
+        }
+        say(
+            &conversations,
+            &fixture.ports,
+            BOB_KEY,
+            "@Scout unsafe progress",
+        )
+        .await;
+        wait_status(
+            &mut fixture.harness,
+            "error",
+            Some("agent.progress_invalid"),
+        )
+        .await;
+        assert_eq!(stub.request_count(), 0);
+        assert!(conversations.posts().is_empty());
+        assert_eq!(acknowledged(data.path(), GENERAL), Some(0));
+        fixture.harness.shutdown().await.unwrap();
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replies_once_when_addressed_and_only_then() {
@@ -752,6 +1089,7 @@ async fn a_burst_during_a_reply_collapses_and_a_restart_never_re_replies() {
     wait_until("the held request", || stub.request_count() == 1).await;
     wait_status(harness, "replying", None).await;
     let pages_before = page_calls(ports, GENERAL);
+    let changes_before = change_calls(ports, GENERAL);
     let lists_before = list_calls(ports);
 
     // A burst while the reply is in flight: every event runs a pass, none pages the busy
@@ -774,12 +1112,12 @@ async fn a_burst_during_a_reply_collapses_and_a_restart_never_re_replies() {
     // One rescan found the second mention; one more after its reply found only the Agent's own
     // posts. Nothing else is pending.
     wait_until("the final rescan", || {
-        page_calls(ports, GENERAL) == pages_before + 2
+        change_calls(ports, GENERAL) == changes_before + 2
     })
     .await;
     // negative-wait: proving no further scan or request happens needs a bounded window.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(page_calls(ports, GENERAL), pages_before + 2);
+    assert_eq!(change_calls(ports, GENERAL), changes_before + 2);
     assert_eq!(stub.request_count(), 2);
     assert!(
         stub.requests()[1].body["messages"]
@@ -792,14 +1130,14 @@ async fn a_burst_during_a_reply_collapses_and_a_restart_never_re_replies() {
 
     // A new process generation reads the marks back: nothing is answered again, and the
     // Agent's own replies in the projection are not triggers.
-    let positions = std::fs::read_to_string(data.path().join("positions.json")).unwrap();
+    let positions = std::fs::read_to_string(data.path().join("progress.json")).unwrap();
     assert!(positions.contains(GENERAL));
     let mut fixture = start(data.path(), &roster, &conversations).await;
     fixture.harness.activate().await.unwrap();
     wait_status(&mut fixture.harness, "ready", None).await;
     fixture.ports.stream().opened().await;
     wait_until("the restarted pass", || {
-        page_calls(&fixture.ports, GENERAL) >= 1
+        change_calls(&fixture.ports, GENERAL) >= 1
     })
     .await;
     settle_pass(&fixture.ports).await;
@@ -890,10 +1228,11 @@ async fn endpoint_and_post_failures_map_to_package_codes_and_are_never_retried()
     assert_eq!(status["lastError"]["retryable"], false);
     assert_eq!(conversations.posts().len(), 2);
     let positions: Value =
-        serde_json::from_str(&std::fs::read_to_string(data.path().join("positions.json")).unwrap())
+        serde_json::from_str(&std::fs::read_to_string(data.path().join("progress.json")).unwrap())
             .unwrap();
     assert!(
-        positions["channels"][GENERAL].as_str().unwrap() >= trigger.as_str(),
+        positions["channels"][GENERAL]["after"].as_u64().unwrap()
+            >= u64::from_str_radix(&trigger, 16).unwrap(),
         "the mark did not pass the trigger: {positions}"
     );
     settle_pass(ports).await;

@@ -1,24 +1,14 @@
-//! The reply harness: one background task per active Instance that answers when the Agent is
-//! addressed.
+//! Reply to addressed Messages using durable projection revisions, not display positions.
 //!
-//! The loop subscribes to Conversations' `messages.changed`; on start and on every event it runs
-//! `channel.list` and pages each Channel forward from its persisted mark ([`crate::positions`]).
-//! A Message triggers a reply when a Person other than the Agent wrote it and its markdown
-//! mentions the Agent's current name ([`crate::mention`]). Each Channel has at most one reply in
-//! flight and a one-slot pending flag, so a burst of events during a reply collapses into one
-//! more scan of that Channel once the reply is done. The mark moves past the trigger, and is
-//! written, before the model is asked, so a crash or an uncertain post never yields a second
-//! reply. Endpoint failures reach the status as Package-owned codes and are never retried.
-//!
-//! The task ends on cancellation (suspend, dispose) and when the status leaves the ready family
-//! (configuration or binding lost); `AgentActive::sync_harness` starts it again when both are
-//! back. A new task reads the marks back from disk, so a restart never re-answers.
+//! `messages.changed` only wakes catch-up. Startup, reconnection and locally pending work use
+//! `message.changes` after the acknowledged revision. Each Channel has one reply in flight;
+//! its trigger is persisted before the model/post attempt and is never retried afterward.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use teamarness_package_sdk::CancellationToken;
 use teamarness_package_sdk::capabilities::agent_binding::BoundAgent;
@@ -28,52 +18,39 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::mention::mentions;
 use crate::model::{ChatMessage, ModelClient, ModelFailure};
-use crate::positions::{Positions, is_after};
+use crate::progress::{Cursor, Progress};
 use crate::settings::SettingsStore;
 use crate::status::StatusCell;
 
-/// The Conversations Port Contract this Package consumes.
 pub const CONVERSATIONS_CONTRACT: &str = "dev.teamarness.conversations";
-/// `message.post` was refused or its outcome is uncertain; the mark had already moved, so the
-/// trigger is never answered again.
 pub const POST_FAILED: &str = "agent.post_failed";
-/// The marks could not be read or written; nothing is posted without a persisted mark.
 pub const STORAGE_FAILED: &str = "agent.storage_failed";
+/// Saved progress cannot be continued safely; never silently replay or rebaseline it.
+pub const PROGRESS_INVALID: &str = "agent.progress_invalid";
 
-/// Messages per `message.page` and pages per Channel per pass: at most 256 Messages are read
-/// per Channel per pass, so a Channel that moved further is answered from its newest 256.
-const PAGE_LIMIT: usize = 64;
-const MAX_PAGES_PER_CHANNEL: usize = 4;
-/// The Conversations `message.post` bound on `markdown`.
+/// Published `message.changes` event bound and finite work per Channel per pass.
+const CHANGE_LIMIT: usize = 32;
+const MAX_BATCHES_PER_CHANNEL: usize = 4;
 const MAX_REPLY_CHARS: usize = 32_768;
-/// How long the loop waits before reopening a subscription that failed or closed.
 const RETRY: Duration = Duration::from_secs(1);
-/// How long a stopping harness waits for its in-flight replies to notice the token.
 const DRAIN: Duration = Duration::from_secs(1);
 
-/// What the harness loop is given when it starts.
-///
-/// The settings store is read on each reply, so a saved change applies to the next reply; the
-/// key is read from the store only while a request is being built, through
-/// `SettingsStore::api_key`.
 #[derive(Clone)]
 pub struct HarnessInputs {
     pub ports: PortClient,
     pub principals: Principals,
-    pub settings: Arc<std::sync::Mutex<SettingsStore>>,
+    pub settings: Arc<Mutex<SettingsStore>>,
     pub status: Arc<StatusCell>,
-    /// The Package Data Directory, where `positions.json` lives.
-    pub data_directory: PathBuf,
+    /// Shared across suspend/resume so blocking writes have one serialized owner.
+    pub progress: Arc<Mutex<Progress>>,
 }
 
-/// One running background task and the token that stops it.
 pub struct TaskHandle {
     cancellation: CancellationToken,
     task: JoinHandle<()>,
 }
 
 impl TaskHandle {
-    /// Runs `work` under a fresh child of `parent`, so cancelling the parent stops it too.
     pub fn spawn<F, Fut>(parent: &CancellationToken, work: F) -> Self
     where
         F: FnOnce(CancellationToken) -> Fut,
@@ -84,13 +61,11 @@ impl TaskHandle {
         Self { cancellation, task }
     }
 
-    /// Whether the task has already returned on its own.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
 
-    /// Cancels the task and waits for it to finish; a task that ignores the token is aborted.
     pub async fn stop(self) {
         self.cancellation.cancel();
         let abort = self.task.abort_handle();
@@ -103,29 +78,97 @@ impl TaskHandle {
     }
 }
 
-/// Starts the reply harness under `parent`.
 pub fn start(parent: &CancellationToken, inputs: HarnessInputs) -> TaskHandle {
-    TaskHandle::spawn(parent, move |cancellation| async move {
-        run(inputs, cancellation).await;
-    })
+    TaskHandle::spawn(parent, move |cancellation| run(inputs, cancellation))
 }
 
-/// One Message as `message.page` shows it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Message {
+    id: String,
     position: String,
     author: String,
     markdown: String,
+    #[serde(rename = "isLocal")]
+    _is_local: bool,
 }
 
-/// The per-Channel reply discipline.
-#[derive(Debug, Default)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Change {
+    revision: String,
+    id: String,
+    position: String,
+    kind: String,
+    status: Option<String>,
+    message: Option<Message>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Batch {
+    events: Vec<Change>,
+    continuation: String,
+    high_water: String,
+    #[serde(default)]
+    resync_required: bool,
+}
+
+/// Validate continuity before allowing any response to acknowledge unseen work.
+impl Batch {
+    fn parse(value: Value, after: u64) -> Option<Self> {
+        let batch: Self = serde_json::from_value(value).ok()?;
+        let continuation = revision(&batch.continuation)?;
+        let high_water = revision(&batch.high_water)?;
+        if batch.resync_required
+            || batch.events.len() > CHANGE_LIMIT
+            || continuation < after
+            || continuation > high_water
+            || (high_water > after && continuation == after)
+        {
+            return None;
+        }
+        let mut previous = after;
+        for event in &batch.events {
+            let next = revision(&event.revision)?;
+            if next <= previous
+                || next > continuation
+                || event.id.is_empty()
+                || event.position.is_empty()
+            {
+                return None;
+            }
+            match (event.kind.as_str(), event.status.as_deref(), &event.message) {
+                ("remove", None, None) | ("insert", Some("pending" | "unavailable"), None) => {}
+                ("insert", Some("ready"), Some(message))
+                    if message.id == event.id && message.position == event.position => {}
+                _ => return None,
+            }
+            previous = next;
+        }
+        Some(batch)
+    }
+}
+
+fn revision(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value <= i64::MAX as u64)
+}
+
+#[derive(Default)]
 struct Slot {
     in_flight: bool,
     pending: bool,
 }
 
-/// How one reply task ended.
 enum ReplyOutcome {
     Posted,
     Cancelled,
@@ -135,11 +178,11 @@ enum ReplyOutcome {
 struct Loop {
     inputs: HarnessInputs,
     client: ModelClient,
-    positions: Positions,
     slots: HashMap<String, Slot>,
     replies: JoinSet<(String, ReplyOutcome)>,
-    /// Cancels every reply task when the loop ends for any reason.
     work: CancellationToken,
+    retry_at: Option<tokio::time::Instant>,
+    fatal: bool,
 }
 
 async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
@@ -150,32 +193,26 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
             return;
         }
     };
-    let positions = match Positions::open(&inputs.data_directory) {
-        Ok(positions) => positions,
-        Err(_) => {
-            inputs.status.set_error(STORAGE_FAILED, true);
-            return;
-        }
-    };
     let mut status = inputs.status.subscribe();
     let mut state = Loop {
-        work: cancellation.child(),
         inputs,
         client,
-        positions,
         slots: HashMap::new(),
         replies: JoinSet::new(),
+        work: cancellation.child(),
+        retry_at: None,
+        fatal: false,
     };
     'subscription: loop {
-        if cancellation.is_cancelled() {
+        if cancellation.is_cancelled() || !state.inputs.status.is_ready_to_run() {
             break;
         }
-        let mut events = match state
-            .inputs
-            .ports
-            .subscribe_event(CONVERSATIONS_CONTRACT, "messages.changed")
-            .await
-        {
+        let subscription = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            events = state.inputs.ports.subscribe_event(CONVERSATIONS_CONTRACT, "messages.changed") => events,
+        };
+        let mut events = match subscription {
             Ok(events) => events,
             Err(_) => {
                 if wait_or_cancel(&cancellation, RETRY).await {
@@ -186,6 +223,11 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
         };
         state.pass().await;
         loop {
+            if state.fatal || cancellation.is_cancelled() {
+                events.close().await;
+                break 'subscription;
+            }
+            let retry_at = state.retry_at;
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
@@ -199,17 +241,15 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
                     }
                 }
                 joined = state.replies.join_next(), if !state.replies.is_empty() => {
-                    if let Some(joined) = joined {
-                        state.finished(joined).await;
-                    }
+                    if let Some(joined) = joined { state.finished(joined).await; }
                 }
                 next = events.recv() => match next {
                     Some(Ok(_)) => state.pass().await,
-                    Some(Err(_)) | None => {
-                        events.close().await;
-                        break;
-                    }
+                    Some(Err(_)) | None => { events.close().await; break; }
                 },
+                () = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
+                    state.pass().await;
+                }
             }
         }
         if wait_or_cancel(&cancellation, RETRY).await {
@@ -219,7 +259,6 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
     state.shutdown().await;
 }
 
-/// Sleeps for `duration` unless cancelled first; `true` means cancelled.
 async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) -> bool {
     tokio::select! {
         () = cancellation.cancelled() => true,
@@ -228,42 +267,99 @@ async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) ->
 }
 
 impl Loop {
-    /// One pass: list the Channels and scan each one that has no reply in flight.
+    fn schedule(&mut self, delay: Duration) {
+        let deadline = tokio::time::Instant::now() + delay;
+        self.retry_at = Some(
+            self.retry_at
+                .map_or(deadline, |previous| previous.min(deadline)),
+        );
+    }
+
+    fn invalid_progress(&mut self) {
+        self.fatal = true;
+        self.work.cancel();
+        self.inputs.status.set_error(PROGRESS_INVALID, false);
+    }
+
+    async fn query(&self, port: &str, request: Value) -> Result<Value, ()> {
+        tokio::select! {
+            biased;
+            () = self.work.cancelled() => Err(()),
+            response = self.inputs.ports.query(CONVERSATIONS_CONTRACT, port, request) => response.map_err(|_| ()),
+        }
+    }
+
+    async fn cursor(&self, channel: &str) -> Result<Option<Cursor>, ()> {
+        let progress = self.inputs.progress.clone();
+        let channel = channel.to_owned();
+        teamarness_package_sdk::blocking(&self.work, move |_| {
+            progress
+                .lock()
+                .map_err(|_| crate::storage_failed())
+                .map(|progress| progress.cursor(&channel).cloned())
+        })
+        .await
+        .map_err(|_| ())
+    }
+
+    async fn persist(&mut self, channel: &str, cursor: &Cursor) -> bool {
+        let progress = self.inputs.progress.clone();
+        let channel = channel.to_owned();
+        let cursor = cursor.clone();
+        let saved = teamarness_package_sdk::blocking(&self.work, move |token| {
+            if token.is_cancelled() {
+                return Err(crate::storage_failed());
+            }
+            progress
+                .lock()
+                .map_err(|_| crate::storage_failed())?
+                .advance(&channel, cursor)
+                .map_err(|_| crate::storage_failed())
+        })
+        .await;
+        if saved.is_err() {
+            if !self.work.is_cancelled() {
+                self.inputs.status.set_error(STORAGE_FAILED, true);
+                self.schedule(RETRY);
+            }
+            return false;
+        }
+        true
+    }
+
     async fn pass(&mut self) {
+        self.retry_at = None;
         let Some(agent) = self.inputs.status.agent() else {
             return;
         };
-        let Ok(list) = self
-            .inputs
-            .ports
-            .query(CONVERSATIONS_CONTRACT, "channel.list", json!({}))
-            .await
-        else {
+        let Ok(list) = self.query("channel.list", json!({})).await else {
+            self.schedule(RETRY);
             return;
         };
-        let channels = list["channels"]
-            .as_array()
-            .map(|channels| {
-                channels
-                    .iter()
-                    .filter_map(|channel| channel["id"].as_str().map(str::to_owned))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let Some(channels) = list["channels"].as_array() else {
+            self.invalid_progress();
+            return;
+        };
+        let channels = channels
+            .iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
         let (context_messages, system_prompt) = {
             let store = self
                 .inputs
                 .settings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let settings = store.settings();
             (
-                settings.context_messages as usize,
-                settings.system_prompt.clone(),
+                store.settings().context_messages as usize,
+                store.settings().system_prompt.clone(),
             )
         };
         let mut lookups = HashMap::new();
         for channel in channels {
+            if self.work.is_cancelled() || self.fatal {
+                break;
+            }
             if self.slots.get(&channel).is_some_and(|slot| slot.in_flight) {
                 self.slots.entry(channel).or_default().pending = true;
                 continue;
@@ -279,7 +375,6 @@ impl Loop {
         }
     }
 
-    /// Pages one Channel newest-first until the mark is passed and enough context is in hand.
     async fn scan(
         &mut self,
         agent: &BoundAgent,
@@ -288,112 +383,145 @@ impl Loop {
         system_prompt: &str,
         lookups: &mut HashMap<String, Option<Principal>>,
     ) {
-        let mark = self.positions.mark(channel).map(str::to_owned);
-        let mut rows: Vec<Message> = Vec::new();
-        let mut before: Option<String> = None;
-        for _ in 0..MAX_PAGES_PER_CHANNEL {
-            let mut request = json!({ "channelId": channel, "limit": PAGE_LIMIT });
-            if let Some(before) = &before {
-                request["before"] = json!(before);
-            }
-            let Ok(page) = self
-                .inputs
-                .ports
-                .query(CONVERSATIONS_CONTRACT, "message.page", request)
-                .await
-            else {
+        let mut cursor = match self.cursor(channel).await {
+            Ok(Some(cursor)) => cursor,
+            Ok(None) => {
+                let Ok(page) = self
+                    .query("message.page", json!({"channelId":channel,"limit":1}))
+                    .await
+                else {
+                    self.schedule(RETRY);
+                    return;
+                };
+                let cursor = page["epoch"]
+                    .as_str()
+                    .zip(page["revision"].as_str().and_then(revision))
+                    .and_then(|(epoch, after)| Cursor::new(epoch.to_owned(), after));
+                let Some(cursor) = cursor else {
+                    self.invalid_progress();
+                    return;
+                };
+                self.persist(channel, &cursor).await;
                 return;
-            };
-            rows.extend(
-                page["messages"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(parse_message),
-            );
-            let Some(mark) = &mark else {
-                // First sight of this Channel: the head becomes the mark; history is never answered.
-                let head = rows.first().map_or("", |row| row.position.as_str());
-                if self.positions.advance(channel, head).is_err() {
-                    self.inputs.status.set_error(STORAGE_FAILED, true);
-                }
-                return;
-            };
-            let older = rows
-                .iter()
-                .filter(|row| !is_after(&row.position, mark))
-                .count();
-            let next = page["nextBefore"].as_str().map(str::to_owned);
-            if older >= context_messages.max(1) || next.is_none() {
-                break;
             }
-            before = next;
-        }
-        let Some(mark) = mark else {
-            return;
-        };
-        let new = rows
-            .iter()
-            .filter(|row| is_after(&row.position, &mark))
-            .collect::<Vec<_>>();
-        let Some(head) = new.first().map(|row| row.position.clone()) else {
-            return;
-        };
-        let mut trigger = None;
-        for candidate in new.iter().rev() {
-            if candidate.author == agent.identity {
-                continue;
-            }
-            let Some(name) = agent.name.as_deref() else {
-                continue;
-            };
-            if !mentions(&candidate.markdown, name) {
-                continue;
-            }
-            let Ok(principal) = self.lookup(&candidate.author, lookups).await else {
-                // The roster is unavailable: leave the mark so the next pass decides.
-                return;
-            };
-            if principal.is_some_and(|principal| principal.kind == PrincipalKind::Person) {
-                trigger = Some((*candidate).clone());
-                break;
-            }
-        }
-        let Some(trigger) = trigger else {
-            if self.positions.advance(channel, &head).is_err() {
+            Err(()) => {
                 self.inputs.status.set_error(STORAGE_FAILED, true);
+                self.schedule(RETRY);
+                return;
             }
-            return;
         };
-        // Mark before anything else: from here on this Message is never answered twice.
-        if self.positions.advance(channel, &trigger.position).is_err() {
-            self.inputs.status.set_error(STORAGE_FAILED, true);
-            return;
-        }
-        let mut prior = rows
-            .iter()
-            .filter(|row| is_after(&trigger.position, &row.position))
-            .take(context_messages)
-            .cloned()
-            .collect::<Vec<_>>();
-        prior.reverse();
-        let mut messages = Vec::with_capacity(prior.len() + 2);
-        messages.push(ChatMessage::system(system_message(agent, system_prompt)));
-        for row in prior.iter().chain(std::iter::once(&trigger)) {
-            if row.author == agent.identity {
-                messages.push(ChatMessage::assistant(row.markdown.clone()));
-                continue;
-            }
-            let label = match self.lookup(&row.author, lookups).await {
-                Ok(principal) => label(principal.as_ref(), &row.author),
-                Err(_) => label(None, &row.author),
+        for _ in 0..MAX_BATCHES_PER_CHANNEL {
+            let Ok(value) = self.query("message.changes", json!({
+                "channelId":channel,"epoch":cursor.epoch,"after":cursor.after.to_string(),"limit":CHANGE_LIMIT,
+            })).await else { self.schedule(RETRY); return; };
+            let Some(batch) = Batch::parse(value, cursor.after) else {
+                self.invalid_progress();
+                return;
             };
-            messages.push(ChatMessage::user(format!("{label}: {}", row.markdown)));
+            for event in batch.events {
+                if event.status.as_deref() == Some("pending") {
+                    if self.persist(channel, &cursor).await {
+                        self.schedule(RETRY);
+                    }
+                    return;
+                }
+                if let Some(message) = event.message
+                    && message.author != agent.identity
+                    && agent
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| mentions(&message.markdown, name))
+                {
+                    let principal = match self.lookup(&message.author, lookups).await {
+                        Ok(principal) => principal,
+                        Err(()) => {
+                            if self.persist(channel, &cursor).await {
+                                self.schedule(RETRY);
+                            }
+                            return;
+                        }
+                    };
+                    if principal.is_some_and(|principal| principal.kind == PrincipalKind::Person) {
+                        let messages = match self
+                            .context(
+                                agent,
+                                channel,
+                                &message,
+                                context_messages,
+                                system_prompt,
+                                lookups,
+                            )
+                            .await
+                        {
+                            Ok(messages) => messages,
+                            Err(()) => {
+                                if self.persist(channel, &cursor).await {
+                                    self.schedule(RETRY);
+                                }
+                                return;
+                            }
+                        };
+                        cursor.after = revision(&event.revision).expect("validated revision");
+                        if self.persist(channel, &cursor).await && !self.work.is_cancelled() {
+                            self.spawn_reply(channel.to_owned(), messages);
+                        }
+                        return;
+                    }
+                }
+                cursor.after = revision(&event.revision).expect("validated revision");
+            }
+            cursor.after = revision(&batch.continuation).expect("validated continuation");
+            if !self.persist(channel, &cursor).await {
+                return;
+            }
+            if cursor.after == revision(&batch.high_water).expect("validated high water") {
+                return;
+            }
         }
-        self.spawn_reply(channel.to_owned(), messages);
+        // The work bound limits this pass, not the history that can ever be processed.
+        self.schedule(Duration::ZERO);
     }
 
-    /// Resolves an author key once per pass.
+    async fn context(
+        &self,
+        agent: &BoundAgent,
+        channel: &str,
+        trigger: &Message,
+        limit: usize,
+        system_prompt: &str,
+        lookups: &mut HashMap<String, Option<Principal>>,
+    ) -> Result<Vec<ChatMessage>, ()> {
+        let mut prior = if limit == 0 {
+            Vec::new()
+        } else {
+            let page = self
+                .query(
+                    "message.page",
+                    json!({"channelId": channel, "before":trigger.position,"limit":limit}),
+                )
+                .await?;
+            let rows = page["messages"].as_array().ok_or(())?;
+            rows.iter()
+                .map(|row| serde_json::from_value::<Message>(row.clone()).map_err(|_| ()))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        prior.reverse();
+        let mut messages = vec![ChatMessage::system(system_message(agent, system_prompt))];
+        for row in prior.iter().chain(std::iter::once(trigger)) {
+            if row.author == agent.identity {
+                messages.push(ChatMessage::assistant(row.markdown.clone()));
+            } else {
+                let principal = self.lookup(&row.author, lookups).await?;
+                messages.push(ChatMessage::user(format!(
+                    "{}: {}",
+                    label(principal.as_ref(), &row.author),
+                    row.markdown
+                )));
+            }
+        }
+        Ok(messages)
+    }
+
     async fn lookup(
         &self,
         author: &str,
@@ -402,12 +530,11 @@ impl Loop {
         if let Some(found) = lookups.get(author) {
             return Ok(found.clone());
         }
-        let found = self
-            .inputs
-            .principals
-            .lookup(author)
-            .await
-            .map_err(|_| ())?;
+        let found = tokio::select! {
+            biased;
+            () = self.work.cancelled() => return Err(()),
+            found = self.inputs.principals.lookup(author) => found.map_err(|_| ())?,
+        };
         lookups.insert(author.to_owned(), found.clone());
         Ok(found)
     }
@@ -415,7 +542,6 @@ impl Loop {
     fn spawn_reply(&mut self, channel: String, messages: Vec<ChatMessage>) {
         let slot = self.slots.entry(channel.clone()).or_default();
         slot.in_flight = true;
-        // Whatever arrives while this reply is in flight is looked at once it is done.
         slot.pending = true;
         if self.replies.is_empty() {
             self.inputs.status.set_replying();
@@ -425,71 +551,31 @@ impl Loop {
         let settings = self.inputs.settings.clone();
         let cancellation = self.work.clone();
         self.replies.spawn(async move {
-            let outcome = reply(
-                &client,
-                &ports,
-                &settings,
-                &channel,
-                messages,
-                &cancellation,
-            )
-            .await;
+            let outcome = reply(&client, &ports, settings, &channel, messages, &cancellation).await;
             (channel, outcome)
         });
     }
 
-    /// A reply task ended: publish its outcome and rescan its Channel if events were pending.
     async fn finished(&mut self, joined: Result<(String, ReplyOutcome), tokio::task::JoinError>) {
         let Ok((channel, outcome)) = joined else {
             return;
         };
-        let pending = {
-            let slot = self.slots.entry(channel.clone()).or_default();
-            slot.in_flight = false;
-            std::mem::take(&mut slot.pending)
-        };
+        let slot = self.slots.entry(channel).or_default();
+        slot.in_flight = false;
+        let pending = std::mem::take(&mut slot.pending);
         match outcome {
-            ReplyOutcome::Posted => {
-                if self.replies.is_empty() {
-                    self.inputs.status.set_idle();
-                }
-            }
-            ReplyOutcome::Cancelled => {
-                if self.replies.is_empty() {
-                    self.inputs.status.set_idle_if_replying();
-                }
+            ReplyOutcome::Posted if self.replies.is_empty() => self.inputs.status.set_idle(),
+            ReplyOutcome::Cancelled if self.replies.is_empty() => {
+                self.inputs.status.set_idle_if_replying()
             }
             ReplyOutcome::Failed(code, retryable) => self.inputs.status.set_error(code, retryable),
+            _ => {}
         }
         if pending && !self.work.is_cancelled() {
-            let Some(agent) = self.inputs.status.agent() else {
-                return;
-            };
-            let (context_messages, system_prompt) = {
-                let store = self
-                    .inputs
-                    .settings
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let settings = store.settings();
-                (
-                    settings.context_messages as usize,
-                    settings.system_prompt.clone(),
-                )
-            };
-            let mut lookups = HashMap::new();
-            self.scan(
-                &agent,
-                &channel,
-                context_messages,
-                &system_prompt,
-                &mut lookups,
-            )
-            .await;
+            self.pass().await;
         }
     }
 
-    /// Cancels the reply tasks and gives them a moment to notice before aborting.
     async fn shutdown(&mut self) {
         self.work.cancel();
         let drain = async {
@@ -504,16 +590,6 @@ impl Loop {
     }
 }
 
-fn parse_message(row: &Value) -> Option<Message> {
-    Some(Message {
-        position: row["position"].as_str()?.to_owned(),
-        author: row["author"].as_str()?.to_owned(),
-        markdown: row["markdown"].as_str()?.to_owned(),
-    })
-}
-
-/// The system message: who the Agent is, how the transcript is labelled, then the Steward's
-/// prompt.
 fn system_message(agent: &BoundAgent, system_prompt: &str) -> String {
     let name = agent.name.as_deref().unwrap_or("the Agent");
     let mut text = format!(
@@ -530,7 +606,6 @@ fn system_message(agent: &BoundAgent, system_prompt: &str) -> String {
     text
 }
 
-/// `Name (kind)` for a resolved Principal; a key prefix for one the roster does not know.
 fn label(principal: Option<&Principal>, author: &str) -> String {
     match principal {
         Some(principal) => {
@@ -548,31 +623,30 @@ fn label(principal: Option<&Principal>, author: &str) -> String {
     }
 }
 
-/// One reply: read the key, ask the model once, post once. The key lives in this task only.
 async fn reply(
     client: &ModelClient,
     ports: &PortClient,
-    settings: &std::sync::Mutex<SettingsStore>,
+    settings: Arc<Mutex<SettingsStore>>,
     channel: &str,
     messages: Vec<ChatMessage>,
     cancellation: &CancellationToken,
 ) -> ReplyOutcome {
-    let (endpoint, model, key) = {
-        let store = settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let settings = store.settings();
-        (
-            settings.endpoint_base_url.clone(),
-            settings.model.clone(),
-            store.api_key(),
-        )
-    };
-    let Ok(Some(key)) = key else {
-        // The key went away between the status check and this reply.
-        return ReplyOutcome::Failed(crate::model::ENDPOINT_REJECTED, false);
+    let configured = teamarness_package_sdk::blocking(cancellation, move |_| {
+        let store = settings.lock().map_err(|_| crate::storage_failed())?;
+        Ok((
+            store.settings().endpoint_base_url.clone(),
+            store.settings().model.clone(),
+            store.api_key().map_err(|_| crate::storage_failed())?,
+        ))
+    })
+    .await;
+    let (endpoint, model, key) = match configured {
+        Ok((endpoint, model, Some(key))) => (endpoint, model, key),
+        Err(_) if cancellation.is_cancelled() => return ReplyOutcome::Cancelled,
+        _ => return ReplyOutcome::Failed(crate::model::ENDPOINT_REJECTED, false),
     };
     let completion = tokio::select! {
+        biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
         completion = client.complete(&endpoint, &model, &messages, &key) => completion,
     };
@@ -585,16 +659,12 @@ async fn reply(
         return ReplyOutcome::Failed(crate::model::MODEL_ERROR, false);
     }
     let post = tokio::select! {
+        biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        post = ports.command(
-            CONVERSATIONS_CONTRACT,
-            "message.post",
-            json!({ "channelId": channel, "markdown": markdown }),
-        ) => post,
+        post = ports.command(CONVERSATIONS_CONTRACT, "message.post", json!({"channelId":channel,"markdown":markdown})) => post,
     };
     match post {
         Ok(_) => ReplyOutcome::Posted,
-        // Refused or uncertain alike: the mark has moved, so this trigger is settled.
         Err(_) => ReplyOutcome::Failed(POST_FAILED, false),
     }
 }
@@ -610,27 +680,17 @@ fn truncate_chars(text: String, limit: usize) -> String {
 mod tests {
     use super::*;
 
-    fn principal(kind: PrincipalKind, name: Option<&str>) -> Principal {
-        Principal {
-            principal_id: "a".repeat(64),
-            kind,
-            steward_principal_id: None,
-            keys: vec!["b".repeat(64)],
-            name: name.map(str::to_owned),
-            fingerprint: "bbbbbbbb".into(),
-        }
-    }
-
     #[test]
     fn labels_and_system_message() {
-        assert_eq!(
-            label(Some(&principal(PrincipalKind::Person, Some("Alice"))), "x"),
-            "Alice (person)"
-        );
-        assert_eq!(
-            label(Some(&principal(PrincipalKind::Agent, None)), "x"),
-            "bbbbbbbb (agent)"
-        );
+        let principal = Principal {
+            principal_id: "a".repeat(64),
+            kind: PrincipalKind::Person,
+            steward_principal_id: None,
+            keys: vec!["b".repeat(64)],
+            name: Some("Alice".into()),
+            fingerprint: "bbbbbbbb".into(),
+        };
+        assert_eq!(label(Some(&principal), "x"), "Alice (person)");
         assert_eq!(label(None, &"c".repeat(64)), "cccccccc (unknown)");
         let agent = BoundAgent {
             principal_id: "a".repeat(64),
@@ -639,8 +699,20 @@ mod tests {
         };
         let text = system_message(&agent, "  Be brief.  ");
         assert!(text.starts_with("You are Scout, an Agent"));
-        assert!(text.ends_with("\n\nBe brief."));
+        assert!(text.ends_with("Be brief."));
         assert_eq!(truncate_chars("héllo".into(), 2), "hé");
         assert_eq!(truncate_chars("hi".into(), 5), "hi");
+    }
+
+    #[test]
+    fn malformed_changes_never_acknowledge_unknown_progress() {
+        for value in [
+            json!({"events":[],"continuation":"0","highWater":"1"}),
+            json!({"events":[],"continuation":"2","highWater":"1"}),
+            json!({"events":[],"continuation":"01","highWater":"1"}),
+            json!({"events":[],"continuation":"0","highWater":"0","resyncRequired":true}),
+        ] {
+            assert!(Batch::parse(value, 0).is_none());
+        }
     }
 }

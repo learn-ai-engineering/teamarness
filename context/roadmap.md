@@ -70,9 +70,11 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-### Agent Package (implemented; manual verification pending)
+### Agent Package (delivery corrections; Verify findings and manual checks open)
 
 Implemented on 2026-10-24 on branch `don-smith/agent_package`, workstream `agent-package`. ADR 0027 (accepted 2026-10-24) makes a bound Agent a standing local signer: Core signs with an Agent's key for any Package Instance on the Steward's Installation once the Agent has a binding there, bindings are keyed by Package through the new `teamarness.agent-binding` 1.0 capability, and the Host derives an Agent actor for a bound caller's Port calls. Conversations 1.1 accepts that actor on `message.post` and adds `channel.list`. The bundled Agent Package `dev.teamarness.agent` is the harness for one Agent per Package Instance: the Steward picks the Agent and enters an OpenAI-compatible endpoint, model and API key in the Package's own UI; the Agent replies once when a Person addresses it by name, keeps per-Channel progress so a restart never re-replies, and reports endpoint failures as Package-owned status codes without retrying.
+
+The delivery correction adds Conversations 1.2 `message.changes`, exposing the existing UI projection journal through a query Port. Agent catch-up now persists epoch/revision progress rather than Message display positions, processes late lower-order arrivals and bounded backlog across passes, and retries safe reads without retrying settled model/post attempts. Automated regression and two-profile tests cover offline lower-order delivery and a 257-Message backlog. No hypothetical legacy binding/progress migration is introduced. Independent Verify findings for rebind attribution, roster reconciliation and completion redirects remain open; this delivery correction does not clear them.
 
 **Outcome:** A Member on another Installation addresses the Agent by name in Conversations, and both Installations show the reply attributed to the Agent with its Steward.
 

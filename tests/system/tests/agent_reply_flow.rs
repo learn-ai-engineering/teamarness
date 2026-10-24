@@ -146,6 +146,21 @@ fn agent_rows<'a>(rows: &'a [Value], agent_key: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+fn progress(root: &Path) -> Option<Value> {
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == "progress.json") {
+            return serde_json::from_slice(&fs::read(path).ok()?).ok();
+        }
+        if path.is_dir()
+            && let Some(value) = progress(&path)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn files_contain(root: &Path, needle: &str) -> bool {
     let Ok(entries) = fs::read_dir(root) else {
         return false;
@@ -342,6 +357,150 @@ async fn the_agent_replies_once_when_addressed_across_two_profiles() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     let bob_rows = general(&bob, "bob-final").await;
     assert_eq!(agent_rows(&bob_rows, &agent_key).len(), 1);
+
+    // Bob goes offline. Alice advances both display order and durable Agent progress.
+    shutdown(bob_host).await;
+    bob_core.shutdown().await.unwrap();
+    alice
+        .post_message(
+            "offline-alice-one",
+            GENERAL_ID,
+            "Alice advances while Bob is offline",
+        )
+        .await;
+    alice
+        .post_message("offline-alice-two", GENERAL_ID, "Alice advances again")
+        .await;
+    let head =
+        serde_json::to_value(alice.channel_open("advanced-head", GENERAL_ID, 64).await).unwrap();
+    let head_revision = head["revision"].as_str().unwrap().parse::<u64>().unwrap();
+    let alice_position = head["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["markdown"] == "Alice advances again")
+        .unwrap()["position"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        poll_until(Duration::from_secs(15), || async {
+            progress(&alice_private).is_some_and(|value| {
+                value["channels"][GENERAL_ID]["after"]
+                    .as_u64()
+                    .is_some_and(|after| after >= head_revision)
+            })
+        })
+        .await,
+        "Agent did not acknowledge Alice's offline advances"
+    );
+
+    // A reopened loopback peer has no address-book introduction yet, so this append is
+    // authored from Bob's older causal view using his real persisted Core and content key.
+    let bob_core = open_core(Addressing::Loopback, &root.join("bob-core")).await;
+    let bob_host = open_host(
+        &bob_app.application_path,
+        root.join("bob-host"),
+        bob_core.clone(),
+    )
+    .await;
+    let bob_mount = open_mount(&bob_host, &conversations_key).await;
+    let bob = ConversationClient {
+        host: &bob_host,
+        mount: &bob_mount,
+    };
+    bob.post_message(
+        "offline-bob-mention",
+        GENERAL_ID,
+        "@Scout a late arrival from Bob",
+    )
+    .await;
+    let bob_page = general(&bob, "offline-bob-page").await;
+    let late_position = bob_page
+        .iter()
+        .find(|row| row["markdown"] == "@Scout a late arrival from Bob")
+        .unwrap()["position"]
+        .as_str()
+        .unwrap();
+    assert!(
+        late_position < alice_position.as_str(),
+        "fixture must deliver below the previously acknowledged display position"
+    );
+    introduce(Addressing::Loopback, &[&alice_core, &bob_core]);
+    for (client, who) in [(&alice, "alice"), (&bob, "bob")] {
+        assert!(
+            poll_until(Duration::from_secs(30), || async {
+                agent_rows(
+                    &general(client, &format!("{who}-late-reply")).await,
+                    &agent_key,
+                )
+                .len()
+                    == 2
+            })
+            .await,
+            "late lower-sort mention was not answered on {who}"
+        );
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+    // Stop only the Agent harness, queue more than the former 256-message scan window in
+    // the real Provider, then resume without sending another Message/notification.
+    agent_ui
+        .request("pause-agent-key", "agent.key.clear", object([]))
+        .await;
+    alice
+        .post_message(
+            "backlog-mention",
+            GENERAL_ID,
+            "@Scout oldest queued backlog mention",
+        )
+        .await;
+    for index in 0..256 {
+        alice
+            .post_message(
+                &format!("backlog-{index}"),
+                GENERAL_ID,
+                "ordinary queued backlog",
+            )
+            .await;
+    }
+    let backlog_head =
+        serde_json::to_value(alice.channel_open("backlog-head", GENERAL_ID, 1).await).unwrap();
+    let backlog_revision = backlog_head["revision"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    agent_ui
+        .request(
+            "resume-agent-key",
+            "agent.key.set",
+            object([("apiKey", PackageValue::String(KEY.into()))]),
+        )
+        .await;
+    assert!(
+        poll_until(Duration::from_secs(30), || async {
+            progress(&alice_private).is_some_and(|value| {
+                value["channels"][GENERAL_ID]["after"]
+                    .as_u64()
+                    .is_some_and(|after| after >= backlog_revision)
+            }) && requests.load(Ordering::SeqCst) == 3
+        })
+        .await,
+        "real Provider backlog was not fully acknowledged and answered"
+    );
+    for (client, who) in [(&alice, "alice"), (&bob, "bob")] {
+        assert!(
+            poll_until(Duration::from_secs(30), || async {
+                let rows = general(client, &format!("{who}-backlog-reply")).await;
+                let replies = agent_rows(&rows, &agent_key);
+                replies.len() == 1 && replies[0]["markdown"] == REPLY
+            })
+            .await,
+            "backlog reply did not reach {who}"
+        );
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
 
     // The key stays in the Package Data Directory and nowhere else.
     assert!(!files_contain(&alice_private.join("packages/logs"), KEY));

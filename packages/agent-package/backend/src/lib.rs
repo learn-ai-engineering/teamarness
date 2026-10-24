@@ -8,11 +8,10 @@
 pub mod harness;
 pub mod mention;
 pub mod model;
-pub mod positions;
+pub mod progress;
 pub mod settings;
 pub mod status;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +24,7 @@ use teamarness_package_sdk::{
 };
 
 use harness::{HarnessInputs, TaskHandle};
+use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
 
@@ -70,7 +70,7 @@ pub struct AgentActive {
     binding: AgentBinding,
     principals: Principals,
     ports: Option<PortClient>,
-    data_directory: PathBuf,
+    progress: Arc<Mutex<Progress>>,
     cancellation: CancellationToken,
     tasks: tokio::sync::Mutex<Tasks>,
 }
@@ -107,7 +107,7 @@ impl AgentActive {
             principals: self.principals.clone(),
             settings: self.settings.clone(),
             status: self.status.clone(),
-            data_directory: self.data_directory.clone(),
+            progress: self.progress.clone(),
         })
     }
 
@@ -306,13 +306,13 @@ pub fn router() -> Router<AgentActive> {
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
-            let store = {
-                let directory = directory.clone();
-                teamarness_package_sdk::blocking(&cancellation, move |_| {
-                    SettingsStore::open(&directory).map_err(|_| storage_failed())
-                })
-                .await?
-            };
+            let (store, progress) = teamarness_package_sdk::blocking(&cancellation, move |_| {
+                Ok((
+                    SettingsStore::open(&directory).map_err(|_| storage_failed())?,
+                    Progress::open(&directory).map_err(|_| storage_failed())?,
+                ))
+            })
+            .await?;
             let binding = AgentBinding::from_initialization(&initialization, capabilities.clone())
                 .map_err(|cause| capability_error(&cause))?;
             let principals = Principals::from_initialization(&initialization, capabilities.clone())
@@ -341,7 +341,7 @@ pub fn router() -> Router<AgentActive> {
                 binding,
                 principals,
                 ports,
-                data_directory: directory,
+                progress: Arc::new(Mutex::new(progress)),
                 cancellation: background,
                 tasks: tokio::sync::Mutex::new(Tasks {
                     roster: Some(roster),
