@@ -17,7 +17,6 @@ const mac = process.platform === "darwin";
 const LINE_START = mac ? "Meta+ArrowLeft" : "Home";
 const LINE_END = mac ? "Meta+ArrowRight" : "End";
 const DOCUMENT_END = mac ? "Meta+ArrowDown" : "Control+End";
-/** Each local change is its own undo step: typing a word is one step per character. */
 
 async function type(h, text) {
   await h.page.keyboard.type(text, { delay: 5 });
@@ -383,11 +382,11 @@ export const SCENARIOS = [
       h.workspace.installation("A").revise(`${current}\nAn agent paragraph.\n`);
       await h.converge(["A1", "B1"]);
       await h.editor("A1").focus();
-      // "mine " was five changes: five undos take it back, and only it.
-      await press(h, `${MOD}+z`, "mine ".length);
+      // "mine " was typed in one burst: one undo takes it back, and only it.
+      await press(h, `${MOD}+z`);
       const undone = await h.converge(["A1", "B1"]);
       assert.equal(undone, "base text theirs\n\nAn agent paragraph.\n");
-      await press(h, `${MOD}+Shift+KeyZ`, "mine ".length);
+      await press(h, `${MOD}+Shift+KeyZ`);
       const redone = await h.converge(["A1", "B1"]);
       assert.equal(redone, "mine base text theirs\n\nAn agent paragraph.\n");
       await press(h, `${MOD}+z`);

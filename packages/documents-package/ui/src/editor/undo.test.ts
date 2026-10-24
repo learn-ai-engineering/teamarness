@@ -16,6 +16,7 @@ import { RECORD_LIMIT_BYTES, textBytes } from "./guard";
 import type { GuardHost, GuardRefusal } from "./guard";
 import { MARK_EXPAND, schema } from "./schema";
 import { EXPORT_BUDGET_BYTES } from "./session";
+import { BURST_IDLE_MS } from "./undo";
 import { editorCommands, editorPlugins, initialDocument } from "./view";
 
 const GENESIS = join(import.meta.dirname, "../../../fixtures/body-trees/from-rust/00-genesis.loro");
@@ -245,11 +246,12 @@ describe("changes too large to undo", () => {
     expect([...a.exports, ...b.exports].every((bytes) => bytes <= RECORD_LIMIT_BYTES)).toBe(true);
   });
 
-  it("an ordinary change made within a second of another is still its own step", async () => {
+  it("a structural change made within a second of typing is still its own step", async () => {
     const a = await editor(body([paragraph("")]), 77n);
-    await edit(a, (state) => state.tr.insertText("first"));
-    await edit(a, (state) => state.tr.insertText(" second"));
+    await type(a, "first");
+    await edit(a, (state) => state.tr.split(state.selection.from));
     expect(await step(a, "undo")).toBe(true);
+    expect(a.view.state.doc.childCount).toBe(1);
     expect(a.text()).toBe("first");
   });
 
@@ -407,9 +409,94 @@ describe("undo under interleaved local and remote edits (seeded)", () => {
   }, 600_000);
 });
 
+/** Types `text` one character per transaction, as key presses do. */
+async function type(peer: Peer, text: string): Promise<void> {
+  for (const character of text) await edit(peer, (state) => state.tr.insertText(character));
+}
+
+/** A clock that only moves when the test moves it. */
+function clock(): { advance: (ms: number) => void } {
+  let now = 1_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  return { advance: (ms) => { now += ms; } };
+}
+
+describe("typing undoes in bursts", () => {
+  it("one undo takes back a typed sentence, not one character", async () => {
+    clock();
+    const a = await editor(body([paragraph("")]), 77n);
+    await type(a, "A typed sentence.");
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("");
+    expect(await step(a, "redo")).toBe(true);
+    expect(a.text()).toBe("A typed sentence.");
+    expect(a.refusals).toEqual([]);
+  });
+
+  it("backspace of typed text belongs to the burst", async () => {
+    clock();
+    const a = await editor(body([paragraph("kept")]), 77n);
+    a.view.dispatch(a.view.state.tr.setSelection(TextSelection.atEnd(a.view.state.doc)));
+    await type(a, " wrod");
+    for (let press = 0; press < 3; press += 1) {
+      await edit(a, (state) => state.tr.delete(state.selection.from - 1, state.selection.from));
+    }
+    await type(a, "ord");
+    expect(a.text()).toBe("kept word");
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("kept");
+  });
+
+  it("two bursts separated by an idle gap undo in two steps", async () => {
+    const time = clock();
+    const a = await editor(body([paragraph("")]), 77n);
+    await type(a, "First burst.");
+    time.advance(BURST_IDLE_MS + 1);
+    await type(a, " Second burst.");
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("First burst.");
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("");
+  });
+
+  it("a selection jump ends the burst", async () => {
+    clock();
+    const a = await editor(body([paragraph("")]), 77n);
+    await type(a, "end");
+    a.view.dispatch(a.view.state.tr.setSelection(TextSelection.atStart(a.view.state.doc)));
+    await type(a, "start ");
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("end");
+  });
+
+  it("a remote edit in the same paragraph during a burst survives the undo of the burst", async () => {
+    clock();
+    const source = body([paragraph("shared")]);
+    const a = await editor(source, 77n);
+    const b = await editor(source, 88n);
+    a.view.dispatch(a.view.state.tr.setSelection(TextSelection.atEnd(a.view.state.doc)));
+    await type(a, " mine");
+    await edit(b, (state) => state.tr.insertText("theirs ", 1));
+    await exchange(a, b);
+    a.view.dispatch(a.view.state.tr.setSelection(TextSelection.atEnd(a.view.state.doc)));
+    await type(a, " more");
+    expect(a.text()).toBe("theirs shared mine more");
+
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("theirs shared mine");
+    expect(await step(a, "undo")).toBe(true);
+    expect(a.text()).toBe("theirs shared");
+    await exchange(a, b);
+    expect(b.text()).toBe("theirs shared");
+    expect(a.refusals).toEqual([]);
+  });
+});
+
 describe("undo depth", () => {
   it("keeps a bounded number of steps and undoes each of them", async () => {
     const { UNDO_DEPTH } = await import("./undo");
+    // Each character is typed after an idle gap, so each is a step of its own.
+    personPace();
     const a = await editor(body([paragraph("")]), 77n);
     for (let index = 0; index < UNDO_DEPTH + 20; index += 1) {
       a.view.dispatch(a.view.state.tr.insertText("a"));

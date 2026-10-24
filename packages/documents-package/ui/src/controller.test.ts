@@ -1,7 +1,10 @@
 /// <reference types="node" />
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createFakePackageClient } from "@teamarness/package-ui-sdk/testing";
 import { describe, expect, it } from "vitest";
-import { MARKDOWN_READ_ATTEMPTS, readChunkedMarkdown } from "./controller";
+import { DocumentsController, MARKDOWN_READ_ATTEMPTS, readChunkedMarkdown } from "./controller";
 
 const DOCUMENT = "d".repeat(64);
 
@@ -64,4 +67,43 @@ describe("copy as Markdown", () => {
     })).rejects.toThrow(/kept changing/);
     expect(calls).toBeLessThanOrEqual(MARKDOWN_READ_ATTEMPTS * 3);
   });
+});
+
+const GENESIS = new Uint8Array(readFileSync(join(import.meta.dirname, "../../fixtures/body-trees/from-rust/00-genesis.loro")));
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe("switching Documents", () => {
+  it("shows the closed-lost notice once the next Document has opened", async () => {
+    const first = "4".repeat(64);
+    const second = "5".repeat(64);
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.comments": () => ({ comments: [] }),
+        // The Backend never acknowledges the update, so it is still outstanding at the switch.
+        "documents.document.update": () => new Promise<never>(() => undefined),
+      },
+      subscriptions: { "documents.document.session": () => undefined },
+    });
+    const controller = new DocumentsController(fake.client, () => undefined);
+    await controller.openDocumentById(first);
+    await fake.emit("documents.document.session", {
+      event: "begin", documentId: first, sessionPeer: "7", version: "0", chunks: 1, editable: true,
+    });
+    await fake.emit("documents.document.session", { event: "chunk", documentId: first, chunkIndex: 0, chunk: Buffer.from(GENESIS).toString("base64") });
+    await fake.emit("documents.document.session", { event: "end", documentId: first });
+    const session = controller.editorSession!;
+    const doc = session.doc!;
+    doc.getText("typed").insert(0, "unconfirmed");
+    doc.commit();
+    session.flush();
+    await tick();
+    expect(session.state.outstanding).toBe(1);
+
+    await controller.openDocumentById(second);
+    expect(controller.state.openDocumentId).toBe(second);
+    expect(controller.state.error).toMatch(/could not be confirmed as saved/);
+  }, 10_000);
 });

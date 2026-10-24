@@ -138,9 +138,11 @@ export class DocumentsController {
   /** Opens a Document: starts its editor session, which loads the body from a snapshot. */
   async openDocumentById(documentId: string): Promise<void> {
     if (this.disposed || this._state.openDocumentId === documentId) return;
+    // Cleared before the close, so the notice of changes the closing session lost stays shown.
+    this.update({ error: null });
     await this.closeDocument();
     const sequence = ++this.openSequence;
-    this.update({ openDocumentId: documentId, comments: [], commentsCursor: null, commentsLoading: false, error: null });
+    this.update({ openDocumentId: documentId, comments: [], commentsCursor: null, commentsLoading: false });
     void this.refreshComments();
     const session = new EditorSession({
       bridge: clientBridge(this.client),
