@@ -6,7 +6,7 @@ import {
   createPackageRequestError,
   createTestMountContext,
 } from "@teamarness/package-ui-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Settings, Status } from "./contract.generated";
 import { createAgentController, describeStatus, mount, type AgentUiState } from "./index";
@@ -169,6 +169,36 @@ describe("Agent Package UI controller", () => {
 });
 
 describe("Agent Package UI mount", () => {
+  it("separates configuration sections and themes the native Agent picker", async () => {
+    const { client } = fakeBackend();
+    const host = document.createElement("div");
+    const root = host.attachShadow({ mode: "open" });
+    const sheets = new WeakMap<CSSStyleSheet, string>();
+    const replaceSync = CSSStyleSheet.prototype.replaceSync;
+    const spy = vi.spyOn(CSSStyleSheet.prototype, "replaceSync").mockImplementation(function (this: CSSStyleSheet, css) {
+      sheets.set(this, css);
+      replaceSync.call(this, css);
+    });
+    let unmount: Awaited<ReturnType<typeof mount>> | undefined;
+    try {
+      unmount = await mount(createTestMountContext({ root, client }));
+      const form = root.querySelector("form.agent-settings");
+      expect(form?.querySelectorAll(":scope > section")).toHaveLength(4);
+      const picker = form?.querySelector<HTMLSelectElement>('select[name="agent"]');
+      expect(picker?.closest(".agent-picker")).not.toBeNull();
+      expect(picker?.classList.contains("agent-picker-control")).toBe(true);
+      expect(picker?.closest("label")?.textContent).toContain("Workspace Agent");
+      const css = sheets.get(root.adoptedStyleSheets.at(-1)!) ?? "";
+      expect(css).toMatch(/\.agent-settings\s*\{[^}]*display:\s*grid[^}]*gap:\s*1\.25rem/s);
+      expect(css).toMatch(/\.agent-picker-control\s*\{[^}]*appearance:\s*none/s);
+      expect(css).toContain("var(--teamarness-color-text)");
+      expect(css).not.toContain("display: contents");
+    } finally {
+      await unmount?.();
+      spy.mockRestore();
+    }
+  });
+
   it("renders one settings form in the Shadow Root, drives the Backend and unmounts cleanly", async () => {
     const { fake, client } = fakeBackend();
     const host = document.createElement("div");

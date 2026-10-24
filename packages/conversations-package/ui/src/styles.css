@@ -29,8 +29,14 @@ button, input, textarea { font: inherit; }
 .message.message--local { border-left-color: var(--teamarness-color-accent); }
 .message--local-continuation.message { margin-top: 0; }
 .message-author { display: block; padding: 0; color: var(--teamarness-color-text); background: transparent; border: 0; cursor: pointer; font-size: .86rem; font-weight: 700; text-align: left; }
-.message-agent-indicator { display: inline-block; padding: .1rem .4rem; border-radius: .4rem; background: var(--teamarness-color-surface, #eee); font-size: .72rem; font-weight: 700; }
-.message-agent-steward { margin-left: .4rem; font-size: .76rem; color: var(--teamarness-color-text); }
+.message-author-line { position: relative; display: flex; align-items: center; gap: .3rem; }
+.message-author-line .message-author { min-width: 0; overflow-wrap: anywhere; }
+.message-agent-attribution { display: inline-flex; flex: none; }
+.message-agent-info { display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; padding: .2rem; border: 0; border-radius: 50%; background: transparent; color: var(--teamarness-color-text-muted); cursor: help; }
+.message-agent-info:hover, .message-agent-info:focus-visible { color: var(--teamarness-color-text); }
+.message-agent-info svg { width: 1rem; height: 1rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+.message-agent-tooltip { position: absolute; z-index: 3; top: 100%; left: 0; width: max-content; max-width: 100%; padding: .45rem .65rem; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-control); background: var(--teamarness-color-panel); color: var(--teamarness-color-text); box-shadow: 0 .2rem .6rem #0002; font-size: .78rem; font-weight: 400; line-height: 1.4; overflow-wrap: anywhere; }
+.message-agent-tooltip[hidden] { display: none; }
 .message-author:hover { text-decoration: underline; }
 .message-markdown { line-height: 1.55; overflow-wrap: anywhere; }
 .message-markdown p { margin: .15rem 0 .4rem; }

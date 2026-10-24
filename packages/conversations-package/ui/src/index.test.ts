@@ -230,8 +230,9 @@ describe("Workspace Person author presentation", () => {
 });
 
 describe("Workspace Agent authors", () => {
-  it("resolves the signed Agent key with a sibling indicator and Steward, then relabels without changing authorship", async () => {
+  it("shows Agent attribution in a sibling info tooltip on hover or focus, retaining identity and safe relabeling", async () => {
     const root = shadowRoot();
+    document.body.append(root.host);
     const agentKey = "b".repeat(64);
     const stewardKey = "a".repeat(64);
     const agentId = "d".repeat(64);
@@ -252,25 +253,40 @@ describe("Workspace Agent authors", () => {
       stewardPrincipalId: stewardId, name: "Helper", fingerprint: "bbbb" };
     await source.emit("conversations.principals", { available: true, cursor: "1", principals: [steward, agent] });
     expect(rows()[0]?.querySelector(".message-author")?.textContent).toBe("Helper");
-    expect(rows()[0]?.querySelector(".message-agent-indicator")?.textContent).toBe("Agent");
-    expect(rows()[0]?.querySelector(".message-agent-steward")?.textContent).toBe("stewarded by Alice");
+    const info = () => rows()[0]?.querySelector<HTMLButtonElement>(".message-agent-info");
+    const tooltip = () => rows()[0]?.querySelector<HTMLElement>('[role="tooltip"]');
+    expect(info()?.getAttribute("aria-label")).toBe("About this Agent");
+    expect(info()?.getAttribute("aria-describedby")).toBe(tooltip()?.id);
+    expect(info()?.parentElement?.parentElement?.className).toBe("message-author-line");
+    expect(tooltip()?.textContent).toBe("Agent · stewarded by Alice");
+    expect(tooltip()?.hidden).toBe(true);
+    expect(rows()[0]?.querySelector(".message-agent-indicator, .message-agent-steward")).toBeNull();
+    info()?.parentElement?.dispatchEvent(new MouseEvent("mouseenter"));
+    expect(tooltip()?.hidden).toBe(false);
+    info()?.parentElement?.dispatchEvent(new MouseEvent("mouseleave"));
+    expect(tooltip()?.hidden).toBe(true);
+    info()?.focus();
+    expect(tooltip()?.hidden).toBe(false);
+    info()?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(tooltip()?.hidden).toBe(true);
+    expect(root.activeElement).toBe(info());
     expect(rows()[1]?.querySelector(".message-author")?.textContent).toBe("You");
-    expect(rows()[1]?.querySelector(".message-agent-indicator")).toBeNull();
+    expect(rows()[1]?.querySelector(".message-agent-info")).toBeNull();
     await source.emit("conversations.principals", { available: true, cursor: "2", principals: [
       { ...steward, name: "<img src=x onerror=alert(1)>" }, { ...agent, name: "Renamed" },
     ] });
     expect(rows()[0]?.querySelector(".message-author")?.textContent).toBe("Renamed");
-    expect(rows()[0]?.querySelector(".message-agent-steward")?.textContent)
-      .toBe("stewarded by <img src=x onerror=alert(1)>");
-    expect(rows()[0]?.querySelector(".message-agent-steward img")).toBeNull();
+    expect(tooltip()?.textContent).toBe("Agent · stewarded by <img src=x onerror=alert(1)>");
+    expect(tooltip()?.querySelector("img")).toBeNull();
+    expect(root.activeElement).toBe(info());
     expect(rows()[0]?.querySelector(".message-author")?.getAttribute("title")).toBe(agentKey);
     await source.emit("conversations.principals", { available: true, cursor: "3", principals: [agent] });
-    expect(rows()[0]?.querySelector(".message-agent-steward")?.textContent)
-      .toBe(`stewarded by ${stewardId.slice(0, 8)}…${stewardId.slice(-6)}`);
+    expect(tooltip()?.textContent).toBe(`Agent · stewarded by ${stewardId.slice(0, 8)}…${stewardId.slice(-6)}`);
     await source.emit("conversations.principals", { available: false, cursor: "0", principals: [] });
-    expect(rows()[0]?.querySelector(".message-agent-indicator")).toBeNull();
+    expect(info()).toBeNull();
     expect(rows()[0]?.querySelector(".message-author")?.textContent).toBe("bbbbbbbb…bbbbbb");
     await unmount();
+    root.host.remove();
   });
 });
 

@@ -177,12 +177,15 @@ export function createAgentController(
 
 const AGENT_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-  .teamarness-section p { margin: 0; }
-  form { display: contents; }
+  .teamarness-section p, .teamarness-section-title { margin: 0; }
+  .agent-settings { display: grid; gap: 1.25rem; }
+  .agent-settings > section { min-width: 0; }
+  .agent-settings > section > button { align-self: flex-start; }
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
-  .row .teamarness-input { flex: 1; min-width: 12rem; }
   textarea.teamarness-input { min-height: 6rem; resize: vertical; }
-  select.teamarness-input { width: auto; min-width: 14rem; }
+  .agent-picker { position: relative; display: block; }
+  .agent-picker-control { appearance: none; -webkit-appearance: none; min-height: 2.65rem; padding-right: 2.5rem; cursor: pointer; }
+  .agent-picker::after { content: ''; position: absolute; pointer-events: none; right: 1rem; top: 50%; width: .4rem; height: .4rem; border-right: 2px solid var(--teamarness-color-text-muted); border-bottom: 2px solid var(--teamarness-color-text-muted); transform: translateY(-75%) rotate(45deg); }
   .status { font-weight: 600; }
   .status[data-state="error"] { color: var(--teamarness-color-danger, #b42318); }
   .status[data-state="ready"] { color: var(--teamarness-color-accent); }
@@ -255,6 +258,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   header.append(title, subtitle);
 
   const form = document.createElement("form");
+  form.className = "agent-settings";
   form.noValidate = true;
   form.addEventListener("submit", (event) => event.preventDefault());
 
@@ -284,15 +288,18 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   agentHelp.className = "teamarness-help";
   agentHelp.textContent = "Only Agents you steward on this Installation are offered.";
   const picker = document.createElement("select");
-  picker.className = "teamarness-input";
+  picker.className = "teamarness-input agent-picker-control";
   picker.name = "agent";
+  const pickerControl = document.createElement("span");
+  pickerControl.className = "agent-picker";
+  pickerControl.append(picker);
   const pickerRow = document.createElement("div");
   pickerRow.className = "row";
   const bindButton = button("Use this Agent", "bind", "primary");
   const unbindButton = button("Clear binding", "unbind", "secondary");
   const refreshButton = button("Refresh", "refresh", "secondary");
-  pickerRow.append(field("Workspace Agent", picker), bindButton, unbindButton, refreshButton);
-  agentSection.append(agentTitle, agentHelp, pickerRow);
+  pickerRow.append(bindButton, unbindButton, refreshButton);
+  agentSection.append(agentTitle, agentHelp, field("Workspace Agent", pickerControl), pickerRow);
 
   // Endpoint settings
   const settingsSection = document.createElement("section");
@@ -332,8 +339,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   keyRow.className = "row";
   const setKeyButton = button("Store key", "set-key", "primary");
   const clearKeyButton = button("Clear key", "clear-key", "secondary");
-  keyRow.append(field("New API key", keyInput, "Stored in this Package's data directory and never shown again."), setKeyButton, clearKeyButton);
-  keySection.append(keyTitle, keyState, keyRow);
+  keyRow.append(setKeyButton, clearKeyButton);
+  keySection.append(keyTitle, keyState,
+    field("New API key", keyInput, "Stored in this Package's data directory and never shown again."), keyRow);
 
   form.append(statusSection, agentSection, settingsSection, keySection);
   page.append(header, form);
