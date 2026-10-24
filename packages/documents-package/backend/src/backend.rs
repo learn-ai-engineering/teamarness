@@ -91,7 +91,8 @@ enum BodyEvent {
         document: String,
         durable: Option<String>,
     },
-    /// Every session of the Document must reload from a new snapshot.
+    /// The body gained more than one update can carry: every session of the Document needs a
+    /// new snapshot.
     Resync { document: String },
 }
 
@@ -842,9 +843,15 @@ fn session_peer(text: &str) -> Option<u64> {
 /// Opens one editor session: registers its peer, sends `begin`, the snapshot chunks and `end`,
 /// then relays the updates of every other writer and the body's status until the session
 /// ends. A session that opened with the live body keeps following it while the body waits for
-/// history. A refused update, a lagging relay, a conflict, or a body that becomes editable for
-/// a session that opened without it ends the session with `resync`, after which the UI opens
-/// a new session.
+/// history.
+///
+/// A session holds a doc when it opened with the live body or resumed as the same peer: its UI
+/// keeps that doc and its unacknowledged edits, so the Backend never discards them. A catch-up
+/// too large for one update, a lagging relay, or a body that becomes editable for a session
+/// that does not yet have it sends such a session a fresh opening as the same peer on the same
+/// stream, which the UI merges into the doc it kept. A session that holds no doc gets `resync`
+/// for those instead, and every session gets `resync` for a refused update or a conflict;
+/// after `resync` the UI opens a new session.
 async fn open_session(
     context: &Context<DocumentsActive>,
     request: SessionRequest,
@@ -876,16 +883,40 @@ async fn open_session(
     tokio::spawn(async move {
         let _session = session;
         let (mut access, opening) = opening;
-        // A session opened on an editable body holds the live body: it follows every change,
-        // including while the body waits for history, and keeps its own unacknowledged edits.
-        // One opened without it (pending or conflicted) must reload once the body is editable.
-        let holds_body = access.editable;
+        // A session opened on an editable body has the live body: it follows every change,
+        // including while the body waits for history. A resumed session keeps the UI's doc even
+        // when it opened without the body (pending), so it, too, must never be discarded.
+        let holds_doc = access.editable || resume == Some(peer);
+        let mut live = access.editable;
         for event in opening {
             if sender.send(event).await.is_err() {
                 return;
             }
         }
         let resync = json!({ "event": "resync", "documentId": document });
+        // Sends the session a fresh opening as the same peer, or `resync` when a conflict now
+        // hides the body; `None` once the session is over.
+        let reopen = || {
+            let hub = hub.clone();
+            let document = document.clone();
+            let context = context.clone();
+            let sender = sender.clone();
+            let resync = resync.clone();
+            async move {
+                let (access, opening) = context
+                    .blocking(move |_| Ok(hub.session_opening(&document, peer)))
+                    .await
+                    .ok()?;
+                if access.reason == Some("identity_conflict") {
+                    let _ = sender.send(resync).await;
+                    return None;
+                }
+                for event in opening {
+                    sender.send(event).await.ok()?;
+                }
+                Some(access)
+            }
+        };
         loop {
             let event = tokio::select! {
                 () = sender.closed() => return,
@@ -898,7 +929,7 @@ async fn open_session(
             let next = match event {
                 Ok(event) if event.document() != document => continue,
                 Ok(BodyEvent::Update { update, origin, .. }) => {
-                    if origin == Some(peer) || !(access.editable || holds_body) {
+                    if origin == Some(peer) || !(access.editable || live) {
                         continue;
                     }
                     json!({
@@ -912,16 +943,23 @@ async fn open_session(
                     let Ok(now) = context.blocking(move |_| Ok(hub.access(&target))).await else {
                         return;
                     };
-                    // A session without the body reloads once it is editable; every session
-                    // reloads when a conflict hides the body.
+                    // A session without a doc reloads once the body is editable, and one that
+                    // kept a doc without the body is sent it; every session reloads when a
+                    // conflict hides the body.
                     if now != access
-                        && ((now.editable && !holds_body)
-                            || now.reason == Some("identity_conflict"))
+                        && ((now.editable && !holds_doc) || now.reason == Some("identity_conflict"))
                     {
                         let _ = sender.send(resync).await;
                         return;
                     }
                     access = now;
+                    if access.editable && !live {
+                        let Some(opened) = reopen().await else {
+                            return;
+                        };
+                        access = opened;
+                        live = access.editable;
+                    }
                     let mut status = json!({
                         "event": "status", "documentId": document,
                         "durable": durable.into_iter().collect::<Vec<_>>(),
@@ -929,9 +967,19 @@ async fn open_session(
                     access.write(&mut status);
                     status
                 }
+                // Updates this session missed: one that holds a doc is reopened, which takes a
+                // snapshot after everything it missed; one that holds none reloads.
                 Ok(BodyEvent::Resync { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = sender.send(resync).await;
-                    return;
+                    if !holds_doc {
+                        let _ = sender.send(resync).await;
+                        return;
+                    }
+                    let Some(opened) = reopen().await else {
+                        return;
+                    };
+                    access = opened;
+                    live = access.editable;
+                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
@@ -6212,6 +6260,169 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    /// An edit record from another Installation's author, carrying `update`.
+    fn remote_edit(document: &str, author: &str, seed: u64, update: Vec<u8>) -> JsonValue {
+        record_frame(
+            seed,
+            author,
+            &DomainRecord::identified_document_edit(
+                author,
+                document,
+                &hex(32, seed),
+                &[seed as u8; 32],
+                update,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Delivers `frame` on the record log stream.
+    async fn deliver(session: &Session, frame: JsonValue) {
+        assert!(session.scripted.stream().send(frame).await);
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a session that holds the body is never resynced by a
+    // catch-up too large for one update: history from two authors delivered out of order
+    // (Carol's edits before the Bob edit they depend on) gains more than 160 KiB at once, and
+    // the session is reopened as the same peer with a fresh snapshot, so its unsent edit lands.
+    #[tokio::test]
+    async fn a_session_holding_the_body_is_reopened_by_a_catch_up_over_one_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut ui = UiSession::open(&mut session.harness, &document).await;
+        assert_eq!(ui.begin["editable"], true);
+        let mut bob = Writer::of(&session.handles, &document);
+        let b1 = bob.write(&format!("{}\n", unique_text(100 * 1024)));
+        let mut carol = Writer::of(&session.handles, &document);
+        carol.body.import(&b1).unwrap();
+        let c1 = carol.write(&format!("{}\n", unique_text(140 * 1024)));
+        let c2 = carol.write(&format!("{}\n", unique_text(180 * 1024)));
+        assert!(b1.len() + c1.len() + c2.len() > MAX_UPDATE);
+        let mine = type_into(&ui.doc, 0, false, "mine ");
+
+        deliver(&session, remote_edit(&document, "carol", 41, c1)).await;
+        deliver(&session, remote_edit(&document, "carol", 42, c2)).await;
+        let pending = ui.next().await;
+        assert_eq!(pending["editable"], false, "{pending}");
+        deliver(&session, remote_edit(&document, "bob", 43, b1)).await;
+
+        // A reopening that races the body becoming editable has no snapshot; another follows.
+        let mut begin = ui.reopened().await;
+        for _ in 0..2 {
+            assert_eq!(begin["sessionPeer"], ui.peer.to_string(), "{begin}");
+            if begin["editable"] == true {
+                break;
+            }
+            begin = ui.reopened().await;
+        }
+        assert_eq!(begin["editable"], true, "{begin}");
+        assert!(
+            ui.markdown()
+                .contains(&unique_text(180 * 1024)[170 * 1024..])
+        );
+        ui.send(&mut session.harness, &document, &hex(32, 0xc4), &mine)
+            .await
+            .unwrap();
+        let body = session.handles.bodies.lock().unwrap()[&document]
+            .text()
+            .to_owned();
+        assert!(body.contains("mine"), "{}", &body[..64]);
+        assert_eq!(
+            ui.markdown(),
+            body,
+            "the kept doc holds everything the body does"
+        );
+        ui.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a session resumed onto a pending body holds the UI's doc:
+    // when the body becomes editable it is reopened as the same peer with the snapshot, not
+    // resynced, so the edit it resumed to keep lands.
+    #[tokio::test]
+    async fn a_session_resumed_onto_a_pending_body_is_reopened_when_it_becomes_editable() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut ui = UiSession::open(&mut session.harness, &document).await;
+        let peer = ui.peer;
+        let mut writer = Writer::of(&session.handles, &document);
+        let b = writer.write("from bob B\n");
+        let c = writer.write("from bob B\n\nthen C\n");
+        deliver(&session, remote_edit(&document, "bob", 31, c)).await;
+        assert_eq!(ui.next().await["editable"], false);
+        let mine = type_into(&ui.doc, 0, false, "mine ");
+        ui.close().await;
+        let hub = session.handles.hub.clone();
+        wait_until(|| hub.session(peer).is_none(), "the session ended").await;
+
+        let mut resumed = UiSession::open_with(
+            &mut session.harness,
+            json!({ "documentId": document, "resumePeer": peer.to_string() }),
+        )
+        .await;
+        assert_eq!(
+            resumed.peer, peer,
+            "the resume is accepted on a pending body"
+        );
+        assert_eq!(resumed.begin["chunks"], 0);
+        let request_id = hex(32, 0xc1);
+        let retry = resumed
+            .send(&mut session.harness, &document, &request_id, &mine)
+            .await
+            .unwrap_err();
+        assert_eq!(retry.code(), "documents.document_pending");
+
+        deliver(&session, remote_edit(&document, "bob", 32, b)).await;
+        let begin = resumed.reopened().await;
+        assert_eq!(begin["sessionPeer"], peer.to_string(), "{begin}");
+        assert_eq!(begin["editable"], true, "{begin}");
+        assert!(resumed.markdown().contains("then C"));
+        resumed
+            .send(&mut session.harness, &document, &request_id, &mine)
+            .await
+            .unwrap();
+        let body = session.handles.bodies.lock().unwrap()[&document]
+            .text()
+            .to_owned();
+        assert!(body.contains("mine") && body.contains("then C"), "{body:?}");
+        resumed.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a session that holds the body and falls behind the body's
+    // events is reopened as the same peer with a fresh snapshot, each time it lags, and is never
+    // resynced.
+    #[tokio::test]
+    async fn a_lagging_session_holding_the_body_is_reopened_not_resynced() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut ui = UiSession::open(&mut session.harness, &document).await;
+        let hub = session.handles.hub.clone();
+        for round in 0..2 {
+            // More events than the body's event channel holds, before the session reads any.
+            for _ in 0..400 {
+                hub.publish_status(&document);
+            }
+            let begin = ui.reopened().await;
+            assert_eq!(
+                begin["sessionPeer"],
+                ui.peer.to_string(),
+                "round {round}: {begin}"
+            );
+            assert_eq!(begin["editable"], true);
+        }
+        let mine = type_into(&ui.doc, 0, false, "after lag");
+        ui.send(&mut session.harness, &document, &hex(32, 0xc7), &mine)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            "after lag\n"
+        );
+        ui.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
     // Verifies: TEAM.SYS.DOCS-R05 — an update that races its session's end is refused as
     // `unknown_session` with nothing appended; the UI reconnects as the same peer, recovery
     // proves the request absent, and the same bytes then land.
@@ -7417,6 +7628,43 @@ mod tests {
 
         fn markdown(&self) -> String {
             crate::markdown::export(&self.doc).unwrap_or_default()
+        }
+
+        /// Follows the session to its next opening, which must come before any `resync`: imports
+        /// the relayed updates on the way and then the opening's snapshot into the doc this
+        /// session keeps, and returns the opening's `begin`.
+        async fn reopened(&mut self) -> JsonValue {
+            loop {
+                // A large catch-up takes a while to import in a debug build.
+                let event = tokio::time::timeout(Duration::from_secs(60), self.events.next_event())
+                    .await
+                    .expect("a session event in time")
+                    .expect("the session is open")
+                    .expect("the session has not failed");
+                match event["event"].as_str() {
+                    Some("begin") => {
+                        let mut snapshot = Vec::new();
+                        for index in 0..event["chunks"].as_u64().unwrap() {
+                            let chunk = self.next().await;
+                            assert_eq!(chunk["event"], "chunk", "{chunk}");
+                            assert_eq!(chunk["chunkIndex"], index);
+                            snapshot
+                                .extend(STANDARD.decode(chunk["chunk"].as_str().unwrap()).unwrap());
+                        }
+                        assert_eq!(self.next().await["event"], "end");
+                        if !snapshot.is_empty() {
+                            self.doc.import(&snapshot).unwrap();
+                        }
+                        return event;
+                    }
+                    Some("update") => {
+                        let update = STANDARD.decode(event["update"].as_str().unwrap()).unwrap();
+                        self.doc.import(&update).unwrap();
+                    }
+                    Some("status") => {}
+                    _ => panic!("expected a reopening, got {event}"),
+                }
+            }
         }
 
         async fn next(&mut self) -> JsonValue {

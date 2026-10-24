@@ -11,8 +11,12 @@ export type StepCost = Readonly<{ bytes: number; growth: number }>;
 
 type Span = { start: number; end: number };
 
-/** Spans no longer on either stack are forgotten beyond this many. */
-const MAX_SPANS = 512;
+/**
+ * The undo manager's step limit. When Loro trims the oldest step at its limit, the step pushed in
+ * that same checkpoint loses its meta value, so it could not be identified or measured. The limit
+ * is therefore set beyond any session's reach; a step that is still unknown is refused.
+ */
+export const UNDO_STEP_LIMIT = 1_000_000;
 
 const tracked = new WeakMap<UndoManager, UndoSteps>();
 
@@ -21,11 +25,18 @@ const tracked = new WeakMap<UndoManager, UndoSteps>();
  * the manager's own pushes. Each push is tagged with a token in its meta value. A step that a
  * later checkpoint merged into keeps its token, so a push whose token is not on top afterwards
  * extended the top step.
+ *
+ * A span is kept while its step is on either stack, and only then. Loro reports pops, but it
+ * clears the redo stack on every new local checkpoint, and both stacks on a checkout or a peer
+ * change, without reporting them; the tokens on each stack are followed here so those are seen.
  */
 export class UndoSteps {
   readonly manager: UndoManager;
   private readonly doc: LoroDoc;
   private readonly spans = new Map<number, Span>();
+  /** The tokens on each stack, bottom first. */
+  private readonly undoTokens: number[] = [];
+  private readonly redoTokens: number[] = [];
   private nextToken = 1;
   /** The last checkpoint push whose outcome (a new step, or merged into the top) is unread. */
   private unsettled: number | null = null;
@@ -33,7 +44,7 @@ export class UndoSteps {
 
   constructor(doc: LoroDoc) {
     this.doc = doc;
-    this.manager = new UndoManager(doc, {});
+    this.manager = new UndoManager(doc, { maxUndoSteps: UNDO_STEP_LIMIT });
     const setOnPush = this.manager.setOnPush.bind(this.manager);
     const setOnPop = this.manager.setOnPop.bind(this.manager);
     type OnPush = NonNullable<Parameters<UndoManager["setOnPush"]>[0]>;
@@ -44,7 +55,7 @@ export class UndoSteps {
       return { ...meta, value: this.pushed(isUndo, range) };
     });
     this.manager.setOnPop = (listener?: OnPop) => setOnPop((isUndo, meta, range) => {
-      if (typeof meta.value === "number") this.spans.delete(meta.value);
+      if (typeof meta.value === "number") this.popped(isUndo, meta.value);
       listener?.(isUndo, meta, range);
     });
     this.manager.setOnPush();
@@ -61,10 +72,11 @@ export class UndoSteps {
    * What undoing (or redoing) the top step would write, measured on a fork: the step's own
    * operations are reverted there exactly as the undo manager computes them, before any later
    * change transforms them, and the fork's new operations are exported. `null` when there is no
-   * step, or its span is unknown.
+   * step, or its span is unknown; the guard refuses such a step.
    */
   measure(kind: "undo" | "redo"): StepCost | null {
     this.settle();
+    this.forgetCleared();
     const token = kind === "undo" ? this.manager.topUndoValue() : this.manager.topRedoValue();
     const span = typeof token === "number" ? this.spans.get(token) : undefined;
     if (span === undefined || span.end <= span.start) return null;
@@ -94,13 +106,37 @@ export class UndoSteps {
 
   private pushed(isUndo: boolean, range: Span): Value {
     this.settle();
+    this.forgetCleared();
     const token = this.nextToken;
     this.nextToken += 1;
     this.spans.set(token, { start: range.start, end: range.end });
-    // A local change's checkpoint goes to the undo stack and may merge into its top step.
-    if (isUndo && !this.performing) this.unsettled = token;
-    while (this.spans.size > MAX_SPANS) this.spans.delete(this.spans.keys().next().value!);
+    (isUndo ? this.undoTokens : this.redoTokens).push(token);
+    if (isUndo && !this.performing) {
+      // A local change's checkpoint may merge into the top step, and it clears the redo stack.
+      this.unsettled = token;
+      this.forget(this.redoTokens);
+    }
     return token;
+  }
+
+  private popped(isUndo: boolean, token: number): void {
+    const stack = isUndo ? this.undoTokens : this.redoTokens;
+    const at = stack.lastIndexOf(token);
+    if (at >= 0) stack.splice(at, 1);
+    this.spans.delete(token);
+  }
+
+  /** Forgets the tokens of a stack Loro has emptied without reporting it. */
+  private forgetCleared(): void {
+    if (!this.manager.canUndo()) this.forget(this.undoTokens);
+    if (!this.manager.canRedo()) this.forget(this.redoTokens);
+  }
+
+  /** Empties `stack` and forgets its spans. */
+  private forget(stack: number[]): void {
+    for (const token of stack.splice(0)) {
+      if (token !== this.unsettled) this.spans.delete(token);
+    }
   }
 
   /** Reads whether the last checkpoint push became a step of its own or extended the top one. */
@@ -113,7 +149,7 @@ export class UndoSteps {
     const into = this.spans.get(top);
     const from = this.spans.get(pushed);
     if (into !== undefined && from !== undefined && into.end === from.start) into.end = from.end;
-    this.spans.delete(pushed);
+    this.popped(true, pushed);
   }
 }
 
@@ -145,11 +181,12 @@ function guardedStep(kind: "undo" | "redo"): Command {
     if (!(kind === "undo" ? manager.canUndo() : manager.canRedo())) return false;
     host.flush();
     const cost = steps.measure(kind);
-    if (cost !== null && cost.bytes > BLOCK_BUDGET_BYTES) {
+    // A step whose span is unknown cannot be measured, so it is refused: the guard fails closed.
+    if (cost === null || cost.bytes > BLOCK_BUDGET_BYTES) {
       host.refused("step_too_large");
       return true;
     }
-    if (cost !== null && cost.growth > 0 && textBytes(state.doc) + cost.growth > TEXT_BUDGET_BYTES) {
+    if (cost.growth > 0 && textBytes(state.doc) + cost.growth > TEXT_BUDGET_BYTES) {
       host.refused("document_too_large");
       return true;
     }

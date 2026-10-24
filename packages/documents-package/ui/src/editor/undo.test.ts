@@ -9,11 +9,12 @@ import { Fragment, Slice } from "prosemirror-model";
 import type { Node } from "prosemirror-model";
 import { AllSelection, EditorState, TextSelection } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RECORD_LIMIT_BYTES } from "./guard";
 import type { GuardHost, GuardRefusal } from "./guard";
 import { MARK_EXPAND, schema } from "./schema";
 import { EXPORT_BUDGET_BYTES } from "./session";
+import { UndoSteps } from "./undo";
 import { editorCommands, editorPlugins, initialDocument } from "./view";
 
 const GENESIS = join(import.meta.dirname, "../../../fixtures/body-trees/from-rust/00-genesis.loro");
@@ -147,4 +148,110 @@ describe("guarded undo and redo", () => {
     expect(refusals).toEqual([]);
     expect(exports.every((bytes) => bytes <= RECORD_LIMIT_BYTES)).toBe(true);
   });
+});
+
+/** Every checkpoint lands outside the undo manager's merge interval, so each is a step of its own. */
+function separateCheckpoints(): void {
+  let now = 1_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => (now += 5000));
+}
+
+describe("undo step spans", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("keeps a live step measurable through more than 512 undo-then-type cycles", () => {
+    separateCheckpoints();
+    const doc = new LoroDoc();
+    doc.setPeerId(7n);
+    const steps = new UndoSteps(doc);
+    const text = doc.getText("t");
+    text.insert(0, "x".repeat(180 * 1024));
+    doc.commit();
+    text.delete(0, text.length);
+    doc.commit();
+    text.insert(0, "y");
+    doc.commit();
+    // Each new checkpoint clears the redo stack, and Loro does not report that as a pop.
+    for (let cycle = 0; cycle < 600; cycle += 1) {
+      steps.perform(() => steps.manager.undo());
+      text.insert(0, "z");
+      doc.commit();
+    }
+    steps.perform(() => steps.manager.undo());
+    const cost = steps.measure("undo");
+    expect(cost).not.toBeNull();
+    expect(cost!.bytes).toBeGreaterThan(RECORD_LIMIT_BYTES);
+  });
+
+  it("keeps every step measurable past Loro's default limit of 100 steps", () => {
+    // Loro drops the meta value of a step pushed while it trims the stack at its limit.
+    separateCheckpoints();
+    const doc = new LoroDoc();
+    doc.setPeerId(8n);
+    const steps = new UndoSteps(doc);
+    const text = doc.getText("t");
+    for (let index = 0; index < 150; index += 1) {
+      text.insert(0, "a");
+      doc.commit();
+    }
+    let undone = 0;
+    while (steps.manager.canUndo()) {
+      expect(steps.measure("undo")).not.toBeNull();
+      steps.perform(() => steps.manager.undo());
+      undone += 1;
+    }
+    expect(undone).toBe(150);
+    while (steps.manager.canRedo()) {
+      expect(steps.measure("redo")).not.toBeNull();
+      steps.perform(() => steps.manager.redo());
+    }
+  });
+
+  it("forgets the steps a checkout clears", () => {
+    separateCheckpoints();
+    const doc = new LoroDoc();
+    doc.setPeerId(9n);
+    const steps = new UndoSteps(doc);
+    const text = doc.getText("t");
+    text.insert(0, "a");
+    doc.commit();
+    const first = doc.frontiers();
+    text.insert(0, "b");
+    doc.commit();
+    doc.checkout(first);
+    doc.checkoutToLatest();
+    expect(steps.manager.canUndo()).toBe(false);
+    // The first checkpoint after a checkout only sets where the next step starts.
+    text.insert(0, "c");
+    doc.commit();
+    text.insert(0, "dd");
+    doc.commit();
+    expect(steps.measure("undo")).toEqual(expect.objectContaining({ growth: 0 }));
+    steps.perform(() => steps.manager.undo());
+    expect(text.toString()).toBe("cba");
+  });
+
+  it("refuses the undo of a delete-all after 600 undo-then-type cycles", async () => {
+    separateCheckpoints();
+    const { view, exports, refusals, flush } = await editor(paragraphs(186, 1000));
+    view.dispatch(view.state.tr.setSelection(new AllSelection(view.state.doc)).deleteSelection());
+    flush();
+    view.dispatch(view.state.tr.insertText("y"));
+    flush();
+    for (let cycle = 0; cycle < 600; cycle += 1) {
+      expect(await step(view, "undo", flush)).toBe(true);
+      view.dispatch(view.state.tr.insertText("z"));
+      flush();
+    }
+    expect(await step(view, "undo", flush)).toBe(true);
+    expect(view.state.doc.textContent).toBe("");
+    exports.length = 0;
+    refusals.length = 0;
+    expect(await step(view, "undo", flush)).toBe(true);
+    expect(refusals).toEqual(["step_too_large"]);
+    expect(exports).toEqual([]);
+    expect(view.state.doc.textContent).toBe("");
+  }, 120_000);
 });

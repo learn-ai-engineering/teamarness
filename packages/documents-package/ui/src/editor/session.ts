@@ -78,8 +78,11 @@ type Assembly = { begin: Extract<SessionEvent, { event: "begin" }>; parts: Uint8
  * Backend generation was replaced), the session reopens as the same peer, asks
  * `documents.document.recover` which outstanding requests arrived, and resends only those proven
  * absent; it does the same when an update is refused because the Backend no longer knows the
- * session. On `resync`, a refused update, or a lost peer, it discards the doc, opens a new
- * session, and reports what it could not keep through `onLost`.
+ * session. The Backend may also send a fresh opening as the same peer on the open stream (it
+ * gained more than one update can carry, the session fell behind, or the body it resumed onto
+ * became editable): the session merges that snapshot into the doc it kept, keeps its queue, and
+ * recovers the same way. Only on `resync`, a refused update, or a lost peer does it discard the
+ * doc, open a new session, and report what it could not keep through `onLost`.
  */
 export class EditorSession {
   private readonly bridge: SessionBridge;
@@ -101,6 +104,10 @@ export class EditorSession {
   private inFlight: Outbound | null = null;
   /** Sending waits while the session reconnects and recovery has not decided what to resend. */
   private paused = false;
+  /** Advanced whenever sending is held, so an answer to a request sent before is ignored. */
+  private sends = 0;
+  /** Advanced by each recovery, so only the latest one decides the queue. */
+  private recoveries = 0;
   private disposed = false;
   private readonly drainWaiters: Array<() => void> = [];
 
@@ -185,7 +192,7 @@ export class EditorSession {
     try {
       const stream = await this.bridge.open(
         request,
-        (event) => { if (generation === this.generation) this.receive(event, resumePeer); },
+        (event) => { if (generation === this.generation) this.receive(event); },
         () => { if (generation === this.generation && !this.disposed) this.reconnect(); },
       );
       if (generation !== this.generation || this.disposed) {
@@ -206,16 +213,18 @@ export class EditorSession {
     }, RETRY_MS);
   }
 
-  private receive(event: SessionEvent, resumePeer: string | null): void {
+  private receive(event: SessionEvent): void {
     if (event.documentId !== this.documentId || this.disposed) return;
     switch (event.event) {
       case "begin":
+        // The same peer continues the doc this session holds: send nothing until recovery.
+        if (this.continues(event)) this.holdSending();
         this.assembly = { begin: event, parts: [] };
         return;
       case "chunk": {
         const assembly = this.assembly;
         if (assembly === null || event.chunkIndex !== assembly.parts.length) {
-          void this.reload();
+          this.restart();
           return;
         }
         assembly.parts.push(fromBase64(event.chunk));
@@ -225,10 +234,10 @@ export class EditorSession {
         const assembly = this.assembly;
         this.assembly = null;
         if (assembly === null || assembly.parts.length !== assembly.begin.chunks) {
-          void this.reload();
+          this.restart();
           return;
         }
-        this.load(assembly, resumePeer);
+        this.load(assembly);
         return;
       }
       case "update":
@@ -243,15 +252,24 @@ export class EditorSession {
     }
   }
 
-  private load({ begin, parts }: Assembly, resumePeer: string | null): void {
+  /** Whether an opening continues the doc this session holds, as the same peer. */
+  private continues(begin: Assembly["begin"]): boolean {
+    return this.loro !== null && begin.sessionPeer === this.current.sessionPeer;
+  }
+
+  /**
+   * Loads an opening. The same peer, resumed or reopened, keeps its doc and queue and merges the
+   * snapshot in; a new peer starts a new doc.
+   */
+  private load({ begin, parts }: Assembly): void {
     const snapshot = concat(parts);
-    const resumed = resumePeer !== null && begin.sessionPeer === resumePeer && this.loro !== null;
+    const resumed = this.continues(begin);
     if (resumed && this.loro !== null) {
       // The same peer continues: keep every local change, and learn what arrived meanwhile.
       if (snapshot.byteLength > 0) this.loro.import(snapshot);
     } else {
       // A different peer cannot continue this peer's operations: what was unacknowledged is lost.
-      if (resumePeer !== null) this.discardLocal();
+      if (this.loro !== null) this.discardLocal();
       this.paused = false;
       this.unsubscribeLocal?.();
       const doc = new LoroDoc();
@@ -289,8 +307,10 @@ export class EditorSession {
     if (this.inFlight !== null || this.paused || this.retryTimer !== null) return;
     if (next === undefined || peer === null) return;
     this.inFlight = next;
-    // A request answered after a reconnect or reload is decided by recovery or the new snapshot.
+    // A request answered after a reconnect, reopen or reload is decided by recovery or the new
+    // snapshot.
     const generation = this.generation;
+    const sends = this.sends;
     let failure: unknown = null;
     try {
       await this.bridge.update({
@@ -299,7 +319,7 @@ export class EditorSession {
     } catch (error) {
       failure = error ?? new Error("update failed");
     }
-    if (generation !== this.generation || this.inFlight !== next) return;
+    if (generation !== this.generation || sends !== this.sends || this.inFlight !== next) return;
     this.inFlight = null;
     if (failure === null) {
       this.queue.shift();
@@ -344,18 +364,32 @@ export class EditorSession {
    * the same peer, then recover.
    */
   private reconnect(): void {
-    this.paused = true;
-    this.inFlight = null;
-    this.clearRetry();
+    this.holdSending();
     const stream = this.stream;
     this.stream = null;
     void this.open(this.current.sessionPeer);
     void stream?.close().catch(() => {});
   }
 
+  /** Stops sending until recovery decides what to resend. */
+  private holdSending(): void {
+    this.paused = true;
+    this.inFlight = null;
+    this.sends += 1;
+    this.clearRetry();
+  }
+
+  /** A malformed opening: reconnect as the same peer if this session holds a doc, else reload. */
+  private restart(): void {
+    if (this.loro !== null && this.current.sessionPeer !== null) this.reconnect();
+    else void this.reload();
+  }
+
   /** Decides each outstanding request from the Backend's own record, then resends the absent. */
   private async recoverOutstanding(): Promise<void> {
     const generation = this.generation;
+    const recovery = ++this.recoveries;
+    const current = () => generation === this.generation && recovery === this.recoveries && !this.disposed;
     const settled = new Set<string>();
     try {
       const ids = this.queue.map((entry) => entry.requestId);
@@ -367,14 +401,14 @@ export class EditorSession {
         }
       }
     } catch {
-      if (generation !== this.generation || this.disposed) return;
+      if (!current()) return;
       this.retryTimer = setTimeout(() => {
         this.retryTimer = null;
         void this.recoverOutstanding();
       }, RETRY_MS);
       return;
     }
-    if (generation !== this.generation || this.disposed) return;
+    if (!current()) return;
     for (let index = this.queue.length - 1; index >= 0; index -= 1) {
       if (settled.has(this.queue[index]!.requestId)) this.queue.splice(index, 1);
     }

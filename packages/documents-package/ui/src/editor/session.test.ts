@@ -46,16 +46,11 @@ class FakeBackend {
         const sessionPeer = resume !== undefined && !this.live.has(resume) && !this.refuseResume
           ? resume : String(this.nextPeer++);
         this.opened.push({ resumePeer: resume, sessionPeer });
-        this.live.set(sessionPeer, { listener, terminated });
-        const snapshot = this.body.export({ mode: "snapshot" });
-        const chunks: Uint8Array[] = [];
-        for (let start = 0; start < snapshot.byteLength; start += CHUNK) chunks.push(snapshot.subarray(start, start + CHUNK));
-        queueMicrotask(() => {
-          listener({ event: "begin", documentId: DOCUMENT, sessionPeer, version: "0", editable: true, chunks: chunks.length });
-          chunks.forEach((chunk, chunkIndex) => listener({ event: "chunk", documentId: DOCUMENT, chunkIndex, chunk: toBase64(chunk) }));
-          listener({ event: "end", documentId: DOCUMENT });
-        });
-        return { close: async () => { this.live.delete(sessionPeer); } };
+        const live = { listener, terminated };
+        this.live.set(sessionPeer, live);
+        queueMicrotask(() => this.sendOpening(listener, sessionPeer));
+        // Closing an old stream must not end a newer session resumed as the same peer.
+        return { close: async () => { if (this.live.get(sessionPeer) === live) this.live.delete(sessionPeer); } };
       },
       update: async (request) => {
         const sent = { requestId: request.requestId, sessionPeer: request.sessionPeer, update: request.update };
@@ -79,10 +74,37 @@ class FakeBackend {
         return { requestId: request.requestId };
       },
       recover: async (_documentId, requestIds) => requestIds.map((requestId): RequestStatus => (
-        this.appended.has(requestId)
+        this.appended.has(requestId) && !this.pending
           ? { requestId, inclusion: "included", durability: "durable" }
-          : { requestId, inclusion: "absent", durability: "unresolved" })),
+          : this.pending
+            ? { requestId, inclusion: "unresolved", durability: "unresolved" }
+            : { requestId, inclusion: "absent", durability: "unresolved" })),
     };
+  }
+
+  /**
+   * `begin`, the snapshot chunks and `end`, as the Backend opens a session. A pending body has no
+   * snapshot. `between` runs after `begin`, while the opening is still arriving.
+   */
+  private sendOpening(listener: Live["listener"], sessionPeer: string, between: () => void = () => {}): void {
+    const snapshot = this.pending ? new Uint8Array() : this.body.export({ mode: "snapshot" });
+    const chunks: Uint8Array[] = [];
+    for (let start = 0; start < snapshot.byteLength; start += CHUNK) chunks.push(snapshot.subarray(start, start + CHUNK));
+    listener({ event: "begin", documentId: DOCUMENT, sessionPeer, version: "0", editable: !this.pending, chunks: chunks.length });
+    between();
+    chunks.forEach((chunk, chunkIndex) => listener({ event: "chunk", documentId: DOCUMENT, chunkIndex, chunk: toBase64(chunk) }));
+    listener({ event: "end", documentId: DOCUMENT });
+  }
+
+  /** Sends an open session a fresh opening as the same peer, on the same stream. */
+  reopen(peer: string, between?: () => void): void {
+    const session = this.live.get(peer);
+    if (session !== undefined) this.sendOpening(session.listener, peer, between);
+  }
+
+  /** Imports a remote record without relaying it, as when the catch-up is too large for one update. */
+  deliverUnrelayed(update: Uint8Array): void {
+    this.body.import(update);
   }
 
   /** The body's records stay; every session stream ends and held requests fail unknowably. */
@@ -395,6 +417,114 @@ describe("EditorSession", () => {
     expect(backend.opened).toHaveLength(2);
     expect(text(backend.body)).toBe("kept genesis");
     expect(session.state.outstanding).toBe(0);
+    await session.dispose();
+  });
+
+  it("a reopen as the same peer merges the snapshot into its doc, keeps its queue and retries", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["unknown"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    const remote = backend.body.fork();
+    remote.setPeerId(9n);
+    const from = remote.oplogVersion();
+    remote.getText("body").insert(7, " remote");
+    remote.commit();
+    type(session, "queued ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    expect(session.state.outstanding).toBe(1);
+    type(session, "unsent ", 7);
+    // The Backend gains more than one update can carry and reopens the session instead of relaying it.
+    backend.deliverUnrelayed(remote.export({ mode: "update", from }));
+    const doc = session.doc;
+    backend.reopen("1000", () => type(session, "during ", 14));
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(lost).toEqual([]);
+    expect(session.doc).toBe(doc);
+    expect(session.state.sessionPeer).toBe("1000");
+    expect(backend.opened).toHaveLength(1);
+    expect(session.state.outstanding).toBe(0);
+    expect(text(backend.body)).toBe("queued unsent during genesis remote");
+    expect(text(session.doc)).toBe(text(backend.body));
+    await session.dispose();
+  });
+
+  it("a reopen whose snapshot already holds a queued request does not send it again", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "one ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    type(session, "two ", 4);
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    expect(backend.sent).toHaveLength(1);
+    // The held request is appended, but its answer has not arrived when the session is reopened.
+    backend.deliverUnrelayed(fromBase64(backend.sent[0]!.update));
+    backend.appended.add(backend.sent[0]!.requestId);
+    backend.reopen("1000");
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.sent).toHaveLength(2);
+    expect(backend.sent[1]!.requestId).not.toBe(backend.sent[0]!.requestId);
+    expect(lost).toEqual([]);
+    expect(session.state.outstanding).toBe(0);
+    expect(text(backend.body)).toBe("one two genesis");
+    expect(text(session.doc)).toBe("one two genesis");
+    await session.dispose();
+  });
+
+  it("keeps its edits through repeated reopens", async () => {
+    const backend = new FakeBackend();
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    for (const word of ["a ", "b ", "c "]) {
+      type(session, word);
+      backend.reopen("1000");
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    expect(lost).toEqual([]);
+    expect(text(backend.body)).toBe("c b a genesis");
+    expect(session.state.outstanding).toBe(0);
+    await session.dispose();
+  });
+
+  it("a session resumed onto a pending body keeps its edits when it is reopened with the body", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    const remote = backend.body.fork();
+    remote.setPeerId(9n);
+    const from = remote.oplogVersion();
+    remote.getText("body").insert(7, " B");
+    remote.commit();
+    const afterB = remote.oplogVersion();
+    const b = remote.export({ mode: "update", from });
+    remote.getText("body").insert(9, " C");
+    remote.commit();
+    type(session, "mine ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    // The Backend restarts; the body waits for B, so the resumed session opens without a snapshot.
+    backend.deliverRemote(remote.export({ mode: "update", from: afterB }));
+    backend.replaceGeneration(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.opened.at(-1)).toEqual({ resumePeer: "1000", sessionPeer: "1000" });
+    expect(session.state.editable).toBe(false);
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    // B arrives: the Backend reopens the session with the body instead of resyncing it.
+    backend.deliverUnrelayed(b);
+    backend.pending = false;
+    backend.reopen("1000");
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lost).toEqual([]);
+    expect(session.state.editable).toBe(true);
+    expect(session.state.outstanding).toBe(0);
+    expect(text(backend.body)).toBe("mine genesis B C");
+    expect(text(session.doc)).toBe(text(backend.body));
     await session.dispose();
   });
 
