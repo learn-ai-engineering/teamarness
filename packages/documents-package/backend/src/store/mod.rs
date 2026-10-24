@@ -47,6 +47,8 @@ pub struct StoredRecord {
 pub struct CollectionView {
     pub id: String,
     pub creator: String,
+    /// The Order Key of the create record, which orders the listing.
+    pub order_key: String,
     pub archived: bool,
     /// `None` until the create or latest rename record has been opened.
     pub name: Option<String>,
@@ -56,6 +58,8 @@ pub struct CollectionView {
 pub struct DocumentView {
     pub id: String,
     pub creator: String,
+    /// The Order Key of the create record, which orders the listing.
+    pub order_key: String,
     pub collection_id: String,
     pub archived: bool,
     pub title: Option<String>,
@@ -1073,7 +1077,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT collection_id,creator,archived FROM collections ORDER BY create_order,collection_id")
+            .prepare("SELECT collection_id,creator,archived,create_order FROM collections ORDER BY create_order,collection_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([], |row| {
@@ -1081,14 +1085,16 @@ impl DocumentStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
-            row.map(|(id, creator, archived)| CollectionView {
+            row.map(|(id, creator, archived, order_key)| CollectionView {
                 name: inner.texts.get(&id).map(|(_, text)| text.clone()),
                 id,
                 creator,
+                order_key,
                 archived,
             })
             .map_err(rerr)
@@ -1100,7 +1106,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT document_id,creator,collection_id,archived FROM documents ORDER BY create_order,document_id")
+            .prepare("SELECT document_id,creator,collection_id,archived,create_order FROM documents ORDER BY create_order,document_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([], |row| {
@@ -1109,17 +1115,21 @@ impl DocumentStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, bool>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
-            row.map(|(id, creator, collection_id, archived)| DocumentView {
-                title: inner.texts.get(&id).map(|(_, text)| text.clone()),
-                id,
-                creator,
-                collection_id,
-                archived,
-            })
+            row.map(
+                |(id, creator, collection_id, archived, order_key)| DocumentView {
+                    title: inner.texts.get(&id).map(|(_, text)| text.clone()),
+                    id,
+                    creator,
+                    order_key,
+                    collection_id,
+                    archived,
+                },
+            )
             .map_err(rerr)
         })
         .collect()

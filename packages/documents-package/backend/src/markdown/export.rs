@@ -25,6 +25,12 @@ pub fn export(doc: &LoroDoc) -> Result<String, SchemaViolation> {
     Ok(serialize(&read_tree(doc)?))
 }
 
+/// The Canonical Markdown of a revision from outside the backend: what [`export`] gives once
+/// `markdown` is the body. Nesting and the schema are checked as for a merge.
+pub fn canonical(markdown: &str) -> Result<String, SchemaViolation> {
+    Ok(serialize(&parse_revision(markdown)?))
+}
+
 /// Inline formatting may nest this much deeper than the block limit in comrak's syntax tree.
 const INLINE_NESTING: usize = 16;
 

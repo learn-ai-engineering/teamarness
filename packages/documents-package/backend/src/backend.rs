@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use loro::Frontiers;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -13,13 +14,16 @@ use teamarness_package_sdk::capabilities::record_log::{
     SessionOptions, SyncState, SyncWarning, run_session_from_start,
 };
 use teamarness_package_sdk::{
-    BackendError, CancellationToken, Context, Empty, Router, event_channel,
+    BackendError, CancellationToken, Context, Empty, Router, event_channel, ports::PortActor,
 };
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::body::{BodyError, DocumentBody};
 use crate::domain::{DomainError, DomainRecord};
 use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
+
+#[path = "ports.rs"]
+mod ports;
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -1238,6 +1242,80 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             Ok(subscription)
         },
     )
+    .port_request(
+        ports::CONTRACT, "document.list", "query",
+        |context: Context<DocumentsActive>, _actor: PortActor, request: ports::ListRequest| async move {
+            ports::list(&context, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "document.markdown", "query",
+        |context: Context<DocumentsActive>, _actor: PortActor, request: ports::MarkdownRequest| async move {
+            ports::read_markdown(&context, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "document.revise", "command",
+        |context: Context<DocumentsActive>, actor: PortActor, request: ports::ReviseRequest| async move {
+            ports::authorize_person(&context, &actor)?;
+            ports::revise(&context, request).await
+        },
+    )
+    .port_event(
+        ports::CONTRACT, "documents.changed",
+        |context: Context<DocumentsActive>, _actor: PortActor| async move {
+            ports::changed(&context)
+        },
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TypeRequest {
+    document_id: String,
+    block: usize,
+    at_end: bool,
+    text: String,
+}
+
+/// The Backend the system tests drive: [`router`] plus `documents.test.type`, which stands in
+/// for a person's editor session until the editor session seam exists. It types `text` into
+/// the first text run of a top-level block, as one update from a fresh peer, through the one
+/// local write path. The shipped Backend never builds this router.
+#[doc(hidden)]
+#[must_use]
+pub fn system_test_router() -> Router<DocumentsActive> {
+    router().request(
+        "documents.test.type",
+        |context: Context<DocumentsActive>, request: TypeRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            let state = context.state();
+            let document = &request.document_id;
+            let peer = state.hub.with_body(document, |body| body.allocate_peer());
+            let update = state
+                .hub
+                .with_body(document, |body| {
+                    body.typing_update(peer, request.block, request.at_end, &request.text)
+                })
+                .map_err(update_error)?;
+            let request_id = format!(
+                "{:016x}{:016x}",
+                getrandom::u64().map_err(|_| error("documents.edit_failed", true))?,
+                getrandom::u64().map_err(|_| error("documents.edit_failed", true))?
+            );
+            submit_update(
+                &state.log,
+                &state.hub,
+                &state.changes,
+                &state.installation,
+                document,
+                peer,
+                &request_id,
+                &update,
+            )
+            .await
+        },
+    )
 }
 
 async fn require_collection(
@@ -1929,20 +2007,27 @@ fn start_flusher(
     let token = cancellation.clone();
     let task = tokio::spawn(async move {
         loop {
-            let pending: Vec<String> = hub
+            // Ingest takes the store lock and then the bodies lock, so the bodies lock is
+            // released before the store is asked anything.
+            let staged: Vec<String> = hub
                 .lock()
                 .iter()
-                .filter(|(id, body)| {
+                .filter(|(_, body)| {
                     body.has_pending()
-                        && !hub.store.identity_conflicted(id).unwrap_or(true)
-                        && hub
-                            .store
-                            .import_failure(id)
-                            .is_ok_and(|failure| failure.is_none())
                         && (body.pending_request_id().is_none()
                             || hub.qualified.load(Ordering::Acquire))
                 })
                 .map(|(id, _)| id.clone())
+                .collect();
+            let pending: Vec<String> = staged
+                .into_iter()
+                .filter(|id| {
+                    !hub.store.identity_conflicted(id).unwrap_or(true)
+                        && hub
+                            .store
+                            .import_failure(id)
+                            .is_ok_and(|failure| failure.is_none())
+                })
                 .collect();
             if pending.is_empty() {
                 tokio::select! {
@@ -2215,30 +2300,49 @@ fn update_error(cause: BodyError) -> BackendError {
     }
 }
 
-/// The one local write path: validates `update` from `session_peer` against the body, then
-/// appends it as exactly one identified `document.edit` record and waits for that append.
+/// What one local write asks of a body.
+#[derive(Clone, Copy)]
+enum LocalWrite<'a> {
+    /// An editor session's update, holding operations only from the session's peer.
+    Update { peer: u64, bytes: &'a [u8] },
+    /// A Markdown revision made against `base`, merged as one update from a fresh peer.
+    Revision {
+        base: &'a Frontiers,
+        markdown: &'a str,
+    },
+}
+
+/// A local write the body accepted. The Document's append lock is held until it is dropped, so
+/// the caller drains exactly this write before any other local write is staged.
+struct Staged {
+    revision: u64,
+    /// The body's version once the write was staged; it includes the write.
+    version: Frontiers,
+    /// `false` when a revision changed nothing: nothing was staged and no record follows.
+    changed: bool,
+    _append: tokio::sync::OwnedMutexGuard<()>,
+    _identity: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Validates one local write against the body and stages it as the next identified
+/// `document.edit` record. The caller drains the staged record.
 ///
 /// The request ID and the payload digest identify the record. A retry of the same ID and bytes
-/// after an unknown outcome is answered from what is known, and never appended twice; a new ID
-/// is accepted only once a qualified replay can prove it absent. The editor session seam and
-/// the Markdown port reach the body through this path.
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-async fn submit_update(
+/// after an unknown outcome is answered from what is known, and never staged twice; a new ID
+/// is accepted only once a qualified replay can prove it absent. A revision always carries a
+/// fresh ID, and its digest is taken from the update the merge produced.
+async fn stage_local_write(
     log: &RecordLog,
     hub: &BodyHub,
-    changes: &watch::Sender<u64>,
     author: &str,
     document: &str,
-    session_peer: u64,
     request_id: &str,
-    update: &[u8],
-) -> Result<JsonValue, BackendError> {
+    write: LocalWrite<'_>,
+) -> Result<Staged, BackendError> {
     if !is_request_id(request_id) {
         return Err(invalid_request());
     }
-    let append_lock = hub.append_lock(document);
-    let _append_guard = append_lock.lock().await;
+    let append_guard = hub.append_lock(document).lock_owned().await;
     if hub
         .store
         .identity_conflicted(document)
@@ -2254,10 +2358,17 @@ async fn submit_update(
     {
         return Err(error("documents.import_failure", false));
     }
-    let digest: [u8; 32] = Sha256::digest(update).into();
-    let _identity_guard = hub.identity_lookup_lock.lock().await;
+    let digest: Option<[u8; 32]> = match write {
+        LocalWrite::Update { bytes, .. } => Some(Sha256::digest(bytes).into()),
+        LocalWrite::Revision { .. } => None,
+    };
+    let identity_guard = hub.identity_lookup_lock.clone().lock_owned().await;
     let found = lookup_identities(log, &hub.store, hub, &[request_id.to_owned()]).await?;
     if let Some((old_document, old_author, old_digest, durable)) = found.get(request_id) {
+        let Some(digest) = digest else {
+            // A revision's ID is fresh; one that already names a record is never reused.
+            return Err(invalid_request());
+        };
         if old_document != document || old_author != author || old_digest != &digest {
             return Err(invalid_request());
         }
@@ -2291,23 +2402,45 @@ async fn submit_update(
     {
         return Err(error("documents.import_failure", false));
     }
-    let (revision, is_retry) = hub.with_body(document, |body| {
+    let (revision, version, staged, changed) = hub.with_body(document, |body| {
         if !body.editable() {
             return Err(error("documents.document_pending", true));
         }
-        if let Some(known) = body.identity(request_id) {
-            if known.author != author || known.digest != digest {
-                return Err(invalid_request());
+        let staged = match (write, digest) {
+            (LocalWrite::Update { peer, bytes }, Some(digest)) => {
+                if let Some(known) = body.identity(request_id) {
+                    if known.author != author || known.digest != digest {
+                        return Err(invalid_request());
+                    }
+                    return Ok((known.revision, body.frontiers(), false, true));
+                }
+                body.accept_local_update(peer, request_id.to_owned(), bytes)
+                    .map_err(update_error)?;
+                digest
             }
-            return Ok((known.revision, true));
-        }
-        body.accept_local_update(session_peer, request_id.to_owned(), update)
-            .map_err(update_error)?;
-        body.remember_identity(request_id.to_owned(), author.to_owned(), digest, false)
+            (LocalWrite::Revision { base, markdown }, _) => {
+                if body.identity(request_id).is_some() {
+                    return Err(invalid_request());
+                }
+                if !body
+                    .merge_markdown(base, markdown, request_id.to_owned())
+                    .map_err(update_error)?
+                {
+                    return Ok((body.revision(), body.frontiers(), false, false));
+                }
+                let update = body
+                    .staged()
+                    .ok_or_else(|| error("documents.edit_failed", true))?;
+                Sha256::digest(update).into()
+            }
+            (LocalWrite::Update { .. }, None) => return Err(invalid_request()),
+        };
+        body.remember_identity(request_id.to_owned(), author.to_owned(), staged, false)
             .map_err(|_| invalid_request())?;
-        Ok((body.revision(), false))
+        Ok((body.revision(), body.frontiers(), true, true))
     })?;
-    if is_retry
+    if !staged
+        && changed
         && hub.with_body(document, |body| {
             body.identity(request_id)
                 .is_some_and(|known| known.projection_pending)
@@ -2315,19 +2448,65 @@ async fn submit_update(
     {
         return Err(error("documents.document_pending", true));
     }
-    if !is_retry {
+    if staged {
         hub.flush.notify_one();
         for event in hub.text_events(document) {
             let _ = hub.events.send(event);
         }
     }
     drop(publication);
-    // Never acknowledge the update until its record has reached the Core record log.
+    Ok(Staged {
+        revision,
+        version,
+        changed,
+        _append: append_guard,
+        _identity: identity_guard,
+    })
+}
+
+/// Waits until every staged update of `document` has reached the Core record log.
+async fn drain_local_writes(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: &str,
+    document: &str,
+) -> Result<(), BackendError> {
     drain_document(hub, document, |staged| {
         append_edit(log, hub, changes, author, document, staged)
     })
+    .await
+}
+
+/// The one local write path for an editor session: validates `update` from `session_peer`
+/// against the body, then appends it as exactly one identified `document.edit` record and
+/// waits for that append. The Markdown port reaches the body through [`stage_local_write`].
+#[allow(clippy::too_many_arguments)]
+async fn submit_update(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: &str,
+    document: &str,
+    session_peer: u64,
+    request_id: &str,
+    update: &[u8],
+) -> Result<JsonValue, BackendError> {
+    let staged = stage_local_write(
+        log,
+        hub,
+        author,
+        document,
+        request_id,
+        LocalWrite::Update {
+            peer: session_peer,
+            bytes: update,
+        },
+    )
     .await?;
-    Ok(json!({ "ok": true, "revision": revision.to_string(), "requestId": request_id }))
+    // Never acknowledge the update until its record has reached the Core record log.
+    drain_local_writes(log, hub, changes, author, document).await?;
+    Ok(json!({ "ok": true, "revision": staged.revision.to_string(), "requestId": request_id }))
 }
 
 async fn stop_flusher(state: &DocumentsActive) {
@@ -5949,5 +6128,614 @@ mod tests {
         subscription.close().await;
         wait_until(|| !stream.is_open(), "idle principals stream closure").await;
         harness.shutdown().await.unwrap();
+    }
+
+    // ------------------------------------------------------------ Port Contract 1.0
+
+    fn port_envelope(port: &str, actor: JsonValue, request: JsonValue) -> JsonValue {
+        json!({
+            "contract": ports::CONTRACT, "major": 1, "minor": 0,
+            "port": port, "actor": actor, "request": request
+        })
+    }
+
+    fn alice() -> JsonValue {
+        json!({"kind":"person","identity":ALICE})
+    }
+
+    /// Calls one provided Port as `actor` and unwraps the Port value.
+    async fn port_as(
+        harness: &mut Harness,
+        kind: &str,
+        port: &str,
+        actor: JsonValue,
+        request: JsonValue,
+    ) -> Result<JsonValue, BackendError> {
+        harness
+            .request(
+                &format!("teamarness.port.{kind}.v1"),
+                port_envelope(port, actor, request),
+            )
+            .await
+            .map(|value| value["$teamarnessPortValue"].clone())
+    }
+
+    async fn query(
+        harness: &mut Harness,
+        port: &str,
+        request: JsonValue,
+    ) -> Result<JsonValue, BackendError> {
+        port_as(harness, "query", port, alice(), request).await
+    }
+
+    async fn revise(
+        harness: &mut Harness,
+        document: &str,
+        base: &JsonValue,
+        markdown: &str,
+    ) -> Result<JsonValue, BackendError> {
+        port_as(
+            harness,
+            "command",
+            "document.revise",
+            alice(),
+            json!({"documentId":document,"baseVersion":base,"markdown":markdown}),
+        )
+        .await
+    }
+
+    fn appends(session: &Session) -> usize {
+        session
+            .scripted
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| call.method == "append")
+            .count()
+    }
+
+    /// A qualified activation holding one Collection and one Document; returns their IDs.
+    async fn ported_document(session: &mut Session) -> (String, String) {
+        qualify_empty_history(session).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({ "name": "Plans" }))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({ "collectionId": collection, "title": "Q4" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (collection, document)
+    }
+
+    /// A person typing into `document` through the one local write path.
+    async fn person_types(
+        handles: &ActivationHandles,
+        document: &str,
+        block: usize,
+        at_end: bool,
+        text: &str,
+    ) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let (peer, update) = {
+            let bodies = handles.bodies.lock().unwrap();
+            let body = &bodies[document];
+            let peer = body.allocate_peer();
+            (peer, body.typing_update(peer, block, at_end, text).unwrap())
+        };
+        let id = format!("7e{:030x}", NEXT.fetch_add(1, Ordering::Relaxed));
+        submit(handles, document, &id, &(peer, update))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn public_port_contract_has_exact_closed_bounded_shapes() {
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
+        assert_eq!(contract.contracts.len(), 1);
+        let provided = &contract.contracts[0];
+        assert_eq!(provided.identity, ports::CONTRACT);
+        assert_eq!((provided.major, provided.minor), (1, 0));
+        let names: Vec<_> = provided
+            .ports
+            .iter()
+            .map(|port| (port.name.as_str(), serde_json::to_value(port.kind).unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("document.list", json!("query")),
+                ("document.markdown", json!("query")),
+                ("document.revise", json!("command")),
+                ("documents.changed", json!("event")),
+            ]
+        );
+        let revise = provided
+            .ports
+            .iter()
+            .find(|port| port.name == "document.revise")
+            .unwrap();
+        assert!(
+            revise
+                .description
+                .contains("must not be retried automatically")
+        );
+        let markdown = provided
+            .ports
+            .iter()
+            .find(|port| port.name == "document.markdown")
+            .unwrap();
+        assert!(markdown.description.contains("MAX_UI_PAYLOAD_BYTES"));
+        let valid = |port: &str, direction: &str, payload: JsonValue| {
+            contract
+                .validate(ports::CONTRACT, port, direction, &payload)
+                .is_ok()
+        };
+        let id = hex(64, 1);
+        let version = ports::encode_version(&Frontiers::from_id(loro::ID::new(7, 0))).unwrap();
+        assert!(valid("document.list", "request", json!({})));
+        assert!(valid("document.list", "request", json!({"limit":64})));
+        assert!(!valid("document.list", "request", json!({"limit":65})));
+        assert!(!valid(
+            "document.list",
+            "request",
+            json!({"actor":"forged"})
+        ));
+        assert!(valid(
+            "document.revise",
+            "request",
+            json!({"documentId":id,"baseVersion":version,"markdown":""})
+        ));
+        for invalid in [
+            json!({"documentId":id,"markdown":"x"}),
+            json!({"documentId":id,"baseVersion":"short","markdown":"x"}),
+            json!({"documentId":id,"baseVersion":version,"markdown":"x".repeat(262_145)}),
+        ] {
+            assert!(!valid("document.revise", "request", invalid));
+        }
+        assert!(valid("documents.changed", "event", json!({})));
+        assert!(valid(
+            "documents.changed",
+            "event",
+            json!({"documentIds":[id]})
+        ));
+        assert!(!valid(
+            "documents.changed",
+            "event",
+            json!({"documentIds":vec![hex(64, 2); 65]})
+        ));
+        assert!(!valid(
+            "documents.changed",
+            "event",
+            json!({"markdown":"secret"})
+        ));
+    }
+
+    // Verifies: AC8 — every shared merge scenario holds through the provider, with each person's
+    // concurrent edits applied through the local write path before the revise arrives.
+    #[tokio::test]
+    async fn every_shared_merge_scenario_holds_through_document_revise() {
+        let table: JsonValue =
+            serde_json::from_str(include_str!("../../fixtures/merge-scenarios.json")).unwrap();
+        let scenarios = table["scenarios"].as_array().unwrap();
+        assert!(!scenarios.is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        for scenario in scenarios {
+            let name = scenario["name"].as_str().unwrap();
+            let document = session
+                .harness
+                .request(
+                    "documents.document.create",
+                    json!({ "collectionId": collection, "title": "Scenario" }),
+                )
+                .await
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let genesis = query(
+                &mut session.harness,
+                "document.markdown",
+                json!({"documentId":document}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(genesis["markdown"], "", "{name}");
+            let setup = revise(
+                &mut session.harness,
+                &document,
+                &genesis["version"],
+                scenario["initial"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(setup["changed"], true, "{name}");
+            assert_eq!(setup["normalised"], false, "{name}: `initial` is canonical");
+            let initial = setup["version"].clone();
+            for edit in scenario["concurrentHumanEdits"].as_array().unwrap() {
+                person_types(
+                    &session.handles,
+                    &document,
+                    usize::try_from(edit["block"].as_u64().unwrap()).unwrap(),
+                    edit["at"] == "end",
+                    edit["text"].as_str().unwrap(),
+                )
+                .await;
+            }
+            let base = match scenario["base"].as_str().unwrap() {
+                "initial" => initial,
+                "current" => query(
+                    &mut session.harness,
+                    "document.markdown",
+                    json!({"documentId":document}),
+                )
+                .await
+                .unwrap()["version"]
+                    .clone(),
+                other => panic!("{name}: unknown base {other}"),
+            };
+            let before = appends(&session);
+            let revised = revise(
+                &mut session.harness,
+                &document,
+                &base,
+                scenario["revision"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            let unchanged = scenario["expectedOps"] == 0;
+            assert_eq!(revised["changed"], !unchanged, "{name}");
+            assert_eq!(
+                appends(&session) - before,
+                usize::from(!unchanged),
+                "{name}: one revise is one record, and a no-op is none"
+            );
+            let read = query(
+                &mut session.harness,
+                "document.markdown",
+                json!({"documentId":document}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(read["markdown"], scenario["expectedMarkdown"], "{name}");
+            if !unchanged {
+                assert_eq!(read["version"], revised["version"], "{name}");
+            }
+        }
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC8 — list, read, revise and observe, with Person authority and the typed
+    // refusals, each refusal appending nothing.
+    #[tokio::test]
+    async fn ports_list_read_revise_observe_and_refuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, document) = ported_document(&mut session).await;
+        let mut events = session
+            .harness
+            .subscribe(
+                "teamarness.port.event.v1",
+                port_envelope("documents.changed", alice(), json!({})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.next_event())
+                .await
+                .is_err(),
+            "the event is live-only: no initial event"
+        );
+
+        let page = query(&mut session.harness, "document.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["collections"],
+            json!([{"id":collection,"name":"Plans","archived":false}])
+        );
+        assert_eq!(page["documents"][0]["id"], document);
+        assert_eq!(page["documents"][0]["collectionId"], collection);
+        assert_eq!(page["documents"][0]["title"], "Q4");
+        assert_eq!(page["documents"][0]["body"], "available");
+        assert!(page.get("next").is_none());
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read,
+            json!({"markdown":"","version":page["documents"][0]["version"]})
+        );
+
+        // Pages follow Order Key order, and a Collection filter lists only its Documents.
+        let first = query(&mut session.harness, "document.list", json!({"limit":1}))
+            .await
+            .unwrap();
+        assert_eq!(first["collections"].as_array().unwrap().len(), 1);
+        assert!(first["documents"].as_array().unwrap().is_empty());
+        let second = query(
+            &mut session.harness,
+            "document.list",
+            json!({"limit":1,"after":first["next"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["documents"][0]["id"], document);
+        assert!(second.get("next").is_none());
+        let filtered = query(
+            &mut session.harness,
+            "document.list",
+            json!({"collectionId":collection}),
+        )
+        .await
+        .unwrap();
+        assert!(filtered["collections"].as_array().unwrap().is_empty());
+        assert_eq!(filtered["documents"].as_array().unwrap().len(), 1);
+        for (request, code) in [
+            (json!({"after":"nowhere"}), "documents.invalid_cursor"),
+            (
+                json!({"collectionId":hex(64, 0xdead)}),
+                "documents.unknown_collection",
+            ),
+        ] {
+            assert_eq!(
+                query(&mut session.harness, "document.list", request)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                code
+            );
+        }
+
+        // Person authority: only the local Installation Person revises.
+        let before = appends(&session);
+        let stranger = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            json!({"kind":"person","identity":"stranger"}),
+            json!({"documentId":document,"baseVersion":read["version"],"markdown":"no\n"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stranger.code(), "documents.actor_unauthorized");
+        assert!(
+            port_as(
+                &mut session.harness,
+                "command",
+                "document.revise",
+                json!({"kind":"agent","identity":ALICE}),
+                json!({"documentId":document,"baseVersion":read["version"],"markdown":"no\n"}),
+            )
+            .await
+            .is_err()
+        );
+
+        // A base this body never had, and a token in a non-canonical encoding.
+        let unknown = ports::encode_version(&Frontiers::from_id(loro::ID::new(0x5eed, 3))).unwrap();
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(read["version"].as_str().unwrap())
+            .unwrap();
+        bytes.extend_from_slice(&bytes.clone());
+        for base in [json!(unknown), json!(URL_SAFE_NO_PAD.encode(&bytes))] {
+            assert_eq!(
+                revise(&mut session.harness, &document, &base, "no\n")
+                    .await
+                    .unwrap_err()
+                    .code(),
+                "documents.base_unavailable"
+            );
+        }
+        // A merge that cannot fit one record changes nothing.
+        let huge = format!("{}\n", unique_text(170 * 1024));
+        assert_eq!(
+            revise(&mut session.harness, &document, &read["version"], &huge)
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.revision_too_large"
+        );
+        assert_eq!(appends(&session), before, "no refusal appends a record");
+
+        // One revise is one record, observed live with its Document named.
+        let revised = revise(
+            &mut session.harness,
+            &document,
+            &read["version"],
+            "* Ship it\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(revised["changed"], true);
+        assert_eq!(revised["normalised"], true, "`*` bullets export as `-`");
+        assert_eq!(appends(&session), before + 1);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event["$teamarnessPortValue"],
+            json!({"documentIds":[document]})
+        );
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["markdown"], "- Ship it\n");
+        assert_eq!(read["version"], revised["version"]);
+
+        // Merging back an unchanged export appends nothing.
+        let unchanged = revise(
+            &mut session.harness,
+            &document,
+            &read["version"],
+            "- Ship it\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged,
+            json!({"changed":false,"normalised":false,"version":read["version"]})
+        );
+        assert_eq!(appends(&session), before + 1);
+
+        // A listing change carries no Document IDs: the Consumer re-lists.
+        session
+            .harness
+            .request(
+                "documents.document.rename",
+                json!({"documentId":document,"title":"Q4 plan"}),
+            )
+            .await
+            .unwrap();
+        let relisted = async {
+            loop {
+                let event = events.next_event().await.unwrap().unwrap();
+                if event["$teamarnessPortValue"] == json!({}) {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), relisted)
+            .await
+            .expect("a rename invalidates the listing");
+        events.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC8 — a body that cannot be read now is refused with its typed error.
+    #[tokio::test]
+    async fn port_reads_refuse_pending_unavailable_and_oversized_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let version = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap()["version"]
+            .clone();
+
+        session
+            .handles
+            .bodies
+            .lock()
+            .unwrap()
+            .get_mut(&document)
+            .unwrap()
+            .set_unopened(1);
+        let pending = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(pending.code(), "documents.pending");
+        assert!(pending.retryable());
+        assert_eq!(
+            revise(&mut session.harness, &document, &version, "x\n")
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.pending"
+        );
+        let page = query(&mut session.harness, "document.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(page["documents"][0]["body"], "pending");
+        assert!(page["documents"][0].get("version").is_none());
+        session
+            .handles
+            .bodies
+            .lock()
+            .unwrap()
+            .get_mut(&document)
+            .unwrap()
+            .set_unopened(0);
+
+        // Valid concurrent edits can grow a body past what one Port value carries.
+        let from_alice =
+            Writer::of(&session.handles, &document).write(&format!("{}\n", "a".repeat(110 * 1024)));
+        let from_bob = Writer::of(&session.handles, &document)
+            .write(&format!("{}\n", "\u{0001}😀".repeat(20_000)));
+        session
+            .handles
+            .hub
+            .apply_edits(&[(document.clone(), from_alice), (document.clone(), from_bob)]);
+        assert_eq!(
+            query(
+                &mut session.harness,
+                "document.markdown",
+                json!({"documentId":document}),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            "documents.too_large"
+        );
+        assert_eq!(
+            query(
+                &mut session.harness,
+                "document.markdown",
+                json!({"documentId":hex(64, 0xdead)}),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            "documents.unknown_document"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn the_system_test_router_adds_only_the_typing_request() {
+        let mut shipped = router().operations();
+        let mut tested = system_test_router().operations();
+        shipped.requests.push("documents.test.type".into());
+        shipped.requests.sort();
+        tested.requests.sort();
+        assert_eq!(tested.requests, shipped.requests);
+        assert_eq!(tested.subscriptions, shipped.subscriptions);
+    }
+
+    fn unique_text(bytes: usize) -> String {
+        let mut text = String::new();
+        let mut index = 0u64;
+        while text.len() < bytes {
+            text.push_str(&format!(
+                "{:016x} ",
+                index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ));
+            index += 1;
+        }
+        text.truncate(bytes);
+        text.trim_end().to_owned()
     }
 }

@@ -12,7 +12,7 @@ pub(crate) mod domain;
 pub mod markdown;
 pub(crate) mod store;
 
-pub use backend::{DocumentsActive, router};
+pub use backend::{DocumentsActive, router, system_test_router};
 pub use domain::{DomainError, DomainRecord};
 pub use store::{
     CollectionView, DocumentStore, DocumentView, IngestResult, StoreError, StoredRecord,

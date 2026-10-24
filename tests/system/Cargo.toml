@@ -21,8 +21,19 @@ path = "../../packages/conversations-package/backend/src/main.rs"
 name = "conversations-port-consumer-under-test"
 path = "src/bin/conversations_port_consumer.rs"
 
+# The Documents Backend is built the same way, over the Package's own router plus the one
+# test-only request that types into a body until the editor session seam exists.
+[[bin]]
+name = "documents-backend-under-test"
+path = "src/bin/documents_backend.rs"
+
+[[bin]]
+name = "documents-port-consumer-under-test"
+path = "src/bin/documents_port_consumer.rs"
+
 [dependencies]
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
+teamarness-documents-package = { path = "../../packages/documents-package/backend" }
 teamarness-package-sdk = { path = "../../crates/teamarness-package-sdk" }
 serde_json.workspace = true
 tokio.workspace = true

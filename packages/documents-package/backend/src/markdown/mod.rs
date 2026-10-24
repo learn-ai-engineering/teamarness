@@ -12,6 +12,8 @@
 //! - [`export`] gives Canonical Markdown. Export, import and export again gives the same
 //!   bytes, and no content character is lost; only formatting Markdown cannot express, line-edge
 //!   whitespace and empty paragraphs are normalised.
+//! - [`canonical`] gives the Canonical Markdown a revision becomes, so a caller can tell whether
+//!   a revision was already canonical.
 //! - [`merge`] merges a Markdown revision made against a base version as one Loro update from a
 //!   fresh peer. Unchanged blocks are untouched, changed blocks of the same kind are edited in
 //!   place, and merging back an unchanged export produces no ops. It does not change the
@@ -21,7 +23,7 @@ mod export;
 mod merge;
 mod schema;
 
-pub use export::export;
+pub use export::{canonical, export};
 pub use merge::{MergeError, Merged, merge};
 pub use schema::{
     Block, Inline, Link, MAX_NESTING, MAX_ORDER, Marks, SchemaViolation, WriteError, read_tree,

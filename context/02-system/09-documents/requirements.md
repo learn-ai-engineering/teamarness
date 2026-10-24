@@ -45,3 +45,14 @@ One body record SHALL carry at most 160 KiB of Loro update, so its base64 form f
 ## TEAM.SYS.DOCS-R10 — Non-Goals of Version 1
 
 Folder mapping, rich text, document-level permissions beyond Canonical Membership, log compaction, and a Core document capability family are not delivered. A `document.snapshot` record kind is reserved for compaction.
+
+## TEAM.SYS.DOCS-R12 — Documents Port Contract
+
+The Documents Package SHALL provide Port Contract `dev.teamarness.documents` 1.0 (`ports.json`, referenced from its manifest) with four Ports:
+
+- `document.list` (query) SHALL return at most 64 Collections and Documents per page in Order Key order, optionally for one Collection, with each Document's Collection, title, archive state, body availability (`available`, `pending` or `unavailable`) and, for an available body, its version token, plus an Order Key cursor for the next page.
+- `document.markdown` (query) SHALL return a Document body as Canonical Markdown with the version token it was exported at, or the typed error `pending` (records not yet opened), `unavailable` (identity conflict, import failure, or a version the token cannot carry) or `too_large` (the response exceeds the Host Port value bound, `MAX_UI_PAYLOAD_BYTES`).
+- `document.revise` (command) SHALL require a base version and merge the Markdown revision of that base as exactly one body edit record through the R05 validation, or none when it changes nothing (`changed: false`). It SHALL report whether the input was already Canonical Markdown (`normalised`). An unknown, not-yet-arrived or non-canonically encoded base SHALL return `base_unavailable`, and a merge that does not fit one record SHALL return `revision_too_large`; neither SHALL change the body. It SHALL accept only the Host-derived local Installation Person as actor, and Core SHALL sign with the Installation signer. A failure after the record was staged SHALL be reported as outcome-uncertain, and an uncertain command SHALL NOT be retried automatically.
+- `documents.changed` (event) SHALL be live-only, at-most-once and coalescible. It SHALL fire on adoption of a local or remote body or listing change, and MAY name at most 64 changed Documents in `documentIds`; without it, the Consumer re-lists.
+
+A version token SHALL be the Loro frontiers' IDs sorted by peer then counter, each encoded as an 8-byte big-endian peer and a 4-byte big-endian counter, in base64url without padding, and SHALL carry at most 64 IDs (1 024 characters). The Provider SHALL read a token strictly. A body whose frontiers exceed 64 IDs SHALL have no token until a later local edit converges them. A system test SHALL drive every Port through the Host broker and run the shared merge scenario table (`fixtures/merge-scenarios.json`) through `document.revise`.

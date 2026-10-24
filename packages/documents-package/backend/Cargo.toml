@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
 comrak.workspace = true
 getrandom.workspace = true
 loro.workspace = true
@@ -17,7 +18,7 @@ teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
 tokio.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 proptest.workspace = true
+teamarness-package-contract = { path = "../../../crates/teamarness-package-contract" }
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk", features = ["testing"] }
 tempfile.workspace = true

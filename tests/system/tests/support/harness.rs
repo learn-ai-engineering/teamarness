@@ -38,7 +38,38 @@ impl Profile {
     }
 }
 
-/// Staged application tree with a real Conversations Backend binary,
+/// One Package a scenario stages: its identity, its Backend executable, and the source
+/// directory its UI contract and Port contract are read from.
+pub struct PackageStage {
+    pub identity: &'static str,
+    pub display_name: &'static str,
+    pub backend: PathBuf,
+    /// Where the Backend is staged inside the Package Directory.
+    pub backend_file: &'static str,
+    /// Relative to the repository root; holds `ui-contract.json` and `ports.json`.
+    pub source: &'static str,
+    /// The `teamarness.synchronization.immutable-record-log` 1.x minor the Package requires.
+    pub record_log_minor: u16,
+    /// Replaces the source UI contract, so a test-only Backend can declare its extra request.
+    pub ui_contract: Option<Vec<u8>>,
+}
+
+impl PackageStage {
+    /// The real Conversations Package.
+    pub fn conversations() -> Self {
+        Self {
+            identity: PACKAGE_ID,
+            display_name: "Conversations",
+            backend: backend_executable(),
+            backend_file: "backend/teamarness-conversations-package-aarch64-apple-darwin",
+            source: "packages/conversations-package",
+            record_log_minor: 0,
+            ui_contract: None,
+        }
+    }
+}
+
+/// Staged application tree with a real Package Backend binary,
 /// a synthetic ESM entrypoint, and the manifest.
 pub struct StagedApplication {
     pub root: tempfile::TempDir,
@@ -46,9 +77,15 @@ pub struct StagedApplication {
 }
 
 impl StagedApplication {
+    /// An application holding the real Conversations Package.
     pub fn new() -> Self {
+        Self::with(&PackageStage::conversations())
+    }
+
+    /// An application holding the one Package `stage` describes.
+    pub fn with(stage: &PackageStage) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
-        let application_path = stage_package(root.path());
+        let application_path = stage_package_with(root.path(), stage);
         Self {
             root,
             application_path,
@@ -537,36 +574,40 @@ pub fn backend_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_conversations-backend-under-test"))
 }
 
-pub fn stage_package(root: &Path) -> PathBuf {
+/// Stages the Package `stage` describes as the application's only registered Package.
+pub fn stage_package_with(root: &Path, stage: &PackageStage) -> PathBuf {
     let application = root.join("application");
-    let package = application.join(PACKAGE_ID);
+    let package = application.join(stage.identity);
     fs::create_dir_all(package.join("backend")).unwrap();
     fs::create_dir_all(package.join("ui")).unwrap();
 
-    let backend = fs::read(backend_executable()).unwrap();
-    let backend_path =
-        package.join("backend/teamarness-conversations-package-aarch64-apple-darwin");
+    let backend = fs::read(&stage.backend).unwrap();
+    let backend_file = stage.backend_file;
+    let backend_path = package.join(backend_file);
     fs::write(&backend_path, &backend).unwrap();
     fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
     let ui = b"export function mount() { return async () => {}; }";
     let css = b"";
-    let contract =
-        fs::read(workspace_root().join("packages/conversations-package/ui-contract.json")).unwrap();
+    let source = workspace_root().join(stage.source);
+    let contract = stage
+        .ui_contract
+        .clone()
+        .unwrap_or_else(|| fs::read(source.join("ui-contract.json")).unwrap());
     fs::write(package.join("ui/index.js"), ui).unwrap();
     fs::write(package.join("ui/style.css"), css).unwrap();
     fs::write(package.join("ui-contract.json"), &contract).unwrap();
-    let ports =
-        fs::read(workspace_root().join("packages/conversations-package/ports.json")).unwrap();
+    let ports = fs::read(source.join("ports.json")).unwrap();
     fs::write(package.join("ports.json"), &ports).unwrap();
+    let minor = stage.record_log_minor;
     fs::write(
         package.join("teamarness.package.json"),
         serde_json::to_vec(&serde_json::json!({
             "schemaVersion":1,
-            "identity":PACKAGE_ID,
+            "identity":stage.identity,
             "version":"1.0.0",
-            "presentation":{"displayName":"Conversations"},
+            "presentation":{"displayName":stage.display_name},
             "protocol":{"major":1,"minMinor":0,"maxMinor":0},
-            "backends":[{"target":"aarch64-apple-darwin","path":"backend/teamarness-conversations-package-aarch64-apple-darwin","size":backend.len(),"sha256":digest(&backend)}],
+            "backends":[{"target":"aarch64-apple-darwin","path":backend_file,"size":backend.len(),"sha256":digest(&backend)}],
             "ui":{
                 "entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},
                 "assets":[{"path":"ui/style.css","mediaType":"text/css","size":css.len(),"sha256":digest(css)}],
@@ -578,7 +619,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
                 {"identity":"teamarness.membership","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.signing","major":1,"minMinor":0,"maxMinor":0},
-                {"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":0,"maxMinor":0}
+                {"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":minor,"maxMinor":minor}
             ],
             "extensions":{
                 "dev.teamarness.build":{
@@ -598,7 +639,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
         application.join("application-packages.v1.json"),
         serde_json::to_vec(&serde_json::json!({
             "schemaVersion":1,
-            "packages":[{"directory":PACKAGE_ID}]
+            "packages":[{"directory":stage.identity}]
         }))
         .unwrap(),
     )

@@ -200,7 +200,6 @@ impl DocumentBody {
         self.revision
     }
     /// The body's current version, a base for [`Self::merge_markdown`].
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn frontiers(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
@@ -346,7 +345,6 @@ impl DocumentBody {
     ///
     /// Returns `false`, with nothing staged, when the revision changes nothing. A merge whose
     /// update does not fit one record is refused, and nothing is staged.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn merge_markdown(
         &mut self,
         base: &Frontiers,
@@ -432,6 +430,43 @@ impl DocumentBody {
         markdown::merge(&self.doc, &self.frontiers(), revision, peer)
             .expect("the test revision merges")
             .update
+    }
+
+    /// What a person typing into the body would send as `peer`: `text` inserted at the start or
+    /// end of the first text run of top-level block `block`, without changing the body.
+    ///
+    /// Only the system tests' Backend reaches this, to stand in for an editor session.
+    pub(crate) fn typing_update(
+        &self,
+        peer: u64,
+        block: usize,
+        at_end: bool,
+        text: &str,
+    ) -> Result<Vec<u8>, BodyError> {
+        use loro::{Container, ValueOrContainer};
+        let doc = self.doc.fork();
+        doc.set_peer_id(peer).map_err(|_| BodyError::Loro)?;
+        let before = doc.oplog_vv();
+        let Some(ValueOrContainer::Container(Container::List(blocks))) =
+            doc.get_map("doc").get("children")
+        else {
+            return Err(BodyError::InvalidUpdate);
+        };
+        let Some(ValueOrContainer::Container(Container::Map(node))) = blocks.get(block) else {
+            return Err(BodyError::InvalidUpdate);
+        };
+        let Some(ValueOrContainer::Container(Container::List(children))) = node.get("children")
+        else {
+            return Err(BodyError::InvalidUpdate);
+        };
+        let Some(ValueOrContainer::Container(Container::Text(run))) = children.get(0) else {
+            return Err(BodyError::InvalidUpdate);
+        };
+        let position = if at_end { run.len_unicode() } else { 0 };
+        run.insert(position, text).map_err(|_| BodyError::Loro)?;
+        doc.commit();
+        doc.export(ExportMode::updates(&before))
+            .map_err(|_| BodyError::Loro)
     }
 
     /// An independent copy that another writer can edit, with nothing staged.
