@@ -20,19 +20,19 @@ Markdown cannot represent every structured body exactly.
 
 **The UI is a Loro peer.** The Package UI runs `loro-crdt` and `loro-prosemirror` in its frame and sends Loro updates to its backend. The backend imports each UI update into a fork of the applied body and checks four things: the update contains ops only from that session's assigned peer, it fits one record, the resulting tree is valid under the schema, and it respects the local growth budget. Only then does the backend append one record and adopt the fork. A refused update makes the UI session discard its state and reload.
 
-A remote record whose import fails, or leaves the tree schema-invalid, takes ADR 0029's import-failure disposition.
+A remote record whose import fails, or leaves the tree schema-invalid, takes ADR 0029's import-failure disposition, with the new category `schema_violation`.
 
 **Genesis.** `document.create` carries the body genesis: the root containers and one empty paragraph, written once by the creating backend. No UI and no later record initializes a body.
 
 **Peer identity.** Every Loro peer is a random 64-bit id allocated by the backend, absent from the Document's version vector. One goes to each UI editor session, each Markdown merge fork and each genesis. Peer ids are never derived and never reused. They carry no authority: records are still signed by the Installation signer.
 
-**Records.** Body edits keep ADR 0027's identified kind-11 envelope (request ID, payload digest, one update) and its identity, recovery and conflict rules. The canonical update bound is 160 KiB, so a base64 update fits one UI message without chunking. A large local paste is split at block boundaries into sequential records. A single block that cannot fit one record is refused before it is committed locally. Kind 10 and plain-text bodies are removed. No Documents existed outside development, and development data is reset.
+**Records.** Body edits keep ADR 0027's identified kind-11 envelope (request ID, payload digest, one update) and its identity, recovery and conflict rules. The canonical update bound is 160 KiB, so a base64 update fits one UI message without chunking. A large local paste is split at top-level block boundaries into sequential records. A single top-level block that cannot fit one record, including a whole list or blockquote, is refused before it is committed locally. Kind 10 and plain-text bodies are removed. No Documents existed outside development, and development data is reset.
 
-**Sessions.** A UI editor session loads from a backend-produced snapshot, delivered in bounded chunks, never from replayed record history. It then receives live updates from remote records and other local sessions. Per-person undo uses the binding's undo plugin and never reverts another peer's ops.
+**Sessions.** A UI editor session loads from a backend-produced snapshot, delivered in bounded chunks, never from replayed record history. It then receives live updates from remote records and other local sessions. A refused update, or a body that becomes editable or conflicted, ends the session with a resync. When a session's stream ends without a resync because the backend generation was replaced, the UI may resume as the same peer. The backend accepts that only for a peer that no open session holds, that no other Installation's record carries, and that this process either handed to an ended session for that Document or never handed out. The resumed session then resends only the requests that recovery proves absent. Per-person undo uses the binding's undo plugin and never reverts another peer's ops.
 
 **Markdown.** The backend is the single Markdown authority. It exports **Canonical Markdown**: the body as Markdown can carry it, with formatting that Markdown cannot express dropped before writing, so the export always imports back to the body it describes. Content always wins over formatting. The normalisations are a documented contract (`context/02-system/09-documents/markdown-contract.md`).
 
-A Markdown revision merges against an explicit base version. The backend forks at the base with a fresh peer, reconciles by block alignment so unchanged blocks are untouched and changed blocks are edited in place, and imports the result, so concurrent edits since the base merge through Loro. Merging back an unchanged export produces no ops.
+A Markdown revision merges against an explicit base version. The backend forks at the base with a fresh peer and reconciles by block alignment, so unchanged blocks are untouched and changed blocks are edited in place. The merge returns one update without changing the body. The body adopts it only after its one record is appended, so concurrent edits since the base merge through Loro. Merging back an unchanged export produces no ops. The UI reads Canonical Markdown from the backend in request-sized chunks, each carrying a digest of the whole text.
 
 **Documents Port Contract 1.0.** It offers:
 
@@ -40,7 +40,7 @@ A Markdown revision merges against an explicit base version. The backend forks a
 - `document.revise` (a Person-only command whose `baseVersion` is required, where one revise is one record and an over-bound revise changes nothing);
 - `documents.changed` (a live, coalescible invalidation).
 
-A version token is the canonical encoding of Loro frontiers. Authority follows Conversations 1.0 (ADR 0026): the Host-derived Installation Person is checked, and Core signs. Agent-signed revisions wait for the Agent authority decision.
+A version token is the canonical encoding of Loro frontiers. A response larger than the Host Port value bound (`MAX_UI_PAYLOAD_BYTES`) is refused as `too_large`. Authority follows Conversations 1.0 (ADR 0026): the Host-derived Installation Person is checked, and Core signs. Agent-signed revisions wait for the Agent authority decision.
 
 ## Rejected alternatives
 
@@ -55,7 +55,7 @@ A version token is the canonical encoding of Loro frontiers. Authority follows C
 
 ## Consequences
 
-- The UI bundle carries `loro-crdt` WebAssembly and ProseMirror, about 4.7 MB raw. `loro-crdt` and the Rust `loro` crate must stay at the same exact version, and a qualification test enforces it. `loro-prosemirror` is pre-1.0 and pinned exactly. Committed cross-language fixtures guard the shared schema.
+- The UI bundle carries `loro-crdt` WebAssembly and ProseMirror, about 5.0 MB raw (4.76 MiB), within the 8 MiB entrypoint bound. `loro-crdt` and the Rust `loro` crate must stay at the same exact version, and a qualification test enforces it. `loro-prosemirror` is pre-1.0 and pinned exactly. Committed cross-language fixtures guard the shared schema.
 - Markdown fidelity and merge minimality are properties tested at scale: round-trip, fixed point, content preservation, no-op merge, revision equality, block identity and concurrent survival.
 - Known merge semantics, documented in the contract: an agent's block deletion loses concurrent edits inside that block; moves are a delete plus an insert; a hard-break structure change rebuilds its paragraph; concurrent structural changes to one block can duplicate text.
 - Future log compaction (`document.snapshot`) must keep port base versions resolvable or refuse stale ones explicitly.
@@ -64,7 +64,8 @@ A version token is the canonical encoding of Loro frontiers. Authority follows C
 
 ## Evidence
 
-- `packages/documents-package/` — `backend/src/{body,domain,markdown}`, `ui-contract.json`, `ports.json`, `ui/src/editor/`; `context/02-system/09-documents/requirements.md` and `markdown-contract.md`.
+- `packages/documents-package/` — `backend/src/{body,domain,markdown,ports}`, `backend/migrations/0007_schema_violation.sql`, `ui-contract.json`, `ports.json`, `ui/src/editor/`, `ui/frame-scenarios/`; `context/02-system/09-documents/requirements.md` and `markdown-contract.md`.
+- `scripts/check-exact-pins.mjs` enforces `loro`/`loro-crdt` parity; `packages/documents-package/fixtures/body-trees/` holds the cross-language schema fixtures.
 - Feasibility spike on branch `spike/rendered-document-editing` (`packages/documents-package/prototype-rendered-body/`):
   - Same-paragraph overlapping-format, offline and two-view convergence passed in WebKit and Chromium.
   - Concurrent empty-document creation lost one side's text (the genesis race).

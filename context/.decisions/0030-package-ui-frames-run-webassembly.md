@@ -34,7 +34,7 @@ The Shell-realm rule of ADR 0015 is unchanged: no Package code, and no Package-c
 ## Consequences
 
 - Package UIs can instantiate WebAssembly from bytes they ship. Because WebAssembly runs on the shared web content thread, a runaway module freezes the Shell exactly as runaway JavaScript does (ADR 0015).
-- The packaged-app isolation probe also checks that WebAssembly instantiates while `eval`, `new Function`, `fetch`, workers, and parent and top access stay refused. It is re-run on every Tauri upgrade.
+- The packaged-app isolation probe also checks that WebAssembly instantiates while `eval`, `new Function` and top navigation stay refused, alongside its existing storage, `fetch`, parent and top checks. Workers stay denied by `worker-src 'none'`. The probe is re-run on every Tauri upgrade.
 - A large WebAssembly payload inlined as base64 grows the entrypoint by about a third. The manifest's 8 MiB entrypoint bound and 32 MiB UI total still apply.
 - A Windows or Linux port re-verifies this policy together with the rest of ADR 0015.
 
@@ -44,7 +44,8 @@ The Shell-realm rule of ADR 0015 is unchanged: no Package code, and no Package-c
 - `scripts/ui-isolation-probe/` and `scripts/smoke-packaged-app.mjs` — the in-app isolation probe.
 - `crates/teamarness-package-contract/src/manifest.rs` — UI entrypoint and total size bounds.
 - Feasibility spike (branch `spike/rendered-document-editing`, `packages/documents-package/prototype-rendered-body/web/`). Under the production frame policy, `loro-crdt` 1.16.2 failed to instantiate. With only `'wasm-unsafe-eval'` added, it instantiated and edited in WebKit and Chromium, while `fetch`, XHR, `Worker`, `eval`, `new Function`, parent and top access, injected `<style>` and `style=` attributes all stayed refused.
-- **Weaknesses.** The spike served frames from a local harness, not the real WKWebView `teamarness-package:` scheme. The packaged-app probe is the authoritative check.
+- `packages/documents-package/ui/frame-scenarios/` (`npm run verify:documents-editor`) runs the Documents editor under the exact frame document and policy in WebKit and Chromium.
+- **Weaknesses.** The spike served frames from a local harness, not the real WKWebView `teamarness-package:` scheme. The packaged-app probe is the authoritative check. WebKit may refuse a sandboxed top navigation without throwing, so the probe's `top-navigation-blocked` check also passes when the frame still runs one second after the attempt; an admitted navigation fails the smoke test on its result timeout instead of a named check.
 
 ### Provenance (non-versioned)
 

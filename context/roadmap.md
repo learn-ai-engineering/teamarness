@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next for the core.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0030 and 0031) is implemented on its branch and pends Verify and integration. Phase 5 is next for the core.
 
 ## Phases
 
@@ -100,6 +100,22 @@ Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Pac
 
 **Depends on:** Phase 4. Follow-up: folder mapping, so a mapped folder lets any editor or CLI agent edit documents.
 
+#### Documents rendered editing (implemented on branch; pending Verify and integration)
+
+Implemented on 2026-10-25 on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, in seven commits from `e6b2afc`. It is not yet verified or integrated into `main`. ADR 0031 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0030 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
+
+- the Rust Markdown core: Canonical Markdown export and base-versioned merge, proven by property tests, with the [Markdown contract](02-system/09-documents/markdown-contract.md);
+- the Body Genesis in `document.create`, Backend-allocated peers, the 160 KiB record bound, and validation before append;
+- Editor Sessions fed by snapshots, with relay, resync, and peer resume;
+- the rendered editor, with per-person undo, split-then-refuse paste guards, copy as Markdown, and comment on selection;
+- Documents Port Contract 1.0 (`document.list`, `document.markdown`, `document.revise`, `documents.changed`), proven through the Host broker.
+
+The record format changed incompatibly, so development data directories that hold Documents must be reset. Automated checks pass, including the WebKit and Chromium frame scenarios (`npm run verify:documents-editor`). Verify owns the two-profile desktop check, the packaged-app isolation probe, IME input, the two-second latency observation, and the long property run. Frame-policy findings are recorded in [DELTA-012](.delta/DELTA-012-package-ui-frame-form-and-select-behaviour.md). Agent mentions, agent-signed revisions, and Comment ports are the follow-on workstream.
+
+**Outcome:** Members edit a Document in rendered form and converge, and another Package reads and revises it as Markdown against a base version.
+
+**Depends on:** Phase 7 (Documents Package), Package interface (ADR 0026).
+
 ## Later (unscheduled)
 
 Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
@@ -110,8 +126,8 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
-- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0027).
-- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027).
+- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes as Markdown revisions merged against a base version (follow-up to Phase 7, ADRs 0027 and 0031).
+- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027). It must keep Port Contract version tokens resolvable or refuse stale ones explicitly (ADR 0031).
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
