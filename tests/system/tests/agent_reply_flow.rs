@@ -18,12 +18,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use support::harness::{
     self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, create_invitation, introduce,
-    object, open_core, open_host, open_mount, poll_until, shutdown, workspace_root,
+    object, open_core, open_host, open_mount, poll_until, shutdown,
 };
-use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
+use teamarness_package_host::{
+    PackageIdentity, PackageInstanceKey, PackageSourceKind, PackageTrustKind, PackageValue,
+    WorkspaceId,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -31,48 +33,34 @@ const AGENT_PACKAGE_ID: &str = "dev.teamarness.agent";
 const REPLY: &str = "Hello from the stub model";
 const KEY: &str = "sk-system-test-key-never-logged";
 
-fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// Stages the real Agent Backend beside the staged Conversations Package and registers it.
-fn stage_agent(application: &Path) {
-    let root = application.join(AGENT_PACKAGE_ID);
-    fs::create_dir_all(root.join("backend")).unwrap();
-    fs::create_dir_all(root.join("ui")).unwrap();
-    let binary = fs::read(env!("CARGO_BIN_EXE_agent-backend-under-test")).unwrap();
-    let mut manifest: Value = serde_json::from_slice(
-        &fs::read(workspace_root().join("packages/agent-package/teamarness.package.json")).unwrap(),
-    )
-    .unwrap();
-    let backend = manifest["backends"][0]["path"].as_str().unwrap().to_owned();
-    fs::write(root.join(&backend), &binary).unwrap();
-    fs::set_permissions(root.join(&backend), fs::Permissions::from_mode(0o700)).unwrap();
-    let ui = b"export function mount() { return async () => {}; }";
-    let contract =
-        fs::read(workspace_root().join("packages/agent-package/ui-contract.json")).unwrap();
-    fs::write(root.join("ui/index.js"), ui).unwrap();
-    fs::write(root.join("ui-contract.json"), &contract).unwrap();
-    manifest["backends"][0]["size"] = json!(binary.len());
-    manifest["backends"][0]["sha256"] = json!(digest(&binary));
-    manifest["ui"]["entrypoint"]["size"] = json!(ui.len());
-    manifest["ui"]["entrypoint"]["sha256"] = json!(digest(ui));
-    manifest["ui"]["contract"]["sha256"] = json!(digest(&contract));
+/// Explicit external qualification: build the standalone project immediately before running.
+/// Never silently skip, substitute a fixture, or claim this proves an unbuilt source revision.
+fn register_agent(private: &Path) {
+    let directory = fs::canonicalize(std::env::var_os("TEAMARNESS_AGENT_PACKAGE_DIR").expect(
+        "build the standalone Agent, then set TEAMARNESS_AGENT_PACKAGE_DIR to its dist directory",
+    ))
+    .expect("the external Agent Package Directory exists");
+    let packages = private.join("packages");
+    fs::create_dir_all(&packages).unwrap();
+    fs::set_permissions(&packages, fs::Permissions::from_mode(0o700)).unwrap();
+    let registration = packages.join("registrations.v1.json");
     fs::write(
-        root.join("teamarness.package.json"),
-        serde_json::to_vec(&manifest).unwrap(),
+        &registration,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "registrations": [{
+                "directory": directory,
+                "expectedIdentity": AGENT_PACKAGE_ID,
+                "trust": {
+                    "kind": "trusted_native_code_v1",
+                    "acceptedRisks": ["filesystem", "network", "process"]
+                }
+            }]
+        }))
+        .unwrap(),
     )
     .unwrap();
-    let registration = application.join("application-packages.v1.json");
-    let mut registered: Value = serde_json::from_slice(&fs::read(&registration).unwrap()).unwrap();
-    registered["packages"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"directory": AGENT_PACKAGE_ID}));
-    fs::write(registration, serde_json::to_vec(&registered).unwrap()).unwrap();
+    fs::set_permissions(registration, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 /// A stub OpenAI-compatible endpoint: every `POST` is answered with one fixed completion.
@@ -179,12 +167,79 @@ fn files_contain(root: &Path, needle: &str) -> bool {
     })
 }
 
+/// Packaging smoke only: real admission, capability grants, activation and a UI-contract request.
+/// No model endpoint, delivery/backlog replay, or live developer profile access.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn local_agent_package_loads_from_registration() {
+    let app = harness::StagedApplication::new();
+    let root = app.root.path();
+    let alice_core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
+    let workspace = alice_core.create_workspace("Personal Agent load").unwrap();
+    let private = root.join("alice-host");
+    register_agent(&private);
+    let alice_host = open_host(&app.application_path, private, alice_core.clone()).await;
+    let snapshot = alice_host.snapshot().await;
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:?}",
+        snapshot.diagnostics
+    );
+    let agent = snapshot
+        .packages
+        .iter()
+        .find(|package| package.identity.as_str() == AGENT_PACKAGE_ID)
+        .expect("the real local Agent is admitted");
+    assert_eq!(agent.source, PackageSourceKind::Local);
+    assert_eq!(agent.trust, PackageTrustKind::TrustedNativeCodeV1);
+    let key = PackageInstanceKey::new(
+        PackageIdentity::from_str(AGENT_PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace.id().to_string()).unwrap(),
+    );
+    let mount = open_mount(&alice_host, &key).await;
+    let client = ConversationClient {
+        host: &alice_host,
+        mount: &mount,
+    };
+    let status = serde_json::to_value(
+        client
+            .request("load-status", "agent.status.get", object([]))
+            .await,
+    )
+    .unwrap();
+    assert!(status["state"].is_string(), "{status}");
+    client
+        .request("load-settings", "agent.settings.get", object([]))
+        .await;
+
+    let bob_core = open_core(Addressing::Loopback, &root.join("bob-core")).await;
+    bob_core.create_workspace("No local Agent").unwrap();
+    let bob_host = open_host(
+        &app.application_path,
+        root.join("bob-host"),
+        bob_core.clone(),
+    )
+    .await;
+    assert!(
+        bob_host
+            .snapshot()
+            .await
+            .packages
+            .iter()
+            .all(|package| package.identity.as_str() != AGENT_PACKAGE_ID)
+    );
+    shutdown(bob_host).await;
+    shutdown(alice_host).await;
+    bob_core.shutdown().await.unwrap();
+    alice_core.shutdown().await.unwrap();
+}
+
 /// Verifies: AC2, AC3 — the Agent answers once when addressed, on both Installations, as itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
 async fn the_agent_replies_once_when_addressed_across_two_profiles() {
     let (endpoint, requests) = stub_endpoint().await;
     let alice_app = harness::StagedApplication::new();
-    stage_agent(&alice_app.application_path);
     let root = alice_app.root.path();
 
     // Alice: Steward of the Agent, runs Conversations and the Agent Package.
@@ -203,6 +258,7 @@ async fn the_agent_replies_once_when_addressed_across_two_profiles() {
         .to_string();
     assert_ne!(agent_key, alice_core.public_identity().to_string());
     let alice_private = root.join("alice-host");
+    register_agent(&alice_private);
     let alice_host = open_host(
         &alice_app.application_path,
         alice_private.clone(),

@@ -48,7 +48,7 @@ npm run dev:instance -- bob
 
 Each profile owns a distinct Installation identity and `core.sqlite3`. When creating or joining a Workspace, choose a Workspace-specific Person name. You can rename your Person in Workspace settings. Add a Workspace Agent by name in the same settings screen; Core creates and keeps its signing key locally. The Agent appears with its Steward in the member roster. A Steward can rename or remove their Agent, and the Workspace creator can remove another Person's Agent without removing that Person. The creator cannot rename someone else's Agent.
 
-Conversations shows remote authors' current Principal names and updates displayed Messages after a rename. A missing or duplicate name keeps an inspectable author-identity fallback; your own Messages remain **You**. An Agent posts in Conversations through the bundled Agent Package; see [Run a Workspace Agent](#run-a-workspace-agent). Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
+Conversations shows remote authors' current Principal names and updates displayed Messages after a rename. A missing or duplicate name keeps an inspectable author-identity fallback; your own Messages remain **You**. An Agent posts in Conversations through the optional Personal Agent Package; see [Run a Workspace Agent](#run-a-workspace-agent). Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
 
 An absolute directory is available as an expert override. Arbitrary relative paths are rejected:
 
@@ -65,10 +65,12 @@ target/debug/teamarness-desktop --data-dir /absolute/private/teamarness-two
 
 ## Run a Workspace Agent
 
-The bundled **Agent** Package (`dev.teamarness.agent`) runs one of your Workspace Agents against an OpenAI-compatible chat-completions endpoint and replies in Conversations when a Member addresses the Agent by name. Configuration lives in the Package's own UI on the Steward's Installation. The Shell has no Agent settings, and binding is never replicated.
+The optional **Agent** Personal Package (`dev.teamarness.agent`) runs one of your Workspace Agents against an OpenAI-compatible chat-completions endpoint and replies in Conversations when a Member addresses the Agent by name. Configuration lives in the Package's own UI on the Steward's Installation. The Shell has no Agent settings, and binding is never replicated.
+
+First build the standalone Agent project outside this repository and [register its Package Directory locally](docs/local-package-registration.md). It is not shipped in the application bundle. Keep `dev.teamarness.agent` unchanged when switching an existing installation from bundled to local: its settings, key and progress remain in the same Package Data Directory. Restart after registration or a rebuild.
 
 1. In Workspace settings, add an Agent by name under **Add agent**. You are its Steward.
-2. Select **Agent** under **Team Packages**. In the **Agent** section, choose the Agent and select **Use this Agent**. Only Agents you steward on this Installation are offered.
+2. Select **Agent** under **Personal Packages**. In the **Agent** section, choose the Agent and select **Use this Agent**. Only Agents you steward on this Installation are offered.
 3. In **Model endpoint**, enter the base URL (default `https://openrouter.ai/api/v1`; the Package appends `/chat/completions`), the model slug your provider expects (for example a DeepSeek model on OpenRouter), an optional system prompt, and how many earlier Messages a reply sees (0 to 64, default 20). Select **Save settings**.
 4. In **API key**, paste the key and select **Store key**. The key is written once and never shown again; the UI reports only whether a key is stored.
 
@@ -147,7 +149,7 @@ The runtime refuses a data directory that still holds retired version-1 protecti
 
 Start with [Build your first Package with an agent](docs/build-your-first-package.md). It begins with the finished Tutorial, explains the boundary between the Teamarness Core Runtime and a Package, then walks through generating, building, registering, and using an external Emojart project. Generate Emojart outside the Teamarness repository with `npm run create:package -- --output <directory> --identity dev.teamarness.emojart --display-name Emojart`. Read the [Package author guide](docs/package-author-guide.md) for the full Package Directory, Backend, UI, contract, and application-distribution rules. Read the UI SDK's [Package UI theme and CSS kit](packages/teamarness-package-ui-sdk/README.md) guidance for the exact semantic tokens, opt-in classes, cleanup contract, and Package-owned header and navigation model. Run `npm run validate:packages` to apply Package Admission's manifest and UI contract rules to every bundled Package's source and staged directory, with a Backend smoke launch, without starting the application; a generated project runs the same validator as `npm run validate`. Read [Local Package registration](docs/local-package-registration.md) for other registration layouts, restart rules, digest invalidation, and Package Data Directory continuity. A local registration does not grant Workspace enablement or synchronize, share, network, or collaborate Package code or data.
 
-The application build composes the Reference, Tutorial, Conversations, Repo-aware, and Agent Packages into one verified index. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
+The application build composes the Reference, Tutorial, Conversations, and Repo-aware Packages into one verified index. Agent is built independently and registered locally. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
 
 The protocol and supported Rust tooling have separate contracts:
 
@@ -169,6 +171,6 @@ The runtime exclusively owns one private `core.sqlite3`. Uncertain commit outcom
 - `context/` is the canonical requirements, ontology, roadmap, and decision tree.
 - `crates/teamarness-core/` contains the Core Runtime library, API documentation, and tests.
 - `crates/teamarness-package-host/`, `crates/teamarness-package-protocol/`, and `crates/teamarness-package-sdk/` contain the Package runtime and supported Rust tooling.
-- `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, `packages/repo-aware/`, and `packages/agent-package/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
+- `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, and `packages/repo-aware/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
 - `apps/teamarness-desktop/` contains the typed Tauri adapter and Shell.
 - `p2p-local-first-user-management.md` is the supporting P2P membership research baseline.

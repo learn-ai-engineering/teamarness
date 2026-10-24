@@ -21,13 +21,10 @@ path = "../../packages/conversations-package/backend/src/main.rs"
 name = "conversations-port-consumer-under-test"
 path = "src/bin/conversations_port_consumer.rs"
 
-# The Agent Backend, built the same way from the Package's own `src/main.rs`.
-[[bin]]
-name = "agent-backend-under-test"
-path = "../../packages/agent-package/backend/src/main.rs"
+# The optional standalone Agent is qualified through an explicitly supplied Package Directory;
+# it is not a source dependency or prerequisite of the default Teamarness suite.
 
 [dependencies]
-teamarness-agent-package = { path = "../../packages/agent-package/backend" }
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
 teamarness-package-sdk = { path = "../../crates/teamarness-package-sdk" }
 serde_json.workspace = true
