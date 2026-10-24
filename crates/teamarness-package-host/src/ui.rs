@@ -195,18 +195,8 @@ impl UiCacheRecord {
 }
 
 fn validate_resource_path(value: &str) -> Result<(), UiContractFailure> {
-    if value.is_empty()
-        || value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains("//")
-        || value.contains('\\')
-        || value.contains('\0')
-        || value.contains('%')
-        || value.contains('?')
-        || value.contains('#')
-        || value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    // The segment rules are shared with content-view paths.
+    if !teamarness_package_contract::media_types::is_normalized_relative_path(value)
         || Path::new(value)
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))

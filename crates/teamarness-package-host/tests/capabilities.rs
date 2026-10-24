@@ -1317,6 +1317,7 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
         "membership.schema.json",
         "principals.schema.json",
         "agent-binding.schema.json",
+        "content-views.schema.json",
         "signing.schema.json",
         "immutable-record-log.schema.json",
         "signing-envelope.golden.json",
@@ -1363,6 +1364,77 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
             "forbidden contract value: {forbidden}"
         );
     }
+}
+
+/// `teamarness.content-views` 1.0 is only for a Package that declares it, and declaring it is
+/// the only way a Package's mounts are reported as nesting content.
+#[tokio::test]
+async fn content_views_are_granted_only_to_a_declaring_package() {
+    const FAMILY: &str = "teamarness.content-views";
+    let undeclared = common::Fixture::node(&[("plain", "dev.teamarness.plain")]).await;
+    let host = PackageHost::open(undeclared.config.clone(), undeclared.core.clone())
+        .await
+        .unwrap();
+    let instance = host.snapshot().await.instances[0].key.clone();
+    let PackageHostOutcome::UiMountOpened { mount, loader, .. } = host
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount { instance }))
+        .await
+        .unwrap()
+    else {
+        panic!("the mount opened")
+    };
+    assert!(
+        !loader.nested_content,
+        "an undeclared Package nests no content"
+    );
+    assert_eq!(
+        grant(&host, mount.clone(), "cv-grant", FAMILY).await,
+        PackageValue::String("missing".into())
+    );
+    let files = serde_json::from_value::<PackageValue>(serde_json::json!([{
+        "path":"index.html","sha256":"0".repeat(64),"size":1,
+        "source":{"kind":"file","path":"index"}
+    }]))
+    .unwrap();
+    let refused = call(
+        &host,
+        mount,
+        "cv-undeclared",
+        capability(
+            FAMILY,
+            "open",
+            object([
+                ("entry", PackageValue::String("index.html".into())),
+                ("files", files),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.get("error"),
+        Some(&PackageValue::String("capability_request_invalid".into()))
+    );
+
+    let declared = common::Fixture::node_with_capabilities(
+        &[("viewer", "dev.teamarness.viewer")],
+        &[serde_json::json!({"identity":FAMILY,"major":1,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    let host = PackageHost::open(declared.config.clone(), declared.core.clone())
+        .await
+        .unwrap();
+    let instance = host.snapshot().await.instances[0].key.clone();
+    let PackageHostOutcome::UiMountOpened { loader, .. } = host
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount { instance }))
+        .await
+        .unwrap()
+    else {
+        panic!("the mount opened")
+    };
+    assert!(
+        loader.nested_content,
+        "a declaring Package may nest content"
+    );
 }
 
 /// Verifies: TEAM.SYS.PKG-R03

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as BlockingMutex};
@@ -230,6 +231,7 @@ enum CapabilityKind {
     Signing,
     ImmutableRecordLog,
     PackagePorts,
+    ContentViews,
     #[cfg(test)]
     Neutral,
 }
@@ -249,6 +251,9 @@ pub(crate) struct CapabilityScope {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) workspace_name: String,
     pub(crate) installation: InstallationPublicIdentity,
+    /// The Package Data Directory content views resolve their sources under.
+    pub(crate) data_directory: PathBuf,
+    pub(crate) content_views: Arc<crate::content_views::ContentViews>,
 }
 
 #[derive(Clone)]
@@ -446,6 +451,7 @@ impl GenerationCapabilities {
                     .await
             }
             CapabilityKind::PackagePorts => Err(PackageErrorCode::CapabilityRequestInvalid),
+            CapabilityKind::ContentViews => self.content_views(method, object).await,
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
         }
@@ -899,6 +905,41 @@ impl GenerationCapabilities {
         }
     }
 
+    /// `teamarness.content-views` 1.0: open and close views over files in this Package's own
+    /// Data Directory. The grant fixes the Package, Workspace and generation, so a view is this
+    /// generation's and no request names a Package or a directory.
+    async fn content_views(
+        &self,
+        method: &str,
+        object: &Map<String, Value>,
+    ) -> Result<Value, PackageErrorCode> {
+        let owner = crate::content_views::ViewOwner {
+            instance: crate::PackageInstanceKey::new(
+                self.scope.package_identity.clone(),
+                self.scope.workspace_id.clone(),
+            ),
+            generation: self.generation,
+        };
+        match method {
+            "open" => {
+                let request = crate::content_views::parse_open(object)?;
+                let views = Arc::clone(&self.scope.content_views);
+                let root = self.scope.data_directory.clone();
+                // Resolving every source is blocking file work.
+                tokio::task::spawn_blocking(move || views.open(owner, &root, request))
+                    .await
+                    .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
+            }
+            "close" => {
+                exact_fields(object, &["method", "view"])?;
+                let view = crate::ContentViewToken::new(string_field(object, "view")?)
+                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                Ok(json!({"closed": self.scope.content_views.close(&owner, &view)}))
+            }
+            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    }
+
     /// The Host-authored actor for a Port dispatch by this generation: the
     /// Workspace Agent the calling Package is bound to, otherwise the
     /// Installation Person (ADR 0030). Read once per dispatch; the lookup
@@ -1240,6 +1281,13 @@ impl Registry {
             min_minor: 0,
             max_minor: 0,
             kind: CapabilityKind::PackagePorts,
+        });
+        registry.register(Descriptor {
+            family: CapabilityFamily::new(crate::content_views::FAMILY),
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::ContentViews,
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.synchronization.immutable-record-log"),
@@ -2094,6 +2142,8 @@ mod tests {
                 workspace_name: workspace.name().to_owned(),
                 installation: InstallationPublicIdentity::new(core.public_identity().to_string())
                     .unwrap(),
+                data_directory: PathBuf::new(),
+                content_views: Arc::default(),
             },
             &[CapabilityRequirement {
                 family: "teamarness.synchronization.immutable-record-log".into(),
@@ -2144,6 +2194,8 @@ mod tests {
             workspace_name: "test".into(),
             installation: InstallationPublicIdentity::new(core.public_identity().to_string())
                 .unwrap(),
+            data_directory: PathBuf::new(),
+            content_views: Arc::default(),
         };
         let old = GenerationCapabilities::bind(
             core.clone(),
@@ -2637,6 +2689,67 @@ mod tests {
                 .as_u64()
                 .unwrap() as usize,
             MAX_AGENT_CANDIDATES
+        );
+    }
+
+    #[test]
+    fn content_view_limits_and_allowlist_match_the_contract_schema() {
+        use teamarness_package_contract::media_types as content;
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/content-views.schema.json"
+        ))
+        .unwrap();
+        let defs = &schema["$defs"];
+        let limits = &defs["limits"]["properties"];
+        let number = |value: &Value| value.as_u64().unwrap();
+        assert_eq!(
+            number(&limits["maxFiles"]["const"]) as usize,
+            content::MAX_CONTENT_FILES
+        );
+        assert_eq!(
+            number(&defs["openCall"]["properties"]["files"]["maxItems"]) as usize,
+            content::MAX_CONTENT_FILES
+        );
+        assert_eq!(
+            number(&limits["maxTotalBytes"]["const"]),
+            content::MAX_CONTENT_TOTAL_BYTES
+        );
+        assert_eq!(
+            number(&limits["maxFileBytes"]["const"]),
+            content::MAX_CONTENT_FILE_BYTES
+        );
+        assert_eq!(
+            number(&defs["file"]["properties"]["size"]["maximum"]),
+            content::MAX_CONTENT_FILE_BYTES
+        );
+        assert_eq!(
+            number(&limits["maxPathBytes"]["const"]) as usize,
+            content::MAX_CONTENT_PATH_BYTES
+        );
+        assert_eq!(
+            number(&defs["contentPath"]["maxLength"]) as usize,
+            content::MAX_CONTENT_PATH_BYTES
+        );
+        assert_eq!(
+            number(&defs["sourcePath"]["maxLength"]) as usize,
+            crate::content_views::MAX_SOURCE_PATH_BYTES
+        );
+        assert_eq!(
+            number(&limits["maxViewsPerGeneration"]["const"]) as usize,
+            crate::content_views::MAX_VIEWS_PER_GENERATION
+        );
+        let published = defs["mediaTypes"]["const"].as_object().unwrap();
+        assert_eq!(published.len(), content::MEDIA_TYPES.len());
+        for (extension, media_type) in content::MEDIA_TYPES {
+            assert_eq!(published[*extension], *media_type, "{extension}");
+        }
+        assert_eq!(
+            Registry::production()
+                .negotiate(&requirement(crate::content_views::FAMILY, 1, 0, 0))
+                .unwrap()
+                .0
+                .kind,
+            CapabilityKind::ContentViews
         );
     }
 }

@@ -7,11 +7,16 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use teamarness_package_protocol::JsonValue;
+use teamarness_package_sdk::capabilities::content_views::{
+    ContentFile, ContentSource, ContentViews,
+};
 use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, ReplayEnd,
     SessionOptions, SyncState, SyncWarning, run_session, run_session_from_start,
 };
-use teamarness_package_sdk::capabilities::{membership, record_log, signing, workspace_context};
+use teamarness_package_sdk::capabilities::{
+    content_views, membership, record_log, signing, workspace_context,
+};
 use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
 use teamarness_package_sdk::{BackendError, CancellationToken, Empty, Router};
 
@@ -342,6 +347,93 @@ async fn workspace_membership_and_signing_clients_decode_schema_shapes() {
     assert_eq!(response.get("signer").unwrap(), &hex(64, 9));
     assert_eq!(response.get("envelopeVersion").unwrap(), 1);
     assert_eq!(response.get("valid").unwrap(), true);
+    harness.shutdown().await.unwrap();
+}
+
+fn content_router() -> Router<()> {
+    Router::stateless().request("fixture.content_view", |context, _: Empty| async move {
+        let views = ContentViews::from_initialization(
+            context.initialization(),
+            context.capabilities().clone(),
+        )?;
+        let opened = views
+            .open(
+                "index.html",
+                &[ContentFile {
+                    path: "index.html".into(),
+                    sha256: hex(64, 7),
+                    size: 42,
+                    source: ContentSource::File {
+                        path: "content/sha256/index".into(),
+                    },
+                }],
+            )
+            .await?;
+        let closed = views.close(&opened.view).await?;
+        Ok(serde_json::json!({"view": opened.view, "url": opened.url, "closed": closed}))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn content_views_client_round_trips_open_and_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let view = hex(32, 5);
+    let answered = view.clone();
+    let scripted = ScriptedCapability::new().calls(move |method, _| match method {
+        "open" => Ok(serde_json::json!({
+            "view": answered,
+            "url": format!("teamarness-content://localhost/{answered}/index.html"),
+        })),
+        "close" => Ok(serde_json::json!({"closed": true})),
+        other => panic!("unexpected content-views method {other}"),
+    });
+    let mut harness = start(
+        content_router(),
+        vec![(content_views::IDENTITY, scripted.clone())],
+        &directory,
+    )
+    .await;
+    let response = harness
+        .request("fixture.content_view", empty())
+        .await
+        .unwrap();
+    assert_eq!(response.get("view").unwrap(), &view);
+    assert_eq!(
+        response.get("url").unwrap(),
+        &format!("teamarness-content://localhost/{view}/index.html")
+    );
+    assert_eq!(response.get("closed").unwrap(), true);
+    let calls = scripted.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].method, "open");
+    assert_eq!(calls[0].payload["entry"], "index.html");
+    assert_eq!(
+        calls[0].payload["files"],
+        serde_json::json!([{
+            "path": "index.html",
+            "sha256": hex(64, 7),
+            "size": 42,
+            "source": {"kind": "file", "path": "content/sha256/index"},
+        }])
+    );
+    assert_eq!(calls[1].method, "close");
+    assert_eq!(calls[1].payload["view"], view);
+    harness.shutdown().await.unwrap();
+
+    // A malformed answer is never half-decoded.
+    let broken = ScriptedCapability::new()
+        .calls(|_, _| Ok(serde_json::json!({"view": "short", "url": "https://example.com/"})));
+    let mut harness = start(
+        content_router(),
+        vec![(content_views::IDENTITY, broken)],
+        &directory,
+    )
+    .await;
+    let error = harness
+        .request("fixture.content_view", empty())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "package.invalid_capability_response");
     harness.shutdown().await.unwrap();
 }
 

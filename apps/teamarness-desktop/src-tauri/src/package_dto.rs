@@ -262,6 +262,7 @@ mod tests {
                     .unwrap(),
                 name: "Fixture Workspace".into(),
             },
+            nested_content: false,
         };
         assert_eq!(
             serde_json::to_value(UiLoaderDto::from(descriptor)).unwrap(),

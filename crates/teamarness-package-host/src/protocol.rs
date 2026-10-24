@@ -1444,6 +1444,9 @@ pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::PrincipalNotBound => "principal_not_bound",
         PackageErrorCode::AgentNotStewarded => "agent_not_stewarded",
         PackageErrorCode::AgentNotFound => "agent_not_found",
+        PackageErrorCode::UnsupportedMediaType => "unsupported_media_type",
+        PackageErrorCode::ContentTooLarge => "content_too_large",
+        PackageErrorCode::InvalidContentPath => "invalid_content_path",
         _ => "capability_request_invalid",
     }
 }

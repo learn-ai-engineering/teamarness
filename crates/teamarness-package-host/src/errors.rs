@@ -32,6 +32,10 @@ pub enum PackageErrorCode {
     PrincipalNotBound,
     AgentNotStewarded,
     AgentNotFound,
+    UnsupportedMediaType,
+    ContentTooLarge,
+    InvalidContentPath,
+    ContentNotFound,
     SpawnFailed,
     HandshakeTimeout,
     HandshakeMismatch,
@@ -219,6 +223,9 @@ pub(crate) fn activation_error(
             | PackageErrorCode::PrincipalNotBound
             | PackageErrorCode::AgentNotStewarded
             | PackageErrorCode::AgentNotFound
+            | PackageErrorCode::UnsupportedMediaType
+            | PackageErrorCode::ContentTooLarge
+            | PackageErrorCode::InvalidContentPath
     ) {
         PackageErrorStage::Capability
     } else {

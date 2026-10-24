@@ -17,6 +17,7 @@ pub use port_observation::{PortObservation, PortObservations, PortStage};
 mod capability;
 mod catalog;
 mod commands;
+mod content_views;
 mod data_directory;
 mod diag;
 mod errors;
@@ -38,9 +39,9 @@ use tokio::sync::{Mutex, watch};
 pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome, ReadUiResource,
-    ReconcileWorkspaces, RecoverPackage, ReportUiFault, ShutdownHost, SuspendPackage,
-    UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext,
+    OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome, ReadContent,
+    ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReportUiFault, ShutdownHost,
+    SuspendPackage, UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext,
 };
 pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
@@ -52,10 +53,11 @@ pub use crate::subscriptions::{
 };
 pub use crate::ui::MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 pub use crate::values::{
-    DiagnosticId, HostRevision, InstallationPublicIdentity, LifecycleState, MountState,
-    PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
-    PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTrustKind, PackageValue,
-    UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
+    ContentViewToken, DiagnosticId, HostRevision, InstallationPublicIdentity, LifecycleState,
+    MountState, PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot, PackageHostState,
+    PackageIdentity, PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind,
+    PackageTrustKind, PackageValue, UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId,
+    ValueParseError, WorkspaceId,
 };
 
 use crate::errors::host_error;
@@ -231,6 +233,7 @@ impl PackageHost {
             }
             PackageHostCommand::ReportUiFault(input) => self.report_ui_fault(input).await,
             PackageHostCommand::ReadUiResource(input) => self.read_ui_resource(input).await,
+            PackageHostCommand::ReadContent(input) => self.read_content(input).await,
             PackageHostCommand::Shutdown(_) => self.shutdown_host().await,
         }
     }

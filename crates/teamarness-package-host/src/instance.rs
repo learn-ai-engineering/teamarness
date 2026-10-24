@@ -105,6 +105,8 @@ impl InstanceActor {
             if attempt > 0 {
                 tokio::time::sleep(RESTART_DELAYS[attempt - 1]).await;
             }
+            // Whatever generation came before has ended, and its content views with it.
+            self.end_content_views();
             let append_fence = Arc::new(AppendFence::default());
             let generation = {
                 let mut state = self.state.lock().await;
@@ -272,6 +274,7 @@ impl InstanceActor {
                     clear_process_state(&mut state);
                     state.failures.clear();
                 }
+                self.end_content_views();
                 self.start_generation(true, false).await
             }
             LifecycleState::Disposed => Err(WireFailure::new(PackageErrorCode::Disposed)),
@@ -314,6 +317,8 @@ impl InstanceActor {
         let mut state = self.state.lock().await;
         clear_process_state(&mut state);
         state.lifecycle = LifecycleState::Disposed;
+        drop(state);
+        self.end_content_views();
         result
     }
 
@@ -876,6 +881,7 @@ impl InstanceActor {
                 }
             };
             if let Some(should_restart) = handling {
+                actor.end_content_views();
                 process.terminate().await;
                 if should_restart {
                     let _ = Box::pin(actor.start_generation(true, true)).await;
@@ -902,7 +908,33 @@ impl InstanceActor {
         }
         let mut state = self.state.lock().await;
         clear_process_state(&mut state);
+        drop(state);
+        self.end_content_views();
         true
+    }
+
+    /// Closes every content view this Instance holds: its process generation has ended.
+    fn end_content_views(&self) {
+        self.spec.calls.content_views.close_instance(&self.key);
+    }
+
+    /// The generation of the live process, if one is running.
+    pub(crate) async fn live_generation(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .await
+            .process
+            .as_ref()
+            .map(|process| process.generation)
+    }
+
+    /// Whether this Package declared one Semantic Capability family.
+    pub(crate) fn declares_capability(&self, family: &str) -> bool {
+        self.spec
+            .template
+            .capabilities
+            .iter()
+            .any(|requirement| requirement.family == family)
     }
 }
 

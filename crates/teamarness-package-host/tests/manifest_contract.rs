@@ -619,3 +619,20 @@ fn port_file_symlink_oversize_and_invalid_schema_fail_locally() {
     );
     assert_eq!(code(&temp), PackageErrorCode::PortContractViolation);
 }
+
+#[test]
+fn a_manifest_may_declare_the_content_views_family() {
+    let temp = valid_package();
+    write_manifest(
+        &temp,
+        serde_json::json!({"capabilities": [{
+            "identity": "teamarness.content-views",
+            "major": 1,
+            "minMinor": 0,
+            "maxMinor": 0
+        }]}),
+    );
+    let loaded = manifest::load(temp.path(), "aarch64-apple-darwin").unwrap();
+    assert_eq!(loaded.capabilities.len(), 1);
+    assert_eq!(loaded.capabilities[0].family, "teamarness.content-views");
+}

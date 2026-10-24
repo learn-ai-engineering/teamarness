@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::values::{
-    HostRevision, LifecycleState, PackageIdentity, PackageInstanceKey, PackageSourceKind,
-    PackageTrustKind, PackageValue, UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId,
-    WorkspaceId,
+    ContentViewToken, HostRevision, LifecycleState, PackageIdentity, PackageInstanceKey,
+    PackageSourceKind, PackageTrustKind, PackageValue, UiMountId, UiRequestId, UiResourceToken,
+    UiSubscriptionId, WorkspaceId,
 };
 
 /// Activates every admitted Package for every Workspace Core lists. Never disposes
@@ -61,6 +61,9 @@ pub struct UiLoaderDescriptor {
     pub contract_digest: String,
     pub package: UiPackageContext,
     pub workspace: UiWorkspaceContext,
+    /// True when the Package declares `teamarness.content-views`: its frames may nest
+    /// `teamarness-content:` frames. Every other Package's frames may nest none.
+    pub nested_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +111,16 @@ pub struct ReadUiResource {
     pub token: UiResourceToken,
     pub relative_path: String,
 }
+/// Reads one listed file of an open content view, as `teamarness-content://localhost/<token>/<path>`
+/// names it. `path` is the decoded content path.
+///
+/// An unknown or ended view, a path the view does not list, and a file that fails verification
+/// are all `content_not_found`, with no further detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadContent {
+    pub token: ContentViewToken,
+    pub path: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownHost;
 
@@ -128,6 +141,7 @@ pub enum PackageHostCommand {
     CloseUiSubscription(CloseUiSubscription),
     ReportUiFault(ReportUiFault),
     ReadUiResource(ReadUiResource),
+    ReadContent(ReadContent),
     Shutdown(ShutdownHost),
 }
 
@@ -166,6 +180,11 @@ pub enum PackageHostOutcome {
         revision: HostRevision,
     },
     UiResource {
+        bytes: Vec<u8>,
+        media_type: String,
+    },
+    /// The verified bytes of one content-view file and its allowlisted media type.
+    Content {
         bytes: Vec<u8>,
         media_type: String,
     },

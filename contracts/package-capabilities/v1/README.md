@@ -52,6 +52,42 @@ A Package Instance's own Agent Binding: Installation-local configuration, held b
 
 `bind` fails with `agent_not_stewarded` when this Installation does not steward the Principal (including a Person or another Steward's Agent) and with `agent_not_found` when no current Workspace Principal has that ID. A malformed ID or any extra field is `capability_request_invalid`. A binding is cleared when this Installation removes the Agent; a Package observes removal or rename through `teamarness.principals`. The closed schema is `agent-binding.schema.json`.
 
+## `teamarness.content-views` 1.0
+
+A Package serves files from its own Package Data Directory to a nested frame without the Host or the Shell knowing what the files are. The Package states *what* to serve; the Host owns path rules, source resolution, verification, media types, token lifetime and bounds. The grant fixes the Package, Workspace and process generation, so no request names a Package or a directory, and a view ends with the generation. Declaring this family is also the Package's opt-in to nesting content: the Host reports `nestedContent: true` on the declaring Package's opened UI mounts, and every other Package's mounts report `false`.
+
+`open` takes exactly `{entry, files}`. `files` lists 1–1,000 entries of exactly `{path, sha256, size, source}`:
+
+- `path` is the content path inside the view: at most 128 bytes, non-empty `/`-separated segments, none of them `.` or `..`, and no `\`, NUL, `%`, `?`, `#` or control characters. Paths are unique.
+- The extension of the last segment chooses the media type from the shared allowlist below. Extensions match **lowercase only**: `image.PNG` is refused.
+- `sha256` is the lowercase hexadecimal SHA-256 of the file's bytes, and `size` is its byte length, at most 16,777,216 (16 MiB). The declared sizes total at most 67,108,864 bytes (64 MiB).
+- `source` 1.0 is only `{kind:"file", path}`: a relative path of at most 256 bytes inside the caller's Package Data Directory. The Host refuses a symlink anywhere on the path, a missing file, a file that is not regular, and a path outside the directory.
+- `entry` is one of the listed paths.
+
+It returns `{view, url}`. `view` is an opaque token of 128 random bits as 32 lowercase hexadecimal characters. `url` is `teamarness-content://localhost/<view>/<entry>`, with every entry byte outside the URL unreserved characters and `/` percent-encoded. Relative references inside the content resolve against it.
+
+`close` takes exactly `{view}` and returns `{closed}`: `false` when the view had already ended or belongs to another generation. A generation holds at most 32 open views; opening a 33rd closes the least recently opened one. Every view of an Instance closes when its process generation ends.
+
+The Host serves a view itself; no Package request happens per file. The first read of each file in a view checks its size and SHA-256 and caches the verdict for that view; every read checks its size and that it is still a regular file. A file that changed after `open` is no longer served, so a Package that changes a file opens a new view. The media type always comes from the allowlist, never from the Package. An unknown or ended view, an unlisted path and a file that fails verification are all the same not-found answer.
+
+| Extension | Media type | Extension | Media type |
+|---|---|---|---|
+| `html` | `text/html; charset=utf-8` | `ico` | `image/x-icon` |
+| `css` | `text/css; charset=utf-8` | `woff` | `font/woff` |
+| `js`, `mjs` | `text/javascript; charset=utf-8` | `woff2` | `font/woff2` |
+| `json` | `application/json` | `ttf` | `font/ttf` |
+| `svg` | `image/svg+xml` | `otf` | `font/otf` |
+| `png` | `image/png` | `wasm` | `application/wasm` |
+| `jpg` | `image/jpeg` | `txt` | `text/plain; charset=utf-8` |
+| `gif` | `image/gif` | `md` | `text/markdown; charset=utf-8` |
+| `webp` | `image/webp` | `csv` | `text/csv; charset=utf-8` |
+| `avif` | `image/avif` | `mp4` | `video/mp4` |
+| `webm` | `video/webm` | `mp3` | `audio/mpeg` |
+
+The allowlist, the bounds and the path rules are published once in Rust as `teamarness_package_contract::media_types`, so a Package that stores content can refuse a file with the verdict the Host would give.
+
+`open` fails with `unsupported_media_type` for an extension outside the allowlist, `content_too_large` for more than 1,000 files, a declared total over 64 MiB or a file over 16 MiB, and `invalid_content_path` for a malformed or duplicate path, an entry that is not listed, or a source the Host refuses. Any other malformed field or extra field is `capability_request_invalid`. The closed schema is `content-views.schema.json`.
+
 ## `teamarness.signing` 1.0
 
 `sign` and `verify` accept a visible ASCII purpose of 1 to 64 bytes and an unpadded base64url payload of at most 262144 decoded bytes. The host uses the fixed Core signing context `package-signing/v1`.
