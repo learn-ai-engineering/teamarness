@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+mod content_protocol;
 mod data_dir;
 mod dto;
 mod error;
@@ -63,6 +64,9 @@ pub struct DesktopState {
 struct ProtocolMountLease {
     mount: UiMountId,
     instance: PackageInstanceKey,
+    /// The mount's Package declares `teamarness.content-views`, so its frame
+    /// policy admits `teamarness-content:` frames.
+    nested_content: bool,
 }
 
 impl DesktopState {
@@ -98,22 +102,25 @@ impl DesktopState {
         token: &str,
         mount: &UiMountId,
         instance: &PackageInstanceKey,
+        nested_content: bool,
     ) {
         self.protocol_mounts.lock().await.insert(
             token.to_owned(),
             ProtocolMountLease {
                 mount: mount.clone(),
                 instance: instance.clone(),
+                nested_content,
             },
         );
     }
 
-    async fn mount_for_token(&self, token: &str) -> Option<UiMountId> {
+    /// The mount a resource token belongs to, and whether it may nest content frames.
+    async fn mount_for_token(&self, token: &str) -> Option<(UiMountId, bool)> {
         self.protocol_mounts
             .lock()
             .await
             .get(token)
-            .map(|lease| lease.mount.clone())
+            .map(|lease| (lease.mount.clone(), lease.nested_content))
     }
 
     async fn remove_mount_token(&self, mount: &UiMountId) {
@@ -226,6 +233,15 @@ pub fn run() {
                 let state = context.app_handle().state::<DesktopState>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     responder.respond(package_protocol::serve(state, request).await);
+                });
+            },
+        )
+        .register_asynchronous_uri_scheme_protocol(
+            "teamarness-content",
+            |context, request, responder| {
+                let state = context.app_handle().state::<DesktopState>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    responder.respond(content_protocol::serve(state, request).await);
                 });
             },
         )

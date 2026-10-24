@@ -96,6 +96,7 @@ pub struct UiLoaderDto {
     pub contract_digest: String,
     pub package: UiPackageContextDto,
     pub workspace: UiWorkspaceContextDto,
+    pub nested_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -137,6 +138,7 @@ impl From<UiLoaderDescriptor> for UiLoaderDto {
                 id: value.workspace.id.into(),
                 name: value.workspace.name,
             },
+            nested_content: value.nested_content,
         }
     }
 }
@@ -265,8 +267,16 @@ mod tests {
             nested_content: false,
         };
         assert_eq!(
-            serde_json::to_value(UiLoaderDto::from(descriptor)).unwrap(),
+            serde_json::to_value(UiLoaderDto::from(descriptor.clone())).unwrap(),
             fixture["loader"]
+        );
+        let nested = teamarness_package_host::UiLoaderDescriptor {
+            nested_content: true,
+            ..descriptor
+        };
+        assert_eq!(
+            serde_json::to_value(UiLoaderDto::from(nested)).unwrap()["nestedContent"],
+            serde_json::Value::Bool(true)
         );
     }
 

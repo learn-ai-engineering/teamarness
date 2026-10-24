@@ -38,7 +38,8 @@
     "workspace": {
       "id": "00112233445566778899aabbccddeeff",
       "name": "Fixture Workspace"
-    }
+    },
+    "nestedContent": false
   },
   "event": {
     "mount": "mount-1",

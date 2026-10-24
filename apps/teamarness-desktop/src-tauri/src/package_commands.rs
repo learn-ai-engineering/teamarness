@@ -83,7 +83,12 @@ pub async fn package_open_mount(
         unreachable!("OpenUiMount has one success outcome")
     };
     state
-        .register_protocol_mount(loader.token.as_str(), &mount, &instance)
+        .register_protocol_mount(
+            loader.token.as_str(),
+            &mount,
+            &instance,
+            loader.nested_content,
+        )
         .await;
     Ok(OpenUiMountDto {
         mount: mount.into(),

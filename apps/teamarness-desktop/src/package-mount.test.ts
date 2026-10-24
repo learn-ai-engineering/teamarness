@@ -49,6 +49,7 @@ function descriptor(number: number): OpenPackageMount {
         processGeneration: 1,
       },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
+      nestedContent: false,
     },
   };
 }

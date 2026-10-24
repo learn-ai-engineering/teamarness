@@ -44,6 +44,7 @@ export type PackageLoader = Readonly<{
     processGeneration: number;
   }>;
   workspace: Readonly<{ id: string; name: string }>;
+  nestedContent: boolean;
 }>;
 
 export type OpenPackageMount = Readonly<{ mount: string; loader: PackageLoader }>;

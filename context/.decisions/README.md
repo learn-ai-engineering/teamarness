@@ -38,6 +38,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0028](0028-qualified-record-replay-and-generation-fence.md) | Qualified immutable-record replay and Package generation append fence | accepted (2026-10-23; renumbered at integration) | – | – | In the ADR | Refines 0018 (additive minor), 0008/0009 (replay), and 0019 (generation retirement); see 0027 for Documents usage |
 | [0029](0029-document-import-failure.md) | A durable body edit may be unapplied on one Installation | accepted (2026-10-23; renumbered at integration) | – | – | In the ADR | Refines 0027/0028; local fail-loud import disposition, last-good incomplete text, no remote ACK or automatic repair |
 | [0030](0030-agent-standing-authority-and-binding.md) | Standing local Agent authority and Package-held Agent binding | accepted (2026-10-24) | 0023 (part), 0026 (part) | – | In the ADR | Refines 0017, 0023 and 0026; caller-independent Agent signing, binding keyed by Package, `teamarness.agent-binding` 1.0, Host-derived Agent actor |
+| [0033](0033-content-views-and-content-scheme.md) | Content views are served through a Shell-owned content scheme | accepted (2026-10-25) | – | – | In the ADR | Extends 0015: `teamarness-content:` with a fixed sandboxed policy, `frame-src teamarness-content:` only for mounts whose Package declares `teamarness.content-views`; token-only scope, IPC exposure as 0015, network denial deferred. 0031–0032 are left for the unintegrated rendered-document-editing decisions |
 
 ### Parallel-branch numbering reconciliation
 
