@@ -476,11 +476,13 @@ async fn bound_agent_append_uses_agent_signer_and_replicates_to_peer() {
         .core
         .bind_agent_package(workspace, agent, PACKAGE)
         .unwrap();
+    // ADR 0027: a bound Agent is a local signer for any Package Instance on
+    // this Installation, not only the Package that bound it.
     let other = self::mount(&host, 1).await;
     let foreign = call(&host, other, "agent-foreign-package", request()).await;
     assert_eq!(
-        foreign.get("error"),
-        Some(&PackageValue::String("principal_not_bound".into()))
+        foreign.get("author"),
+        Some(&PackageValue::String(agent_key.to_string()))
     );
     let appended = call(&host, mount.clone(), "agent-bound", request()).await;
     assert_eq!(

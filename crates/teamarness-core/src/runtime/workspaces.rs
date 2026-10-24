@@ -690,21 +690,16 @@ impl CoreRuntime {
         self.subscribe_person_names(workspace)
     }
 
-    /// Local-only binding; authorization requires this Installation to steward
-    /// the Agent. The Package Host consumes this in Phase 4.
+    /// Binds one Package Instance to an Agent this Installation stewards,
+    /// replacing that Package's previous Agent. Local configuration, never
+    /// replicated; any number of Packages may bind the same Agent (ADR 0027).
     pub fn bind_agent_package(
         &self,
         workspace: WorkspaceId,
         id: crate::PrincipalId,
         package: &str,
     ) -> Result<(), crate::PersonNameError> {
-        if package.is_empty()
-            || package.len() > u16::MAX as usize
-            || !package.is_ascii()
-            || crate::synchronization::is_reserved_record_scope(package)
-        {
-            return Err(crate::PersonNameError::InvalidPackageIdentity);
-        }
+        Self::validate_package_identity(package)?;
         let state = self
             .state
             .lock()
@@ -735,5 +730,76 @@ impl CoreRuntime {
         }
         crate::principals::agent_keys::bind(&state.connection, workspace, id, package)
             .map_err(crate::PersonNameError::Storage)
+    }
+
+    /// Clears a Package Instance's Agent Binding. Idempotent, and valid after
+    /// the Agent has left the registry, so a Package can always let go.
+    pub fn unbind_agent_package(
+        &self,
+        workspace: WorkspaceId,
+        package: &str,
+    ) -> Result<(), crate::PersonNameError> {
+        Self::validate_package_identity(package)?;
+        let state = self.binding_state()?;
+        if !state.memberships.contains_key(&workspace) {
+            return Err(crate::PersonNameError::WorkspaceNotFound);
+        }
+        crate::principals::agent_keys::unbind(&state.connection, workspace, package)
+            .map_err(crate::PersonNameError::Storage)
+    }
+
+    /// The Agent a Package Instance is bound to, or `None` when it has no
+    /// binding or the bound Agent is no longer a current Workspace Agent.
+    pub fn bound_agent(
+        &self,
+        workspace: WorkspaceId,
+        package: &str,
+    ) -> Result<Option<crate::PrincipalId>, crate::PersonNameError> {
+        Self::validate_package_identity(package)?;
+        let state = self.binding_state()?;
+        let projection = state
+            .memberships
+            .get(&workspace)
+            .ok_or(crate::PersonNameError::WorkspaceNotFound)?;
+        let Some(id) =
+            crate::principals::agent_keys::bound_agent(&state.connection, workspace, package)
+                .map_err(crate::PersonNameError::Storage)?
+        else {
+            return Ok(None);
+        };
+        Ok(crate::principals::registry(projection)
+            .into_iter()
+            .find(|(candidate, _, kind, _, _)| {
+                *candidate == id && *kind == crate::PrincipalKind::Agent
+            })
+            .map(|(id, _, _, _, _)| id))
+    }
+
+    fn validate_package_identity(package: &str) -> Result<(), crate::PersonNameError> {
+        if package.is_empty()
+            || package.len() > u16::MAX as usize
+            || !package.is_ascii()
+            || crate::synchronization::is_reserved_record_scope(package)
+        {
+            return Err(crate::PersonNameError::InvalidPackageIdentity);
+        }
+        Ok(())
+    }
+
+    fn binding_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, crate::PersonNameError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(fault!(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned
+            )))?;
+        if state.poisoned {
+            return Err(crate::PersonNameError::Storage(
+                StorageError::RuntimePoisoned,
+            ));
+        }
+        Ok(state)
     }
 }
