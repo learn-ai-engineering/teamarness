@@ -1,0 +1,354 @@
+//! The Agent reply flow across two Profiles.
+//!
+//! Alice stewards an Agent and runs the real Agent Package against a stub completion endpoint
+//! on loopback; Bob is a second Installation with Conversations only. Bob addresses the Agent
+//! by name, the reply appears in `#general` on both Installations attributed to the Agent's own
+//! key, and an unaddressed Message produces nothing. Hermetic: real `CoreRuntime`s on loopback,
+//! real Package Hosts, real Backend processes, nothing off this machine.
+#![cfg(unix)]
+#[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
+mod support;
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use support::harness::{
+    self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, create_invitation, introduce,
+    object, open_core, open_host, open_mount, poll_until, shutdown, workspace_root,
+};
+use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+const AGENT_PACKAGE_ID: &str = "dev.teamarness.agent";
+const REPLY: &str = "Hello from the stub model";
+const KEY: &str = "sk-system-test-key-never-logged";
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Stages the real Agent Backend beside the staged Conversations Package and registers it.
+fn stage_agent(application: &Path) {
+    let root = application.join(AGENT_PACKAGE_ID);
+    fs::create_dir_all(root.join("backend")).unwrap();
+    fs::create_dir_all(root.join("ui")).unwrap();
+    let binary = fs::read(env!("CARGO_BIN_EXE_agent-backend-under-test")).unwrap();
+    let mut manifest: Value = serde_json::from_slice(
+        &fs::read(workspace_root().join("packages/agent-package/teamarness.package.json")).unwrap(),
+    )
+    .unwrap();
+    let backend = manifest["backends"][0]["path"].as_str().unwrap().to_owned();
+    fs::write(root.join(&backend), &binary).unwrap();
+    fs::set_permissions(root.join(&backend), fs::Permissions::from_mode(0o700)).unwrap();
+    let ui = b"export function mount() { return async () => {}; }";
+    let contract =
+        fs::read(workspace_root().join("packages/agent-package/ui-contract.json")).unwrap();
+    fs::write(root.join("ui/index.js"), ui).unwrap();
+    fs::write(root.join("ui-contract.json"), &contract).unwrap();
+    manifest["backends"][0]["size"] = json!(binary.len());
+    manifest["backends"][0]["sha256"] = json!(digest(&binary));
+    manifest["ui"]["entrypoint"]["size"] = json!(ui.len());
+    manifest["ui"]["entrypoint"]["sha256"] = json!(digest(ui));
+    manifest["ui"]["contract"]["sha256"] = json!(digest(&contract));
+    fs::write(
+        root.join("teamarness.package.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let registration = application.join("application-packages.v1.json");
+    let mut registered: Value = serde_json::from_slice(&fs::read(&registration).unwrap()).unwrap();
+    registered["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"directory": AGENT_PACKAGE_ID}));
+    fs::write(registration, serde_json::to_vec(&registered).unwrap()).unwrap();
+}
+
+/// A stub OpenAI-compatible endpoint: every `POST` is answered with one fixed completion.
+async fn stub_endpoint() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+                let content_length = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while bytes.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                assert!(
+                    head.contains(&format!("Bearer {KEY}")),
+                    "the stub saw no bearer key"
+                );
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body =
+                    json!({"choices": [{"message": {"role": "assistant", "content": REPLY}}]})
+                        .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (base_url, requests)
+}
+
+/// The `#general` rows of `client`, as JSON.
+async fn general(client: &ConversationClient<'_>, request_id: &str) -> Vec<Value> {
+    let page = client.channel_open(request_id, GENERAL_ID, 64).await;
+    serde_json::to_value(&page).unwrap()["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn agent_rows<'a>(rows: &'a [Value], agent_key: &str) -> Vec<&'a Value> {
+    rows.iter()
+        .filter(|row| row["author"] == agent_key)
+        .collect()
+}
+
+fn files_contain(root: &Path, needle: &str) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            files_contain(&path, needle)
+        } else {
+            fs::read(&path).is_ok_and(|bytes| {
+                bytes
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+            })
+        }
+    })
+}
+
+/// Verifies: AC2, AC3 — the Agent answers once when addressed, on both Installations, as itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_agent_replies_once_when_addressed_across_two_profiles() {
+    let (endpoint, requests) = stub_endpoint().await;
+    let alice_app = harness::StagedApplication::new();
+    stage_agent(&alice_app.application_path);
+    let root = alice_app.root.path();
+
+    // Alice: Steward of the Agent, runs Conversations and the Agent Package.
+    let alice_core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
+    let workspace = alice_core.create_workspace("Agent flow").unwrap();
+    let workspace_id = workspace.id();
+    alice_core
+        .set_own_person_name(workspace_id, "Alice")
+        .unwrap();
+    let agent = alice_core.add_agent(workspace_id, "Scout").unwrap();
+    let agent_key = alice_core
+        .principal(workspace_id, agent)
+        .unwrap()
+        .unwrap()
+        .keys()[0]
+        .to_string();
+    assert_ne!(agent_key, alice_core.public_identity().to_string());
+    let alice_private = root.join("alice-host");
+    let alice_host = open_host(
+        &alice_app.application_path,
+        alice_private.clone(),
+        alice_core.clone(),
+    )
+    .await;
+    let conversations_key = PackageInstanceKey::new(
+        PackageIdentity::from_str(PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace_id.to_string()).unwrap(),
+    );
+    let agent_package_key = PackageInstanceKey::new(
+        PackageIdentity::from_str(AGENT_PACKAGE_ID).unwrap(),
+        WorkspaceId::new(workspace_id.to_string()).unwrap(),
+    );
+    let alice_mount = open_mount(&alice_host, &conversations_key).await;
+    let alice = ConversationClient {
+        host: &alice_host,
+        mount: &alice_mount,
+    };
+    alice
+        .post_message("alice-history", GENERAL_ID, "@Scout this is history")
+        .await;
+
+    // The Steward configures the Agent Package through its own UI operations.
+    let agent_mount = open_mount(&alice_host, &agent_package_key).await;
+    let agent_ui = ConversationClient {
+        host: &alice_host,
+        mount: &agent_mount,
+    };
+    agent_ui
+        .request(
+            "agent-settings",
+            "agent.settings.set",
+            object([(
+                "settings",
+                object([
+                    ("endpointBaseUrl", PackageValue::String(endpoint.clone())),
+                    ("model", PackageValue::String("stub/model".into())),
+                    (
+                        "systemPrompt",
+                        PackageValue::String("You are the team's scout.".into()),
+                    ),
+                    ("contextMessages", PackageValue::Unsigned(8)),
+                ]),
+            )]),
+        )
+        .await;
+    agent_ui
+        .request(
+            "agent-key",
+            "agent.key.set",
+            object([("apiKey", PackageValue::String(KEY.into()))]),
+        )
+        .await;
+    let candidates = serde_json::to_value(
+        &agent_ui
+            .request("agent-candidates", "agent.binding.candidates", object([]))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(candidates["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(candidates["agents"][0]["principalId"], agent.to_string());
+    assert_eq!(candidates["agents"][0]["name"], "Scout");
+    agent_ui
+        .request(
+            "agent-bind",
+            "agent.binding.set",
+            object([("principalId", PackageValue::String(agent.to_string()))]),
+        )
+        .await;
+    assert!(
+        poll_until(Duration::from_secs(15), || async {
+            let status = serde_json::to_value(
+                &agent_ui
+                    .request("agent-status", "agent.status.get", object([]))
+                    .await,
+            )
+            .unwrap();
+            assert!(!status.to_string().contains(KEY));
+            status["state"] == "ready"
+        })
+        .await,
+        "the Agent Package did not become ready"
+    );
+
+    // Bob: a second Installation with Conversations only.
+    let invitation = create_invitation(&alice_core, workspace_id).await;
+    let bob_core = open_core(Addressing::Loopback, &root.join("bob-core")).await;
+    introduce(Addressing::Loopback, &[&alice_core, &bob_core]);
+    bob_core.join_workspace(&invitation).await.unwrap();
+    drop(invitation);
+    let bob_app = harness::StagedApplication::new();
+    let bob_host = open_host(
+        &bob_app.application_path,
+        root.join("bob-host"),
+        bob_core.clone(),
+    )
+    .await;
+    let bob_mount = open_mount(&bob_host, &conversations_key).await;
+    let bob = ConversationClient {
+        host: &bob_host,
+        mount: &bob_mount,
+    };
+    assert!(
+        poll_until(Duration::from_secs(30), || async {
+            general(&bob, "bob-history")
+                .await
+                .iter()
+                .any(|row| row["markdown"] == "@Scout this is history")
+        })
+        .await,
+        "Bob did not receive Alice's history"
+    );
+
+    // Bob addresses the Agent; the reply reaches both Installations as the Agent.
+    bob.post_message("bob-mention", GENERAL_ID, "@Scout hello from Bob")
+        .await;
+    for (client, who) in [(&alice, "alice"), (&bob, "bob")] {
+        assert!(
+            poll_until(Duration::from_secs(30), || async {
+                let rows = general(client, &format!("{who}-reply")).await;
+                agent_rows(&rows, &agent_key)
+                    .iter()
+                    .any(|row| row["markdown"] == REPLY)
+            })
+            .await,
+            "the Agent's reply did not reach {who}"
+        );
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    // An unaddressed Message yields nothing, and the history mention was never answered.
+    bob.post_message("bob-unaddressed", GENERAL_ID, "nothing for the agent here")
+        .await;
+    assert!(
+        poll_until(Duration::from_secs(30), || async {
+            general(&alice, "alice-unaddressed")
+                .await
+                .iter()
+                .any(|row| row["markdown"] == "nothing for the agent here")
+        })
+        .await
+    );
+    // negative-wait: a reply would follow the Message by one completion round trip; a bounded
+    // window after it arrived is the only way to show none came.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let rows = general(&alice, "alice-final").await;
+    let replies = agent_rows(&rows, &agent_key);
+    assert_eq!(replies.len(), 1, "{rows:?}");
+    assert_eq!(replies[0]["markdown"], REPLY);
+    assert_eq!(replies[0]["isLocal"], false);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let bob_rows = general(&bob, "bob-final").await;
+    assert_eq!(agent_rows(&bob_rows, &agent_key).len(), 1);
+
+    // The key stays in the Package Data Directory and nowhere else.
+    assert!(!files_contain(&alice_private.join("packages/logs"), KEY));
+    assert!(!files_contain(&root.join("alice-core"), KEY));
+
+    shutdown(bob_host).await;
+    shutdown(alice_host).await;
+    bob_core.shutdown().await.unwrap();
+    alice_core.shutdown().await.unwrap();
+}

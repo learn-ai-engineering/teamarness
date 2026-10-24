@@ -21,7 +21,13 @@ path = "../../packages/conversations-package/backend/src/main.rs"
 name = "conversations-port-consumer-under-test"
 path = "src/bin/conversations_port_consumer.rs"
 
+# The Agent Backend, built the same way from the Package's own `src/main.rs`.
+[[bin]]
+name = "agent-backend-under-test"
+path = "../../packages/agent-package/backend/src/main.rs"
+
 [dependencies]
+teamarness-agent-package = { path = "../../packages/agent-package/backend" }
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
 teamarness-package-sdk = { path = "../../crates/teamarness-package-sdk" }
 serde_json.workspace = true
@@ -36,4 +42,5 @@ teamarness-core = { path = "../../crates/teamarness-core", features = ["test-hoo
 teamarness-package-host = { path = "../../crates/teamarness-package-host" }
 teamarness-package-protocol = { path = "../../crates/teamarness-package-protocol" }
 tempfile.workspace = true
-tokio.workspace = true
+# `net` is for the stub completion endpoint the Agent reply flow binds on loopback.
+tokio = { workspace = true, features = ["net"] }

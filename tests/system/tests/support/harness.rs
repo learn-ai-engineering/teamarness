@@ -578,7 +578,7 @@ pub fn stage_package(root: &Path) -> PathBuf {
                 {"identity":"teamarness.membership","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.principals","major":1,"minMinor":0,"maxMinor":0},
                 {"identity":"teamarness.signing","major":1,"minMinor":0,"maxMinor":0},
-                {"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":0,"maxMinor":0}
+                {"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":1,"maxMinor":1}
             ],
             "extensions":{
                 "dev.teamarness.build":{

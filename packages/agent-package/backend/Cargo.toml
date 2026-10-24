@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 teamarness-package-protocol = { path = "../../../crates/teamarness-package-protocol" }
@@ -15,3 +17,4 @@ tokio.workspace = true
 [dev-dependencies]
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk", features = ["testing"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["net"] }

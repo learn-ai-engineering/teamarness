@@ -1,13 +1,18 @@
 #![forbid(unsafe_code)]
 
 //! The Agent Package Backend: Package-owned settings and key, the Agent Binding held by Core and
-//! read through `teamarness.agent-binding`, and the status its UI shows. The reply harness and
-//! model client attach at [`harness`].
+//! read through `teamarness.agent-binding`, the status its UI shows, and the reply harness
+//! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
+//! family.
 
 pub mod harness;
+pub mod mention;
+pub mod model;
+pub mod positions;
 pub mod settings;
 pub mod status;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +59,7 @@ fn capability_error(cause: &BackendError) -> BackendError {
 struct Tasks {
     /// Watches the Principal roster so a removed or renamed Agent reaches the status.
     roster: Option<TaskHandle>,
-    /// The reply harness; Phase 4 never starts it.
+    /// The reply harness; runs while configuration and binding are both present.
     harness: Option<TaskHandle>,
 }
 
@@ -65,6 +70,7 @@ pub struct AgentActive {
     binding: AgentBinding,
     principals: Principals,
     ports: Option<PortClient>,
+    data_directory: PathBuf,
     cancellation: CancellationToken,
     tasks: tokio::sync::Mutex<Tasks>,
 }
@@ -94,28 +100,40 @@ impl AgentActive {
         }
     }
 
-    /// Starts the reply harness when configuration and binding are both present.
-    ///
-    /// Phase 4 wires the slot but never calls this: the harness body is a stub. The next phase
-    /// calls it from activation, resume and the settings, key and binding handlers, and stops it
-    /// when the status leaves `ready`.
-    #[allow(dead_code)]
-    async fn start_harness(self: &Arc<Self>) {
-        let Some(ports) = self.ports.clone() else {
-            return;
-        };
-        if !self.status.is_ready_to_run() {
-            return;
-        }
-        let inputs = HarnessInputs {
-            ports,
+    /// The inputs a harness task needs, or `None` when the Package has no Port grant.
+    fn harness_inputs(&self) -> Option<HarnessInputs> {
+        Some(HarnessInputs {
+            ports: self.ports.clone()?,
             principals: self.principals.clone(),
             settings: self.settings.clone(),
             status: self.status.clone(),
-        };
-        let handle = harness::start(&self.cancellation, inputs);
+            data_directory: self.data_directory.clone(),
+        })
+    }
+
+    /// Brings the harness in line with the status: running while configuration and binding are
+    /// both present, stopped otherwise. A harness that ended on its own is replaced.
+    ///
+    /// Called after every settings, key and binding change and on resume. The harness also
+    /// watches the status itself and returns when it leaves the ready family, so this is what
+    /// starts it again.
+    async fn sync_harness(&self) {
         let mut tasks = self.tasks.lock().await;
-        if let Some(previous) = tasks.harness.replace(handle) {
+        if self.status.is_ready_to_run() {
+            if tasks
+                .harness
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+            {
+                return;
+            }
+            if let Some(previous) = tasks.harness.take() {
+                previous.stop().await;
+            }
+            if let Some(inputs) = self.harness_inputs() {
+                tasks.harness = Some(harness::start(&self.cancellation, inputs));
+            }
+        } else if let Some(previous) = tasks.harness.take() {
             previous.stop().await;
         }
     }
@@ -288,10 +306,13 @@ pub fn router() -> Router<AgentActive> {
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
-            let store = teamarness_package_sdk::blocking(&cancellation, move |_| {
-                SettingsStore::open(&directory).map_err(|_| storage_failed())
-            })
-            .await?;
+            let store = {
+                let directory = directory.clone();
+                teamarness_package_sdk::blocking(&cancellation, move |_| {
+                    SettingsStore::open(&directory).map_err(|_| storage_failed())
+                })
+                .await?
+            };
             let binding = AgentBinding::from_initialization(&initialization, capabilities.clone())
                 .map_err(|cause| capability_error(&cause))?;
             let principals = Principals::from_initialization(&initialization, capabilities.clone())
@@ -314,24 +335,29 @@ pub fn router() -> Router<AgentActive> {
                 binding.clone(),
                 status.clone(),
             );
-            Ok(AgentActive {
+            let state = AgentActive {
                 settings: Arc::new(Mutex::new(store)),
                 status,
                 binding,
                 principals,
                 ports,
+                data_directory: directory,
                 cancellation: background,
                 tasks: tokio::sync::Mutex::new(Tasks {
                     roster: Some(roster),
                     harness: None,
                 }),
-            })
+            };
+            // A configured and bound Package resumes replying as soon as it activates.
+            state.sync_harness().await;
+            Ok(state)
         }
     })
     .on_resume(|state: Arc<AgentActive>| async move {
         state.refresh_configured();
         let _ = refresh_binding(&state.binding, &state.status).await;
         state.start_roster_watch().await;
+        state.sync_harness().await;
         Ok(())
     })
     .on_suspend(|state: Arc<AgentActive>| async move {
@@ -362,18 +388,22 @@ pub fn router() -> Router<AgentActive> {
                 ));
             }
             let state = context.state().clone();
-            let view = context
-                .blocking(move |_| {
-                    state
-                        .settings
-                        .lock()
-                        .map_err(|_| storage_failed())?
-                        .replace(settings)
-                        .map_err(|_| storage_failed())?;
-                    state.refresh_configured();
-                    Ok(state.settings_view())
-                })
-                .await?;
+            let view = {
+                let state = state.clone();
+                context
+                    .blocking(move |_| {
+                        state
+                            .settings
+                            .lock()
+                            .map_err(|_| storage_failed())?
+                            .replace(settings)
+                            .map_err(|_| storage_failed())?;
+                        state.refresh_configured();
+                        Ok(state.settings_view())
+                    })
+                    .await?
+            };
+            state.sync_harness().await;
             Ok(view)
         },
     )
@@ -381,43 +411,55 @@ pub fn router() -> Router<AgentActive> {
         "agent.key.set",
         |context: Context<AgentActive>, request: KeySetRequest| async move {
             let state = context.state().clone();
-            context
-                .blocking(move |_| {
-                    let outcome = {
-                        let store = state.settings.lock().map_err(|_| storage_failed())?;
-                        store.set_key(&request.api_key)
-                    };
-                    match outcome {
-                        Ok(()) => {}
-                        Err(KeyError::Invalid) => return Err(error("agent.invalid_key", false)),
-                        Err(KeyError::Io(_)) => return Err(storage_failed()),
-                    }
-                    state.refresh_configured();
-                    Ok(KeyView {
-                        has_key: state.settings_view().has_key,
+            let view = {
+                let state = state.clone();
+                context
+                    .blocking(move |_| {
+                        let outcome = {
+                            let store = state.settings.lock().map_err(|_| storage_failed())?;
+                            store.set_key(&request.api_key)
+                        };
+                        match outcome {
+                            Ok(()) => {}
+                            Err(KeyError::Invalid) => {
+                                return Err(error("agent.invalid_key", false));
+                            }
+                            Err(KeyError::Io(_)) => return Err(storage_failed()),
+                        }
+                        state.refresh_configured();
+                        Ok(KeyView {
+                            has_key: state.settings_view().has_key,
+                        })
                     })
-                })
-                .await
+                    .await?
+            };
+            state.sync_harness().await;
+            Ok(view)
         },
     )
     .request(
         "agent.key.clear",
         |context: Context<AgentActive>, _: Empty| async move {
             let state = context.state().clone();
-            context
-                .blocking(move |_| {
-                    state
-                        .settings
-                        .lock()
-                        .map_err(|_| storage_failed())?
-                        .clear_key()
-                        .map_err(|_| storage_failed())?;
-                    state.refresh_configured();
-                    Ok(KeyView {
-                        has_key: state.settings_view().has_key,
+            let view = {
+                let state = state.clone();
+                context
+                    .blocking(move |_| {
+                        state
+                            .settings
+                            .lock()
+                            .map_err(|_| storage_failed())?
+                            .clear_key()
+                            .map_err(|_| storage_failed())?;
+                        state.refresh_configured();
+                        Ok(KeyView {
+                            has_key: state.settings_view().has_key,
+                        })
                     })
-                })
-                .await
+                    .await?
+            };
+            state.sync_harness().await;
+            Ok(view)
         },
     )
     .request(
@@ -445,6 +487,7 @@ pub fn router() -> Router<AgentActive> {
                 .map_err(|cause| capability_error(&cause))?;
             let summary = AgentSummary::from(&agent);
             state.status.set_agent(Some(agent));
+            state.sync_harness().await;
             Ok(BindingView {
                 agent: Some(summary),
             })
@@ -460,6 +503,7 @@ pub fn router() -> Router<AgentActive> {
                 .await
                 .map_err(|cause| capability_error(&cause))?;
             state.status.set_agent(None);
+            state.sync_harness().await;
             Ok(BindingView { agent: None })
         },
     )

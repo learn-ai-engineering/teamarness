@@ -174,6 +174,15 @@ impl StatusCell {
         self.update(|inner| inner.activity = Activity::Idle);
     }
 
+    /// A reply was cancelled: back to idle, but a recorded error is kept.
+    pub fn set_idle_if_replying(&self) {
+        self.update(|inner| {
+            if inner.activity == Activity::Replying {
+                inner.activity = Activity::Idle;
+            }
+        });
+    }
+
     /// The harness failed with a Package-owned code. The code is never a secret.
     pub fn set_error(&self, code: &str, retryable: bool) {
         let error = StatusError {
@@ -243,6 +252,12 @@ mod tests {
         cell.set_agent(Some(agent("Scout")));
         assert_eq!(cell.current().state, StatusState::Error);
         cell.set_agent(Some(agent("Pathfinder")));
+        assert_eq!(cell.current().state, StatusState::Ready);
+        cell.set_error("agent.model_error", false);
+        cell.set_idle_if_replying();
+        assert_eq!(cell.current().state, StatusState::Error);
+        cell.set_replying();
+        cell.set_idle_if_replying();
         assert_eq!(cell.current().state, StatusState::Ready);
         cell.set_error("agent.model_error", false);
         cell.set_agent(None);
