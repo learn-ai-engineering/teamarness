@@ -15,7 +15,7 @@ import type { LoroDoc } from "loro-crdt";
 import { guardPlugin } from "./guard";
 import type { GuardHost, GuardRefusal } from "./guard";
 import { schema } from "./schema";
-import { UndoSteps, guardedRedo, guardedUndo } from "./undo";
+import { UndoHistory, guardedRedo, guardedUndo, historyPlugin } from "./undo";
 
 /** A Comment quote is at most this many UTF-8 bytes (the Backend's `MAX_QUOTE`). */
 export const MAX_QUOTE = 2 * 1024;
@@ -283,11 +283,13 @@ export function editorKeymap(openLink: () => boolean): Record<string, Command> {
 /** Every plugin of a rendered editor bound to one Loro document. */
 export function editorPlugins(doc: LoroDoc, guard: GuardHost, openLink: () => boolean): Plugin[] {
   const loro = doc as unknown as LoroDocType;
+  // Per-person undo keeps every change that cannot be undone in one record out of its history.
+  const history = new UndoHistory(doc);
   return [
-    guardPlugin(guard),
+    guardPlugin(guard, { batched: (apply) => history.batched(apply) }),
     LoroSyncPlugin({ doc: loro }),
-    // Undo and redo are measured before they apply (`undo.ts`), so the steps are tracked.
-    LoroUndoPlugin({ doc, undoManager: new UndoSteps(doc).manager }),
+    historyPlugin(history),
+    LoroUndoPlugin({ doc, undoManager: history.manager }),
     editorInputRules(),
     keymap(editorKeymap(openLink)),
     keymap(baseKeymap),
@@ -324,7 +326,8 @@ function markActive(type: MarkType) {
 const REFUSAL_TEXT: Readonly<Record<GuardRefusal, string>> = {
   block_too_large: "That is too large to add as one block. Split it into smaller paragraphs and try again.",
   document_too_large: "This Document has reached its size limit. Remove some content before adding more.",
-  step_too_large: "That is too large to undo or redo at once. It is still available once the Document is smaller.",
+  step_too_large: "That change is too large to undo or redo.",
+  step_unknown: "That change could not be checked, so it cannot be undone or redone.",
 };
 
 export type DocumentEditorOptions = Readonly<{

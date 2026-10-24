@@ -845,11 +845,13 @@ fn session_peer(text: &str) -> Option<u64> {
 /// ends. A session that opened with the live body keeps following it while the body waits for
 /// history.
 ///
-/// A session holds a doc when it opened with the live body or resumed as the same peer: its UI
-/// keeps that doc and its unacknowledged edits, so the Backend never discards them. A catch-up
-/// too large for one update, a lagging relay, or a body that becomes editable for a session
-/// that does not yet have it sends such a session a fresh opening as the same peer on the same
-/// stream, which the UI merges into the doc it kept. A session that holds no doc gets `resync`
+/// A session holds a doc when it opened with the snapshot of an editable body or the Backend
+/// accepted its resume as its own peer: its UI keeps that doc and its unacknowledged edits, so
+/// the Backend never discards them. A catch-up too large for one update, a lagging relay, or a
+/// body that becomes editable for a session that does not yet have it sends such a session a
+/// fresh opening as the same peer on the same stream, which the UI merges into the doc it kept.
+/// An opening sent while the body is pending has no snapshot: the session keeps following the
+/// body and is sent another opening once the body is editable. A session that holds no doc gets `resync`
 /// for those instead, and every session gets `resync` for a refused update or a conflict;
 /// after `resync` the UI opens a new session.
 async fn open_session(
@@ -888,6 +890,9 @@ async fn open_session(
         // when it opened without the body (pending), so it, too, must never be discarded.
         let holds_doc = access.editable || resume == Some(peer);
         let mut live = access.editable;
+        // A session that holds a doc but was reopened while the body was pending missed what
+        // only an opening with the body can bring; it is reopened once the body is editable.
+        let mut behind = false;
         for event in opening {
             if sender.send(event).await.is_err() {
                 return;
@@ -953,12 +958,13 @@ async fn open_session(
                         return;
                     }
                     access = now;
-                    if access.editable && !live {
+                    if access.editable && (!live || behind) {
                         let Some(opened) = reopen().await else {
                             return;
                         };
                         access = opened;
-                        live = access.editable;
+                        live = live || access.editable;
+                        behind = !access.editable;
                     }
                     let mut status = json!({
                         "event": "status", "documentId": document,
@@ -977,8 +983,10 @@ async fn open_session(
                     let Some(opened) = reopen().await else {
                         return;
                     };
+                    // A session that followed the live body keeps following it.
                     access = opened;
-                    live = access.editable;
+                    live = live || access.editable;
+                    behind = !access.editable;
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -6419,6 +6427,63 @@ mod tests {
             session.handles.bodies.lock().unwrap()[&document].text(),
             "after lag\n"
         );
+        ui.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a session that follows the live body and is reopened while
+    // the body waits for history keeps following it: it is still sent the updates the body
+    // adopts, and it is reopened with the body once the body is editable.
+    #[tokio::test]
+    async fn a_live_session_reopened_onto_a_pending_body_keeps_following_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut ui = UiSession::open(&mut session.harness, &document).await;
+        let mut bob = Writer::of(&session.handles, &document);
+        let mut dave = Writer::of(&session.handles, &document);
+        let b = bob.write("from bob B\n");
+        let c = bob.write("from bob B\n\nthen C\n");
+        let d = dave.write("from dave D\n");
+        deliver(&session, remote_edit(&document, "bob", 51, c)).await;
+        assert_eq!(ui.next().await["editable"], false);
+        // The session falls behind the body's events while the body is pending: it is reopened
+        // without a snapshot.
+        let hub = session.handles.hub.clone();
+        for _ in 0..400 {
+            hub.publish_status(&document);
+        }
+        let begin = ui.reopened().await;
+        assert_eq!(begin["sessionPeer"], ui.peer.to_string(), "{begin}");
+        assert_eq!(begin["editable"], false, "{begin}");
+        // An update the pending body adopts still reaches it.
+        deliver(&session, remote_edit(&document, "dave", 52, d)).await;
+        let relayed = ui
+            .follow_until(|markdown| markdown.contains("from dave D"))
+            .await;
+        assert!(
+            relayed.iter().any(|event| event["event"] == "update"),
+            "{relayed:?}"
+        );
+        // Once the body is editable, the session is reopened with it.
+        deliver(&session, remote_edit(&document, "bob", 53, b)).await;
+        let mut begin = ui.reopened().await;
+        while begin["editable"] != true {
+            begin = ui.reopened().await;
+        }
+        assert_eq!(begin["sessionPeer"], ui.peer.to_string(), "{begin}");
+        assert!(ui.markdown().contains("then C"), "{}", ui.markdown());
+        let mine = type_into(&ui.doc, 0, false, "mine ");
+        ui.send(&mut session.harness, &document, &hex(32, 0xc9), &mine)
+            .await
+            .unwrap();
+        let body = session.handles.bodies.lock().unwrap()[&document]
+            .text()
+            .to_owned();
+        assert!(
+            body.contains("mine") && body.contains("then C") && body.contains("from dave D"),
+            "{body:?}"
+        );
+        assert_eq!(ui.markdown(), body);
         ui.close().await;
         session.harness.shutdown().await.unwrap();
     }

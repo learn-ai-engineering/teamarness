@@ -146,7 +146,10 @@ export class DocumentsController {
       bridge: clientBridge(this.client),
       documentId,
       onChange: () => { if (!this.disposed && sequence === this.openSequence) this.announce(); },
-      onLost: (notice) => { if (!this.disposed && sequence === this.openSequence) this.update({ error: lostMessage(notice) }); },
+      // A session closed with unacknowledged changes reports them too, after its Document closed.
+      onLost: (notice) => {
+        if (!this.disposed) this.update({ error: sequence === this.openSequence ? lostMessage(notice) : CLOSED_LOST_MESSAGE });
+      },
     });
     this.session = session;
     await session.start();
@@ -371,6 +374,8 @@ async function digestMatches(text: string, digest: string): Promise<boolean> {
   const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(text)));
   return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("") === digest;
 }
+
+const CLOSED_LOST_MESSAGE = "Your last changes to the Document you closed could not be confirmed as saved.";
 
 function lostMessage(notice: LostNotice): string {
   return notice.requests > 0

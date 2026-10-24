@@ -2,7 +2,7 @@ import { createPackageRequestError } from "@teamarness/package-ui-sdk/testing";
 import { LoroDoc, decodeImportBlobMeta } from "loro-crdt";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RequestStatus, SessionEvent } from "../contract.generated";
-import { EXPORT_BUDGET_BYTES, EditorSession, RETRY_MS, SEND_IDLE_MS, fromBase64, toBase64 } from "./session";
+import { EXPORT_BUDGET_BYTES, EditorSession, RESUME_ATTEMPTS, RETRY_MS, SEND_IDLE_MS, fromBase64, toBase64 } from "./session";
 import type { LostNotice, SessionBridge } from "./session";
 
 const DOCUMENT = "d".repeat(64);
@@ -27,6 +27,11 @@ class FakeBackend {
   refuseResume = false;
   /** The body waits for missing causal history: it is not editable and refuses updates as pending. */
   pending = false;
+  /**
+   * When set, a closed stream's session stays registered this long after the close is
+   * acknowledged, as the Backend's session task notices the close only later.
+   */
+  releaseAfterMs: number | null = null;
   private nextPeer = 1000n;
   private readonly live = new Map<string, Live>();
   private readonly held: Array<{ resolve: () => void; reject: (error: unknown) => void; sent: Sent }> = [];
@@ -50,7 +55,13 @@ class FakeBackend {
         this.live.set(sessionPeer, live);
         queueMicrotask(() => this.sendOpening(listener, sessionPeer));
         // Closing an old stream must not end a newer session resumed as the same peer.
-        return { close: async () => { if (this.live.get(sessionPeer) === live) this.live.delete(sessionPeer); } };
+        const release = () => { if (this.live.get(sessionPeer) === live) this.live.delete(sessionPeer); };
+        return {
+          close: async () => {
+            if (this.releaseAfterMs === null) release();
+            else setTimeout(release, this.releaseAfterMs);
+          },
+        };
       },
       update: async (request) => {
         const sent = { requestId: request.requestId, sessionPeer: request.sessionPeer, update: request.update };
@@ -100,6 +111,11 @@ class FakeBackend {
   reopen(peer: string, between?: () => void): void {
     const session = this.live.get(peer);
     if (session !== undefined) this.sendOpening(session.listener, peer, between);
+  }
+
+  /** Sends an open session a chunk it cannot place: a malformed opening. */
+  malformed(peer: string): void {
+    this.live.get(peer)?.listener({ event: "chunk", documentId: DOCUMENT, chunkIndex: 7, chunk: "" });
   }
 
   /** Imports a remote record without relaying it, as when the catch-up is too large for one update. */
@@ -290,26 +306,6 @@ describe("EditorSession", () => {
     expect(text(backend.body)).toBe("one two genesis");
     expect(text(session.doc)).toBe("one two genesis");
     expect(session.state.outstanding).toBe(0);
-    await session.dispose();
-  });
-
-  it("reports unacknowledged changes as lost when a reconnect cannot keep its peer", async () => {
-    const backend = new FakeBackend();
-    backend.answers = ["hold"];
-    const lost: LostNotice[] = [];
-    const session = await opened(backend, lost);
-    type(session, "pending ");
-    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
-    backend.refuseResume = true;
-    backend.replaceGeneration(0);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(lost).toEqual([{ requests: 1, unsentBytes: 0 }]);
-    expect(session.state.sessionPeer).toBe("1001");
-    expect(text(session.doc)).toBe("genesis");
-    type(session, "fresh ");
-    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
-    expect(backend.sent.at(-1)!.sessionPeer).toBe("1001");
-    expect(text(backend.body)).toBe("fresh genesis");
     await session.dispose();
   });
 
@@ -526,6 +522,190 @@ describe("EditorSession", () => {
     expect(text(backend.body)).toBe("mine genesis B C");
     expect(text(session.doc)).toBe(text(backend.body));
     await session.dispose();
+  });
+
+  it("CR-202: a malformed opening reconnects as the same peer only after the old stream is closed", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "kept ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    backend.malformed("1000");
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.opened.at(-1)).toEqual({ resumePeer: "1000", sessionPeer: "1000" });
+    expect(lost).toEqual([]);
+    expect(text(backend.body)).toBe("kept genesis");
+    expect(session.state.outstanding).toBe(0);
+    await session.dispose();
+  });
+
+  it("asks again to continue as its peer while the Backend still holds the old session", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    backend.releaseAfterMs = RETRY_MS / 2;
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "kept ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    backend.malformed("1000");
+    await vi.advanceTimersByTimeAsync(0);
+    // The old session is still registered: the Backend hands out another peer, which is closed.
+    expect(backend.opened.at(-1)).toEqual({ resumePeer: "1000", sessionPeer: "1001" });
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.opened.at(-1)).toEqual({ resumePeer: "1000", sessionPeer: "1000" });
+    expect(lost).toEqual([]);
+    expect(session.state.sessionPeer).toBe("1000");
+    expect(text(backend.body)).toBe("kept genesis");
+    await session.dispose();
+  });
+
+  it("gives up its doc and reports it after the Backend keeps handing out other peers", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "pending ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    backend.refuseResume = true;
+    backend.replaceGeneration(0);
+    await vi.advanceTimersByTimeAsync(0);
+    for (let attempt = 0; attempt < RESUME_ATTEMPTS; attempt += 1) await vi.advanceTimersByTimeAsync(RETRY_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.opened.filter((open) => open.resumePeer === "1000")).toHaveLength(RESUME_ATTEMPTS + 1);
+    expect(lost).toEqual([{ requests: 1, unsentBytes: 0 }]);
+    expect(text(session.doc)).toBe("genesis");
+    await session.dispose();
+  });
+
+  it("CR-201: a recovery answered during a reopen never unpauses sending or drops another request", async () => {
+    const body = new LoroDoc();
+    body.setPeerId(1n);
+    body.getText("body").insert(0, "genesis");
+    body.commit();
+    const appended = new Set<string>();
+    type Held<T> = { resolve: (value: T) => void; reject: (error: unknown) => void };
+    const updates: Array<{ requestId: string; update: string } & Held<unknown>> = [];
+    const recovers: Array<{ ids: readonly string[] } & Held<readonly RequestStatus[]>> = [];
+    const sent: string[] = [];
+    let listener: (event: SessionEvent) => void = () => {};
+    let terminated: (error: unknown) => void = () => {};
+    let pending = false;
+    const opening = (): SessionEvent[] => {
+      const chunks = pending ? [] : [body.export({ mode: "snapshot" })];
+      return [
+        { event: "begin", documentId: DOCUMENT, sessionPeer: "1000", version: "0", editable: !pending, chunks: chunks.length },
+        ...chunks.map((chunk, chunkIndex): SessionEvent => ({ event: "chunk", documentId: DOCUMENT, chunkIndex, chunk: toBase64(chunk) })),
+        { event: "end", documentId: DOCUMENT },
+      ];
+    };
+    const bridge: SessionBridge = {
+      open: async (_request, l, t) => {
+        listener = l;
+        terminated = t;
+        const events = opening();
+        queueMicrotask(() => events.forEach((event) => listener(event)));
+        return { close: async () => {} };
+      },
+      update: (request) => new Promise((resolve, reject) => {
+        sent.push(request.requestId);
+        updates.push({ requestId: request.requestId, update: request.update, resolve, reject });
+      }),
+      recover: (_documentId, ids) => new Promise((resolve, reject) => { recovers.push({ ids, resolve, reject }); }),
+    };
+    const lost: LostNotice[] = [];
+    const session = new EditorSession({ bridge, documentId: DOCUMENT, onLost: (notice) => lost.push(notice) });
+    await session.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // X is sent and its answer is held; Y queues behind it.
+    type(session, "X");
+    session.flush();
+    type(session, "Y", 1);
+    session.flush();
+    expect(updates).toHaveLength(1);
+
+    // The generation is replaced; the resumed session opens onto a pending body.
+    pending = true;
+    terminated(createPackageRequestError({ code: "backend_unavailable", retryable: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(recovers).toHaveLength(1);
+    const ids = [...recovers[0]!.ids];
+    recovers.shift()!.resolve(ids.map((requestId) => ({ requestId, inclusion: "unresolved", durability: "unresolved" })));
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(recovers).toHaveLength(1);
+
+    // The body becomes editable and the session is reopened on its stream; only `begin` has arrived
+    // when the retried recovery is answered.
+    pending = false;
+    const reopen = opening();
+    listener(reopen[0]!);
+    recovers.shift()!.resolve(ids.map((requestId) => ({ requestId, inclusion: "absent", durability: "unresolved" })));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toHaveLength(1);
+    reopen.slice(1).forEach((event) => listener(event));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The Backend answers everything from its own record from here on.
+    for (let round = 0; round < 10; round += 1) {
+      for (const recover of recovers.splice(0)) {
+        recover.resolve(recover.ids.map((requestId): RequestStatus => appended.has(requestId)
+          ? { requestId, inclusion: "included", durability: "durable" }
+          : { requestId, inclusion: "absent", durability: "unresolved" }));
+      }
+      for (const update of updates.splice(0)) {
+        if (!appended.has(update.requestId)) {
+          const status = body.import(fromBase64(update.update));
+          expect(status.pending ?? null).toBeNull();
+          appended.add(update.requestId);
+        }
+        update.resolve({ requestId: update.requestId });
+      }
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+    }
+    type(session, "Z");
+    session.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    for (const update of updates.splice(0)) {
+      expect(body.import(fromBase64(update.update)).pending ?? null).toBeNull();
+      update.resolve({ requestId: update.requestId });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lost).toEqual([]);
+    expect(text(body)).toBe("ZXYgenesis");
+    expect(text(session.doc)).toBe("ZXYgenesis");
+    expect(session.state.outstanding).toBe(0);
+    await session.dispose();
+  });
+
+  it("closing during a reopen still sends its queue once recovery decides it", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "last ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    let closing: Promise<void> | null = null;
+    backend.reopen("1000", () => { closing = session.dispose(); });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await closing;
+    expect(lost).toEqual([]);
+    expect(text(backend.body)).toBe("last genesis");
+  });
+
+  it("closing reports what the Backend never acknowledged", async () => {
+    const backend = new FakeBackend();
+    backend.pending = true;
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "unconfirmed ");
+    const closing = session.dispose();
+    await vi.advanceTimersByTimeAsync(5 * RETRY_MS);
+    await closing;
+    expect(lost).toEqual([{ requests: 1, unsentBytes: 0 }]);
+    expect(text(backend.body)).toBe("genesis");
   });
 
   it("two sessions converge through the relay", async () => {

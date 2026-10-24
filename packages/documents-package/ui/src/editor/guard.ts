@@ -40,9 +40,10 @@ export const MEASURE_THRESHOLD_BYTES = EXPORT_BUDGET_BYTES / 2;
  *
  * - `block_too_large`: one change, or one block, cannot fit one record.
  * - `document_too_large`: the change would grow the body past its text budget.
- * - `step_too_large`: an undo or redo step cannot fit one record; it stays on its stack.
+ * - `step_too_large`: the change to undo or redo is too large to undo or redo as one record.
+ * - `step_unknown`: the change to undo or redo could not be measured, so it is not undone or redone.
  */
-export type GuardRefusal = "block_too_large" | "document_too_large" | "step_too_large";
+export type GuardRefusal = "block_too_large" | "document_too_large" | "step_too_large" | "step_unknown";
 
 /** What the guard needs from the editor session. */
 export interface GuardHost {
@@ -138,6 +139,30 @@ function withinTextblock(doc: Node, from: number, to: number): boolean {
   return $from.parent.isTextblock && $from.sameParent(doc.resolve(to));
 }
 
+/**
+ * An upper estimate of the update bytes undoing a transaction writes: undoing an insertion only
+ * deletes, while undoing a removal re-creates what was removed, and undoing a structural step
+ * re-creates every top-level block it touched.
+ */
+export function estimateRevertBytes(tr: Transaction): number {
+  let total = 0;
+  tr.steps.forEach((step, index) => {
+    total += estimateStepRevertBytes(step, tr.docs[index]!, tr.docs[index + 1] ?? tr.doc);
+  });
+  return total;
+}
+
+function estimateStepRevertBytes(step: Step, before: Node, after: Node): number {
+  if (step instanceof AddMarkStep || step instanceof RemoveMarkStep) return estimateStepBytes(step, before, after);
+  if (!(step instanceof ReplaceStep || step instanceof ReplaceAroundStep)) return NODE_OVERHEAD_BYTES;
+  const removed = NODE_OVERHEAD_BYTES + estimateFragmentBytes(before.slice(step.from, step.to).content);
+  if (step instanceof ReplaceStep && withinTextblock(before, step.from, step.to)) {
+    const map = step.getMap();
+    if (withinTextblock(after, map.map(step.from, -1), map.map(step.to, 1))) return removed;
+  }
+  return removed + touchedBlockBytes(before, step.from, step.to);
+}
+
 /** The estimate of every top-level block of `doc` that the range from `from` to `to` touches. */
 function touchedBlockBytes(doc: Node, from: number, to: number): number {
   const $from = doc.resolve(from);
@@ -149,24 +174,46 @@ function touchedBlockBytes(doc: Node, from: number, to: number): number {
   return total;
 }
 
+/** What a transaction writes (`bytes`), and what undoing it would write (`revertBytes`). */
+export type TransactionCost = Readonly<{ bytes: number; revertBytes: number }>;
+
+const measured = new WeakMap<Transaction, TransactionCost | null>();
+
 /**
- * The exact update bytes the binding would write for `tr`: its write runs on a fork of the body,
- * as this peer, and the fork's new operations are exported. `null` when the editor is not bound.
+ * The exact update bytes the binding would write for `tr`, and those its undo would write: the
+ * binding's write runs on a fork of the body, as this peer, the fork's new operations are
+ * exported, and then the fork is returned to where it was and that update is exported too. `null`
+ * when the editor is not bound or the measurement fails. Each transaction is measured once.
  */
-export function measureTransactionBytes(state: EditorState, tr: Transaction): number | null {
+export function measureTransaction(state: EditorState, tr: Transaction): TransactionCost | null {
+  if (measured.has(tr)) return measured.get(tr) ?? null;
+  let cost: TransactionCost | null = null;
   const sync = loroSyncPluginKey.getState(state) as { doc?: LoroDoc; mapping?: Map<unknown, unknown> } | undefined;
   const doc = sync?.doc;
-  if (doc === undefined || sync?.mapping === undefined) return null;
-  const fork = doc.fork();
-  fork.setPeerId(doc.peerIdStr);
-  fork.configTextStyle(MARK_EXPAND);
-  const before = fork.oplogVersion();
-  const mapping = new Map(sync.mapping) as Parameters<typeof updateLoroToPmState>[1];
-  // The binding remembers, per ProseMirror node, the container it wrote it to. A copy of the
-  // document keeps the fork's containers off the editor's own nodes.
-  const copy = tr.doc.type.schema.nodeFromJSON(tr.doc.toJSON());
-  updateLoroToPmState(fork as unknown as LoroDocType, mapping, { doc: copy } as EditorState);
-  return fork.export({ mode: "update", from: before }).byteLength;
+  if (doc !== undefined && sync?.mapping !== undefined) {
+    try {
+      const fork = doc.fork();
+      fork.setPeerId(doc.peerIdStr);
+      fork.configTextStyle(MARK_EXPAND);
+      const before = fork.oplogVersion();
+      const start = fork.frontiers();
+      const mapping = new Map(sync.mapping) as Parameters<typeof updateLoroToPmState>[1];
+      // The binding remembers, per ProseMirror node, the container it wrote it to. A copy of the
+      // document keeps the fork's containers off the editor's own nodes.
+      const copy = tr.doc.type.schema.nodeFromJSON(tr.doc.toJSON());
+      updateLoroToPmState(fork as unknown as LoroDocType, mapping, { doc: copy } as EditorState);
+      const bytes = fork.export({ mode: "update", from: before }).byteLength;
+      const written = fork.oplogVersion();
+      const end = fork.frontiers();
+      fork.applyDiff(fork.diff(end, start, false));
+      fork.commit();
+      cost = { bytes, revertBytes: fork.export({ mode: "update", from: written }).byteLength };
+    } catch {
+      cost = null;
+    }
+  }
+  measured.set(tr, cost);
+  return cost;
 }
 
 /** A paste too large for one export, cut at top-level block boundaries. */
@@ -239,13 +286,18 @@ export function applySplitPaste(view: EditorView, slice: Slice, pieces: readonly
 
 const guardKey = new PluginKey<GuardHost>("documentsGuard");
 
+export type GuardOptions = Readonly<{
+  /** Runs the pieces of a split paste, so that the undo history records them as one step. */
+  batched?: (apply: () => void) => void;
+}>;
+
 /** The guard host of an editor state, for the guarded undo and redo commands. */
 export function guardHostOf(state: EditorState): GuardHost | undefined {
   return guardKey.getState(state);
 }
 
 /** Whether a transaction is the binding replaying the Loro document, which the guard never filters. */
-function isBindingReplay(tr: Transaction): boolean {
+export function isBindingReplay(tr: Transaction): boolean {
   return tr.getMeta(loroSyncPluginKey) !== undefined;
 }
 
@@ -259,9 +311,11 @@ function isBindingReplay(tr: Transaction): boolean {
  *   structural edit that makes the binding rewrite large blocks.
  * - A transaction that grows text content beyond {@link TEXT_BUDGET_BYTES} is refused; one that
  *   shrinks, or keeps, the size is always allowed.
- * - A paste larger than the export budget is split at block boundaries ({@link planPaste}).
+ * - A paste larger than the export budget is split at block boundaries ({@link planPaste}); its
+ *   pieces are applied inside `options.batched`, which makes them one undo step.
  */
-export function guardPlugin(host: GuardHost): Plugin {
+export function guardPlugin(host: GuardHost, options: GuardOptions = {}): Plugin {
+  const batched = options.batched ?? ((apply: () => void) => apply());
   return new Plugin({
     key: guardKey,
     state: { init: () => host, apply: (_tr, value) => value },
@@ -274,7 +328,7 @@ export function guardPlugin(host: GuardHost): Plugin {
         return false;
       }
       let growth = estimateTransactionBytes(tr);
-      if (growth > MEASURE_THRESHOLD_BYTES) growth = measureTransactionBytes(state, tr) ?? growth;
+      if (growth > MEASURE_THRESHOLD_BYTES) growth = measureTransaction(state, tr)?.bytes ?? growth;
       if (growth > BLOCK_BUDGET_BYTES) {
         host.refused("block_too_large");
         return false;
@@ -291,7 +345,7 @@ export function guardPlugin(host: GuardHost): Plugin {
           return true;
         }
         host.flush();
-        applySplitPaste(view, slice, plan.pieces, () => host.flush());
+        batched(() => applySplitPaste(view, slice, plan.pieces, () => host.flush()));
         return true;
       },
     },

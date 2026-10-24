@@ -127,6 +127,7 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
 - Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes as Markdown revisions merged against a base version (follow-up to Phase 7, ADRs 0027 and 0031).
+- View earlier Document versions and copy from them, built on the immutable record history. A change too large to undo in one record is not undoable (ADR 0031), and this is how a Member recovers from one.
 - Document log compaction via the reserved `document.snapshot` record kind (ADR 0027). It must keep Port Contract version tokens resolvable or refuse stale ones explicitly (ADR 0031).
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).

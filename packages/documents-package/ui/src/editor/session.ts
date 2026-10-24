@@ -15,6 +15,12 @@ export const RETRY_MS = 1000;
 const DISPOSE_DRAIN_MS = 2000;
 /** `documents.document.recover` answers at most this many request IDs at a time. */
 const RECOVER_BATCH = 8;
+/**
+ * How many times a reconnect asks again to continue as its peer when the Backend hands out
+ * another one (it still holds the old session, or cannot prove the peer is this UI's) before the
+ * session gives up its doc and reports what it could not keep.
+ */
+export const RESUME_ATTEMPTS = 5;
 
 type UpdateRequest = DocumentsContract["requests"]["documents.document.update"]["request"];
 type SessionRequest = DocumentsContract["subscriptions"]["documents.document.session"]["request"];
@@ -52,7 +58,10 @@ export type SessionState = Readonly<{
   outstanding: number;
 }>;
 
-/** Local changes a reload discarded before the Backend acknowledged them. */
+/**
+ * Local changes the session gave up before the Backend acknowledged them: a reload discarded
+ * them, or the session closed first. Some of the requests may still have been appended.
+ */
 export type LostNotice = Readonly<{ requests: number; unsentBytes: number }>;
 
 export type EditorSessionOptions = Readonly<{
@@ -60,7 +69,7 @@ export type EditorSessionOptions = Readonly<{
   documentId: string;
   /** Called after every state change, and when a new doc replaces the old one. */
   onChange?: (state: SessionState) => void;
-  /** Called when a reload discarded local changes. */
+  /** Called when the session gives up local changes the Backend has not acknowledged. */
   onLost?: (notice: LostNotice) => void;
 }>;
 
@@ -82,7 +91,13 @@ type Assembly = { begin: Extract<SessionEvent, { event: "begin" }>; parts: Uint8
  * gained more than one update can carry, the session fell behind, or the body it resumed onto
  * became editable): the session merges that snapshot into the doc it kept, keeps its queue, and
  * recovers the same way. Only on `resync`, a refused update, or a lost peer does it discard the
- * doc, open a new session, and report what it could not keep through `onLost`.
+ * doc, open a new session, and report what it could not keep through `onLost`; closing the
+ * session reports what is still unacknowledged the same way. No queued change is dropped
+ * silently.
+ *
+ * A reconnect closes the old stream before it asks to continue as the same peer, because the
+ * Backend hands out a fresh peer while it still holds the old session. When it is handed another
+ * peer anyway, it closes that stream and asks again, up to {@link RESUME_ATTEMPTS} times.
  */
 export class EditorSession {
   private readonly bridge: SessionBridge;
@@ -106,8 +121,11 @@ export class EditorSession {
   private paused = false;
   /** Advanced whenever sending is held, so an answer to a request sent before is ignored. */
   private sends = 0;
-  /** Advanced by each recovery, so only the latest one decides the queue. */
+  /** Advanced by each recovery and whenever sending is held, so only the latest recovery decides the queue. */
   private recoveries = 0;
+  /** The peer this session asked to continue as, until an opening answers it. */
+  private resuming: string | null = null;
+  private resumeAttempts = 0;
   private disposed = false;
   private readonly drainWaiters: Array<() => void> = [];
 
@@ -163,14 +181,20 @@ export class EditorSession {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.flush();
-    if (!this.paused) await this.drained(DISPOSE_DRAIN_MS);
+    // A reconnect or reopen in progress may still recover and send the queue.
+    await this.drained(DISPOSE_DRAIN_MS);
     this.disposed = true;
     this.clearIdle();
     this.clearRetry();
     this.generation += 1;
     this.unsubscribeLocal?.();
     this.unsubscribeLocal = null;
-    this.current = { ...this.current, phase: "closed" };
+    // What is still unacknowledged is reported, never dropped silently.
+    const unacknowledged = this.queue.length;
+    this.queue.length = 0;
+    this.inFlight = null;
+    this.current = { ...this.current, phase: "closed", outstanding: 0 };
+    if (unacknowledged > 0) this.onLost({ requests: unacknowledged, unsentBytes: 0 });
     const stream = this.stream;
     this.stream = null;
     await stream?.close();
@@ -186,6 +210,7 @@ export class EditorSession {
   private async open(resumePeer: string | null): Promise<void> {
     const generation = ++this.generation;
     this.assembly = null;
+    this.resuming = resumePeer;
     const request: SessionRequest = resumePeer === null
       ? { documentId: this.documentId }
       : { documentId: this.documentId, resumePeer };
@@ -217,6 +242,7 @@ export class EditorSession {
     if (event.documentId !== this.documentId || this.disposed) return;
     switch (event.event) {
       case "begin":
+        if (this.resumeRefused(event)) return;
         // The same peer continues the doc this session holds: send nothing until recovery.
         if (this.continues(event)) this.holdSending();
         this.assembly = { begin: event, parts: [] };
@@ -250,6 +276,30 @@ export class EditorSession {
         void this.reload();
         return;
     }
+  }
+
+  /**
+   * Whether an opening hands out another peer although this session holds a doc and asked to
+   * continue as its own: then it closes that stream and asks again, until it runs out of attempts.
+   */
+  private resumeRefused(begin: Assembly["begin"]): boolean {
+    const asked = this.resuming;
+    this.resuming = null;
+    if (asked === null || this.loro === null || begin.sessionPeer === asked) {
+      this.resumeAttempts = 0;
+      return false;
+    }
+    this.resumeAttempts += 1;
+    if (this.resumeAttempts > RESUME_ATTEMPTS) {
+      this.resumeAttempts = 0;
+      return false;
+    }
+    const stream = this.stream;
+    this.stream = null;
+    this.generation += 1;
+    void stream?.close().catch(() => {});
+    this.retryOpen(asked);
+    return true;
   }
 
   /** Whether an opening continues the doc this session holds, as the same peer. */
@@ -322,7 +372,9 @@ export class EditorSession {
     if (generation !== this.generation || sends !== this.sends || this.inFlight !== next) return;
     this.inFlight = null;
     if (failure === null) {
-      this.queue.shift();
+      // Recovery may have settled other requests meanwhile: remove this one, wherever it is.
+      const at = this.queue.indexOf(next);
+      if (at >= 0) this.queue.splice(at, 1);
       this.announce();
       void this.pump();
       return;
@@ -367,15 +419,23 @@ export class EditorSession {
     this.holdSending();
     const stream = this.stream;
     this.stream = null;
-    void this.open(this.current.sessionPeer);
-    void stream?.close().catch(() => {});
+    // Nothing more from the old stream counts.
+    const generation = ++this.generation;
+    this.assembly = null;
+    const peer = this.current.sessionPeer;
+    void (async () => {
+      // The Backend refuses to resume a peer it still holds, so the old stream goes first.
+      await closed(stream);
+      if (generation === this.generation && !this.disposed) await this.open(peer);
+    })();
   }
 
-  /** Stops sending until recovery decides what to resend. */
+  /** Stops sending until a new recovery decides what to resend; any recovery under way is void. */
   private holdSending(): void {
     this.paused = true;
     this.inFlight = null;
     this.sends += 1;
+    this.recoveries += 1;
     this.clearRetry();
   }
 
@@ -458,6 +518,17 @@ export class EditorSession {
     if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     this.retryTimer = null;
   }
+}
+
+/** Closes a stream, waiting at most {@link RETRY_MS} for the close to be acknowledged. */
+async function closed(stream: { close(): Promise<void> } | null): Promise<void> {
+  if (stream === null) return;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  await Promise.race([
+    stream.close().catch(() => {}),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, RETRY_MS); }),
+  ]);
+  if (timer !== null) clearTimeout(timer);
 }
 
 /** Whether the Backend refused a request because it no longer knows the session's peer. */

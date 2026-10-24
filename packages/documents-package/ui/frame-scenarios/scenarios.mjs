@@ -17,8 +17,7 @@ const mac = process.platform === "darwin";
 const LINE_START = mac ? "Meta+ArrowLeft" : "Home";
 const LINE_END = mac ? "Meta+ArrowRight" : "End";
 const DOCUMENT_END = mac ? "Meta+ArrowDown" : "Control+End";
-/** The undo manager merges a peer's edits made within a second of each other into one step. */
-const UNDO_MERGE_MS = 1100;
+/** Each local change is its own undo step: typing a word is one step per character. */
 
 async function type(h, text) {
   await h.page.keyboard.type(text, { delay: 5 });
@@ -374,10 +373,9 @@ export const SCENARIOS = [
       await h.editor("A1").click();
       await type(h, "base text");
       await h.converge(["A1", "B1"]);
-      await sleep(UNDO_MERGE_MS);
       await caret(h, "A1", 0, "start");
       await type(h, "mine ");
-      await h.settle(UNDO_MERGE_MS);
+      await h.settle();
       await caret(h, "B1", 0);
       await type(h, " theirs");
       await h.converge(["A1", "B1"]);
@@ -385,10 +383,11 @@ export const SCENARIOS = [
       h.workspace.installation("A").revise(`${current}\nAn agent paragraph.\n`);
       await h.converge(["A1", "B1"]);
       await h.editor("A1").focus();
-      await press(h, `${MOD}+z`);
+      // "mine " was five changes: five undos take it back, and only it.
+      await press(h, `${MOD}+z`, "mine ".length);
       const undone = await h.converge(["A1", "B1"]);
       assert.equal(undone, "base text theirs\n\nAn agent paragraph.\n");
-      await press(h, `${MOD}+Shift+KeyZ`);
+      await press(h, `${MOD}+Shift+KeyZ`, "mine ".length);
       const redone = await h.converge(["A1", "B1"]);
       assert.equal(redone, "mine base text theirs\n\nAn agent paragraph.\n");
       await press(h, `${MOD}+z`);
@@ -449,7 +448,7 @@ export const SCENARIOS = [
     },
   },
   {
-    name: "undo and redo are refused before commit when one step cannot fit a record",
+    name: "a change too large to undo or redo in one record is refused, and nothing is committed",
     pastesStyledHtml: true,
     async run(h) {
       await h.addView("A1", "A");
@@ -457,7 +456,6 @@ export const SCENARIOS = [
       await h.editor("A1").click();
       await type(h, "Before the paste.");
       await h.converge(["A1", "B1"]);
-      await sleep(UNDO_MERGE_MS);
       // A 150 KB paste is split into records, but it is one undo step.
       const paragraphs = Array.from({ length: 610 }, (_, index) => `Paragraph ${index} ${"lorem ipsum dolor sit amet ".repeat(9)}`.slice(0, 250).trim());
       await paste(h, "A1", { "text/html": paragraphs.map((text) => `<p>${text}</p>`).join(""), "text/plain": paragraphs.join("\n\n") });
@@ -474,7 +472,8 @@ export const SCENARIOS = [
       await noticeMatches(h, "A1", /too large to undo or redo/);
       await clearNotice(h, "A1");
 
-      // A delete-all on a 180 KiB body that another peer wrote: its undo cannot fit one record.
+      // A delete-all on a 180 KiB body that another peer wrote: its undo cannot fit one record, so
+      // it never enters the undo history, and the next undo is refused.
       await largeBody(h, "B", ["A1", "B1"], 186, 990);
       const large = h.markdown("A");
       assert.ok(Buffer.byteLength(large) > 180 * 1024, `${Buffer.byteLength(large)} bytes`);
