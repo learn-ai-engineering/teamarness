@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete; Phase 7 (Documents Package) is implemented on the `workspace-documents` workstream pending its two-profile manual Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next for the core.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) is implemented on `workspace_docs`, but its overall Verify remains failed on two accepted internal-stage risks. The separate Documents layout workstream passed its scoped Verify and closed locally; neither result authorizes integration. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next for the core.
 
 ## Phases
 
@@ -84,7 +84,7 @@ Branch `architecture-review`, merged to `main` on 2026-09-22. Reviewed the whole
 
 ### Phase 7 - Documents Package
 
-Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Package (`packages/documents-package`) owns Collections, Documents, Comments, and a collaborative plain-text Markdown body replicated as Loro updates on the immutable record log, with no Core change (ADR 0023). Automated qualification covers record convergence in any order, deferral and quarantine, Loro import order independence, coalesced and bounded edit records, restart replay, and the UI edit and comment flows. The two-profile manual Verify (two-second visibility across NAT, offline merge, late joiner) is recorded in the workstream.
+Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Package (`packages/documents-package`) owns Collections, Documents, Comments, and a collaborative plain-text Markdown body replicated as Loro updates on the immutable record log, with no Core change (ADR 0023). Automated qualification covers record convergence in any order, deferral and quarantine, Loro import order independence, coalesced and bounded edit records, restart replay, and the UI edit and comment flows. The separate `documents-layout` workstream completed its layout, quoting, and minimal-controls changes with a passing scoped review, automated checks, and developer two-instance UI observations. The overall Package Verify remains failed on SF-701 and SF-702, accepted only for internal evaluation. Two-second visibility across separate networks, offline merge, and late join were not reported as passed. An existing Member's app-closed metadata catch-up observation is deferred in [DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md).
 
 **Outcome:** Two team members on separate networks edit a planning document together and discuss it in comments that stay with the document (vision success criterion 4).
 
@@ -102,6 +102,7 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
 - Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0023).
 - Document log compaction via the reserved `document.snapshot` record kind (ADR 0023).
+- Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
 

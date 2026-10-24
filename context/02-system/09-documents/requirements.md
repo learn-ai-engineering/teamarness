@@ -12,6 +12,8 @@ The Documents Package SHALL own Collections, Documents, Comments, their canonica
 
 The Documents Package SHALL replicate every Collection, Document, Comment, and body edit record through one `teamarness.synchronization.immutable-record-log` 1.x scope per Package and Workspace. Documents SHALL require the additive 1.1 replay-boundary minor; 1.0 clients SHALL keep their existing stream behavior. The Core Runtime SHALL treat Documents canonical bytes as opaque.
 
+**Verification gap:** An existing Member's app-closed Collection and Document catch-up is unverified. See [DELTA-011](../../.delta/DELTA-011-documents-offline-metadata-catchup.md); this note does not weaken R02.
+
 ## TEAM.SYS.DOCS-R03 — Identity and Convergence
 
 A Collection, Document, or Comment SHALL be identified by the Record ID of the record that created it. Rename, move, archive, restore, resolve, and reopen SHALL converge by Order Key, so every Installation shows the same state regardless of arrival order. A record whose target has not arrived SHALL be retained and applied when the target arrives.
