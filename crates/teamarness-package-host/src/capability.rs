@@ -269,6 +269,12 @@ pub(crate) struct AdvertisedGrant {
     pub(crate) minor: u16,
 }
 
+/// Constructor inputs only: append retirement and authority leases remain independent guards.
+pub(crate) struct GenerationGuards {
+    pub(crate) append_fence: Arc<AppendFence>,
+    pub(crate) authority: crate::authority::GenerationAuthority,
+}
+
 pub(crate) struct GenerationCapabilities {
     authority: crate::authority::GenerationAuthority,
     core: Arc<CoreRuntime>,
@@ -290,9 +296,8 @@ impl GenerationCapabilities {
         requirements: &[CapabilityRequirement],
         generation: u64,
         limiter: CoreCallLimiter,
-        append_fence: Arc<AppendFence>,
+        guards: GenerationGuards,
         broker: std::sync::Weak<crate::broker::PortBroker>,
-        authority: crate::authority::GenerationAuthority,
     ) -> Result<Arc<Self>, PackageErrorCode> {
         if scope.package_identity.as_str() == crate::values::RESERVED_PRINCIPALS_SCOPE {
             return Err(PackageErrorCode::InvalidPackageIdentity);
@@ -325,10 +330,10 @@ impl GenerationCapabilities {
         }
         let (cancelled, _) = watch::channel(false);
         Ok(Arc::new(Self {
-            authority,
+            authority: guards.authority,
             core,
             limiter,
-            append_fence,
+            append_fence: guards.append_fence,
             scope,
             generation,
             grants,
@@ -2098,12 +2103,14 @@ mod tests {
             }],
             1,
             limiter,
-            Arc::new(AppendFence::default()),
+            GenerationGuards {
+                append_fence: Arc::new(AppendFence::default()),
+                authority: crate::authority::AuthorityGeneration::default()
+                    .advance()
+                    .await
+                    .unwrap(),
+            },
             std::sync::Weak::new(),
-            crate::authority::AuthorityGeneration::default()
-                .advance()
-                .await
-                .unwrap(),
         )
         .unwrap();
         let grant = capabilities.advertised()[0].grant.clone();
@@ -2144,9 +2151,11 @@ mod tests {
             &[],
             1,
             CoreCallLimiter::new(),
-            Arc::new(AppendFence::default()),
+            GenerationGuards {
+                append_fence: Arc::new(AppendFence::default()),
+                authority: broker.authority_generation(&key).advance().await.unwrap(),
+            },
             Arc::downgrade(&broker),
-            broker.authority_generation(&key).advance().await.unwrap(),
         )
         .unwrap();
         core.bind_agent_package(workspace.id(), a, package.as_str())
@@ -2159,9 +2168,11 @@ mod tests {
             &[],
             1,
             CoreCallLimiter::new(),
-            Arc::new(AppendFence::default()),
+            GenerationGuards {
+                append_fence: Arc::new(AppendFence::default()),
+                authority: broker.authority_generation(&key).advance().await.unwrap(),
+            },
             Arc::downgrade(&broker),
-            broker.authority_generation(&key).advance().await.unwrap(),
         )
         .unwrap();
         new.agent_binding(

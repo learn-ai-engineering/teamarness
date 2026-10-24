@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::capability::{
-    AppendFence, CapabilityRequirement, CapabilityScope, GenerationCapabilities,
+    AppendFence, CapabilityRequirement, CapabilityScope, GenerationCapabilities, GenerationGuards,
 };
 use crate::diag::fault;
 use crate::host_store::{HostStore, HostStoreHandle, ProcessLease};
@@ -101,9 +101,11 @@ pub(crate) async fn spawn(
         &spec.template.capabilities,
         generation,
         spec.calls.limiter.clone(),
-        append_fence,
+        GenerationGuards {
+            append_fence,
+            authority,
+        },
         spec.broker.clone(),
-        authority,
     )
     .map_err(WireFailure::new)?;
     // Reading and hashing the Backend executable is blocking file work.
