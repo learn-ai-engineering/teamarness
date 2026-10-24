@@ -2,7 +2,7 @@
 :host { display: block; height: 100vh; height: 100dvh; color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
 * { box-sizing: border-box; }
 button, input, select, textarea { font: inherit; }
-.documents-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
+.documents-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; container-type: inline-size; }
 .documents-page.teamarness-page > * + * { margin-top: 0; }
 .documents-page .teamarness-page-header { display: flex; flex: none; align-items: center; gap: .6rem; border-bottom: 1px solid var(--teamarness-color-border); padding: .85rem 1.4rem; }
 .documents-page .teamarness-page-title { margin: 0; font-size: 1.4rem; }

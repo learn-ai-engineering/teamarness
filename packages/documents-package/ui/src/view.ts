@@ -18,6 +18,19 @@ const AVAILABILITY_LABEL = {
   waiting_for_history_access: "Waiting for history access",
 } as const;
 
+function boundedQuote(selection: string): string | null {
+  const encoder = new TextEncoder();
+  let quote = "";
+  let bytes = 0;
+  for (const character of selection.trim()) {
+    const size = encoder.encode(character).length;
+    if (bytes + size > 2048) break;
+    quote += character;
+    bytes += size;
+  }
+  return quote || null;
+}
+
 function button(label: string, className: string, onClick: () => void): HTMLButtonElement {
   const element = document.createElement("button");
   element.type = "button";
@@ -215,6 +228,8 @@ export class DocumentsView {
       label: "New Document title", placeholder: "New Document title", submitLabel: "Create",
       maxLength: 256, className: "document-create",
       onSubmit: async (title) => {
+        if (this.createTarget === null || this.createTarget === "collection"
+          || this.createTarget !== controller.state.selectedCollectionId) return false;
         const ok = await controller.createDocument(title);
         if (ok) { this.createTarget = null; this.render(); }
         return ok;
@@ -276,8 +291,8 @@ export class DocumentsView {
     this.commentInput.addEventListener("focus", () => {
       if (this.controller.state.openDocumentId === null || !this.controller.openEditor
         || this.textarea.hidden || this.textarea.disabled) return;
-      const selected = this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd).trim();
-      this.draftQuote = selected ? selected.slice(0, 2048) : null;
+      const selected = this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd);
+      this.draftQuote = boundedQuote(selected);
       this.renderComposer();
     });
     this.commentSubmit = document.createElement("button");
@@ -296,6 +311,7 @@ export class DocumentsView {
       void controller.addComment(markdown, this.draftQuote, this.replyTo).then((ok) => {
         if (ok && controller.state.openDocumentId === documentId) {
           this.commentInput.value = "";
+          this.collapseEditorSelection();
           this.draftQuote = null;
           this.replyTo = null;
           this.renderComposer();
@@ -330,6 +346,10 @@ export class DocumentsView {
     }
   }
 
+  private collapseEditorSelection(): void {
+    this.textarea.setSelectionRange(this.textarea.selectionEnd, this.textarea.selectionEnd);
+  }
+
   private renderComposer(): void {
     this.commentQuote.hidden = this.draftQuote === null && this.replyTo === null;
     this.commentQuote.replaceChildren();
@@ -351,7 +371,7 @@ export class DocumentsView {
       quote.textContent = this.draftQuote;
       this.commentQuote.append(cue, quote, icon("x", "Clear quote", () => {
         this.draftQuote = null;
-        this.textarea.setSelectionRange(this.textarea.selectionEnd, this.textarea.selectionEnd);
+        this.collapseEditorSelection();
         this.renderComposer();
       }));
     }
@@ -478,6 +498,7 @@ export class DocumentsView {
   render(): void {
     const { snapshot, busy, error, showArchived, openDocumentId } = this.controller.state;
     if (this.composerDocumentId !== openDocumentId) {
+      this.collapseEditorSelection();
       this.composerDocumentId = openDocumentId;
       this.draftQuote = null;
       this.replyTo = null;
@@ -499,6 +520,10 @@ export class DocumentsView {
     if (selected !== this.selectedCollectionId) {
       this.selectedCollectionId = selected;
       if (selected) this.expanded.add(selected);
+    }
+    if (this.createTarget !== "collection" && this.createTarget !== selected) {
+      this.createTarget = null;
+      this.documentForm.input.value = "";
     }
     this.documentForm.submit.disabled = busy || this.controller.selectedCollection === null;
     this.renderCollections();
@@ -568,7 +593,6 @@ export class DocumentsView {
   }
 
   private menu(row: HTMLElement, trigger: HTMLButtonElement, actions: HTMLElement): void {
-    trigger.setAttribute("aria-haspopup", "menu");
     trigger.setAttribute("aria-expanded", "false");
     trigger.addEventListener("click", () => {
       if (this.activeMenuButton === trigger) { this.dismissMenu(); return; }
@@ -608,6 +632,13 @@ export class DocumentsView {
   }
 
   private renderCollections(): void {
+    const root = this.collectionList.getRootNode() as ShadowRoot;
+    const focused = root.activeElement;
+    const inTree = focused !== null && this.collectionList.contains(focused);
+    const focusKey = inTree ? (focused as HTMLElement).dataset.treeFocus
+      ?? this.activeMenuButton?.dataset.treeFocus : undefined;
+    const selection = inTree && focused instanceof HTMLInputElement
+      ? { start: focused.selectionStart, end: focused.selectionEnd } : null;
     this.dismissMenu();
     const selected = this.controller.state.selectedCollectionId;
     const rows = this.controller.visibleCollections.map((collection) => {
@@ -622,12 +653,14 @@ export class DocumentsView {
         else this.expanded.add(collection.id);
         this.render();
       });
+      expand.dataset.treeFocus = `collection:expand:${collection.id}`;
       expand.setAttribute("aria-expanded", String(expanded));
       expand.classList.toggle("is-expanded", expanded);
       const select = button(collection.name, "collection-button", () => {
         if (this.controller.state.selectedCollectionId !== collection.id) this.expanded.add(collection.id);
         this.controller.selectCollection(collection.id);
       });
+      select.dataset.treeFocus = `collection:select:${collection.id}`;
       if (collection.id === selected) select.setAttribute("aria-current", "page");
       const add = icon("plus", `Add Document to ${collection.name}`, () => {
         this.controller.selectCollection(collection.id);
@@ -637,9 +670,12 @@ export class DocumentsView {
         this.documentForm.input.focus();
       });
       const trigger = icon("more", `Actions for ${collection.name}`, () => {});
+      add.dataset.treeFocus = `collection:add:${collection.id}`;
+      trigger.dataset.treeFocus = `collection:actions:${collection.id}`;
       const actions = document.createElement("div");
       actions.className = "collection-actions action-menu";
-      actions.setAttribute("role", "menu");
+      actions.setAttribute("role", "group");
+      actions.setAttribute("aria-label", `Actions for ${collection.name}`);
       actions.append(
         button("Rename", KIT.secondary, () => this.startRename("collection", collection.id, collection.name)),
         button(collection.archived ? "Restore" : "Archive", KIT.secondary, () => {
@@ -680,6 +716,16 @@ export class DocumentsView {
       create.append(this.collectionForm.form);
       this.collectionList.prepend(create);
     }
+    if (inTree) {
+      const next = focused instanceof HTMLElement && this.collectionList.contains(focused) ? focused
+        : [...this.collectionList.querySelectorAll<HTMLElement>("[data-tree-focus]")]
+          .find((control) => control.dataset.treeFocus === focusKey);
+      next?.focus();
+      if (next === focused && selection && focused instanceof HTMLInputElement
+        && selection.start !== null && selection.end !== null) {
+        focused.setSelectionRange(selection.start, selection.end);
+      }
+    }
   }
 
   private documentRow(document_: Document, collection: Collection): HTMLLIElement {
@@ -697,9 +743,12 @@ export class DocumentsView {
     });
     if (this.controller.state.openDocumentId === document_.id) title.setAttribute("aria-current", "true");
     const trigger = icon("more", `Actions for ${document_.title}`, () => {});
+    title.dataset.treeFocus = `document:select:${document_.id}`;
+    trigger.dataset.treeFocus = `document:actions:${document_.id}`;
     const actions = document.createElement("div");
     actions.className = "document-actions action-menu";
-    actions.setAttribute("role", "menu");
+    actions.setAttribute("role", "group");
+    actions.setAttribute("aria-label", `Actions for ${document_.title}`);
     actions.append(
       button("Rename", KIT.secondary, () => this.startRename("document", document_.id, document_.title)),
       button(document_.archived ? "Restore" : "Archive", KIT.secondary, () => {

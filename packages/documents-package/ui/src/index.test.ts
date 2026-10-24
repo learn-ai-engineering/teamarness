@@ -381,7 +381,10 @@ describe("Documents mount", () => {
     form.requestSubmit();
     await tick();
     expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Quoted', quote: 'x'.repeat(2048) });
+    expect(editor.selectionStart).toBe(editor.selectionEnd);
+    composer.dispatchEvent(new Event('focus'));
     expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
+    expect((root.querySelector('.comment-input') as HTMLTextAreaElement).value).toBe('');
     editor.focus();
     editor.setSelectionRange(2, 5);
     composer.dispatchEvent(new Event('focus'));
@@ -451,6 +454,9 @@ describe("Documents mount", () => {
     expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
     expect(root.querySelector('.comment-input')).toBe(composer);
     expect(editor.value).toBe('Selected text');
+    expect(editor.selectionStart).toBe(editor.selectionEnd);
+    composer.dispatchEvent(new Event('focus'));
+    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
     fail = false;
     (root.querySelector('.comment-compose') as HTMLFormElement).requestSubmit();
     await tick();
@@ -560,6 +566,9 @@ describe("Documents mount", () => {
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     const actions = () => root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement;
     actions().click();
+    expect(actions().getAttribute('aria-haspopup')).toBeNull();
+    expect(root.querySelector('.document-actions')?.getAttribute('role')).toBe('group');
+    expect(root.querySelector('.document-actions')?.getAttribute('aria-label')).toBe('Actions for Q4 plan');
     expect(root.querySelector('.document-actions')).not.toBeNull();
     root.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     expect(root.querySelector('.document-actions')).toBeNull();
@@ -632,13 +641,25 @@ describe("Documents mount", () => {
     (root.querySelector('[aria-label="Hide Comments"]') as HTMLButtonElement).click();
     expect((root.querySelector('.comments-panel') as HTMLElement).hidden).toBe(true);
     (root.querySelector('[aria-label="Show Comments"]') as HTMLButtonElement).click();
+    const shell = root.querySelector('.documents-shell') as HTMLElement;
+    Object.defineProperty(shell, 'clientWidth', { configurable: true, value: 1000 });
     const handle = root.querySelector('.left-resizer') as HTMLElement;
+    handle.setPointerCapture = () => { handle.hasPointerCapture = () => true; };
+    handle.releasePointerCapture = () => { handle.hasPointerCapture = () => false; };
     handle.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 1, clientX: 200, bubbles: true }));
     handle.dispatchEvent(new PointerEvent('pointermove', { pointerId: 1, clientX: 240, bubbles: true }));
     handle.dispatchEvent(new PointerEvent('pointerup', { pointerId: 1, bubbles: true }));
-    expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--left-width')).toBe('190px');
+    expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--left-width')).toBe('290px');
     const rightHandle = root.querySelector('.right-resizer') as HTMLElement;
     rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--right-width')).toBe('320px');
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--right-width')).toBe('190px');
     await fake.emit('documents.changes', snapshot());
     expect(root.querySelector('.editor-textarea')).toBe(editor);
@@ -648,6 +669,110 @@ describe("Documents mount", () => {
     (root.querySelector('.editor-header button') as HTMLButtonElement).click();
     expect(root.querySelector('.editor-preview')?.textContent?.trim()).toBe('Draft');
     expect(root.querySelector('.editor-header button')?.textContent).toBe('Edit');
+    await unmount();
+  });
+
+  it("dismisses Add Document when its selected Collection changes before submission", async () => {
+    const research = "4".repeat(64);
+    const current = { ...snapshot(), collections: [...snapshot().collections,
+      { id: research, name: "Research", archived: false }] };
+    const { fake, calls } = backend(() => current);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
+    const oldForm = root.querySelector('.document-create') as HTMLFormElement;
+    (oldForm.querySelector('input') as HTMLInputElement).value = 'For Planning';
+    (root.querySelector('[aria-label="Expand Research"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.collection-button')].find((b) => b.textContent === 'Research') as HTMLButtonElement).click();
+    expect(root.querySelector('.document-create')).toBeNull();
+    oldForm.requestSubmit();
+    await tick();
+    expect(calls.filter((call) => call.operation === 'documents.document.create')).toEqual([]);
+    (root.querySelector('[aria-label="Add Document to Research"]') as HTMLButtonElement).click();
+    expect((root.querySelector('.document-create input') as HTMLInputElement).value).toBe('');
+    (root.querySelector('.document-create input') as HTMLInputElement).value = 'For Research';
+    (root.querySelector('.document-create') as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.create',
+      payload: { collectionId: research, title: 'For Research' } });
+    await unmount();
+  });
+
+  it("keeps a focused tree form or row control usable across a pushed snapshot", async () => {
+    const current = snapshot();
+    const { fake } = backend(() => current);
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    try {
+      const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+      (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
+      const input = root.querySelector('.document-create input') as HTMLInputElement;
+      input.value = 'Draft';
+      input.focus();
+      input.setSelectionRange(1, 3);
+      expect(root.activeElement).toBe(input);
+      await fake.emit('documents.changes', current);
+      expect(root.querySelector('.document-create input')).toBe(input);
+      expect(root.activeElement).toBe(input);
+      expect(input.value).toBe('Draft');
+      expect([input.selectionStart, input.selectionEnd]).toEqual([1, 3]);
+      const rowControl = root.querySelector('[aria-label="Collapse Planning"]') as HTMLButtonElement;
+      rowControl.focus();
+      expect(root.activeElement).toBe(rowControl);
+      await fake.emit('documents.changes', current);
+      expect(root.activeElement?.getAttribute('aria-label')).toBe('Collapse Planning');
+      (root.activeElement as HTMLButtonElement).click();
+      expect(root.querySelector('[aria-label="Expand Planning"]')).not.toBeNull();
+      (root.querySelector('[aria-label="Actions for Planning"]') as HTMLButtonElement).click();
+      const menuAction = root.querySelector('.collection-actions button') as HTMLButtonElement;
+      menuAction.focus();
+      await fake.emit('documents.changes', current);
+      expect(root.activeElement?.getAttribute('aria-label')).toBe('Actions for Planning');
+      (root.activeElement as HTMLButtonElement).click();
+      (root.querySelector('.collection-actions button') as HTMLButtonElement).click();
+      const rename = root.querySelector('.collection-rename input') as HTMLInputElement;
+      rename.value = 'Renaming';
+      rename.focus();
+      await fake.emit('documents.changes', current);
+      expect(root.activeElement).toBe(rename);
+      expect(rename.value).toBe('Renaming');
+      (root.querySelector('.collection-rename button[aria-label="Cancel"]') as HTMLButtonElement).click();
+      (root.querySelector('[aria-label="Add Collection"]') as HTMLButtonElement).click();
+      const collection = root.querySelector('.collection-create input') as HTMLInputElement;
+      collection.value = 'A new Collection';
+      collection.focus();
+      await fake.emit('documents.changes', current);
+      expect(root.activeElement).toBe(collection);
+      expect(collection.value).toBe('A new Collection');
+      await unmount();
+    } finally { host.remove(); }
+  });
+
+  it("caps a multibyte selected quote to 2048 UTF-8 bytes before posting", async () => {
+    const added: unknown[] = [];
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': () => snapshot(),
+      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: '' }),
+      'documents.comment.add': (payload) => { added.push(payload); return { ok: true as const, id: 'd'.repeat(64) }; },
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    const root = document.createElement('div').attachShadow({ mode: 'open' });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    const text = `${'é'.repeat(1023)}😀é`;
+    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text });
+    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+    editor.setSelectionRange(0, text.length);
+    const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
+    composer.dispatchEvent(new Event('focus'));
+    const expected = 'é'.repeat(1023);
+    expect(root.querySelector('.comment-quote-excerpt')?.textContent).toBe(expected);
+    composer.value = 'Quoted';
+    (root.querySelector('.comment-compose') as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(added).toEqual([{ documentId: doc, markdown: 'Quoted', quote: expected }]);
+    expect(new TextEncoder().encode(expected).length).toBe(2046);
     await unmount();
   });
 
