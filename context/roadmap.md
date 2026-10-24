@@ -70,6 +70,16 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Agent Package (implemented; manual verification pending)
+
+Implemented on 2026-10-24 on branch `don-smith/agent_package`, workstream `agent-package`. ADR 0027 (accepted 2026-10-24) makes a bound Agent a standing local signer: Core signs with an Agent's key for any Package Instance on the Steward's Installation once the Agent has a binding there, bindings are keyed by Package through the new `teamarness.agent-binding` 1.0 capability, and the Host derives an Agent actor for a bound caller's Port calls. Conversations 1.1 accepts that actor on `message.post` and adds `channel.list`. The bundled Agent Package `dev.teamarness.agent` is the harness for one Agent per Package Instance: the Steward picks the Agent and enters an OpenAI-compatible endpoint, model and API key in the Package's own UI; the Agent replies once when a Person addresses it by name, keeps per-Channel progress so a restart never re-replies, and reports endpoint failures as Package-owned status codes without retrying.
+
+**Outcome:** A Member on another Installation addresses the Agent by name in Conversations, and both Installations show the reply attributed to the Agent with its Steward.
+
+**Depends on:** Workspace Principals, Package interface.
+
+Automated coverage spans Core, Host, SDK, Conversations and Agent Package tests plus a two-profile system flow against a stub endpoint. The developer's two-Installation procedure against a real endpoint is written in the workstream's `verify/` directory and not yet executed; the developer supplies the model slug and key. Follow-ups, each needing its own Scope: key-at-rest protection beyond file mode `0600` (joins the platform key custody item under Later), streaming replies and tool use, Documents participation, and the WebAssembly Package class re-evaluation that names Agent Packages as its motivating case.
+
 ### Workspace Principals (complete)
 
 Verified on 2026-10-23 on branch `don-smith/agent_invite`, workstream `agent-invite`. ADR 0023 (accepted 2026-10-21) defines Workspace Principals: a Workspace Person is a key group nested in the Workspace group, a Workspace Agent is a Principal whose key the Steward's Installation custodies, and attribution is the signer key resolved to its Principal. The workstream replaces the names capability of ADR 0022 with `teamarness.principals` 1.0, adds the optional `principal` selector to `teamarness.synchronization.immutable-record-log` 1.1, lets any Member add an Agent by name from the Shell without a Manager, lists Agents with their Steward, and shows Agent authors in Conversations. The agent runtime Package, cross-Package reads, and Shell-driven Package binding are the next workstream.
@@ -101,10 +111,11 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - CI-published updates that reach every Member within one hour (vision success criterion 6), with code signing, notarization, and CI/CD (`TEAM.DEL`).
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
-- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (4 bundled Packages × 3 Workspaces = 12 processes); measure before scheduling.
+- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
 - Collaborative planning documents (vision success criterion 4).
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
-- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
+- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
+- Agent Package: streaming replies, tool use beyond declared Ports, Documents participation, and unprompted or scheduled posts (non-goals of the `agent-package` workstream).
 
 ## Not planned
 
@@ -147,7 +158,7 @@ The agreed sequence is four workstreams. Each needs its own Scope.
 
 Implementation in progress: the declaration, admission, scoped broker, and live event phases are committed on `package-interface`. The final source-built Conversations proof, local observations, documentation, and full verification are in progress. ADR 0026 records the Host-brokered interface.
 
-A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract exposes a Person-only post, read-only page, and live coalescible invalidation. The Host derives actor context, but cannot delegate another Package's Agent signing key. Agent runtime, Instance binding, and Agent-authored posts need a separate Agent Package workstream. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
+A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract shipped a Person-only post, read-only page, and live coalescible invalidation; the Host derived a Person actor only. The Agent Package workstream (ADR 0027, see **Current work**) then added the Host-derived Agent actor, Conversations 1.1 with Agent-authored posts and `channel.list`, and the Agent runtime. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
 
 #### Data format versioning
 

@@ -30,4 +30,4 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 
 ## Current state
 
-The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, Package Foundation, Conversations Package, Repository Integration, Shell and Package UI polish, architecture review, and Workspace Principals workstream are complete. Phase 5 Membership Management and Hardening remains next for the core roadmap. See `roadmap.md` for workstream status and `open-questions.md` for unresolved design questions.
+The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, Package Foundation, Conversations Package, Repository Integration, Shell and Package UI polish, architecture review, and Workspace Principals workstream are complete. The Agent Package workstream (ADR 0027) is implemented and awaits the developer's two-Installation verification. Phase 5 Membership Management and Hardening remains next for the core roadmap. See `roadmap.md` for workstream status and `open-questions.md` for unresolved design questions.
