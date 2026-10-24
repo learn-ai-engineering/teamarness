@@ -3,18 +3,22 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { LoroDoc } from "loro-crdt";
+import { updateLoroToPmState } from "loro-prosemirror";
+import type { LoroDocType } from "loro-prosemirror";
 import { Fragment, Slice } from "prosemirror-model";
 import type { Node } from "prosemirror-model";
 import { EditorState, TextSelection } from "prosemirror-state";
+import type { Transaction } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  BLOCK_BUDGET_BYTES, TEXT_BUDGET_BYTES, estimateFragmentBytes, estimateNodeBytes, guardPlugin, planPaste, textBytes,
+  BLOCK_BUDGET_BYTES, RECORD_LIMIT_BYTES, TEXT_BUDGET_BYTES, estimateFragmentBytes, estimateNodeBytes,
+  estimateTransactionBytes, guardPlugin, planPaste, textBytes,
 } from "./guard";
 import type { GuardHost, GuardRefusal } from "./guard";
 import { MARK_EXPAND, schema } from "./schema";
 import { EXPORT_BUDGET_BYTES } from "./session";
-import { editorPlugins, initialDocument } from "./view";
+import { editorCommands, editorPlugins, initialDocument } from "./view";
 
 const GENESIS = join(import.meta.dirname, "../../../fixtures/body-trees/from-rust/00-genesis.loro");
 
@@ -198,5 +202,69 @@ describe("the pre-commit guard", () => {
     const host = new Host();
     const view = guarded(host);
     expect(pasteInto(view, paste(1000))).toBe(false);
+  });
+});
+
+describe("structural edits", () => {
+  /**
+   * An editor bound to a Loro body of `blocks`, written by another peer, that records the size of
+   * every update it sends.
+   */
+  async function bound(blocks: Node[]) {
+    const loro = new LoroDoc();
+    loro.import(new Uint8Array(readFileSync(GENESIS)));
+    loro.configTextStyle(MARK_EXPAND);
+    loro.setPeerId(5n);
+    updateLoroToPmState(loro as unknown as LoroDocType, new Map(), EditorState.create({ schema, doc: doc(...blocks) }));
+    loro.setPeerId(77n);
+    const sizes: number[] = [];
+    loro.subscribeLocalUpdates((update) => { sizes.push(update.byteLength); });
+    const host = new Host();
+    const view = new EditorView(document.createElement("div"), {
+      state: EditorState.create({ schema, doc: initialDocument(loro), plugins: editorPlugins(loro, host, () => true) }),
+    });
+    views.push(view);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, 1, view.state.doc.content.size - 1)));
+    return { loro, view, host, sizes };
+  }
+
+  const large = () => Array.from({ length: 170 }, (_, index) => paragraph(`${index} `.padEnd(1000, "x")));
+
+  for (const [name, command] of [
+    ["Blockquote", editorCommands.blockquote],
+    ["Bullets", editorCommands.bulletList],
+    ["Heading", editorCommands.heading(2)],
+  ] as const) {
+    it(`refuses ${name} over a 166 KB body before commit, since the rewrite cannot fit one record`, async () => {
+      const { loro, view, host, sizes } = await bound(large());
+      const before = view.state.doc;
+      const version = loro.oplogVersion();
+      expect(command(view.state, view.dispatch, view)).toBe(true);
+      expect(host.refusals).toEqual(["block_too_large"]);
+      expect(view.state.doc.eq(before)).toBe(true);
+      expect(loro.oplogVersion().compare(version)).toBe(0);
+      expect(sizes).toEqual([]);
+    });
+  }
+
+  it("counts what a structural step rewrites, not only what it inserts", () => {
+    const content = doc(...large());
+    const state = EditorState.create({ schema, doc: content });
+    const select = state.apply(state.tr.setSelection(TextSelection.create(content, 1, content.content.size - 1)));
+    let wrapped: Transaction | null = null;
+    editorCommands.blockquote(select, (tr) => { wrapped = tr; });
+    expect(wrapped).not.toBeNull();
+    expect(estimateTransactionBytes(wrapped!)).toBeGreaterThanOrEqual(estimateFragmentBytes(content.content));
+  });
+
+  it("allows a structural edit whose real update fits one record", async () => {
+    const { view, host, sizes } = await bound(Array.from({ length: 60 }, (_, index) => paragraph(`${index} `.padEnd(1000, "x"))));
+    expect(editorCommands.blockquote(view.state, view.dispatch, view)).toBe(true);
+    expect(host.refusals).toEqual([]);
+    expect(view.state.doc.firstChild?.type.name).toBe("blockquote");
+    expect(sizes.length).toBe(1);
+    expect(sizes[0]!).toBeGreaterThan(60_000);
+    expect(sizes[0]!).toBeLessThanOrEqual(RECORD_LIMIT_BYTES);
   });
 });

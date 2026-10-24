@@ -24,7 +24,7 @@ mod merge;
 mod schema;
 
 pub use export::{canonical, export};
-pub use merge::{MergeError, Merged, merge};
+pub use merge::{DIFF_BUDGET, MergeError, Merged, merge, merge_within};
 pub use schema::{
     Block, Inline, Link, MAX_NESTING, MAX_ORDER, Marks, SchemaViolation, WriteError, read_tree,
     write_tree,

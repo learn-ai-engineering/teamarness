@@ -756,7 +756,7 @@ mod tests {
         );
     }
 
-    // Verifies: AC3 — one record carries at most 160 KiB of update.
+    // Verifies: TEAM.SYS.DOCS-R09 — one record carries at most 160 KiB of update.
     #[test]
     fn edit_updates_are_bounded_at_160_kib() {
         assert_eq!(MAX_UPDATE, 160 * 1024);

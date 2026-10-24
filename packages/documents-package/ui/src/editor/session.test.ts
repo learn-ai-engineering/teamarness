@@ -10,7 +10,7 @@ const DOCUMENT = "d".repeat(64);
 const CHUNK = 18 * 1024;
 
 type Sent = { requestId: string; sessionPeer: string; update: string };
-type Answer = "ok" | "unknown" | "refuse" | "hold";
+type Answer = "ok" | "unknown" | "refuse" | "hold" | "lost_session";
 type Live = { listener: (event: SessionEvent) => void; terminated: (error: unknown) => void };
 
 /**
@@ -25,9 +25,13 @@ class FakeBackend {
   answers: Answer[] = [];
   /** A replacement generation that cannot prove the old peer was this UI's hands out a new one. */
   refuseResume = false;
+  /** The body waits for missing causal history: it is not editable and refuses updates as pending. */
+  pending = false;
   private nextPeer = 1000n;
   private readonly live = new Map<string, Live>();
   private readonly held: Array<{ resolve: () => void; reject: (error: unknown) => void; sent: Sent }> = [];
+  /** Sessions the Backend ended whose streams have not reported it yet. */
+  readonly ended = new Map<string, Live>();
 
   constructor() {
     this.body.setPeerId(1n);
@@ -56,8 +60,14 @@ class FakeBackend {
       update: async (request) => {
         const sent = { requestId: request.requestId, sessionPeer: request.sessionPeer, update: request.update };
         this.sent.push(sent);
-        const answer = this.answers.shift() ?? "ok";
+        const answer = this.pending ? "unknown" : this.answers.shift() ?? "ok";
         if (answer === "unknown") throw createPackageRequestError({ packageError: { code: "documents.document_pending", retryable: true } });
+        if (answer === "lost_session") {
+          // The Backend no longer knows the session (it ended); its stream ends only later.
+          this.ended.set(request.sessionPeer, this.live.get(request.sessionPeer)!);
+          this.live.delete(request.sessionPeer);
+          throw createPackageRequestError({ packageError: { code: "documents.unknown_session", retryable: false } });
+        }
         if (answer === "refuse") {
           this.resync(request.sessionPeer);
           throw createPackageRequestError({ packageError: { code: "documents.schema_violation", retryable: false } });
@@ -84,6 +94,34 @@ class FakeBackend {
     const live = [...this.live.values()];
     this.live.clear();
     for (const session of live) session.terminated(createPackageRequestError({ code: "backend_unavailable", retryable: true }));
+  }
+
+  /** Ends the streams of sessions the Backend already ended. */
+  terminateEnded(): void {
+    for (const session of this.ended.values()) session.terminated(createPackageRequestError({ code: "backend_unavailable", retryable: true }));
+    this.ended.clear();
+  }
+
+  /** Fails the held requests as the Backend answers a session it no longer knows. */
+  failHeld(code: string): void {
+    for (const held of this.held.splice(0)) held.reject(createPackageRequestError({ packageError: { code, retryable: false } }));
+  }
+
+  /**
+   * Imports a remote record, as the record log delivers it. One whose causal history is missing
+   * waits, and the body is pending until it arrives; then sessions get what the body gained.
+   */
+  deliverRemote(update: Uint8Array): void {
+    const before = this.body.oplogVersion();
+    const status = this.body.import(update);
+    const waiting = status.pending !== undefined && status.pending !== null;
+    if (waiting !== this.pending) {
+      this.pending = waiting;
+      for (const session of this.live.values()) session.listener({ event: "status", documentId: DOCUMENT, durable: [], editable: !waiting });
+    }
+    if (this.body.oplogVersion().compare(before) === 0) return;
+    const gained = toBase64(this.body.export({ mode: "update", from: before }));
+    for (const session of this.live.values()) session.listener({ event: "update", documentId: DOCUMENT, update: gained });
   }
 
   resync(peer: string): void {
@@ -282,6 +320,81 @@ describe("EditorSession", () => {
     expect(lost).toEqual([{ requests: 1, unsentBytes: 0 }]);
     expect(text(session.doc)).toBe("genesis");
     expect(session.state.sessionPeer).toBe("1001");
+    await session.dispose();
+  });
+
+  it("keeps unacknowledged edits while the body waits for history delivered out of order", async () => {
+    const backend = new FakeBackend();
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    const remote = backend.body.fork();
+    remote.setPeerId(9n);
+    const from = remote.oplogVersion();
+    remote.getText("body").insert(7, " B");
+    remote.commit();
+    const afterB = remote.oplogVersion();
+    const b = remote.export({ mode: "update", from });
+    remote.getText("body").insert(9, " C");
+    remote.commit();
+    const c = remote.export({ mode: "update", from: afterB });
+
+    type(session, "mine ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS - 10);
+    // C arrives before B: the body is pending, and the first update is refused as pending.
+    backend.deliverRemote(c);
+    expect(session.state.editable).toBe(false);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(backend.sent).toHaveLength(1);
+    type(session, "more ", 5);
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(session.state.outstanding).toBe(2);
+    // B arrives: the body is editable again, the session gains both, and its retries land.
+    backend.deliverRemote(b);
+    expect(session.state.editable).toBe(true);
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lost).toEqual([]);
+    expect(session.state.sessionPeer).toBe("1000");
+    expect(session.state.outstanding).toBe(0);
+    expect(text(backend.body)).toBe("mine more genesis B C");
+    expect(text(session.doc)).toBe(text(backend.body));
+    await session.dispose();
+  });
+
+  it("reconnects as the same peer when the Backend no longer knows its session, keeping its queue", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["lost_session"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "kept ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    // The ended stream reports it only after the refusal; it is no longer this session's.
+    backend.terminateEnded();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lost).toEqual([]);
+    expect(backend.opened.at(-1)).toEqual({ resumePeer: "1000", sessionPeer: "1000" });
+    expect(text(backend.body)).toBe("kept genesis");
+    expect(session.state.outstanding).toBe(0);
+    expect(backend.opened).toHaveLength(2);
+    await session.dispose();
+  });
+
+  it("an unknown session answered after its stream ended changes nothing more", async () => {
+    const backend = new FakeBackend();
+    backend.answers = ["hold"];
+    const lost: LostNotice[] = [];
+    const session = await opened(backend, lost);
+    type(session, "kept ");
+    await vi.advanceTimersByTimeAsync(SEND_IDLE_MS);
+    backend.replaceGeneration(0);
+    backend.failHeld("documents.unknown_session");
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lost).toEqual([]);
+    expect(backend.opened).toHaveLength(2);
+    expect(text(backend.body)).toBe("kept genesis");
+    expect(session.state.outstanding).toBe(0);
     await session.dispose();
   });
 

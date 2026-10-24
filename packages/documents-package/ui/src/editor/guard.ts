@@ -2,8 +2,13 @@ import { Fragment, Slice } from "prosemirror-model";
 import type { Node } from "prosemirror-model";
 import { Plugin, PluginKey, TextSelection } from "prosemirror-state";
 import type { EditorState, Transaction } from "prosemirror-state";
+import { AddMarkStep, RemoveMarkStep, ReplaceAroundStep, ReplaceStep } from "prosemirror-transform";
+import type { Step } from "prosemirror-transform";
 import type { EditorView } from "prosemirror-view";
-import { loroSyncPluginKey } from "loro-prosemirror";
+import { loroSyncPluginKey, updateLoroToPmState } from "loro-prosemirror";
+import type { LoroDocType } from "loro-prosemirror";
+import type { LoroDoc } from "loro-crdt";
+import { MARK_EXPAND } from "./schema";
 import { EXPORT_BUDGET_BYTES } from "./session";
 
 /** One record carries at most this much update (the Backend's `MAX_UPDATE`). */
@@ -23,9 +28,21 @@ export const TEXT_BUDGET_BYTES = 192 * 1024;
 const NODE_OVERHEAD_BYTES = 96;
 /** What the estimate adds for each mark on a text run. */
 const MARK_OVERHEAD_BYTES = 24;
+/**
+ * A transaction estimated above this is measured exactly before it commits: the binding's own
+ * write is run on a fork of the body and its update exported. Below it, the estimate cannot be
+ * far enough off to reach a record.
+ */
+export const MEASURE_THRESHOLD_BYTES = EXPORT_BUDGET_BYTES / 2;
 
-/** Why the guard refused a change. Nothing was committed. */
-export type GuardRefusal = "block_too_large" | "document_too_large";
+/**
+ * Why the guard refused a change. Nothing was committed.
+ *
+ * - `block_too_large`: one change, or one block, cannot fit one record.
+ * - `document_too_large`: the change would grow the body past its text budget.
+ * - `step_too_large`: an undo or redo step cannot fit one record; it stays on its stack.
+ */
+export type GuardRefusal = "block_too_large" | "document_too_large" | "step_too_large";
 
 /** What the guard needs from the editor session. */
 export interface GuardHost {
@@ -85,15 +102,71 @@ export function estimateFragmentBytes(fragment: Fragment): number {
   return total;
 }
 
-/** An upper estimate of the update bytes a transaction adds: everything its steps insert. */
+/**
+ * An upper estimate of the update bytes a transaction adds: everything its steps insert, and
+ * everything a structural step makes the binding rewrite. The binding replaces a node whose type
+ * changes, and a parent whose children are wrapped or lifted, with a full copy, so a step that
+ * is not confined to one text block counts every top-level block it touches.
+ */
 export function estimateTransactionBytes(tr: Transaction): number {
   let total = 0;
-  for (const step of tr.steps) {
-    const slice = (step as { slice?: Slice }).slice;
-    if (slice !== undefined) total += estimateFragmentBytes(slice.content);
-    else total += NODE_OVERHEAD_BYTES;
-  }
+  tr.steps.forEach((step, index) => {
+    total += estimateStepBytes(step, tr.docs[index]!, tr.docs[index + 1] ?? tr.doc);
+  });
   return total;
+}
+
+function estimateStepBytes(step: Step, before: Node, after: Node): number {
+  if (step instanceof AddMarkStep || step instanceof RemoveMarkStep) {
+    // A mark is one range operation in each text run it covers.
+    let runs = 0;
+    before.nodesBetween(step.from, step.to, (node) => { if (node.isTextblock) runs += 1; });
+    return Math.max(1, runs) * MARK_OVERHEAD_BYTES;
+  }
+  if (!(step instanceof ReplaceStep || step instanceof ReplaceAroundStep)) return NODE_OVERHEAD_BYTES;
+  const inserted = estimateFragmentBytes(step.slice.content);
+  if (step instanceof ReplaceStep && withinTextblock(before, step.from, step.to)) {
+    const map = step.getMap();
+    if (withinTextblock(after, map.map(step.from, -1), map.map(step.to, 1))) return inserted;
+  }
+  return inserted + touchedBlockBytes(before, step.from, step.to);
+}
+
+/** Whether `from` and `to` lie in one text block of `doc`. */
+function withinTextblock(doc: Node, from: number, to: number): boolean {
+  const $from = doc.resolve(from);
+  return $from.parent.isTextblock && $from.sameParent(doc.resolve(to));
+}
+
+/** The estimate of every top-level block of `doc` that the range from `from` to `to` touches. */
+function touchedBlockBytes(doc: Node, from: number, to: number): number {
+  const $from = doc.resolve(from);
+  const $to = doc.resolve(to);
+  const start = $from.index(0);
+  const end = $to.depth === 0 ? $to.index(0) : $to.index(0) + 1;
+  let total = 0;
+  for (let index = start; index < end && index < doc.childCount; index += 1) total += estimateNodeBytes(doc.child(index));
+  return total;
+}
+
+/**
+ * The exact update bytes the binding would write for `tr`: its write runs on a fork of the body,
+ * as this peer, and the fork's new operations are exported. `null` when the editor is not bound.
+ */
+export function measureTransactionBytes(state: EditorState, tr: Transaction): number | null {
+  const sync = loroSyncPluginKey.getState(state) as { doc?: LoroDoc; mapping?: Map<unknown, unknown> } | undefined;
+  const doc = sync?.doc;
+  if (doc === undefined || sync?.mapping === undefined) return null;
+  const fork = doc.fork();
+  fork.setPeerId(doc.peerIdStr);
+  fork.configTextStyle(MARK_EXPAND);
+  const before = fork.oplogVersion();
+  const mapping = new Map(sync.mapping) as Parameters<typeof updateLoroToPmState>[1];
+  // The binding remembers, per ProseMirror node, the container it wrote it to. A copy of the
+  // document keeps the fork's containers off the editor's own nodes.
+  const copy = tr.doc.type.schema.nodeFromJSON(tr.doc.toJSON());
+  updateLoroToPmState(fork as unknown as LoroDocType, mapping, { doc: copy } as EditorState);
+  return fork.export({ mode: "update", from: before }).byteLength;
 }
 
 /** A paste too large for one export, cut at top-level block boundaries. */
@@ -164,7 +237,12 @@ export function applySplitPaste(view: EditorView, slice: Slice, pieces: readonly
   });
 }
 
-const guardKey = new PluginKey("documentsGuard");
+const guardKey = new PluginKey<GuardHost>("documentsGuard");
+
+/** The guard host of an editor state, for the guarded undo and redo commands. */
+export function guardHostOf(state: EditorState): GuardHost | undefined {
+  return guardKey.getState(state);
+}
 
 /** Whether a transaction is the binding replaying the Loro document, which the guard never filters. */
 function isBindingReplay(tr: Transaction): boolean {
@@ -174,9 +252,11 @@ function isBindingReplay(tr: Transaction): boolean {
 /**
  * The pre-commit size guard.
  *
- * - Before a transaction applies, its growth is estimated; when the pending export would then
- *   exceed {@link EXPORT_BUDGET_BYTES}, the session flushes first.
- * - A transaction that inserts more than {@link BLOCK_BUDGET_BYTES} at once is refused.
+ * - Before a transaction applies, its growth is estimated ({@link estimateTransactionBytes}), and
+ *   measured exactly on a fork when the estimate is above {@link MEASURE_THRESHOLD_BYTES}; when
+ *   the pending export would then exceed {@link EXPORT_BUDGET_BYTES}, the session flushes first.
+ * - A transaction whose update would exceed {@link BLOCK_BUDGET_BYTES} is refused, including a
+ *   structural edit that makes the binding rewrite large blocks.
  * - A transaction that grows text content beyond {@link TEXT_BUDGET_BYTES} is refused; one that
  *   shrinks, or keeps, the size is always allowed.
  * - A paste larger than the export budget is split at block boundaries ({@link planPaste}).
@@ -184,6 +264,7 @@ function isBindingReplay(tr: Transaction): boolean {
 export function guardPlugin(host: GuardHost): Plugin {
   return new Plugin({
     key: guardKey,
+    state: { init: () => host, apply: (_tr, value) => value },
     filterTransaction(tr: Transaction, state: EditorState): boolean {
       if (!tr.docChanged || isBindingReplay(tr)) return true;
       const before = textBytes(state.doc);
@@ -192,7 +273,8 @@ export function guardPlugin(host: GuardHost): Plugin {
         host.refused("document_too_large");
         return false;
       }
-      const growth = estimateTransactionBytes(tr);
+      let growth = estimateTransactionBytes(tr);
+      if (growth > MEASURE_THRESHOLD_BYTES) growth = measureTransactionBytes(state, tr) ?? growth;
       if (growth > BLOCK_BUDGET_BYTES) {
         host.refused("block_too_large");
         return false;

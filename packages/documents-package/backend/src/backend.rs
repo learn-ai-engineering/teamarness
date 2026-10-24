@@ -160,6 +160,14 @@ struct BodyHub {
     publication_gate: Arc<Mutex<()>>,
 }
 
+/// Locks `mutex`, taking it as it is when a panic poisoned it: every std mutex here guards
+/// state that each holder leaves consistent, so a panic elsewhere must not stop later writes.
+fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn import_failure_diagnostic(
     document: &str,
@@ -184,6 +192,12 @@ impl BodyHub {
         self.bodies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The publication gate. A panic while it was held leaves nothing half-published that the
+    /// next holder could see, so a poisoned gate is taken as it is.
+    fn gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        recover(&self.publication_gate)
     }
 
     /// Runs `with` on the body of `document`, creating it on first use.
@@ -217,7 +231,7 @@ impl BodyHub {
     /// An unopened deferred edit can conflict with an applied edit. Do not show the
     /// applied body until that sealed row has been opened and checked.
     fn refresh_deferred_waiting(&self) -> Result<Vec<String>, BackendError> {
-        let waiting = self.waiting_metadata.lock().unwrap().clone();
+        let waiting = recover(&self.waiting_metadata).clone();
         let targets: HashSet<String> = self
             .store
             .deferred_records()
@@ -245,7 +259,7 @@ impl BodyHub {
 
     fn refresh_identity_index_complete(&self) {
         let bodies_ready = self.lock().values().all(DocumentBody::editable);
-        let metadata_ready = self.waiting_metadata.lock().unwrap().is_empty();
+        let metadata_ready = recover(&self.waiting_metadata).is_empty();
         self.identity_index_complete
             .store(bodies_ready && metadata_ready, Ordering::Release);
     }
@@ -287,7 +301,7 @@ impl BodyHub {
         on_commit: &dyn Fn(),
         ingest: impl FnOnce(&dyn Fn(), &ImportClassifier<'_>) -> Result<Ingested, StoreError>,
     ) -> Result<Ingested, StoreError> {
-        let _publication = self.publication_gate.lock().unwrap();
+        let _publication = self.gate();
         let pending = Mutex::new(Vec::new());
         let failures = Mutex::new(Vec::new());
         let classify = |record: &str,
@@ -407,7 +421,7 @@ impl BodyHub {
         update: &[u8],
         request_id: Option<&str>,
     ) -> Result<(), BackendError> {
-        let _publication = self.publication_gate.lock().unwrap();
+        let _publication = self.gate();
         if self
             .store
             .identity_conflicted(document)
@@ -449,8 +463,9 @@ impl BodyHub {
         Ok(())
     }
 
-    /// Makes `candidate` the body of `document` and tells the editor sessions what it added:
-    /// one update of the operations it gained, and a status when its editability changed.
+    /// Adopts the import `candidate` into the body of `document` ([`DocumentBody::adopt_import`])
+    /// and tells the editor sessions what it added: one update of the operations it gained, and
+    /// a status when its editability changed.
     /// An update too large for one UI message makes every session reload instead.
     ///
     /// Only the bodies lock is taken, so this may run while the store holds its own.
@@ -458,7 +473,9 @@ impl BodyHub {
         let (update, editability_changed) = self.with_body(document, |body| {
             let before = body.version_vector();
             let was_editable = body.editable();
-            *body = candidate;
+            // Bookkeeping can change outside the gate between classify and adopt (an append
+            // that succeeded, an identity, the unopened count); only the import is adopted.
+            body.adopt_import(candidate);
             (body.updates_since(&before), was_editable != body.editable())
         });
         if let Some(update) = update {
@@ -625,7 +642,7 @@ impl BodyHub {
         looked_up: &Result<IdentityLookups, BackendError>,
         foreign_ids: &HashSet<&str>,
     ) -> Result<Vec<JsonValue>, BackendError> {
-        let _publication = self.publication_gate.lock().unwrap();
+        let _publication = self.gate();
         let unresolved = |id: &String| json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"});
         if self
             .store
@@ -824,8 +841,10 @@ fn session_peer(text: &str) -> Option<u64> {
 
 /// Opens one editor session: registers its peer, sends `begin`, the snapshot chunks and `end`,
 /// then relays the updates of every other writer and the body's status until the session
-/// ends. A refused update, a lagging relay or a body that becomes editable again ends it with
-/// `resync`, after which the UI opens a new session.
+/// ends. A session that opened with the live body keeps following it while the body waits for
+/// history. A refused update, a lagging relay, a conflict, or a body that becomes editable for
+/// a session that opened without it ends the session with `resync`, after which the UI opens
+/// a new session.
 async fn open_session(
     context: &Context<DocumentsActive>,
     request: SessionRequest,
@@ -857,6 +876,10 @@ async fn open_session(
     tokio::spawn(async move {
         let _session = session;
         let (mut access, opening) = opening;
+        // A session opened on an editable body holds the live body: it follows every change,
+        // including while the body waits for history, and keeps its own unacknowledged edits.
+        // One opened without it (pending or conflicted) must reload once the body is editable.
+        let holds_body = access.editable;
         for event in opening {
             if sender.send(event).await.is_err() {
                 return;
@@ -875,7 +898,7 @@ async fn open_session(
             let next = match event {
                 Ok(event) if event.document() != document => continue,
                 Ok(BodyEvent::Update { update, origin, .. }) => {
-                    if origin == Some(peer) || !access.editable {
+                    if origin == Some(peer) || !(access.editable || holds_body) {
                         continue;
                     }
                     json!({
@@ -889,8 +912,12 @@ async fn open_session(
                     let Ok(now) = context.blocking(move |_| Ok(hub.access(&target))).await else {
                         return;
                     };
-                    // A body that became editable, or was hidden by a conflict, is reloaded.
-                    if now != access && (now.editable || now.reason == Some("identity_conflict")) {
+                    // A session without the body reloads once it is editable; every session
+                    // reloads when a conflict hides the body.
+                    if now != access
+                        && ((now.editable && !holds_body)
+                            || now.reason == Some("identity_conflict"))
+                    {
                         let _ = sender.send(resync).await;
                         return;
                     }
@@ -1748,7 +1775,7 @@ async fn import_edit_rows(
                             update,
                         }) => {
                             let indexed = {
-                                let _publication = hub.publication_gate.lock().unwrap();
+                                let _publication = hub.gate();
                                 hub.store.index_opened_edit(row, &record.canonical)
                             };
                             match indexed {
@@ -1974,7 +2001,7 @@ async fn reopen_metadata(
     waiting_only: bool,
 ) -> Result<(), BackendError> {
     let _guard = hub.metadata_lock.lock().await;
-    if waiting_only && hub.waiting_metadata.lock().unwrap().is_empty() {
+    if waiting_only && recover(&hub.waiting_metadata).is_empty() {
         return Ok(());
     }
     for deferred in [false, true] {
@@ -1989,7 +2016,7 @@ async fn reopen_metadata(
         })
         .await?;
         let rows: Vec<_> = if waiting_only {
-            let waiting = hub.waiting_metadata.lock().unwrap();
+            let waiting = recover(&hub.waiting_metadata);
             rows.into_iter()
                 .filter(|row| waiting.contains(&row.record_id))
                 .collect()
@@ -2011,10 +2038,7 @@ async fn reopen_metadata(
             for (row, result) in batch.iter().zip(results) {
                 match result {
                     OpenResult::WaitingForHistoryAccess => {
-                        hub.waiting_metadata
-                            .lock()
-                            .unwrap()
-                            .insert(row.record_id.clone());
+                        recover(&hub.waiting_metadata).insert(row.record_id.clone());
                     }
                     OpenResult::Ready(record) => {
                         if deferred && row.purpose == DomainRecord::EDIT_KIND {
@@ -2024,20 +2048,17 @@ async fn reopen_metadata(
                                 || record.purpose != row.purpose
                                 || record.signature != row.signature
                             {
-                                hub.waiting_metadata
-                                    .lock()
-                                    .unwrap()
-                                    .insert(row.record_id.clone());
+                                recover(&hub.waiting_metadata).insert(row.record_id.clone());
                                 continue;
                             }
                             let indexed = {
-                                let _publication = hub.publication_gate.lock().unwrap();
+                                let _publication = hub.gate();
                                 store
                                     .index_opened_edit(row, &record.canonical)
                                     .map_err(|_| storage_failed())?
                             };
                             if !indexed {
-                                hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
+                                recover(&hub.waiting_metadata).remove(&row.record_id);
                                 for affected in
                                     store.conflicted_documents().map_err(|_| storage_failed())?
                                 {
@@ -2054,10 +2075,10 @@ async fn reopen_metadata(
                                 .remember_opened(&row.record_id, &row.order_key, &record.canonical)
                                 .map_err(|_| storage_failed())?;
                         }
-                        hub.waiting_metadata.lock().unwrap().remove(&row.record_id);
+                        recover(&hub.waiting_metadata).remove(&row.record_id);
                     }
                     OpenResult::WrongScope | OpenResult::Corrupt => {
-                        let mut waiting = hub.waiting_metadata.lock().unwrap();
+                        let mut waiting = recover(&hub.waiting_metadata);
                         if deferred && row.purpose == DomainRecord::EDIT_KIND {
                             waiting.insert(row.record_id.clone());
                         } else {
@@ -2103,7 +2124,7 @@ async fn rehydrate(
                         && record.purpose == row.purpose
                         && record.signature == row.signature =>
                 {
-                    let _publication = hub.publication_gate.lock().unwrap();
+                    let _publication = hub.gate();
                     store
                         .index_opened_edit(row, &record.canonical)
                         .map_err(|_| storage_failed())?;
@@ -2238,7 +2259,7 @@ where
             return Err(error("documents.import_failure", false));
         }
         let next = {
-            let _publication = hub.publication_gate.lock().unwrap();
+            let _publication = hub.gate();
             if hub.with_body(document, |body| body.pending_request_id().is_some())
                 && !hub.qualified.load(Ordering::Acquire)
             {
@@ -2262,7 +2283,7 @@ where
                         .is_some_and(|id| body.identity(id).is_some())
                 });
                 if saved {
-                    let _publication = hub.publication_gate.lock().unwrap();
+                    let _publication = hub.gate();
                     if hub
                         .store
                         .identity_conflicted(document)
@@ -2297,7 +2318,7 @@ where
         {
             return Err(error("documents.identity_conflict", false));
         }
-        let _publication = hub.publication_gate.lock().unwrap();
+        let _publication = hub.gate();
         if hub
             .store
             .import_failure(document)
@@ -2350,7 +2371,7 @@ async fn append_edit(
     // mistake the local preview for an imported body. A replay may commit while SQLite
     // projection is in flight; only that commit may clear this flag.
     if let Some((id, digest)) = &identity {
-        let _publication = hub.publication_gate.lock().unwrap();
+        let _publication = hub.gate();
         hub.remember_identity(document, id, author, *digest, true);
         hub.with_body(document, |body| body.set_projection_pending(id, true));
     }
@@ -2502,6 +2523,14 @@ async fn stage_local_write(
         LocalWrite::Update { bytes, .. } => Some(Sha256::digest(bytes).into()),
         LocalWrite::Revision { .. } => None,
     };
+    // A revision is merged first, on a blocking thread and holding nothing but this Document's
+    // append lock, so a slow merge delays only this write.
+    let mut merged = match write {
+        LocalWrite::Revision { base, markdown } => {
+            Some(merge_off_lock(hub, document, base, markdown).await?)
+        }
+        LocalWrite::Update { .. } => None,
+    };
     let identity_guard = hub.identity_lookup_lock.clone().lock_owned().await;
     let found = lookup_identities(log, &hub.store, hub, &[request_id.to_owned()]).await?;
     if let Some((old_document, old_author, old_digest, durable)) = found.get(request_id) {
@@ -2533,7 +2562,7 @@ async fn stage_local_write(
     {
         return Err(invalid_request());
     }
-    let publication = hub.publication_gate.lock().unwrap();
+    let publication = hub.gate();
     if hub
         .store
         .import_failure(document)
@@ -2558,12 +2587,15 @@ async fn stage_local_write(
                     .map_err(update_error)?;
                 digest
             }
-            (LocalWrite::Revision { base, markdown }, _) => {
+            (LocalWrite::Revision { .. }, _) => {
                 if body.identity(request_id).is_some() {
                     return Err(invalid_request());
                 }
+                let Some((peer, merged)) = merged.take() else {
+                    return Err(error("documents.edit_failed", true));
+                };
                 if !body
-                    .merge_markdown(base, markdown, request_id.to_owned())
+                    .stage_merged(peer, request_id.to_owned(), &merged)
                     .map_err(update_error)?
                 {
                     return Ok((body.revision(), body.frontiers(), None, false));
@@ -2605,6 +2637,36 @@ async fn stage_local_write(
         _append: append_guard,
         _identity: identity_guard,
     })
+}
+
+/// Merges a Markdown revision of `base` into a fork of the body of `document`, as a fresh peer,
+/// on a blocking thread. The bodies lock is held only to fork; the merge holds no lock, so other
+/// Documents keep reading, writing and publishing while it runs. Returns the peer and the merge.
+async fn merge_off_lock(
+    hub: &BodyHub,
+    document: &str,
+    base: &Frontiers,
+    markdown: &str,
+) -> Result<(u64, crate::markdown::Merged), BackendError> {
+    let (source, peer) = hub
+        .with_body(document, |body| body.merge_source())
+        .map_err(update_error)?;
+    let base = base.clone();
+    let markdown = markdown.to_owned();
+    #[cfg(test)]
+    let pause = tests::merge_pause(document);
+    let merged = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((started, release)) = pause {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+        crate::body::merge_revision(&source, &base, &markdown, peer)
+    })
+    .await
+    .map_err(|_| error("documents.edit_failed", true))?
+    .map_err(update_error)?;
+    Ok((peer, merged))
 }
 
 /// Waits until every staged update of `document` has reached the Core record log.
@@ -2860,7 +2922,7 @@ impl RecordLogSink for DocumentsSink {
         // observation gives pending editors another opportunity to open sealed edits.
         self.changes
             .send_modify(|revision| *revision = revision.saturating_add(1));
-        if self.hub.waiting_metadata.lock().unwrap().is_empty() {
+        if recover(&self.hub.waiting_metadata).is_empty() {
             return;
         }
         let store = self.store.clone();
@@ -3010,8 +3072,9 @@ mod tests {
         crate::markdown::export(&doc).unwrap_or_default()
     }
 
-    // Verifies: AC3 — the snapshot reaches a session in chunks that reassemble to the body, and
-    // no session event, including the largest possible update, exceeds one UI message.
+    // Verifies: TEAM.SYS.DOCS-R05, TEAM.SYS.DOCS-R09 — the snapshot reaches a session in chunks
+    // that reassemble to the body, and no session event, including the largest possible update,
+    // exceeds one UI message.
     #[test]
     fn session_events_reassemble_and_never_exceed_one_ui_message() {
         let directory = tempfile::tempdir().unwrap();
@@ -3065,8 +3128,8 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(BodyEvent::Update { .. })));
     }
 
-    // Verifies: AC5 — the Markdown request delivers the Canonical Markdown in bounded chunks of
-    // one text.
+    // Verifies: TEAM.SYS.DOCS-R11 — the Markdown request delivers the Canonical Markdown in bounded
+    // chunks of one text.
     #[test]
     fn markdown_chunks_reassemble_to_the_canonical_export_within_one_ui_message() {
         let directory = tempfile::tempdir().unwrap();
@@ -3108,7 +3171,8 @@ mod tests {
         );
     }
 
-    // Verifies: AC3 — a Document whose records cannot all be opened is pending, never partial.
+    // Verifies: TEAM.SYS.DOCS-R05 — a Document whose records cannot all be opened is pending, never
+    // partial.
     #[test]
     fn pending_body_opens_a_session_without_a_partial_snapshot() {
         let directory = tempfile::tempdir().unwrap();
@@ -5698,8 +5762,9 @@ mod tests {
         doc.export(loro::ExportMode::updates(&before)).unwrap()
     }
 
-    // Verifies: AC3 — a remote record that leaves a schema-invalid tree is an import failure of
-    // category `schema_violation`, and the last good body stays visible, read-only and incomplete.
+    // Verifies: TEAM.SYS.DOCS-R05 — a remote record that leaves a schema-invalid tree is an import
+    // failure of category `schema_violation`, and the last good body stays visible, read-only and
+    // incomplete.
     #[tokio::test]
     async fn schema_invalid_remote_record_is_an_import_failure_that_keeps_the_last_good_body() {
         let directory = tempfile::tempdir().unwrap();
@@ -5752,9 +5817,9 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: AC2, AC3 — each local update is appended once as its own record, a refused
-    // update appends nothing, a remote record is relayed to the open editor session, and the
-    // Package SQLite never holds the body's text.
+    // Verifies: TEAM.SYS.DOCS-R05, TEAM.SYS.DOCS-R09 — each local update is appended once as its
+    // own record, a refused update appends nothing, a remote record is relayed to the open editor
+    // session, and the Package SQLite never holds the body's text.
     #[tokio::test]
     async fn local_updates_are_appended_once_and_remote_edits_pushed_without_plaintext() {
         let directory = tempfile::tempdir().unwrap();
@@ -5915,8 +5980,9 @@ mod tests {
             .collect()
     }
 
-    // Verifies: AC4 — two views on one Installation are two sessions with distinct peers; both
-    // edit, each receives only the other's update, and both converge on an intact history.
+    // Verifies: TEAM.SYS.DOCS-R05 — two views on one Installation are two sessions with distinct
+    // peers; both edit, each receives only the other's update, and both converge on an intact
+    // history.
     #[tokio::test]
     async fn two_sessions_on_one_backend_relay_each_others_updates_and_converge() {
         let directory = tempfile::tempdir().unwrap();
@@ -5984,8 +6050,9 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: AC3, AC4 — a refused update ends its session with `resync` and appends nothing;
-    // the same UI may resume as its own peer, never as an open session's or another writer's.
+    // Verifies: TEAM.SYS.DOCS-R05 — a refused update ends its session with `resync` and appends
+    // nothing; the same UI may resume as its own peer, never as an open session's or another
+    // writer's.
     #[tokio::test]
     async fn a_refused_update_resyncs_its_session_and_only_its_own_peer_resumes() {
         let directory = tempfile::tempdir().unwrap();
@@ -6070,6 +6137,221 @@ mod tests {
         for open in [observer, resumed, taken, refused_foreign] {
             open.close().await;
         }
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a session that holds the body keeps its unacknowledged
+    // edits while the body waits for history delivered out of order (C before B): it gains
+    // what the body adopts, is never resynced, and its retried update lands.
+    #[tokio::test]
+    async fn a_session_keeps_its_edits_while_history_arrives_out_of_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut ui = UiSession::open(&mut session.harness, &document).await;
+        assert_eq!(ui.begin["editable"], true);
+        let mut writer = Writer::of(&session.handles, &document);
+        let b = writer.write("from bob B\n");
+        let c = writer.write("from bob B\n\nthen C\n");
+        let remote = |seed: u64, update: Vec<u8>| {
+            record_frame(
+                seed,
+                "bob",
+                &DomainRecord::identified_document_edit(
+                    "bob",
+                    &document,
+                    &hex(32, seed),
+                    &[seed as u8; 32],
+                    update,
+                )
+                .unwrap(),
+            )
+        };
+
+        // C arrives first: the body waits for B and is not editable.
+        assert!(session.scripted.stream().send(remote(31, c)).await);
+        let pending = ui.next().await;
+        assert_eq!(pending["event"], "status", "{pending}");
+        assert_eq!(pending["editable"], false);
+        let mine = type_into(&ui.doc, 0, false, "mine ");
+        let refused = ui
+            .send(&mut session.harness, &document, &hex(32, 0xc1), &mine)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "documents.document_pending");
+        assert!(refused.retryable());
+
+        // B arrives: the session gains B and C, then learns the body is editable, with no resync.
+        assert!(session.scripted.stream().send(remote(32, b)).await);
+        let seen = ui
+            .follow_until(|markdown| markdown.contains("then C"))
+            .await;
+        assert!(
+            seen.iter().all(|event| event["event"] != "resync"),
+            "{seen:?}"
+        );
+        let mut editable = seen
+            .iter()
+            .any(|event| event["event"] == "status" && event["editable"] == true);
+        while !editable {
+            let event = ui.next().await;
+            assert_ne!(event["event"], "resync", "{event}");
+            editable = event["event"] == "status" && event["editable"] == true;
+        }
+
+        // The same request, retried with the same bytes, now lands.
+        ui.send(&mut session.harness, &document, &hex(32, 0xc1), &mine)
+            .await
+            .unwrap();
+        let body = session.handles.bodies.lock().unwrap()[&document]
+            .text()
+            .to_owned();
+        assert!(body.contains("mine") && body.contains("then C"), "{body:?}");
+        assert_eq!(ui.markdown(), body);
+        assert_eq!(edit_appends(&session.scripted).len(), 1);
+        ui.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — an update that races its session's end is refused as
+    // `unknown_session` with nothing appended; the UI reconnects as the same peer, recovery
+    // proves the request absent, and the same bytes then land.
+    #[tokio::test]
+    async fn an_update_racing_its_sessions_end_is_absent_and_lands_after_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let ui = UiSession::open(&mut session.harness, &document).await;
+        let peer = ui.peer;
+        let update = type_into(&ui.doc, 0, true, "raced");
+        ui.close().await;
+        let hub = session.handles.hub.clone();
+        wait_until(|| hub.session(peer).is_none(), "the session ended").await;
+        let request_id = hex(32, 0xd1);
+        let request = json!({
+            "documentId": document, "sessionPeer": peer.to_string(),
+            "requestId": request_id, "update": STANDARD.encode(&update),
+        });
+        let error = session
+            .harness
+            .request("documents.document.update", request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "documents.unknown_session");
+        assert!(edit_appends(&session.scripted).is_empty());
+
+        let resumed = UiSession::open_with(
+            &mut session.harness,
+            json!({ "documentId": document, "resumePeer": peer.to_string() }),
+        )
+        .await;
+        assert_eq!(resumed.peer, peer);
+        let recovered = session
+            .harness
+            .request(
+                "documents.document.recover",
+                json!({ "documentId": document, "requestIds": [request_id] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered["requestStatuses"][0]["inclusion"], "absent",
+            "{recovered}"
+        );
+        session
+            .harness
+            .request("documents.document.update", request)
+            .await
+            .unwrap();
+        assert_eq!(edit_appends(&session.scripted).len(), 1);
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            "raced\n"
+        );
+        resumed.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — adopting an import keeps the bookkeeping that changed after
+    // the import was classified: an append that succeeded is not staged again, and an identity
+    // that became durable stays durable.
+    #[test]
+    fn adopting_an_import_keeps_bookkeeping_changed_since_it_was_classified() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, _receiver) = broadcast::channel(256);
+        let hub = test_hub(store, events);
+        hub.apply_edits(&[("doc".into(), TEST_GENESIS.clone())]);
+        let id = hex(32, 0x41);
+        hub.with_body("doc", |body| {
+            let peer = body.allocate_peer();
+            let update = body.revision_update(peer, "local\n");
+            body.accept_local_update(peer, id.clone(), &update).unwrap();
+            body.remember_identity(id.clone(), ALICE.into(), [4; 32], false)
+                .unwrap();
+        });
+        let remote = Writer::new().write("remote\n");
+        let (candidate, _) = hub
+            .with_body("doc", |body| body.import_candidate(&remote))
+            .unwrap();
+        // Outside the gate, before the candidate is adopted: the staged update is appended.
+        hub.with_body("doc", |body| {
+            body.append_succeeded();
+            body.remember_identity(id.clone(), ALICE.into(), [4; 32], true)
+                .unwrap();
+            body.set_projection_pending(&id, true);
+        });
+        hub.adopt("doc", candidate, None);
+        hub.with_body("doc", |body| {
+            assert!(
+                !body.has_pending(),
+                "the appended update is not staged again"
+            );
+            let known = body.identity(&id).unwrap();
+            assert!(known.durable && known.projection_pending);
+            assert!(body.text().contains("local") && body.text().contains("remote"));
+        });
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a panic while the publication gate was held does not stop
+    // later local writes or remote imports.
+    #[tokio::test]
+    async fn a_poisoned_publication_gate_still_admits_writes_and_imports() {
+        let directory = tempfile::tempdir().unwrap();
+        let (session, document) = editable_document(directory.path()).await;
+        let gate = session.handles.hub.publication_gate.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = gate.lock().unwrap();
+            panic!("a panic under the gate");
+        })
+        .join();
+        assert!(session.handles.hub.publication_gate.is_poisoned());
+        person_types(&session.handles, &document, 0, true, "still ").await;
+        let update = Writer::of(&session.handles, &document).write("still\n\nand remote\n");
+        let remote = DomainRecord::identified_document_edit(
+            "bob",
+            &document,
+            &hex(32, 0x42),
+            &[5; 32],
+            update,
+        )
+        .unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(42, "bob", &remote))
+                .await
+        );
+        let bodies = session.handles.bodies.clone();
+        let target = document.clone();
+        wait_until(
+            || {
+                bodies.lock().unwrap()[&target]
+                    .text()
+                    .contains("and remote")
+            },
+            "the remote edit",
+        )
+        .await;
         session.harness.shutdown().await.unwrap();
     }
 
@@ -6423,6 +6705,156 @@ mod tests {
             .unwrap();
     }
 
+    /// `length` lowercase letters from `seed`, unrelated to any other seed's: a worst case for a
+    /// character diff.
+    fn letters(seed: u64, length: usize) -> String {
+        let mut state = seed | 1;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'a' + (state % 26) as u8)
+            })
+            .collect()
+    }
+
+    /// How long one revise may take when its character diff exhausts the merge's diff budget
+    /// (`markdown::DIFF_BUDGET`). Measured: about 0.9 s in release and 10 s in the debug build.
+    /// An unbounded diff of the same texts took 146 s in release.
+    const LARGE_REVISE_BOUND: Duration = if cfg!(debug_assertions) {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(5)
+    };
+
+    // Verifies: TEAM.SYS.DOCS-R12 — a revise that replaces one 150 K-character paragraph with
+    // unrelated text returns within a stated bound, as one record, instead of running an
+    // unbounded character diff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revise_replacing_a_large_paragraph_returns_within_its_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        let first = letters(1, 150_000);
+        let revised = revise(
+            &mut session.harness,
+            &document,
+            &read["version"],
+            &format!("{first}\n"),
+        )
+        .await
+        .unwrap();
+        let before = appends(&session);
+        let second = letters(2, 150_000);
+        let started = std::time::Instant::now();
+        let replaced = revise(
+            &mut session.harness,
+            &document,
+            &revised["version"],
+            &format!("{second}\n"),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed < LARGE_REVISE_BOUND, "the revise took {elapsed:?}");
+        assert_eq!(replaced["changed"], true);
+        assert_eq!(appends(&session), before + 1, "one record");
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            format!("{second}\n")
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    type MergePause = (
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    /// Merges of these Documents wait, once each, after reporting that they started.
+    static MERGE_PAUSES: std::sync::LazyLock<Mutex<HashMap<String, MergePause>>> =
+        std::sync::LazyLock::new(Mutex::default);
+
+    /// The pause a test set for the next merge of `document`, if any.
+    pub(super) fn merge_pause(document: &str) -> Option<MergePause> {
+        recover(&MERGE_PAUSES).remove(document)
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — a revise merges without holding the publication gate, the
+    // bodies lock or the identity lock, so a session update on another Document completes while
+    // the merge is still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_running_merge_does_not_block_an_update_on_another_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, merging) = ported_document(&mut session).await;
+        let other = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({ "collectionId": collection, "title": "Other" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (started, on_start) = std::sync::mpsc::sync_channel(1);
+        let (release, on_release) = std::sync::mpsc::sync_channel(1);
+        recover(&MERGE_PAUSES).insert(merging.clone(), (started, on_release));
+        let handles = session.handles.clone();
+        let target = merging.clone();
+        let revising = tokio::spawn(async move {
+            let base = handles.bodies.lock().unwrap()[&target].frontiers();
+            let staged = stage_local_write(
+                &handles.log,
+                &handles.hub,
+                ALICE,
+                &target,
+                &hex(32, 0xe1),
+                LocalWrite::Revision {
+                    base: &base,
+                    markdown: "merged later\n",
+                },
+            )
+            .await?;
+            drop(staged);
+            drain_local_writes(&handles.log, &handles.hub, &handles.changes, ALICE, &target).await
+        });
+        tokio::task::spawn_blocking(move || on_start.recv().unwrap())
+            .await
+            .unwrap();
+
+        // The merge is running: an update on the other Document goes through now.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            person_types(&session.handles, &other, 0, true, "typed"),
+        )
+        .await
+        .expect("the update did not wait for the merge");
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&other].text(),
+            "typed\n"
+        );
+        assert!(!revising.is_finished());
+
+        release.send(()).unwrap();
+        revising.await.unwrap().unwrap();
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&merging].text(),
+            "merged later\n"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
     #[test]
     fn public_port_contract_has_exact_closed_bounded_shapes() {
         let contract = teamarness_package_contract::port_contract::compile_port_contracts(
@@ -6458,6 +6890,18 @@ mod tests {
                 .description
                 .contains("must not be retried automatically")
         );
+        // Every code the provider's revise returns is named for the Consumer.
+        for code in [
+            "documents.base_unavailable",
+            "documents.revision_too_large",
+            "documents.schema_violation",
+            "documents.unknown_document",
+            "documents.pending",
+            "documents.unavailable",
+            "documents.actor_unauthorized",
+        ] {
+            assert!(revise.description.contains(code), "{code}");
+        }
         let markdown = provided
             .ports
             .iter()
@@ -6509,8 +6953,9 @@ mod tests {
         ));
     }
 
-    // Verifies: AC8 — every shared merge scenario holds through the provider, with each person's
-    // concurrent edits applied through the local write path before the revise arrives.
+    // Verifies: TEAM.SYS.DOCS-R12 — every shared merge scenario holds through the provider, with
+    // each person's concurrent edits applied through the local write path before the revise
+    // arrives.
     #[tokio::test]
     async fn every_shared_merge_scenario_holds_through_document_revise() {
         let table: JsonValue =
@@ -6605,8 +7050,8 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: AC8 — list, read, revise and observe, with Person authority and the typed
-    // refusals, each refusal appending nothing.
+    // Verifies: TEAM.SYS.DOCS-R12 — list, read, revise and observe, with Person authority and the
+    // typed refusals, each refusal appending nothing.
     #[tokio::test]
     async fn ports_list_read_revise_observe_and_refuse() {
         let directory = tempfile::tempdir().unwrap();
@@ -6811,7 +7256,7 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: AC8 — a body that cannot be read now is refused with its typed error.
+    // Verifies: TEAM.SYS.DOCS-R12 — a body that cannot be read now is refused with its typed error.
     #[tokio::test]
     async fn port_reads_refuse_pending_unavailable_and_oversized_bodies() {
         let directory = tempfile::tempdir().unwrap();

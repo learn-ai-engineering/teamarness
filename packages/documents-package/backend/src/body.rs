@@ -9,7 +9,8 @@
 //! The backend never edits a body as a Loro peer of its own. Every operation comes from a peer
 //! that [`DocumentBody::allocate_peer`] handed out: one per genesis, per Markdown merge and (from
 //! the editor session seam) per UI session. Peers are random, absent from the Document's
-//! version vector, never reused in this process, and never derived from the Installation.
+//! version vector when allocated, and never derived from the Installation. The only reuse is an
+//! editor session resuming as its own peer (`BodyHub::register_session`).
 //!
 //! An editor session loads the body from [`DocumentBody::snapshot`] and then follows the
 //! operations each change adds ([`DocumentBody::updates_since`]); it never replays records.
@@ -207,7 +208,7 @@ impl DocumentBody {
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
-    /// The body's current version, a base for [`Self::merge_markdown`].
+    /// The body's current version, a base for a Markdown merge ([`Self::merge_source`]).
     pub(crate) fn frontiers(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
@@ -384,27 +385,26 @@ impl DocumentBody {
         Ok(())
     }
 
-    /// Merges a Markdown revision made against `base` as one update from a fresh peer, and
-    /// stages it through [`Self::accept_local_update`].
-    ///
-    /// Returns `false`, with nothing staged, when the revision changes nothing. A merge whose
-    /// update does not fit one record is refused, and nothing is staged.
-    pub(crate) fn merge_markdown(
-        &mut self,
-        base: &Frontiers,
-        revision: &str,
-        request_id: String,
-    ) -> Result<bool, BodyError> {
+    /// What a Markdown merge starts from: a fork of the body and a fresh peer for it. The merge
+    /// itself ([`merge_revision`]) then runs without the body, and [`Self::stage_merged`] stages
+    /// its update.
+    pub(crate) fn merge_source(&self) -> Result<(LoroDoc, u64), BodyError> {
         if !self.editable() || self.has_pending() {
             return Err(BodyError::NotReady);
         }
-        let peer = self.allocate_peer();
-        let merged =
-            markdown::merge(&self.doc, base, revision, peer).map_err(|error| match error {
-                MergeError::BaseUnavailable => BodyError::BaseUnavailable,
-                MergeError::Schema(violation) => BodyError::Schema(violation),
-                MergeError::PeerInUse | MergeError::Loro(_) => BodyError::Loro,
-            })?;
+        Ok((self.doc.fork(), self.allocate_peer()))
+    }
+
+    /// Stages a merged revision from `peer` through [`Self::accept_local_update`].
+    ///
+    /// Returns `false`, with nothing staged, when the revision changes nothing. A merge whose
+    /// update does not fit one record is refused, and nothing is staged.
+    pub(crate) fn stage_merged(
+        &mut self,
+        peer: u64,
+        request_id: String,
+        merged: &markdown::Merged,
+    ) -> Result<bool, BodyError> {
         if merged.ops == 0 {
             return Ok(false);
         }
@@ -413,6 +413,32 @@ impl DocumentBody {
         }
         self.accept_local_update(peer, request_id, &merged.update)?;
         Ok(true)
+    }
+
+    /// Merges a Markdown revision made against `base` as one update from a fresh peer, and
+    /// stages it: [`Self::merge_source`], [`merge_revision`] and [`Self::stage_merged`] in one.
+    #[cfg(test)]
+    pub(crate) fn merge_markdown(
+        &mut self,
+        base: &Frontiers,
+        revision: &str,
+        request_id: String,
+    ) -> Result<bool, BodyError> {
+        let (source, peer) = self.merge_source()?;
+        let merged = merge_revision(&source, base, revision, peer)?;
+        self.stage_merged(peer, request_id, &merged)
+    }
+
+    /// Adopts `candidate`, an import built from a fork of this body, keeping the bookkeeping
+    /// that changed since the fork: only the Loro documents and what they derive are taken.
+    pub(crate) fn adopt_import(&mut self, candidate: DocumentBody) {
+        self.doc = candidate.doc;
+        self.text = candidate.text;
+        self.applied = candidate.applied;
+        self.revision = candidate.revision;
+        self.pending_history = candidate.pending_history;
+        self.pending_updates = candidate.pending_updates;
+        self.foreign_peers.extend(candidate.foreign_peers);
     }
 
     /// The ID of the one staged identified request, if present.
@@ -490,6 +516,22 @@ impl DocumentBody {
             .map(|blocks| content_bytes(&blocks))
             .unwrap_or(0)
     }
+}
+
+/// Merges `revision`, a Markdown revision of `base`, into `source` as `peer` (see
+/// [`markdown::merge`]). `source` is not changed. This is the expensive part of a revise, so the
+/// caller runs it on a blocking thread without holding any body.
+pub(crate) fn merge_revision(
+    source: &LoroDoc,
+    base: &Frontiers,
+    revision: &str,
+    peer: u64,
+) -> Result<markdown::Merged, BodyError> {
+    markdown::merge(source, base, revision, peer).map_err(|error| match error {
+        MergeError::BaseUnavailable => BodyError::BaseUnavailable,
+        MergeError::Schema(violation) => BodyError::Schema(violation),
+        MergeError::PeerInUse | MergeError::Loro(_) | MergeError::Internal(_) => BodyError::Loro,
+    })
 }
 
 /// A body genesis: one update from a freshly allocated peer holding the root map, its
@@ -673,7 +715,8 @@ mod tests {
         fork.export(ExportMode::updates(&before)).unwrap()
     }
 
-    // Verifies: AC2 — two Installations converge whatever order and delay their records have.
+    // Verifies: TEAM.SYS.DOCS-R05 — two Installations converge whatever order and delay their
+    // records have.
     #[test]
     fn two_bodies_converge_under_shuffled_and_delayed_delivery() {
         let genesis = genesis();
@@ -715,8 +758,8 @@ mod tests {
         assert!(alice.text().contains("Alice 5") && alice.text().contains("bob item"));
     }
 
-    // Verifies: AC2 — S7 cannot recur: both Installations start from one genesis and keep
-    // their concurrent text.
+    // Verifies: TEAM.SYS.DOCS-R05 — S7 cannot recur: both Installations start from one genesis and
+    // keep their concurrent text.
     #[test]
     fn concurrent_first_edits_after_one_genesis_keep_both_sides_text() {
         let genesis = genesis();
@@ -988,7 +1031,7 @@ mod tests {
         assert_eq!(restarted.text(), "durable\n");
     }
 
-    // Verifies: AC4 — peers never collide with the history or with each other.
+    // Verifies: TEAM.SYS.DOCS-R05 — peers never collide with the history or with each other.
     #[test]
     fn allocated_peers_avoid_the_version_vector_and_earlier_allocations() {
         let genesis = genesis();

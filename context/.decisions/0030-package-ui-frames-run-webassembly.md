@@ -43,10 +43,11 @@ The Shell-realm rule of ADR 0015 is unchanged: no Package code, and no Package-c
 - `apps/teamarness-desktop/src-tauri/src/package_protocol.rs` — `FRAME_DOCUMENT_CSP`.
 - `scripts/ui-isolation-probe/` and `scripts/smoke-packaged-app.mjs` — the in-app isolation probe.
 - `crates/teamarness-package-contract/src/manifest.rs` — UI entrypoint and total size bounds.
-- Feasibility spike (branch `spike/rendered-document-editing`, `packages/documents-package/prototype-rendered-body/web/`). Under the production frame policy, `loro-crdt` 1.16.2 failed to instantiate. With only `'wasm-unsafe-eval'` added, it instantiated and edited in WebKit and Chromium, while `fetch`, XHR, `Worker`, `eval`, `new Function`, parent and top access, injected `<style>` and `style=` attributes all stayed refused.
-- `packages/documents-package/ui/frame-scenarios/` (`npm run verify:documents-editor`) runs the Documents editor under the exact frame document and policy in WebKit and Chromium.
-- **Weaknesses.** The spike served frames from a local harness, not the real WKWebView `teamarness-package:` scheme. The packaged-app probe is the authoritative check. WebKit may refuse a sandboxed top navigation without throwing, so the probe's `top-navigation-blocked` check also passes when the frame still runs one second after the attempt; an admitted navigation fails the smoke test on its result timeout instead of a named check.
+- `packages/documents-package/ui/frame-scenarios/` (`npm run verify:documents-editor`) runs the Documents editor, with `loro-crdt` WebAssembly, under the exact frame document and policy in WebKit and Chromium.
+- `scripts/ui-isolation-probe/ui/index.js` checks `wasm-instantiates` alongside `eval-blocked`, `function-constructor-blocked` and `top-navigation-blocked`.
+- **Weaknesses.** The frame scenarios serve frames from a local harness, not the real WKWebView `teamarness-package:` scheme. The packaged-app probe is the authoritative check. WebKit may refuse a sandboxed top navigation without throwing, so the probe's `top-navigation-blocked` check also passes when the frame still runs one second after the attempt; an admitted navigation fails the smoke test on its result timeout instead of a named check.
 
 ### Provenance (non-versioned)
 
+- Feasibility spike on the local branch `spike/rendered-document-editing` (`packages/documents-package/prototype-rendered-body/web/`). Under the production frame policy, `loro-crdt` 1.16.2 failed to instantiate. With only `'wasm-unsafe-eval'` added, it instantiated and edited in WebKit and Chromium, while `fetch`, XHR, `Worker`, `eval`, `new Function`, parent and top access, injected `<style>` and `style=` attributes all stayed refused.
 - Workstream `rendered-document-editing`: `scope/20261024T054907Z_rendered-document-editing.md`, `prototype/20261024T062700Z_option-c-feasibility-spike.md`, `design/20261024T070649Z_rendered-document-editing.md`.

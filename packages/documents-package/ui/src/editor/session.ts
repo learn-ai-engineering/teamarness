@@ -77,8 +77,9 @@ type Assembly = { begin: Extract<SessionEvent, { event: "begin" }>; parts: Uint8
  * unknown is sent again with the same ID and bytes. When the stream ends without `resync` (the
  * Backend generation was replaced), the session reopens as the same peer, asks
  * `documents.document.recover` which outstanding requests arrived, and resends only those proven
- * absent. On `resync`, a refused update, or a lost peer, it discards the doc, opens a new session,
- * and reports what it could not keep through `onLost`.
+ * absent; it does the same when an update is refused because the Backend no longer knows the
+ * session. On `resync`, a refused update, or a lost peer, it discards the doc, opens a new
+ * session, and reports what it could not keep through `onLost`.
  */
 export class EditorSession {
   private readonly bridge: SessionBridge;
@@ -315,6 +316,12 @@ export class EditorSession {
       }, RETRY_MS);
       return;
     }
+    if (sessionEnded(failure)) {
+      // The Backend ended this session before its stream said so: nothing was appended, and
+      // the same peer may continue, so reconnect and recover instead of discarding the queue.
+      this.reconnect();
+      return;
+    }
     void this.reload();
   }
 
@@ -332,13 +339,18 @@ export class EditorSession {
     });
   }
 
-  /** The stream ended without `resync`: reconnect as the same peer, then recover. */
+  /**
+   * The stream ended without `resync`, or the Backend no longer knows the session: reconnect as
+   * the same peer, then recover.
+   */
   private reconnect(): void {
     this.paused = true;
     this.inFlight = null;
     this.clearRetry();
+    const stream = this.stream;
     this.stream = null;
     void this.open(this.current.sessionPeer);
+    void stream?.close().catch(() => {});
   }
 
   /** Decides each outstanding request from the Backend's own record, then resends the absent. */
@@ -412,6 +424,11 @@ export class EditorSession {
     if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     this.retryTimer = null;
   }
+}
+
+/** Whether the Backend refused a request because it no longer knows the session's peer. */
+function sessionEnded(error: unknown): boolean {
+  return isPackageRequestError(error) && error.packageError?.code === "documents.unknown_session";
 }
 
 /** Whether a failed request may still have been appended: only an explicit refusal says no. */

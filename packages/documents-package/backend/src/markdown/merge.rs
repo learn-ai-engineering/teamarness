@@ -7,6 +7,7 @@
 //! character diff, marks by range), so concurrent edits inside them survive.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use loro::{
     Container, ExportMode, Frontiers, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue,
@@ -23,6 +24,12 @@ use super::schema::{
 /// The longest-common-subsequence table is bounded at this many cells (16 MiB of `u32`).
 /// Beyond it, the blocks between the unchanged prefix and suffix are paired by position.
 const LCS_CELLS: usize = 4 * 1024 * 1024;
+
+/// How long the character diffs of one merge may run together. A character diff costs about
+/// the product of the changed lengths, so unrelated long texts cannot be diffed in time; once
+/// the budget is spent, the merge is redone with every remaining changed text run replaced
+/// between its unchanged prefix and suffix.
+pub const DIFF_BUDGET: Duration = Duration::from_millis(500);
 
 /// A merged revision.
 #[derive(Debug)]
@@ -44,6 +51,8 @@ pub enum MergeError {
     /// The body at the base, or the revision, is not a body under the schema.
     Schema(SchemaViolation),
     Loro(LoroError),
+    /// An invariant of the merge did not hold; nothing was changed.
+    Internal(&'static str),
 }
 
 impl From<SchemaViolation> for MergeError {
@@ -65,6 +74,7 @@ impl fmt::Display for MergeError {
             Self::PeerInUse => write!(f, "the merge peer already has operations"),
             Self::Schema(violation) => violation.fmt(f),
             Self::Loro(error) => error.fmt(f),
+            Self::Internal(what) => write!(f, "merge invariant failed: {what}"),
         }
     }
 }
@@ -75,12 +85,26 @@ impl std::error::Error for MergeError {}
 ///
 /// `doc` is not changed: the caller appends the returned update and then imports it. `peer`
 /// must have no operations in `doc`; a fork at an older base cannot see a reused peer's later
-/// operations and would mint colliding op ids.
+/// operations and would mint colliding op ids. The character diffs share [`DIFF_BUDGET`].
 pub fn merge(
     doc: &LoroDoc,
     base: &Frontiers,
     markdown: &str,
     peer: PeerID,
+) -> Result<Merged, MergeError> {
+    merge_within(doc, base, markdown, peer, DIFF_BUDGET)
+}
+
+/// [`merge`] with the character diffs bounded by `budget`. When the budget runs out at a text
+/// run, the merge is redone on a fresh fork: the runs before it are diffed again in full (they
+/// fitted the budget once), and that run and every later one is replaced between its
+/// unchanged prefix and suffix. The result is still one update.
+pub fn merge_within(
+    doc: &LoroDoc,
+    base: &Frontiers,
+    markdown: &str,
+    peer: PeerID,
+    budget: Duration,
 ) -> Result<Merged, MergeError> {
     let mut target = parse_revision(markdown)?;
     // Schema `doc` is `block+`: an empty revision leaves one empty paragraph.
@@ -94,13 +118,28 @@ pub fn merge(
     if known.get(&peer).is_some_and(|end| *end > 0) {
         return Err(MergeError::PeerInUse);
     }
+    let mut diff = TextDiff::within(budget);
+    let merged = merge_once(doc, base, &target, peer, &mut diff)?;
+    match diff.spent_at {
+        None => Ok(merged),
+        Some(run) => merge_once(doc, base, &target, peer, &mut TextDiff::replacing_from(run)),
+    }
+}
+
+fn merge_once(
+    doc: &LoroDoc,
+    base: &Frontiers,
+    target: &[Block],
+    peer: PeerID,
+    diff: &mut TextDiff,
+) -> Result<Merged, MergeError> {
     let work = doc.fork_at(base).map_err(|_| MergeError::BaseUnavailable)?;
     work.set_peer_id(peer)?;
     configure(&work);
     // The whole body at the base must be valid before any of it is reconciled.
     read_tree(&work)?;
     let before = work.oplog_vv();
-    reconcile_blocks(&body_list(&work)?, &target, 1)?;
+    reconcile_blocks(&body_list(&work)?, target, 1, diff)?;
     work.commit();
     let after = work.oplog_vv();
     let ops = after
@@ -111,6 +150,94 @@ pub fn merge(
         .export(ExportMode::updates(&before))
         .map_err(LoroError::from)?;
     Ok(Merged { update, ops })
+}
+
+/// How the text runs of one merge are diffed: by character within a deadline, or replaced from
+/// a given run on. Runs are numbered in the order the merge visits them, which is the same on
+/// every fork of one base.
+struct TextDiff {
+    deadline: Option<Instant>,
+    replace_from: usize,
+    next_run: usize,
+    /// The run at which the deadline was reached, if it was.
+    spent_at: Option<usize>,
+}
+
+impl TextDiff {
+    fn within(budget: Duration) -> Self {
+        Self {
+            deadline: Some(Instant::now() + budget),
+            replace_from: usize::MAX,
+            next_run: 0,
+            spent_at: None,
+        }
+    }
+
+    fn replacing_from(run: usize) -> Self {
+        Self {
+            deadline: None,
+            replace_from: run,
+            next_run: 0,
+            spent_at: None,
+        }
+    }
+
+    /// Makes `run` read `target`.
+    fn apply(&mut self, run: &LoroText, target: &str) -> Result<(), MergeError> {
+        let ordinal = self.next_run;
+        self.next_run += 1;
+        if self.spent_at.is_some() || ordinal >= self.replace_from {
+            return replace_changed(run, target);
+        }
+        let timeout_ms = match self.deadline {
+            None => None,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    self.spent_at = Some(ordinal);
+                    return replace_changed(run, target);
+                }
+                Some(left.as_secs_f64() * 1000.0)
+            }
+        };
+        let options = UpdateOptions {
+            timeout_ms,
+            use_refined_diff: true,
+        };
+        if run.update(target, options).is_err() {
+            // This attempt is discarded; the merge is redone, replacing from this run.
+            self.spent_at = Some(ordinal);
+            return replace_changed(run, target);
+        }
+        Ok(())
+    }
+}
+
+/// Replaces what differs between `run` and `target`: everything between their common prefix and
+/// suffix, deleted and inserted in place. Concurrent edits outside that range keep their place.
+fn replace_changed(run: &LoroText, target: &str) -> Result<(), MergeError> {
+    let current: Vec<char> = run.to_string().chars().collect();
+    let wanted: Vec<char> = target.chars().collect();
+    let prefix = current
+        .iter()
+        .zip(&wanted)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = current[prefix..]
+        .iter()
+        .rev()
+        .zip(wanted[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let removed = current.len() - prefix - suffix;
+    if removed > 0 {
+        run.delete(prefix, removed)?;
+    }
+    let inserted: String = wanted[prefix..wanted.len() - suffix].iter().collect();
+    if !inserted.is_empty() {
+        run.insert(prefix, &inserted)?;
+    }
+    Ok(())
 }
 
 /// What Markdown makes of a block on its own. `None` means it vanishes (an empty paragraph).
@@ -230,7 +357,12 @@ fn align<K: PartialEq>(
 }
 
 /// Reconciles a block list whose blocks sit at `depth`.
-fn reconcile_blocks(list: &LoroList, target: &[Block], depth: usize) -> Result<(), MergeError> {
+fn reconcile_blocks(
+    list: &LoroList,
+    target: &[Block],
+    depth: usize,
+    diff: &mut TextDiff,
+) -> Result<(), MergeError> {
     let maps = child_maps(list);
     let current: Vec<Block> = maps
         .iter()
@@ -261,11 +393,16 @@ fn reconcile_blocks(list: &LoroList, target: &[Block], depth: usize) -> Result<(
             (None, None) => unreachable!("an alignment pair holds at least one side"),
         })
         .collect();
-    apply_steps(list, &steps, depth)
+    apply_steps(list, &steps, depth, diff)
 }
 
 /// Reconciles the items of a list whose items sit at `depth`.
-fn reconcile_items(list: &LoroList, target: &[Vec<Block>], depth: usize) -> Result<(), MergeError> {
+fn reconcile_items(
+    list: &LoroList,
+    target: &[Vec<Block>],
+    depth: usize,
+    diff: &mut TextDiff,
+) -> Result<(), MergeError> {
     let maps = child_maps(list);
     let current: Vec<Vec<Block>> = maps
         .iter()
@@ -285,21 +422,26 @@ fn reconcile_items(list: &LoroList, target: &[Vec<Block>], depth: usize) -> Resu
             (None, None) => unreachable!("an alignment pair holds at least one side"),
         })
         .collect();
-    apply_steps(list, &steps, depth)
+    apply_steps(list, &steps, depth, diff)
 }
 
-fn apply_steps(list: &LoroList, steps: &[Step], depth: usize) -> Result<(), MergeError> {
+fn apply_steps(
+    list: &LoroList,
+    steps: &[Step],
+    depth: usize,
+    diff: &mut TextDiff,
+) -> Result<(), MergeError> {
     let mut cursor = 0;
     for step in steps {
         match step {
             Step::Keep => cursor += 1,
             Step::Update(block) => {
-                update_block(&map_at(list, cursor)?, block, depth)?;
+                update_block(&map_at(list, cursor)?, block, depth, diff)?;
                 cursor += 1;
             }
             Step::UpdateItem(item) => {
                 let map = map_at(list, cursor)?;
-                reconcile_blocks(&children(&map)?, item, depth + 1)?;
+                reconcile_blocks(&children(&map)?, item, depth + 1, diff)?;
                 cursor += 1;
             }
             Step::Delete => list.delete(cursor, 1)?,
@@ -355,7 +497,12 @@ fn attributes(map: &LoroMap) -> Result<LoroMap, MergeError> {
 }
 
 /// Edits a block of the same kind as `target`, sitting at `depth`, into `target`.
-fn update_block(map: &LoroMap, target: &Block, depth: usize) -> Result<(), MergeError> {
+fn update_block(
+    map: &LoroMap,
+    target: &Block,
+    depth: usize,
+    diff: &mut TextDiff,
+) -> Result<(), MergeError> {
     let attributes = attributes(map)?;
     for (key, value) in block_attributes(target) {
         let same =
@@ -367,12 +514,12 @@ fn update_block(map: &LoroMap, target: &Block, depth: usize) -> Result<(), Merge
     let list = children(map)?;
     match target {
         Block::Paragraph(content) | Block::Heading { content, .. } => {
-            reconcile_inlines(&list, content)
+            reconcile_inlines(&list, content, diff)
         }
         Block::Code { text, .. } => {
             match list_entries(&list).into_iter().next() {
                 Some(ValueOrContainer::Container(Container::Text(run))) => {
-                    update_text(&run, &[(text.clone(), Marks::default())])?
+                    update_text(&run, &[(text.clone(), Marks::default())], diff)?
                 }
                 _ => {
                     list.clear()?;
@@ -384,15 +531,19 @@ fn update_block(map: &LoroMap, target: &Block, depth: usize) -> Result<(), Merge
             }
             Ok(())
         }
-        Block::Blockquote(blocks) => reconcile_blocks(&list, blocks, depth + 1),
+        Block::Blockquote(blocks) => reconcile_blocks(&list, blocks, depth + 1, diff),
         Block::Rule => Ok(()),
         Block::Bullet { items, .. } | Block::Ordered { items, .. } => {
-            reconcile_items(&list, items, depth + 1)
+            reconcile_items(&list, items, depth + 1, diff)
         }
     }
 }
 
-fn reconcile_inlines(list: &LoroList, target: &[Inline]) -> Result<(), MergeError> {
+fn reconcile_inlines(
+    list: &LoroList,
+    target: &[Inline],
+    diff: &mut TextDiff,
+) -> Result<(), MergeError> {
     let entries = list_entries(list);
     let wanted = segments(target);
     let shape_matches = entries.len() == wanted.len()
@@ -413,7 +564,7 @@ fn reconcile_inlines(list: &LoroList, target: &[Inline]) -> Result<(), MergeErro
             if let (ValueOrContainer::Container(Container::Text(run)), Segment::Text(runs)) =
                 (entry, want)
             {
-                update_text(run, runs)?;
+                update_text(run, runs, diff)?;
             }
         }
     } else {
@@ -424,18 +575,16 @@ fn reconcile_inlines(list: &LoroList, target: &[Inline]) -> Result<(), MergeErro
     Ok(())
 }
 
-/// Character diff for the text, then range marks for any formatting difference.
-fn update_text(run: &LoroText, wanted: &[(String, Marks)]) -> Result<(), MergeError> {
+/// Character diff for the text (bounded by `diff`), then range marks for any formatting
+/// difference.
+fn update_text(
+    run: &LoroText,
+    wanted: &[(String, Marks)],
+    diff: &mut TextDiff,
+) -> Result<(), MergeError> {
     let target: String = wanted.iter().map(|(text, _)| text.as_str()).collect();
     if run.to_string() != target {
-        run.update(
-            &target,
-            UpdateOptions {
-                timeout_ms: None,
-                use_refined_diff: true,
-            },
-        )
-        .expect("a text diff without a timeout cannot time out");
+        diff.apply(run, &target)?;
     }
     let mut want_marks: Vec<Marks> = Vec::new();
     for (text, marks) in wanted {
@@ -447,40 +596,91 @@ fn update_text(run: &LoroText, wanted: &[(String, Marks)]) -> Result<(), MergeEr
             have_marks.extend(std::iter::repeat_n(marks, text.chars().count()));
         }
     }
-    debug_assert_eq!(want_marks.len(), have_marks.len());
     for key in ["strong", "em", "strikethrough", "code", "link"] {
-        let value = |marks: &Marks| -> Option<LoroValue> {
-            mark_values(marks)
-                .into_iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v)
-        };
-        let mut index = 0;
-        while index < want_marks.len() {
-            let want = value(&want_marks[index]);
-            if want == value(&have_marks[index]) {
-                index += 1;
-                continue;
-            }
-            let start = index;
-            while index < want_marks.len()
-                && value(&want_marks[index]) == want
-                && value(&have_marks[index]) != want
-            {
-                index += 1;
-            }
-            match &want {
-                Some(v) => run.mark(start..index, key, v.clone())?,
-                None => run.unmark(start..index, key)?,
+        for (range, want) in mark_changes(&want_marks, &have_marks, key)? {
+            match want {
+                Some(v) => run.mark(range, key, v)?,
+                None => run.unmark(range, key)?,
             }
         }
     }
     Ok(())
 }
 
+/// A character range of a text run and the value one mark must take there (`None` removes it).
+type MarkChange = (std::ops::Range<usize>, Option<LoroValue>);
+
+/// The ranges where mark `key` must change so `have` (per character) becomes `want`, with the
+/// value it must take there (`None` removes it). Both sides must describe the same characters.
+fn mark_changes(want: &[Marks], have: &[Marks], key: &str) -> Result<Vec<MarkChange>, MergeError> {
+    if want.len() != have.len() {
+        return Err(MergeError::Internal(
+            "the text run does not hold the revised text",
+        ));
+    }
+    let value = |marks: &Marks| -> Option<LoroValue> {
+        mark_values(marks)
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    };
+    let mut changes = Vec::new();
+    let mut index = 0;
+    while index < want.len() {
+        let wanted = value(&want[index]);
+        if wanted == value(&have[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < want.len() && value(&want[index]) == wanted && value(&have[index]) != wanted {
+            index += 1;
+        }
+        changes.push((start..index, wanted));
+    }
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mark_changes_refuse_texts_of_different_lengths() {
+        let marks = vec![Marks::default(); 3];
+        assert!(matches!(
+            mark_changes(&marks, &marks[..2], "strong"),
+            Err(MergeError::Internal(_))
+        ));
+        assert!(mark_changes(&marks, &marks, "strong").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_spent_diff_budget_replaces_the_changed_middle_as_one_update() {
+        let doc = LoroDoc::new();
+        super::super::write_tree(&doc, &[]).unwrap();
+        let first = "a".repeat(2000) + &"xyzw".repeat(5000) + &"b".repeat(2000);
+        let merged = merge(&doc, &doc.oplog_frontiers(), &format!("{first}\n"), 11).unwrap();
+        doc.import(&merged.update).unwrap();
+        let second = "a".repeat(2000) + &"qrst".repeat(5000) + &"b".repeat(2000);
+        // No budget at all: every changed run is replaced between its prefix and suffix.
+        let replaced = merge_within(
+            &doc,
+            &doc.oplog_frontiers(),
+            &format!("{second}\n"),
+            12,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let diffed = merge(&doc, &doc.oplog_frontiers(), &format!("{second}\n"), 13).unwrap();
+        for update in [&replaced.update, &diffed.update] {
+            let check = doc.fork();
+            check.import(update).unwrap();
+            assert_eq!(super::super::export(&check).unwrap(), format!("{second}\n"));
+        }
+        // The replacement keeps the unchanged prefix and suffix: it deletes and inserts once.
+        assert_eq!(replaced.ops, 2 * 20_000);
+    }
 
     #[test]
     fn matches_trims_prefix_and_suffix() {

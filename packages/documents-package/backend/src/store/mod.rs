@@ -448,7 +448,10 @@ impl DocumentStore {
         on_commit: &dyn Fn(),
         classify: &ImportClassifier<'_>,
     ) -> Result<Ingested, StoreError> {
-        let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
+        let _ingest = self
+            .ingest_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parsed = DomainRecord::decode(canonical);
         let mut inner = lock(&self.inner)?;
         let transaction = inner.conn.transaction().map_err(rerr)?;
@@ -884,7 +887,10 @@ impl DocumentStore {
         on_commit: &dyn Fn(),
         classify: &ImportClassifier<'_>,
     ) -> Result<Ingested, StoreError> {
-        let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
+        let _ingest = self
+            .ingest_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(domain) = DomainRecord::decode(canonical) else {
             return Ok(Ingested {
                 result: IngestResult::Quarantined("malformed_record".into()),

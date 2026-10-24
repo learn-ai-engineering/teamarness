@@ -71,6 +71,34 @@ function authored(h, installation) {
   return h.workspace.records.filter((record) => record.author === installation);
 }
 
+/** `count` distinct paragraphs of about `each` characters, as Markdown. */
+function paragraphsMarkdown(count, each, label = "P") {
+  return Array.from({ length: count }, (_, index) => `${label}${index} ${"lorem ipsum dolor sit amet ".repeat(Math.ceil(each / 27))}`.slice(0, each).trim()).join("\n\n");
+}
+
+/** Gives Installation `id` a large body through port-style revisions of at most one record each. */
+async function largeBody(h, id, views, count, each) {
+  const half = Math.ceil(count / 2);
+  h.workspace.installation(id).revise(`${paragraphsMarkdown(half, each)}\n`);
+  await h.converge(views, 30_000);
+  h.workspace.installation(id).revise(`${paragraphsMarkdown(half, each)}\n\n${paragraphsMarkdown(count - half, each, "Q")}\n`);
+  return h.converge(views, 30_000);
+}
+
+/** Waits until the editor notice of `view` reads `pattern`. */
+async function noticeMatches(h, view, pattern) {
+  const notice = h.frame(view).locator(".editor-notice");
+  await h.waitFor(async () => await notice.isVisible() && pattern.test(await notice.innerText()), `${view} notice ${pattern}`);
+}
+
+/** Hides the editor notice of `view`, so the next refusal is seen afresh. */
+async function clearNotice(h, view) {
+  await h.rawFrame(view).evaluate(() => {
+    const notice = document.getElementById("teamarness-package-host").shadowRoot.querySelector(".editor-notice");
+    if (notice) { notice.hidden = true; notice.textContent = ""; }
+  });
+}
+
 /** Markdown syntax that must never appear in what a Member sees while editing. */
 const MARKDOWN_SYNTAX = [/\*\*/, /~~/, /```/, /\]\(/, /^#{1,6} /m, /^> /m, /^- /m, /^\d+\. /m, /^-{3,}$/m, /`[^`]+`/];
 
@@ -418,6 +446,80 @@ export const SCENARIOS = [
       await type(h, " and this");
       assert.equal(await h.converge(["A1", "B1"]), "keep me and this\n");
       return "refused before commit; the Backends saw nothing";
+    },
+  },
+  {
+    name: "undo and redo are refused before commit when one step cannot fit a record",
+    pastesStyledHtml: true,
+    async run(h) {
+      await h.addView("A1", "A");
+      await h.addView("B1", "B");
+      await h.editor("A1").click();
+      await type(h, "Before the paste.");
+      await h.converge(["A1", "B1"]);
+      await sleep(UNDO_MERGE_MS);
+      // A 150 KB paste is split into records, but it is one undo step.
+      const paragraphs = Array.from({ length: 610 }, (_, index) => `Paragraph ${index} ${"lorem ipsum dolor sit amet ".repeat(9)}`.slice(0, 250).trim());
+      await paste(h, "A1", { "text/html": paragraphs.map((text) => `<p>${text}</p>`).join(""), "text/plain": paragraphs.join("\n\n") });
+      const pasted = await h.converge(["A1", "B1"], 60_000);
+      assert.ok(pasted.includes(paragraphs.at(-1)));
+      await h.editor("A1").focus();
+      // Undoing the paste only deletes, so it fits one record.
+      await press(h, `${MOD}+z`);
+      const undone = await h.converge(["A1", "B1"], 30_000);
+      assert.equal(undone, "Before the paste.\n");
+      // Redoing it would re-insert 150 KB at once: refused, and nothing reaches the Backends.
+      const records = h.workspace.records.length;
+      await press(h, `${MOD}+Shift+KeyZ`);
+      await noticeMatches(h, "A1", /too large to undo or redo/);
+      await clearNotice(h, "A1");
+
+      // A delete-all on a 180 KiB body that another peer wrote: its undo cannot fit one record.
+      await largeBody(h, "B", ["A1", "B1"], 186, 990);
+      const large = h.markdown("A");
+      assert.ok(Buffer.byteLength(large) > 180 * 1024, `${Buffer.byteLength(large)} bytes`);
+      await h.editor("A1").focus();
+      await press(h, `${MOD}+a`);
+      await sleep(SELECTION_SETTLE_MS);
+      await press(h, "Backspace");
+      assert.equal(await h.converge(["A1", "B1"], 30_000), "");
+      const afterDelete = h.workspace.records.length;
+      await press(h, `${MOD}+z`);
+      await noticeMatches(h, "A1", /too large to undo or redo/);
+      // The editor still works, and the refused steps added nothing: only this edit follows.
+      await type(h, "after");
+      assert.equal(await h.converge(["A1", "B1"]), "after\n");
+      assert.equal(h.workspace.records.length, afterDelete + 1, "only the typed edit was appended after the refused undo");
+      assert.equal(afterDelete, records + 3, "the refused redo added nothing: two revisions and the delete followed it");
+      assert.deepEqual(h.workspace.refusals, []);
+      const largest = Math.max(...authored(h, "A").map((record) => record.bytes.byteLength));
+      assert.ok(largest <= MAX_UPDATE, `largest record ${largest} bytes`);
+      return `redo and undo refused before commit; largest record from A ${largest} bytes`;
+    },
+  },
+  {
+    name: "a structural edit over a large body is refused before commit",
+    async run(h) {
+      await h.addView("A1", "A");
+      await h.addView("B1", "B");
+      const markdown = await largeBody(h, "B", ["A1", "B1"], 170, 980);
+      assert.ok(Buffer.byteLength(markdown) > 160 * 1024, `${Buffer.byteLength(markdown)} bytes`);
+      const before = await h.rendered("A1");
+      const records = h.workspace.records.length;
+      await h.editor("A1").click();
+      await press(h, `${MOD}+a`);
+      await sleep(SELECTION_SETTLE_MS);
+      await h.frame("A1").getByRole("button", { name: "Blockquote" }).click();
+      await noticeMatches(h, "A1", /too large to add as one block/);
+      assert.equal(await h.rendered("A1"), before);
+      // A structural edit of one block still applies, as the only record after the refusal.
+      await caret(h, "A1", 0);
+      await press(h, "Control+Shift+Digit2");
+      const headed = await h.converge(["A1", "B1"], 30_000);
+      assert.ok(headed.startsWith("## P0 "), headed.slice(0, 40));
+      assert.equal(h.workspace.records.length, records + 1, "only the heading was appended");
+      assert.deepEqual(h.workspace.refusals, []);
+      return `${Buffer.byteLength(markdown)} bytes; blockquote refused before commit, heading applied`;
     },
   },
   {

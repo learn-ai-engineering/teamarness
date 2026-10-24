@@ -50,8 +50,6 @@ pub struct PackageStage {
     pub source: &'static str,
     /// The `teamarness.synchronization.immutable-record-log` 1.x minor the Package requires.
     pub record_log_minor: u16,
-    /// Replaces the source UI contract, so a test-only Backend can declare its extra request.
-    pub ui_contract: Option<Vec<u8>>,
 }
 
 impl PackageStage {
@@ -64,7 +62,6 @@ impl PackageStage {
             backend_file: "backend/teamarness-conversations-package-aarch64-apple-darwin",
             source: "packages/conversations-package",
             record_log_minor: 0,
-            ui_contract: None,
         }
     }
 }
@@ -589,10 +586,7 @@ pub fn stage_package_with(root: &Path, stage: &PackageStage) -> PathBuf {
     let ui = b"export function mount() { return async () => {}; }";
     let css = b"";
     let source = workspace_root().join(stage.source);
-    let contract = stage
-        .ui_contract
-        .clone()
-        .unwrap_or_else(|| fs::read(source.join("ui-contract.json")).unwrap());
+    let contract = fs::read(source.join("ui-contract.json")).unwrap();
     fs::write(package.join("ui/index.js"), ui).unwrap();
     fs::write(package.join("ui/style.css"), css).unwrap();
     fs::write(package.join("ui-contract.json"), &contract).unwrap();

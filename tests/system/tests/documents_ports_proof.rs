@@ -46,7 +46,6 @@ fn documents_stage() -> PackageStage {
         backend_file: "backend/teamarness-documents-package-aarch64-apple-darwin",
         source: "packages/documents-package",
         record_log_minor: 1,
-        ui_contract: None,
     }
 }
 

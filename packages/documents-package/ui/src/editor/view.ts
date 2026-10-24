@@ -9,12 +9,13 @@ import { liftListItem, sinkListItem, splitListItem, wrapInList } from "prosemirr
 import { EditorState, Selection, TextSelection } from "prosemirror-state";
 import type { Command, Plugin, Transaction } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
-import { LoroSyncPlugin, LoroUndoPlugin, createNodeFromLoroObj, redo, undo } from "loro-prosemirror";
+import { LoroSyncPlugin, LoroUndoPlugin, createNodeFromLoroObj } from "loro-prosemirror";
 import type { LoroDocType } from "loro-prosemirror";
 import type { LoroDoc } from "loro-crdt";
 import { guardPlugin } from "./guard";
 import type { GuardHost, GuardRefusal } from "./guard";
 import { schema } from "./schema";
+import { UndoSteps, guardedRedo, guardedUndo } from "./undo";
 
 /** A Comment quote is at most this many UTF-8 bytes (the Backend's `MAX_QUOTE`). */
 export const MAX_QUOTE = 2 * 1024;
@@ -191,8 +192,8 @@ export const editorCommands = {
   em: toggleMark(marks.em),
   strikethrough: toggleMark(marks.strikethrough),
   code: toggleMark(marks.code),
-  undo,
-  redo,
+  undo: guardedUndo,
+  redo: guardedRedo,
 } as const;
 
 /**
@@ -252,9 +253,9 @@ export function editorInputRules(): Plugin {
 /** The editor's keyboard shortcuts; `openLink` shows the link prompt. */
 export function editorKeymap(openLink: () => boolean): Record<string, Command> {
   const bindings: Record<string, Command> = {
-    "Mod-z": undo,
-    "Shift-Mod-z": redo,
-    "Mod-y": redo,
+    "Mod-z": guardedUndo,
+    "Shift-Mod-z": guardedRedo,
+    "Mod-y": guardedRedo,
     Backspace: undoInputRule,
     "Mod-b": editorCommands.strong,
     "Mod-i": editorCommands.em,
@@ -285,7 +286,8 @@ export function editorPlugins(doc: LoroDoc, guard: GuardHost, openLink: () => bo
   return [
     guardPlugin(guard),
     LoroSyncPlugin({ doc: loro }),
-    LoroUndoPlugin({ doc }),
+    // Undo and redo are measured before they apply (`undo.ts`), so the steps are tracked.
+    LoroUndoPlugin({ doc, undoManager: new UndoSteps(doc).manager }),
     editorInputRules(),
     keymap(editorKeymap(openLink)),
     keymap(baseKeymap),
@@ -322,6 +324,7 @@ function markActive(type: MarkType) {
 const REFUSAL_TEXT: Readonly<Record<GuardRefusal, string>> = {
   block_too_large: "That is too large to add as one block. Split it into smaller paragraphs and try again.",
   document_too_large: "This Document has reached its size limit. Remove some content before adding more.",
+  step_too_large: "That is too large to undo or redo at once. It is still available once the Document is smaller.",
 };
 
 export type DocumentEditorOptions = Readonly<{
@@ -384,8 +387,8 @@ export class DocumentEditor {
         { label: "Break", title: "Line break (⇧↵)", command: editorCommands.hardBreak },
       ],
       [
-        { label: "Undo", title: "Undo (⌘Z)", command: undo },
-        { label: "Redo", title: "Redo (⇧⌘Z)", command: redo },
+        { label: "Undo", title: "Undo (⌘Z)", command: guardedUndo },
+        { label: "Redo", title: "Redo (⇧⌘Z)", command: guardedRedo },
       ],
     ];
     for (const group of groups) {
