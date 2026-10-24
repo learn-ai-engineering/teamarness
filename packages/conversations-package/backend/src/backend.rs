@@ -295,6 +295,12 @@ pub(crate) fn router_observing(
         },
     )
     .port_request(
+        "dev.teamarness.conversations", "message.changes", "query",
+        |context: Context<ConversationsActive>, _actor: PortActor, request: ChangesRequest| async move {
+            changes(&context, request).await
+        },
+    )
+    .port_request(
         "dev.teamarness.conversations", "channel.list", "query",
         |context: Context<ConversationsActive>, _actor: PortActor, _: Empty| async move {
             let state = context.state().clone();
@@ -1175,8 +1181,8 @@ mod session_tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, "dev.teamarness.conversations");
-        assert_eq!((provided.major, provided.minor), (1, 1));
-        assert_eq!(provided.ports.len(), 4);
+        assert_eq!((provided.major, provided.minor), (1, 2));
+        assert_eq!(provided.ports.len(), 5);
         let list = |direction: &str, value: &JsonValue| {
             contract.validate(
                 "dev.teamarness.conversations",
@@ -1379,9 +1385,144 @@ mod session_tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.CONV-R19
+    #[tokio::test]
+    async fn message_changes_port_reuses_revision_recovery_without_marking_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let (entered, _) = std::sync::mpsc::channel();
+        let (_, release) = std::sync::mpsc::channel();
+        let mut session = start(
+            directory.path(),
+            paused_history_log(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                entered,
+                release,
+            ),
+        )
+        .await;
+        let store = session.store();
+        commit_history_row(&store, 100);
+        let (epoch, baseline) = store.history_head().unwrap();
+        let late_id = commit_history_row(&store, 2);
+        let next_id = commit_history_row(&store, 3);
+        let envelope = |request: JsonValue| {
+            json!({
+                "contract": "dev.teamarness.conversations", "major": 1, "minor": 2,
+                "port": "message.changes", "actor": {"kind":"person", "identity": ALICE},
+                "request": request,
+            })
+        };
+        let request = json!({"channelId": hex_id(GENERAL_ID), "epoch": epoch,
+            "after": baseline.to_string(), "limit": 1});
+        let ui = session
+            .harness
+            .request("conversations.channel.changes", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(ui["events"][0]["id"], late_id);
+        assert_eq!(ui["events"][0]["position"], hex(82, 2));
+        assert_eq!(ui["events"][0]["message"]["markdown"], "row 2");
+        let port = session
+            .harness
+            .request("teamarness.port.query.v1", envelope(request))
+            .await
+            .unwrap();
+        assert_eq!(port["$teamarnessPortValue"], ui);
+        let second = session.harness.request("teamarness.port.query.v1", envelope(json!({
+            "channelId": hex_id(GENERAL_ID), "epoch": epoch, "after": ui["continuation"], "limit": 1,
+        }))).await.unwrap()["$teamarnessPortValue"].clone();
+        assert_eq!(second["events"][0]["id"], next_id);
+        assert_eq!(second["continuation"], "3");
+        let terminal = session.harness.request("teamarness.port.query.v1", envelope(json!({
+            "channelId": hex_id(GENERAL_ID), "epoch": epoch, "after": second["continuation"],
+        }))).await.unwrap()["$teamarnessPortValue"].clone();
+        assert_eq!(terminal["events"], json!([]));
+        assert_eq!(terminal["continuation"], terminal["highWater"]);
+        let stale = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                envelope(json!({
+                    "channelId": hex_id(GENERAL_ID), "epoch": "0".repeat(32), "after": "0",
+                })),
+            )
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        assert_eq!(stale["resyncRequired"], true);
+        assert_eq!(store.read_ordinal(&hex_id(GENERAL_ID)).unwrap(), 0);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.PKG-R12, TEAM.SYS.CONV-R19
+    #[test]
+    fn message_changes_port_is_closed_bounded_and_additive_over_1_1() {
+        use teamarness_package_contract::port_contract::{
+            check_additive_minor_documents, compile_port_contracts,
+        };
+        let old =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.1.json")).unwrap();
+        let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
+        assert_eq!(new.contracts[0].minor, 2);
+        check_additive_minor_documents(&old, &new, "dev.teamarness.conversations").unwrap();
+        for before in &old.contracts[0].ports {
+            let after = new.contracts[0]
+                .ports
+                .iter()
+                .find(|port| port.name == before.name)
+                .unwrap();
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.request, after.request);
+            assert_eq!(before.response, after.response);
+            assert_eq!(before.event, after.event);
+        }
+        let validate = |direction, value: &JsonValue| {
+            new.validate(
+                "dev.teamarness.conversations",
+                "message.changes",
+                direction,
+                value,
+            )
+        };
+        let request = json!({"channelId": hex_id(GENERAL_ID), "epoch": "a".repeat(32), "after": "0", "limit": 32});
+        assert!(validate("request", &request).is_ok());
+        for (field, value) in [
+            ("limit", json!(0)),
+            ("limit", json!(33)),
+            ("after", json!("-1")),
+            ("actor", json!({})),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = value;
+            assert!(validate("request", &invalid).is_err());
+        }
+        let event = json!({"id":"message", "position":"01", "kind":"insert", "revision":"1", "status":"pending"});
+        assert!(
+            validate(
+                "response",
+                &json!({"events": vec![event.clone();32], "continuation":"1", "highWater":"1"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "response",
+                &json!({"events": vec![event;33], "continuation":"1", "highWater":"1"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                "response",
+                &json!({"events":[], "continuation":"1", "highWater":"1", "unexpected":true})
+            )
+            .is_err()
+        );
+    }
+
     // Verifies: TEAM.SYS.PKG-R12
     #[test]
-    fn port_contract_1_1_is_additive_over_the_shipped_1_0_document() {
+    fn port_contract_1_2_is_additive_over_the_shipped_1_0_document() {
         use teamarness_package_contract::port_contract::{
             check_additive_minor_documents, compile_port_contracts,
         };
@@ -1389,7 +1530,7 @@ mod session_tests {
             compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.0.json")).unwrap();
         let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
         assert_eq!((old.contracts[0].major, old.contracts[0].minor), (1, 0));
-        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 1));
+        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 2));
         check_additive_minor_documents(&old, &new, "dev.teamarness.conversations").unwrap();
         for name in ["message.post", "message.page", "messages.changed"] {
             let before = old.contracts[0]
@@ -2443,6 +2584,38 @@ mod session_tests {
         assert_eq!(delta["events"][1]["status"], "pending");
         assert_eq!(delta["continuation"], "2");
         assert_eq!(delta["highWater"], "4");
+        let port = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":2,
+                    "port":"message.changes", "actor":{"kind":"person","identity":ALICE},
+                    "request":{"channelId":channel_id,"epoch":head["epoch"],"after":"0","limit":2}
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(port["$teamarnessPortValue"], delta);
+        let unavailable = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":2,
+                    "port":"message.changes", "actor":{"kind":"person","identity":ALICE},
+                    "request":{"channelId":channel_id,"epoch":head["epoch"],"after":"2","limit":2}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            unavailable["$teamarnessPortValue"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|event| event["status"] == "unavailable")
+        );
         let stale = session
             .harness
             .request(

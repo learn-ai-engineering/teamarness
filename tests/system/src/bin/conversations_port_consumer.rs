@@ -154,6 +154,15 @@ async fn scenario(
         .await
         .err()
         .map(|err| err.code().to_owned());
+    let undeclared_changes = client
+        .query(
+            CONTRACT,
+            "message.changes",
+            json!({"channelId":GENERAL,"epoch":"0".repeat(32),"after":"0"}),
+        )
+        .await
+        .err()
+        .map(|err| err.code().to_owned());
     let malformed = client
         .command(
             CONTRACT,
@@ -166,7 +175,7 @@ async fn scenario(
     Ok(
         json!({"available":available,"initialQuiet":initial,"first":first,"event":event,
         "page":page,"second":second,"lateReplay":replay,"recovered":recovered,
-        "denied":denied,"malformed":malformed,"forged":forged,"hidden":hidden}),
+        "denied":denied,"undeclaredChanges":undeclared_changes,"malformed":malformed,"forged":forged,"hidden":hidden}),
     )
 }
 
