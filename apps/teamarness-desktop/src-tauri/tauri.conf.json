@@ -42,13 +42,15 @@
       "../../../target/teamarness-packages/dev.teamarness.reference/": "packages/dev.teamarness.reference/",
       "../../../target/teamarness-packages/dev.teamarness.tutorial/": "packages/dev.teamarness.tutorial/",
       "../../../target/teamarness-packages/dev.teamarness.conversations/": "packages/dev.teamarness.conversations/",
-      "../../../target/teamarness-packages/dev.teamarness.repo-aware/": "packages/dev.teamarness.repo-aware/"
+      "../../../target/teamarness-packages/dev.teamarness.repo-aware/": "packages/dev.teamarness.repo-aware/",
+      "../../../target/teamarness-packages/dev.teamarness.agent/": "packages/dev.teamarness.agent/"
     },
     "externalBin": [
       "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
       "../../../target/teamarness-packages/dev.teamarness.tutorial/backend/teamarness-tutorial-package",
       "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package",
-      "../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package"
+      "../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package",
+      "../../../target/teamarness-packages/dev.teamarness.agent/backend/teamarness-agent-package"
     ]
   }
 }

@@ -12,6 +12,9 @@
     },
     {
       "directory": "packages/dev.teamarness.repo-aware"
+    },
+    {
+      "directory": "packages/dev.teamarness.agent"
     }
   ]
 }

@@ -160,6 +160,7 @@ const PACKAGE_UI_DIRECTORIES = [
   ["packages/tutorial/ui", "TutorialContract"],
   ["packages/conversations-package/ui", "ConversationsContract"],
   ["packages/repo-aware/ui", "RepoAwareContract"],
+  ["packages/agent-package/ui", "AgentContract"],
 ];
 
 test("Package UIs use contract-typed requests and shared style adoption", async () => {
@@ -197,6 +198,7 @@ const BACKEND_DIRECTORIES = [
   "packages/tutorial/backend",
   "packages/conversations-package/backend",
   "packages/repo-aware/backend",
+  "packages/agent-package/backend",
   "templates/package-foundation/v1/backend",
 ];
 
@@ -306,6 +308,7 @@ test("generated foundation and bundled Package policies remain independent", asy
     "dev.teamarness.tutorial",
     "dev.teamarness.conversations",
     "dev.teamarness.repo-aware",
+    "dev.teamarness.agent",
   ]);
   assert.deepEqual(index, applicationIndexDocument(bundled));
   const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
@@ -370,6 +373,7 @@ test("Package UIs run only in sandboxed frames and the Shell realm loads no Pack
     "packages/tutorial/ui/src",
     "packages/conversations-package/ui/src",
     "packages/repo-aware/ui/src",
+    "packages/agent-package/ui/src",
     "templates/package-foundation/v1/ui/src",
     "apps/teamarness-desktop/src/package-frame",
   ];
