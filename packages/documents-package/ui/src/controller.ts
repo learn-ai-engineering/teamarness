@@ -1,4 +1,4 @@
-import { describePackageError, isAbortError } from "@teamarness/package-ui-sdk";
+import { describePackageError, isAbortError, packageErrorCode } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
 import type { Collection, Comment, Document, DocumentsContract, Names, Snapshot } from "./contract.generated";
 import { EditorSession, clientBridge } from "./editor/session";
@@ -60,6 +60,23 @@ export class DocumentsController {
   /** The open Document's editor session state, once its session has started. */
   get openSession(): SessionState | null {
     return this.session?.state ?? null;
+  }
+
+  /** The open Document's editor session: its Loro document, export cadence and size. */
+  get editorSession(): EditorSession | null {
+    return this.session;
+  }
+
+  /** The open Document as Canonical Markdown, read from the Backend in chunks. */
+  async documentMarkdown(): Promise<string> {
+    const documentId = this._state.openDocumentId;
+    if (documentId === null) throw new Error("No Document is open.");
+    try {
+      return await readChunkedMarkdown((chunkIndex) =>
+        this.client.request("documents.document.markdown", { documentId, chunkIndex }));
+    } catch (error) {
+      throw new Error(describeError(error), { cause: error });
+    }
   }
 
   get openDocument(): Document | null {
@@ -321,6 +338,40 @@ export class DocumentsController {
   }
 }
 
+type MarkdownChunk = DocumentsContract["requests"]["documents.document.markdown"]["response"];
+
+/** How many times a Markdown read starts over when the Document changes while it is read. */
+export const MARKDOWN_READ_ATTEMPTS = 3;
+
+/**
+ * Reads a chunked Markdown export. Every chunk must carry the first chunk's digest and count;
+ * when one does not, the Document changed meanwhile and the read starts over from chunk 0. When
+ * the frame can hash, the reassembled text is checked against the digest too.
+ */
+export async function readChunkedMarkdown(read: (chunkIndex: number) => Promise<MarkdownChunk>): Promise<string> {
+  for (let attempt = 0; attempt < MARKDOWN_READ_ATTEMPTS; attempt += 1) {
+    const first = await read(0);
+    const parts = [first.chunk];
+    let consistent = first.chunkIndex === 0;
+    for (let index = 1; consistent && index < first.chunks; index += 1) {
+      const next = await read(index);
+      consistent = next.digest === first.digest && next.chunks === first.chunks && next.chunkIndex === index;
+      parts.push(next.chunk);
+    }
+    if (!consistent) continue;
+    const text = parts.join("");
+    if (await digestMatches(text, first.digest)) return text;
+  }
+  throw new Error("The Document kept changing while it was read; try again.");
+}
+
+async function digestMatches(text: string, digest: string): Promise<boolean> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) return true;
+  const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("") === digest;
+}
+
 function lostMessage(notice: LostNotice): string {
   return notice.requests > 0
     ? "The Document was reloaded; your most recent changes could not be saved."
@@ -328,7 +379,7 @@ function lostMessage(notice: LostNotice): string {
 }
 
 function describeError(error: unknown): string {
-  const code = (error as { code?: unknown } | null)?.code;
+  const code = packageErrorCode(error) ?? (error as { code?: unknown } | null)?.code;
   switch (code) {
     case "documents.invalid_name":
       return "Collection names are 1 to 128 characters with no leading or trailing spaces.";
@@ -346,6 +397,10 @@ function describeError(error: unknown): string {
       return "A quote is at most 2 KiB.";
     case "documents.deferred":
       return "Saved locally; it will apply once its Collection arrives.";
+    case "documents.document_pending":
+      return "This Document is still waiting for its history.";
+    case "documents.unavailable":
+      return "This Document is unavailable.";
     default:
       return describePackageError(error);
   }

@@ -119,6 +119,11 @@ export class EditorSession {
     return this.loro;
   }
 
+  /** Local update bytes recorded since the last export; the size guard reads it. */
+  get unexportedBytes(): number {
+    return this.unsentBytes;
+  }
+
   async start(): Promise<void> {
     await this.open(null);
   }

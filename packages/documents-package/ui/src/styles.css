@@ -46,6 +46,57 @@ button, input, select, textarea { font: inherit; }
 .editor-status { color: var(--teamarness-color-text-muted); font-size: .8rem; }
 .editor-status-failure { color: #a32020; font-weight: 700; border: 2px solid currentColor; padding: .5rem; }
 .editor-placeholder { flex: 1; min-height: 0; padding: 1rem 1.2rem; color: var(--teamarness-color-text-muted); }
+.editor-copy-status { color: var(--teamarness-color-text-muted); font-size: .8rem; }
+.document-editor { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.document-editor[hidden] { display: none; }
+.editor-toolbar { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: .35rem .6rem; border-bottom: 1px solid var(--teamarness-color-border); padding: .4rem 1rem; }
+.editor-toolbar-group { display: inline-flex; gap: .15rem; }
+.editor-toolbar-actions { margin-left: auto; }
+.editor-block-type { width: auto; padding: .2rem .4rem; }
+.editor-tool { min-width: 2rem; height: 2rem; padding: 0 .5rem; border: 1px solid transparent; border-radius: var(--teamarness-radius-control, 6px); background: transparent; color: var(--teamarness-color-text); cursor: pointer; font-size: .85rem; }
+.editor-tool:hover:not(:disabled) { background: var(--teamarness-color-background); border-color: var(--teamarness-color-border); }
+.editor-tool[aria-pressed="true"] { background: color-mix(in srgb, var(--teamarness-color-accent) 18%, var(--teamarness-color-panel)); border-color: var(--teamarness-color-accent); }
+.editor-tool:disabled { opacity: .45; cursor: default; }
+.editor-tool:focus-visible { outline: 2px solid var(--teamarness-color-accent); outline-offset: -2px; }
+.editor-link-prompt { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: .35rem; padding: .4rem 1rem; border-bottom: 1px solid var(--teamarness-color-border); }
+.editor-link-prompt .teamarness-input { flex: 1; min-width: 12rem; }
+.editor-link-error { flex-basis: 100%; color: #a32020; font-size: .8rem; }
+.editor-link-error:empty { display: none; }
+.editor-notice { flex: none; margin: .5rem 1rem 0; }
+.markdown-copy { flex: none; display: flex; flex-direction: column; gap: .4rem; padding: .6rem 1rem; border-bottom: 1px solid var(--teamarness-color-border); }
+.markdown-copy-hint { margin: 0; font-size: .85rem; color: var(--teamarness-color-text-muted); }
+.markdown-copy-text { width: 100%; font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .85rem; }
+.markdown-copy-actions { display: flex; justify-content: flex-end; gap: .5rem; }
+.editor-surface { flex: 1; min-height: 0; overflow-y: auto; }
+.editor-surface .ProseMirror { min-height: 100%; padding: 1rem 1.4rem 3rem; outline: none; line-height: 1.55; }
+.editor-surface .ProseMirror[contenteditable="false"] { color: var(--teamarness-color-text-muted); }
+.editor-surface .ProseMirror > :first-child { margin-top: 0; }
+.editor-surface .ProseMirror p { margin: 0 0 .7em; }
+.editor-surface .ProseMirror h1, .editor-surface .ProseMirror h2, .editor-surface .ProseMirror h3,
+.editor-surface .ProseMirror h4, .editor-surface .ProseMirror h5, .editor-surface .ProseMirror h6 { margin: 1.1em 0 .45em; line-height: 1.25; }
+.editor-surface .ProseMirror blockquote { margin: 0 0 .7em; padding-left: 1rem; border-left: 3px solid var(--teamarness-color-border); color: var(--teamarness-color-text-muted); }
+.editor-surface .ProseMirror pre { margin: 0 0 .7em; padding: .6rem .8rem; border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .88em; overflow-x: auto; }
+.editor-surface .ProseMirror code { font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .9em; padding: .05em .25em; border-radius: 4px; background: var(--teamarness-color-panel); }
+.editor-surface .ProseMirror pre code { padding: 0; background: none; }
+.editor-surface .ProseMirror ul, .editor-surface .ProseMirror ol { margin: 0 0 .7em; padding-left: 1.6rem; }
+.editor-surface .ProseMirror li > p { margin: 0 0 .2em; }
+.editor-surface .ProseMirror hr { border: 0; border-top: 1px solid var(--teamarness-color-border); margin: 1em 0; }
+.editor-surface .ProseMirror a { color: var(--teamarness-color-accent); text-decoration: underline; cursor: text; }
+/* ProseMirror's own required rules (prosemirror-view/style/prosemirror.css and prosemirror-gapcursor/style/gapcursor.css). */
+.ProseMirror { position: relative; word-wrap: break-word; white-space: pre-wrap; white-space: break-spaces; -webkit-font-variant-ligatures: none; font-variant-ligatures: none; font-feature-settings: "liga" 0; }
+.ProseMirror pre { white-space: pre-wrap; }
+.ProseMirror li { position: relative; }
+.ProseMirror-hideselection *::selection { background: transparent; }
+.ProseMirror-hideselection { caret-color: transparent; }
+.ProseMirror [draggable][contenteditable=false] { user-select: text; }
+.ProseMirror-selectednode { outline: 2px solid var(--teamarness-color-accent); }
+li.ProseMirror-selectednode { outline: none; }
+li.ProseMirror-selectednode:after { content: ""; position: absolute; left: -32px; right: -2px; top: -2px; bottom: -2px; border: 2px solid var(--teamarness-color-accent); pointer-events: none; }
+img.ProseMirror-separator { display: inline !important; border: none !important; margin: 0 !important; }
+.ProseMirror-gapcursor { display: none; pointer-events: none; position: absolute; }
+.ProseMirror-gapcursor:after { content: ""; display: block; position: absolute; top: -2px; width: 20px; border-top: 1px solid var(--teamarness-color-text); animation: ProseMirror-cursor-blink 1.1s steps(2, start) infinite; }
+@keyframes ProseMirror-cursor-blink { to { visibility: hidden; } }
+.ProseMirror-focused .ProseMirror-gapcursor { display: block; }
 .comments-panel { flex: none; width: min(var(--right-width), 36%); display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--teamarness-color-panel); }
 .comments-panel h3 { flex: none; margin: 0; padding: .8rem 1rem; border-bottom: 1px solid var(--teamarness-color-border); color: var(--teamarness-color-text-muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }
 .comment-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0 1rem .5rem; container-type: inline-size; }

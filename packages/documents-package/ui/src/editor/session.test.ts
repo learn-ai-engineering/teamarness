@@ -169,6 +169,19 @@ describe("EditorSession", () => {
     await session.dispose();
   });
 
+  it("reports its unexported bytes to the size guard until it flushes", async () => {
+    const backend = new FakeBackend();
+    const session = await opened(backend);
+    expect(session.unexportedBytes).toBe(0);
+    type(session, noise(1000));
+    expect(session.unexportedBytes).toBeGreaterThanOrEqual(1000);
+    session.flush();
+    expect(session.unexportedBytes).toBe(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.sent).toHaveLength(1);
+    await session.dispose();
+  });
+
   it("flushes at once when the export budget is reached", async () => {
     const backend = new FakeBackend();
     const session = await opened(backend);

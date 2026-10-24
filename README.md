@@ -78,6 +78,14 @@ cargo test --workspace --exclude teamarness-desktop --locked
 cargo clippy --workspace --exclude teamarness-desktop --all-targets --all-features --locked -- -D warnings
 ```
 
+The Documents rendered editor has real-browser scenarios that are not part of `npm test`:
+
+```sh
+npm run verify:documents-editor
+```
+
+It builds the Documents UI and the Rust Markdown authority (`packages/documents-package/backend/examples/frame_scenarios.rs`), installs the Playwright WebKit and Chromium browsers if they are missing, and runs `packages/documents-package/ui/frame-scenarios/`: two or more views mounted in sandboxed `allow-scripts` frames under the Shell's frame policy (read from `package_protocol.rs`), relayed between Installations through an in-memory record log with offline control. Pass `webkit` or `chromium` to run one browser, and `--only "<scenario>"` to run one scenario.
+
 The bundled Packages are listed once in `packages/bundled-packages.json`. After editing it, run `node scripts/bundled-packages.mjs --write` and `npm run build`; `npm test` fails while the Tauri bundle configuration or the application index disagrees with the list.
 
 The Core Runtime public API is `teamarness_core::CoreRuntime`. Identity secrets, raw key bytes, SQLite handles, Iroh transport handles, canonical membership bytes, and private membership adapters remain private. The Tauri bridge carries only owned Installation, Workspace, membership, Principal, invitation, and stable-error DTOs. Agent keys and invitation material do not cross the bridge as Agent-management responses.

@@ -1,4 +1,8 @@
 // @vitest-environment happy-dom
+/// <reference types="node" />
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { createFakePackageClient, createTestMountContext } from "@teamarness/package-ui-sdk/testing";
 import type { PackageValue } from "@teamarness/package-ui-sdk";
@@ -51,16 +55,30 @@ function backend(current: () => DocumentsSnapshot) {
   return { fake, calls };
 }
 
-/** The Backend opens the editor session of `doc`: `begin` and `end`, with no snapshot chunks. */
+/** The Rust-written body holding every node and mark. */
+const ALL_NODES = new Uint8Array(readFileSync(join(import.meta.dirname, "../../fixtures/body-trees/from-rust/01-all-nodes.loro")));
+const mac = /Mac|iP(hone|[oa]d)/.test(globalThis.navigator?.platform ?? "");
+
+/** The Backend opens the editor session of `doc`: `begin`, the snapshot (none by default) and `end`. */
 async function opened(fake: ReturnType<typeof createFakePackageClient>, state: {
-  editable?: boolean; reason?: "identity_conflict" | "import_failure"; diagnosticRecordId?: string;
+  editable?: boolean; reason?: "identity_conflict" | "import_failure"; diagnosticRecordId?: string; snapshot?: Uint8Array;
 } = {}): Promise<void> {
+  const chunks = state.snapshot ? [state.snapshot] : [];
   await fake.emit("documents.document.session", {
-    event: "begin", documentId: doc, sessionPeer: "7", version: "0", chunks: 0, editable: state.editable ?? true,
+    event: "begin", documentId: doc, sessionPeer: "7", version: "0", chunks: chunks.length, editable: state.editable ?? true,
     ...(state.reason ? { reason: state.reason } : {}),
     ...(state.diagnosticRecordId ? { diagnosticRecordId: state.diagnosticRecordId } : {}),
   });
+  for (const [chunkIndex, chunk] of chunks.entries()) {
+    await fake.emit("documents.document.session", { event: "chunk", documentId: doc, chunkIndex, chunk: Buffer.from(chunk).toString("base64") });
+  }
   await fake.emit("documents.document.session", { event: "end", documentId: doc });
+}
+
+/** Waits, a task at a time, until `done` holds. */
+async function settle(done: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 200 && !done(); attempt += 1) await tick();
+  expect(done()).toBe(true);
 }
 
 function texts(root: ParentNode, selector: string): string[] {
@@ -211,11 +229,11 @@ describe("Documents mount", () => {
     (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
     expect(placeholder.hidden).toBe(false);
-    expect(placeholder.textContent).toBe("Editor loading");
+    expect(placeholder.textContent).toBe("Opening…");
     expect(root.querySelector("textarea.editor-textarea")).toBeNull();
     await unmount();
   });
-  it("opens a Document through its editor session and shows no Markdown", async () => {
+  it("opens a Document through its editor session and renders its body without Markdown", async () => {
     const fake = createFakePackageClient({
       requests: { "documents.snapshot": () => snapshot() },
       subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
@@ -230,12 +248,113 @@ describe("Documents mount", () => {
     expect(pane.hidden).toBe(false);
     expect(root.querySelector(".editor-title")?.textContent).toBe("Q4 plan");
     expect(root.querySelector(".editor-status")?.textContent).toBe("Opening…");
-    await opened(fake);
+    await opened(fake, { snapshot: ALL_NODES });
+    await tick();
     expect(root.querySelector(".editor-status")?.textContent).toBe("");
-    expect(root.querySelector(".editor-placeholder")?.textContent).toBe("Editor loading");
+    expect((root.querySelector(".editor-placeholder") as HTMLElement).hidden).toBe(true);
+    const body = root.querySelector(".ProseMirror") as HTMLElement;
+    expect(body.getAttribute("contenteditable")).toBe("true");
+    for (const selector of ["h1", "h6", "strong", "em", "s", "code", "a", "blockquote", "ol", "ul", "hr", "pre", "br"]) {
+      expect(body.querySelector(selector), selector).not.toBeNull();
+    }
+    expect(body.querySelector("a")?.getAttribute("href")).toBe("https://example.com/a");
+    // The rendered body and the whole page show no Markdown syntax.
+    expect(root.textContent).not.toMatch(/\*\*|~~|```|\]\(|^#+ /m);
     expect(root.querySelector("textarea.editor-textarea")).toBeNull();
     await unmount();
     expect(fake.calls.some((call) => call.operation === "documents.document.open")).toBe(false);
+  });
+
+  it("quotes the rendered selection when commenting on it", async () => {
+    const added: PackageValue[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.comments": () => ({ comments: [] }),
+        "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    await opened(fake, { snapshot: ALL_NODES });
+    await tick();
+    const body = root.querySelector(".ProseMirror") as HTMLElement;
+    body.dispatchEvent(new KeyboardEvent("keydown", { key: "a", ctrlKey: !mac, metaKey: mac, bubbles: true }));
+    (root.querySelector(".editor-comment") as HTMLButtonElement).click();
+    const draft = root.querySelector(".comment-quote--draft") as HTMLElement;
+    expect(draft.hidden).toBe(false);
+    const excerpt = draft.querySelector(".comment-quote-excerpt")?.textContent ?? "";
+    expect(excerpt.startsWith("One\nTwo")).toBe(true);
+    expect(excerpt).toContain("Plain strong em strike code link bare both and a hard\nbreak.");
+    expect(excerpt).not.toContain("**");
+    const input = root.querySelector(".comment-input") as HTMLTextAreaElement;
+    input.value = "On all of it";
+    (root.querySelector(".comment-compose") as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(added).toEqual([{ documentId: doc, markdown: "On all of it", quote: excerpt }]);
+    expect(draft.hidden).toBe(true);
+    await unmount();
+  });
+
+  it("copies the Document as Markdown, falling back to a visible copy panel when the clipboard is refused", async () => {
+    const markdown = "# Title\n\n" + "Body text.\n\n".repeat(3000);
+    const parts: string[] = [];
+    for (let start = 0; start < markdown.length; start += 24 * 1024) parts.push(markdown.slice(start, start + 24 * 1024));
+    const digest = createHash("sha256").update(markdown).digest("hex");
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.comments": () => ({ comments: [] }),
+        "documents.document.markdown": (payload) => {
+          const chunkIndex = (payload as { chunkIndex: number }).chunkIndex;
+          return { documentId: doc, digest, chunks: parts.length, chunkIndex, chunk: parts[chunkIndex]! };
+        },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
+    });
+    const written: string[] = [];
+    let allow = true;
+    const original = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      configurable: true,
+      value: {
+        write: async (items: ClipboardItem[]) => {
+          if (!allow) throw Object.assign(new Error("denied"), { name: "NotAllowedError" });
+          written.push(await (await items[0]!.getType("text/plain")).text());
+        },
+      },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    try {
+      (root.querySelector(".document-title") as HTMLButtonElement).click();
+      await tick();
+      await opened(fake, { snapshot: ALL_NODES });
+      await tick();
+      const copy = root.querySelector(".editor-copy-markdown") as HTMLButtonElement;
+      copy.click();
+      await settle(() => written.length === 1);
+      expect(written).toEqual([markdown]);
+      expect(fake.calls.filter((call) => call.operation === "documents.document.markdown").map((call) => (call.payload as { chunkIndex: number }).chunkIndex))
+        .toEqual(parts.map((_, index) => index));
+      expect(root.querySelector(".editor-copy-status")?.textContent).toBe("Copied as Markdown");
+      expect((root.querySelector(".markdown-copy") as HTMLElement).hidden).toBe(true);
+
+      allow = false;
+      copy.click();
+      const panel = root.querySelector(".markdown-copy") as HTMLElement;
+      await settle(() => !panel.hidden);
+      expect((panel.querySelector("textarea") as HTMLTextAreaElement).value).toBe(markdown);
+      [...panel.querySelectorAll("button")].find((button) => button.textContent === "Close")!.click();
+      expect(panel.hidden).toBe(true);
+    } finally {
+      await unmount();
+      if (original) Object.defineProperty(globalThis.navigator, "clipboard", original);
+      else delete (globalThis.navigator as { clipboard?: unknown }).clipboard;
+    }
   });
   it("shows a terminal conflict warning without retrying", async () => {
     let opens = 0;
