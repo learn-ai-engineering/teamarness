@@ -42,11 +42,17 @@ function button(label: string, className: string, onClick: () => void): HTMLButt
 
 const ICON_PATHS = {
   plus: "M12 5v14 M5 12h14", x: "M5 5l14 14 M19 5L5 19",
-  chevron: "m9 18 6-6-6-6", more: "M5 12h.01 M12 12h.01 M19 12h.01",
+  more: "M5 12h.01 M12 12h.01 M19 12h.01",
   panel: "M4 4h16v16H4z M9 4v16", comments: "M4 4h16v16H4z M15 4v16",
+  eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
+  eyeOff: "M3 3l18 18 M10.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a16 16 0 0 1-3.1 4.1 M6.1 6.1C3.4 8 2 12 2 12s3.5 7 10 7c1.5 0 2.9-.4 4.1-1",
+  reply: "M9 17 4 12l5-5 M4 12h10a6 6 0 0 1 6 6v1",
+  resolve: "M4 12l5 5L20 6", reopen: "M4 11a8 8 0 1 1 2 6 M4 5v6h6",
+  preview: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
+  edit: "M4 20h4l12-12-4-4L4 16v4z M14 6l4 4", clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
 } as const;
 
-function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void): HTMLButtonElement {
+function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
   const control = button("", "documents-icon", onClick);
   control.setAttribute("aria-label", label);
   control.title = label;
@@ -57,7 +63,24 @@ function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void)
   path.setAttribute("d", ICON_PATHS[name]);
   svg.append(path);
   control.append(svg);
+  if (tooltip) {
+    control.classList.add("documents-tooltip-control");
+    const hint = document.createElement("span");
+    hint.className = "control-tooltip";
+    hint.setAttribute("role", "tooltip");
+    hint.setAttribute("aria-hidden", "true");
+    hint.textContent = label;
+    control.append(hint);
+  }
   return control;
+}
+
+function updateIcon(control: HTMLButtonElement, name: keyof typeof ICON_PATHS, label: string): void {
+  control.setAttribute("aria-label", label);
+  control.title = label;
+  control.querySelector("path")?.setAttribute("d", ICON_PATHS[name]);
+  const hint = control.querySelector(".control-tooltip");
+  if (hint) hint.textContent = label;
 }
 
 /** A one-field form built once; the view only patches its disabled state. */
@@ -117,7 +140,7 @@ export class DocumentsView {
   private readonly collectionList: HTMLUListElement;
   private readonly collectionForm: ReturnType<typeof inlineForm>;
   private readonly documentForm: ReturnType<typeof inlineForm>;
-  private readonly archivedToggle: HTMLInputElement;
+  private readonly archivedToggle: HTMLButtonElement;
   private readonly editorPane: HTMLElement;
   private readonly editorTitle: HTMLElement;
   private readonly editorStatus: HTMLElement;
@@ -188,12 +211,9 @@ export class DocumentsView {
     const headerActions = document.createElement("div");
     headerActions.className = "documents-header-actions";
     headerActions.append(this.showNavigation, this.commentsToggle);
-    const archivedLabel = document.createElement("label");
-    archivedLabel.className = "archived-toggle";
-    this.archivedToggle = document.createElement("input");
-    this.archivedToggle.type = "checkbox";
-    this.archivedToggle.addEventListener("change", () => controller.toggleArchived());
-    archivedLabel.append(this.archivedToggle, document.createTextNode(" Show archived"));
+    this.archivedToggle = icon("eyeOff", "Show archived", () => controller.toggleArchived(), true);
+    this.archivedToggle.classList.add("archived-toggle");
+    this.archivedToggle.setAttribute("aria-pressed", "false");
     header.append(heading, this.status, headerActions);
 
     this.warnings = document.createElement("div");
@@ -213,14 +233,14 @@ export class DocumentsView {
     railHeader.className = "collection-rail-header";
     const railHeading = document.createElement("h2");
     railHeading.textContent = "Collections";
-    const hideNavigation = icon("panel", "Hide navigation", () => { this.leftOpen = false; this.renderRails(); });
+    const hideNavigation = icon("panel", "Hide navigation", () => { this.leftOpen = false; this.renderRails(); this.showNavigation.focus(); });
     const addCollection = icon("plus", "Add Collection", () => {
       this.createGeneration++;
       this.createTarget = "collection";
       this.render();
       this.collectionForm.input.focus();
     });
-    railHeader.append(hideNavigation, railHeading, archivedLabel, addCollection);
+    railHeader.append(hideNavigation, railHeading, this.archivedToggle, addCollection);
     this.collectionList = document.createElement("ul");
     this.collectionList.className = "collection-list";
     this.collectionForm = inlineForm({
@@ -271,7 +291,7 @@ export class DocumentsView {
     this.editorStatus = document.createElement("span");
     this.editorStatus.className = "editor-status";
     this.editorStatus.setAttribute("role", "status");
-    this.previewButton = button("Preview", KIT.secondary, () => controller.togglePreview());
+    this.previewButton = icon("preview", "Preview", () => controller.togglePreview(), true);
     this.previewButton.disabled = true;
     this.previewButton.setAttribute("aria-pressed", "false");
     editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton);
@@ -418,7 +438,10 @@ export class DocumentsView {
         this.renderComposer();
       }));
     }
-    if (focusedCue) this.commentQuote.querySelector<HTMLButtonElement>(`[aria-label="${focusedCue}"]`)?.focus();
+    if (focusedCue) {
+      const next = this.commentQuote.querySelector<HTMLButtonElement>(`[aria-label="${focusedCue}"]`);
+      (next ?? this.commentInput).focus();
+    }
     this.commentSubmit.disabled = this.controller.state.busy;
   }
 
@@ -438,12 +461,29 @@ export class DocumentsView {
     state.textContent = comment.resolved ? "Resolved" : "";
     const time = document.createElement("time");
     time.className = "comment-time";
-    if (comment.createdAt === undefined) time.textContent = "Time unavailable";
-    else {
+    let timeLabel = "Time unavailable";
+    if (comment.createdAt !== undefined) {
       const date = new Date(Number(comment.createdAt));
       time.dateTime = date.toISOString();
-      time.textContent = date.toLocaleString();
+      timeLabel = date.toLocaleString();
     }
+    time.tabIndex = 0;
+    time.dataset.commentFocus = `${comment.id}:time`;
+    time.setAttribute("aria-label", timeLabel);
+    time.title = timeLabel;
+    time.classList.add("documents-tooltip-control");
+    const clock = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    clock.setAttribute("viewBox", "0 0 24 24");
+    clock.setAttribute("aria-hidden", "true");
+    const clockPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    clockPath.setAttribute("d", ICON_PATHS.clock);
+    clock.append(clockPath);
+    const hint = document.createElement("span");
+    hint.className = "control-tooltip";
+    hint.setAttribute("role", "tooltip");
+    hint.setAttribute("aria-hidden", "true");
+    hint.textContent = timeLabel;
+    time.append(clock, hint);
     meta.append(author, time, state);
     item.append(meta);
     if (comment.quote !== undefined) {
@@ -463,17 +503,22 @@ export class DocumentsView {
     const actions = document.createElement("div");
     actions.className = "comment-actions";
     actions.append(
-      button("Reply", KIT.secondary, () => { this.replyTo = comment.id; this.renderComposer(); this.commentInput.focus(); }),
+      icon("reply", "Reply", () => { this.replyTo = comment.id; this.renderComposer(); this.commentInput.focus(); }, true),
       comment.resolved
-        ? button("Reopen", KIT.secondary, () => { void this.controller.reopenComment(comment.id); })
-        : button("Resolve", KIT.secondary, () => { void this.controller.resolveComment(comment.id); }),
+        ? icon("reopen", "Reopen", () => { void this.controller.reopenComment(comment.id); }, true)
+        : icon("resolve", "Resolve", () => { void this.controller.resolveComment(comment.id); }, true),
     );
     for (const control of actions.querySelectorAll("button")) control.disabled = this.controller.state.busy;
+    (actions.firstElementChild as HTMLButtonElement).dataset.commentFocus = `${comment.id}:reply`;
+    (actions.lastElementChild as HTMLButtonElement).dataset.commentFocus = `${comment.id}:resolution`;
     item.append(actions);
     return item;
   }
 
   private renderComments(): void {
+    const focused = (this.commentList.getRootNode() as ShadowRoot).activeElement;
+    const focusKey = focused instanceof HTMLElement && this.commentList.contains(focused)
+      ? focused.dataset.commentFocus : undefined;
     const { comments, commentsCursor, commentsLoading } = this.controller.state;
     const sorted = [...comments].sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id));
     const children = new Map<string | null, Comment[]>();
@@ -504,6 +549,12 @@ export class DocumentsView {
       more.append(load);
       this.commentList.prepend(more);
     }
+    if (focusKey) {
+      const next = [...this.commentList.querySelectorAll<HTMLElement>("[data-comment-focus]")]
+        .find((control) => control.dataset.commentFocus === focusKey);
+      if (next && !(next instanceof HTMLButtonElement && next.disabled)) next.focus();
+      else this.commentInput.focus();
+    }
     this.renderComposer();
   }
 
@@ -533,7 +584,7 @@ export class DocumentsView {
     this.syncTextarea(null);
     const preview = this.controller.state.preview;
     this.previewButton.setAttribute("aria-pressed", String(preview));
-    this.previewButton.textContent = preview ? "Edit" : "Preview";
+    updateIcon(this.previewButton, preview ? "edit" : "preview", preview ? "Edit" : "Preview");
     this.textarea.hidden = preview;
     this.preview.hidden = !preview;
     if (preview) this.preview.innerHTML = reason === "identity_conflict" ? ""
@@ -549,7 +600,8 @@ export class DocumentsView {
       this.replyTo = null;
     }
     this.status.textContent = AVAILABILITY_LABEL[snapshot.availability];
-    this.archivedToggle.checked = showArchived;
+    updateIcon(this.archivedToggle, showArchived ? "eye" : "eyeOff", showArchived ? "Hide archived" : "Show archived");
+    this.archivedToggle.setAttribute("aria-pressed", String(showArchived));
     this.warnings.replaceChildren(
       ...(snapshot.warnings ?? []).map((text) => {
         const notice = document.createElement("p");
@@ -712,18 +764,14 @@ export class DocumentsView {
       row.className = "tree-row";
       if (collection.archived) row.classList.add("is-archived");
       const expanded = this.expanded.has(collection.id);
-      const expand = icon("chevron", `${expanded ? "Collapse" : "Expand"} ${collection.name}`, () => {
-        if (expanded) this.expanded.delete(collection.id);
+      const select = button(collection.name, "collection-button", () => {
+        if (this.expanded.has(collection.id)) this.expanded.delete(collection.id);
         else this.expanded.add(collection.id);
+        this.selectedCollectionId = collection.id;
+        this.controller.selectCollection(collection.id);
         this.render();
       });
-      expand.dataset.treeFocus = `collection:expand:${collection.id}`;
-      expand.setAttribute("aria-expanded", String(expanded));
-      expand.classList.toggle("is-expanded", expanded);
-      const select = button(collection.name, "collection-button", () => {
-        if (this.controller.state.selectedCollectionId !== collection.id) this.expanded.add(collection.id);
-        this.controller.selectCollection(collection.id);
-      });
+      select.setAttribute("aria-expanded", String(expanded));
       select.dataset.treeFocus = `collection:select:${collection.id}`;
       if (collection.id === selected) select.setAttribute("aria-current", "page");
       const add = icon("plus", `Add Document to ${collection.name}`, () => {
@@ -750,7 +798,7 @@ export class DocumentsView {
       );
       for (const control of actions.querySelectorAll("button")) control.disabled = this.controller.state.busy;
       this.menu(item, trigger, actions);
-      row.append(expand, select, add, trigger);
+      row.append(select, add, trigger);
       item.append(row);
       if (this.renameTarget === `collection:${collection.id}` && this.renameForm) item.append(this.renameForm.form);
       if (expanded) {

@@ -5,6 +5,7 @@ import type { PackageValue } from "@teamarness/package-ui-sdk";
 import { describe, expect, it } from "vitest";
 import type { DocumentsSnapshot } from "./index";
 import { mount } from "./index";
+import documentsCss from "./styles.css?raw";
 
 const planning = "1".repeat(64);
 const archive = "2".repeat(64);
@@ -68,9 +69,18 @@ describe("Documents mount", () => {
     expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
     expect(root.querySelector('.collection-create')).toBeNull();
     expect(root.querySelector('.document-create')).toBeNull();
-    const toggle = root.querySelector(".archived-toggle input") as HTMLInputElement;
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event("change"));
+    const toggle = root.querySelector(".archived-toggle") as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-label')).toBe('Show archived');
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    expect(toggle.title).toBe('Show archived');
+    expect(toggle.querySelector('[role=tooltip]')?.textContent).toBe('Show archived');
+    const hiddenGraphic = toggle.querySelector('path')?.getAttribute('d');
+    toggle.click();
+    expect(toggle.getAttribute('aria-label')).toBe('Hide archived');
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    expect(toggle.querySelector('path')?.getAttribute('d')).not.toBe(hiddenGraphic);
+    expect(toggle.querySelector('[role=tooltip]')?.textContent).toBe('Hide archived');
+    expect(root.querySelector('.collection-rail-header')?.lastElementChild?.getAttribute('aria-label')).toBe('Add Collection');
     expect(texts(root, ".collection-button")).toEqual(["Planning", "Old"]);
     await unmount();
     expect(root.childElementCount).toBe(0);
@@ -167,11 +177,13 @@ describe("Documents mount", () => {
     expect(texts(root, ".collection-button")).toEqual(["Research"]);
     expect(root.querySelector(".collection-button[aria-current=page]")?.textContent).toBe("Research");
     expect(texts(root, ".document-title")).toEqual(["New plan"]);
-    const toggle = root.querySelector(".archived-toggle input") as HTMLInputElement;
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event("change"));
+    const toggle = root.querySelector(".archived-toggle") as HTMLButtonElement;
+    toggle.click();
     expect(texts(root, ".collection-button")).toContain("Planning");
     ([...root.querySelectorAll(".collection-button")].find((button) => button.textContent === "Planning") as HTMLButtonElement).click();
+    expect(texts(root, ".document-title")).toEqual(["New plan"]);
+    expect(root.querySelector('.collection-button')?.getAttribute('aria-expanded')).toBe('false');
+    (root.querySelector('.collection-button') as HTMLButtonElement).click();
     expect(texts(root, ".document-title")).toEqual(["Q4 plan", "New plan"]);
     await unmount();
   });
@@ -190,7 +202,18 @@ describe("Documents mount", () => {
     await tick();
     await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Draft' });
     expect(preview.disabled).toBe(false);
-    expect(preview.textContent).toBe('Preview');
+    expect(preview.getAttribute("aria-label")).toBe("Preview");
+    expect(preview.title).toBe('Preview');
+    expect(preview.querySelector('svg path')?.getAttribute('d')).toBeTruthy();
+    expect(preview.querySelector('[role=tooltip]')?.textContent).toBe('Preview');
+    expect(preview.getAttribute('aria-pressed')).toBe('false');
+    const previewGraphic = preview.querySelector('path')?.getAttribute('d');
+    preview.click();
+    expect(preview.querySelector('path')?.getAttribute('d')).not.toBe(previewGraphic);
+    expect(preview.getAttribute('aria-label')).toBe('Edit');
+    expect(preview.querySelector('[role=tooltip]')?.textContent).toBe('Edit');
+    expect(preview.getAttribute('aria-pressed')).toBe('true');
+    preview.click();
     expect((root.querySelector('.editor-textarea') as HTMLElement).hidden).toBe(false);
     await unmount();
   });
@@ -254,7 +277,7 @@ describe("Documents mount", () => {
     expect(root.querySelector(".editor-status")?.textContent).toContain("Conflicting edit history");
     expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(true);
     expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).value).toBe("");
-    ([...root.querySelectorAll(".editor-header button")].find((button) => button.textContent === "Preview") as HTMLButtonElement).click();
+    ([...root.querySelectorAll(".editor-header button")].find((button) => button.getAttribute("aria-label") === "Preview") as HTMLButtonElement).click();
     expect(root.querySelector(".editor-preview")?.innerHTML).toBe("");
     await fake.emit("documents.changes", snapshot());
     await tick();
@@ -339,6 +362,14 @@ describe("Documents mount", () => {
     const items = [...rootNode.querySelectorAll(".comment")];
     expect(items).toHaveLength(2);
     expect(items[0]?.querySelector(".comment-quote")?.textContent).toBe("# Q4");
+    const graphics = ['Reply', 'Resolve', 'Reopen'].map((label) => {
+      const action = rootNode.querySelector(`.comment-actions [aria-label="${label}"]`) as HTMLButtonElement;
+      expect(action?.title).toBe(label);
+      expect(action.querySelector('[role=tooltip]')?.textContent).toBe(label);
+      return action.querySelector('svg path')?.getAttribute('d');
+    });
+    expect(new Set(graphics).size).toBe(3);
+    expect(rootNode.querySelector('.comment-actions')?.querySelectorAll('button')).toHaveLength(2);
     expect(items[0]?.querySelector(".comment-body strong")?.textContent).toBe("dates");
     expect(items[1]?.querySelector(".comment-author")?.textContent).toBe("You");
     expect(items[0]?.querySelector(".comment-author")?.textContent).toBe("cccccccc…cccccc");
@@ -348,10 +379,10 @@ describe("Documents mount", () => {
     await fake.emit("documents.names", { available: true, cursor: "2", persons: [{ ...person, name: "Carol R" }], part: 0, parts: 1 });
     expect(rootNode.querySelector(".comment-author")?.textContent).toBe("Carol R");
     // Preview renders the current draft and hides the editor.
-    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.textContent === "Preview") as HTMLButtonElement).click();
+    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.getAttribute("aria-label") === "Preview") as HTMLButtonElement).click();
     expect((rootNode.querySelector(".editor-textarea") as HTMLElement).hidden).toBe(true);
     expect(rootNode.querySelector(".editor-preview h1")?.textContent).toBe("Q4");
-    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.textContent === "Edit") as HTMLButtonElement).click();
+    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.getAttribute("aria-label") === "Edit") as HTMLButtonElement).click();
     expect((rootNode.querySelector(".editor-textarea") as HTMLElement).hidden).toBe(false);
     expect(items[1]?.classList.contains("is-resolved")).toBe(true);
     expect((items[1] as HTMLElement).style.getPropertyValue("--comment-depth")).toBe("1");
@@ -369,6 +400,46 @@ describe("Documents mount", () => {
     expect(added).toEqual([{ documentId: doc, markdown: "Agree", quote: "# Q4" }]);
     expect(input.value).toBe("");
     await unmount();
+  });
+
+  it("keeps icon comment actions and keyboard-focused time operable", async () => {
+    const commentId = 'a'.repeat(64);
+    let resolved = false;
+    const calls: Array<{ operation: string; payload: PackageValue }> = [];
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': () => snapshot(),
+      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: '' }),
+      'documents.comments': () => ({ comments: [{ id: commentId, documentId: doc, author: 'me',
+        position: '01', resolved, isLocal: true, markdown: 'Parent', createdAt: '1730000000000' }] }),
+      'documents.comment.resolve': (payload) => { calls.push({ operation: 'resolve', payload }); resolved = true; return { ok: true as const, id: commentId }; },
+      'documents.comment.reopen': (payload) => { calls.push({ operation: 'reopen', payload }); resolved = false; return { ok: true as const, id: commentId }; },
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    try {
+      const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+      (root.querySelector('.document-title') as HTMLButtonElement).click();
+      await tick();
+      const time = root.querySelector('.comment-time') as HTMLElement;
+      time.focus();
+      expect(root.activeElement).toBe(time);
+      expect(time.querySelector('[role=tooltip]')?.textContent).toBe(new Date(1730000000000).toLocaleString());
+      await fake.emit('documents.changes', snapshot());
+      await tick();
+      expect(root.activeElement).toBe(root.querySelector('.comment-time'));
+      (root.querySelector('[aria-label=Reply]') as HTMLButtonElement).click();
+      expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Replying to a comment');
+      (root.querySelector('[aria-label=Resolve]') as HTMLButtonElement).click();
+      await tick();
+      expect(root.querySelector('.comment.is-resolved [aria-label=Reopen]')).not.toBeNull();
+      (root.querySelector('[aria-label=Reopen]') as HTMLButtonElement).click();
+      await tick();
+      expect(root.querySelector('.comment.is-resolved')).toBeNull();
+      expect(calls).toEqual([{ operation: 'resolve', payload: { commentId } },
+        { operation: 'reopen', payload: { commentId } }]);
+      await unmount();
+    } finally { host.remove(); }
   });
 
   it("captures only a nonempty editor selection on composer focus, caps it, and clears it on deselection or X", async () => {
@@ -505,12 +576,21 @@ describe("Documents mount", () => {
     (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
     expect(texts(root, ".comment-body").map((text) => text.trim())).toEqual(["Reply"]);
-    expect(texts(root, ".comment-time")).toEqual([new Date(1730000000000).toLocaleString()]);
+    const clock = root.querySelector('.comment-time') as HTMLElement;
+    expect(clock.getAttribute('aria-label')).toBe(new Date(1730000000000).toLocaleString());
+    expect(clock.querySelector('svg path')?.getAttribute('d')).toBeTruthy();
+    expect(clock.querySelector('[role=tooltip]')?.textContent).toBe(clock.getAttribute('aria-label'));
+    expect(clock.title).toBe(clock.getAttribute('aria-label'));
+    expect(root.querySelector('.comment-time')?.getAttribute('datetime')).toBe(new Date(1730000000000).toISOString());
+    expect(clock.tabIndex).toBe(0);
+    expect(clock.matches('.documents-tooltip-control')).toBe(true);
+    expect(documentsCss).toMatch(/\.documents-tooltip-control:hover \.control-tooltip, \.documents-tooltip-control:focus-visible \.control-tooltip\s*\{[^}]*visibility:\s*visible/);
     (root.querySelector(".comments-load-older") as HTMLButtonElement).click();
     await tick();
     expect(requests).toEqual([{ documentId: doc }, { documentId: doc, cursor: "older" }]);
     expect(texts(root, ".comment-body").map((text) => text.trim())).toEqual(["Parent", "Reply"]);
-    expect(texts(root, ".comment-time")[0]).toBe("Time unavailable");
+    expect(root.querySelector(".comment-time")?.getAttribute("aria-label")).toBe("Time unavailable");
+    expect(root.querySelector('.comment-time [role=tooltip]')?.textContent).toBe('Time unavailable');
     await unmount();
   });
 
@@ -552,6 +632,32 @@ describe("Documents mount", () => {
     await unmount();
   });
 
+  it("uses the bold Collection name as its only expansion control without closing the editor", async () => {
+    const fake = createFakePackageClient({ requests: {
+      "documents.snapshot": () => snapshot(),
+      "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "Draft" }),
+    }, subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined } });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    const name = () => root.querySelector('.collection-button') as HTMLButtonElement;
+    expect(root.querySelectorAll('.tree-row button')).toHaveLength(3);
+    expect(name().getAttribute('aria-expanded')).toBe('true');
+    expect(name().getAttribute('aria-current')).toBe('page');
+    expect(documentsCss).toMatch(/\.collection-button\s*\{[^}]*font-weight:\s*700/);
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    const editor = root.querySelector('.editor-textarea');
+    name().click();
+    expect(name().getAttribute('aria-expanded')).toBe('false');
+    expect(name().getAttribute('aria-current')).toBe('page');
+    expect(root.querySelector('.document-title')).toBeNull();
+    expect(root.querySelector('.editor-textarea')).toBe(editor);
+    expect(root.querySelector('.editor-title')?.textContent).toBe('Q4 plan');
+    name().click();
+    expect(name().getAttribute('aria-expanded')).toBe('true');
+    await unmount();
+  });
+
   it("expands independent Collection branches and opens a nested Document with its Collection selected", async () => {
     const research = "4".repeat(64);
     const other = "5".repeat(64);
@@ -561,9 +667,9 @@ describe("Documents mount", () => {
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
-    (root.querySelector('[aria-label="Expand Research"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll(".collection-button")].find((b) => b.textContent === "Research") as HTMLButtonElement).click();
     expect(texts(root, ".document-title")).toEqual(["Q4 plan", "Notes"]);
-    (root.querySelector('[aria-label="Collapse Planning"]') as HTMLButtonElement).click();
+    (root.querySelector(".collection-button") as HTMLButtonElement).click();
     expect(texts(root, ".document-title")).toEqual(["Notes"]);
     (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
     expect(root.querySelector('.collection-button[aria-current="page"]')?.textContent).toBe("Planning");
@@ -611,9 +717,8 @@ describe("Documents mount", () => {
     move.dispatchEvent(new Event('change'));
     await tick();
     expect(calls.at(-1)).toEqual({ operation: 'documents.document.move', payload: { documentId: doc, collectionId: research } });
-    const toggle = root.querySelector('.archived-toggle input') as HTMLInputElement;
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event('change'));
+    const toggle = root.querySelector('.archived-toggle') as HTMLButtonElement;
+    toggle.click();
     (root.querySelector('[aria-label="Actions for Past"]') as HTMLButtonElement).click();
     ([...root.querySelectorAll('.document-row.is-archived .document-actions button')].find((b) => b.textContent === 'Restore') as HTMLButtonElement).click();
     await tick();
@@ -702,7 +807,7 @@ describe("Documents mount", () => {
     expect(composer.value).toBe('Pending comment');
     (root.querySelector('.editor-header button') as HTMLButtonElement).click();
     expect(root.querySelector('.editor-preview')?.textContent?.trim()).toBe('Draft');
-    expect(root.querySelector('.editor-header button')?.textContent).toBe('Edit');
+    expect(root.querySelector('.editor-header button')?.getAttribute('aria-label')).toBe('Edit');
     await unmount();
   });
 
@@ -757,7 +862,6 @@ describe("Documents mount", () => {
     (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
     const oldForm = root.querySelector('.document-create') as HTMLFormElement;
     (oldForm.querySelector('input') as HTMLInputElement).value = 'For Planning';
-    (root.querySelector('[aria-label="Expand Research"]') as HTMLButtonElement).click();
     ([...root.querySelectorAll('.collection-button')].find((b) => b.textContent === 'Research') as HTMLButtonElement).click();
     expect(root.querySelector('.document-create')).toBeNull();
     oldForm.requestSubmit();
@@ -792,13 +896,13 @@ describe("Documents mount", () => {
       expect(root.activeElement).toBe(input);
       expect(input.value).toBe('Draft');
       expect([input.selectionStart, input.selectionEnd]).toEqual([1, 3]);
-      const rowControl = root.querySelector('[aria-label="Collapse Planning"]') as HTMLButtonElement;
+      const rowControl = root.querySelector('.collection-button') as HTMLButtonElement;
       rowControl.focus();
       expect(root.activeElement).toBe(rowControl);
       await fake.emit('documents.changes', current);
-      expect(root.activeElement?.getAttribute('aria-label')).toBe('Collapse Planning');
+      expect(root.activeElement?.textContent).toBe('Planning');
       (root.activeElement as HTMLButtonElement).click();
-      expect(root.querySelector('[aria-label="Expand Planning"]')).not.toBeNull();
+      expect(root.querySelector('.collection-button')?.getAttribute('aria-expanded')).toBe('false');
       (root.querySelector('[aria-label="Actions for Planning"]') as HTMLButtonElement).click();
       const menuAction = root.querySelector('.collection-actions button') as HTMLButtonElement;
       menuAction.focus();
@@ -879,7 +983,13 @@ describe("Documents mount", () => {
         expect(root.activeElement).toBe(control);
         await fake.emit('documents.changes', snapshot());
         expect(root.activeElement).toBe(root.querySelector(`[aria-label="${label}"]`));
+        (root.activeElement as HTMLButtonElement).click();
+        expect(root.activeElement).toBe(root.querySelector('.comment-input'));
       }
+      const hide = root.querySelector('[aria-label="Hide navigation"]') as HTMLButtonElement;
+      hide.focus();
+      hide.click();
+      expect(root.activeElement).toBe(root.querySelector('[aria-label="Show navigation"]'));
       await unmount();
     } finally { host.remove(); }
   });

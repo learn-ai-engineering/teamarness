@@ -8,7 +8,6 @@ button, input, select, textarea { font: inherit; }
 .documents-page .teamarness-page-title { margin: 0; font-size: 1.4rem; }
 .availability { margin: 0; color: var(--teamarness-color-text-muted); font-size: .8rem; }
 .documents-header-actions { margin-left: auto; display: flex; gap: .3rem; }
-.archived-toggle { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; color: var(--teamarness-color-text-muted); font-size: .8rem; }
 .documents-warnings:empty, .documents-page [hidden] { display: none; }
 .documents-warnings .teamarness-notice, .documents-page .teamarness-notice--danger { margin: .6rem 1.4rem 0; }
 .documents-shell { --left-width: 250px; --right-width: 300px; display: flex; flex: 1; min-height: 0; min-width: 0; position: relative; container-type: inline-size; }
@@ -18,14 +17,17 @@ button, input, select, textarea { font: inherit; }
 .documents-icon { display: inline-grid; flex: none; place-items: center; width: 2rem; height: 2rem; border: 1px solid transparent; border-radius: var(--teamarness-radius-control, 6px); background: transparent; color: var(--teamarness-color-text-muted); cursor: pointer; padding: .3rem; }
 .documents-icon:hover, .documents-icon[aria-expanded="true"], .documents-icon[aria-pressed="true"] { color: var(--teamarness-color-text); background: var(--teamarness-color-background); border-color: var(--teamarness-color-border); }
 .documents-icon svg { width: 1.15rem; height: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.documents-icon.is-expanded svg { transform: rotate(90deg); }
-.documents-page button:focus-visible, .documents-page input:focus-visible, .documents-page select:focus-visible, .documents-page textarea:focus-visible, .documents-resizer:focus-visible { outline: 2px solid var(--teamarness-color-accent); outline-offset: -2px; }
+.documents-tooltip-control { position: relative; }
+.control-tooltip { position: absolute; z-index: 8; top: 100%; right: 0; width: max-content; max-width: min(22rem, 80vw); padding: .3rem .5rem; border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-text); color: var(--teamarness-color-background); font-size: .75rem; font-weight: 400; white-space: normal; overflow-wrap: anywhere; visibility: hidden; pointer-events: none; }
+.documents-tooltip-control:hover .control-tooltip, .documents-tooltip-control:focus-visible .control-tooltip { visibility: visible; }
+.documents-page button:focus-visible, .documents-page input:focus-visible, .documents-page select:focus-visible, .documents-page textarea:focus-visible, .comment-time:focus-visible, .documents-resizer:focus-visible { outline: 2px solid var(--teamarness-color-accent); outline-offset: -2px; }
 .collection-list, .document-list { list-style: none; margin: 0; }
 .collection-list { flex: 1; min-height: 0; overflow: auto; padding: .5rem; }
 .collection-group { position: relative; }
 .tree-row, .document-row { position: relative; display: flex; align-items: center; min-width: 0; border-radius: var(--teamarness-radius-control, 6px); }
 .tree-row:hover, .document-row:hover { background: var(--teamarness-color-background); }
 .collection-button, .document-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; border: 0; background: transparent; color: var(--teamarness-color-text); cursor: pointer; padding: .55rem .25rem; }
+.collection-button { font-weight: 700; }
 .collection-button[aria-current="page"], .document-title[aria-current="true"] { background: color-mix(in srgb, var(--teamarness-color-accent) 14%, var(--teamarness-color-panel)); box-shadow: inset 3px 0 var(--teamarness-color-accent); font-weight: 700; }
 .is-archived .collection-button, .is-archived .document-title { color: var(--teamarness-color-text-muted); text-decoration: line-through; }
 .document-list { padding: 0 0 0 1.15rem; }
@@ -46,11 +48,15 @@ button, input, select, textarea { font: inherit; }
 .editor-textarea { flex: 1; min-height: 0; width: 100%; resize: none; border: 0; border-radius: 0; padding: 1rem 1.2rem; font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .95rem; line-height: 1.5; }
 .comments-panel { flex: none; width: min(var(--right-width), 36%); display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--teamarness-color-panel); }
 .comments-panel h3 { flex: none; margin: 0; padding: .8rem 1rem; border-bottom: 1px solid var(--teamarness-color-border); color: var(--teamarness-color-text-muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }
-.comment-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0 1rem .5rem; }
+.comment-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0 1rem .5rem; container-type: inline-size; }
+.comment-list .control-tooltip { max-width: 75cqw; }
+.comment-actions .control-tooltip { left: 0; right: auto; }
 .comment { margin-left: calc(var(--comment-depth, 0) * 1.1rem); padding: .5rem 0; border-bottom: 1px solid var(--teamarness-color-border); }
 .comment.is-resolved { opacity: .65; }
 .comment-meta { display: flex; justify-content: space-between; gap: .5rem; font-size: .8rem; color: var(--teamarness-color-text-muted); }
 .comment-author { font-weight: 650; color: var(--teamarness-color-text); }
+.comment-time { display: inline-grid; place-items: center; width: 1.8rem; height: 1.8rem; border-radius: var(--teamarness-radius-control, 6px); cursor: help; }
+.comment-time svg { width: 1rem; height: 1rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .comment-quote { margin: .3rem 0; padding: .2rem .6rem; border-left: 3px solid var(--teamarness-color-accent); color: var(--teamarness-color-text-muted); font-size: .85rem; white-space: pre-wrap; }
 .comment-quote--draft { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
 .comment-quote-cue { font-weight: 650; color: var(--teamarness-color-text); }
@@ -66,6 +72,8 @@ button, input, select, textarea { font: inherit; }
 @container (max-width: 760px) {
   .documents-page .teamarness-page-header { padding: .5rem; }
   .collection-rail { position: absolute; z-index: 4; top: 0; bottom: 0; left: 0; width: min(var(--left-width), 70%); box-shadow: 5px 0 15px #0004; }
+  .collection-rail-header { flex-wrap: wrap; }
+  .collection-rail h2 { min-width: 5rem; }
   .left-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; left: min(var(--left-width), 70%); }
   .comments-panel { position: absolute; z-index: 4; top: 0; bottom: 0; right: 0; width: min(var(--right-width), 75%); box-shadow: -5px 0 15px #0004; }
   .right-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; right: min(var(--right-width), 75%); }
