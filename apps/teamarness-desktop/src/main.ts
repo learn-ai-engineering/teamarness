@@ -3,6 +3,7 @@ import { bridge } from "./bridge";
 import { packageBridge } from "./package-bridge";
 import { browserFrameDom, browserThemeSource, PackageMountController } from "./package-mount";
 import { createPackageShell } from "./package-shell";
+import { createInstallationPackageVisibility } from "./package-visibility";
 import { Shell, shellFrameFromDocument } from "./shell";
 import { createInstallationThemeController } from "./theme";
 import { ShellController } from "./view";
@@ -27,6 +28,7 @@ const packageShell = createPackageShell(
 const shell = new Shell(frame, {
   packageShell,
   theme,
+  packageVisibility: createInstallationPackageVisibility(),
   workspaceActions: {
     selectWorkspace: (workspaceId) => { controller.selectWorkspace(workspaceId); },
     createWorkspace: async (name, personName) => { await controller.createWorkspace(name, personName); },

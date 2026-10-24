@@ -1,5 +1,6 @@
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
+import type { InstallationPackageVisibility } from "./package-visibility";
 import {
   buildPackageNavigationPresentation,
   buildShellPresentation,
@@ -55,6 +56,7 @@ type WorkspaceActions = Readonly<{
 type ShellOptions = Readonly<{
   packageShell: PackageRouter;
   theme: InstallationThemeController;
+  packageVisibility: InstallationPackageVisibility;
   workspaceActions: WorkspaceActions;
   onRouteChange?: (route: ShellRoute) => void;
 }>;
@@ -204,9 +206,13 @@ export class Shell {
       .filter(({ key }) => key.workspaceId === active.id)
       .map(({ key }) => key) ?? [];
     this.packagePresentation = buildPackageNavigationPresentation(this.packageSnapshot, active.id);
-    const team = this.packagePresentation.teamPackages
+    const visible = (row: PackageInstancePresentation): boolean => {
+      const instance = this.packageActionTargets[row.actionIndex];
+      return !instance || !this.options.packageVisibility.isHidden(instance);
+    };
+    const team = this.packagePresentation.teamPackages.filter(visible)
       .map((row) => packageButton(row, this.selectedRoute, this.packageActionTargets)).join("");
-    const privatePackages = this.packagePresentation.privatePackages
+    const privatePackages = this.packagePresentation.privatePackages.filter(visible)
       .map((row) => packageButton(row, this.selectedRoute, this.packageActionTargets)).join("");
 
     const settingsCurrent = this.selectedRoute.kind === "workspace-settings" ? ' aria-current="page"' : "";
@@ -249,6 +255,7 @@ export class Shell {
         this.packagePresentation,
         this.packageActionTargets,
         this.packageLifecycleFeedback,
+        this.options.packageVisibility,
       )}`
       : undefined;
     this.shellFrame.shellScreen.innerHTML = renderShell(
@@ -327,6 +334,17 @@ export class Shell {
         const action = button.dataset.packageAction;
         if (!instance || !row || !lifecycleActionAllowed(row, action)) return;
         void this.runPackageLifecycle(action, instance);
+      });
+    });
+    this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-visibility-index]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const index = Number(button.dataset.packageVisibilityIndex);
+        const instance = this.packageActionTargets[index];
+        if (!instance) return;
+        this.options.packageVisibility.setHidden(instance, !this.options.packageVisibility.isHidden(instance));
+        this.renderPackageConsumers();
+        // Re-rendering replaces the buttons, so return keyboard focus to the toggled one.
+        this.shellFrame.shellScreen.querySelector<HTMLButtonElement>(`[data-package-visibility-index="${index}"]`)?.focus();
       });
     });
     this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-failure-action]").forEach((button) => {
@@ -415,6 +433,10 @@ function isThemePreference(value: string): value is ThemePreference {
 
 const SETTINGS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 
+const EYE_OPEN_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+const EYE_CLOSED_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c6.5 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3.5 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="M2 2l20 20"/></svg>';
+
 function packageButton(
   row: PackageInstancePresentation,
   route: ShellRoute,
@@ -437,6 +459,7 @@ function renderPackageInstanceSettings(
   presentation: PackageNavigationPresentation,
   packageActionTargets: readonly PackageInstanceKey[],
   feedback: PackageLifecycleFeedback | null,
+  visibility: InstallationPackageVisibility,
 ): string {
   const rows = packageRows(presentation);
   if (rows.length === 0) return '<p class="empty-state">No Packages are available for this Workspace.</p>';
@@ -449,9 +472,15 @@ function renderPackageInstanceSettings(
     const rowFeedback = instance && feedback && samePackageInstance(instance, feedback.instance)
       ? renderPackageLifecycleFeedback(row, feedback)
       : "";
-    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>
+    const visibilityToggle = instance ? packageVisibilityButton(row, visibility.isHidden(instance)) : "";
+    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div class="package-instance-summary"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>${visibilityToggle}</div>
       ${rowFeedback}${renderPackageInstanceActions(row)}</article>`;
   }).join("")}</div>`;
+}
+
+function packageVisibilityButton(row: PackageInstancePresentation, hidden: boolean): string {
+  const label = `${hidden ? "Show" : "Hide"} ${row.name} in navigation`;
+  return `<button type="button" class="package-visibility-toggle" data-package-visibility-index="${row.actionIndex}" aria-pressed="${hidden ? "false" : "true"}" aria-label="${escape(label)}" title="${escape(label)}">${hidden ? EYE_CLOSED_ICON : EYE_OPEN_ICON}</button>`;
 }
 
 function renderPackageLifecycleFeedback(
