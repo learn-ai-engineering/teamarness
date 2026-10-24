@@ -476,7 +476,7 @@ async fn bound_agent_append_uses_agent_signer_and_replicates_to_peer() {
         .core
         .bind_agent_package(workspace, agent, PACKAGE)
         .unwrap();
-    // ADR 0027: a bound Agent is a local signer for any Package Instance on
+    // ADR 0030: a bound Agent is a local signer for any Package Instance on
     // this Installation, not only the Package that bound it.
     let other = self::mount(&host, 1).await;
     let foreign = call(&host, other, "agent-foreign-package", request()).await;
@@ -543,7 +543,7 @@ async fn bound_agent_append_uses_agent_signer_and_replicates_to_peer() {
     peer.shutdown().await.unwrap();
 }
 
-/// Verifies: TEAM.SYS.PKG-R03 (`teamarness.agent-binding` 1.0, ADR 0027)
+/// Verifies: TEAM.SYS.PKG-R03 (`teamarness.agent-binding` 1.0, ADR 0030)
 #[tokio::test]
 async fn agent_binding_capability_is_scoped_to_the_calling_package() {
     const FAMILY: &str = "teamarness.agent-binding";
@@ -1336,7 +1336,10 @@ fn capability_contracts_are_dependency_neutral_and_have_no_unapproved_family() {
         if matches!(
             path.file_name().and_then(|name| name.to_str()),
             Some(
-                "immutable-record-log.schema.json" | "immutable-record-log.test.mjs" | "README.md"
+                "immutable-record-log.schema.json"
+                    | "immutable-record-log-1.1.schema.json"
+                    | "immutable-record-log.test.mjs"
+                    | "README.md"
             )
         ) {
             continue;
@@ -1940,6 +1943,139 @@ async fn immutable_record_stream_reports_catching_up_then_current() {
             "state current 0".to_owned(),
         ]
     );
+}
+
+/// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R07 — the v1.1 marker shares
+/// the credited record stream, whereas v1.0 above has exactly five old events.
+#[tokio::test]
+async fn immutable_record_v11_replay_end_follows_fixed_prefix() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":1,"maxMinor":1
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    for index in 0..3_u8 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                "dev.teamarness.fixture",
+                "fixture.record",
+                &[index; 4],
+            )
+            .unwrap();
+    }
+    fixture_request(
+        &host,
+        &mount,
+        "v11-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    let response = poll_immutable(&host, &mount, "the qualified replay boundary", |response| {
+        events_of(response).iter().any(|event| {
+            matches!(event, PackageValue::Object(value)
+            if value.get("kind") == Some(&PackageValue::String("replay_end".into())))
+        })
+    })
+    .await;
+    let kinds = events_of(&response)
+        .iter()
+        .filter_map(|event| match event {
+            PackageValue::Object(value) => value.get("kind"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let marker = kinds
+        .iter()
+        .position(|kind| **kind == PackageValue::String("replay_end".into()))
+        .unwrap();
+    let record_positions = kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, kind)| {
+            (**kind == PackageValue::String("record".into())).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(record_positions.len(), 3);
+    assert!(record_positions.iter().all(|index| *index < marker));
+    assert!(
+        matches!(&events_of(&response)[marker], PackageValue::Object(value)
+        if value.get("gapFree") == Some(&PackageValue::Boolean(true)))
+    );
+}
+
+/// Verifies: TEAM.SYS.PKG-R10: replay_end consumes one credit after 31 records.
+#[tokio::test]
+async fn immutable_record_v11_marker_waits_for_credit() {
+    let requirements = [serde_json::json!({
+        "identity":"teamarness.synchronization.immutable-record-log",
+        "major":1,"minMinor":1,"maxMinor":1
+    })];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].clone();
+    for index in 0..31_u8 {
+        fixture
+            .core
+            .append_record(
+                workspace.id(),
+                "dev.teamarness.fixture",
+                "fixture.record",
+                &[index],
+            )
+            .unwrap();
+    }
+    fixture_request(
+        &host,
+        &mount,
+        "v11-credit-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    let before = poll_immutable(&host, &mount, "all initial credit spent", |response| {
+        events_of(response).len() == 32
+    })
+    .await;
+    assert_eq!(record_events(&before), 31);
+    assert!(
+        events_of(&before)
+            .iter()
+            .all(|event| !matches!(event, PackageValue::Object(value)
+        if value.get("kind") == Some(&PackageValue::String("replay_end".into()))))
+    );
+    fixture_request(
+        &host,
+        &mount,
+        "v11-credit-one",
+        "fixture.immutable_credit",
+        object([("amount", PackageValue::Integer(1))]),
+    )
+    .await;
+    let after = poll_immutable(&host, &mount, "credited replay boundary", |response| {
+        events_of(response).len() == 33
+    })
+    .await;
+    assert!(matches!(&events_of(&after)[32], PackageValue::Object(value)
+        if value.get("kind") == Some(&PackageValue::String("replay_end".into()))));
 }
 
 /// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R08

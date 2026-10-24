@@ -1,4 +1,4 @@
--- ADR 0027: an Agent Binding is Package configuration. One Package Instance in
+-- ADR 0030: an Agent Binding is Package configuration. One Package Instance in
 -- one Workspace maps to at most one Agent; any number of Packages may share an
 -- Agent. Existing rows (at most one per Agent) carry over without collision.
 CREATE TABLE agent_package_bindings_by_package (

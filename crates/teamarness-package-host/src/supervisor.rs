@@ -14,7 +14,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::capability::{CapabilityRequirement, CapabilityScope, GenerationCapabilities};
+use crate::capability::{
+    AppendFence, CapabilityRequirement, CapabilityScope, GenerationCapabilities,
+};
 use crate::diag::fault;
 use crate::host_store::{HostStore, HostStoreHandle, ProcessLease};
 use crate::manifest::sha256;
@@ -85,6 +87,7 @@ pub(crate) async fn spawn(
     spec: &ProcessSpec,
     generation: u64,
     recovering: bool,
+    append_fence: Arc<AppendFence>,
 ) -> Result<ProcessGeneration, WireFailure> {
     let authority = spec.authority.advance().await.map_err(WireFailure::new)?;
     let capabilities = GenerationCapabilities::bind(
@@ -98,6 +101,7 @@ pub(crate) async fn spawn(
         &spec.template.capabilities,
         generation,
         spec.calls.limiter.clone(),
+        append_fence,
         spec.broker.clone(),
         authority,
     )
@@ -459,7 +463,7 @@ mod tests {
             broker: std::sync::Weak::new(),
         };
 
-        let error = match spawn(&spec, 1, false).await {
+        let error = match spawn(&spec, 1, false, Arc::new(AppendFence::default())).await {
             Ok(_) => panic!("malformed handshake unexpectedly succeeded"),
             Err(error) => error,
         };

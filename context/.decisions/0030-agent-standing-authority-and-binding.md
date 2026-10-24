@@ -1,4 +1,4 @@
-# 0027 — Standing local Agent authority and Package-held Agent binding
+# 0030 — Standing local Agent authority and Package-held Agent binding
 
 **Status:** accepted (2026-10-24)
 **Supersedes in part:** ADR 0023 (record-log 1.1 clause "Core signs … when, and only when, the calling Package Instance is bound to that Agent"; "one Agent is bound to at most one Package Instance"), ADR 0026 (clause "this decision does not enable a separate Conversations Provider to sign records as that Agent"; Person-only `message.post`)

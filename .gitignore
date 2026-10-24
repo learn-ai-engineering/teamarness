@@ -8,6 +8,7 @@ node_modules/
 /packages/conversations-package/ui/dist/
 /packages/repo-aware/ui/dist/
 /packages/agent-package/ui/dist/
+/packages/documents-package/ui/dist/
 /apps/teamarness-desktop/src-tauri/gen/
 /.teamarness-dev/
 # Temporary typecheck trees the contract-types generator test builds

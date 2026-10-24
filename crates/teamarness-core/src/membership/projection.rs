@@ -2051,7 +2051,7 @@ pub(crate) fn persist_candidate_rows(
     // transaction. Never commit a roster change without its name invalidation.
     crate::principals::refresh(transaction, candidate).map_err(MembershipError::Storage)?;
     // An Agent Binding is local configuration for a current Agent: a removal
-    // commits with its bindings cleared, in this transaction (ADR 0027).
+    // commits with its bindings cleared, in this transaction (ADR 0030).
     if let MembershipAction::RemoveAgentKey { agent, .. } = &envelope.action {
         crate::principals::agent_keys::clear_bindings_for_key(
             transaction,

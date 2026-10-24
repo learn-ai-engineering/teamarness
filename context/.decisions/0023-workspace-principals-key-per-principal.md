@@ -62,4 +62,4 @@ Names are Principal names. A Person's name edit is signed by the Person's key; a
 
 ### Provenance (non-versioned)
 
-- Workstream `agent-invite`: alignment `scope/20261019T065934Z_workspace-principals.md`, research `research/20261019T070643Z_principal-seams.md`, design `design/20261021T002739Z_workspace-principals.md`.
+- Workstream `agent-invite`: alignment `scope/20261019T065934Z_workspace-principals.md`, research `research/20261019T070643Z_principal-seams.md`, design `design/20261021T003039Z_workspace-principals.md`.

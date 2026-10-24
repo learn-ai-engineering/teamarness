@@ -301,6 +301,15 @@ pub(crate) fn validate_cursor(
     Ok(sequence)
 }
 
+/// End of the finite installation-local prefix captured when this subscription opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialReplayBoundary {
+    /// Journal generation and fixed high-water position (also for an empty scope).
+    pub cursor: Option<Cursor>,
+    /// False if any prefix row was skipped or the scope was unavailable at capture.
+    pub gap_free: bool,
+}
+
 /// One bounded read of committed records.
 #[derive(Debug, Default)]
 pub struct RecordPage {
@@ -309,6 +318,8 @@ pub struct RecordPage {
     /// How many records in the same range were skipped because they are
     /// quarantined. Their delivery sequences are still consumed.
     pub quarantined_skipped: usize,
+    /// Appears once, after all record events in the captured prefix, never on a cursor resume.
+    pub initial_replay: Option<InitialReplayBoundary>,
 }
 
 /// What a Package is told about its ability to synchronize this scope.
@@ -387,6 +398,9 @@ pub struct RecordSubscription {
     /// Records skipped as quarantined since availability was last read.
     pub(crate) quarantined_seen: usize,
     pub(crate) last_seen: HeadState,
+    /// Captured under the same runtime lock that serializes append and cursor validation.
+    pub(crate) initial_high_water: Option<i64>,
+    pub(crate) initial_gap_free: bool,
     /// This Installation, so a revocation of it is visible to the Package.
     pub(crate) local: crate::PublicIdentity,
     pub(crate) health: Arc<SyncHealthRegistry>,
@@ -409,6 +423,8 @@ impl RecordSubscription {
         scope: [u8; 32],
         journal: Option<[u8; 16]>,
         position: i64,
+        initial_high_water: Option<i64>,
+        initial_gap_free: bool,
         scope_head: Arc<ScopeHead>,
         local: crate::PublicIdentity,
         health: Arc<SyncHealthRegistry>,
@@ -427,6 +443,8 @@ impl RecordSubscription {
             buffer: VecDeque::new(),
             quarantined_seen: 0,
             last_seen,
+            initial_high_water,
+            initial_gap_free,
             local,
             health,
         }
@@ -453,8 +471,22 @@ impl RecordSubscription {
         let Some((journal, content_key)) = self.scope_state(&state)? else {
             return Ok(RecordPage::default());
         };
+        if self.journal.is_some_and(|captured| captured != journal) {
+            return Err(SynchronizationError::CursorScopeMismatch);
+        }
         self.journal = Some(journal);
-        let rows = self.read_rows(&state.connection, limit)?;
+        // Never include post-capture records in the page carrying the marker.
+        let rows = self.read_rows(&state.connection, limit, self.initial_high_water)?;
+        if let Some(last) = rows.last().map(|row| row.0) {
+            let count: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM record_delivery WHERE scope_id=?1 AND delivery_sequence>?2 AND delivery_sequence<=?3",
+                rusqlite::params![self.scope.as_slice(), self.position, last],
+                |row| row.get(0),
+            ).map_err(|_| storage_error())?;
+            if usize::try_from(count).ok() != Some(rows.len()) {
+                self.initial_gap_free = false;
+            }
+        }
         let protection = P2pandaRecordProtection {
             package_identity: self.package.clone(),
             workspace_id: self.workspace,
@@ -508,6 +540,30 @@ impl RecordSubscription {
                     u64::try_from(sequence).map_err(|_| SynchronizationError::CorruptRecord)?,
                 ),
             });
+        }
+        if page.quarantined_skipped > 0
+            || quarantine::is_scope_quarantined(&state.connection, self.scope)?
+        {
+            self.initial_gap_free = false;
+        }
+        if let Some(high_water) = self.initial_high_water {
+            if self.position < high_water && page.events.is_empty() && page.quarantined_skipped == 0
+            {
+                // A dangling delivery row or interrupted history must never certify absence.
+                self.initial_gap_free = false;
+                self.position = high_water;
+            }
+            if self.position >= high_water {
+                page.initial_replay = Some(InitialReplayBoundary {
+                    cursor: Some(Cursor::new(
+                        journal,
+                        u64::try_from(high_water)
+                            .map_err(|_| SynchronizationError::CorruptRecord)?,
+                    )),
+                    gap_free: self.initial_gap_free,
+                });
+                self.initial_high_water = None;
+            }
         }
         drop(state);
         self.quarantined_seen = self
@@ -654,6 +710,7 @@ impl RecordSubscription {
         &self,
         connection: &rusqlite::Connection,
         limit: usize,
+        initial_high_water: Option<i64>,
     ) -> Result<Vec<DeliveryRow>, SynchronizationError> {
         let mut statement = connection
             .prepare(
@@ -665,6 +722,7 @@ impl RecordSubscription {
                  JOIN immutable_operations o ON o.record_id=r.record_id
                  LEFT JOIN quarantined_records q ON q.record_id=r.record_id
                  WHERE d.scope_id=?1 AND d.delivery_sequence>?2
+                       AND (?4 IS NULL OR d.delivery_sequence<=?4)
                  ORDER BY d.delivery_sequence LIMIT ?3",
             )
             .map_err(|_| storage_error())?;
@@ -673,7 +731,8 @@ impl RecordSubscription {
                 rusqlite::params![
                     self.scope.as_slice(),
                     self.position,
-                    i64::try_from(limit).unwrap_or(i64::from(u32::MAX))
+                    i64::try_from(limit).unwrap_or(i64::from(u32::MAX)),
+                    initial_high_water
                 ],
                 |row| {
                     Ok((

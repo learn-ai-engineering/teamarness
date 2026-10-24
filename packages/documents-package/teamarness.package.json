@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "identity": "dev.teamarness.documents",
+  "version": "1.0.0",
+  "presentation": {
+    "displayName": "Documents"
+  },
+  "protocol": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "backends": [
+    {
+      "target": "aarch64-apple-darwin",
+      "path": "backend/teamarness-documents-package-aarch64-apple-darwin",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "ui": {
+    "entrypoint": {
+      "path": "ui/index.js",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "assets": [
+      {
+        "path": "ui/style.css",
+        "mediaType": "text/css",
+        "size": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "contract": {
+      "path": "ui-contract.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "capabilities": [
+    {
+      "identity": "teamarness.workspace-context",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.membership",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.principals",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.signing",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.synchronization.immutable-record-log",
+      "major": 1,
+      "minMinor": 1,
+      "maxMinor": 1
+    }
+  ],
+  "extensions": {
+    "dev.teamarness.build": {
+      "generatedFields": [
+        "backends.0.size",
+        "backends.0.sha256",
+        "ui.entrypoint.size",
+        "ui.entrypoint.sha256",
+        "ui.assets.0.size",
+        "ui.assets.0.sha256",
+        "ui.contract.sha256"
+      ]
+    }
+  }
+}

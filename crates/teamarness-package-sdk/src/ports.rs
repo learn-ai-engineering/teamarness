@@ -8,7 +8,7 @@ use crate::{BackendError, CapabilityClient, CapabilitySubscription};
 ///
 /// The Host emits the Installation Person for an unbound caller, and the
 /// Workspace Agent the calling Package Instance is bound to through
-/// `teamarness.agent-binding` otherwise (ADR 0027). `identity` is the actor's
+/// `teamarness.agent-binding` otherwise (ADR 0030). `identity` is the actor's
 /// current signing key in both cases; an Agent also carries its Principal ID,
 /// which a Provider passes as `principal` to a record-log 1.1 append so Core
 /// signs with the Agent's key.

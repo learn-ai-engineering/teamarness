@@ -692,7 +692,7 @@ impl CoreRuntime {
 
     /// Binds one Package Instance to an Agent this Installation stewards,
     /// replacing that Package's previous Agent. Local configuration, never
-    /// replicated; any number of Packages may bind the same Agent (ADR 0027).
+    /// replicated; any number of Packages may bind the same Agent (ADR 0030).
     pub fn bind_agent_package(
         &self,
         workspace: WorkspaceId,

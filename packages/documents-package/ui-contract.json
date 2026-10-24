@@ -1,0 +1,741 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "recordId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^\\S(.*\\S)?$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^\\S(.*\\S)?$"
+    },
+    "availability": {
+      "type": "string",
+      "enum": [
+        "waiting_for_history_access",
+        "offline",
+        "catching_up",
+        "current"
+      ]
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "archived"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/recordId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "archived": {
+          "type": "boolean"
+        }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "collectionId",
+        "title",
+        "archived"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/recordId"
+        },
+        "collectionId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "archived": {
+          "type": "boolean"
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collections",
+        "documents",
+        "availability"
+      ],
+      "properties": {
+        "collections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/collection"
+          }
+        },
+        "documents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/document"
+          }
+        },
+        "availability": {
+          "$ref": "#/$defs/availability"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "appended": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "id"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "id": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "collectionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collectionId"
+      ],
+      "properties": {
+        "collectionId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "documentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentId"
+      ],
+      "properties": {
+        "documentId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "requestId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "requestStatus": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requestId", "inclusion", "durability"],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "inclusion": { "enum": ["included", "absent", "unresolved"] },
+        "durability": { "enum": ["durable", "pending", "unresolved"] }
+      }
+    },
+    "textOp": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "retain"
+          ],
+          "properties": {
+            "retain": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "insert"
+          ],
+          "properties": {
+            "insert": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "delete"
+          ],
+          "properties": {
+            "delete": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "textEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentId",
+        "revision",
+        "editable"
+      ],
+      "properties": {
+        "documentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "editable": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["identity_conflict", "import_failure"]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 98304
+        },
+        "transfer": {
+          "type": "string",
+          "enum": ["begin", "chunk", "end"]
+        },
+        "diagnosticRecordId": { "$ref": "#/$defs/recordId" },
+        "savedRevision": {
+          "$ref": "#/$defs/revision"
+        },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "transferId": { "$ref": "#/$defs/requestId" },
+        "requestStatuses": {
+          "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/requestStatus" }
+        },
+        "chunks": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "chunkIndex": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chunk": {
+          "type": "string",
+          "maxLength": 24576
+        },
+        "origin": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "delta": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/textOp"
+          }
+        }
+      }
+    },
+    "edited": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "revision",
+        "requestId"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "requestId": { "$ref": "#/$defs/requestId" }
+      }
+    },
+    "comment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "documentId",
+        "author",
+        "position",
+        "resolved",
+        "isLocal"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/recordId"
+        },
+        "documentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "parentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "author": {
+          "type": "string"
+        },
+        "position": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved": {
+          "type": "boolean"
+        },
+        "isLocal": {
+          "type": "boolean"
+        },
+        "markdown": {
+          "type": "string",
+          "maxLength": 32768
+        },
+        "quote": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "createdAt": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,14})$"
+        }
+      }
+    },
+    "comments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comments"
+      ],
+      "properties": {
+        "comments": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/comment"
+          }
+        },
+        "hasMore": {
+          "type": "boolean"
+        },
+        "nextCursor": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "commentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commentId"
+      ],
+      "properties": {
+        "commentId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "personName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "personId",
+        "name",
+        "fingerprint"
+      ],
+      "properties": {
+        "identity": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "personId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      }
+    },
+    "names": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "cursor",
+        "persons"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "$ref": "#/$defs/revision"
+        },
+        "persons": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/personName"
+          }
+        },
+        "part": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "parts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        }
+      }
+    }
+  },
+  "requests": {
+    "documents.snapshot": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "response": {
+        "$ref": "#/$defs/snapshot"
+      }
+    },
+    "documents.collection.create": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/$defs/name"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.collection.rename": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "name"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "name": {
+            "$ref": "#/$defs/name"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.collection.archive": {
+      "request": {
+        "$ref": "#/$defs/collectionRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.collection.restore": {
+      "request": {
+        "$ref": "#/$defs/collectionRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.document.create": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "title"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "title": {
+            "$ref": "#/$defs/title"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.document.rename": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "title"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "title": {
+            "$ref": "#/$defs/title"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.document.move": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "collectionId"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.document.archive": {
+      "request": {
+        "$ref": "#/$defs/documentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.document.restore": {
+      "request": {
+        "$ref": "#/$defs/documentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.document.open": {
+      "request": {
+        "$ref": "#/$defs/documentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/textEvent"
+      }
+    },
+    "documents.document.recover": {
+      "request": {
+        "type": "object", "additionalProperties": false,
+        "required": ["documentId", "transferId", "requestIds"],
+        "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "transferId": { "$ref": "#/$defs/requestId" },
+          "requestIds": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/requestId" } }
+        }
+      },
+      "response": {
+        "type": "object", "additionalProperties": false,
+        "required": ["documentId", "revision", "transferId"],
+        "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "revision": { "$ref": "#/$defs/revision" },
+          "transferId": { "$ref": "#/$defs/requestId" }
+        }
+      }
+    },
+    "documents.document.edit": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "requestId",
+          "baseRevision",
+          "ops"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "requestId": { "$ref": "#/$defs/requestId" },
+          "baseRevision": {
+            "$ref": "#/$defs/revision"
+          },
+          "ops": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4096,
+            "items": {
+              "$ref": "#/$defs/textOp"
+            }
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/edited"
+      }
+    },
+    "documents.comments": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["documentId"],
+        "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "cursor": { "type": "string", "minLength": 1 }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/comments"
+      }
+    },
+    "documents.comment.add": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "markdown"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "parentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "quote": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "markdown": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.comment.resolve": {
+      "request": {
+        "$ref": "#/$defs/commentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.comment.reopen": {
+      "request": {
+        "$ref": "#/$defs/commentRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    }
+  },
+  "subscriptions": {
+    "documents.changes": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "event": {
+        "$ref": "#/$defs/snapshot"
+      }
+    },
+    "documents.document.text": {
+      "request": {
+        "$ref": "#/$defs/documentRequest"
+      },
+      "event": {
+        "$ref": "#/$defs/textEvent"
+      }
+    },
+    "documents.names": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "event": {
+        "$ref": "#/$defs/names"
+      }
+    }
+  }
+}

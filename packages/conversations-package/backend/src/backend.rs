@@ -545,7 +545,7 @@ impl Author {
 /// Turns the Host-authored actor into the author a post is written as.
 ///
 /// A Person must be this Installation. An Agent actor is Host-derived from the calling Package
-/// Instance's Agent Binding (ADR 0027), so it is accepted as given: the record names the Agent's
+/// Instance's Agent Binding (ADR 0030), so it is accepted as given: the record names the Agent's
 /// key and Core signs with that key, or refuses with `principal_not_bound`, when the Package
 /// appends with its Principal ID.
 fn authorize_actor(

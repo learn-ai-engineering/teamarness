@@ -205,7 +205,7 @@ async fn live_actor(host: &PackageHost, mount: &UiMountId, id: &str) -> serde_js
     events().await["events"][0]["actor"].clone()
 }
 
-/// Verifies: TEAM.SYS.PKG-R13 (Host-derived actor, ADR 0027)
+/// Verifies: TEAM.SYS.PKG-R13 (Host-derived actor, ADR 0030)
 #[tokio::test]
 async fn a_bound_consumer_presents_an_agent_actor_and_an_unbound_one_its_person() {
     let fixture = common::Fixture::node_with_capabilities(

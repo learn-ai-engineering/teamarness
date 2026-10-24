@@ -1,6 +1,6 @@
 //! Installation-local Agent signing-key custody and Agent Bindings: the
 //! Package-keyed local configuration that makes a stewarded Agent a signer on
-//! this Installation (ADR 0027).
+//! this Installation (ADR 0030).
 use iroh_base::SecretKey;
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
@@ -53,7 +53,7 @@ pub(crate) fn load(
 }
 
 /// Binds one Package Instance to an Agent; a later bind replaces the
-/// Package's previous Agent, never another Package's binding (ADR 0027).
+/// Package's previous Agent, never another Package's binding (ADR 0030).
 pub(crate) fn bind(
     connection: &Connection,
     workspace: WorkspaceId,

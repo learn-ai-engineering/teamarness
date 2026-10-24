@@ -10,6 +10,7 @@ members = [
     "packages/tutorial/backend",
     "packages/conversations-package/backend",
     "packages/repo-aware/backend",
+    "packages/documents-package/backend",
     "tests/system",
 ]
 resolver = "3"
@@ -26,6 +27,7 @@ gix = { version = "=0.87.1", default-features = false, features = ["status", "sh
 iroh = "=1.2.0"
 iroh-base = { version = "=1.2.0", default-features = false, features = ["key"] }
 iroh-tickets = "=1.0.0"
+loro = { version = "=1.16.2", default-features = false }
 jsonschema = { version = "=0.56.0", default-features = false }
 mime = "=0.3.17"
 nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }

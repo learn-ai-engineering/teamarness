@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex as BlockingMutex};
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
@@ -111,6 +112,84 @@ impl CoreCallLimiter {
         .await
         .map_err(|_| PackageErrorCode::CapabilityUnavailable)
     }
+
+    async fn run_append<T: Send + 'static>(
+        &self,
+        fence: Arc<AppendFence>,
+        started: Arc<AtomicBool>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, PackageErrorCode> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
+        tokio::task::spawn_blocking(move || {
+            let _running = fence.enter().ok_or(PackageErrorCode::Cancelled)?;
+            started.store(true, Ordering::Release);
+            let result = f();
+            drop(permit);
+            Ok(result)
+        })
+        .await
+        .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
+    }
+}
+
+/// Admission and quiescence of append work belonging to one Package Process generation.
+/// Closing the gate and entering a Core closure share the same lock. A caller deadline
+/// cannot make a closure which already entered disappear from the drain count.
+#[derive(Default)]
+pub(crate) struct AppendFence {
+    state: BlockingMutex<AppendFenceState>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct AppendFenceState {
+    retired: bool,
+    running: usize,
+}
+
+struct RunningAppend<'a>(&'a AppendFence);
+
+impl Drop for RunningAppend<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.running -= 1;
+        self.0.drained.notify_all();
+    }
+}
+
+impl AppendFence {
+    fn enter(&self) -> Option<RunningAppend<'_>> {
+        let mut state = self.state.lock().unwrap();
+        if state.retired {
+            return None;
+        }
+        state.running += 1;
+        Some(RunningAppend(self))
+    }
+
+    /// Refuse all queued work atomically with entry, then await closure exit.
+    pub(crate) async fn retire(self: &Arc<Self>, deadline: Duration) -> bool {
+        let fence = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let end = Instant::now() + deadline;
+            let mut state = fence.state.lock().unwrap();
+            state.retired = true;
+            while state.running > 0 {
+                let remaining = end.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (next, _) = fence.drained.wait_timeout(state, remaining).unwrap();
+                state = next;
+            }
+            true
+        })
+        .await
+        .unwrap_or(false)
+    }
 }
 
 /// The stable name of one Semantic Capability contract shape.
@@ -194,6 +273,7 @@ pub(crate) struct GenerationCapabilities {
     authority: crate::authority::GenerationAuthority,
     core: Arc<CoreRuntime>,
     limiter: CoreCallLimiter,
+    append_fence: Arc<AppendFence>,
     scope: CapabilityScope,
     generation: u64,
     grants: BTreeMap<String, BoundGrant>,
@@ -210,6 +290,7 @@ impl GenerationCapabilities {
         requirements: &[CapabilityRequirement],
         generation: u64,
         limiter: CoreCallLimiter,
+        append_fence: Arc<AppendFence>,
         broker: std::sync::Weak<crate::broker::PortBroker>,
         authority: crate::authority::GenerationAuthority,
     ) -> Result<Arc<Self>, PackageErrorCode> {
@@ -247,6 +328,7 @@ impl GenerationCapabilities {
             authority,
             core,
             limiter,
+            append_fence,
             scope,
             generation,
             grants,
@@ -524,6 +606,7 @@ impl GenerationCapabilities {
                     output,
                     all_streams,
                     self.cancelled.subscribe(),
+                    grant.minor,
                 ));
             }
             _ => {
@@ -721,7 +804,7 @@ impl GenerationCapabilities {
 
     /// `teamarness.agent-binding` 1.0: a Package reads and sets its own Agent
     /// Binding. The grant fixes the Package and Workspace, so no request names
-    /// a Package, and Core enforces stewardship (ADR 0027).
+    /// a Package, and Core enforces stewardship (ADR 0030).
     async fn agent_binding(
         &self,
         method: &str,
@@ -813,7 +896,7 @@ impl GenerationCapabilities {
 
     /// The Host-authored actor for a Port dispatch by this generation: the
     /// Workspace Agent the calling Package is bound to, otherwise the
-    /// Installation Person (ADR 0027). Read once per dispatch; the lookup
+    /// Installation Person (ADR 0030). Read once per dispatch; the lookup
     /// never marks the command as started, because nothing has reached the
     /// Provider yet.
     async fn port_actor(&self) -> Result<Value, PackageErrorCode> {
@@ -879,7 +962,7 @@ impl GenerationCapabilities {
                     MAX_CANONICAL_DECODED_BYTES,
                 )?;
                 self.limiter
-                    .run(started, move || {
+                    .run_append(self.append_fence.clone(), started, move || {
                         let record = core
                             .append_record_as_principal(
                                 workspace, &package, &purpose, &canonical, principal,
@@ -1644,6 +1727,7 @@ async fn run_record_stream(
     output: HostStreamSender,
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
+    negotiated_minor: u16,
 ) {
     let subscribe_core = core.clone();
     let subscribe_package = package.clone();
@@ -1680,6 +1764,7 @@ async fn run_record_stream(
         }
     };
     let mut sequence = 0_u64;
+    let mut pending_replay: Option<teamarness_core::InitialReplayBoundary> = None;
     let mut tracking = StateTracking::new();
     // The first event of every stream is a state event.
     let mut need_state = true;
@@ -1694,6 +1779,19 @@ async fn run_record_stream(
             output.retire(&stream_id).await;
             streams.lock().await.remove(&stream_id);
             return;
+        }
+        if let Some(boundary) = pending_replay.take() {
+            if negotiated_minor >= 1
+                && let Some(cursor) = boundary.cursor
+            {
+                sequence = sequence.saturating_add(1);
+                let payload = json!({"kind":"replay_end","cursor":cursor.to_string(),"gapFree":boundary.gap_free});
+                if output.event(&stream_id, sequence, payload).await.is_err() {
+                    break;
+                }
+                credit -= 1;
+            }
+            continue;
         }
         if need_state {
             let read = tokio::task::spawn_blocking(move || {
@@ -1774,6 +1872,9 @@ async fn run_record_stream(
         };
         if page.quarantined_skipped > 0 {
             need_state = true;
+        }
+        if negotiated_minor >= 1 {
+            pending_replay = page.initial_replay;
         }
         let mut delivered = true;
         for event in &page.events {
@@ -1997,6 +2098,7 @@ mod tests {
             }],
             1,
             limiter,
+            Arc::new(AppendFence::default()),
             std::sync::Weak::new(),
             crate::authority::AuthorityGeneration::default()
                 .advance()
@@ -2042,6 +2144,7 @@ mod tests {
             &[],
             1,
             CoreCallLimiter::new(),
+            Arc::new(AppendFence::default()),
             Arc::downgrade(&broker),
             broker.authority_generation(&key).advance().await.unwrap(),
         )
@@ -2056,6 +2159,7 @@ mod tests {
             &[],
             1,
             CoreCallLimiter::new(),
+            Arc::new(AppendFence::default()),
             Arc::downgrade(&broker),
             broker.authority_generation(&key).advance().await.unwrap(),
         )
@@ -2098,6 +2202,44 @@ mod tests {
 
     fn append_request() -> Value {
         json!({"method":"append","purpose":"message.post","canonical":"aGVsbG8"})
+    }
+
+    #[tokio::test]
+    async fn retired_append_fence_cancels_queued_work_and_waits_for_started_closure() {
+        let fence = Arc::new(AppendFence::default());
+        let entered = fence.enter().expect("first append entered Core closure");
+        let drain = tokio::spawn({
+            let fence = fence.clone();
+            async move { fence.retire(Duration::from_secs(2)).await }
+        });
+        let limit = std::time::Instant::now() + Duration::from_secs(1);
+        while !fence.state.lock().unwrap().retired {
+            assert!(
+                std::time::Instant::now() < limit,
+                "retirement did not close admission"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fence.enter().is_none(),
+            "a queued append cannot enter after retirement"
+        );
+        assert!(
+            !drain.is_finished(),
+            "started append must drain through closure exit"
+        );
+        drop(entered);
+        assert!(drain.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn append_fence_timeout_does_not_reopen_admission() {
+        let fence = Arc::new(AppendFence::default());
+        let entered = fence.enter().unwrap();
+        assert!(!fence.retire(Duration::from_millis(1)).await);
+        assert!(fence.enter().is_none());
+        drop(entered);
+        assert!(fence.retire(Duration::from_secs(1)).await);
     }
 
     /// Verifies: TEAM.SYS.TRANS-R07
@@ -2240,6 +2382,47 @@ mod tests {
             min_minor,
             max_minor,
         }
+    }
+
+    #[test]
+    fn record_log_v11_negotiates_without_changing_v10_consumers() {
+        let registry = Registry::production();
+        assert_eq!(
+            registry
+                .negotiate(&requirement(
+                    "teamarness.synchronization.immutable-record-log",
+                    1,
+                    0,
+                    0
+                ))
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement(
+                    "teamarness.synchronization.immutable-record-log",
+                    1,
+                    1,
+                    1
+                ))
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement(
+                    "teamarness.synchronization.immutable-record-log",
+                    1,
+                    0,
+                    1
+                ))
+                .unwrap()
+                .1,
+            1
+        );
     }
 
     #[test]
