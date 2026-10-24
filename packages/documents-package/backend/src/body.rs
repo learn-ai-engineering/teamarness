@@ -10,6 +10,9 @@
 //! that [`DocumentBody::allocate_peer`] handed out: one per genesis, per Markdown merge and (from
 //! the editor session seam) per UI session. Peers are random, absent from the Document's
 //! version vector, never reused in this process, and never derived from the Installation.
+//!
+//! An editor session loads the body from [`DocumentBody::snapshot`] and then follows the
+//! operations each change adds ([`DocumentBody::updates_since`]); it never replays records.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -150,6 +153,9 @@ pub(crate) struct DocumentBody {
     pending_request_id: Option<String>,
     identities: HashMap<String, EditIdentity>,
     identity_order: VecDeque<String>,
+    /// Peers whose operations reached this body in records another Installation wrote. A UI
+    /// session never resumes as one of them.
+    foreign_peers: HashSet<u64>,
 }
 
 impl DocumentBody {
@@ -167,6 +173,7 @@ impl DocumentBody {
             pending_request_id: None,
             identities: HashMap::new(),
             identity_order: VecDeque::new(),
+            foreign_peers: HashSet::new(),
         }
     }
 
@@ -185,6 +192,7 @@ impl DocumentBody {
             pending_request_id: self.pending_request_id.clone(),
             identities: self.identities.clone(),
             identity_order: self.identity_order.clone(),
+            foreign_peers: self.foreign_peers.clone(),
         }
     }
 
@@ -202,6 +210,42 @@ impl DocumentBody {
     /// The body's current version, a base for [`Self::merge_markdown`].
     pub(crate) fn frontiers(&self) -> Frontiers {
         self.doc.oplog_frontiers()
+    }
+    /// Every operation the body holds, including an accepted update not yet appended.
+    pub(crate) fn version_vector(&self) -> VersionVector {
+        self.doc.oplog_vv()
+    }
+    /// The operations the body gained since `since`, as one update, or `None` when it gained
+    /// none. Updates still waiting for causal history are not operations yet.
+    pub(crate) fn updates_since(&self, since: &VersionVector) -> Option<Vec<u8>> {
+        if self.doc.oplog_vv() == *since {
+            return None;
+        }
+        self.doc.export(ExportMode::updates(since)).ok()
+    }
+    /// The whole body as one Loro snapshot, the only thing an editor session loads.
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        self.doc.export(ExportMode::Snapshot).unwrap_or_default()
+    }
+    /// The body as the record log alone makes it, as one Loro snapshot: what stays visible,
+    /// read-only, after an import failure.
+    pub(crate) fn applied_snapshot(&self) -> Vec<u8> {
+        self.applied
+            .doc
+            .export(ExportMode::Snapshot)
+            .unwrap_or_default()
+    }
+    /// Remembers the peers of `update`, a record another Installation wrote.
+    pub(crate) fn note_foreign_record(&mut self, update: &[u8]) {
+        if let Ok(meta) = LoroDoc::decode_import_blob_meta(update, false) {
+            self.foreign_peers
+                .extend(meta.partial_end_vv.keys().copied());
+        }
+    }
+    /// Whether a UI session that held `peer` before may resume as it: never a peer another
+    /// Installation writes with, so no two writers ever share one.
+    pub(crate) fn may_resume(&self, peer: u64) -> bool {
+        peer != u64::MAX && !self.foreign_peers.contains(&peer)
     }
     pub(crate) fn unopened(&self) -> usize {
         self.unopened
@@ -432,43 +476,6 @@ impl DocumentBody {
             .update
     }
 
-    /// What a person typing into the body would send as `peer`: `text` inserted at the start or
-    /// end of the first text run of top-level block `block`, without changing the body.
-    ///
-    /// Only the system tests' Backend reaches this, to stand in for an editor session.
-    pub(crate) fn typing_update(
-        &self,
-        peer: u64,
-        block: usize,
-        at_end: bool,
-        text: &str,
-    ) -> Result<Vec<u8>, BodyError> {
-        use loro::{Container, ValueOrContainer};
-        let doc = self.doc.fork();
-        doc.set_peer_id(peer).map_err(|_| BodyError::Loro)?;
-        let before = doc.oplog_vv();
-        let Some(ValueOrContainer::Container(Container::List(blocks))) =
-            doc.get_map("doc").get("children")
-        else {
-            return Err(BodyError::InvalidUpdate);
-        };
-        let Some(ValueOrContainer::Container(Container::Map(node))) = blocks.get(block) else {
-            return Err(BodyError::InvalidUpdate);
-        };
-        let Some(ValueOrContainer::Container(Container::List(children))) = node.get("children")
-        else {
-            return Err(BodyError::InvalidUpdate);
-        };
-        let Some(ValueOrContainer::Container(Container::Text(run))) = children.get(0) else {
-            return Err(BodyError::InvalidUpdate);
-        };
-        let position = if at_end { run.len_unicode() } else { 0 };
-        run.insert(position, text).map_err(|_| BodyError::Loro)?;
-        doc.commit();
-        doc.export(ExportMode::updates(&before))
-            .map_err(|_| BodyError::Loro)
-    }
-
     /// An independent copy that another writer can edit, with nothing staged.
     #[cfg(test)]
     pub(crate) fn writer_copy(&self) -> Self {
@@ -569,6 +576,15 @@ fn content_bytes(blocks: &[Block]) -> usize {
 
 fn system_random() -> u64 {
     getrandom::u64().expect("the system random source is available")
+}
+
+/// Records `peer` as handed out in this process, as a resumed session does. Returns `false`
+/// when this process already handed it out.
+pub(crate) fn claim_peer(peer: u64) -> bool {
+    ALLOCATED_PEERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(peer)
 }
 
 /// Draws until a peer is absent from every `known` version vector and from this process's

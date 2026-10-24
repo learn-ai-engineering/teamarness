@@ -9,7 +9,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -17,7 +20,11 @@ use support::harness::{
     self, Addressing, ConversationClient, PackageStage, open_core, open_host, open_mount,
     poll_short, shutdown, workspace_root,
 };
-use teamarness_package_host::{PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
+use teamarness_package_host::{
+    CloseUiSubscription, OpenUiSubscription, PackageHostCommand, PackageHostNotification,
+    PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey, PackageValue,
+    UiSubscriptionId, WorkspaceId,
+};
 
 const DOCUMENTS: &str = "dev.teamarness.documents";
 const CONSUMER: &str = "dev.teamarness.documents-port-proof";
@@ -31,34 +38,6 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The shipped UI contract plus the test Backend's `documents.test.type` request.
-fn test_ui_contract() -> Vec<u8> {
-    let path = workspace_root().join("packages/documents-package/ui-contract.json");
-    let mut contract: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-    contract["requests"]["documents.test.type"] = json!({
-        "request": {
-            "type": "object", "additionalProperties": false,
-            "required": ["documentId", "block", "atEnd", "text"],
-            "properties": {
-                "documentId": { "$ref": "#/$defs/recordId" },
-                "block": { "type": "integer", "minimum": 0, "maximum": 1024 },
-                "atEnd": { "type": "boolean" },
-                "text": { "type": "string", "minLength": 1, "maxLength": 256 }
-            }
-        },
-        "response": {
-            "type": "object", "additionalProperties": false,
-            "required": ["ok", "revision", "requestId"],
-            "properties": {
-                "ok": { "const": true },
-                "revision": { "type": "string" },
-                "requestId": { "type": "string" }
-            }
-        }
-    });
-    serde_json::to_vec(&contract).unwrap()
-}
-
 fn documents_stage() -> PackageStage {
     PackageStage {
         identity: DOCUMENTS,
@@ -67,7 +46,7 @@ fn documents_stage() -> PackageStage {
         backend_file: "backend/teamarness-documents-package-aarch64-apple-darwin",
         source: "packages/documents-package",
         record_log_minor: 1,
-        ui_contract: Some(test_ui_contract()),
+        ui_contract: None,
     }
 }
 
@@ -203,6 +182,105 @@ async fn ui(client: &ConversationClient<'_>, operation: &str, payload: Value) ->
             .await,
     )
     .unwrap()
+}
+
+/// A person typing into `document` through a real editor session, as the Documents UI does:
+/// open `documents.document.session`, load the snapshot, type `text` at the start or end of the
+/// first text run of top-level block `block` as the session peer, and send that one update
+/// through `documents.document.update`.
+async fn person_types(
+    client: &ConversationClient<'_>,
+    document: &str,
+    block: usize,
+    at_end: bool,
+    text: &str,
+) {
+    use loro::{Container, ValueOrContainer};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let subscription = UiSubscriptionId::new(format!("editor-session-{sequence}")).unwrap();
+    client
+        .host
+        .execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+            mount: client.mount.clone(),
+            subscription: subscription.clone(),
+            operation: "documents.document.session".into(),
+            payload: object(json!({ "documentId": document })),
+        }))
+        .await
+        .unwrap();
+    let mut events = client
+        .host
+        .subscribe(PackageHostSubscriptionSelector::UiEvents {
+            mount: client.mount.clone(),
+            subscription: subscription.clone(),
+        })
+        .await
+        .unwrap();
+    let mut opening = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while opening
+            .last()
+            .is_none_or(|event: &Value| event["event"] != "end")
+        {
+            if let PackageHostNotification::UiEvent(event) = events.changed().await.unwrap() {
+                opening.push(serde_json::to_value(&event.payload).unwrap());
+            }
+        }
+    })
+    .await
+    .expect("the session opens");
+    let begin = &opening[0];
+    assert_eq!(begin["event"], "begin", "{begin}");
+    assert_eq!(begin["editable"], true, "{begin}");
+    let mut snapshot = Vec::new();
+    for chunk in &opening[1..opening.len() - 1] {
+        snapshot.extend(STANDARD.decode(chunk["chunk"].as_str().unwrap()).unwrap());
+    }
+    let doc = loro::LoroDoc::new();
+    doc.import(&snapshot).unwrap();
+    let peer: u64 = begin["sessionPeer"].as_str().unwrap().parse().unwrap();
+    doc.set_peer_id(peer).unwrap();
+    let before = doc.oplog_vv();
+    let Some(ValueOrContainer::Container(Container::List(blocks))) =
+        doc.get_map("doc").get("children")
+    else {
+        panic!("the body has a children list");
+    };
+    let Some(ValueOrContainer::Container(Container::Map(node))) = blocks.get(block) else {
+        panic!("the body has block {block}");
+    };
+    let Some(ValueOrContainer::Container(Container::List(children))) = node.get("children") else {
+        panic!("block {block} has children");
+    };
+    let Some(ValueOrContainer::Container(Container::Text(run))) = children.get(0) else {
+        panic!("block {block} starts with a text run");
+    };
+    run.insert(if at_end { run.len_unicode() } else { 0 }, text)
+        .unwrap();
+    doc.commit();
+    let update = doc.export(loro::ExportMode::updates(&before)).unwrap();
+    let request_id = format!("7e{sequence:030x}");
+    let answer = ui(
+        client,
+        "documents.document.update",
+        json!({
+            "documentId": document, "sessionPeer": peer.to_string(),
+            "requestId": request_id, "update": STANDARD.encode(update),
+        }),
+    )
+    .await;
+    assert_eq!(answer, json!({ "requestId": request_id }));
+    client
+        .host
+        .execute(PackageHostCommand::CloseUiSubscription(
+            CloseUiSubscription {
+                mount: client.mount.clone(),
+                subscription,
+            },
+        ))
+        .await
+        .unwrap();
 }
 
 fn unique_text(bytes: usize) -> String {
@@ -418,13 +496,12 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
         assert_eq!(setup["value"]["changed"], true, "{name}: {setup}");
         let initial = setup["value"]["version"].clone();
         for edit in scenario["concurrentHumanEdits"].as_array().unwrap() {
-            ui(
+            person_types(
                 &client,
-                "documents.test.type",
-                json!({
-                    "documentId": document, "block": edit["block"],
-                    "atEnd": edit["at"] == "end", "text": edit["text"],
-                }),
+                &document,
+                usize::try_from(edit["block"].as_u64().unwrap()).unwrap(),
+                edit["at"] == "end",
+                edit["text"].as_str().unwrap(),
             )
             .await;
         }

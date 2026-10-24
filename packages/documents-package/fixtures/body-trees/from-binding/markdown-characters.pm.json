@@ -1,0 +1,26 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "# not a heading, * not a bullet, [not](a link), `not code`, \\ backslash, 1. not a list"
+    }
+   ]
+  },
+  {
+   "type": "heading",
+   "attrs": {
+    "level": 2
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "**literal** stars"
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,45 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "bullet_list",
+   "content": [
+    {
+     "type": "list_item",
+     "content": [
+      {
+       "type": "paragraph",
+       "content": [
+        {
+         "type": "text",
+         "text": "lead"
+        }
+       ]
+      },
+      {
+       "type": "paragraph",
+       "content": [
+        {
+         "type": "text",
+         "text": "second paragraph"
+        }
+       ]
+      },
+      {
+       "type": "code_block",
+       "attrs": {
+        "params": ""
+       },
+       "content": [
+        {
+         "type": "text",
+         "text": "code in item"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

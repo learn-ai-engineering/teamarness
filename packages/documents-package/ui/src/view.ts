@@ -1,4 +1,4 @@
-import type { Collection, Comment, Document, TextEvent } from "./contract.generated";
+import type { Collection, Comment, Document } from "./contract.generated";
 import type { DocumentsController } from "./controller";
 import { renderMarkdown } from "./markdown";
 
@@ -18,19 +18,6 @@ const AVAILABILITY_LABEL = {
   waiting_for_history_access: "Waiting for history access",
 } as const;
 
-function boundedQuote(selection: string): string | null {
-  const encoder = new TextEncoder();
-  let quote = "";
-  let bytes = 0;
-  for (const character of selection.trim()) {
-    const size = encoder.encode(character).length;
-    if (bytes + size > 2048) break;
-    quote += character;
-    bytes += size;
-  }
-  return quote || null;
-}
-
 function button(label: string, className: string, onClick: () => void): HTMLButtonElement {
   const element = document.createElement("button");
   element.type = "button";
@@ -48,8 +35,7 @@ const ICON_PATHS = {
   eyeOff: "M3 3l18 18 M10.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a16 16 0 0 1-3.1 4.1 M6.1 6.1C3.4 8 2 12 2 12s3.5 7 10 7c1.5 0 2.9-.4 4.1-1",
   reply: "M9 17 4 12l5-5 M4 12h10a6 6 0 0 1 6 6v1",
   resolve: "M4 12l5 5L20 6", reopen: "M4 11a8 8 0 1 1 2 6 M4 5v6h6",
-  preview: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
-  edit: "M4 20h4l12-12-4-4L4 16v4z M14 6l4 4", clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
+  clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
 } as const;
 
 function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
@@ -144,7 +130,8 @@ export class DocumentsView {
   private readonly editorPane: HTMLElement;
   private readonly editorTitle: HTMLElement;
   private readonly editorStatus: HTMLElement;
-  private readonly textarea: HTMLTextAreaElement;
+  /** Where the rendered editor mounts; until then it only says that the editor is loading. */
+  private readonly editorPlaceholder: HTMLElement;
   private readonly rail: HTMLElement;
   private readonly shell: HTMLElement;
   private readonly leftHandle: HTMLElement;
@@ -153,8 +140,6 @@ export class DocumentsView {
   private readonly resizeObserver: ResizeObserver | null;
   private readonly showNavigation: HTMLButtonElement;
   private readonly commentsToggle: HTMLButtonElement;
-  private readonly previewButton: HTMLButtonElement;
-  private readonly preview: HTMLElement;
   private readonly commentsPanel: HTMLElement;
   private readonly commentList: HTMLElement;
   private readonly commentForm: HTMLFormElement;
@@ -162,7 +147,6 @@ export class DocumentsView {
   private readonly commentQuote: HTMLElement;
   private readonly commentSubmit: HTMLButtonElement;
   private readonly controller: DocumentsController;
-  private draftQuote: string | null = null;
   private replyTo: string | null = null;
   private composerDocumentId: string | null = null;
   private readonly expanded = new Set<string>();
@@ -291,31 +275,11 @@ export class DocumentsView {
     this.editorStatus = document.createElement("span");
     this.editorStatus.className = "editor-status";
     this.editorStatus.setAttribute("role", "status");
-    this.previewButton = icon("preview", "Preview", () => controller.togglePreview(), true);
-    this.previewButton.disabled = true;
-    this.previewButton.setAttribute("aria-pressed", "false");
-    editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton);
-    this.preview = document.createElement("article");
-    this.preview.className = "editor-preview";
-    this.preview.setAttribute("aria-label", "Rendered document");
-    this.preview.hidden = true;
-    this.textarea = document.createElement("textarea");
-    this.textarea.className = `${KIT.input} editor-textarea`;
-    this.textarea.setAttribute("aria-label", "Document text (Markdown)");
-    this.textarea.spellcheck = false;
-    // The body is shown read-only until the rendered editor mounts here.
-    this.textarea.readOnly = true;
-    const clearCollapsedQuote = () => {
-      if (this.draftQuote !== null && this.textarea.selectionStart === this.textarea.selectionEnd) {
-        this.draftQuote = null;
-        this.renderComposer();
-      }
-    };
-    this.textarea.addEventListener("select", clearCollapsedQuote);
-    this.textarea.addEventListener("keyup", clearCollapsedQuote);
-    this.textarea.addEventListener("pointerup", clearCollapsedQuote);
-    this.editorPane.append(editorHeader, this.textarea, this.preview);
-    controller.textListener = (event: TextEvent) => this.onTextEvent(event);
+    editorHeader.append(this.editorTitle, this.editorStatus);
+    this.editorPlaceholder = document.createElement("div");
+    this.editorPlaceholder.className = "editor-placeholder";
+    this.editorPlaceholder.textContent = "Editor loading";
+    this.editorPane.append(editorHeader, this.editorPlaceholder);
 
     // --- comments (built once; the list is rebuilt per render, the composer persists) ---
     this.commentsPanel = document.createElement("section");
@@ -336,12 +300,6 @@ export class DocumentsView {
     this.commentInput.maxLength = 32768;
     this.commentInput.placeholder = "Add a comment (Markdown)";
     this.commentInput.setAttribute("aria-label", "New comment");
-    this.commentInput.addEventListener("focus", () => {
-      if (this.controller.state.openDocumentId === null || !this.controller.openEditor
-        || this.textarea.hidden || this.textarea.disabled) return;
-      this.draftQuote = this.selectedEditorQuote();
-      this.renderComposer();
-    });
     this.commentSubmit = document.createElement("button");
     this.commentSubmit.type = "submit";
     this.commentSubmit.className = KIT.primary;
@@ -355,15 +313,9 @@ export class DocumentsView {
       const markdown = this.commentInput.value.trim();
       if (!markdown) return;
       const documentId = controller.state.openDocumentId;
-      if (this.draftQuote !== null && this.selectedEditorQuote() === null) {
-        this.draftQuote = null;
-        this.renderComposer();
-      }
-      void controller.addComment(markdown, this.draftQuote, this.replyTo).then((ok) => {
+      void controller.addComment(markdown, null, this.replyTo).then((ok) => {
         if (ok && controller.state.openDocumentId === documentId) {
           this.commentInput.value = "";
-          this.collapseEditorSelection();
-          this.draftQuote = null;
           this.replyTo = null;
           this.renderComposer();
         }
@@ -382,31 +334,11 @@ export class DocumentsView {
     this.resizeObserver?.observe(this.shell);
   }
 
-  /** Routes a text event through the controller, then syncs the textarea. */
-  private onTextEvent(event: TextEvent): void {
-    this.controller.receiveText(event);
-    this.syncTextarea();
-  }
-
-  private syncTextarea(): void {
-    const editor = this.controller.openEditor;
-    if (!editor) return;
-    if (this.textarea.value !== editor.value) this.textarea.value = editor.value;
-  }
-
-  private selectedEditorQuote(): string | null {
-    return boundedQuote(this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd));
-  }
-
-  private collapseEditorSelection(): void {
-    this.textarea.setSelectionRange(this.textarea.selectionEnd, this.textarea.selectionEnd);
-  }
-
   private renderComposer(): void {
     const root = this.commentQuote.getRootNode() as ShadowRoot;
     const focusedCue = this.commentQuote.contains(root.activeElement)
       ? root.activeElement?.getAttribute("aria-label") : null;
-    this.commentQuote.hidden = this.draftQuote === null && this.replyTo === null;
+    this.commentQuote.hidden = this.replyTo === null;
     this.commentQuote.replaceChildren();
     if (this.replyTo !== null) {
       const reply = document.createElement("span");
@@ -414,19 +346,6 @@ export class DocumentsView {
       reply.textContent = "Replying to a comment";
       this.commentQuote.append(reply, icon("x", "Clear reply", () => {
         this.replyTo = null;
-        this.renderComposer();
-      }));
-    }
-    if (this.draftQuote !== null) {
-      const cue = document.createElement("span");
-      cue.className = "comment-quote-cue";
-      cue.textContent = "Commenting on highlighted text";
-      const quote = document.createElement("span");
-      quote.className = "comment-quote-excerpt";
-      quote.textContent = this.draftQuote;
-      this.commentQuote.append(cue, quote, icon("x", "Clear quote", () => {
-        this.draftQuote = null;
-        this.collapseEditorSelection();
         this.renderComposer();
       }));
     }
@@ -552,42 +471,32 @@ export class DocumentsView {
 
   private renderEditor(): void {
     const open = this.controller.openDocument;
-    const editor = this.controller.openEditor;
+    const session = this.controller.openSession;
     this.editorPane.hidden = false;
-    this.previewButton.disabled = open === null;
     this.commentsPanel.hidden = open === null || !this.commentsOpen;
     this.rightHandle.hidden = this.commentsPanel.hidden;
-    if (open === null) { this.editorTitle.textContent = "Choose a Document"; this.textarea.hidden = true; this.preview.hidden = true; return; }
+    this.editorPlaceholder.hidden = open === null;
+    if (open === null) { this.editorTitle.textContent = "Choose a Document"; this.editorStatus.textContent = ""; return; }
     this.renderComments();
     this.editorTitle.textContent = open.title;
-    if (!editor) {
+    if (session === null || session.phase !== "ready") {
       this.editorStatus.textContent = "Opening…";
-      this.textarea.disabled = true;
+      this.editorStatus.classList.remove("editor-status-failure");
       return;
     }
-    const { editable, reason } = editor.current;
-    this.textarea.disabled = !editable;
+    const { editable, reason } = session;
     this.editorStatus.textContent = reason === "identity_conflict"
       ? "Conflicting edit history — document unavailable."
       : reason === "import_failure"
-        ? `Incomplete edit history — read only. Last known-good text; record ${editor.current.diagnosticRecordId ?? "unknown"}.`
-        : !editable ? "Waiting for history" : "Read only";
+        ? `Incomplete edit history — read only. Last known-good text; record ${session.diagnosticRecordId ?? "unknown"}.`
+        : !editable ? "Waiting for history" : "";
     this.editorStatus.classList.toggle("editor-status-failure", reason === "import_failure");
-    this.syncTextarea();
-    const preview = this.controller.state.preview;
-    this.previewButton.setAttribute("aria-pressed", String(preview));
-    updateIcon(this.previewButton, preview ? "edit" : "preview", preview ? "Edit" : "Preview");
-    this.textarea.hidden = preview;
-    this.preview.hidden = !preview;
-    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? "" : renderMarkdown(editor.value);
   }
 
   render(): void {
     const { snapshot, busy, error, showArchived, openDocumentId } = this.controller.state;
     if (this.composerDocumentId !== openDocumentId) {
-      this.collapseEditorSelection();
       this.composerDocumentId = openDocumentId;
-      this.draftQuote = null;
       this.replyTo = null;
     }
     this.status.textContent = AVAILABILITY_LABEL[snapshot.availability];

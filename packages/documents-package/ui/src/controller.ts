@@ -1,7 +1,8 @@
 import { describePackageError, isAbortError } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Collection, Comment, Document, DocumentsContract, Names, Snapshot, TextEvent } from "./contract.generated";
-import { DocumentEditor } from "./editor";
+import type { Collection, Comment, Document, DocumentsContract, Names, Snapshot } from "./contract.generated";
+import { EditorSession, clientBridge } from "./editor/session";
+import type { LostNotice, SessionState } from "./editor/session";
 import { authorLabel } from "./markdown";
 
 export type ControllerState = Readonly<{
@@ -12,8 +13,6 @@ export type ControllerState = Readonly<{
   commentsCursor: string | null;
   commentsLoading: boolean;
   names: Names;
-  /** Document body shown as rendered Markdown instead of the editor. */
-  preview: boolean;
   showArchived: boolean;
   busy: boolean;
   error: string | null;
@@ -36,7 +35,6 @@ export class DocumentsController {
     commentsCursor: null,
     commentsLoading: false,
     names: { available: false, cursor: "0", persons: [] },
-    preview: false,
     showArchived: false,
     busy: false,
     error: null,
@@ -44,9 +42,8 @@ export class DocumentsController {
   private disposed = false;
   /** A Collection this Installation just created, selected once its record is listed. */
   private pendingSelectionId: string | null = null;
-  /** The editor for the open Document and its text subscription. */
-  private editor: DocumentEditor | null = null;
-  private textSubscription: { close(): Promise<void> } | null = null;
+  /** The editor session of the open Document. */
+  private session: EditorSession | null = null;
   private openSequence = 0;
   private commentsSequence = 0;
   private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
@@ -60,8 +57,9 @@ export class DocumentsController {
     return this._state;
   }
 
-  get openEditor(): DocumentEditor | null {
-    return this.editor;
+  /** The open Document's editor session state, once its session has started. */
+  get openSession(): SessionState | null {
+    return this.session?.state ?? null;
   }
 
   get openDocument(): Document | null {
@@ -95,10 +93,10 @@ export class DocumentsController {
     if (this.disposed) return;
     // Any committed record may be a Comment on the open Document; refresh its thread.
     void this.refreshComments();
-    if (this._state.openDocumentId !== null && this.editor !== null
-      && !this.editor.current.editable && !this.editor.assembling
-      && this.editor.current.reason !== "identity_conflict"
-      && this.editor.current.reason !== "import_failure") {
+    // A body still waiting for history may open now; its session reloads once it can.
+    const session = this.session?.state;
+    if (this._state.openDocumentId !== null && session !== undefined && session.phase === "ready"
+      && !session.editable && session.reason === undefined) {
       void this.retryOpen(this._state.openDocumentId, this.openSequence);
     }
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);
@@ -120,28 +118,21 @@ export class DocumentsController {
     }
   }
 
-  /** Opens a Document: fetches its text, then follows its text events. */
+  /** Opens a Document: starts its editor session, which loads the body from a snapshot. */
   async openDocumentById(documentId: string): Promise<void> {
     if (this.disposed || this._state.openDocumentId === documentId) return;
     await this.closeDocument();
     const sequence = ++this.openSequence;
     this.update({ openDocumentId: documentId, comments: [], commentsCursor: null, commentsLoading: false, error: null });
     void this.refreshComments();
-    try {
-      const subscription = await this.client.subscribe("documents.document.text", { documentId }, (event) => {
-        if (this.disposed || sequence !== this.openSequence) return;
-        this.onTextEvent(event);
-      });
-      if (this.disposed || sequence !== this.openSequence) {
-        await subscription.close();
-        return;
-      }
-      this.textSubscription = subscription;
-      await this.retryOpen(documentId, sequence);
-    } catch (error) {
-      if (sequence !== this.openSequence || this.disposed) return;
-      this.update({ openDocumentId: null, error: describeError(error) });
-    }
+    const session = new EditorSession({
+      bridge: clientBridge(this.client),
+      documentId,
+      onChange: () => { if (!this.disposed && sequence === this.openSequence) this.announce(); },
+      onLost: (notice) => { if (!this.disposed && sequence === this.openSequence) this.update({ error: lostMessage(notice) }); },
+    });
+    this.session = session;
+    await session.start();
   }
 
   private async retryOpen(documentId: string, sequence: number): Promise<void> {
@@ -157,11 +148,10 @@ export class DocumentsController {
   async closeDocument(): Promise<void> {
     this.openSequence += 1;
     this.commentsSequence += 1;
-    const subscription = this.textSubscription;
-    this.textSubscription = null;
-    this.editor = null;
+    const session = this.session;
+    this.session = null;
     if (this._state.openDocumentId !== null) this.update({ openDocumentId: null, comments: [], commentsCursor: null, commentsLoading: false });
-    if (subscription) await subscription.close();
+    await session?.dispose();
   }
 
   async refreshComments(): Promise<void> {
@@ -227,37 +217,6 @@ export class DocumentsController {
     const ok = (await this.perform(() => this.client.request("documents.comment.reopen", { commentId }))) !== null;
     if (ok) await this.refreshComments();
     return ok;
-  }
-
-  /** Called by the view for each text event of the open Document. */
-  receiveText(event: TextEvent): void {
-    if (event.documentId !== this._state.openDocumentId) return;
-    if (this.editor === null || this.editor.current.documentId !== event.documentId) {
-      if (event.text === undefined && event.transfer !== "begin") {
-        void this.retryOpen(event.documentId, this.openSequence);
-        return;
-      }
-      this.editor = new DocumentEditor(
-        event.transfer === "begin" ? { documentId: event.documentId, revision: "0", editable: false, text: "" } : event,
-        this.announce,
-        () => { void this.retryOpen(event.documentId, this.openSequence); },
-      );
-      this.announce();
-      if (event.transfer === "begin") this.editor.receive(event);
-      return;
-    }
-    this.editor.receive(event);
-  }
-
-  private onTextEvent(event: TextEvent): void {
-    this.textListener?.(event);
-  }
-
-  /** The view installs this to supply the caret when an event arrives. */
-  textListener: ((event: TextEvent) => void) | null = null;
-
-  togglePreview(): void {
-    this.update({ preview: !this._state.preview });
   }
 
   /** The current Workspace Person Name for an author identity, with duplicate detection. */
@@ -360,6 +319,12 @@ export class DocumentsController {
     this._state = { ...this._state, ...changes };
     this.announce();
   }
+}
+
+function lostMessage(notice: LostNotice): string {
+  return notice.requests > 0
+    ? "The Document was reloaded; your most recent changes could not be saved."
+    : "The Document was reloaded; changes not yet sent were discarded.";
 }
 
 function describeError(error: unknown): string {

@@ -16,8 +16,8 @@ use teamarness_package_sdk::{BackendError, Context, EventSubscription, event_cha
 use tokio::sync::broadcast;
 
 use super::{
-    BodyHub, DocumentsActive, LocalWrite, drain_local_writes, error, reopen_unopened_edits,
-    require_collection, require_document, stage_local_write, storage_failed,
+    BodyEvent, BodyHub, DocumentsActive, LocalWrite, drain_local_writes, error,
+    reopen_unopened_edits, require_collection, require_document, stage_local_write, storage_failed,
 };
 use crate::markdown;
 
@@ -444,10 +444,8 @@ pub(super) fn changed(
     Ok(subscription)
 }
 
-fn note_document(event: &JsonValue, documents: &mut BTreeSet<String>) {
-    if let Some(document) = event["documentId"].as_str() {
-        documents.insert(document.to_owned());
-    }
+fn note_document(event: &BodyEvent, documents: &mut BTreeSet<String>) {
+    documents.insert(event.document().to_owned());
 }
 
 #[cfg(test)]

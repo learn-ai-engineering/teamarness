@@ -7,6 +7,15 @@ export type Appended = {
 
 export type Availability = "waiting_for_history_access" | "offline" | "catching_up" | "current";
 
+export type BodyReason = "identity_conflict" | "import_failure";
+
+export type BodyState = {
+  readonly "diagnosticRecordId"?: RecordId;
+  readonly "documentId": RecordId;
+  readonly "editable": boolean;
+  readonly "reason"?: BodyReason;
+};
+
 export type Collection = {
   readonly "archived": boolean;
   readonly "id": RecordId;
@@ -80,28 +89,46 @@ export type RequestStatus = {
 
 export type Revision = string;
 
+export type SessionEvent = {
+  readonly "chunks": number;
+  readonly "diagnosticRecordId"?: RecordId;
+  readonly "documentId": RecordId;
+  readonly "editable": boolean;
+  readonly "event": "begin";
+  readonly "reason"?: BodyReason;
+  readonly "sessionPeer": SessionPeer;
+  readonly "version": Revision;
+} | {
+  readonly "chunk": string;
+  readonly "chunkIndex": number;
+  readonly "documentId": RecordId;
+  readonly "event": "chunk";
+} | {
+  readonly "documentId": RecordId;
+  readonly "event": "end";
+} | {
+  readonly "documentId": RecordId;
+  readonly "event": "update";
+  readonly "update": string;
+} | {
+  readonly "diagnosticRecordId"?: RecordId;
+  readonly "documentId": RecordId;
+  readonly "durable": readonly RequestId[];
+  readonly "editable": boolean;
+  readonly "event": "status";
+  readonly "reason"?: BodyReason;
+} | {
+  readonly "documentId": RecordId;
+  readonly "event": "resync";
+};
+
+export type SessionPeer = string;
+
 export type Snapshot = {
   readonly "availability": Availability;
   readonly "collections": readonly Collection[];
   readonly "documents": readonly Document[];
   readonly "warnings"?: readonly string[];
-};
-
-export type TextEvent = {
-  readonly "chunk"?: string;
-  readonly "chunkIndex"?: number;
-  readonly "chunks"?: number;
-  readonly "diagnosticRecordId"?: RecordId;
-  readonly "documentId": RecordId;
-  readonly "editable": boolean;
-  readonly "reason"?: "identity_conflict" | "import_failure";
-  readonly "requestId"?: RequestId;
-  readonly "requestStatuses"?: readonly RequestStatus[];
-  readonly "revision": Revision;
-  readonly "savedRevision"?: Revision;
-  readonly "text"?: string;
-  readonly "transfer"?: "begin" | "chunk" | "end";
-  readonly "transferId"?: RequestId;
 };
 
 export type Title = string;
@@ -134,30 +161,49 @@ export type DocumentsContract = {
         readonly "collectionId": RecordId;
         readonly "title": Title;
       }; readonly response: Appended };
+    readonly "documents.document.markdown": { readonly request: {
+        readonly "chunkIndex": number;
+        readonly "documentId": RecordId;
+      }; readonly response: {
+        readonly "chunk": string;
+        readonly "chunkIndex": number;
+        readonly "chunks": number;
+        readonly "digest": string;
+        readonly "documentId": RecordId;
+      } };
     readonly "documents.document.move": { readonly request: {
         readonly "collectionId": RecordId;
         readonly "documentId": RecordId;
       }; readonly response: Appended };
-    readonly "documents.document.open": { readonly request: DocumentRequest; readonly response: TextEvent };
+    readonly "documents.document.open": { readonly request: DocumentRequest; readonly response: BodyState };
     readonly "documents.document.recover": { readonly request: {
         readonly "documentId": RecordId;
         readonly "requestIds": readonly RequestId[];
-        readonly "transferId": RequestId;
       }; readonly response: {
         readonly "documentId": RecordId;
-        readonly "revision": Revision;
-        readonly "transferId": RequestId;
+        readonly "requestStatuses": readonly RequestStatus[];
       } };
     readonly "documents.document.rename": { readonly request: {
         readonly "documentId": RecordId;
         readonly "title": Title;
       }; readonly response: Appended };
     readonly "documents.document.restore": { readonly request: DocumentRequest; readonly response: Appended };
+    readonly "documents.document.update": { readonly request: {
+        readonly "documentId": RecordId;
+        readonly "requestId": RequestId;
+        readonly "sessionPeer": SessionPeer;
+        readonly "update": string;
+      }; readonly response: {
+        readonly "requestId": RequestId;
+      } };
     readonly "documents.snapshot": { readonly request: Record<string, never>; readonly response: Snapshot };
   };
   readonly subscriptions: {
     readonly "documents.changes": { readonly request: Record<string, never>; readonly event: Snapshot };
-    readonly "documents.document.text": { readonly request: DocumentRequest; readonly event: TextEvent };
+    readonly "documents.document.session": { readonly request: {
+        readonly "documentId": RecordId;
+        readonly "resumePeer"?: SessionPeer;
+      }; readonly event: SessionEvent };
     readonly "documents.names": { readonly request: Record<string, never>; readonly event: Names };
   };
 };

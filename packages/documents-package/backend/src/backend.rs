@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use loro::Frontiers;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -14,12 +15,13 @@ use teamarness_package_sdk::capabilities::record_log::{
     SessionOptions, SyncState, SyncWarning, run_session_from_start,
 };
 use teamarness_package_sdk::{
-    BackendError, CancellationToken, Context, Empty, Router, event_channel, ports::PortActor,
+    BackendError, CancellationToken, Context, Empty, EventSubscription, Router, event_channel,
+    ports::PortActor,
 };
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::body::{BodyError, DocumentBody};
-use crate::domain::{DomainError, DomainRecord};
+use crate::domain::{DomainError, DomainRecord, MAX_UPDATE};
 use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
 
 #[path = "ports.rs"]
@@ -69,14 +71,82 @@ fn domain_error(cause: DomainError) -> BackendError {
 /// Every Document body this activation holds, keyed by Document identity.
 type Bodies = Arc<Mutex<HashMap<String, DocumentBody>>>;
 
-/// The shared pieces that import remote edits and publish text events, used by the request
+/// Raw bytes of one snapshot chunk: 24 KiB once base64-encoded.
+const SNAPSHOT_CHUNK_BYTES: usize = 18 * 1024;
+/// UTF-8 bytes of one Canonical Markdown chunk.
+const MARKDOWN_CHUNK_BYTES: usize = 24 * 1024;
+
+/// What one body change tells the open editor sessions. Sessions filter by Document.
+#[derive(Clone, Debug)]
+enum BodyEvent {
+    /// The body gained operations: one Loro update, relative to what every session holds.
+    /// `origin` is the session that submitted it, which never receives it back.
+    Update {
+        document: String,
+        update: Arc<Vec<u8>>,
+        origin: Option<u64>,
+    },
+    /// Editability may have changed, or a request reached the Core record log.
+    Status {
+        document: String,
+        durable: Option<String>,
+    },
+    /// Every session of the Document must reload from a new snapshot.
+    Resync { document: String },
+}
+
+impl BodyEvent {
+    fn document(&self) -> &str {
+        match self {
+            Self::Update { document, .. }
+            | Self::Status { document, .. }
+            | Self::Resync { document } => document,
+        }
+    }
+}
+
+/// One open editor session: the Document it edits, and how a refused update ends it.
+#[derive(Clone)]
+struct SessionEntry {
+    document: String,
+    refused: Arc<Notify>,
+}
+
+/// Whether a body can be edited, and why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BodyAccess {
+    editable: bool,
+    reason: Option<&'static str>,
+    diagnostic: Option<String>,
+}
+
+impl BodyAccess {
+    fn write(&self, event: &mut JsonValue) {
+        event["editable"] = json!(self.editable);
+        if let Some(reason) = self.reason {
+            event["reason"] = json!(reason);
+        }
+        if let Some(record) = &self.diagnostic {
+            event["diagnosticRecordId"] = json!(record);
+        }
+    }
+}
+
+/// The shared pieces that import remote edits and publish body events, used by the request
 /// handlers, the record-log sink, and the flusher alike.
 #[derive(Clone)]
 struct BodyHub {
     store: DocumentStore,
     bodies: Bodies,
-    /// Text events for every Document; subscriptions filter by `documentId`.
-    events: broadcast::Sender<JsonValue>,
+    /// The Installation this activation writes as; records by anyone else are foreign.
+    installation: String,
+    /// Body events for every Document; editor sessions filter by Document.
+    events: broadcast::Sender<BodyEvent>,
+    /// Open editor sessions by session peer.
+    sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
+    /// Session peers whose session ended in this process, with their Document, so the same
+    /// UI may resume as one.
+    ended_sessions: Arc<Mutex<HashMap<u64, String>>>,
     /// Wakes the flusher when a staged append is pending.
     flush: Arc<Notify>,
     /// Serializes append attempts with requests without holding the body mutex across I/O.
@@ -205,22 +275,10 @@ impl BodyHub {
                 phase
             )
         );
-        let mut events = self.with_body(document, |body| {
-            full_text_events_bounded(
-                document,
-                body.revision(),
-                body.applied_text(),
-                false,
-                TEXT_EVENT_BUDGET - 2048,
-            )
+        let _ = self.events.send(BodyEvent::Status {
+            document: document.to_owned(),
+            durable: None,
         });
-        for event in &mut events {
-            event["reason"] = json!("import_failure");
-            event["diagnosticRecordId"] = json!(record);
-        }
-        for event in events {
-            let _ = self.events.send(event);
-        }
     }
 
     fn project_with_candidates(
@@ -239,11 +297,14 @@ impl BodyHub {
                         sealed_length: usize,
                         update: &[u8]| {
             match self.with_body(document, |body| body.import_candidate(update)) {
-                Ok((candidate, changed)) => {
+                Ok((mut candidate, _)) => {
+                    if author != self.installation {
+                        candidate.note_foreign_record(update);
+                    }
                     pending
                         .lock()
                         .unwrap()
-                        .push((document.to_owned(), candidate, changed));
+                        .push((document.to_owned(), candidate));
                     None
                 }
                 Err(category) => {
@@ -261,18 +322,9 @@ impl BodyHub {
             }
         };
         let publish = || {
-            for (document, candidate, changed) in pending.lock().unwrap().drain(..) {
-                let revision = candidate.revision();
-                let editable = candidate.editable();
-                let text = candidate.text().to_owned();
-                self.with_body(&document, |body| *body = candidate);
-                // The store holds its lock while publishing, so the full text is built from
-                // the candidate rather than through `text_events`.
-                if changed && editable {
-                    for event in full_text_events(&document, revision, &text, editable) {
-                        let _ = self.events.send(event);
-                    }
-                }
+            // The store holds its lock while publishing, so only the bodies are touched here.
+            for (document, candidate) in pending.lock().unwrap().drain(..) {
+                self.adopt(&document, candidate, None);
             }
             for (document, record, author, request, update_length, sealed_length, category) in
                 failures.lock().unwrap().drain(..)
@@ -342,15 +394,7 @@ impl BodyHub {
                 continue;
             }
             match self.with_body(document, |body| body.import_candidate(update)) {
-                Ok((candidate, changed)) => {
-                    let editable = candidate.editable();
-                    self.with_body(document, |body| *body = candidate);
-                    if changed && editable {
-                        for event in self.text_events(document) {
-                            let _ = self.events.send(event);
-                        }
-                    }
-                }
+                Ok((candidate, _)) => self.adopt(document, candidate, None),
                 Err(_) => eprintln!("documents body import failure: document={document}"),
             }
         }
@@ -396,222 +440,229 @@ impl BodyHub {
             );
             return Ok(());
         }
-        if let Ok((candidate, changed)) = imported {
-            let editable = candidate.editable();
-            self.with_body(document, |body| *body = candidate);
-            if changed && editable {
-                for event in self.text_events(document) {
-                    let _ = self.events.send(event);
-                }
+        if let Ok((mut candidate, _)) = imported {
+            if row.author != self.installation {
+                candidate.note_foreign_record(update);
             }
+            self.adopt(document, candidate, None);
         }
         Ok(())
     }
 
-    fn text_events(&self, document: &str) -> Vec<JsonValue> {
+    /// Makes `candidate` the body of `document` and tells the editor sessions what it added:
+    /// one update of the operations it gained, and a status when its editability changed.
+    /// An update too large for one UI message makes every session reload instead.
+    ///
+    /// Only the bodies lock is taken, so this may run while the store holds its own.
+    fn adopt(&self, document: &str, candidate: DocumentBody, origin: Option<u64>) {
+        let (update, editability_changed) = self.with_body(document, |body| {
+            let before = body.version_vector();
+            let was_editable = body.editable();
+            *body = candidate;
+            (body.updates_since(&before), was_editable != body.editable())
+        });
+        if let Some(update) = update {
+            self.publish_update(document, update, origin);
+        }
+        if editability_changed {
+            self.publish_status(document);
+        }
+    }
+
+    fn publish_update(&self, document: &str, update: Vec<u8>, origin: Option<u64>) {
+        let event = if update.len() > MAX_UPDATE {
+            BodyEvent::Resync {
+                document: document.to_owned(),
+            }
+        } else {
+            BodyEvent::Update {
+                document: document.to_owned(),
+                update: Arc::new(update),
+                origin,
+            }
+        };
+        let _ = self.events.send(event);
+    }
+
+    /// Asks every editor session of `document` to report its editability again.
+    fn publish_status(&self, document: &str) {
+        let _ = self.events.send(BodyEvent::Status {
+            document: document.to_owned(),
+            durable: None,
+        });
+    }
+
+    /// Whether `document` can be edited now, and why not.
+    ///
+    /// The store is asked first, and the bodies lock only afterwards (ingest order).
+    fn access(&self, document: &str) -> BodyAccess {
+        let refused = |reason, diagnostic| BodyAccess {
+            editable: false,
+            reason,
+            diagnostic,
+        };
         match self.store.identity_conflicted(document) {
-            Ok(true) => {
-                let revision = self.with_body(document, |body| body.revision());
-                return vec![
-                    json!({"documentId":document, "revision":revision.to_string(),
-                    "editable":false, "text":"", "reason":"identity_conflict"}),
-                ];
-            }
-            Err(_) => {
-                let revision = self.with_body(document, |body| body.revision());
-                return vec![
-                    json!({"documentId":document, "revision":revision.to_string(),
-                    "editable":false, "text":""}),
-                ];
-            }
+            Ok(true) => return refused(Some("identity_conflict"), None),
+            Err(_) => return refused(None, None),
             Ok(false) => {}
         }
         match self.store.import_failure(document) {
-            Err(_) => {
-                let revision = self.with_body(document, |body| body.revision());
-                return vec![
-                    json!({"documentId":document, "revision":revision.to_string(),
-                    "editable":false, "text":""}),
-                ];
-            }
+            Ok(Some((record, _))) => return refused(Some("import_failure"), Some(record)),
+            Err(_) => return refused(None, None),
             Ok(None) => {}
-            Ok(Some((record_id, _))) => {
-                return self.with_body(document, |body| {
-                    let mut events = full_text_events_bounded(
-                        document,
-                        body.revision(),
-                        body.applied_text(),
-                        false,
-                        TEXT_EVENT_BUDGET - 2048,
-                    );
-                    for event in &mut events {
-                        event["reason"] = json!("import_failure");
-                        event["diagnosticRecordId"] = json!(record_id);
-                    }
-                    events
-                });
-            }
         }
-        self.with_body(document, |body| {
-            full_text_events(
-                document,
-                body.revision(),
-                if body.editable() { body.text() } else { "" },
-                body.editable(),
-            )
-        })
+        BodyAccess {
+            editable: self.with_body(document, |body| body.editable()),
+            reason: None,
+            diagnostic: None,
+        }
     }
 
-    fn publish_recovery(
+    /// The body state `documents.document.open` answers with.
+    fn access_value(&self, document: &str) -> JsonValue {
+        let mut value = json!({ "documentId": document });
+        self.access(document).write(&mut value);
+        value
+    }
+
+    /// The opening of one editor session as `peer`: `begin`, the snapshot in base64 chunks, and
+    /// `end`. Only an editable body, or the last good body after an import failure, has a
+    /// snapshot; a pending or conflicted body sends none.
+    fn session_opening(&self, document: &str, peer: u64) -> (BodyAccess, Vec<JsonValue>) {
+        let access = self.access(document);
+        let (version, snapshot) = self.with_body(document, |body| {
+            let snapshot = if access.editable {
+                body.snapshot()
+            } else if access.reason == Some("import_failure") {
+                body.applied_snapshot()
+            } else {
+                Vec::new()
+            };
+            (body.revision(), snapshot)
+        });
+        let chunks: Vec<&[u8]> = snapshot.chunks(SNAPSHOT_CHUNK_BYTES).collect();
+        let mut begin = json!({
+            "event": "begin", "documentId": document, "sessionPeer": peer.to_string(),
+            "version": version.to_string(), "chunks": chunks.len(),
+        });
+        access.write(&mut begin);
+        let mut events = vec![begin];
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            events.push(json!({
+                "event": "chunk", "documentId": document, "chunkIndex": index,
+                "chunk": STANDARD.encode(chunk),
+            }));
+        }
+        events.push(json!({ "event": "end", "documentId": document }));
+        (access, events)
+    }
+
+    /// Registers an editor session of `document` and returns its peer: `resume` when the same UI
+    /// may continue as it, otherwise a freshly allocated one.
+    fn register_session(&self, document: &str, resume: Option<u64>) -> (u64, Arc<Notify>) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resumable = resume.filter(|peer| {
+            !sessions.contains_key(peer)
+                && self.with_body(document, |body| body.may_resume(*peer))
+                && (self
+                    .ended_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(peer)
+                    .is_some_and(|ended| ended == document)
+                    || crate::body::claim_peer(*peer))
+        });
+        let peer =
+            resumable.unwrap_or_else(|| self.with_body(document, |body| body.allocate_peer()));
+        self.ended_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer);
+        let refused = Arc::new(Notify::new());
+        sessions.insert(
+            peer,
+            SessionEntry {
+                document: document.to_owned(),
+                refused: refused.clone(),
+            },
+        );
+        (peer, refused)
+    }
+
+    fn session(&self, peer: u64) -> Option<SessionEntry> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer)
+            .cloned()
+    }
+
+    /// Ends the session of `peer`: it is no longer registered, and the same UI may resume it.
+    fn end_session(&self, peer: u64) {
+        let ended = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer);
+        if let Some(entry) = ended {
+            entry.refused.notify_one();
+            self.ended_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(peer, entry.document);
+        }
+    }
+
+    /// Inclusion and durability of each request ID, taken together under the publication gate
+    /// so no conflict marker or import failure commits halfway through.
+    fn recovery_statuses(
         &self,
         request: &RecoverRequest,
         author: &str,
         looked_up: &Result<IdentityLookups, BackendError>,
         foreign_ids: &HashSet<&str>,
-    ) -> Result<JsonValue, BackendError> {
+    ) -> Result<Vec<JsonValue>, BackendError> {
         let _publication = self.publication_gate.lock().unwrap();
+        let unresolved = |id: &String| json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"});
         if self
             .store
             .identity_conflicted(&request.document_id)
             .map_err(|_| storage_failed())?
+            || self
+                .store
+                .import_failure(&request.document_id)
+                .map_err(|_| storage_failed())?
+                .is_some()
         {
-            let revision = self.with_body(&request.document_id, |body| body.revision());
-            let mut event = json!({"documentId":request.document_id,
-                    "revision":revision.to_string(),"editable":false,"text":"",
-                    "reason":"identity_conflict","transferId":request.transfer_id});
-            event["requestStatuses"] = json!(
-                request
-                    .request_ids
-                    .iter()
-                    .map(|id| json!({
-                        "requestId":id,"inclusion":"unresolved","durability":"unresolved"
-                    }))
-                    .collect::<Vec<_>>()
-            );
-            let _ = self.events.send(event);
-            return Ok(
-                json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}),
-            );
+            return Ok(request.request_ids.iter().map(unresolved).collect());
         }
-        if let Some((record_id, _)) = self
-            .store
-            .import_failure(&request.document_id)
-            .map_err(|_| storage_failed())?
-        {
-            let mut events = self.text_events(&request.document_id);
-            for (index, event) in events.iter_mut().enumerate() {
-                event["transferId"] = json!(request.transfer_id);
-                if index == 0 {
-                    event["requestStatuses"] = json!(request.request_ids.iter().map(|id|
-                        json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"})
-                    ).collect::<Vec<_>>());
-                }
-            }
-            for event in events {
-                let _ = self.events.send(event);
-            }
-            let revision = self.with_body(&request.document_id, |body| body.revision());
-            return Ok(
-                json!({"documentId":request.document_id,"revision":revision.to_string(),
-                "transferId":request.transfer_id,"diagnosticRecordId":record_id}),
-            );
-        }
-        let (revision, text, editable, statuses) = self.with_body(&request.document_id, |body| {
-                let statuses: Vec<JsonValue> = request.request_ids.iter().map(|id| {
+        Ok(self.with_body(&request.document_id, |body| {
+            request
+                .request_ids
+                .iter()
+                .map(|id| {
                     match body.identity(id).filter(|known| known.author == *author) {
-                        Some(known) => json!({"requestId":id,"inclusion":if body.editable() && !known.projection_pending { "included" } else { "unresolved" },"durability": if known.durable { "durable" } else { "pending" }}),
-                        None if looked_up.is_ok() && !foreign_ids.contains(id.as_str()) && self.qualified.load(Ordering::Acquire) && body.editable() => json!({"requestId":id,"inclusion":"absent","durability":"unresolved"}),
-                        None => json!({"requestId":id,"inclusion":"unresolved","durability":"unresolved"}),
+                        Some(known) => json!({
+                            "requestId": id,
+                            "inclusion": if body.editable() && !known.projection_pending { "included" } else { "unresolved" },
+                            "durability": if known.durable { "durable" } else { "pending" },
+                        }),
+                        None if looked_up.is_ok()
+                            && !foreign_ids.contains(id.as_str())
+                            && self.qualified.load(Ordering::Acquire)
+                            && body.editable() =>
+                        {
+                            json!({"requestId":id,"inclusion":"absent","durability":"unresolved"})
+                        }
+                        None => unresolved(id),
                     }
-                }).collect();
-                (body.revision(), if body.editable() { body.text().to_owned() } else { String::new() }, body.editable(), statuses)
-            });
-        let mut events = full_text_events_bounded(
-            &request.document_id,
-            revision,
-            &text,
-            editable,
-            TEXT_EVENT_BUDGET - 2048,
-        );
-        for (index, event) in events.iter_mut().enumerate() {
-            event["transferId"] = json!(request.transfer_id);
-            if index == 0 {
-                event["requestStatuses"] = json!(statuses);
-            }
-        }
-        for event in events {
-            let _ = self.events.send(event);
-        }
-        Ok(
-            json!({"documentId":request.document_id,"revision":revision.to_string(),"transferId":request.transfer_id}),
-        )
+                })
+                .collect()
+        }))
     }
-
-    // The request frame is bounded even when the subscription must deliver the text in parts.
-    fn open_response(&self, document: &str) -> JsonValue {
-        let first = self.text_events(document).remove(0);
-        if first["transfer"] == "begin" {
-            let mut response = json!({ "documentId": document, "revision": first["revision"], "editable": first["editable"] });
-            if let Some(reason) = first.get("reason") {
-                response["reason"] = reason.clone();
-            }
-            if let Some(id) = first.get("diagnosticRecordId") {
-                response["diagnosticRecordId"] = id.clone();
-            }
-            response
-        } else {
-            first
-        }
-    }
-}
-
-// Reserve plenty of room for the Package UI envelope and JSON escaping of control characters.
-const TEXT_EVENT_BUDGET: usize = 96 * 1024;
-const TEXT_CHUNK_BYTES: usize = 24 * 1024;
-
-fn full_text_events(document: &str, revision: u64, text: &str, editable: bool) -> Vec<JsonValue> {
-    full_text_events_bounded(document, revision, text, editable, TEXT_EVENT_BUDGET)
-}
-
-fn full_text_events_bounded(
-    document: &str,
-    revision: u64,
-    text: &str,
-    editable: bool,
-    budget: usize,
-) -> Vec<JsonValue> {
-    let base =
-        json!({ "documentId": document, "revision": revision.to_string(), "editable": editable });
-    let mut small = base.clone();
-    small["text"] = json!(text);
-    if small.to_string().len() <= budget {
-        return vec![small];
-    }
-    let mut chunks = Vec::new();
-    let mut offset = 0;
-    while offset < text.len() {
-        let mut end = (offset + TEXT_CHUNK_BYTES).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        chunks.push(&text[offset..end]);
-        offset = end;
-    }
-    let mut events = vec![
-        json!({ "documentId": document, "revision": revision.to_string(),
-        "editable": editable, "transfer": "begin", "chunks": chunks.len() }),
-    ];
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        events.push(
-            json!({ "documentId": document, "revision": revision.to_string(),
-            "editable": editable, "transfer": "chunk", "chunkIndex": index, "chunk": chunk }),
-        );
-    }
-    events.push(
-        json!({ "documentId": document, "revision": revision.to_string(),
-        "editable": editable, "transfer": "end" }),
-    );
-    events
 }
 
 /// What the Package tells the UI about synchronization.
@@ -739,8 +790,219 @@ struct CommentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoverRequest {
     document_id: String,
-    transfer_id: String,
     request_ids: Vec<String>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateRequest {
+    document_id: String,
+    session_peer: String,
+    request_id: String,
+    update: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarkdownRequest {
+    document_id: String,
+    chunk_index: usize,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionRequest {
+    document_id: String,
+    #[serde(default)]
+    resume_peer: Option<String>,
+}
+
+/// A session peer as the UI contract writes it: a decimal `u64`.
+fn session_peer(text: &str) -> Option<u64> {
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Opens one editor session: registers its peer, sends `begin`, the snapshot chunks and `end`,
+/// then relays the updates of every other writer and the body's status until the session
+/// ends. A refused update, a lagging relay or a body that becomes editable again ends it with
+/// `resync`, after which the UI opens a new session.
+async fn open_session(
+    context: &Context<DocumentsActive>,
+    request: SessionRequest,
+) -> Result<EventSubscription, BackendError> {
+    require_document(context, &request.document_id).await?;
+    let resume = match request.resume_peer.as_deref() {
+        Some(text) => Some(session_peer(text).ok_or_else(invalid_request)?),
+        None => None,
+    };
+    reopen_unopened_edits(context, &request.document_id).await?;
+    let hub = context.state().hub.clone();
+    let document = request.document_id;
+    // Subscribe before taking the snapshot: an update in both is imported twice, harmlessly.
+    let mut events = hub.events.subscribe();
+    let (peer, refused) = hub.register_session(&document, resume);
+    let session = SessionGuard {
+        hub: hub.clone(),
+        peer,
+    };
+    let opening = {
+        let hub = hub.clone();
+        let document = document.clone();
+        context
+            .blocking(move |_| Ok(hub.session_opening(&document, peer)))
+            .await?
+    };
+    let (sender, subscription) = event_channel(32);
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _session = session;
+        let (mut access, opening) = opening;
+        for event in opening {
+            if sender.send(event).await.is_err() {
+                return;
+            }
+        }
+        let resync = json!({ "event": "resync", "documentId": document });
+        loop {
+            let event = tokio::select! {
+                () = sender.closed() => return,
+                () = refused.notified() => {
+                    let _ = sender.send(resync).await;
+                    return;
+                }
+                event = events.recv() => event,
+            };
+            let next = match event {
+                Ok(event) if event.document() != document => continue,
+                Ok(BodyEvent::Update { update, origin, .. }) => {
+                    if origin == Some(peer) || !access.editable {
+                        continue;
+                    }
+                    json!({
+                        "event": "update", "documentId": document,
+                        "update": STANDARD.encode(update.as_slice()),
+                    })
+                }
+                Ok(BodyEvent::Status { durable, .. }) => {
+                    let hub = hub.clone();
+                    let target = document.clone();
+                    let Ok(now) = context.blocking(move |_| Ok(hub.access(&target))).await else {
+                        return;
+                    };
+                    // A body that became editable, or was hidden by a conflict, is reloaded.
+                    if now != access && (now.editable || now.reason == Some("identity_conflict")) {
+                        let _ = sender.send(resync).await;
+                        return;
+                    }
+                    access = now;
+                    let mut status = json!({
+                        "event": "status", "documentId": document,
+                        "durable": durable.into_iter().collect::<Vec<_>>(),
+                    });
+                    access.write(&mut status);
+                    status
+                }
+                Ok(BodyEvent::Resync { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = sender.send(resync).await;
+                    return;
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
+            if sender.send(next).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(subscription)
+}
+
+/// Ends a session's registration when its subscription task ends, however it ends.
+struct SessionGuard {
+    hub: BodyHub,
+    peer: u64,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.hub.end_session(self.peer);
+    }
+}
+
+/// Validates and appends one update from an open editor session. A refusal that retrying the
+/// same bytes cannot cure ends the session with `resync`.
+async fn update_from_session(
+    context: &Context<DocumentsActive>,
+    request: UpdateRequest,
+) -> Result<JsonValue, BackendError> {
+    let state = context.state();
+    let peer = session_peer(&request.session_peer).ok_or_else(invalid_request)?;
+    let Some(session) = state.hub.session(peer) else {
+        return Err(error("documents.unknown_session", false));
+    };
+    if session.document != request.document_id {
+        state.hub.end_session(peer);
+        return Err(error("documents.unknown_session", false));
+    }
+    let refuse = |cause: BackendError| {
+        if !cause.retryable() {
+            state.hub.end_session(peer);
+        }
+        cause
+    };
+    let update = STANDARD
+        .decode(&request.update)
+        .map_err(|_| refuse(error("documents.invalid_update", false)))?;
+    submit_update(
+        &state.log,
+        &state.hub,
+        &state.changes,
+        &state.installation,
+        &request.document_id,
+        peer,
+        &request.request_id,
+        &update,
+    )
+    .await
+    .map_err(refuse)?;
+    Ok(json!({ "requestId": request.request_id }))
+}
+
+/// One chunk of the body's Canonical Markdown, with a digest of the whole text so a reader can
+/// tell that every chunk it assembled came from the same text.
+fn markdown_chunk(hub: &BodyHub, document: &str, index: usize) -> Result<JsonValue, BackendError> {
+    let access = hub.access(document);
+    let markdown = match (access.editable, access.reason) {
+        (true, _) => hub.with_body(document, |body| body.text().to_owned()),
+        (false, Some("import_failure")) => {
+            hub.with_body(document, |body| body.applied_text().to_owned())
+        }
+        (false, Some(_)) => return Err(error("documents.unavailable", false)),
+        (false, None) => return Err(error("documents.document_pending", true)),
+    };
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < markdown.len() {
+        let mut end = (offset + MARKDOWN_CHUNK_BYTES).min(markdown.len());
+        while !markdown.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&markdown[offset..end]);
+        offset = end;
+    }
+    if chunks.is_empty() {
+        chunks.push("");
+    }
+    let Some(chunk) = chunks.get(index) else {
+        return Err(invalid_request());
+    };
+    let digest: String = Sha256::digest(markdown.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(json!({
+        "documentId": document, "digest": digest, "chunks": chunks.len(),
+        "chunkIndex": index, "chunk": chunk,
+    }))
 }
 
 /// The Documents Backend.
@@ -781,7 +1043,10 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             let hub = BodyHub {
                 store: store.clone(),
                 bodies: Arc::new(Mutex::new(HashMap::new())),
+                installation: installation.clone(),
                 events,
+                sessions: Arc::new(Mutex::new(HashMap::new())),
+                ended_sessions: Arc::new(Mutex::new(HashMap::new())),
                 flush: Arc::new(Notify::new()),
                 append_locks: Arc::new(Mutex::new(HashMap::new())),
                 waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
@@ -979,29 +1244,19 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         |context: Context<DocumentsActive>, request: DocumentRequest| async move {
             require_document(&context, &request.document_id).await?;
             reopen_unopened_edits(&context, &request.document_id).await?;
-            let hub = &context.state().hub;
-            for event in hub.text_events(&request.document_id) {
-                let _ = hub.events.send(event);
-            }
-            Ok(hub.open_response(&request.document_id))
+            let hub = context.state().hub.clone();
+            let document = request.document_id;
+            context
+                .blocking(move |_| Ok(hub.access_value(&document)))
+                .await
         },
     )
     .request(
         "documents.document.recover",
         |context: Context<DocumentsActive>, request: RecoverRequest| async move {
             require_document(&context, &request.document_id).await?;
-            if request.transfer_id.len() != 32
-                || !request
-                    .transfer_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                || request.request_ids.len() > 8
-                || request.request_ids.iter().any(|id| {
-                    id.len() != 32
-                        || !id
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                })
+            if request.request_ids.len() > 8
+                || request.request_ids.iter().any(|id| !is_request_id(id))
             {
                 return Err(invalid_request());
             }
@@ -1024,7 +1279,25 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     }
                 }
             }
-            hub.publish_recovery(&request, author, &looked_up, &foreign_ids)
+            let statuses = hub.recovery_statuses(&request, author, &looked_up, &foreign_ids)?;
+            Ok(json!({ "documentId": request.document_id, "requestStatuses": statuses }))
+        },
+    )
+    .request(
+        "documents.document.update",
+        |context: Context<DocumentsActive>, request: UpdateRequest| async move {
+            update_from_session(&context, request).await
+        },
+    )
+    .request(
+        "documents.document.markdown",
+        |context: Context<DocumentsActive>, request: MarkdownRequest| async move {
+            require_document(&context, &request.document_id).await?;
+            reopen_unopened_edits(&context, &request.document_id).await?;
+            let hub = context.state().hub.clone();
+            context
+                .blocking(move |_| markdown_chunk(&hub, &request.document_id, request.chunk_index))
+                .await
         },
     )
     .request(
@@ -1084,71 +1357,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         },
     )
     .subscription(
-        "documents.document.text",
-        |context: Context<DocumentsActive>, request: DocumentRequest| async move {
-            require_document(&context, &request.document_id).await?;
-            let hub = context.state().hub.clone();
-            let document = request.document_id;
-            let (sender, subscription) = event_channel(64);
-            let mut events = hub.events.subscribe();
-            tokio::spawn(async move {
-                // The initial full text is taken after subscribing, so no delta between the two
-                // is lost; a delta older than the initial revision is skipped below.
-                let initial = hub.text_events(&document);
-                let mut revision = revision_of(&initial[0]);
-                for event in initial {
-                    if sender.send(event).await.is_err() {
-                        return;
-                    }
-                }
-                loop {
-                    let event = tokio::select! {
-                        event = events.recv() => event,
-                        () = sender.closed() => return,
-                    };
-                    match event {
-                        Ok(event) => {
-                            if event["documentId"].as_str() != Some(document.as_str()) {
-                                continue;
-                            }
-                            let next = revision_of(&event);
-                            if next < revision
-                                || (next == revision
-                                    && event.get("transfer").is_none()
-                                    && event.get("text").is_none())
-                            {
-                                continue;
-                            }
-                            if next > revision.saturating_add(1) {
-                                let full = hub.text_events(&document);
-                                revision = revision_of(&full[0]);
-                                for part in full {
-                                    if sender.send(part).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                continue;
-                            }
-                            revision = next;
-                            if sender.send(event).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Resynchronize with the full text rather than guess what was missed.
-                            let full = hub.text_events(&document);
-                            revision = revision_of(&full[0]);
-                            for part in full {
-                                if sender.send(part).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-            });
-            Ok(subscription)
+        "documents.document.session",
+        |context: Context<DocumentsActive>, request: SessionRequest| async move {
+            open_session(&context, request).await
         },
     )
     .subscription(
@@ -1269,55 +1480,6 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
     )
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TypeRequest {
-    document_id: String,
-    block: usize,
-    at_end: bool,
-    text: String,
-}
-
-/// The Backend the system tests drive: [`router`] plus `documents.test.type`, which stands in
-/// for a person's editor session until the editor session seam exists. It types `text` into
-/// the first text run of a top-level block, as one update from a fresh peer, through the one
-/// local write path. The shipped Backend never builds this router.
-#[doc(hidden)]
-#[must_use]
-pub fn system_test_router() -> Router<DocumentsActive> {
-    router().request(
-        "documents.test.type",
-        |context: Context<DocumentsActive>, request: TypeRequest| async move {
-            require_document(&context, &request.document_id).await?;
-            let state = context.state();
-            let document = &request.document_id;
-            let peer = state.hub.with_body(document, |body| body.allocate_peer());
-            let update = state
-                .hub
-                .with_body(document, |body| {
-                    body.typing_update(peer, request.block, request.at_end, &request.text)
-                })
-                .map_err(update_error)?;
-            let request_id = format!(
-                "{:016x}{:016x}",
-                getrandom::u64().map_err(|_| error("documents.edit_failed", true))?,
-                getrandom::u64().map_err(|_| error("documents.edit_failed", true))?
-            );
-            submit_update(
-                &state.log,
-                &state.hub,
-                &state.changes,
-                &state.installation,
-                document,
-                peer,
-                &request_id,
-                &update,
-            )
-            .await
-        },
-    )
-}
-
 async fn require_collection(
     context: &Context<DocumentsActive>,
     id: &str,
@@ -1408,13 +1570,6 @@ async fn require_comment(context: &Context<DocumentsActive>, id: &str) -> Result
     } else {
         Err(error("documents.unknown_comment", false))
     }
-}
-
-fn revision_of(event: &JsonValue) -> u64 {
-    event["revision"]
-        .as_str()
-        .and_then(|revision| revision.parse().ok())
-        .unwrap_or(0)
 }
 
 /// Both the SDK and host cap an `open` call at 32 records and 512 KiB of decoded sealed input.
@@ -1548,9 +1703,7 @@ async fn reopen_unopened_edits(
     });
     if changed {
         hub.refresh_identity_index_complete();
-        for event in hub.text_events(document) {
-            let _ = hub.events.send(event);
-        }
+        hub.publish_status(document);
     }
     Ok(())
 }
@@ -1606,9 +1759,7 @@ async fn import_edit_rows(
                                         .conflicted_documents()
                                         .map_err(|_| storage_failed())?
                                     {
-                                        for event in hub.text_events(&affected) {
-                                            let _ = hub.events.send(event);
-                                        }
+                                        hub.publish_status(&affected);
                                     }
                                     continue;
                                 }
@@ -1890,9 +2041,7 @@ async fn reopen_metadata(
                                 for affected in
                                     store.conflicted_documents().map_err(|_| storage_failed())?
                                 {
-                                    for event in hub.text_events(&affected) {
-                                        let _ = hub.events.send(event);
-                                    }
+                                    hub.publish_status(&affected);
                                 }
                                 continue;
                             }
@@ -2107,13 +2256,12 @@ where
         };
         let Some(update) = next else {
             if appended {
-                let saved_revision = hub.with_body(document, |body| {
+                let saved = hub.with_body(document, |body| {
                     completed_id
                         .as_deref()
-                        .and_then(|id| body.identity(id))
-                        .map(|known| known.revision)
+                        .is_some_and(|id| body.identity(id).is_some())
                 });
-                if let Some(saved_revision) = saved_revision {
+                if saved {
                     let _publication = hub.publication_gate.lock().unwrap();
                     if hub
                         .store
@@ -2130,16 +2278,10 @@ where
                     {
                         return Err(error("documents.import_failure", false));
                     }
-                    let mut events = hub.text_events(document);
-                    if let Some(last) = events.last_mut() {
-                        last["savedRevision"] = json!(saved_revision.to_string());
-                        if let Some(id) = completed_id {
-                            last["requestId"] = json!(id);
-                        }
-                    }
-                    for event in events {
-                        let _ = hub.events.send(event);
-                    }
+                    let _ = hub.events.send(BodyEvent::Status {
+                        document: document.to_owned(),
+                        durable: completed_id,
+                    });
                 }
             }
             return Ok(());
@@ -2248,9 +2390,7 @@ async fn append_edit(
                 .map_or(true, |failure| failure.is_some())
             {
                 hub.with_body(document, DocumentBody::append_succeeded);
-                for event in hub.text_events(document) {
-                    let _ = hub.events.send(event);
-                }
+                hub.publish_status(document);
                 return Err(error("documents.import_failure", false));
             }
             if hub.store.identity_conflicted(document).unwrap_or(true) {
@@ -2406,13 +2546,13 @@ async fn stage_local_write(
         if !body.editable() {
             return Err(error("documents.document_pending", true));
         }
-        let staged = match (write, digest) {
+        let digest = match (write, digest) {
             (LocalWrite::Update { peer, bytes }, Some(digest)) => {
                 if let Some(known) = body.identity(request_id) {
                     if known.author != author || known.digest != digest {
                         return Err(invalid_request());
                     }
-                    return Ok((known.revision, body.frontiers(), false, true));
+                    return Ok((known.revision, body.frontiers(), None, true));
                 }
                 body.accept_local_update(peer, request_id.to_owned(), bytes)
                     .map_err(update_error)?;
@@ -2426,7 +2566,7 @@ async fn stage_local_write(
                     .merge_markdown(base, markdown, request_id.to_owned())
                     .map_err(update_error)?
                 {
-                    return Ok((body.revision(), body.frontiers(), false, false));
+                    return Ok((body.revision(), body.frontiers(), None, false));
                 }
                 let update = body
                     .staged()
@@ -2435,11 +2575,11 @@ async fn stage_local_write(
             }
             (LocalWrite::Update { .. }, None) => return Err(invalid_request()),
         };
-        body.remember_identity(request_id.to_owned(), author.to_owned(), staged, false)
+        body.remember_identity(request_id.to_owned(), author.to_owned(), digest, false)
             .map_err(|_| invalid_request())?;
-        Ok((body.revision(), body.frontiers(), true, true))
+        Ok((body.revision(), body.frontiers(), body.staged(), true))
     })?;
-    if !staged
+    if staged.is_none()
         && changed
         && hub.with_body(document, |body| {
             body.identity(request_id)
@@ -2448,11 +2588,14 @@ async fn stage_local_write(
     {
         return Err(error("documents.document_pending", true));
     }
-    if staged {
+    if let Some(update) = staged {
         hub.flush.notify_one();
-        for event in hub.text_events(document) {
-            let _ = hub.events.send(event);
-        }
+        // Other sessions see the accepted update at once; its own session already holds it.
+        let origin = match write {
+            LocalWrite::Update { peer, .. } => Some(peer),
+            LocalWrite::Revision { .. } => None,
+        };
+        hub.publish_update(document, update, origin);
     }
     drop(publication);
     Ok(Staged {
@@ -2506,7 +2649,7 @@ async fn submit_update(
     .await?;
     // Never acknowledge the update until its record has reached the Core record log.
     drain_local_writes(log, hub, changes, author, document).await?;
-    Ok(json!({ "ok": true, "revision": staged.revision.to_string(), "requestId": request_id }))
+    Ok(json!({ "revision": staged.revision.to_string(), "requestId": request_id }))
 }
 
 async fn stop_flusher(state: &DocumentsActive) {
@@ -2639,9 +2782,7 @@ impl RecordLogSink for DocumentsSink {
                 .conflicted_documents()
                 .map_err(|_| storage_failed())?
             {
-                for event in self.hub.text_events(&affected) {
-                    let _ = self.hub.events.send(event);
-                }
+                self.hub.publish_status(&affected);
             }
             self.store
                 .note_replayed(record.record_id.as_str())
@@ -2735,9 +2876,7 @@ impl RecordLogSink for DocumentsSink {
             {
                 hub.refresh_identity_index_complete();
                 for document in changed {
-                    for event in hub.text_events(&document) {
-                        let _ = hub.events.send(event);
-                    }
+                    hub.publish_status(&document);
                 }
                 changes.send_modify(|revision| *revision = revision.saturating_add(1));
             }
@@ -2778,6 +2917,7 @@ impl RecordLogSink for DocumentsSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teamarness_package_contract::ui_contract::MAX_UI_PAYLOAD_BYTES;
     use teamarness_package_sdk::testing::assert_router_matches_contract;
 
     #[test]
@@ -2820,32 +2960,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn full_text_frames_stay_below_bridge_limit() {
-        let text = "\u{0000}😀".repeat(60_000);
-        let events = full_text_events(&hex(64, 1), 42, &text, true);
-        assert!(events.len() > 3);
-        assert_eq!(events[0]["transfer"], "begin");
-        assert_eq!(events.last().unwrap()["transfer"], "end");
-        assert_eq!(
-            events
-                .iter()
-                .filter_map(|event| event["chunk"].as_str())
-                .collect::<String>(),
-            text
-        );
-        assert!(
-            events
-                .iter()
-                .all(|event| event.to_string().len() < 256 * 1024)
-        );
-    }
-
-    fn test_hub(store: DocumentStore, events: broadcast::Sender<JsonValue>) -> BodyHub {
+    fn test_hub(store: DocumentStore, events: broadcast::Sender<BodyEvent>) -> BodyHub {
         BodyHub {
             store,
             bodies: Arc::new(Mutex::new(HashMap::new())),
+            installation: ALICE.into(),
             events,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            ended_sessions: Arc::new(Mutex::new(HashMap::new())),
             flush: Arc::new(Notify::new()),
             append_locks: Arc::new(Mutex::new(HashMap::new())),
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
@@ -2857,52 +2979,138 @@ mod tests {
         }
     }
 
+    fn ui_contract() -> teamarness_package_contract::ui_contract::CompiledUiContract {
+        teamarness_package_contract::ui_contract::compile_ui_contract(include_bytes!(
+            "../../ui-contract.json"
+        ))
+        .unwrap()
+    }
+
+    /// The snapshot a session opening carries, reassembled from its chunks.
+    fn reassembled(opening: &[JsonValue]) -> Vec<u8> {
+        assert_eq!(opening[0]["event"], "begin");
+        assert_eq!(opening.last().unwrap()["event"], "end");
+        let chunks = &opening[1..opening.len() - 1];
+        assert_eq!(opening[0]["chunks"], chunks.len());
+        let mut snapshot = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk["event"], "chunk");
+            assert_eq!(chunk["chunkIndex"], index);
+            snapshot.extend(STANDARD.decode(chunk["chunk"].as_str().unwrap()).unwrap());
+        }
+        snapshot
+    }
+
+    /// The Canonical Markdown of a snapshot, as the UI's doc would hold it.
+    fn markdown_of(snapshot: &[u8]) -> String {
+        let doc = loro::LoroDoc::new();
+        if !snapshot.is_empty() {
+            doc.import(snapshot).unwrap();
+        }
+        crate::markdown::export(&doc).unwrap_or_default()
+    }
+
+    // Verifies: AC3 — the snapshot reaches a session in chunks that reassemble to the body, and
+    // no session event, including the largest possible update, exceeds one UI message.
     #[test]
-    fn oversized_import_falls_back_to_bounded_full_text_events() {
+    fn session_events_reassemble_and_never_exceed_one_ui_message() {
         let directory = tempfile::tempdir().unwrap();
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let (events, mut receiver) = broadcast::channel(256);
         let hub = test_hub(store, events);
         let mut alice = Writer::new();
         let mut bob = Writer::new();
-        let from_alice = alice.write(&format!("{}\n", "a".repeat(110 * 1024)));
+        let from_alice = alice.write(&format!("{}\n", unique_text(110 * 1024)));
         let from_bob = bob.write(&format!("{}\n", "\u{0001}😀".repeat(20_000)));
         hub.apply_edits(&[("doc".into(), genesis())]);
         hub.apply_edits(&[("doc".into(), from_alice)]);
-        while receiver.try_recv().is_ok() {}
         hub.apply_edits(&[("doc".into(), from_bob)]);
         let merged = hub.with_body("doc", |body| body.text().to_owned());
         assert!(merged.len() > crate::body::MAX_TEXT_BYTES);
-        let published: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-        assert!(
-            published
-                .iter()
-                .any(|event: &JsonValue| event["transfer"] == "begin")
-        );
-        assert!(
-            published
-                .iter()
-                .all(|event| event.to_string().len() < 256 * 1024)
-        );
-        let response = hub.open_response("doc");
-        assert!(response.get("text").is_none());
-        assert!(response.to_string().len() < 256 * 1024);
-        let full = hub.text_events("doc");
-        assert!(
-            full.iter()
-                .all(|event| event.to_string().len() < 256 * 1024)
+        let contract = ui_contract();
+        let document = hex(64, 7);
+        hub.apply_edits(&[(document.clone(), genesis())]);
+        let (_, opening) = hub.session_opening("doc", 42);
+        assert!(opening.len() > 3, "a large body arrives in several chunks");
+        assert_eq!(markdown_of(&reassembled(&opening)), merged);
+        let mut published = Vec::new();
+        while let Ok(BodyEvent::Update { update, .. }) = receiver.try_recv() {
+            published.push(json!({
+                "event": "update", "documentId": document,
+                "update": STANDARD.encode(update.as_slice()),
+            }));
+        }
+        assert!(!published.is_empty());
+        // The largest update a session can receive: exactly one record's worth.
+        let largest = json!({
+            "event": "update", "documentId": document,
+            "update": STANDARD.encode(vec![0xa5; MAX_UPDATE]),
+        });
+        for event in opening.iter().chain(&published).chain([&largest]) {
+            let mut event = event.clone();
+            event["documentId"] = json!(document);
+            assert!(event.to_string().len() <= MAX_UI_PAYLOAD_BYTES);
+            contract
+                .validate_event("documents.document.session", &event)
+                .unwrap_or_else(|error| panic!("{error:?}: {}", event["event"]));
+        }
+        assert!(largest.to_string().len() > 200 * 1024, "the bound is tight");
+        // One byte more never reaches a session as an update: every session reloads instead.
+        hub.publish_update("doc", vec![0; MAX_UPDATE + 1], None);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(BodyEvent::Resync { document }) if document == "doc"
+        ));
+        hub.publish_update("doc", vec![0; MAX_UPDATE], None);
+        assert!(matches!(receiver.try_recv(), Ok(BodyEvent::Update { .. })));
+    }
+
+    // Verifies: AC5 — the Markdown request delivers the Canonical Markdown in bounded chunks of
+    // one text.
+    #[test]
+    fn markdown_chunks_reassemble_to_the_canonical_export_within_one_ui_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, _receiver) = broadcast::channel(256);
+        let hub = test_hub(store, events);
+        let document = hex(64, 7);
+        let mut writer = Writer::new();
+        let large = writer.write(&format!("# Plan\n\n{}\n", "\u{0001}😀 ".repeat(20_000)));
+        hub.apply_edits(&[(document.clone(), genesis()), (document.clone(), large)]);
+        let contract = ui_contract();
+        let first = markdown_chunk(&hub, &document, 0).unwrap();
+        let chunks = first["chunks"].as_u64().unwrap() as usize;
+        assert!(chunks > 4);
+        let mut markdown = String::new();
+        for index in 0..chunks {
+            let chunk = markdown_chunk(&hub, &document, index).unwrap();
+            assert_eq!(chunk["digest"], first["digest"]);
+            assert!(chunk.to_string().len() <= MAX_UI_PAYLOAD_BYTES);
+            contract
+                .validate_response("documents.document.markdown", &chunk)
+                .unwrap();
+            markdown.push_str(chunk["chunk"].as_str().unwrap());
+        }
+        assert_eq!(
+            markdown,
+            hub.with_body(&document, |body| body.text().to_owned())
         );
         assert_eq!(
-            full.iter()
-                .filter_map(|event| event["chunk"].as_str())
-                .collect::<String>(),
-            merged
+            markdown_chunk(&hub, &document, chunks).unwrap_err().code(),
+            "documents.invalid_request"
+        );
+        let empty = hex(64, 8);
+        hub.apply_edits(&[(empty.clone(), genesis())]);
+        let only = markdown_chunk(&hub, &empty, 0).unwrap();
+        assert_eq!(
+            (only["chunks"].clone(), only["chunk"].clone()),
+            (json!(1), json!(""))
         );
     }
 
     // Verifies: AC3 — a Document whose records cannot all be opened is pending, never partial.
     #[test]
-    fn pending_body_never_publishes_partial_ready_edits() {
+    fn pending_body_opens_a_session_without_a_partial_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let (events, mut receiver) = broadcast::channel(16);
@@ -2910,13 +3118,21 @@ mod tests {
         let update = Writer::new().write("complete\n");
         hub.apply_edits(&[("doc".into(), genesis())]);
         hub.with_body("doc", |body| body.set_unopened(2));
+        while receiver.try_recv().is_ok() {}
         hub.apply_edits(&[("doc".into(), update.clone())]);
-        assert_eq!(hub.open_response("doc")["text"], "");
-        assert_eq!(hub.open_response("doc")["editable"], false);
-        assert!(receiver.try_recv().is_err(), "no partial body is broadcast");
+        let (access, opening) = hub.session_opening("doc", 1);
+        assert!(!access.editable);
+        assert_eq!(opening[0]["editable"], false);
+        assert_eq!(opening[0]["chunks"], 0, "no partial body is sent");
+        assert_eq!(hub.access_value("doc")["editable"], false);
+        assert!(matches!(
+            markdown_chunk(&hub, "doc", 0),
+            Err(cause) if cause.code() == "documents.document_pending"
+        ));
         hub.with_body("doc", |body| body.set_unopened(0));
-        assert_eq!(hub.open_response("doc")["text"], "complete\n");
-        assert_eq!(hub.open_response("doc")["editable"], true);
+        let (access, opening) = hub.session_opening("doc", 2);
+        assert!(access.editable);
+        assert_eq!(markdown_of(&reassembled(&opening)), "complete\n");
     }
 
     #[test]
@@ -2929,7 +3145,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
 
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
@@ -3236,42 +3452,20 @@ mod tests {
                     );
                 }
             }
-            let hidden = session
-                .harness
-                .request("documents.document.open", json!({"documentId":document}))
-                .await
-                .unwrap();
+            let hidden = body_view(&mut session.harness, &document).await;
             assert_eq!(hidden["reason"], "identity_conflict");
             assert_eq!(hidden["text"], "");
+            assert_eq!(hidden["chunks"], 0);
             session.handles.qualified.store(true, Ordering::Release);
-            let mut subscription = session
-                .harness
-                .subscribe("documents.document.text", json!({"documentId":document}))
-                .await
-                .unwrap();
-            let transfer = hex(32, 88);
-            session
+            let recovered = session
                 .harness
                 .request(
                     "documents.document.recover",
-                    json!({"documentId":document,
-                "transferId":transfer,"requestIds":[hex(32, 89)]}),
+                    json!({"documentId":document,"requestIds":[hex(32, 89)]}),
                 )
                 .await
                 .unwrap();
-            let recovered = tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let event = subscription.next_event().await.unwrap().unwrap();
-                    if event["transferId"] == transfer {
-                        break event;
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(recovered["reason"], "identity_conflict");
             assert_eq!(recovered["requestStatuses"][0]["inclusion"], "unresolved");
-            assert_eq!(recovered["text"], "");
             let rejected = submit(&session.handles, &document, &hex(32, 89), &(1, vec![1]))
                 .await
                 .unwrap_err();
@@ -3326,20 +3520,10 @@ mod tests {
             "metadata",
         )
         .await;
-        let (events, mut receiver) = broadcast::channel(64);
-        let hub = BodyHub {
-            store: store.clone(),
-            bodies: Arc::new(Mutex::new(HashMap::new())),
-            events,
-            flush: Arc::new(Notify::new()),
-            append_locks: Arc::new(Mutex::new(HashMap::new())),
-            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
-            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-            qualified: Arc::new(AtomicBool::new(true)),
-            identity_index_complete: Arc::new(AtomicBool::new(true)),
-            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
-            publication_gate: Arc::new(Mutex::new(())),
-        };
+        let (events, _receiver) = broadcast::channel(64);
+        let hub = test_hub(store.clone(), events);
+        hub.qualified.store(true, Ordering::Release);
+        hub.identity_index_complete.store(true, Ordering::Release);
         // An accepted local update, large enough that its text needs a chunked transfer.
         hub.with_body(&document, |body| {
             body.import(&genesis()).unwrap();
@@ -3351,14 +3535,15 @@ mod tests {
         let request_id = hex(32, 9);
         let request = RecoverRequest {
             document_id: document.clone(),
-            transfer_id: hex(32, 55),
             request_ids: vec![request_id.clone()],
         };
         let (release, pending_lookup) = tokio::sync::oneshot::channel::<()>();
+        let recovering = hub.clone();
         let publishing = tokio::spawn(async move {
             pending_lookup.await.unwrap();
-            hub.publish_recovery(&request, ALICE, &Ok(HashMap::new()), &HashSet::new())
-                .unwrap();
+            recovering
+                .recovery_statuses(&request, ALICE, &Ok(HashMap::new()), &HashSet::new())
+                .unwrap()
         });
         let update = Writer::new().write("signed\n");
         for seed in [3, 4] {
@@ -3378,19 +3563,19 @@ mod tests {
             .await;
         }
         assert!(store.identity_conflicted(&document).unwrap());
-        while receiver.try_recv().is_ok() {}
         release.send(()).unwrap();
-        publishing.await.unwrap();
-        let published: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-        assert!(!published.is_empty());
-        assert!(
-            published
-                .iter()
-                .all(|event| event["reason"] == "identity_conflict"
-                    && event["text"] == ""
-                    && event.get("chunk").is_none()
-                    && event["editable"] == false)
+        let statuses = publishing.await.unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                json!({"requestId":request_id,"inclusion":"unresolved","durability":"unresolved"})
+            ]
         );
+        // The conflicted body opens with no snapshot at all.
+        let (access, opening) = hub.session_opening(&document, 3);
+        assert_eq!(access.reason, Some("identity_conflict"));
+        assert_eq!(opening.len(), 2);
+        assert_eq!(opening[0]["editable"], false);
         session.harness.shutdown().await.unwrap();
     }
 
@@ -3569,12 +3754,7 @@ mod tests {
             "applied text",
         )
         .await;
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap();
+        let mut text = UiSession::open(&mut session.harness, &document).await;
         let draft = session_update(&session.handles, &document, "good draft\n");
         assert!(
             submit(&session.handles, &document, &hex(32, 55), &draft)
@@ -3604,11 +3784,7 @@ mod tests {
             "invalid disposition",
         )
         .await;
-        let opened = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let opened = body_view(&mut session.harness, &document).await;
         assert_eq!(
             opened["text"], "good\n",
             "an unappended preview is not authoritative last-good text"
@@ -3616,9 +3792,9 @@ mod tests {
         assert_eq!(opened["reason"], "import_failure");
         let mut saved = false;
         while let Ok(Some(Ok(event))) =
-            tokio::time::timeout(Duration::from_millis(20), text.next_event()).await
+            tokio::time::timeout(Duration::from_millis(20), text.events.next_event()).await
         {
-            saved |= event.get("savedRevision").is_some();
+            saved |= event["event"] == "status" && event["durable"] != json!([]);
         }
         assert!(
             !saved,
@@ -3682,11 +3858,7 @@ mod tests {
             "invalid edit cursor",
         )
         .await;
-        let opened = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let opened = body_view(&mut session.harness, &document).await;
         assert_eq!(opened["reason"], "import_failure");
         assert_eq!(opened["editable"], false);
         assert_eq!(opened["text"], "good\n");
@@ -3695,35 +3867,15 @@ mod tests {
             store.import_failure(&document).unwrap(),
             Some((hex(64, 4), "decode_or_checksum".into()))
         );
-        let mut subscription = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = subscription.next_event().await.unwrap();
-        session
+        let recovery = session
             .harness
             .request(
                 "documents.document.recover",
-                json!({
-                    "documentId":document,"transferId":hex(32, 90),"requestIds":[bad_id]
-                }),
+                json!({ "documentId":document, "requestIds":[bad_id] }),
             )
             .await
             .unwrap();
-        let recovery = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = subscription.next_event().await.unwrap().unwrap();
-                if event["transferId"] == hex(32, 90) {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(recovery["reason"], "import_failure");
         assert_eq!(recovery["requestStatuses"][0]["inclusion"], "unresolved");
-        subscription.close().await;
         assert_eq!(store.edit_identity(&bad_id).unwrap().unwrap().0, hex(64, 4));
         let later = source.write("good later\n");
         assert!(
@@ -3843,11 +3995,7 @@ mod tests {
             store.import_failure(&document).unwrap().unwrap().0,
             hex(64, 2)
         );
-        let opened = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let opened = body_view(&mut session.harness, &document).await;
         assert_eq!(opened["reason"], "import_failure");
         assert_eq!(opened["editable"], false);
         session.harness.shutdown().await.unwrap();
@@ -3927,11 +4075,7 @@ mod tests {
                 _ => Err(error("unavailable", false)),
             });
             let mut session = start(directory.path(), scripted).await;
-            let opened = session
-                .harness
-                .request("documents.document.open", json!({"documentId":document}))
-                .await
-                .unwrap();
+            let opened = body_view(&mut session.harness, &document).await;
             assert_eq!(opened["text"], "last good\n");
             assert_eq!(opened["reason"], "import_failure");
             assert_eq!(opened["editable"], false);
@@ -3945,11 +4089,7 @@ mod tests {
                     .0,
                 hex(64, 5)
             );
-            let healthy = session
-                .harness
-                .request("documents.document.open", json!({"documentId":other}))
-                .await
-                .unwrap();
+            let healthy = body_view(&mut session.harness, &other).await;
             assert_eq!(healthy["editable"], true);
             session.harness.shutdown().await.unwrap();
             let store = DocumentStore::open(&path).unwrap();
@@ -4058,34 +4198,15 @@ mod tests {
             "healthy append",
         )
         .await;
-        let mut subscription = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":unavailable}))
-            .await
-            .unwrap();
-        let _ = subscription.next_event().await.unwrap();
-        session
+        let unresolved = session
             .harness
             .request(
                 "documents.document.recover",
-                json!({
-                    "documentId":unavailable,"transferId":hex(32, 91),"requestIds":[hex(32, 92)]
-                }),
+                json!({"documentId":unavailable,"requestIds":[hex(32, 92)]}),
             )
             .await
             .unwrap();
-        let unresolved = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = subscription.next_event().await.unwrap().unwrap();
-                if event["transferId"] == hex(32, 91) {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
         assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
-        subscription.close().await;
         let update = Writer::new().write("remote\n");
         let edit =
             DomainRecord::identified_document_edit("bob", &healthy, &hex(32, 98), &[6; 32], update)
@@ -4179,11 +4300,7 @@ mod tests {
             _ => Err(error("unavailable", false)),
         });
         let mut session = start(directory.path(), scripted).await;
-        let pending = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let pending = body_view(&mut session.harness, &document).await;
         assert_eq!(pending["editable"], false);
         assert_eq!(pending["text"], "");
         let stream = session.scripted.stream();
@@ -4229,28 +4346,15 @@ mod tests {
             session.handles.bodies.lock().unwrap()[&other].text(),
             "live\n"
         );
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap();
-        session
+        let unresolved = session
             .harness
             .request(
                 "documents.document.recover",
-                json!({"documentId":document,"transferId":hex(32, 16),"requestIds":[hex(32, 17)]}),
+                json!({"documentId":document,"requestIds":[hex(32, 17)]}),
             )
             .await
             .unwrap();
-        let unresolved = loop {
-            let event = text.next_event().await.unwrap().unwrap();
-            if event["transferId"] == hex(32, 16) {
-                break event;
-            }
-        };
         assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
-        text.close().await;
         access.store(true, Ordering::SeqCst);
         let stream = session.scripted.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
@@ -4267,11 +4371,7 @@ mod tests {
             "opened deferred collision",
         )
         .await;
-        let hidden = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let hidden = body_view(&mut session.harness, &document).await;
         assert_eq!(hidden["reason"], "identity_conflict");
         session.harness.shutdown().await.unwrap();
     }
@@ -4421,31 +4521,14 @@ mod tests {
             "document arrives",
         )
         .await;
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap();
-        let before = hex(32, 90);
-        session
+        let unresolved = session
             .harness
             .request(
                 "documents.document.recover",
-                json!({"documentId":document,"transferId":before,"requestIds":[id]}),
+                json!({"documentId":document,"requestIds":[id]}),
             )
             .await
             .unwrap();
-        let unresolved = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = text.next_event().await.unwrap().unwrap();
-                if event["transferId"] == before {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
         assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
         let update = Writer::new().write("replayed\n");
         let edit = DomainRecord::identified_document_edit(ALICE, &document, &id, &[7; 32], update)
@@ -4465,26 +4548,20 @@ mod tests {
             "Core replay and index",
         )
         .await;
-        let next_transfer = hex(32, 91);
-        session.harness.request("documents.document.recover",
-            json!({"documentId":document,"transferId":next_transfer,"requestIds":[id,hex(32,89)]})).await.unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = text.next_event().await.unwrap().unwrap();
-                if event["transferId"] == next_transfer {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let received = session
+            .harness
+            .request(
+                "documents.document.recover",
+                json!({"documentId":document,"requestIds":[id,hex(32,89)]}),
+            )
+            .await
+            .unwrap();
         assert_eq!(received["requestStatuses"][0]["inclusion"], "included");
         assert_eq!(
             received["requestStatuses"][1]["inclusion"], "unresolved",
             "an unopenable indexed row cannot certify other IDs absent"
         );
         assert_eq!(store.edit_identity(&id).unwrap().unwrap().0, hex(64, 3));
-        text.close().await;
         session.harness.shutdown().await.unwrap();
     }
 
@@ -4744,47 +4821,33 @@ mod tests {
             17,
             "sixteen edits and the create that carries the genesis"
         );
-        let mut subscription = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        assert_eq!(
-            subscription.next_event().await.unwrap().unwrap()["editable"],
-            false
-        );
-        let pending = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let mut subscription = UiSession::open(&mut session.harness, &document).await;
+        assert_eq!(subscription.begin["editable"], false);
+        assert_eq!(subscription.begin["chunks"], 0);
+        let pending = body_view(&mut session.harness, &document).await;
         assert_eq!(pending["editable"], false);
         assert_eq!(
             pending["text"], "",
             "one ready edit must not reveal partial body"
         );
         access.store(true, Ordering::SeqCst);
-        let ready = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let ready = body_view(&mut session.harness, &document).await;
         assert_eq!(ready["editable"], true);
         assert_eq!(ready["text"], "recovered\n");
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].unopened(),
             0
         );
-        let mut published = false;
+        let mut reloaded = false;
         for _ in 0..4 {
-            if subscription.next_event().await.unwrap().unwrap()["editable"] == true {
-                published = true;
+            if subscription.next().await["event"] == "resync" {
+                reloaded = true;
                 break;
             }
         }
         assert!(
-            published,
-            "the existing subscription sees the final editable state"
+            reloaded,
+            "the existing session reloads once the body becomes editable"
         );
         let calls = scripted.recorded_calls();
         let activation_opens = calls.iter().filter(|call| call.method == "open").count();
@@ -4878,12 +4941,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap();
+        let text = UiSession::open(&mut session.harness, &document).await;
         let store = session.handles.store.clone();
         store.inner.lock().unwrap().conn.execute_batch(
             "CREATE TRIGGER fail_edit_projection BEFORE INSERT ON records WHEN NEW.purpose='document.edit' BEGIN SELECT RAISE(FAIL, 'injected'); END;"
@@ -4903,23 +4961,12 @@ mod tests {
             "Core accepted exactly one edit"
         );
         assert!(store.edit_identity(&id).unwrap().is_none());
-        let recover =
-            |seed| json!({"documentId":document,"transferId":hex(32,seed),"requestIds":[id]});
-        session
+        let recover = |_seed: u64| json!({"documentId":document,"requestIds":[id]});
+        let before = session
             .harness
             .request("documents.document.recover", recover(84))
             .await
             .unwrap();
-        let before = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = text.next_event().await.unwrap().unwrap();
-                if event["transferId"] == hex(32, 84) {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
         assert_eq!(before["requestStatuses"][0]["durability"], "durable");
         assert_eq!(before["requestStatuses"][0]["inclusion"], "unresolved");
         assert_eq!(
@@ -4952,21 +4999,11 @@ mod tests {
             "replayed edit projection",
         )
         .await;
-        session
+        let after = session
             .harness
             .request("documents.document.recover", recover(85))
             .await
             .unwrap();
-        let after = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = text.next_event().await.unwrap().unwrap();
-                if event["transferId"] == hex(32, 85) {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
         assert_eq!(after["requestStatuses"][0]["inclusion"], "included");
         assert_eq!(after["requestStatuses"][0]["durability"], "durable");
         assert_eq!(appended.lock().unwrap().len(), 3);
@@ -5162,12 +5199,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap();
+        let text = UiSession::open(&mut session.harness, &document).await;
         let id = hex(32, 31);
         let draft = session_update(&session.handles, &document, "draft\n");
         let editing = {
@@ -5193,32 +5225,20 @@ mod tests {
             "pending identity",
         )
         .await;
-        let recover = |transfer: u64| json!({"documentId":document,"transferId":hex(32,transfer),"requestIds":[id]});
-        session
+        let recover = |_transfer: u64| json!({"documentId":document,"requestIds":[id]});
+        let before = session
             .harness
             .request("documents.document.recover", recover(40))
             .await
             .unwrap();
-        let before = loop {
-            let event = text.next_event().await.unwrap().unwrap();
-            if event["transferId"] == hex(32, 40) {
-                break event;
-            }
-        };
         assert_eq!(before["requestStatuses"][0]["inclusion"], "included");
         assert_eq!(before["requestStatuses"][0]["durability"], "pending");
         assert!(editing.await.unwrap().is_err());
-        session
+        let failed = session
             .harness
             .request("documents.document.recover", recover(41))
             .await
             .unwrap();
-        let failed = loop {
-            let event = text.next_event().await.unwrap().unwrap();
-            if event["transferId"] == hex(32, 41) {
-                break event;
-            }
-        };
         assert_eq!(failed["requestStatuses"][0]["durability"], "pending");
         fail.store(false, Ordering::SeqCst);
         let premature = submit(&session.handles, &document, &id, &draft)
@@ -5239,17 +5259,11 @@ mod tests {
         submit(&session.handles, &document, &id, &draft)
             .await
             .unwrap();
-        session
+        let saved = session
             .harness
             .request("documents.document.recover", recover(42))
             .await
             .unwrap();
-        let saved = loop {
-            let event = text.next_event().await.unwrap().unwrap();
-            if event["transferId"] == hex(32, 42) {
-                break event;
-            }
-        };
         assert_eq!(saved["requestStatuses"][0]["durability"], "durable");
         text.close().await;
         session.harness.shutdown().await.unwrap();
@@ -5310,12 +5324,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap().unwrap();
+        let mut text = UiSession::open(&mut session.harness, &document).await;
         let id = "11111111111111111111111111111111";
         let draft = session_update(&session.handles, &document, "draft\n");
         let result = submit(&session.handles, &document, id, &draft).await;
@@ -5343,19 +5352,15 @@ mod tests {
             "background append retry",
         )
         .await;
-        let saved = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = text.next_event().await.unwrap().unwrap();
-                if event.get("savedRevision").is_some() {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(saved["savedRevision"], "1");
-        assert_eq!(saved["text"], "draft\n");
-        assert_eq!(saved["requestId"], id);
+        let seen = text.follow_until(|markdown| markdown == "draft\n").await;
+        assert!(
+            seen.iter().all(|event| event["event"] == "update"),
+            "the staged update reaches the session before it is durable"
+        );
+        let saved = text.next().await;
+        assert_eq!(saved["event"], "status");
+        assert_eq!(saved["durable"], json!([id]));
+        assert_eq!(saved["editable"], true);
         let response = submit(&session.handles, &document, id, &draft)
             .await
             .unwrap();
@@ -5551,26 +5556,13 @@ mod tests {
                 .code(),
             "documents.capability_unavailable"
         );
-        let mut text = restarted
-            .harness
-            .subscribe("documents.document.text", json!({"documentId":document}))
-            .await
-            .unwrap();
-        let _ = text.next_event().await.unwrap();
-        let transfer = "abababababababababababababababab";
         let missing = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-        let query = json!({"documentId":document,"transferId":transfer,"requestIds":["33333333333333333333333333333333",missing]});
-        restarted
+        let query = json!({"documentId":document,"requestIds":["33333333333333333333333333333333",missing]});
+        let first = restarted
             .harness
             .request("documents.document.recover", query.clone())
             .await
             .unwrap();
-        let first = tokio::time::timeout(Duration::from_secs(2), text.next_event())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(first["transferId"], transfer);
         assert_eq!(
             first["requestStatuses"][0]["inclusion"], "unresolved",
             "failed sealed lookup is not an absence proof"
@@ -5594,12 +5586,11 @@ mod tests {
                 .code(),
             "documents.invalid_request"
         );
-        restarted
+        let found = restarted
             .harness
             .request("documents.document.recover", query.clone())
             .await
             .unwrap();
-        let found = text.next_event().await.unwrap().unwrap();
         assert_eq!(found["requestStatuses"][0]["inclusion"], "included");
         assert_eq!(found["requestStatuses"][0]["durability"], "durable");
         let stream = restarted.scripted.stream();
@@ -5635,12 +5626,11 @@ mod tests {
         // The SDK delivers the callback after the credited marker; wait for absence.
         let absent = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                restarted
+                let event = restarted
                     .harness
                     .request("documents.document.recover", query.clone())
                     .await
                     .unwrap();
-                let event = text.next_event().await.unwrap().unwrap();
                 if event["requestStatuses"][1]["inclusion"] == "absent" {
                     break event;
                 }
@@ -5650,7 +5640,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(absent["requestStatuses"][0]["durability"], "durable");
-        text.close().await;
         restarted.harness.shutdown().await.unwrap();
     }
 
@@ -5746,11 +5735,7 @@ mod tests {
             store.import_failure(&document).unwrap(),
             Some((hex(64, 4), "schema_violation".into()))
         );
-        let opened = session
-            .harness
-            .request("documents.document.open", json!({"documentId":document}))
-            .await
-            .unwrap();
+        let opened = body_view(&mut session.harness, &document).await;
         assert_eq!(opened["reason"], "import_failure");
         assert_eq!(opened["editable"], false);
         assert_eq!(opened["text"], "good\n");
@@ -5768,7 +5753,7 @@ mod tests {
     }
 
     // Verifies: AC2, AC3 — each local update is appended once as its own record, a refused
-    // update appends nothing, a remote record is pushed to the open text subscription, and the
+    // update appends nothing, a remote record is relayed to the open editor session, and the
     // Package SQLite never holds the body's text.
     #[tokio::test]
     async fn local_updates_are_appended_once_and_remote_edits_pushed_without_plaintext() {
@@ -5794,29 +5779,20 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let opened = session
-            .harness
-            .request("documents.document.open", json!({ "documentId": document }))
-            .await
-            .unwrap();
+        let opened = body_view(&mut session.harness, &document).await;
         assert_eq!(opened["text"], "");
-        assert_eq!(opened["revision"], "0");
+        assert_eq!(opened["version"], "0");
         assert_eq!(opened["editable"], true);
-        let mut text = session
-            .harness
-            .subscribe("documents.document.text", json!({ "documentId": document }))
-            .await
-            .unwrap();
-        let initial = text.next_event().await.unwrap().unwrap();
-        assert_eq!(initial["text"], "");
+        let mut text = UiSession::open(&mut session.harness, &document).await;
+        assert_eq!(text.markdown(), "");
 
         let first = session_update(&session.handles, &document, "# Zebra plan\n");
         let edited = submit(&session.handles, &document, &hex(32, 0x44), &first)
             .await
             .unwrap();
         assert_eq!(edited["revision"], "1");
-        let shown = text.next_event().await.unwrap().unwrap();
-        assert_eq!(shown["text"], "# Zebra plan\n");
+        text.follow_until(|markdown| markdown == "# Zebra plan\n")
+            .await;
         let (peer, update) = session_update(&session.handles, &document, "x\n");
         let foreign = submit(
             &session.handles,
@@ -5872,25 +5848,11 @@ mod tests {
             .await
             .unwrap();
         assert!(stream.send(record_frame(9, "bob", &remote)).await);
-        let pushed = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let event = text.next_event().await.unwrap().unwrap();
-                if event["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("platypus"))
-                {
-                    break event;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(pushed["revision"], "3");
-        let reopened = session
-            .harness
-            .request("documents.document.open", json!({ "documentId": document }))
-            .await
-            .unwrap();
+        text.follow_until(|markdown| markdown.contains("platypus"))
+            .await;
+        let reopened = body_view(&mut session.harness, &document).await;
+        assert_eq!(reopened["version"], "3");
+        assert_eq!(reopened["text"], json!(text.markdown()));
         let merged = reopened["text"].as_str().unwrap();
         assert!(
             merged.contains("# Zebra plan\n") && merged.contains("bob: platypus"),
@@ -5909,6 +5871,225 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A qualified activation holding one new, empty Document.
+    async fn editable_document(directory: &std::path::Path) -> (Session, String) {
+        let mut session = start(directory, scripted_log()).await;
+        qualify_empty_history(&session).await;
+        let collection = session
+            .harness
+            .request("documents.collection.create", json!({ "name": "Plans" }))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({ "collectionId": collection, "title": "Q4" }),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (session, document)
+    }
+
+    fn edit_appends(scripted: &ScriptedCapability) -> Vec<DomainRecord> {
+        scripted
+            .recorded_calls()
+            .iter()
+            .filter(|call| call.method == "append" && call.payload["purpose"] == "document.edit")
+            .map(|call| {
+                DomainRecord::decode(
+                    &URL_SAFE_NO_PAD
+                        .decode(call.payload["canonical"].as_str().unwrap())
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    // Verifies: AC4 — two views on one Installation are two sessions with distinct peers; both
+    // edit, each receives only the other's update, and both converge on an intact history.
+    #[tokio::test]
+    async fn two_sessions_on_one_backend_relay_each_others_updates_and_converge() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut left = UiSession::open(&mut session.harness, &document).await;
+        let mut right = UiSession::open(&mut session.harness, &document).await;
+        assert_ne!(left.peer, right.peer, "each session has its own peer");
+        assert_eq!(left.markdown(), "");
+        assert_eq!(left.begin["editable"], true);
+
+        let from_left = type_into(&left.doc, 0, true, "left ");
+        let answer = left
+            .send(&mut session.harness, &document, &hex(32, 0xa1), &from_left)
+            .await
+            .unwrap();
+        assert_eq!(answer, json!({ "requestId": hex(32, 0xa1) }));
+        let from_right = type_into(&right.doc, 0, false, "right ");
+        right
+            .send(&mut session.harness, &document, &hex(32, 0xa2), &from_right)
+            .await
+            .unwrap();
+
+        // Each side receives the other's update and never its own.
+        let seen_by_right = right
+            .follow_until(|markdown| markdown.contains("left"))
+            .await;
+        let seen_by_left = left
+            .follow_until(|markdown| markdown.contains("right"))
+            .await;
+        for (seen, own) in [(&seen_by_left, &from_left), (&seen_by_right, &from_right)] {
+            for event in seen.iter().filter(|event| event["event"] == "update") {
+                assert_ne!(
+                    STANDARD.decode(event["update"].as_str().unwrap()).unwrap(),
+                    **own
+                );
+            }
+        }
+        assert_eq!(left.markdown(), right.markdown());
+        let body = session.handles.bodies.lock().unwrap()[&document]
+            .text()
+            .to_owned();
+        assert_eq!(left.markdown(), body);
+        assert!(body.contains("left") && body.contains("right"), "{body:?}");
+
+        // The record history is intact: one record per request, each holding only its
+        // session's operations, and the records alone rebuild the same body.
+        let records = edit_appends(&session.scripted);
+        assert_eq!(records.len(), 2);
+        let mut rebuilt = DocumentBody::new();
+        rebuilt.import(&genesis_of(&session.scripted)).unwrap();
+        for (record, peer) in records.iter().zip([left.peer, right.peer]) {
+            let DomainRecord::IdentifiedDocumentEdit { update, .. } = record else {
+                panic!("an identified edit");
+            };
+            let meta = loro::LoroDoc::decode_import_blob_meta(update, false).unwrap();
+            assert_eq!(
+                meta.partial_end_vv.keys().copied().collect::<Vec<_>>(),
+                [peer]
+            );
+            rebuilt.import(update).unwrap();
+        }
+        assert_eq!(rebuilt.text(), body);
+        left.close().await;
+        right.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC3, AC4 — a refused update ends its session with `resync` and appends nothing;
+    // the same UI may resume as its own peer, never as an open session's or another writer's.
+    #[tokio::test]
+    async fn a_refused_update_resyncs_its_session_and_only_its_own_peer_resumes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut session, document) = editable_document(directory.path()).await;
+        let mut observer = UiSession::open(&mut session.harness, &document).await;
+        let mut refused = UiSession::open(&mut session.harness, &document).await;
+        let impostor = loro::LoroDoc::new();
+        impostor
+            .import(&refused.doc.export(loro::ExportMode::Snapshot).unwrap())
+            .unwrap();
+        impostor.set_peer_id(refused.peer ^ 1).unwrap();
+        let forged = type_into(&impostor, 0, true, "forged");
+        let error = refused
+            .send(&mut session.harness, &document, &hex(32, 0xb1), &forged)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "documents.foreign_peer");
+        assert_eq!(refused.next().await["event"], "resync");
+        assert!(
+            refused.events.next_event().await.is_none(),
+            "the refused session ends after resync"
+        );
+        let late = type_into(&refused.doc, 0, true, "late");
+        assert_eq!(
+            refused
+                .send(&mut session.harness, &document, &hex(32, 0xb2), &late)
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.unknown_session"
+        );
+        assert!(
+            edit_appends(&session.scripted).is_empty(),
+            "nothing was appended"
+        );
+
+        // The same UI resumes as its peer and its unsent bytes are accepted unchanged.
+        let resume = |peer: u64| json!({ "documentId": document, "resumePeer": peer.to_string() });
+        let resumed = UiSession::open_with(&mut session.harness, resume(refused.peer)).await;
+        assert_eq!(resumed.peer, refused.peer);
+        resumed
+            .send(&mut session.harness, &document, &hex(32, 0xb3), &late)
+            .await
+            .unwrap();
+        let seen = observer.follow_until(|markdown| markdown == "late\n").await;
+        assert!(seen.iter().all(|event| event["event"] == "update"));
+        let durable = observer.next().await;
+        assert_eq!(durable["event"], "status");
+        assert_eq!(durable["durable"], json!([hex(32, 0xb3)]));
+
+        // An open session's peer is never handed to another session.
+        let taken = UiSession::open_with(&mut session.harness, resume(observer.peer)).await;
+        assert_ne!(taken.peer, observer.peer);
+        // Nor is a peer another Installation writes with.
+        let update = Writer::of(&session.handles, &document).write("late\n\nfrom bob\n");
+        let foreign = *loro::LoroDoc::decode_import_blob_meta(&update, false)
+            .unwrap()
+            .partial_end_vv
+            .keys()
+            .next()
+            .unwrap();
+        let remote = DomainRecord::identified_document_edit(
+            "bob",
+            &document,
+            &hex(32, 0xb4),
+            &[4; 32],
+            update,
+        )
+        .unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(9, "bob", &remote))
+                .await
+        );
+        observer
+            .follow_until(|markdown| markdown.contains("from bob"))
+            .await;
+        let refused_foreign = UiSession::open_with(&mut session.harness, resume(foreign)).await;
+        assert_ne!(refused_foreign.peer, foreign);
+        for open in [observer, resumed, taken, refused_foreign] {
+            open.close().await;
+        }
+        session.harness.shutdown().await.unwrap();
+    }
+
+    /// The genesis the `document.create` record this activation appended carried.
+    fn genesis_of(scripted: &ScriptedCapability) -> Vec<u8> {
+        scripted
+            .recorded_calls()
+            .iter()
+            .filter(|call| call.method == "append" && call.payload["purpose"] == "document.create")
+            .find_map(|call| {
+                match DomainRecord::decode(
+                    &URL_SAFE_NO_PAD
+                        .decode(call.payload["canonical"].as_str().unwrap())
+                        .unwrap(),
+                ) {
+                    Ok(DomainRecord::DocumentCreate { genesis, .. }) => Some(genesis),
+                    _ => None,
+                }
+            })
+            .expect("the create record")
     }
 
     // Verifies: AC5 — a comment with a quote is appended, listed with its author, and resolved.
@@ -6231,7 +6412,10 @@ mod tests {
             let bodies = handles.bodies.lock().unwrap();
             let body = &bodies[document];
             let peer = body.allocate_peer();
-            (peer, body.typing_update(peer, block, at_end, text).unwrap())
+            let doc = loro::LoroDoc::new();
+            doc.import(&body.snapshot()).unwrap();
+            doc.set_peer_id(peer).unwrap();
+            (peer, type_into(&doc, block, at_end, text))
         };
         let id = format!("7e{:030x}", NEXT.fetch_add(1, Ordering::Relaxed));
         submit(handles, document, &id, &(peer, update))
@@ -6714,15 +6898,143 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn the_system_test_router_adds_only_the_typing_request() {
-        let mut shipped = router().operations();
-        let mut tested = system_test_router().operations();
-        shipped.requests.push("documents.test.type".into());
-        shipped.requests.sort();
-        tested.requests.sort();
-        assert_eq!(tested.requests, shipped.requests);
-        assert_eq!(tested.subscriptions, shipped.subscriptions);
+    /// What a person typing into `doc` as its peer sends: `text` inserted at the start or end
+    /// of the first text run of top-level block `block`, as one update.
+    fn type_into(doc: &loro::LoroDoc, block: usize, at_end: bool, text: &str) -> Vec<u8> {
+        use loro::{Container, ValueOrContainer};
+        let before = doc.oplog_vv();
+        let Some(ValueOrContainer::Container(Container::List(blocks))) =
+            doc.get_map("doc").get("children")
+        else {
+            panic!("the body has a children list");
+        };
+        let Some(ValueOrContainer::Container(Container::Map(node))) = blocks.get(block) else {
+            panic!("the body has block {block}");
+        };
+        let Some(ValueOrContainer::Container(Container::List(children))) = node.get("children")
+        else {
+            panic!("block {block} has children");
+        };
+        // An empty paragraph has no text run yet; typing creates one, as the binding does.
+        let run = match children.get(0) {
+            Some(ValueOrContainer::Container(Container::Text(run))) => run,
+            None => children.insert_container(0, loro::LoroText::new()).unwrap(),
+            Some(_) => panic!("block {block} starts with a text run"),
+        };
+        let position = if at_end { run.len_unicode() } else { 0 };
+        run.insert(position, text).unwrap();
+        doc.commit();
+        doc.export(loro::ExportMode::updates(&before)).unwrap()
+    }
+
+    /// One editor session as a UI holds it: the subscription, the Loro doc loaded from its
+    /// snapshot, and its peer.
+    struct UiSession {
+        events: teamarness_package_sdk::testing::HarnessSubscription,
+        doc: loro::LoroDoc,
+        peer: u64,
+        begin: JsonValue,
+    }
+
+    impl UiSession {
+        async fn open(harness: &mut Harness, document: &str) -> Self {
+            Self::open_with(harness, json!({ "documentId": document })).await
+        }
+
+        async fn open_with(harness: &mut Harness, request: JsonValue) -> Self {
+            let mut events = harness
+                .subscribe("documents.document.session", request)
+                .await
+                .unwrap();
+            let begin = next_session_event(&mut events).await;
+            assert_eq!(begin["event"], "begin", "{begin}");
+            let mut snapshot = Vec::new();
+            for index in 0..begin["chunks"].as_u64().unwrap() {
+                let chunk = next_session_event(&mut events).await;
+                assert_eq!(chunk["event"], "chunk");
+                assert_eq!(chunk["chunkIndex"], index);
+                snapshot.extend(STANDARD.decode(chunk["chunk"].as_str().unwrap()).unwrap());
+            }
+            assert_eq!(next_session_event(&mut events).await["event"], "end");
+            let doc = loro::LoroDoc::new();
+            if !snapshot.is_empty() {
+                doc.import(&snapshot).unwrap();
+            }
+            let peer = begin["sessionPeer"].as_str().unwrap().parse().unwrap();
+            doc.set_peer_id(peer).unwrap();
+            Self {
+                events,
+                doc,
+                peer,
+                begin,
+            }
+        }
+
+        fn markdown(&self) -> String {
+            crate::markdown::export(&self.doc).unwrap_or_default()
+        }
+
+        async fn next(&mut self) -> JsonValue {
+            next_session_event(&mut self.events).await
+        }
+
+        /// Follows the session, importing every relayed update, until `ready` holds for its
+        /// Markdown; returns every event it saw.
+        async fn follow_until(&mut self, ready: impl Fn(&str) -> bool) -> Vec<JsonValue> {
+            let mut seen = Vec::new();
+            while !ready(&self.markdown()) {
+                let event = self.next().await;
+                if event["event"] == "update" {
+                    let update = STANDARD.decode(event["update"].as_str().unwrap()).unwrap();
+                    self.doc.import(&update).unwrap();
+                }
+                seen.push(event);
+            }
+            seen
+        }
+
+        /// Sends `update` as this session's request `request_id`.
+        async fn send(
+            &self,
+            harness: &mut Harness,
+            document: &str,
+            request_id: &str,
+            update: &[u8],
+        ) -> Result<JsonValue, BackendError> {
+            harness
+                .request(
+                    "documents.document.update",
+                    json!({
+                        "documentId": document, "sessionPeer": self.peer.to_string(),
+                        "requestId": request_id, "update": STANDARD.encode(update),
+                    }),
+                )
+                .await
+        }
+
+        async fn close(mut self) {
+            self.events.close().await;
+        }
+    }
+
+    async fn next_session_event(
+        events: &mut teamarness_package_sdk::testing::HarnessSubscription,
+    ) -> JsonValue {
+        tokio::time::timeout(Duration::from_secs(5), events.next_event())
+            .await
+            .expect("a session event in time")
+            .expect("the session is open")
+            .expect("the session has not failed")
+    }
+
+    /// What a UI opening `document` now would show: the opening's state, plus `text`, the
+    /// Markdown of its snapshot.
+    async fn body_view(harness: &mut Harness, document: &str) -> JsonValue {
+        let session = UiSession::open(harness, document).await;
+        let mut view = session.begin.clone();
+        view["text"] = json!(session.markdown());
+        session.close().await;
+        view
     }
 
     fn unique_text(bytes: usize) -> String {

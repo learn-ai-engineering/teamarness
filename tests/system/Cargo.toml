@@ -21,11 +21,10 @@ path = "../../packages/conversations-package/backend/src/main.rs"
 name = "conversations-port-consumer-under-test"
 path = "src/bin/conversations_port_consumer.rs"
 
-# The Documents Backend is built the same way, over the Package's own router plus the one
-# test-only request that types into a body until the editor session seam exists.
+# The Documents Backend is built the same way, from the Package's own `src/main.rs`.
 [[bin]]
 name = "documents-backend-under-test"
-path = "src/bin/documents_backend.rs"
+path = "../../packages/documents-package/backend/src/main.rs"
 
 [[bin]]
 name = "documents-port-consumer-under-test"
@@ -39,6 +38,8 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+loro.workspace = true
 sha2.workspace = true
 # `test-hooks` is what binds an Installation's Iroh endpoint to loopback, so
 # the default suite reaches no public relay. It is a dev-dependency: the
