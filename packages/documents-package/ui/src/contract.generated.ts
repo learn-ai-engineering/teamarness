@@ -51,12 +51,6 @@ export type DocumentRequest = {
   readonly "documentId": RecordId;
 };
 
-export type Edited = {
-  readonly "ok": true;
-  readonly "requestId": RequestId;
-  readonly "revision": Revision;
-};
-
 export type Name = string;
 
 export type Names = {
@@ -97,11 +91,9 @@ export type TextEvent = {
   readonly "chunk"?: string;
   readonly "chunkIndex"?: number;
   readonly "chunks"?: number;
-  readonly "delta"?: readonly TextOp[];
   readonly "diagnosticRecordId"?: RecordId;
   readonly "documentId": RecordId;
   readonly "editable": boolean;
-  readonly "origin"?: "local" | "remote";
   readonly "reason"?: "identity_conflict" | "import_failure";
   readonly "requestId"?: RequestId;
   readonly "requestStatuses"?: readonly RequestStatus[];
@@ -110,14 +102,6 @@ export type TextEvent = {
   readonly "text"?: string;
   readonly "transfer"?: "begin" | "chunk" | "end";
   readonly "transferId"?: RequestId;
-};
-
-export type TextOp = {
-  readonly "retain": number;
-} | {
-  readonly "insert": string;
-} | {
-  readonly "delete": number;
 };
 
 export type Title = string;
@@ -150,12 +134,6 @@ export type DocumentsContract = {
         readonly "collectionId": RecordId;
         readonly "title": Title;
       }; readonly response: Appended };
-    readonly "documents.document.edit": { readonly request: {
-        readonly "baseRevision": Revision;
-        readonly "documentId": RecordId;
-        readonly "ops": readonly TextOp[];
-        readonly "requestId": RequestId;
-      }; readonly response: Edited };
     readonly "documents.document.move": { readonly request: {
         readonly "collectionId": RecordId;
         readonly "documentId": RecordId;

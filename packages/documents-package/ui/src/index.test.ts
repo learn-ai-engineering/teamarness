@@ -218,17 +218,12 @@ describe("Documents mount", () => {
     await unmount();
   });
 
-  it("opens a Document, sends typed edits, and applies a remote delta with the caret moved", async () => {
-    const edits: { base: string; ops: unknown }[] = [];
+  it("opens a Document read-only and follows each pushed full text", async () => {
+    const calls: string[] = [];
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
-        "documents.document.edit": (payload) => {
-          const { baseRevision, ops } = payload as { baseRevision: string; ops: unknown };
-          edits.push({ base: baseRevision, ops });
-          return { ok: true as const, revision: String(Number(baseRevision) + 1) };
-        },
+        "documents.document.open": () => { calls.push("open"); return { documentId: doc, revision: "0", editable: true, text: "" }; },
       },
       subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
     });
@@ -242,20 +237,15 @@ describe("Documents mount", () => {
     await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "# Q4\n" });
     const textarea = root.querySelector("textarea") as HTMLTextAreaElement;
     expect(textarea.value).toBe("# Q4\n");
-    expect(textarea.disabled).toBe(false);
-    textarea.value = "# Q4\n- hire\n";
+    expect(textarea.readOnly).toBe(true);
+    expect(root.querySelector(".editor-status")?.textContent).toBe("Read only");
+    textarea.value = "# Q4\n- typed\n";
     textarea.dispatchEvent(new Event("input"));
     await tick();
-    expect(edits).toEqual([{ base: "0", ops: [{ retain: 5 }, { insert: "- hire\n" }] }]);
-    await fake.emit("documents.document.text", { documentId: doc, revision: "1", editable: true, origin: "local", delta: [{ retain: 5 }, { insert: "- hire\n" }] });
-    expect(textarea.value).toBe("# Q4\n- hire\n");
-    textarea.focus();
-    textarea.setSelectionRange(12, 12);
-    await fake.emit("documents.document.text", { documentId: doc, revision: "2", editable: true, origin: "remote", delta: [{ insert: "> intro\n" }] });
-    expect(textarea.value).toBe("> intro\n# Q4\n- hire\n");
-    expect(textarea.selectionStart).toBe(20);
+    expect(calls).toEqual(["open"]);
+    await fake.emit("documents.document.text", { documentId: doc, revision: "1", editable: true, text: "> intro\n\n# Q4\n" });
+    expect(textarea.value).toBe("> intro\n\n# Q4\n");
     expect(texts(root, ".editor-header button")).not.toContain("Close");
-    expect(pane.hidden).toBe(false);
     await unmount();
   });
 
@@ -757,7 +747,7 @@ describe("Documents mount", () => {
     const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
     composer.value = 'Pending comment';
     expect(root.querySelectorAll('.comments-toggle')).toHaveLength(1);
-    expect(root.querySelector('.editor-status')?.textContent).toBe('Saved');
+    expect(root.querySelector('.editor-status')?.textContent).toBe('Read only');
     expect(root.querySelector('.editor-pane .comments-panel')).toBeNull();
     (root.querySelector('[aria-label="Hide navigation"]') as HTMLButtonElement).click();
     expect((root.querySelector('.collection-rail') as HTMLElement).hidden).toBe(true);

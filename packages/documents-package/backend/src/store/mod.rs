@@ -934,6 +934,36 @@ impl DocumentStore {
         Ok(Ingested { result, edits })
     }
 
+    /// Every applied record a body is built from, oldest first, optionally for one Document:
+    /// the `document.create` that carries its genesis, then its `document.edit` records.
+    /// [`StoredRecord::target`] is the Document for both.
+    pub fn body_records(&self, document: Option<&str>) -> Result<Vec<StoredRecord>, StoreError> {
+        let filter = match document {
+            Some(id) => {
+                validate_sql_identity(id)?;
+                format!(
+                    "((purpose='{create}' AND record_id='{id}') OR (purpose='{edit}' AND target='{id}'))",
+                    create = DomainRecord::CREATE_KIND,
+                    edit = DomainRecord::EDIT_KIND,
+                )
+            }
+            None => format!(
+                "purpose IN ('{}','{}')",
+                DomainRecord::CREATE_KIND,
+                DomainRecord::EDIT_KIND
+            ),
+        };
+        let mut rows = self.records_where(&format!(
+            "{filter} AND quarantine_code IS NULL AND NOT EXISTS (SELECT 1 FROM document_identity_conflicts WHERE document_id=COALESCE(target,record_id))"
+        ))?;
+        for row in &mut rows {
+            if row.purpose == DomainRecord::CREATE_KIND {
+                row.target = Some(row.record_id.clone());
+            }
+        }
+        Ok(rows)
+    }
+
     /// Every applied body edit record, oldest first, optionally for one Document.
     pub fn edit_records(&self, document: Option<&str>) -> Result<Vec<StoredRecord>, StoreError> {
         match document {

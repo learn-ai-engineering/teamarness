@@ -29,6 +29,24 @@ mod store_tests {
         format!("{seed:0length$x}")
     }
 
+    fn genesis() -> Vec<u8> {
+        crate::body::genesis()
+    }
+
+    /// An identified edit whose request ID no assertion names; each call gets a fresh one.
+    fn unidentified_edit(
+        author: &str,
+        document: &str,
+        update: Vec<u8>,
+    ) -> Result<DomainRecord, DomainError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = format!(
+            "e{:031x}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        DomainRecord::identified_document_edit(author, document, &id, &[0xee; 32], update)
+    }
+
     struct Fixture {
         store: DocumentStore,
         _directory: tempfile::TempDir,
@@ -105,6 +123,10 @@ mod store_tests {
         let id = hex(32, 9);
         let edit =
             DomainRecord::identified_document_edit(ALICE, &doc, &id, &[7; 32], vec![42]).unwrap();
+        let first_id = hex(32, 8);
+        let first =
+            DomainRecord::identified_document_edit(ALICE, &doc, &first_id, &[6; 32], vec![1])
+                .unwrap();
         {
             let store = DocumentStore::open(&path).unwrap();
             ingest(
@@ -117,14 +139,9 @@ mod store_tests {
                 &store,
                 2,
                 ALICE,
-                &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+                &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes", genesis()).unwrap(),
             );
-            ingest(
-                &store,
-                3,
-                ALICE,
-                &DomainRecord::document_edit(ALICE, &doc, vec![1]).unwrap(),
-            );
+            ingest(&store, 3, ALICE, &first);
             ingest(&store, 4, ALICE, &edit);
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
@@ -140,17 +157,12 @@ mod store_tests {
         );
         let old = store.edit_records(None).unwrap();
         assert_eq!(old.len(), 2);
-        assert!(
-            store
-                .index_opened_edit(
-                    &old[0],
-                    &DomainRecord::document_edit(ALICE, &doc, vec![1])
-                        .unwrap()
-                        .encode()
-                )
-                .unwrap()
+        assert!(store.index_opened_edit(&old[0], &first.encode()).unwrap());
+        assert_eq!(
+            store.edit_identity(&id).unwrap(),
+            None,
+            "only the opened record is indexed"
         );
-        assert_eq!(store.edit_identity(&id).unwrap(), None, "kind 10 has no ID");
         assert!(store.index_opened_edit(&old[1], &edit.encode()).unwrap());
         assert_eq!(
             store.edit_identity(&id).unwrap(),
@@ -196,7 +208,7 @@ mod store_tests {
                     &f.store,
                     seed,
                     ALICE,
-                    &DomainRecord::document_create(ALICE, &hex(64, 1), title).unwrap(),
+                    &DomainRecord::document_create(ALICE, &hex(64, 1), title, genesis()).unwrap(),
                 );
             }
             let mut records = vec![(4, ALICE, &a, vec![1]), (5, BOB, &b, vec![2])];
@@ -220,7 +232,7 @@ mod store_tests {
             }
             for target in [&a, &b] {
                 assert!(f.store.identity_conflicted(target).unwrap());
-                let later = DomainRecord::document_edit(ALICE, target, vec![3]).unwrap();
+                let later = unidentified_edit(ALICE, target, vec![3]).unwrap();
                 assert_eq!(
                     ingest(&f.store, 10 + target.eq(&b) as u64, ALICE, &later),
                     IngestResult::Quarantined("identity_conflict".into())
@@ -232,7 +244,7 @@ mod store_tests {
                     &f.store,
                     12,
                     ALICE,
-                    &DomainRecord::document_edit(ALICE, &hex(64, 99), vec![4]).unwrap()
+                    &unidentified_edit(ALICE, &hex(64, 99), vec![4]).unwrap()
                 ),
                 IngestResult::Deferred("waiting_for_target".into())
             );
@@ -254,7 +266,7 @@ mod store_tests {
             &f.store,
             2,
             ALICE,
-            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes", genesis()).unwrap(),
         );
         let first = hex(32, 10);
         let make = |id: &str, author: &str, document: &str| {
@@ -326,7 +338,7 @@ mod store_tests {
                     &store,
                     2,
                     ALICE,
-                    &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+                    &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes", genesis()).unwrap(),
                 );
                 assert_eq!(ingest(&store, 3, ALICE, &a), IngestResult::Applied);
                 assert_eq!(
@@ -460,7 +472,7 @@ mod store_tests {
                 ALICE,
                 "document.create",
                 "sig",
-                &DomainRecord::document_create(ALICE, &hex(64, 8), "Notes")
+                &DomainRecord::document_create(ALICE, &hex(64, 8), "Notes", genesis())
                     .unwrap()
                     .encode(),
                 b"sealed",
@@ -491,7 +503,7 @@ mod store_tests {
             &f.store,
             2,
             ALICE,
-            &DomainRecord::document_create(ALICE, &hex(64, 1), "Doc").unwrap(),
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Doc", genesis()).unwrap(),
         );
         let cursor = f.store.cursor().unwrap();
         let edit = DomainRecord::identified_document_edit(
@@ -574,7 +586,7 @@ mod store_tests {
             &f.store,
             2,
             ALICE,
-            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes", genesis()).unwrap(),
         );
         let first =
             DomainRecord::identified_document_edit(ALICE, &document, &id, &[1; 32], vec![1])
@@ -620,7 +632,7 @@ mod store_tests {
             &f.store,
             2,
             ALICE,
-            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes").unwrap(),
+            &DomainRecord::document_create(ALICE, &hex(64, 1), "Notes", genesis()).unwrap(),
         );
         let cursor = f.store.cursor().unwrap();
         let edit =
@@ -657,7 +669,7 @@ mod store_tests {
         let rename_late = DomainRecord::collection_rename(ALICE, &collection, "Roadmap").unwrap();
         let archive = DomainRecord::collection_archive(ALICE, &collection).unwrap();
         let restore = DomainRecord::collection_restore(BOB, &collection).unwrap();
-        let document = DomainRecord::document_create(BOB, &collection, "Q4").unwrap();
+        let document = DomainRecord::document_create(BOB, &collection, "Q4", genesis()).unwrap();
         let steps: Vec<(u64, &str, &DomainRecord)> = vec![
             (1, ALICE, &create),
             (2, BOB, &rename_early),
@@ -843,7 +855,7 @@ mod store_tests {
             &f.store,
             2,
             ALICE,
-            &DomainRecord::document_create(ALICE, &source, "Doc").unwrap(),
+            &DomainRecord::document_create(ALICE, &source, "Doc", genesis()).unwrap(),
         );
         let moved = DomainRecord::document_move(ALICE, &document, &destination).unwrap();
         assert!(matches!(
@@ -904,7 +916,7 @@ mod store_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("documents.sqlite3");
         let collection = hex(64, 1);
-        let document = DomainRecord::document_create(ALICE, &collection, "Doc").unwrap();
+        let document = DomainRecord::document_create(ALICE, &collection, "Doc", genesis()).unwrap();
         {
             let store = DocumentStore::open(&path).unwrap();
             assert!(matches!(
@@ -944,7 +956,7 @@ mod store_tests {
         let f = fixture();
         let collection = hex(64, 1);
         let document = hex(64, 2);
-        let edit = DomainRecord::document_edit(BOB, &document, vec![1, 2, 3]).unwrap();
+        let edit = unidentified_edit(BOB, &document, vec![1, 2, 3]).unwrap();
         assert!(matches!(
             ingest(&f.store, 3, BOB, &edit),
             IngestResult::Deferred(_)
@@ -955,6 +967,7 @@ mod store_tests {
             ALICE,
             &DomainRecord::collection_create(ALICE, "C").unwrap(),
         );
+        let genesis = genesis();
         let ingested = f
             .store
             .ingest_with_commit(
@@ -963,7 +976,7 @@ mod store_tests {
                 ALICE,
                 "document.create",
                 "sig",
-                &DomainRecord::document_create(ALICE, &collection, "Doc")
+                &DomainRecord::document_create(ALICE, &collection, "Doc", genesis.clone())
                     .unwrap()
                     .encode(),
                 b"sealed",
@@ -972,14 +985,32 @@ mod store_tests {
             )
             .unwrap();
         assert_eq!(ingested.result, IngestResult::Applied);
-        assert_eq!(ingested.edits, vec![(document.clone(), vec![1, 2, 3])]);
+        assert_eq!(
+            ingested.edits,
+            vec![
+                (document.clone(), genesis),
+                (document.clone(), vec![1, 2, 3])
+            ],
+            "the genesis is the body's first update, before the edit it unblocked"
+        );
         assert_eq!(f.store.edit_records(Some(&document)).unwrap().len(), 1);
+        let body = f.store.body_records(Some(&document)).unwrap();
+        assert_eq!(
+            body.iter()
+                .map(|row| (row.purpose.as_str(), row.target.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("document.create", Some(document.as_str())),
+                ("document.edit", Some(document.as_str()))
+            ]
+        );
+        assert_eq!(f.store.body_records(None).unwrap().len(), 2);
         assert_eq!(
             f.store.edit_records(None).unwrap()[0].target.as_deref(),
             Some(document.as_str())
         );
         assert!(f.store.edit_records(Some("not-an-id")).is_err());
-        let direct = DomainRecord::document_edit(ALICE, &document, vec![9]).unwrap();
+        let direct = unidentified_edit(ALICE, &document, vec![9]).unwrap();
         let ingested = f
             .store
             .ingest_with_commit(
@@ -1033,7 +1064,7 @@ mod store_tests {
                 &store,
                 2,
                 ALICE,
-                &DomainRecord::document_create(ALICE, &collection, "D").unwrap(),
+                &DomainRecord::document_create(ALICE, &collection, "D", genesis()).unwrap(),
             );
             ingest(&store, 3, ALICE, &old);
             ingest(&store, 4, BOB, &new);
@@ -1088,7 +1119,7 @@ mod store_tests {
                 &store,
                 2,
                 ALICE,
-                &DomainRecord::document_create(ALICE, &collection, "D").unwrap(),
+                &DomainRecord::document_create(ALICE, &collection, "D", genesis()).unwrap(),
             );
             assert!(matches!(
                 ingest(&store, 4, BOB, &reply),
@@ -1121,7 +1152,7 @@ mod store_tests {
                 &store,
                 9,
                 ALICE,
-                &DomainRecord::document_create(ALICE, &collection, "Other").unwrap(),
+                &DomainRecord::document_create(ALICE, &collection, "Other", genesis()).unwrap(),
             );
             let cross =
                 DomainRecord::comment_add(ALICE, &other, Some(&root), None, "wrong").unwrap();

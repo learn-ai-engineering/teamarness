@@ -9,9 +9,9 @@ use std::fmt;
 const MAGIC: &[u8] = b"TDOCS\x01";
 pub(crate) const MAX_NAME: usize = 128;
 pub(crate) const MAX_TITLE: usize = 256;
-/// The largest Loro update one edit record carries, leaving headroom under the 262,144-byte
-/// canonical bound for the envelope, author, and target.
-pub(crate) const MAX_UPDATE: usize = 200 * 1024;
+/// The largest Loro update one record carries. Base64 inside a JSON event (about 214 KB) still
+/// fits one 256 KiB UI message, and the record stays under the 262,144-byte canonical bound.
+pub(crate) const MAX_UPDATE: usize = 160 * 1024;
 /// A Comment's Markdown is bounded like a Conversations Message.
 pub(crate) const MAX_MARKDOWN: usize = 32 * 1024;
 /// A quoted excerpt is short context, not a copy of the document.
@@ -19,7 +19,8 @@ pub(crate) const MAX_QUOTE: usize = 2 * 1024;
 const TARGET_LEN: usize = 64;
 
 /// The record vocabulary. Kind numbers are part of the canonical encoding and are never
-/// reused: 10 is reserved for `document.edit`, 20–22 for Comments, 30 for `document.snapshot`.
+/// reused: 10 is the retired plain-text `document.edit`, 11 the identified `document.edit`,
+/// 20–22 are Comments, and 30 is reserved for `document.snapshot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainRecord {
     CollectionCreate {
@@ -39,10 +40,14 @@ pub enum DomainRecord {
         author: String,
         collection: String,
     },
+    /// A Document and its body genesis: one Loro update, from a fresh peer, holding the root
+    /// map, its attributes, the `children` list and one empty paragraph. Every Installation
+    /// imports it before any edit, so no editor ever initialises an empty body.
     DocumentCreate {
         author: String,
         collection: String,
         title: String,
+        genesis: Vec<u8>,
     },
     DocumentRename {
         author: String,
@@ -62,13 +67,7 @@ pub enum DomainRecord {
         author: String,
         document: String,
     },
-    /// One Loro update for a Document's body, exported since the author's previous edit.
-    DocumentEdit {
-        author: String,
-        document: String,
-        update: Vec<u8>,
-    },
-    /// One identified, bounded request, unlike legacy kind 10 batches.
+    /// One identified, bounded Loro update of a Document's body tree.
     IdentifiedDocumentEdit {
         author: String,
         document: String,
@@ -106,6 +105,8 @@ pub enum DomainError {
     InvalidName,
     InvalidTitle,
     InvalidUpdate,
+    /// A `document.create` without a body genesis, or with one that is not exactly the genesis.
+    InvalidGenesis,
     InvalidRequestId,
     InvalidMarkdown,
     InvalidQuote,
@@ -161,14 +162,22 @@ impl DomainRecord {
         author: &str,
         collection: &str,
         title: &str,
+        genesis: Vec<u8>,
     ) -> Result<Self, DomainError> {
         validate_identity(author)?;
         validate_target(collection)?;
         validate_text(title, MAX_TITLE, DomainError::InvalidTitle)?;
+        if genesis.is_empty()
+            || genesis.len() > MAX_UPDATE
+            || !crate::body::is_valid_genesis(&genesis)
+        {
+            return Err(DomainError::InvalidGenesis);
+        }
         Ok(Self::DocumentCreate {
             author: author.into(),
             collection: collection.into(),
             title: title.into(),
+            genesis,
         })
     }
     pub fn document_rename(author: &str, document: &str, title: &str) -> Result<Self, DomainError> {
@@ -209,23 +218,6 @@ impl DomainRecord {
         Ok(Self::DocumentRestore {
             author: author.into(),
             document: document.into(),
-        })
-    }
-
-    pub fn document_edit(
-        author: &str,
-        document: &str,
-        update: Vec<u8>,
-    ) -> Result<Self, DomainError> {
-        validate_identity(author)?;
-        validate_target(document)?;
-        if update.is_empty() || update.len() > MAX_UPDATE {
-            return Err(DomainError::InvalidUpdate);
-        }
-        Ok(Self::DocumentEdit {
-            author: author.into(),
-            document: document.into(),
-            update,
         })
     }
 
@@ -332,7 +324,6 @@ impl DomainRecord {
             | Self::DocumentMove { author, .. }
             | Self::DocumentArchive { author, .. }
             | Self::DocumentRestore { author, .. }
-            | Self::DocumentEdit { author, .. }
             | Self::IdentifiedDocumentEdit { author, .. }
             | Self::CommentAdd { author, .. }
             | Self::CommentResolve { author, .. }
@@ -355,7 +346,6 @@ impl DomainRecord {
             | Self::DocumentMove { document, .. }
             | Self::DocumentArchive { document, .. }
             | Self::DocumentRestore { document, .. }
-            | Self::DocumentEdit { document, .. }
             | Self::IdentifiedDocumentEdit { document, .. }
             | Self::CommentAdd { document, .. } => Some(document),
             Self::CommentResolve { comment, .. } | Self::CommentReopen { comment, .. } => {
@@ -375,7 +365,7 @@ impl DomainRecord {
             Self::DocumentMove { .. } => "document.move",
             Self::DocumentArchive { .. } => "document.archive",
             Self::DocumentRestore { .. } => "document.restore",
-            Self::DocumentEdit { .. } | Self::IdentifiedDocumentEdit { .. } => "document.edit",
+            Self::IdentifiedDocumentEdit { .. } => "document.edit",
             Self::CommentAdd { .. } => "comment.add",
             Self::CommentResolve { .. } => "comment.resolve",
             Self::CommentReopen { .. } => "comment.reopen",
@@ -384,6 +374,8 @@ impl DomainRecord {
 
     /// The purpose of body edit records, which the listing never needs to open.
     pub const EDIT_KIND: &'static str = "document.edit";
+    /// The purpose of the record that creates a Document and carries its body genesis.
+    pub const CREATE_KIND: &'static str = "document.create";
 
     /// Every purpose the listing and comments need opened after restart.
     pub const METADATA_KINDS: [&'static str; 12] = [
@@ -433,11 +425,13 @@ impl DomainRecord {
                 author,
                 collection,
                 title,
+                genesis,
             } => {
                 out.push(5);
                 put_text(&mut out, author);
                 put_text(&mut out, collection);
                 put_text(&mut out, title);
+                put_bytes(&mut out, genesis);
             }
             Self::DocumentRename {
                 author,
@@ -468,16 +462,6 @@ impl DomainRecord {
                 out.push(9);
                 put_text(&mut out, author);
                 put_text(&mut out, document);
-            }
-            Self::DocumentEdit {
-                author,
-                document,
-                update,
-            } => {
-                out.push(10);
-                put_text(&mut out, author);
-                put_text(&mut out, document);
-                put_bytes(&mut out, update);
             }
             Self::IdentifiedDocumentEdit {
                 author,
@@ -554,7 +538,8 @@ impl DomainRecord {
             5 => {
                 let collection = take_text(bytes, &mut p)?;
                 let title = take_text(bytes, &mut p)?;
-                Self::document_create(&author, &collection, &title)?
+                let genesis = take_bytes(bytes, &mut p).map_err(|_| DomainError::InvalidGenesis)?;
+                Self::document_create(&author, &collection, &title, genesis)?
             }
             6 => {
                 let document = take_text(bytes, &mut p)?;
@@ -574,11 +559,7 @@ impl DomainRecord {
                 let document = take_text(bytes, &mut p)?;
                 Self::document_restore(&author, &document)?
             }
-            10 => {
-                let document = take_text(bytes, &mut p)?;
-                let update = take_bytes(bytes, &mut p)?;
-                Self::document_edit(&author, &document, update)?
-            }
+            // Kind 10 (the plain-text body) is retired: there are no such Documents to read.
             11 => {
                 let document = take_text(bytes, &mut p)?;
                 let request_id = take_text(bytes, &mut p)?;
@@ -740,10 +721,12 @@ mod tests {
         );
     }
 
+    fn genesis() -> Vec<u8> {
+        crate::body::genesis()
+    }
+
     #[test]
-    fn identified_edit_round_trips_without_changing_kind_ten() {
-        let old = DomainRecord::document_edit("alice", TARGET, vec![1, 2]).unwrap();
-        assert_eq!(old.encode()[6], 10);
+    fn identified_edit_round_trips_and_kind_ten_is_refused() {
         let identified = DomainRecord::identified_document_edit(
             "alice",
             TARGET,
@@ -761,15 +744,110 @@ mod tests {
             DomainRecord::identified_document_edit("alice", TARGET, "short", &[3], vec![1])
                 .is_err()
         );
+        // The retired plain-text layout: author, document, update.
+        let mut kind_ten = MAGIC.to_vec();
+        kind_ten.push(10);
+        put_text(&mut kind_ten, "alice");
+        put_text(&mut kind_ten, TARGET);
+        put_bytes(&mut kind_ten, &[1, 2]);
+        assert_eq!(
+            DomainRecord::decode(&kind_ten).unwrap_err(),
+            DomainError::InvalidKind
+        );
+    }
+
+    // Verifies: AC3 — one record carries at most 160 KiB of update.
+    #[test]
+    fn edit_updates_are_bounded_at_160_kib() {
+        assert_eq!(MAX_UPDATE, 160 * 1024);
+        let at_bound = DomainRecord::identified_document_edit(
+            "alice",
+            TARGET,
+            &"a".repeat(32),
+            &[3; 32],
+            vec![7; MAX_UPDATE],
+        )
+        .unwrap();
+        assert_eq!(DomainRecord::decode(&at_bound.encode()).unwrap(), at_bound);
+        assert_eq!(
+            DomainRecord::identified_document_edit(
+                "alice",
+                TARGET,
+                &"a".repeat(32),
+                &[3; 32],
+                vec![7; MAX_UPDATE + 1],
+            )
+            .unwrap_err(),
+            DomainError::InvalidUpdate
+        );
+        assert!(
+            DomainRecord::identified_document_edit(
+                "alice",
+                TARGET,
+                &"a".repeat(32),
+                &[3; 32],
+                vec![]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_document_create_requires_exactly_a_body_genesis() {
+        let create = DomainRecord::document_create("alice", TARGET, "Notes", genesis()).unwrap();
+        assert_eq!(DomainRecord::decode(&create.encode()).unwrap(), create);
+        // The layout before genesis: author, collection, title.
+        let mut without = MAGIC.to_vec();
+        without.push(5);
+        for field in ["alice", TARGET, "Notes"] {
+            put_text(&mut without, field);
+        }
+        assert_eq!(
+            DomainRecord::decode(&without).unwrap_err(),
+            DomainError::InvalidGenesis
+        );
+        for invalid in [Vec::new(), b"not loro".to_vec(), vec![1; MAX_UPDATE + 1]] {
+            assert_eq!(
+                DomainRecord::document_create("alice", TARGET, "Notes", invalid).unwrap_err(),
+                DomainError::InvalidGenesis
+            );
+        }
+        // A tree with content, or a schema-invalid tree, is not a genesis.
+        let doc = loro::LoroDoc::new();
+        crate::markdown::write_tree(
+            &doc,
+            &[crate::markdown::Block::Paragraph(vec![
+                crate::markdown::Inline::Text("text".into(), crate::markdown::Marks::default()),
+            ])],
+        )
+        .unwrap();
+        let content = doc.export(loro::ExportMode::all_updates()).unwrap();
+        let junk = loro::LoroDoc::new();
+        junk.get_map("doc").insert("nodeName", "page").unwrap();
+        junk.commit();
+        let junk = junk.export(loro::ExportMode::all_updates()).unwrap();
+        for invalid in [content, junk] {
+            assert_eq!(
+                DomainRecord::document_create("alice", TARGET, "Notes", invalid).unwrap_err(),
+                DomainError::InvalidGenesis
+            );
+        }
+        let mut swapped = create.encode();
+        swapped.truncate(swapped.len() - 1);
+        assert!(DomainRecord::decode(&swapped).is_err());
     }
 
     #[test]
     fn names_and_titles_count_unicode_characters() {
         assert!(DomainRecord::collection_create("alice", &"界".repeat(MAX_NAME)).is_ok());
         assert!(DomainRecord::collection_create("alice", &"界".repeat(MAX_NAME + 1)).is_err());
-        assert!(DomainRecord::document_create("alice", TARGET, &"界".repeat(MAX_TITLE)).is_ok());
         assert!(
-            DomainRecord::document_create("alice", TARGET, &"界".repeat(MAX_TITLE + 1)).is_err()
+            DomainRecord::document_create("alice", TARGET, &"界".repeat(MAX_TITLE), genesis())
+                .is_ok()
+        );
+        assert!(
+            DomainRecord::document_create("alice", TARGET, &"界".repeat(MAX_TITLE + 1), genesis())
+                .is_err()
         );
     }
 
@@ -780,7 +858,7 @@ mod tests {
             DomainRecord::collection_rename("alice", TARGET, "Plans").unwrap(),
             DomainRecord::collection_archive("alice", TARGET).unwrap(),
             DomainRecord::collection_restore("alice", TARGET).unwrap(),
-            DomainRecord::document_create("alice", TARGET, "Q4 plan").unwrap(),
+            DomainRecord::document_create("alice", TARGET, "Q4 plan", genesis()).unwrap(),
             DomainRecord::document_rename("alice", TARGET, "Q4 plan v2").unwrap(),
             DomainRecord::document_move("alice", TARGET, TARGET).unwrap(),
             DomainRecord::document_archive("alice", TARGET).unwrap(),
@@ -812,12 +890,17 @@ mod tests {
             DomainRecord::comment_add("alice", TARGET, None, None, &"m".repeat(MAX_MARKDOWN + 1))
                 .is_err()
         );
-        let edit = DomainRecord::document_edit("alice", TARGET, vec![0, 255, 7]).unwrap();
+        let edit = DomainRecord::identified_document_edit(
+            "alice",
+            TARGET,
+            &"b".repeat(32),
+            &[1; 32],
+            vec![0, 255, 7],
+        )
+        .unwrap();
         assert_eq!(DomainRecord::decode(&edit.encode()).unwrap(), edit);
         assert_eq!(edit.kind(), DomainRecord::EDIT_KIND);
         assert!(!DomainRecord::METADATA_KINDS.contains(&edit.kind()));
-        assert!(DomainRecord::document_edit("alice", TARGET, Vec::new()).is_err());
-        assert!(DomainRecord::document_edit("alice", TARGET, vec![1; MAX_UPDATE + 1]).is_err());
     }
 
     #[test]
@@ -827,10 +910,13 @@ mod tests {
         assert!(DomainRecord::collection_create("alice", "tab\there").is_err());
         assert!(DomainRecord::collection_create("alice", &"n".repeat(MAX_NAME + 1)).is_err());
         assert!(
-            DomainRecord::document_create("alice", TARGET, &"t".repeat(MAX_TITLE + 1)).is_err()
+            DomainRecord::document_create("alice", TARGET, &"t".repeat(MAX_TITLE + 1), genesis())
+                .is_err()
         );
-        assert!(DomainRecord::document_create("alice", "not-a-target", "t").is_err());
-        assert!(DomainRecord::document_create("alice", &TARGET.to_uppercase(), "t").is_err());
+        assert!(DomainRecord::document_create("alice", "not-a-target", "t", genesis()).is_err());
+        assert!(
+            DomainRecord::document_create("alice", &TARGET.to_uppercase(), "t", genesis()).is_err()
+        );
         assert!(DomainRecord::collection_create("", "x").is_err());
     }
 

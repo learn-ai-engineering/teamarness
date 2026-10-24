@@ -163,49 +163,6 @@
         "durability": { "enum": ["durable", "pending", "unresolved"] }
       }
     },
-    "textOp": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "retain"
-          ],
-          "properties": {
-            "retain": {
-              "type": "integer",
-              "minimum": 0
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "insert"
-          ],
-          "properties": {
-            "insert": {
-              "type": "string",
-              "minLength": 1
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "delete"
-          ],
-          "properties": {
-            "delete": {
-              "type": "integer",
-              "minimum": 1
-            }
-          }
-        }
-      ]
-    },
     "textEvent": {
       "type": "object",
       "additionalProperties": false,
@@ -256,39 +213,7 @@
         "chunk": {
           "type": "string",
           "maxLength": 24576
-        },
-        "origin": {
-          "type": "string",
-          "enum": [
-            "local",
-            "remote"
-          ]
-        },
-        "delta": {
-          "type": "array",
-          "maxItems": 4096,
-          "items": {
-            "$ref": "#/$defs/textOp"
-          }
         }
-      }
-    },
-    "edited": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "ok",
-        "revision",
-        "requestId"
-      ],
-      "properties": {
-        "ok": {
-          "const": true
-        },
-        "revision": {
-          "$ref": "#/$defs/revision"
-        },
-        "requestId": { "$ref": "#/$defs/requestId" }
       }
     },
     "comment": {
@@ -614,38 +539,6 @@
           "revision": { "$ref": "#/$defs/revision" },
           "transferId": { "$ref": "#/$defs/requestId" }
         }
-      }
-    },
-    "documents.document.edit": {
-      "request": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "documentId",
-          "requestId",
-          "baseRevision",
-          "ops"
-        ],
-        "properties": {
-          "documentId": {
-            "$ref": "#/$defs/recordId"
-          },
-          "requestId": { "$ref": "#/$defs/requestId" },
-          "baseRevision": {
-            "$ref": "#/$defs/revision"
-          },
-          "ops": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 4096,
-            "items": {
-              "$ref": "#/$defs/textOp"
-            }
-          }
-        }
-      },
-      "response": {
-        "$ref": "#/$defs/edited"
       }
     },
     "documents.comments": {

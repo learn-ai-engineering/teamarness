@@ -303,9 +303,8 @@ export class DocumentsView {
     this.textarea.className = `${KIT.input} editor-textarea`;
     this.textarea.setAttribute("aria-label", "Document text (Markdown)");
     this.textarea.spellcheck = false;
-    this.textarea.addEventListener("input", () => {
-      controller.openEditor?.input(this.textarea.value);
-    });
+    // The body is shown read-only until the rendered editor mounts here.
+    this.textarea.readOnly = true;
     const clearCollapsedQuote = () => {
       if (this.draftQuote !== null && this.textarea.selectionStart === this.textarea.selectionEnd) {
         this.draftQuote = null;
@@ -383,23 +382,16 @@ export class DocumentsView {
     this.resizeObserver?.observe(this.shell);
   }
 
-  /** Routes a text event through the controller with the live caret, then syncs the textarea. */
+  /** Routes a text event through the controller, then syncs the textarea. */
   private onTextEvent(event: TextEvent): void {
-    const focused = this.textarea.ownerDocument.activeElement === this.textarea
-      || (this.textarea.getRootNode() as ShadowRoot).activeElement === this.textarea;
-    const caret = focused ? { start: this.textarea.selectionStart, end: this.textarea.selectionEnd } : null;
-    const next = this.controller.receiveText(event, caret);
-    this.syncTextarea(next);
+    this.controller.receiveText(event);
+    this.syncTextarea();
   }
 
-  private syncTextarea(caret: { start: number; end: number } | null): void {
+  private syncTextarea(): void {
     const editor = this.controller.openEditor;
     if (!editor) return;
-    const visible = editor.current.reason === "import_failure" ? editor.current.text : editor.value;
-    if (this.textarea.value !== visible) {
-      this.textarea.value = visible;
-      if (caret) this.textarea.setSelectionRange(caret.start, caret.end);
-    }
+    if (this.textarea.value !== editor.value) this.textarea.value = editor.value;
   }
 
   private selectedEditorQuote(): string | null {
@@ -573,22 +565,21 @@ export class DocumentsView {
       this.textarea.disabled = true;
       return;
     }
-    const { editable, sending, error, reason } = editor.current;
+    const { editable, reason } = editor.current;
     this.textarea.disabled = !editable;
     this.editorStatus.textContent = reason === "identity_conflict"
-      ? "Conflicting edit history — document unavailable. Unsaved draft remains only in this window."
+      ? "Conflicting edit history — document unavailable."
       : reason === "import_failure"
-        ? `Incomplete edit history — read only. Last known-good text; record ${editor.current.diagnosticRecordId ?? "unknown"}. Unsaved draft remains only in this window.`
-        : error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
+        ? `Incomplete edit history — read only. Last known-good text; record ${editor.current.diagnosticRecordId ?? "unknown"}.`
+        : !editable ? "Waiting for history" : "Read only";
     this.editorStatus.classList.toggle("editor-status-failure", reason === "import_failure");
-    this.syncTextarea(null);
+    this.syncTextarea();
     const preview = this.controller.state.preview;
     this.previewButton.setAttribute("aria-pressed", String(preview));
     updateIcon(this.previewButton, preview ? "edit" : "preview", preview ? "Edit" : "Preview");
     this.textarea.hidden = preview;
     this.preview.hidden = !preview;
-    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? ""
-      : renderMarkdown(reason === "import_failure" ? editor.current.text : editor.value);
+    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? "" : renderMarkdown(editor.value);
   }
 
   render(): void {

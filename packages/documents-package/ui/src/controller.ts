@@ -120,7 +120,7 @@ export class DocumentsController {
     }
   }
 
-  /** Opens a Document for editing: fetches its text, then follows its text events. */
+  /** Opens a Document: fetches its text, then follows its text events. */
   async openDocumentById(documentId: string): Promise<void> {
     if (this.disposed || this._state.openDocumentId === documentId) return;
     await this.closeDocument();
@@ -146,14 +146,7 @@ export class DocumentsController {
 
   private async retryOpen(documentId: string, sequence: number): Promise<void> {
     try {
-      const outstanding = this.editor?.current.documentId === documentId ? this.editor.outstandingIds : [];
-      if (outstanding.length > 0) {
-        const transferId = globalThis.crypto.randomUUID().replaceAll("-", "");
-        this.editor?.beginRecovery(transferId);
-        await this.client.request("documents.document.recover", { documentId, transferId, requestIds: outstanding });
-      } else {
-        await this.client.request("documents.document.open", { documentId });
-      }
+      await this.client.request("documents.document.open", { documentId });
     } catch (error) {
       if (!this.disposed && sequence === this.openSequence && !isAbortError(error)) {
         this.update({ error: describeError(error) });
@@ -236,27 +229,24 @@ export class DocumentsController {
     return ok;
   }
 
-  /** Called by the view with the caret so a remote change can move it. */
-  receiveText(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
-    if (event.documentId !== this._state.openDocumentId) return caret;
+  /** Called by the view for each text event of the open Document. */
+  receiveText(event: TextEvent): void {
+    if (event.documentId !== this._state.openDocumentId) return;
     if (this.editor === null || this.editor.current.documentId !== event.documentId) {
       if (event.text === undefined && event.transfer !== "begin") {
         void this.retryOpen(event.documentId, this.openSequence);
-        return caret;
+        return;
       }
       this.editor = new DocumentEditor(
         event.transfer === "begin" ? { documentId: event.documentId, revision: "0", editable: false, text: "" } : event,
-        async (documentId, baseRevision, ops, requestId) => {
-          const { revision } = await this.client.request("documents.document.edit", { documentId, requestId, baseRevision, ops });
-          return { revision };
-        },
         this.announce,
         () => { void this.retryOpen(event.documentId, this.openSequence); },
       );
       this.announce();
-      return event.transfer === "begin" ? this.editor.receive(event, caret) : caret;
+      if (event.transfer === "begin") this.editor.receive(event);
+      return;
     }
-    return this.editor.receive(event, caret);
+    this.editor.receive(event);
   }
 
   private onTextEvent(event: TextEvent): void {

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -17,12 +17,14 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::{Notify, broadcast, watch};
 
-use crate::body::{BodyError, COALESCE_WINDOW, DocumentBody, TextOp};
+use crate::body::{BodyError, DocumentBody};
 use crate::domain::{DomainError, DomainRecord};
 use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
+/// How often the flusher retries a staged append that failed.
+const FLUSH_RETRY: Duration = Duration::from_millis(100);
 
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, json!({}))
@@ -51,7 +53,9 @@ fn domain_error(cause: DomainError) -> BackendError {
     match cause {
         DomainError::InvalidName => error("documents.invalid_name", false),
         DomainError::InvalidTitle => error("documents.invalid_title", false),
-        DomainError::InvalidUpdate => error("documents.invalid_update", false),
+        DomainError::InvalidUpdate | DomainError::InvalidGenesis => {
+            error("documents.invalid_update", false)
+        }
         DomainError::InvalidMarkdown => error("documents.invalid_markdown", false),
         DomainError::InvalidQuote => error("documents.invalid_quote", false),
         _ => invalid_request(),
@@ -69,14 +73,12 @@ struct BodyHub {
     bodies: Bodies,
     /// Text events for every Document; subscriptions filter by `documentId`.
     events: broadcast::Sender<JsonValue>,
-    /// Wakes the flusher when a local edit is pending.
+    /// Wakes the flusher when a staged append is pending.
     flush: Arc<Notify>,
     /// Serializes append attempts with requests without holding the body mutex across I/O.
     append_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     waiting_metadata: Arc<Mutex<HashSet<String>>>,
     metadata_lock: Arc<tokio::sync::Mutex<()>>,
-    /// This Installation's Loro peer id, stable across restarts and distinct across Installations.
-    peer: u64,
     qualified: Arc<AtomicBool>,
     identity_index_complete: Arc<AtomicBool>,
     identity_lookup_lock: Arc<tokio::sync::Mutex<()>>,
@@ -115,7 +117,7 @@ impl BodyHub {
         let mut bodies = self.lock();
         let body = bodies
             .entry(document.to_owned())
-            .or_insert_with(|| DocumentBody::new(self.peer));
+            .or_insert_with(DocumentBody::new);
         with(body)
     }
 
@@ -157,7 +159,7 @@ impl BodyHub {
         for document in &targets {
             bodies
                 .entry(document.clone())
-                .or_insert_with(|| DocumentBody::new(self.peer));
+                .or_insert_with(DocumentBody::new);
         }
         for (document, body) in bodies.iter_mut() {
             if body.set_waiting_deferred(targets.contains(document)) {
@@ -233,11 +235,11 @@ impl BodyHub {
                         sealed_length: usize,
                         update: &[u8]| {
             match self.with_body(document, |body| body.import_candidate(update)) {
-                Ok((candidate, delta)) => {
+                Ok((candidate, changed)) => {
                     pending
                         .lock()
                         .unwrap()
-                        .push((document.to_owned(), candidate, delta));
+                        .push((document.to_owned(), candidate, changed));
                     None
                 }
                 Err(category) => {
@@ -255,21 +257,15 @@ impl BodyHub {
             }
         };
         let publish = || {
-            for (document, candidate, delta) in pending.lock().unwrap().drain(..) {
+            for (document, candidate, changed) in pending.lock().unwrap().drain(..) {
                 let revision = candidate.revision();
                 let editable = candidate.editable();
                 let text = candidate.text().to_owned();
                 self.with_body(&document, |body| *body = candidate);
-                if let Some(delta) = delta
-                    && editable
-                {
-                    let event = json!({"documentId":document,"revision":revision.to_string(),
-                        "origin":"remote","delta":delta,"editable":editable});
-                    if event.to_string().len() > TEXT_EVENT_BUDGET {
-                        for event in full_text_events(&document, revision, &text, editable) {
-                            let _ = self.events.send(event);
-                        }
-                    } else {
+                // The store holds its lock while publishing, so the full text is built from
+                // the candidate rather than through `text_events`.
+                if changed && editable {
+                    for event in full_text_events(&document, revision, &text, editable) {
                         let _ = self.events.send(event);
                     }
                 }
@@ -341,26 +337,17 @@ impl BodyHub {
             if self.store.identity_conflicted(document).unwrap_or(true) {
                 continue;
             }
-            let published = self.with_body(document, |body| match body.import(update) {
-                Ok(Some(_)) if !body.editable() => None,
-                Ok(Some(delta)) => Some(json!({
-                    "documentId": document, "revision": body.revision().to_string(),
-                    "origin": "remote", "delta": delta, "editable": body.editable(),
-                })),
-                Ok(None) => None,
-                Err(_) => {
-                    eprintln!("documents body import failure: document={document}");
-                    None
-                }
-            });
-            if let Some(event) = published {
-                if event.to_string().len() > TEXT_EVENT_BUDGET {
-                    for full in self.text_events(document) {
-                        let _ = self.events.send(full);
+            match self.with_body(document, |body| body.import_candidate(update)) {
+                Ok((candidate, changed)) => {
+                    let editable = candidate.editable();
+                    self.with_body(document, |body| *body = candidate);
+                    if changed && editable {
+                        for event in self.text_events(document) {
+                            let _ = self.events.send(event);
+                        }
                     }
-                } else {
-                    let _ = self.events.send(event);
                 }
+                Err(_) => eprintln!("documents body import failure: document={document}"),
             }
         }
     }
@@ -405,20 +392,11 @@ impl BodyHub {
             );
             return Ok(());
         }
-        if let Ok((candidate, delta)) = imported {
-            let revision = candidate.revision();
+        if let Ok((candidate, changed)) = imported {
             let editable = candidate.editable();
             self.with_body(document, |body| *body = candidate);
-            if let Some(delta) = delta
-                && editable
-            {
-                let event = json!({"documentId":document,"revision":revision.to_string(),
-                    "origin":"remote","delta":delta,"editable":editable});
-                if event.to_string().len() > TEXT_EVENT_BUDGET {
-                    for event in self.text_events(document) {
-                        let _ = self.events.send(event);
-                    }
-                } else {
+            if changed && editable {
+                for event in self.text_events(document) {
                     let _ = self.events.send(event);
                 }
             }
@@ -632,17 +610,6 @@ fn full_text_events_bounded(
     events
 }
 
-/// Derives a Loro peer id from the Installation identity: the first eight bytes of a
-/// domain-separated SHA-256, so it is stable across restarts and distinct across Installations.
-fn peer_id(installation: &str) -> u64 {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"teamarness.documents.loro-peer\x00");
-    hasher.update(installation.as_bytes());
-    let digest = hasher.finalize();
-    u64::from_be_bytes(digest[..8].try_into().expect("eight bytes"))
-}
-
 /// What the Package tells the UI about synchronization.
 ///
 /// Availability changes only when the host sends a state event or the session reports a
@@ -693,6 +660,12 @@ pub(crate) struct ActivationHandles {
     pub(crate) waiting_metadata: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     qualified: Arc<AtomicBool>,
+    #[cfg(test)]
+    hub: BodyHub,
+    #[cfg(test)]
+    log: RecordLog,
+    #[cfg(test)]
+    changes: watch::Sender<u64>,
 }
 
 pub(crate) type ActivationObserver = Arc<Mutex<Option<ActivationHandles>>>;
@@ -760,15 +733,6 @@ struct CommentRequest {
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EditRequest {
-    document_id: String,
-    request_id: String,
-    base_revision: String,
-    ops: Vec<TextOp>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoverRequest {
     document_id: String,
     transfer_id: String,
@@ -799,8 +763,11 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             .await?;
             let replay_store = store.clone();
             teamarness_package_sdk::blocking(&cancellation, move |_| {
-                replay_store.begin_replay_qualification().map_err(|_| storage_failed())
-            }).await?;
+                replay_store
+                    .begin_replay_qualification()
+                    .map_err(|_| storage_failed())
+            })
+            .await?;
             let log = RecordLog::from_initialization(&initialization, capabilities.clone())
                 .map_err(|cause| capability_error("record-log", cause))?;
             let names = Principals::from_initialization(&initialization, capabilities)
@@ -815,7 +782,6 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 append_locks: Arc::new(Mutex::new(HashMap::new())),
                 waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
                 metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-                peer: peer_id(&installation),
                 qualified: Arc::new(AtomicBool::new(false)),
                 identity_index_complete: Arc::new(AtomicBool::new(false)),
                 identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -835,6 +801,12 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                     waiting_metadata: hub.waiting_metadata.clone(),
                     #[cfg(test)]
                     qualified: hub.qualified.clone(),
+                    #[cfg(test)]
+                    hub: hub.clone(),
+                    #[cfg(test)]
+                    log: log.clone(),
+                    #[cfg(test)]
+                    changes: changes.clone(),
                 });
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
@@ -862,7 +834,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         stop_flusher(&state).await;
         let replay_store = state.store.clone();
         tokio::task::spawn_blocking(move || replay_store.begin_replay_qualification())
-            .await.map_err(|_| storage_failed())?.map_err(|_| storage_failed())?;
+            .await
+            .map_err(|_| storage_failed())?
+            .map_err(|_| storage_failed())?;
         let session = start_session(
             &state.store,
             &state.log,
@@ -943,9 +917,13 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         |context: Context<DocumentsActive>, request: DocumentCreateRequest| async move {
             require_collection(&context, &request.collection_id).await?;
             let author = context.state().installation.clone();
-            let record =
-                DomainRecord::document_create(&author, &request.collection_id, &request.title)
-                    .map_err(domain_error)?;
+            let record = DomainRecord::document_create(
+                &author,
+                &request.collection_id,
+                &request.title,
+                crate::body::genesis(),
+            )
+            .map_err(domain_error)?;
             append(&context, record).await
         },
     )
@@ -1008,13 +986,30 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         "documents.document.recover",
         |context: Context<DocumentsActive>, request: RecoverRequest| async move {
             require_document(&context, &request.document_id).await?;
-            if request.transfer_id.len() != 32 || !request.transfer_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                || request.request_ids.len() > 8 || request.request_ids.iter().any(|id| id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))) {
+            if request.transfer_id.len() != 32
+                || !request
+                    .transfer_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || request.request_ids.len() > 8
+                || request.request_ids.iter().any(|id| {
+                    id.len() != 32
+                        || !id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            {
                 return Err(invalid_request());
             }
             let hub = &context.state().hub;
             let author = &context.state().installation;
-            let looked_up = lookup_identities(&context.state().log, &context.state().store, hub, &request.request_ids).await;
+            let looked_up = lookup_identities(
+                &context.state().log,
+                &context.state().store,
+                hub,
+                &request.request_ids,
+            )
+            .await;
             let mut foreign_ids = HashSet::new();
             if let Ok(found) = &looked_up {
                 for (id, (document, owner, digest, durable)) in found {
@@ -1026,119 +1021,6 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 }
             }
             hub.publish_recovery(&request, author, &looked_up, &foreign_ids)
-        },
-    )
-    .request(
-        "documents.document.edit",
-        |context: Context<DocumentsActive>, request: EditRequest| async move {
-            require_document(&context, &request.document_id).await?;
-            let base: u64 = request
-                .base_revision
-                .parse()
-                .map_err(|_| invalid_request())?;
-            let hub = context.state().hub.clone();
-            let document = request.document_id.clone();
-            let append_lock = hub.append_lock(&document);
-            let _append_guard = append_lock.lock().await;
-            if context.state().store.identity_conflicted(&document).map_err(|_| storage_failed())? {
-                return Err(error("documents.identity_conflict", false));
-            }
-            if context.state().store.import_failure(&document).map_err(|_| storage_failed())?.is_some() {
-                return Err(error("documents.import_failure", false));
-            }
-            if request.request_id.len() != 32 || !request.request_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
-                return Err(invalid_request());
-            }
-            let author = context.state().installation.clone();
-            let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&(base, &request.ops)).map_err(|_| invalid_request())?).into();
-            let _identity_guard = hub.identity_lookup_lock.lock().await;
-            let found = lookup_identities(&context.state().log, &context.state().store, &hub, std::slice::from_ref(&request.request_id)).await?;
-            if let Some((old_document, old_author, old_digest, durable)) = found.get(&request.request_id) {
-                if old_document != &document || old_author != &author || old_digest != &digest {
-                    return Err(invalid_request());
-                }
-                hub.remember_identity(&document, &request.request_id, &author, digest, *durable);
-            }
-            // A new ID is absent only after the fenced, gap-free from-start replay and
-            // successful opening of every relevant prior edit.
-            if found.is_empty()
-                && !hub.lock().values().any(|body| body.identity(&request.request_id).is_some())
-                && !hub.qualified.load(Ordering::Acquire) {
-                return Err(error("documents.document_pending", true));
-            }
-            // One ID cannot name a request on another Document or Installation.
-            if hub.lock().iter().any(|(id, body)| id != &document && body.identity(&request.request_id).is_some()) {
-                return Err(invalid_request());
-            }
-            let _publication = hub.publication_gate.lock().unwrap();
-            if hub.store.import_failure(&document).map_err(|_| storage_failed())?.is_some() {
-                return Err(error("documents.import_failure", false));
-            }
-            let (revision, delta, editable, is_retry) = hub.with_body(&document, |body| {
-                if !body.editable() {
-                    return Err(error("documents.document_pending", true));
-                }
-                if let Some(known) = body.identity(&request.request_id) {
-                    if known.author != author || known.digest != digest {
-                        return Err(invalid_request());
-                    }
-                    return Ok((known.revision, Vec::new(), body.editable(), true));
-                }
-                if body.revision() != base {
-                    return Err(BackendError::new(
-                        "documents.stale_revision",
-                        false,
-                        json!({ "revision": body.revision().to_string() }),
-                    ));
-                }
-                let before = body.text().to_owned();
-                match body.apply_identified(&request.ops, request.request_id.clone()) {
-                    Ok(_) => {
-                        body.remember_request(base, &request.ops);
-                        body.remember_identity(request.request_id.clone(), author.clone(), digest, false).map_err(|_| invalid_request())?;
-                        Ok((body.revision(), crate::body::diff(&before, body.text()), body.editable(), false))
-                    }
-                    Err(BodyError::TooLarge) => Err(error("documents.document_too_large", false)),
-                    Err(BodyError::RecordTooLarge) => Err(error("documents.edit_request_too_large", false)),
-                    Err(BodyError::OutOfRange) => Err(invalid_request()),
-                    Err(BodyError::Loro) => Err(error("documents.edit_failed", true)),
-                }
-            })?;
-            if is_retry && hub.with_body(&document, |body| body.identity(&request.request_id).is_some_and(|known| known.projection_pending)) {
-                return Err(error("documents.document_pending", true));
-            }
-            if !is_retry {
-                hub.flush.notify_one();
-                let event = json!({
-                    "documentId": document, "revision": revision.to_string(),
-                    "origin": "local", "requestId": request.request_id, "delta": delta, "editable": editable,
-                });
-                if event.to_string().len() > TEXT_EVENT_BUDGET {
-                    for full in hub.text_events(&document) {
-                        let _ = hub.events.send(full);
-                    }
-                } else {
-                    let _ = hub.events.send(event);
-                }
-            }
-            drop(_publication);
-            // Keep the draft visible during the coalescing window, but never acknowledge it
-            // until every export in this request has reached the Core record log.
-            if !is_retry {
-                tokio::time::sleep(COALESCE_WINDOW).await;
-            }
-            drain_document(&hub, &document, true, |update| {
-                append_edit(
-                    &context.state().log,
-                    &hub,
-                    &context.state().changes,
-                    &context.state().installation,
-                    &document,
-                    update,
-                )
-            })
-            .await?;
-            Ok(json!({ "ok": true, "revision": revision.to_string(), "requestId": request.request_id }))
         },
     )
     .request(
@@ -1565,7 +1447,7 @@ async fn lookup_identities(
     Ok(found)
 }
 
-/// Re-opens the edit records of one Document whose sealed bytes could not be opened before,
+/// Re-opens the body records of one Document whose sealed bytes could not be opened before,
 /// so a Document becomes editable as soon as history access arrives.
 async fn reopen_unopened_edits(
     context: &Context<DocumentsActive>,
@@ -1578,7 +1460,7 @@ async fn reopen_unopened_edits(
     let store = context.state().store.clone();
     let id = document.to_owned();
     let rows = context
-        .blocking(move |_| store.edit_records(Some(&id)).map_err(|_| storage_failed()))
+        .blocking(move |_| store.body_records(Some(&id)).map_err(|_| storage_failed()))
         .await?;
     let unopened = import_edit_rows(&context.state().log, &hub, &rows).await?;
     let changed = hub.with_body(document, |body| {
@@ -1624,9 +1506,9 @@ async fn import_edit_rows(
                         && record.signature == row.signature =>
                 {
                     match DomainRecord::decode(&record.canonical) {
-                        Ok(DomainRecord::DocumentEdit {
-                            document, update, ..
-                        }) => hub.import_opened_update(row, &document, &update, None)?,
+                        Ok(DomainRecord::DocumentCreate { genesis, .. }) => {
+                            hub.import_opened_update(row, &row.record_id, &genesis, None)?;
+                        }
                         Ok(DomainRecord::IdentifiedDocumentEdit {
                             author,
                             document,
@@ -2006,11 +1888,11 @@ async fn rehydrate(
         }
     }
     reopen_metadata(store, log, hub, cancellation, false).await?;
-    // Rebuild every body from its edit records; a Document whose records cannot be opened yet
-    // stays pending until `documents.document.open` retries it.
+    // Rebuild every body from its genesis and edit records; a Document whose records cannot be
+    // opened yet stays pending until `documents.document.open` retries it.
     let reader = store.clone();
     let edits = teamarness_package_sdk::blocking(cancellation, move |_| {
-        reader.edit_records(None).map_err(|_| storage_failed())
+        reader.body_records(None).map_err(|_| storage_failed())
     })
     .await?;
     let mut by_document: HashMap<String, Vec<crate::store::StoredRecord>> = HashMap::new();
@@ -2030,10 +1912,10 @@ async fn rehydrate(
     Ok(())
 }
 
-/// Appends due local edits as `document.edit` records.
+/// Appends staged local updates as `document.edit` records.
 ///
-/// One task per activation wakes on a local edit and then every 100 ms while anything is
-/// pending, so a burst of keystrokes becomes one record once the coalescing window passes.
+/// One task per activation wakes when an update is staged, and retries every
+/// [`FLUSH_RETRY`] while an append that failed is still staged.
 fn start_flusher(
     log: &RecordLog,
     hub: &BodyHub,
@@ -2072,7 +1954,7 @@ fn start_flusher(
             for document in pending {
                 let append_lock = hub.append_lock(&document);
                 let _guard = append_lock.lock().await;
-                if let Err(cause) = drain_document(&hub, &document, false, |update| {
+                if let Err(cause) = drain_document(&hub, &document, |update| {
                     append_edit(&log, &hub, &changes, &author, &document, update)
                 })
                 .await
@@ -2085,7 +1967,7 @@ fn start_flusher(
                 }
             }
             tokio::select! {
-                () = tokio::time::sleep(COALESCE_WINDOW.min(Duration::from_millis(100))) => {}
+                () = tokio::time::sleep(FLUSH_RETRY) => {}
                 () = token.cancelled() => return,
             }
         }
@@ -2097,7 +1979,6 @@ fn start_flusher(
 async fn drain_document<F, Fut>(
     hub: &BodyHub,
     document: &str,
-    force: bool,
     mut append: F,
 ) -> Result<(), BackendError>
 where
@@ -2137,14 +2018,16 @@ where
             {
                 return Err(error("documents.import_failure", false));
             }
-            hub.with_body(document, |body| {
-                body.flush(Instant::now(), force)
-                    .and_then(|flushed| flushed.updates.into_iter().next())
-            })
+            hub.with_body(document, |body| body.staged())
         };
         let Some(update) = next else {
             if appended {
-                let saved_revision = hub.with_body(document, |body| body.last_request_revision());
+                let saved_revision = hub.with_body(document, |body| {
+                    completed_id
+                        .as_deref()
+                        .and_then(|id| body.identity(id))
+                        .map(|known| known.revision)
+                });
                 if let Some(saved_revision) = saved_revision {
                     let _publication = hub.publication_gate.lock().unwrap();
                     if hub
@@ -2215,12 +2098,12 @@ async fn append_edit(
         body.pending_request_id()
             .and_then(|id| body.identity(id).map(|known| (id.to_owned(), known.digest)))
     });
-    let record = if let Some((id, digest)) = identity.as_ref() {
-        DomainRecord::identified_document_edit(author, document, id, digest, update)
-    } else {
-        DomainRecord::document_edit(author, document, update)
-    }
-    .map_err(domain_error)?;
+    // Every staged update was accepted under a request identity.
+    let Some((id, digest)) = identity.as_ref() else {
+        return Err(error("documents.edit_failed", true));
+    };
+    let record = DomainRecord::identified_document_edit(author, document, id, digest, update)
+        .map_err(domain_error)?;
     if hub
         .store
         .identity_conflicted(document)
@@ -2231,7 +2114,7 @@ async fn append_edit(
     let purpose = record.kind();
     let canonical = record.encode();
     let appended = log.append(purpose, &canonical).await.map_err(|cause| {
-        if identity.is_some() && cause.retryable() {
+        if cause.retryable() {
             hub.qualified.store(false, Ordering::Release);
         }
         capability_error(purpose, cause)
@@ -2310,6 +2193,143 @@ async fn append_edit(
     Ok(())
 }
 
+fn is_request_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The UI-facing error for an update the body refused; nothing was staged.
+fn update_error(cause: BodyError) -> BackendError {
+    match cause {
+        BodyError::ForeignPeer => error("documents.foreign_peer", false),
+        BodyError::RecordTooLarge => error("documents.edit_request_too_large", false),
+        BodyError::Schema(_) => error("documents.schema_violation", false),
+        BodyError::TooLarge => error("documents.document_too_large", false),
+        BodyError::InvalidUpdate => error("documents.invalid_update", false),
+        BodyError::BaseUnavailable => error("documents.base_unavailable", false),
+        BodyError::NotReady => error("documents.document_pending", true),
+        BodyError::IdentityMismatch => invalid_request(),
+        BodyError::Loro => error("documents.edit_failed", true),
+    }
+}
+
+/// The one local write path: validates `update` from `session_peer` against the body, then
+/// appends it as exactly one identified `document.edit` record and waits for that append.
+///
+/// The request ID and the payload digest identify the record. A retry of the same ID and bytes
+/// after an unknown outcome is answered from what is known, and never appended twice; a new ID
+/// is accepted only once a qualified replay can prove it absent. The editor session seam and
+/// the Markdown port reach the body through this path.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+async fn submit_update(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: &str,
+    document: &str,
+    session_peer: u64,
+    request_id: &str,
+    update: &[u8],
+) -> Result<JsonValue, BackendError> {
+    if !is_request_id(request_id) {
+        return Err(invalid_request());
+    }
+    let append_lock = hub.append_lock(document);
+    let _append_guard = append_lock.lock().await;
+    if hub
+        .store
+        .identity_conflicted(document)
+        .map_err(|_| storage_failed())?
+    {
+        return Err(error("documents.identity_conflict", false));
+    }
+    if hub
+        .store
+        .import_failure(document)
+        .map_err(|_| storage_failed())?
+        .is_some()
+    {
+        return Err(error("documents.import_failure", false));
+    }
+    let digest: [u8; 32] = Sha256::digest(update).into();
+    let _identity_guard = hub.identity_lookup_lock.lock().await;
+    let found = lookup_identities(log, &hub.store, hub, &[request_id.to_owned()]).await?;
+    if let Some((old_document, old_author, old_digest, durable)) = found.get(request_id) {
+        if old_document != document || old_author != author || old_digest != &digest {
+            return Err(invalid_request());
+        }
+        hub.remember_identity(document, request_id, author, digest, *durable);
+    }
+    // A new ID is absent only after the fenced, gap-free from-start replay and
+    // successful opening of every relevant prior edit.
+    if found.is_empty()
+        && !hub
+            .lock()
+            .values()
+            .any(|body| body.identity(request_id).is_some())
+        && !hub.qualified.load(Ordering::Acquire)
+    {
+        return Err(error("documents.document_pending", true));
+    }
+    // One ID cannot name a request on another Document or Installation.
+    if hub
+        .lock()
+        .iter()
+        .any(|(id, body)| id != document && body.identity(request_id).is_some())
+    {
+        return Err(invalid_request());
+    }
+    let publication = hub.publication_gate.lock().unwrap();
+    if hub
+        .store
+        .import_failure(document)
+        .map_err(|_| storage_failed())?
+        .is_some()
+    {
+        return Err(error("documents.import_failure", false));
+    }
+    let (revision, is_retry) = hub.with_body(document, |body| {
+        if !body.editable() {
+            return Err(error("documents.document_pending", true));
+        }
+        if let Some(known) = body.identity(request_id) {
+            if known.author != author || known.digest != digest {
+                return Err(invalid_request());
+            }
+            return Ok((known.revision, true));
+        }
+        body.accept_local_update(session_peer, request_id.to_owned(), update)
+            .map_err(update_error)?;
+        body.remember_identity(request_id.to_owned(), author.to_owned(), digest, false)
+            .map_err(|_| invalid_request())?;
+        Ok((body.revision(), false))
+    })?;
+    if is_retry
+        && hub.with_body(document, |body| {
+            body.identity(request_id)
+                .is_some_and(|known| known.projection_pending)
+        })
+    {
+        return Err(error("documents.document_pending", true));
+    }
+    if !is_retry {
+        hub.flush.notify_one();
+        for event in hub.text_events(document) {
+            let _ = hub.events.send(event);
+        }
+    }
+    drop(publication);
+    // Never acknowledge the update until its record has reached the Core record log.
+    drain_document(hub, document, |staged| {
+        append_edit(log, hub, changes, author, document, staged)
+    })
+    .await?;
+    Ok(json!({ "ok": true, "revision": revision.to_string(), "requestId": request_id }))
+}
+
 async fn stop_flusher(state: &DocumentsActive) {
     let flusher = state
         .flusher
@@ -2332,7 +2352,7 @@ async fn stop_flusher(state: &DocumentsActive) {
         let _guard = append_lock.lock().await;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            drain_document(&state.hub, &document, true, |update| {
+            drain_document(&state.hub, &document, |update| {
                 append_edit(
                     &state.log,
                     &state.hub,
@@ -2622,7 +2642,7 @@ mod tests {
     }
 
     #[test]
-    fn full_text_and_oversized_delta_frames_stay_below_bridge_limit() {
+    fn full_text_frames_stay_below_bridge_limit() {
         let text = "\u{0000}😀".repeat(60_000);
         let events = full_text_events(&hex(64, 1), 42, &text, true);
         assert!(events.len() > 3);
@@ -2642,12 +2662,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oversized_import_delta_falls_back_to_bounded_full_text_events() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
-        let (events, mut receiver) = broadcast::channel(256);
-        let hub = BodyHub {
+    fn test_hub(store: DocumentStore, events: broadcast::Sender<JsonValue>) -> BodyHub {
+        BodyHub {
             store,
             bodies: Arc::new(Mutex::new(HashMap::new())),
             events,
@@ -2655,30 +2671,27 @@ mod tests {
             append_locks: Arc::new(Mutex::new(HashMap::new())),
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
             metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-            peer: 3,
             qualified: Arc::new(AtomicBool::new(false)),
             identity_index_complete: Arc::new(AtomicBool::new(false)),
             identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
             publication_gate: Arc::new(Mutex::new(())),
-        };
-        let mut alice = DocumentBody::new(1);
-        let mut bob = DocumentBody::new(2);
-        alice
-            .apply(&[TextOp::Insert {
-                insert: "a".repeat(110 * 1024),
-            }])
-            .unwrap();
-        bob.apply(&[TextOp::Insert {
-            insert: "\u{0000}😀".repeat(20_000),
-        }])
-        .unwrap();
-        for update in alice.flush(Instant::now(), true).unwrap().updates {
-            hub.apply_edits(&[("doc".into(), update)]);
-            while receiver.try_recv().is_ok() {}
         }
-        for update in bob.flush(Instant::now(), true).unwrap().updates {
-            hub.apply_edits(&[("doc".into(), update)]);
-        }
+    }
+
+    #[test]
+    fn oversized_import_falls_back_to_bounded_full_text_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+        let (events, mut receiver) = broadcast::channel(256);
+        let hub = test_hub(store, events);
+        let mut alice = Writer::new();
+        let mut bob = Writer::new();
+        let from_alice = alice.write(&format!("{}\n", "a".repeat(110 * 1024)));
+        let from_bob = bob.write(&format!("{}\n", "\u{0001}😀".repeat(20_000)));
+        hub.apply_edits(&[("doc".into(), genesis())]);
+        hub.apply_edits(&[("doc".into(), from_alice)]);
+        while receiver.try_recv().is_ok() {}
+        hub.apply_edits(&[("doc".into(), from_bob)]);
         let merged = hub.with_body("doc", |body| body.text().to_owned());
         assert!(merged.len() > crate::body::MAX_TEXT_BYTES);
         let published: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
@@ -2708,45 +2721,22 @@ mod tests {
         );
     }
 
+    // Verifies: AC3 — a Document whose records cannot all be opened is pending, never partial.
     #[test]
     fn pending_body_never_publishes_partial_ready_edits() {
         let directory = tempfile::tempdir().unwrap();
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let (events, mut receiver) = broadcast::channel(16);
-        let hub = BodyHub {
-            store,
-            bodies: Arc::new(Mutex::new(HashMap::new())),
-            events,
-            flush: Arc::new(Notify::new()),
-            append_locks: Arc::new(Mutex::new(HashMap::new())),
-            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
-            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-            peer: 3,
-            qualified: Arc::new(AtomicBool::new(false)),
-            identity_index_complete: Arc::new(AtomicBool::new(false)),
-            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
-            publication_gate: Arc::new(Mutex::new(())),
-        };
-        let mut source = DocumentBody::new(1);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "complete".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let hub = test_hub(store, events);
+        let update = Writer::new().write("complete\n");
+        hub.apply_edits(&[("doc".into(), genesis())]);
         hub.with_body("doc", |body| body.set_unopened(2));
         hub.apply_edits(&[("doc".into(), update.clone())]);
         assert_eq!(hub.open_response("doc")["text"], "");
-        assert!(
-            receiver.try_recv().is_err(),
-            "no partial delta is broadcast"
-        );
+        assert_eq!(hub.open_response("doc")["editable"], false);
+        assert!(receiver.try_recv().is_err(), "no partial body is broadcast");
         hub.with_body("doc", |body| body.set_unopened(0));
-        assert_eq!(hub.open_response("doc")["text"], "complete");
+        assert_eq!(hub.open_response("doc")["text"], "complete\n");
         assert_eq!(hub.open_response("doc")["editable"], true);
     }
 
@@ -2756,17 +2746,6 @@ mod tests {
             &router().operations(),
             include_str!("../../ui-contract.json"),
         );
-    }
-
-    /// Loro is linked and its text container round-trips an edit; the body model builds on it
-    /// in a later phase.
-    #[test]
-    fn loro_text_round_trips() {
-        let doc = loro::LoroDoc::new();
-        let text = doc.get_text("body");
-        text.insert(0, "# Plan").unwrap();
-        doc.commit();
-        assert_eq!(text.to_string(), "# Plan");
     }
 
     use std::time::Duration;
@@ -2779,6 +2758,83 @@ mod tests {
 
     fn hex(length: usize, seed: u64) -> String {
         format!("{seed:0length$x}")
+    }
+
+    /// One genesis shared by every test Document created from a record, so a [`Writer`] made
+    /// without a body writes updates any of them can import.
+    static TEST_GENESIS: std::sync::LazyLock<Vec<u8>> =
+        std::sync::LazyLock::new(crate::body::genesis);
+
+    fn genesis() -> Vec<u8> {
+        TEST_GENESIS.clone()
+    }
+
+    /// Another Installation's editor of one Document: each write revises the whole body to the
+    /// given Markdown and returns the one update, from a fresh peer, that its record carries.
+    struct Writer {
+        body: DocumentBody,
+    }
+
+    impl Writer {
+        /// A writer of a Document created with [`genesis`].
+        fn new() -> Self {
+            let mut body = DocumentBody::new();
+            body.import(&TEST_GENESIS).unwrap();
+            Self { body }
+        }
+
+        /// A writer of a Document this activation holds, starting from its current body.
+        fn of(handles: &ActivationHandles, document: &str) -> Self {
+            Self {
+                body: handles.bodies.lock().unwrap()[document].writer_copy(),
+            }
+        }
+
+        fn write(&mut self, markdown: &str) -> Vec<u8> {
+            let base = self.body.frontiers();
+            assert!(
+                self.body
+                    .merge_markdown(&base, markdown, hex(32, 0xab))
+                    .unwrap()
+            );
+            let update = self.body.staged().unwrap();
+            self.body.append_succeeded();
+            self.body.import(&update).unwrap();
+            update
+        }
+    }
+
+    /// What one UI session would submit: the body's Markdown revised to `markdown`, as one
+    /// update from a fresh session peer.
+    fn session_update(
+        handles: &ActivationHandles,
+        document: &str,
+        markdown: &str,
+    ) -> (u64, Vec<u8>) {
+        let bodies = handles.bodies.lock().unwrap();
+        let body = &bodies[document];
+        let peer = body.allocate_peer();
+        (peer, body.revision_update(peer, markdown))
+    }
+
+    /// Submits a session update through the one local write path, as Alice's Installation.
+    async fn submit(
+        handles: &ActivationHandles,
+        document: &str,
+        request_id: &str,
+        (peer, update): &(u64, Vec<u8>),
+    ) -> Result<JsonValue, BackendError> {
+        submit_update(
+            &handles.log,
+            &handles.hub,
+            &handles.changes,
+            ALICE,
+            document,
+            *peer,
+            request_id,
+            update,
+        )
+        .await
     }
 
     /// A capability that opens nothing, appends deterministically, and refuses the rest.
@@ -2941,13 +2997,8 @@ mod tests {
         let other = hex(64, 3);
         let request_id = hex(32, 9);
         let mut edits = Vec::new();
-        for (seed, peer, text) in [(4, 91, "one"), (5, 92, "two")] {
-            let mut body = DocumentBody::new(peer);
-            body.apply(&[TextOp::Insert {
-                insert: text.into(),
-            }])
-            .unwrap();
-            let update = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+        for (seed, text) in [(4, "one"), (5, "two")] {
+            let update = Writer::new().write(&format!("{text}\n"));
             edits.push((
                 seed,
                 DomainRecord::identified_document_edit(
@@ -2971,11 +3022,11 @@ mod tests {
                 (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
                 (
                     2,
-                    DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+                    DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
                 ),
                 (
                     3,
-                    DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap(),
+                    DomainRecord::document_create("bob", &hex(64, 1), "Other", genesis()).unwrap(),
                 ),
             ] {
                 assert!(stream.send(record_frame(seed, "bob", &record)).await);
@@ -3042,28 +3093,19 @@ mod tests {
             assert_eq!(recovered["reason"], "identity_conflict");
             assert_eq!(recovered["requestStatuses"][0]["inclusion"], "unresolved");
             assert_eq!(recovered["text"], "");
-            let rejected = session
-                .harness
-                .request(
-                    "documents.document.edit",
-                    json!({"documentId":document,
-                "baseRevision":"0","requestId":hex(32, 89),"ops":[{"insert":"bad"}]}),
-                )
+            let rejected = submit(&session.handles, &document, &hex(32, 89), &(1, vec![1]))
                 .await
                 .unwrap_err();
             assert_eq!(rejected.code(), "documents.identity_conflict");
-            let mut unrelated_body = DocumentBody::new(93);
-            unrelated_body
-                .apply(&[TextOp::Insert {
-                    insert: "live".into(),
-                }])
-                .unwrap();
-            let unrelated_update = unrelated_body
-                .flush(Instant::now(), true)
-                .unwrap()
-                .updates
-                .remove(0);
-            let unrelated = DomainRecord::document_edit("bob", &other, unrelated_update).unwrap();
+            let unrelated_update = Writer::new().write("live\n");
+            let unrelated = DomainRecord::identified_document_edit(
+                "bob",
+                &other,
+                &hex(32, 606),
+                &[6; 32],
+                unrelated_update,
+            )
+            .unwrap();
             assert!(stream.send(record_frame(6, "bob", &unrelated)).await);
             let store = session.handles.store.clone();
             wait_until(
@@ -3074,7 +3116,7 @@ mod tests {
             assert_eq!(store.edit_records(Some(&other)).unwrap().len(), 1);
             assert_eq!(
                 session.handles.bodies.lock().unwrap()[&other].text(),
-                "live"
+                "live\n"
             );
             assert!(!store.identity_conflicted(&other).unwrap());
             session.harness.shutdown().await.unwrap();
@@ -3094,7 +3136,7 @@ mod tests {
             (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
             (
                 2,
-                DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+                DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
             ),
         ] {
             assert!(stream.send(record_frame(seed, "bob", &record)).await);
@@ -3114,17 +3156,18 @@ mod tests {
             append_locks: Arc::new(Mutex::new(HashMap::new())),
             waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
             metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-            peer: 5,
             qualified: Arc::new(AtomicBool::new(true)),
             identity_index_complete: Arc::new(AtomicBool::new(true)),
             identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
             publication_gate: Arc::new(Mutex::new(())),
         };
+        // An accepted local update, large enough that its text needs a chunked transfer.
         hub.with_body(&document, |body| {
-            body.apply(&[TextOp::Insert {
-                insert: "A".repeat(180 * 1024),
-            }])
-            .unwrap();
+            body.import(&genesis()).unwrap();
+            let peer = body.allocate_peer();
+            let update = body.revision_update(peer, &format!("{}\n", "A".repeat(150 * 1024)));
+            body.accept_local_update(peer, hex(32, 54), &update)
+                .unwrap();
         });
         let request_id = hex(32, 9);
         let request = RecoverRequest {
@@ -3138,17 +3181,7 @@ mod tests {
             hub.publish_recovery(&request, ALICE, &Ok(HashMap::new()), &HashSet::new())
                 .unwrap();
         });
-        let mut source = DocumentBody::new(91);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "signed".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::new().write("signed\n");
         for seed in [3, 4] {
             let signed = DomainRecord::identified_document_edit(
                 "bob",
@@ -3205,22 +3238,12 @@ mod tests {
                 .send(record_frame(
                     2,
                     "bob",
-                    &DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap()
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap()
                 ))
                 .await
         );
-        let mut source = DocumentBody::new(91);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "first".into(),
-            }])
-            .unwrap();
-        let first_update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
-        source.append_succeeded();
+        let mut source = Writer::new();
+        let first_update = source.write("first\n");
         let first_id = hex(32, 10);
         let edit = |id: &str, update: Vec<u8>| {
             DomainRecord::identified_document_edit("bob", &document, id, &[7; 32], update).unwrap()
@@ -3252,17 +3275,7 @@ mod tests {
             "eviction replay",
         )
         .await;
-        let mut attacker = DocumentBody::new(92);
-        attacker
-            .apply(&[TextOp::Insert {
-                insert: "bad".into(),
-            }])
-            .unwrap();
-        let bad = attacker
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let bad = Writer::new().write("bad\n");
         assert!(
             stream
                 .send(record_frame(500, "bob", &edit(&first_id, bad)))
@@ -3275,19 +3288,7 @@ mod tests {
         .await;
         assert!(store.has_projection_warnings().unwrap());
         assert!(store.identity_conflicted(&document).unwrap());
-        source
-            .apply(&[
-                TextOp::Retain { retain: 5 },
-                TextOp::Insert {
-                    insert: "later".into(),
-                },
-            ])
-            .unwrap();
-        let next = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let next = source.write("firstlater\n");
         assert!(
             stream
                 .send(record_frame(501, "bob", &edit(&hex(32, 501), next)))
@@ -3300,7 +3301,7 @@ mod tests {
         .await;
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].text(),
-            "first",
+            "first\n",
             "later edit is sealed but not applied after conflict"
         );
         assert_eq!(
@@ -3319,11 +3320,32 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    /// Like [`scripted_log`], but `document.edit` appends fail, retryably, while `fail` is set.
+    fn failing_edit_log(fail: Arc<AtomicBool>) -> ScriptedCapability {
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                .map(|_| json!({"status":"waiting_for_history_access"})).collect::<Vec<_>>()})),
+            "append" if payload["purpose"] == "document.edit" && fail.load(Ordering::SeqCst) => {
+                Err(error("unavailable", true))
+            }
+            "append" => {
+                let seed = next.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"recordId":hex(64, seed),"orderKey":hex(82, seed),
+                    "author":ALICE,"signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}))
+            }
+            _ => Err(error("unavailable", false)),
+        })
+    }
+
     #[tokio::test]
-    async fn invalid_remote_edit_during_coalescing_preserves_applied_baseline_not_unsaved_preview()
-    {
+    async fn invalid_remote_edit_while_a_local_update_is_staged_preserves_applied_baseline() {
         let directory = tempfile::tempdir().unwrap();
-        let mut session = start(directory.path(), scripted_log()).await;
+        let mut session = start(
+            directory.path(),
+            failing_edit_log(Arc::new(AtomicBool::new(true))),
+        )
+        .await;
         qualify_empty_history(&session).await;
         let collection = session
             .harness
@@ -3344,25 +3366,15 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let mut source = DocumentBody::new(94);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "good".into(),
-            }])
-            .unwrap();
-        let valid = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let valid = Writer::of(&session.handles, &document).write("good\n");
         let stream = session.scripted.stream();
+        let remote = |id: u64, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", &document, &hex(32, id), &[1; 32], update)
+                .unwrap()
+        };
         assert!(
             stream
-                .send(record_frame(
-                    8,
-                    "bob",
-                    &DomainRecord::document_edit("bob", &document, valid).unwrap()
-                ))
+                .send(record_frame(8, "bob", &remote(57, valid)))
                 .await
         );
         wait_until(
@@ -3373,7 +3385,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .get(&document)
-                    .is_some_and(|body| body.text() == "good")
+                    .is_some_and(|body| body.text() == "good\n")
             },
             "applied text",
         )
@@ -3384,30 +3396,23 @@ mod tests {
             .await
             .unwrap();
         let _ = text.next_event().await.unwrap();
-        let request = session
-            .harness
-            .start_request(
-                "documents.document.edit",
-                json!({
-                    "documentId":document,"baseRevision":"1","requestId":hex(32, 55),
-                    "ops":[{"retain":4},{"insert":" draft"}]
-                }),
-            )
-            .await;
-        wait_until(
-            || session.handles.bodies.lock().unwrap()[&document].text() == "good draft",
-            "local preview",
-        )
-        .await;
-        let bad = DomainRecord::identified_document_edit(
-            "bob",
-            &document,
-            &hex(32, 56),
-            &[1; 32],
-            b"not loro".to_vec(),
-        )
-        .unwrap();
-        assert!(stream.send(record_frame(9, "bob", &bad)).await);
+        let draft = session_update(&session.handles, &document, "good draft\n");
+        assert!(
+            submit(&session.handles, &document, &hex(32, 55), &draft)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session.handles.bodies.lock().unwrap()[&document].text(),
+            "good draft\n",
+            "the accepted update stays staged as a local preview"
+        );
+        assert!(session.handles.bodies.lock().unwrap()[&document].has_pending());
+        assert!(
+            stream
+                .send(record_frame(9, "bob", &remote(56, b"not loro".to_vec())))
+                .await
+        );
         wait_until(
             || {
                 session
@@ -3426,11 +3431,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            opened["text"], "good",
+            opened["text"], "good\n",
             "an unappended preview is not authoritative last-good text"
         );
         assert_eq!(opened["reason"], "import_failure");
-        assert!(request.result().await.is_err());
         let mut saved = false;
         while let Ok(Some(Ok(event))) =
             tokio::time::timeout(Duration::from_millis(20), text.next_event()).await
@@ -3458,25 +3462,18 @@ mod tests {
             (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
             (
                 2,
-                DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+                DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
             ),
         ] {
             assert!(stream.send(record_frame(seed, "bob", &record)).await);
         }
         let store = session.handles.store.clone();
         wait_until(|| store.document_exists(&document).unwrap(), "document").await;
-        let mut source = DocumentBody::new(91);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "good".into(),
-            }])
-            .unwrap();
-        let good = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
-        let first = DomainRecord::document_edit("bob", &document, good).unwrap();
+        let mut source = Writer::new();
+        let good = source.write("good\n");
+        let first =
+            DomainRecord::identified_document_edit("bob", &document, &hex(32, 3), &[3; 32], good)
+                .unwrap();
         assert!(stream.send(record_frame(3, "bob", &first)).await);
         wait_until(
             || {
@@ -3486,7 +3483,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .get(&document)
-                    .is_some_and(|b| b.text() == "good")
+                    .is_some_and(|b| b.text() == "good\n")
             },
             "good body",
         )
@@ -3513,7 +3510,7 @@ mod tests {
             .unwrap();
         assert_eq!(opened["reason"], "import_failure");
         assert_eq!(opened["editable"], false);
-        assert_eq!(opened["text"], "good");
+        assert_eq!(opened["text"], "good\n");
         assert_eq!(opened["diagnosticRecordId"], hex(64, 4));
         assert_eq!(
             store.import_failure(&document).unwrap(),
@@ -3549,25 +3546,20 @@ mod tests {
         assert_eq!(recovery["requestStatuses"][0]["inclusion"], "unresolved");
         subscription.close().await;
         assert_eq!(store.edit_identity(&bad_id).unwrap().unwrap().0, hex(64, 4));
-        source
-            .apply(&[
-                TextOp::Retain { retain: 4 },
-                TextOp::Insert {
-                    insert: " later".into(),
-                },
-            ])
-            .unwrap();
-        let later = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let later = source.write("good later\n");
         assert!(
             stream
                 .send(record_frame(
                     5,
                     "bob",
-                    &DomainRecord::document_edit("bob", &document, later).unwrap()
+                    &DomainRecord::identified_document_edit(
+                        "bob",
+                        &document,
+                        &hex(32, 5),
+                        &[5; 32],
+                        later
+                    )
+                    .unwrap()
                 ))
                 .await
         );
@@ -3577,27 +3569,24 @@ mod tests {
                 .send(record_frame(
                     6,
                     "bob",
-                    &DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap()
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Other", genesis()).unwrap()
                 ))
                 .await
         );
-        let mut other_body = DocumentBody::new(93);
-        other_body
-            .apply(&[TextOp::Insert {
-                insert: "live".into(),
-            }])
-            .unwrap();
-        let other_update = other_body
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let other_update = Writer::new().write("live\n");
         assert!(
             stream
                 .send(record_frame(
                     7,
                     "bob",
-                    &DomainRecord::document_edit("bob", &other, other_update).unwrap()
+                    &DomainRecord::identified_document_edit(
+                        "bob",
+                        &other,
+                        &hex(32, 7),
+                        &[7; 32],
+                        other_update
+                    )
+                    .unwrap()
                 ))
                 .await
         );
@@ -3608,11 +3597,11 @@ mod tests {
         .await;
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].text(),
-            "good"
+            "good\n"
         );
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&other].text(),
-            "live"
+            "live\n"
         );
         assert_eq!(store.record_count().unwrap(), 7);
         session.harness.shutdown().await.unwrap();
@@ -3657,7 +3646,7 @@ mod tests {
                 .send(record_frame(
                     4,
                     "bob",
-                    &DomainRecord::document_create("bob", &hex(64, 1), "Doc").unwrap()
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Doc", genesis()).unwrap()
                 ))
                 .await
         );
@@ -3692,17 +3681,19 @@ mod tests {
             let path = directory.path().join("documents.sqlite3");
             let document = hex(64, 2);
             let other = hex(64, 3);
-            let mut body = DocumentBody::new(91);
-            body.apply(&[TextOp::Insert {
-                insert: "last good".into(),
-            }])
-            .unwrap();
-            let valid = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+            let valid = Writer::new().write("last good\n");
             let records = [
                 DomainRecord::collection_create("bob", "Plan").unwrap(),
-                DomainRecord::document_create("bob", &hex(64, 1), "Doc").unwrap(),
-                DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap(),
-                DomainRecord::document_edit("bob", &document, valid).unwrap(),
+                DomainRecord::document_create("bob", &hex(64, 1), "Doc", genesis()).unwrap(),
+                DomainRecord::document_create("bob", &hex(64, 1), "Other", genesis()).unwrap(),
+                DomainRecord::identified_document_edit(
+                    "bob",
+                    &document,
+                    &hex(32, 10),
+                    &[6; 32],
+                    valid,
+                )
+                .unwrap(),
                 DomainRecord::identified_document_edit(
                     "bob",
                     &document,
@@ -3762,7 +3753,7 @@ mod tests {
                 .request("documents.document.open", json!({"documentId":document}))
                 .await
                 .unwrap();
-            assert_eq!(opened["text"], "last good");
+            assert_eq!(opened["text"], "last good\n");
             assert_eq!(opened["reason"], "import_failure");
             assert_eq!(opened["editable"], false);
             assert_eq!(
@@ -3796,21 +3787,11 @@ mod tests {
         let collection = hex(64, 1);
         let unavailable = hex(64, 2);
         let healthy = hex(64, 3);
-        let mut source = DocumentBody::new(91);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "private".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::new().write("private\n");
         let records = [
             DomainRecord::collection_create("bob", "Plan").unwrap(),
-            DomainRecord::document_create("bob", &collection, "Unavailable").unwrap(),
-            DomainRecord::document_create("bob", &collection, "Healthy").unwrap(),
+            DomainRecord::document_create("bob", &collection, "Unavailable", genesis()).unwrap(),
+            DomainRecord::document_create("bob", &collection, "Healthy", genesis()).unwrap(),
             DomainRecord::identified_document_edit(
                 "bob",
                 &unavailable,
@@ -3888,15 +3869,8 @@ mod tests {
             "Core prefix",
         )
         .await;
-        let edited = session
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({
-                    "documentId":healthy,"baseRevision":"0","requestId":hex(32, 99),
-                    "ops":[{"insert":"healthy"}]
-                }),
-            )
+        let local = session_update(&session.handles, &healthy, "healthy\n");
+        let edited = submit(&session.handles, &healthy, &hex(32, 99), &local)
             .await
             .unwrap();
         assert_eq!(edited["revision"], "1");
@@ -3933,17 +3907,7 @@ mod tests {
         .unwrap();
         assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
         subscription.close().await;
-        let mut incoming = DocumentBody::new(92);
-        incoming
-            .apply(&[TextOp::Insert {
-                insert: "remote".into(),
-            }])
-            .unwrap();
-        let update = incoming
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::new().write("remote\n");
         let edit =
             DomainRecord::identified_document_edit("bob", &healthy, &hex(32, 98), &[6; 32], update)
                 .unwrap();
@@ -3971,12 +3935,7 @@ mod tests {
         let path = directory.path().join("documents.sqlite3");
         let document = hex(64, 2);
         let id = hex(32, 9);
-        let mut body = DocumentBody::new(91);
-        body.apply(&[TextOp::Insert {
-            insert: "private".into(),
-        }])
-        .unwrap();
-        let update = body.flush(Instant::now(), true).unwrap().updates.remove(0);
+        let update = Writer::new().write("private\n");
         let first =
             DomainRecord::identified_document_edit("bob", &document, &id, &[1; 32], update.clone())
                 .unwrap();
@@ -3990,7 +3949,7 @@ mod tests {
                 (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
                 (
                     2,
-                    DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap(),
+                    DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
                 ),
                 (3, first.clone()),
                 (4, second.clone()),
@@ -4058,7 +4017,7 @@ mod tests {
                 .send(record_frame(
                     5,
                     "bob",
-                    &DomainRecord::document_create("bob", &hex(64, 1), "Other").unwrap()
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Other", genesis()).unwrap()
                 ))
                 .await
         );
@@ -4068,17 +4027,7 @@ mod tests {
             "other Document create",
         )
         .await;
-        let mut source = DocumentBody::new(92);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "live".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::new().write("live\n");
         let identified =
             DomainRecord::identified_document_edit("bob", &other, &hex(32, 15), &[3; 32], update)
                 .unwrap();
@@ -4099,7 +4048,7 @@ mod tests {
         .await;
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&other].text(),
-            "live"
+            "live\n"
         );
         let mut text = session
             .harness
@@ -4154,17 +4103,7 @@ mod tests {
         let path = directory.path().join("documents.sqlite3");
         let absent_document = hex(64, 9);
         let request_id = hex(32, 13);
-        let mut source = DocumentBody::new(91);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "safe".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::new().write("safe\n");
         let original = DomainRecord::identified_document_edit(
             "bob",
             &absent_document,
@@ -4177,7 +4116,8 @@ mod tests {
         {
             let store = DocumentStore::open(&path).unwrap();
             let create = DomainRecord::collection_create("bob", "Plan").unwrap();
-            let doc = DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap();
+            let doc =
+                DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap();
             for (seed, record) in [(1, create), (2, doc), (3, original.clone())] {
                 let sealed = format!("row-{seed}");
                 let result = store
@@ -4261,7 +4201,7 @@ mod tests {
         .await;
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&hex(64, 2)].text(),
-            "safe"
+            "safe\n"
         );
         assert!(store.has_projection_warnings().unwrap());
         session.harness.shutdown().await.unwrap();
@@ -4292,7 +4232,7 @@ mod tests {
                 .send(record_frame(
                     2,
                     "bob",
-                    &DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap()
+                    &DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap()
                 ))
                 .await
         );
@@ -4328,17 +4268,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(unresolved["requestStatuses"][0]["inclusion"], "unresolved");
-        let mut source = DocumentBody::new(94);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "replayed".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::new().write("replayed\n");
         let edit = DomainRecord::identified_document_edit(ALICE, &document, &id, &[7; 32], update)
             .unwrap();
         assert!(stream.send(record_frame(3, ALICE, &edit)).await);
@@ -4390,7 +4320,7 @@ mod tests {
             .unwrap();
         let create = DomainRecord::collection_create("bob", "Shared").unwrap();
         assert!(stream.send(record_frame(1, "bob", &create)).await);
-        let title = DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap();
+        let title = DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap();
         assert!(stream.send(record_frame(2, "bob", &title)).await);
         let store = session.handles.store.clone();
         wait_until(
@@ -4432,9 +4362,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let collection = DomainRecord::collection_create("bob", "Plan").unwrap();
-        let document = DomainRecord::document_create("bob", &hex(64, 1), "Notes").unwrap();
+        let document =
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap();
         let comment = DomainRecord::comment_add("bob", &hex(64, 2), None, None, "Hello").unwrap();
-        let deferred = DomainRecord::document_create("bob", &hex(64, 99), "Later").unwrap();
+        let deferred =
+            DomainRecord::document_create("bob", &hex(64, 99), "Later", genesis()).unwrap();
         let records = [collection, document, comment, deferred];
         let mut canonical = HashMap::new();
         for (index, record) in records.iter().enumerate() {
@@ -4547,16 +4479,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let collection = hex(64, 1);
         let document = hex(64, 2);
-        let mut body = DocumentBody::new(90);
-        body.apply(&[TextOp::Insert {
-            insert: "recovered".into(),
-        }])
-        .unwrap();
-        let update = body.flush(Instant::now(), true).unwrap().updates.remove(0);
-        let edit = DomainRecord::document_edit("bob", &document, update).unwrap();
+        let update = Writer::new().write("recovered\n");
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let mut seed = 1;
+        let mut canonicals = HashMap::new();
         let mut save = |record: DomainRecord, target: u8| {
+            canonicals.insert(
+                seed,
+                (
+                    record.kind().to_owned(),
+                    URL_SAFE_NO_PAD.encode(record.encode()),
+                ),
+            );
             let mut sealed = vec![target; 32 * 1024];
             sealed[1] = seed as u8;
             store
@@ -4575,7 +4509,7 @@ mod tests {
         };
         save(DomainRecord::collection_create("bob", "Plan").unwrap(), 1);
         save(
-            DomainRecord::document_create("bob", &collection, "Notes").unwrap(),
+            DomainRecord::document_create("bob", &collection, "Notes", genesis()).unwrap(),
             2,
         );
         for _ in 0..17 {
@@ -4590,12 +4524,19 @@ mod tests {
                 4,
             );
         }
-        for _ in 0..17 {
-            save(edit.clone(), 5);
+        for index in 0..17 {
+            let edit = DomainRecord::identified_document_edit(
+                "bob",
+                &document,
+                &hex(32, 700 + index),
+                &[5; 32],
+                update.clone(),
+            )
+            .unwrap();
+            save(edit, 5);
         }
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
-        let canonical = URL_SAFE_NO_PAD.encode(edit.encode());
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
             "open" => {
                 let sealed = payload["sealedRecords"].as_array().unwrap();
@@ -4603,9 +4544,16 @@ mod tests {
                 assert!(sealed.len() <= 32 && total <= 512 * 1024);
                 Ok(json!({"results": sealed.iter().map(|value| {
                     let bytes = URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap();
-                    if bytes[0] == 5 && (gained.load(Ordering::SeqCst) || bytes[1] == 37) {
+                    // One edit opens early; the rest, and the create holding the genesis, wait.
+                    let ready = match bytes[0] {
+                        2 => gained.load(Ordering::SeqCst),
+                        5 => gained.load(Ordering::SeqCst) || bytes[1] == 37,
+                        _ => false,
+                    };
+                    if ready {
+                        let (purpose, canonical) = &canonicals[&u64::from(bytes[1])];
                         json!({"status":"ready", "recordId":hex(64, u64::from(bytes[1])), "orderKey":hex(82, u64::from(bytes[1])),
-                            "author":"bob", "purpose":"document.edit", "signature":"sig", "canonical":canonical})
+                            "author":"bob", "purpose":purpose, "signature":"sig", "canonical":canonical})
                     } else { json!({"status":"waiting_for_history_access"}) }
                 }).collect::<Vec<_>>() }))
             }
@@ -4614,7 +4562,8 @@ mod tests {
         let mut session = start(directory.path(), scripted.clone()).await;
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].unopened(),
-            16
+            17,
+            "sixteen edits and the create that carries the genesis"
         );
         let mut subscription = session
             .harness
@@ -4642,7 +4591,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready["editable"], true);
-        assert_eq!(ready["text"], "recovered");
+        assert_eq!(ready["text"], "recovered\n");
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].unopened(),
             0
@@ -4761,11 +4710,9 @@ mod tests {
             "CREATE TRIGGER fail_edit_projection BEFORE INSERT ON records WHEN NEW.purpose='document.edit' BEGIN SELECT RAISE(FAIL, 'injected'); END;"
         ).unwrap();
         let id = hex(32, 83);
-        let request = json!({"documentId":document,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]});
+        let draft = session_update(&session.handles, &document, "draft\n");
         assert_eq!(
-            session
-                .harness
-                .request("documents.document.edit", request.clone())
+            submit(&session.handles, &document, &id, &draft)
                 .await
                 .unwrap_err()
                 .code(),
@@ -4797,9 +4744,7 @@ mod tests {
         assert_eq!(before["requestStatuses"][0]["durability"], "durable");
         assert_eq!(before["requestStatuses"][0]["inclusion"], "unresolved");
         assert_eq!(
-            session
-                .harness
-                .request("documents.document.edit", request.clone())
+            submit(&session.handles, &document, &id, &draft)
                 .await
                 .unwrap_err()
                 .code(),
@@ -4918,16 +4863,8 @@ mod tests {
             .await
             .unwrap();
         let id = hex(32, 91);
-        let digest: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&(
-                0_u64,
-                vec![TextOp::Insert {
-                    insert: "draft".into(),
-                }],
-            ))
-            .unwrap(),
-        )
-        .into();
+        let draft = session_update(&session.handles, &b, "draft\n");
+        let digest: [u8; 32] = Sha256::digest(&draft.1).into();
         session
             .handles
             .bodies
@@ -4937,17 +4874,7 @@ mod tests {
             .unwrap()
             .remember_identity(id.clone(), ALICE.into(), digest, false)
             .unwrap();
-        let mut source = DocumentBody::new(71);
-        source
-            .apply(&[TextOp::Insert {
-                insert: "on A".into(),
-            }])
-            .unwrap();
-        let update = source
-            .flush(Instant::now(), true)
-            .unwrap()
-            .updates
-            .remove(0);
+        let update = Writer::of(&session.handles, &a).write("on A\n");
         let record =
             DomainRecord::identified_document_edit(ALICE, &a, &id, &[5; 32], update).unwrap();
         *indexed.lock().unwrap() = Some((
@@ -4998,16 +4925,7 @@ mod tests {
                 .is_some()
         );
         // The scripted opener cannot authenticate this row: fail closed instead of accepting B's cache.
-        let result = session
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({
-                    "documentId":b,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]
-                }),
-            )
-            .await
-            .unwrap_err();
+        let result = submit(&session.handles, &b, &id, &draft).await.unwrap_err();
         assert_eq!(result.code(), "documents.document_pending");
         assert_eq!(
             appends.load(Ordering::SeqCst),
@@ -5015,16 +4933,7 @@ mod tests {
             "unopenable row cannot cause an append"
         );
         openable.store(true, Ordering::SeqCst);
-        let rejected = session
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({
-                    "documentId":b,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]
-                }),
-            )
-            .await
-            .unwrap_err();
+        let rejected = submit(&session.handles, &b, &id, &draft).await.unwrap_err();
         assert_eq!(rejected.code(), "documents.invalid_request");
         assert_eq!(
             appends.load(Ordering::SeqCst),
@@ -5081,11 +4990,16 @@ mod tests {
             .unwrap();
         let _ = text.next_event().await.unwrap();
         let id = hex(32, 31);
-        let request = json!({"documentId":document,"requestId":id,"baseRevision":"0","ops":[{"insert":"draft"}]});
-        let editing = session
-            .harness
-            .start_request("documents.document.edit", request.clone())
-            .await;
+        let draft = session_update(&session.handles, &document, "draft\n");
+        let editing = {
+            let (handles, document, id, draft) = (
+                session.handles.clone(),
+                document.clone(),
+                id.clone(),
+                draft.clone(),
+            );
+            tokio::spawn(async move { submit(&handles, &document, &id, &draft).await })
+        };
         wait_until(
             || {
                 session
@@ -5114,7 +5028,7 @@ mod tests {
         };
         assert_eq!(before["requestStatuses"][0]["inclusion"], "included");
         assert_eq!(before["requestStatuses"][0]["durability"], "pending");
-        assert!(editing.result().await.is_err());
+        assert!(editing.await.unwrap().is_err());
         session
             .harness
             .request("documents.document.recover", recover(41))
@@ -5128,9 +5042,7 @@ mod tests {
         };
         assert_eq!(failed["requestStatuses"][0]["durability"], "pending");
         fail.store(false, Ordering::SeqCst);
-        let premature = session
-            .harness
-            .request("documents.document.edit", request.clone())
+        let premature = submit(&session.handles, &document, &id, &draft)
             .await
             .unwrap_err();
         assert_eq!(premature.code(), "documents.document_pending");
@@ -5145,9 +5057,7 @@ mod tests {
             "new Core prefix",
         )
         .await;
-        session
-            .harness
-            .request("documents.document.edit", request)
+        submit(&session.handles, &document, &id, &draft)
             .await
             .unwrap();
         session
@@ -5227,11 +5137,9 @@ mod tests {
             .await
             .unwrap();
         let _ = text.next_event().await.unwrap().unwrap();
-        let request = json!({"documentId": document, "requestId":"11111111111111111111111111111111", "baseRevision":"0", "ops":[{"insert":"draft"}]});
-        let result = session
-            .harness
-            .request("documents.document.edit", request.clone())
-            .await;
+        let id = "11111111111111111111111111111111";
+        let draft = session_update(&session.handles, &document, "draft\n");
+        let result = submit(&session.handles, &document, id, &draft).await;
         assert_eq!(
             result.unwrap_err().code(),
             "documents.capability_unavailable"
@@ -5267,26 +5175,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(saved["savedRevision"], "1");
-        assert_eq!(saved["text"], "draft");
-        let response = session
-            .harness
-            .request("documents.document.edit", request)
+        assert_eq!(saved["text"], "draft\n");
+        assert_eq!(saved["requestId"], id);
+        let response = submit(&session.handles, &document, id, &draft)
             .await
             .unwrap();
         assert_eq!(response["revision"], "1");
         assert!(!session.handles.bodies.lock().unwrap()[&document].has_pending());
         assert_eq!(
             session.handles.bodies.lock().unwrap()[&document].text(),
-            "draft"
+            "draft\n"
         );
         fail.store(true, Ordering::SeqCst);
-        let second = json!({"documentId": document, "requestId":"22222222222222222222222222222222", "baseRevision":"1", "ops":[{"retain":5},{"insert":"!"}]});
+        let second = session_update(&session.handles, &document, "draft!\n");
         assert!(
-            session
-                .harness
-                .request("documents.document.edit", second)
-                .await
-                .is_err()
+            submit(
+                &session.handles,
+                &document,
+                "22222222222222222222222222222222",
+                &second
+            )
+            .await
+            .is_err()
         );
         assert!(session.handles.bodies.lock().unwrap()[&document].has_pending());
         wait_until(
@@ -5361,12 +5271,9 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let response = first
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({"documentId": document, "requestId":"33333333333333333333333333333333", "baseRevision":"0", "ops":[{"insert":"durable"}]}),
-            )
+        let old_id = "33333333333333333333333333333333";
+        let durable = session_update(&first.handles, &document, "durable\n");
+        let response = submit(&first.handles, &document, old_id, &durable)
             .await
             .unwrap();
         assert_eq!(response["revision"], "1");
@@ -5447,7 +5354,7 @@ mod tests {
         let mut restarted = start(directory.path(), restart_log).await;
         assert_eq!(
             restarted.handles.bodies.lock().unwrap()[&document].text(),
-            "durable"
+            "durable\n"
         );
         assert!(!restarted.handles.bodies.lock().unwrap()[&document].has_pending());
         assert!(
@@ -5456,13 +5363,10 @@ mod tests {
                 .is_none(),
             "the old ID was evicted from the bounded cache"
         );
-        let old_edit = json!({"documentId":document,"requestId":"33333333333333333333333333333333","baseRevision":"0","ops":[{"insert":"durable"}]});
         let old_count = records.lock().unwrap().len();
         fail_lookup.store(true, Ordering::SeqCst);
         assert_eq!(
-            restarted
-                .harness
-                .request("documents.document.edit", old_edit.clone())
+            submit(&restarted.handles, &document, old_id, &durable)
                 .await
                 .unwrap_err()
                 .code(),
@@ -5494,9 +5398,7 @@ mod tests {
         );
         assert_eq!(first["requestStatuses"][1]["inclusion"], "unresolved");
         fail_lookup.store(false, Ordering::SeqCst);
-        let repeated = restarted
-            .harness
-            .request("documents.document.edit", old_edit.clone())
+        let repeated = submit(&restarted.handles, &document, old_id, &durable)
             .await
             .unwrap();
         assert_eq!(repeated["revision"], "1");
@@ -5505,11 +5407,9 @@ mod tests {
             old_count,
             "evicted retry must not append again"
         );
-        let conflict = json!({"documentId":document,"requestId":"33333333333333333333333333333333","baseRevision":"0","ops":[{"insert":"other"}]});
+        let conflict = session_update(&restarted.handles, &document, "other\n");
         assert_eq!(
-            restarted
-                .harness
-                .request("documents.document.edit", conflict)
+            submit(&restarted.handles, &document, old_id, &conflict)
                 .await
                 .unwrap_err()
                 .code(),
@@ -5576,120 +5476,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_append_failure_retries_only_unacknowledged_exports() {
+    async fn failed_append_keeps_the_staged_update_for_retry_and_shutdown_drain() {
         let directory = tempfile::tempdir().unwrap();
         let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
         let (events, _) = broadcast::channel(8);
-        let hub = BodyHub {
-            store,
-            bodies: Arc::new(Mutex::new(HashMap::new())),
-            events,
-            flush: Arc::new(Notify::new()),
-            append_locks: Arc::new(Mutex::new(HashMap::new())),
-            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
-            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-            peer: 1,
-            qualified: Arc::new(AtomicBool::new(false)),
-            identity_index_complete: Arc::new(AtomicBool::new(false)),
-            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
-            publication_gate: Arc::new(Mutex::new(())),
-        };
-        let text = "x".repeat(150 * 1024);
-        hub.with_body("doc", |body| {
-            body.apply(&[TextOp::Insert {
-                insert: text.clone(),
-            }])
-            .unwrap();
+        let hub = test_hub(store, events);
+        hub.qualified.store(true, Ordering::Release);
+        let staged = hub.with_body("doc", |body| {
+            body.import(&genesis()).unwrap();
+            let peer = body.allocate_peer();
+            let update = body.revision_update(peer, "saved\n");
+            body.accept_local_update(peer, hex(32, 1), &update).unwrap();
+            update
         });
-        let exports = hub.with_body("doc", |body| {
-            body.flush(Instant::now(), true).unwrap().updates
-        });
-        assert!(exports.len() >= 2);
-        let mut appended = Vec::new();
-        let failure = drain_document(&hub, "doc", true, |update| {
-            if appended.is_empty() {
-                appended.push(update);
-                std::future::ready(Ok(()))
-            } else {
-                std::future::ready(Err(error("documents.capability_unavailable", true)))
-            }
-        })
-        .await;
-        assert!(
-            failure.is_err(),
-            "the request cannot acknowledge a partial append"
-        );
-        assert!(hub.with_body("doc", |body| body.has_pending()));
-        drain_document(&hub, "doc", true, |update| {
-            appended.push(update);
-            std::future::ready(Ok(()))
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            appended, exports,
-            "a retry must not duplicate an accepted export"
-        );
-        assert!(!hub.with_body("doc", |body| body.has_pending()));
-        let mut restarted = DocumentBody::new(2);
-        for update in &appended {
-            restarted.import(update).unwrap();
-        }
-        assert_eq!(restarted.text(), text);
-    }
-
-    #[tokio::test]
-    async fn failed_append_keeps_export_for_retry_and_shutdown_drain() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
-        let (events, _) = broadcast::channel(8);
-        let hub = BodyHub {
-            store,
-            bodies: Arc::new(Mutex::new(HashMap::new())),
-            events,
-            flush: Arc::new(Notify::new()),
-            append_locks: Arc::new(Mutex::new(HashMap::new())),
-            waiting_metadata: Arc::new(Mutex::new(HashSet::new())),
-            metadata_lock: Arc::new(tokio::sync::Mutex::new(())),
-            peer: 1,
-            qualified: Arc::new(AtomicBool::new(false)),
-            identity_index_complete: Arc::new(AtomicBool::new(false)),
-            identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
-            publication_gate: Arc::new(Mutex::new(())),
-        };
-        hub.with_body("doc", |body| {
-            body.apply(&[TextOp::Insert {
-                insert: "saved".into(),
-            }])
-            .unwrap();
-        });
-        let first = hub.with_body("doc", |body| {
-            body.flush(Instant::now(), true).unwrap().updates[0].clone()
-        });
-        let failure = drain_document(&hub, "doc", true, |_update| async {
+        let failure = drain_document(&hub, "doc", |_update| async {
             Err(error("documents.capability_unavailable", true))
         })
         .await;
         assert!(failure.is_err());
         assert!(hub.with_body("doc", |body| body.has_pending()));
         let mut persisted = Vec::new();
-        drain_document(&hub, "doc", true, |update| {
+        drain_document(&hub, "doc", |update| {
             persisted.push(update);
             std::future::ready(Ok(()))
         })
         .await
         .unwrap();
-        assert_eq!(persisted, vec![first]);
+        assert_eq!(
+            persisted,
+            vec![staged],
+            "a retry appends exactly the same bytes"
+        );
         assert!(!hub.with_body("doc", |body| body.has_pending()));
-        let mut restarted = DocumentBody::new(1);
+        let mut restarted = DocumentBody::new();
+        restarted.import(&genesis()).unwrap();
         restarted.import(&persisted[0]).unwrap();
-        assert_eq!(restarted.text(), "saved");
+        assert_eq!(restarted.text(), "saved\n");
     }
 
-    // Verifies: AC2, AC3 — local edits are echoed, coalesced into one appended record, and a
-    // remote edit record is imported and pushed to the open text subscription.
+    /// A tree update the shared schema does not allow, on top of [`genesis`].
+    fn schema_invalid_update() -> Vec<u8> {
+        let doc = loro::LoroDoc::new();
+        doc.import(&TEST_GENESIS).unwrap();
+        let before = doc.oplog_vv();
+        let Some(loro::ValueOrContainer::Container(loro::Container::List(children))) =
+            doc.get_map("doc").get("children")
+        else {
+            panic!("the genesis has a children list");
+        };
+        let node = children.insert_container(0, loro::LoroMap::new()).unwrap();
+        node.insert("nodeName", "table").unwrap();
+        doc.commit();
+        doc.export(loro::ExportMode::updates(&before)).unwrap()
+    }
+
+    // Verifies: AC3 — a remote record that leaves a schema-invalid tree is an import failure of
+    // category `schema_violation`, and the last good body stays visible, read-only and incomplete.
     #[tokio::test]
-    async fn edits_are_echoed_appended_and_remote_edits_pushed() {
+    async fn schema_invalid_remote_record_is_an_import_failure_that_keeps_the_last_good_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let stream = session.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        let document = hex(64, 2);
+        let good = Writer::new().write("good\n");
+        let edit = |id: u64, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", &document, &hex(32, id), &[1; 32], update)
+                .unwrap()
+        };
+        for (seed, record) in [
+            (1, DomainRecord::collection_create("bob", "Plan").unwrap()),
+            (
+                2,
+                DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            ),
+            (3, edit(3, good)),
+            (4, edit(4, schema_invalid_update())),
+        ] {
+            assert!(stream.send(record_frame(seed, "bob", &record)).await);
+        }
+        let store = session.handles.store.clone();
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(hex(50, 4).as_str()),
+            "invalid record cursor",
+        )
+        .await;
+        assert_eq!(
+            store.import_failure(&document).unwrap(),
+            Some((hex(64, 4), "schema_violation".into()))
+        );
+        let opened = session
+            .harness
+            .request("documents.document.open", json!({"documentId":document}))
+            .await
+            .unwrap();
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        assert_eq!(opened["text"], "good\n");
+        assert_eq!(opened["diagnosticRecordId"], hex(64, 4));
+        let refused = submit(
+            &session.handles,
+            &document,
+            &hex(32, 5),
+            &session_update(&session.handles, &document, "good more\n"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code(), "documents.import_failure");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC2, AC3 — each local update is appended once as its own record, a refused
+    // update appends nothing, a remote record is pushed to the open text subscription, and the
+    // Package SQLite never holds the body's text.
+    #[tokio::test]
+    async fn local_updates_are_appended_once_and_remote_edits_pushed_without_plaintext() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), scripted_log()).await;
         qualify_empty_history(&session).await;
@@ -5728,36 +5631,27 @@ mod tests {
         let initial = text.next_event().await.unwrap().unwrap();
         assert_eq!(initial["text"], "");
 
-        let edited = session
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({ "documentId": document, "requestId":"44444444444444444444444444444444", "baseRevision": "0", "ops": [{ "insert": "# Plan" }] }),
-            )
+        let first = session_update(&session.handles, &document, "# Zebra plan\n");
+        let edited = submit(&session.handles, &document, &hex(32, 0x44), &first)
             .await
             .unwrap();
         assert_eq!(edited["revision"], "1");
-        let echo = text.next_event().await.unwrap().unwrap();
-        assert_eq!(echo["origin"], "local");
-        assert_eq!(echo["delta"], json!([{ "insert": "# Plan" }]));
-        let stale = session
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({ "documentId": document, "requestId":"55555555555555555555555555555555", "baseRevision": "0", "ops": [{ "insert": "x" }] }),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(stale.code(), "documents.stale_revision");
-        session
-            .harness
-            .request(
-                "documents.document.edit",
-                json!({ "documentId": document, "requestId":"66666666666666666666666666666666", "baseRevision": "1", "ops": [{ "retain": 6 }, { "insert": "\n" }] }),
-            )
+        let shown = text.next_event().await.unwrap().unwrap();
+        assert_eq!(shown["text"], "# Zebra plan\n");
+        let (peer, update) = session_update(&session.handles, &document, "x\n");
+        let foreign = submit(
+            &session.handles,
+            &document,
+            &hex(32, 0x55),
+            &(peer ^ 1, update),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign.code(), "documents.foreign_peer");
+        let second = session_update(&session.handles, &document, "# Zebra plan\n\nmore\n");
+        submit(&session.handles, &document, &hex(32, 0x66), &second)
             .await
             .unwrap();
-        let _ = text.next_event().await.unwrap().unwrap();
 
         // Each sequentially acknowledged request has its own durable append.
         let edit_appends = |scripted: &ScriptedCapability| {
@@ -5771,26 +5665,29 @@ mod tests {
         };
         let scripted = session.scripted.clone();
         wait_until(|| edit_appends(&scripted) == 2, "two durable edit appends").await;
-        tokio::time::sleep(COALESCE_WINDOW * 2).await;
+        tokio::time::sleep(FLUSH_RETRY * 3).await;
         assert_eq!(
             edit_appends(&session.scripted),
             2,
-            "no repeated record for an appended edit"
+            "no repeated record for an appended update, and none for the refused one"
         );
         {
             let bodies = session.handles.bodies.lock().unwrap();
-            assert_eq!(bodies[&document].text(), "# Plan\n");
+            assert_eq!(bodies[&document].text(), "# Zebra plan\n\nmore\n");
             assert!(!bodies[&document].has_pending());
         }
 
-        // A remote peer's edit arrives as a record and is pushed as a remote delta.
-        let mut bob = DocumentBody::new(77);
-        bob.apply(&[TextOp::Insert {
-            insert: "bob: ".into(),
-        }])
+        // A remote peer's edit arrives as a record and is pushed to the subscription.
+        let update = Writer::of(&session.handles, &document)
+            .write("# Zebra plan\n\nmore\n\nbob: platypus\n");
+        let remote = DomainRecord::identified_document_edit(
+            "bob",
+            &document,
+            &hex(32, 0x77),
+            &[7; 32],
+            update,
+        )
         .unwrap();
-        let update = bob.flush(Instant::now(), true).unwrap().updates.remove(0);
-        let remote = DomainRecord::document_edit("bob", &document, update).unwrap();
         let stream = session.scripted.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
             .await
@@ -5799,7 +5696,10 @@ mod tests {
         let pushed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = text.next_event().await.unwrap().unwrap();
-                if event["origin"] == "remote" {
+                if event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("platypus"))
+                {
                     break event;
                 }
             }
@@ -5814,11 +5714,22 @@ mod tests {
             .unwrap();
         let merged = reopened["text"].as_str().unwrap();
         assert!(
-            merged.contains("# Plan\n") && merged.contains("bob: "),
+            merged.contains("# Zebra plan\n") && merged.contains("bob: platypus"),
             "{merged:?}"
         );
         text.close().await;
         session.harness.shutdown().await.unwrap();
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            for plaintext in [&b"Zebra"[..], b"platypus", b"more\n"] {
+                assert!(
+                    !bytes
+                        .windows(plaintext.len())
+                        .any(|window| window == plaintext),
+                    "the Package data directory holds body text"
+                );
+            }
+        }
     }
 
     // Verifies: AC5 — a comment with a quote is appended, listed with its author, and resolved.
