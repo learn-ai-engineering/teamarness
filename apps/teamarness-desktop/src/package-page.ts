@@ -6,8 +6,12 @@ import type {
   PackageUiView,
 } from "./package-contracts";
 import {
+  isTeamIdentityEntry,
   packageRefusalMessage,
+  pendingRestartChange,
+  pendingRestartCopy,
   REMOVE_KEEPS_DATA_COPY,
+  teamEntryRemoveQuestion,
   type PackageManagementController,
   type RegistrationState,
 } from "./package-install";
@@ -60,6 +64,10 @@ export type PackagePagePresentation = Readonly<{
   trustLabel: string | null;
   personal: boolean;
   override: boolean;
+  /** The question before removing this Team Package identity's file entry, when it has one to remove. */
+  teamEntryRemoveQuestion: string | null;
+  /** What waits for a restart, when the registration file changed while Teamarness ran. */
+  pending: string | null;
   /** The registered Package Directory, for Personal Packages only. */
   directory: string | null;
   /** Why the registration could not start, when it was refused. */
@@ -284,7 +292,10 @@ export function buildPackagePagePresentation(
   const registration = snapshot.registrations.find((value) => value.expectedIdentity === identity);
   if (!entry && !registration) return null;
   const override = registration?.override === true;
-  const personal = registration !== undefined && registration.tier === "personal" && !override;
+  const teamEntry = registration !== undefined && isTeamIdentityEntry(registration);
+  const pending = registration ? pendingRestartChange(registration) : null;
+  const personal = registration !== undefined && registration.tier === "personal" && !teamEntry;
+  const name = entry?.displayName ?? identity;
   const instance = snapshot.instances.find(({ key }) =>
     key.packageIdentity === identity && key.workspaceId === target.workspaceId);
   const descriptor = instance ? lifecycleDescriptor(instance.lifecycle) : null;
@@ -315,7 +326,9 @@ export function buildPackagePagePresentation(
       controls.push("recover");
       if (descriptor.canDispose) controls.push("dispose");
     }
-    if (override) controls.push("remove");
+    if (pending) controls.push("restart-app");
+    // A removed entry is already gone from the file.
+    if (teamEntry && pending !== "removed") controls.push("remove");
   }
 
   const diagnostics = [...new Set(snapshot.diagnostics
@@ -325,7 +338,7 @@ export function buildPackagePagePresentation(
 
   return {
     identity,
-    name: entry?.displayName ?? identity,
+    name,
     version: entry?.version ?? null,
     description: entry?.description ?? null,
     author: entry?.author ?? null,
@@ -334,6 +347,8 @@ export function buildPackagePagePresentation(
     trustLabel: entry ? TRUST_LABELS[entry.trust] : null,
     personal,
     override,
+    teamEntryRemoveQuestion: teamEntry && pending !== "removed" ? teamEntryRemoveQuestion(registration, name) : null,
+    pending: pending ? pendingRestartCopy(pending, name) : null,
     directory: personal ? registration.directory : null,
     refusal: registration?.status.kind === "refused" ? packageRefusalMessage(registration.status.code) : null,
     instance: instance && descriptor
@@ -426,27 +441,31 @@ function renderControls(
 ): string {
   const registration = state.registration;
   const feedback = state.feedback ?? registration.feedback;
+  // A page that waits for a restart already offers Restart Teamarness.
+  const restartOffered = presentation.controls.includes("restart-app");
   const feedbackHtml = feedback
-    ? `<div class="${feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${feedback.failed ? "alert" : "status"}"><p>${escape(feedback.message)}</p>${registration.feedback?.restart && !state.feedback ? button("restart-app") : ""}</div>`
+    ? `<div class="${feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${feedback.failed ? "alert" : "status"}"><p>${escape(feedback.message)}</p>${registration.feedback?.restart && !state.feedback && !restartOffered ? button("restart-app") : ""}</div>`
+    : "";
+  const pendingHtml = presentation.pending
+    ? `<p class="package-install-note" role="status">${escape(presentation.pending)}</p>`
     : "";
   const working = state.working !== null || registration.working
     ? '<p role="status" aria-live="polite">Working…</p>'
     : "";
   const controls = presentation.controls;
-  if (controls.length === 0) return `${working}${feedbackHtml}`;
+  if (controls.length === 0) return `${pendingHtml}${working}${feedbackHtml}`;
   const removeLabel = presentation.override ? "Remove override" : "Remove";
   if (registration.confirming && controls.includes("remove")) {
-    const question = presentation.override
-      ? `Remove the override? ${presentation.name} returns to the Team Package after Teamarness restarts. Data is kept.`
-      : `Remove ${presentation.name} from this device? It stops in all your Workspaces. ${REMOVE_KEEPS_DATA_COPY}`;
-    return `${working}${feedbackHtml}<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${presentation.name}`)}"><p>${escape(question)}</p><div class="package-instance-actions">${button("confirm-remove", false, removeLabel)}${button("cancel-remove", true)}</div></div>`;
+    const question = presentation.teamEntryRemoveQuestion
+      ?? `Remove ${presentation.name} from this device? It stops in all your Workspaces. ${REMOVE_KEEPS_DATA_COPY}`;
+    return `${pendingHtml}${working}${feedbackHtml}<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${presentation.name}`)}"><p>${escape(question)}</p><div class="package-instance-actions">${button("confirm-remove", false, removeLabel)}${button("cancel-remove", true)}</div></div>`;
   }
   const buttons = controls.map((action) =>
     action === "remove" ? button("remove", true, removeLabel) : button(action, action === "dispose")).join("");
   const hint = presentation.personal
     ? '<p class="package-page-hint">Pause asks the Package to stop its work; its process keeps running until you Resume it. Restart starts a new process. Pause, Resume, and Restart apply to this Workspace. Reload and Remove apply in all your Workspaces.</p>'
     : "";
-  return `${working}${feedbackHtml}<div class="package-instance-actions">${buttons}</div>${hint}`;
+  return `${pendingHtml}${working}${feedbackHtml}<div class="package-instance-actions">${buttons}</div>${hint}`;
 }
 
 function renderCatalog(

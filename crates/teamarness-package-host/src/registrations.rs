@@ -196,6 +196,12 @@ pub(crate) fn preflight(
             PackageErrorStage::Admission,
             Some(identity.clone()),
         )),
+        // A fresh admission never reports a pending change.
+        RegistrationStatus::PendingRestart { .. } => Err(refusal(
+            PackageErrorCode::InvalidRegistration,
+            PackageErrorStage::Admission,
+            Some(identity.clone()),
+        )),
     }
 }
 

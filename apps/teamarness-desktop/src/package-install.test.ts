@@ -251,7 +251,8 @@ describe("Add Personal Package flow", () => {
   });
 
   it.each([
-    ["manifest_malformed", "no valid teamarness.package.json manifest"],
+    ["manifest_malformed", "is missing, cannot be read, or breaks a manifest rule"],
+    ["manifest_malformed", "Run teamarness-package-validate on the folder to see which rule."],
     ["source_not_found", "That folder does not exist."],
     ["invalid_registration", "full path"],
     ["override_required", "can only be replaced by an override"],
@@ -383,5 +384,67 @@ describe("registrations that need attention", () => {
     expect(after).toContain('data-package-registration-action="restart"');
     await test.controller.registrationAction("restart", override.expectedIdentity);
     expect(test.names().at(-1)).toBe("restart");
+  });
+
+  it("shows a removed override as waiting for a restart and offers no second Remove", async () => {
+    const removed: PackageRegistration = { ...override, status: { kind: "pending_restart", change: "removed" } };
+    const test = harness();
+    const html = test.controller.renderRegistrations(snapshot([removed]));
+    expect(html).toContain("Applies after restart: removed from this device. The Team Package Tutorial returns when Teamarness restarts.");
+    expect(html).toContain('data-package-registration-action="restart"');
+    expect(html).not.toContain('data-package-registration-action="remove"');
+    expect(html).not.toContain('data-package-registration-action="reload"');
+    await test.controller.registrationAction("restart", removed.expectedIdentity);
+    expect(test.names()).toEqual(["restart"]);
+  });
+
+  it("shows a written override as waiting for a restart, with Restart and Remove override", async () => {
+    const written: PackageRegistration = { ...override, status: { kind: "pending_restart", change: "written" } };
+    const test = harness();
+    await test.controller.registrationAction("remove", written.expectedIdentity);
+    const html = test.controller.renderRegistrations(snapshot([written]));
+    expect(html).toContain("Applies after restart: this override replaces the Team Package Tutorial when Teamarness restarts.");
+    expect(html).toContain("Remove the override?");
+    test.controller.dismissFeedback();
+    const idle = test.controller.renderRegistrations(snapshot([written]));
+    expect(idle).toContain('data-package-registration-action="restart"');
+    expect(idle).toContain("Remove override");
+  });
+
+  it("re-reads the snapshot after an override is written, so it shows as pending", async () => {
+    const test = harness({ inspected: tutorialOverride });
+    await test.controller.installAction("open");
+    await test.controller.installAction("choose");
+    await test.controller.installAction("continue");
+    await test.controller.installAction("trust");
+    const before = test.refreshes();
+    await test.controller.installAction("override");
+    expect(test.refreshes()).toBe(before + 1);
+    expect(test.controller.state().kind).toBe("restart");
+  });
+
+  it("offers Remove, not Reload, for an entry written by hand for a Team Package identity", async () => {
+    const handWritten: PackageRegistration = {
+      directory: "/Users/person/Packages/tutorial",
+      expectedIdentity: "dev.teamarness.tutorial",
+      override: false,
+      tier: "personal",
+      status: { kind: "refused", code: "override_required" },
+    };
+    const test = harness({ remove: async (identity) => { test.calls.push(["remove", identity]); return { revision: null, restartRequired: true }; } });
+    const html = test.controller.renderRegistrations(snapshot([handWritten]));
+    expect(html).toContain("without an override. The Team Package stays unavailable until you remove it and restart Teamarness.");
+    expect(html).not.toContain('data-package-registration-action="reload"');
+    expect(html).toContain('aria-label="Remove Tutorial"');
+
+    await test.controller.registrationAction("remove", handWritten.expectedIdentity);
+    expect(test.controller.renderRegistrations(snapshot([handWritten])))
+      .toContain("Remove this entry? The Team Package Tutorial returns after Teamarness restarts. Data is kept.");
+    await test.controller.registrationAction("confirm-remove", handWritten.expectedIdentity);
+    expect(test.calls).toEqual([["remove", handWritten.expectedIdentity]]);
+    const after = test.controller.renderRegistrations(snapshot([{ ...handWritten, status: { kind: "pending_restart", change: "removed" } }]));
+    expect(after).toContain("Removed from this device. Restart Teamarness to use the Team Package again.");
+    expect(after.match(/data-package-registration-action="restart"/g)).toHaveLength(1);
+    expect(after).not.toContain('data-package-registration-action="remove"');
   });
 });

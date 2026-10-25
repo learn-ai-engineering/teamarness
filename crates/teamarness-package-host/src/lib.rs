@@ -62,8 +62,8 @@ pub use crate::values::{
     LifecycleState, MountState, PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot,
     PackageHostState, PackageIdentity, PackageInstanceKey, PackageInstanceSnapshot,
     PackageSourceKind, PackageTier, PackageTrustKind, PackageUiView, PackageValue,
-    RegistrationRequest, RegistrationStatus, UiMountId, UiRequestId, UiResourceToken,
-    UiSubscriptionId, ValueParseError, WorkspaceId,
+    PendingRegistrationChange, RegistrationRequest, RegistrationStatus, UiMountId, UiRequestId,
+    UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
 };
 
 use crate::errors::host_error;

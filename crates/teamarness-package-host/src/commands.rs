@@ -166,7 +166,10 @@ pub struct RestartPersonal {
 }
 
 /// Writes an override registration that replaces a Team Package at the next
-/// application start (ADR 0031). Nothing changes in the running Host.
+/// application start (ADR 0031). No Instance, route, or mount changes in the
+/// running Host; its snapshot shows the registration as
+/// [`RegistrationStatus::PendingRestart`](crate::RegistrationStatus::PendingRestart)
+/// at a new revision.
 ///
 /// The identity must belong to a bundled Package, the directory must inspect as
 /// `expected_identity`, and the risks must be exactly the
@@ -180,8 +183,13 @@ pub struct WriteOverride {
     pub accepted_risks: Vec<String>,
 }
 
-/// Removes an override registration, so the bundled Package returns at the next
-/// application start. Nothing changes in the running Host.
+/// Removes the registration file entry for a Team Package identity, so the
+/// bundled Package returns at the next application start. The entry is an
+/// override, or one written by hand without `overrideApplication`, which the
+/// Host refused with `override_required`. No Instance, route, or mount changes
+/// in the running Host; its snapshot shows the registration as
+/// [`RegistrationStatus::PendingRestart`](crate::RegistrationStatus::PendingRestart)
+/// at a new revision, or drops it when the bundled Package already runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoveOverride {
     pub identity: PackageIdentity,

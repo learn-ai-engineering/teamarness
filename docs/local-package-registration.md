@@ -81,9 +81,11 @@ A local Package with the Package Identity of a bundled Package replaces it only 
 3. Read the second confirmation and select the replace button. It names the Team Package, for example **Replace Tutorial after restart**.
 4. Select **Restart Teamarness**, or select **Later** to apply the override at the next start.
 
-After the restart, the override runs in the Team tier. Its Package page labels its source as "Team, replaced on this device by an override", and the sidebar lists it under **Personal Packages**. It has no Personal controls.
+Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The bundled Package keeps running.
 
-To return to the bundled Package, select **Remove override** on the Package page or under **Needs attention on this device**. Then select **Restart Teamarness**.
+After the restart, the override runs in the Team tier, so the sidebar lists it under **Team Packages**. The sidebar groups Packages by tier, and its source label follows Package Source, so the override's label reads `Personal`. Its Package page labels its source as "Team, replaced on this device by an override". It has no Personal controls.
+
+To return to the bundled Package, select **Remove override** on the Package page or under **Needs attention on this device**. The override then shows "Applies after restart" and keeps running until you select **Restart Teamarness**.
 
 No source wins by file order or Package version. If a declared override is invalid, that Package Identity stays unavailable. Teamarness does not silently fall back to bundled code. Unrelated valid Packages and the Core Runtime continue.
 
@@ -178,7 +180,7 @@ Add `"overrideApplication": true` to an entry whose `expectedIdentity` is the id
 }
 ```
 
-Teamarness accepts a replacement only when the directory is canonical and readable, the manifest identity equals `expectedIdentity`, trust evidence is complete, and `overrideApplication` is true. An entry with a bundled identity and without `overrideApplication` is refused with `override_required`, and the bundled Package with that identity also stays unavailable until you correct the entry.
+Teamarness accepts a replacement only when the directory is canonical and readable, the manifest identity equals `expectedIdentity`, trust evidence is complete, and `overrideApplication` is true. An entry with a bundled identity and without `overrideApplication` is refused with `override_required`, and the bundled Package with that identity also stays unavailable until you correct the entry. **Needs attention on this device** lists such an entry with **Remove** and without **Reload**. **Remove** deletes the entry from the file, and the bundled Package returns after you select **Restart Teamarness**.
 
 ### What the Shell writes
 

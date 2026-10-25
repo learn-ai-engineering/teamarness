@@ -38,9 +38,9 @@ use crate::errors::{activation_error, host_error, instance_error};
 use crate::host::lifecycle::{prepare_instance, process_template};
 use crate::registrations;
 use crate::values::{
-    InstallationRegistrationSnapshot, LifecycleState, PackageCatalogEntry, PackageHostState,
-    PackageIdentity, PackageInstanceKey, PackageTier, RegistrationRequest, RegistrationStatus,
-    WorkspaceId,
+    InstallationRegistrationSnapshot, PackageCatalogEntry, PackageHostState, PackageIdentity,
+    PackageInstanceKey, PackageSourceKind, PackageTier, PendingRegistrationChange,
+    RegistrationRequest, RegistrationStatus, WorkspaceId,
 };
 use crate::{
     AuthoringCatalogEntry, InstallPersonal, PackageErrorCode, PackageErrorEnvelope,
@@ -376,27 +376,24 @@ impl PackageHost {
             return Err(refusal(PackageErrorCode::NotRegistered, identity));
         }
         let actor = self.actor(&key).await?;
-        let lifecycle = actor.snapshot().await.lifecycle;
-        if !matches!(
-            lifecycle,
-            LifecycleState::Active | LifecycleState::Failed | LifecycleState::CrashLoop
-        ) {
+        let restarted = actor
+            .restart()
+            .await
+            .map_err(|failure| instance_error(failure, &key))?;
+        if restarted == instance::RestartOutcome::NotRunning {
             return Err(instance_error(
                 crate::protocol::WireFailure::new(PackageErrorCode::InvalidLifecycleState),
                 &key,
             ));
         }
-        actor
-            .restart()
-            .await
-            .map_err(|failure| instance_error(failure, &key))?;
         Ok(PackageHostOutcome::PersonalRestarted {
             revision: self.bump_revision().await,
         })
     }
 
-    /// Writes an override registration for a bundled identity. The running Host
-    /// is unchanged; the override is admitted in the Team tier at the next open.
+    /// Writes an override registration for a bundled identity. No running
+    /// Instance changes; the override is admitted in the Team tier at the next
+    /// open. The snapshot shows the entry as pending a restart.
     ///
     /// The write holds the tier lock, so it never interleaves with a live
     /// Personal write to the same file.
@@ -429,12 +426,34 @@ impl PackageHost {
             })
             .await
             .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))??;
+        let entry = proposed
+            .iter()
+            .find(|entry| entry.expected_identity == input.expected_identity.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                refusal(
+                    PackageErrorCode::InvalidRegistration,
+                    &input.expected_identity,
+                )
+            })?;
         self.write_registrations(proposed).await?;
+        self.upsert_registration(snapshot_of(
+            &entry,
+            RegistrationStatus::PendingRestart {
+                change: PendingRegistrationChange::Written,
+            },
+        ))
+        .await;
+        self.bump_revision().await;
         Ok(PackageHostOutcome::OverrideWritten)
     }
 
-    /// Removes an override registration. The running Host is unchanged; the
+    /// Removes the file entry for a Team Package identity: an override, or an
+    /// entry written by hand without one. No running Instance changes; the
     /// bundled Package returns at the next open. Data is kept.
+    ///
+    /// The snapshot shows the entry as pending a restart, or drops it when the
+    /// bundled Package already runs, because then nothing is left to apply.
     pub(crate) async fn remove_override(
         &self,
         input: RemoveOverride,
@@ -446,8 +465,9 @@ impl PackageHost {
         let removing = identity.clone();
         tokio::task::spawn_blocking(move || {
             let mut entries = registrations::read_entries(&config)?;
+            let team = registrations::application_identities(&config).contains(&removing);
             if !entries.iter().any(|entry| {
-                entry.expected_identity == removing.as_str() && entry.override_application
+                entry.expected_identity == removing.as_str() && (entry.override_application || team)
             }) {
                 return Err(refusal(PackageErrorCode::NotRegistered, &removing));
             }
@@ -456,6 +476,25 @@ impl PackageHost {
         })
         .await
         .map_err(|_| unavailable())??;
+        {
+            let mut data = self.inner.data.lock().await;
+            let bundled_runs = data.packages.iter().any(|package| {
+                package.identity == identity && package.source == PackageSourceKind::Bundled
+            });
+            if bundled_runs {
+                data.registrations
+                    .retain(|registration| registration.expected_identity != identity.as_str());
+            } else {
+                for registration in &mut data.registrations {
+                    if registration.expected_identity == identity.as_str() {
+                        registration.status = RegistrationStatus::PendingRestart {
+                            change: PendingRegistrationChange::Removed,
+                        };
+                    }
+                }
+            }
+        }
+        self.bump_revision().await;
         Ok(PackageHostOutcome::OverrideRemoved)
     }
 
@@ -472,20 +511,27 @@ impl PackageHost {
     }
 
     /// The registration file entry for a Personal identity.
+    ///
+    /// An entry for a Team Package identity is refused with `override_required`,
+    /// also one written by hand without `overrideApplication`: it changes only
+    /// through [`RemoveOverride`] or an override, applied on restart.
     async fn personal_entry(
         &self,
         identity: &PackageIdentity,
     ) -> Result<InstallationEntry, PackageErrorEnvelope> {
         let config = self.inner.config.clone();
-        let entries = tokio::task::spawn_blocking(move || registrations::read_entries(&config))
-            .await
-            .map_err(|_| unavailable())??;
+        let checking = identity.clone();
+        let (entries, team) = tokio::task::spawn_blocking(move || {
+            let team = registrations::application_identities(&config).contains(&checking);
+            registrations::read_entries(&config).map(|entries| (entries, team))
+        })
+        .await
+        .map_err(|_| unavailable())??;
         let entry = entries
             .into_iter()
             .find(|entry| entry.expected_identity == identity.as_str())
             .ok_or_else(|| refusal(PackageErrorCode::NotRegistered, identity))?;
-        if entry.override_application || self.inner.team.admitted.contains_key(identity) {
-            // A Team Package changes only through an override, applied on restart.
+        if entry.override_application || team || self.inner.team.admitted.contains_key(identity) {
             return Err(refusal(PackageErrorCode::OverrideRequired, identity));
         }
         Ok(entry)
@@ -789,13 +835,18 @@ impl PackageHost {
                 .map(|(key, actor)| (key.clone(), actor.clone()))
                 .collect::<Vec<_>>();
             for (key, actor) in actors {
-                if let Err(failure) = actor.restart().await {
-                    self.inner
+                match actor.restart().await {
+                    // A consumer that is not running reads its new routes when it next starts.
+                    Ok(
+                        instance::RestartOutcome::Restarted | instance::RestartOutcome::NotRunning,
+                    ) => {}
+                    Err(failure) => self
+                        .inner
                         .data
                         .lock()
                         .await
                         .diagnostics
-                        .push(activation_error(&failure, &key));
+                        .push(activation_error(&failure, &key)),
                 }
             }
         }
@@ -908,8 +959,12 @@ fn snapshot_of(
     InstallationRegistrationSnapshot {
         directory: registration.directory.to_string_lossy().into_owned(),
         expected_identity: entry.expected_identity.clone(),
-        override_application: false,
-        tier: PackageTier::Personal,
+        override_application: entry.override_application,
+        tier: if entry.override_application {
+            PackageTier::Team
+        } else {
+            PackageTier::Personal
+        },
         status,
     }
 }

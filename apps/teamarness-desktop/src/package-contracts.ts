@@ -35,7 +35,11 @@ export type PackageRegistration = Readonly<{
   expectedIdentity: string;
   override: boolean;
   tier: "team" | "personal";
-  status: Readonly<{ kind: "admitted" }> | Readonly<{ kind: "refused"; code: string }>;
+  status:
+    | Readonly<{ kind: "admitted" }>
+    | Readonly<{ kind: "refused"; code: string }>
+    /** The file entry of a Team Package identity changed while Teamarness ran; it applies after a restart. */
+    | Readonly<{ kind: "pending_restart"; change: "written" | "removed" }>;
 }>;
 
 export type PackageHostSnapshot = Readonly<{

@@ -129,6 +129,7 @@ describe("display-safe Shell presentation", () => {
         availability: "Available",
         actionIndex: 1,
         installationLocal: false,
+        tier: "team",
         sourceLabel: "Team",
         canRecover: false,
         canDispose: true,
@@ -138,6 +139,7 @@ describe("display-safe Shell presentation", () => {
         availability: "Needs recovery",
         actionIndex: 0,
         installationLocal: true,
+        tier: "personal",
         sourceLabel: "Personal",
         canRecover: true,
         canDispose: true,
@@ -164,6 +166,44 @@ describe("display-safe Shell presentation", () => {
       "812",
       "991",
     ]) expect(serialized).not.toContain(forbidden);
+  });
+
+  it("groups by admission tier, so an override of a Team Package lists under Team Packages", () => {
+    const overrideIdentity = "dev.teamarness.tutorial";
+    const tiered: PackageHostSnapshot = {
+      ...snapshot,
+      packages: [...snapshot.packages, {
+        identity: overrideIdentity,
+        version: "1.0.1",
+        displayName: "Tutorial (local build)",
+        source: "local",
+        trust: "trusted_native_code_v1",
+        uiContractDigest: "override-digest",
+      }],
+      instances: [...snapshot.instances, {
+        key: { packageIdentity: overrideIdentity, workspaceId: workspace.id },
+        lifecycle: "active",
+        processGeneration: 1,
+        mountState: null,
+      }],
+      registrations: [{
+        directory: "/Users/person/Packages/tutorial",
+        expectedIdentity: overrideIdentity,
+        override: true,
+        tier: "team",
+        status: { kind: "admitted" },
+      }, {
+        directory: "/Users/person/Packages/planning",
+        expectedIdentity: packageIdentity,
+        override: false,
+        tier: "personal",
+        status: { kind: "admitted" },
+      }],
+    };
+    const presented = buildPackageNavigationPresentation(tiered, workspace.id);
+    expect(presented.teamPackages.map(({ name, sourceLabel, installationLocal }) => [name, sourceLabel, installationLocal]))
+      .toEqual([["Notes", "Team", false], ["Tutorial (local build)", "Personal", true]]);
+    expect(presented.privatePackages.map(({ name }) => name)).toEqual(["Planning"]);
   });
 
   it("maps every lifecycle to plain availability and gates only valid stable-state actions", () => {

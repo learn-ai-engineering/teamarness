@@ -19,6 +19,15 @@ use crate::{
     PackageValue, UiMountId, UiRequestId, UiSubscriptionId,
 };
 
+/// What [`InstanceActor::restart`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartOutcome {
+    /// A new process generation started.
+    Restarted,
+    /// The Instance was not running or failed, so nothing changed.
+    NotRunning,
+}
+
 pub(crate) struct InstanceActor {
     key: PackageInstanceKey,
     spec: ProcessSpec,
@@ -288,9 +297,11 @@ impl InstanceActor {
 
     /// Replaces a running or failed process with a new generation, so the
     /// Package starts again over its current Port routes. An Instance that never
-    /// started, is suspended, or has ended is left alone: it reads the current
-    /// routes whenever it next starts.
-    pub(crate) async fn restart(self: &Arc<Self>) -> Result<(), WireFailure> {
+    /// started, is suspended, or has ended is left alone and reports
+    /// [`RestartOutcome::NotRunning`]: it reads the current routes whenever it
+    /// next starts. The check runs under the lifecycle gate, so the outcome
+    /// always says what happened.
+    pub(crate) async fn restart(self: &Arc<Self>) -> Result<RestartOutcome, WireFailure> {
         let _gate = self.lifecycle_gate.lock().await;
         let process = {
             let mut state = self.state.lock().await;
@@ -299,7 +310,7 @@ impl InstanceActor {
                 LifecycleState::Active | LifecycleState::Failed | LifecycleState::CrashLoop
             ) || state.shutting_down
             {
-                return Ok(());
+                return Ok(RestartOutcome::NotRunning);
             }
             // The failure monitor sees a different generation and leaves the exit alone.
             let process = state.process.clone();
@@ -311,7 +322,8 @@ impl InstanceActor {
         if let Some(process) = process {
             process.shutdown().await;
         }
-        self.start_generation(true, false).await
+        self.start_generation(true, false).await?;
+        Ok(RestartOutcome::Restarted)
     }
 
     /// The process generation the newest spawn used, or the seed before any spawn.

@@ -468,7 +468,8 @@ pub enum PackageTier {
     Personal,
 }
 
-/// Whether one installation registration was admitted.
+/// Whether one installation registration was admitted, or how it changed
+/// since the Host opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RegistrationStatus {
@@ -476,6 +477,22 @@ pub enum RegistrationStatus {
     Refused {
         code: crate::errors::PackageErrorCode,
     },
+    /// The file entry for a Team Package identity was written or removed while
+    /// the Host ran. The running Host is unchanged; the change applies at the
+    /// next open.
+    PendingRestart {
+        change: PendingRegistrationChange,
+    },
+}
+
+/// The file change a [`RegistrationStatus::PendingRestart`] entry waits to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRegistrationChange {
+    /// An override was written. It replaces the bundled Package at the next open.
+    Written,
+    /// The entry was removed. The bundled Package returns at the next open.
+    Removed,
 }
 
 /// One entry of the installation registration file, as the Host last admitted it.

@@ -14,10 +14,10 @@ use std::time::Duration;
 use teamarness_package_host::{
     InstallPersonal, LifecycleState, MountState, OpenUiMount, PackageErrorCode,
     PackageErrorEnvelope, PackageHost, PackageHostCommand, PackageHostOutcome, PackageIdentity,
-    PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTier, PortStage,
-    ReconcileWorkspaces, RegistrationStatus, ReloadPersonal, RemoveOverride, RemovePersonal,
-    RestartPersonal, ShutdownHost, SuspendPackage, UiMountId, UiRequest, UiRequestId,
-    WriteOverride,
+    PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTier,
+    PendingRegistrationChange, PortStage, ReconcileWorkspaces, RegistrationStatus, ReloadPersonal,
+    RemoveOverride, RemovePersonal, RestartPersonal, ShutdownHost, SuspendPackage, UiMountId,
+    UiRequest, UiRequestId, WriteOverride,
 };
 
 const TEAM: &str = "com.example.team";
@@ -380,6 +380,9 @@ async fn restart_replaces_one_personal_process_and_refuses_a_team_instance() {
         }))
         .await
         .unwrap();
+    // The Instance actor decides under its lifecycle gate, so a refusal is
+    // never reported as a restart and publishes no new revision.
+    let paused_revision = live.host.snapshot().await.revision;
     let paused = live
         .host
         .execute(PackageHostCommand::RestartPersonal(RestartPersonal {
@@ -392,9 +395,15 @@ async fn restart_replaces_one_personal_process_and_refuses_a_team_instance() {
         PackageErrorCode::InvalidLifecycleState,
         "a paused Instance is not restarted silently"
     );
+    assert_eq!(paused.affected_instance.as_ref(), Some(&target));
+    assert_eq!(live.host.snapshot().await.revision, paused_revision);
     assert_eq!(
         generations(&instances(&live.host, "com.example.personal").await),
         vec![Some(2), Some(1)]
+    );
+    assert_eq!(
+        instances(&live.host, "com.example.personal").await[0].lifecycle,
+        LifecycleState::Suspended
     );
     live.shutdown().await;
 }
@@ -820,9 +829,25 @@ async fn an_override_is_written_to_the_file_only_and_applies_after_reopen() {
         serde_json::from_slice(&live.registration_file().unwrap()).unwrap();
     assert_eq!(file["registrations"][0]["expectedIdentity"], TEAM);
     assert_eq!(file["registrations"][0]["overrideApplication"], true);
-    // The running Host is unchanged: same revision, same Team Package and Instances.
+    // No Instance changes. The snapshot shows the override as pending a restart.
     let snapshot = live.host.snapshot().await;
-    assert_eq!(snapshot.revision, revision);
+    assert!(
+        snapshot.revision > revision,
+        "the pending override is published"
+    );
+    let pending = snapshot
+        .registrations
+        .iter()
+        .find(|registration| registration.expected_identity == TEAM)
+        .unwrap();
+    assert!(pending.override_application);
+    assert_eq!(pending.tier, PackageTier::Team);
+    assert_eq!(
+        pending.status,
+        RegistrationStatus::PendingRestart {
+            change: PendingRegistrationChange::Written
+        }
+    );
     let source = |snapshot: &teamarness_package_host::PackageHostSnapshot| {
         snapshot
             .packages
@@ -864,17 +889,35 @@ async fn an_override_is_written_to_the_file_only_and_applies_after_reopen() {
         .await
         .unwrap_err();
     assert_eq!(missing.code, PackageErrorCode::NotRegistered);
-    let removed = reopened
-        .execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+    let before_remove = reopened.snapshot().await.revision;
+    let remove_team = || {
+        PackageHostCommand::RemoveOverride(RemoveOverride {
             identity: TEAM.parse().unwrap(),
-        }))
-        .await
-        .unwrap();
+        })
+    };
+    let removed = reopened.execute(remove_team()).await.unwrap();
     assert_eq!(removed, PackageHostOutcome::OverrideRemoved);
-    assert_eq!(
-        source(&reopened.snapshot().await),
-        Some(PackageSourceKind::Local)
+    let snapshot = reopened.snapshot().await;
+    assert_eq!(source(&snapshot), Some(PackageSourceKind::Local));
+    assert!(
+        snapshot.revision > before_remove,
+        "the removal is published"
     );
+    let pending = snapshot
+        .registrations
+        .iter()
+        .find(|registration| registration.expected_identity == TEAM)
+        .unwrap();
+    assert_eq!(
+        pending.status,
+        RegistrationStatus::PendingRestart {
+            change: PendingRegistrationChange::Removed
+        },
+        "the running override stays listed until the restart"
+    );
+    // Nothing is left to remove until the restart applies the change.
+    let again = reopened.execute(remove_team()).await.unwrap_err();
+    assert_eq!(again.code, PackageErrorCode::NotRegistered);
     reopened
         .execute(PackageHostCommand::Shutdown(ShutdownHost))
         .await
@@ -883,6 +926,137 @@ async fn an_override_is_written_to_the_file_only_and_applies_after_reopen() {
     assert_eq!(
         source(&restored.snapshot().await),
         Some(PackageSourceKind::Bundled)
+    );
+    restored
+        .execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+    drop(live.fixture);
+}
+
+/// Verifies: TEAM.SYS.PKG-R09
+#[tokio::test]
+async fn an_override_removed_before_the_restart_leaves_nothing_pending() {
+    let live = Live::open().await;
+    let build = live.package("team-build", TEAM, Ports::None);
+    live.host
+        .execute(PackageHostCommand::WriteOverride(WriteOverride {
+            directory: build,
+            expected_identity: TEAM.parse().unwrap(),
+            accepted_risks: RISKS.map(str::to_owned).to_vec(),
+        }))
+        .await
+        .unwrap();
+    let written = live.host.snapshot().await.revision;
+    let removed = live
+        .host
+        .execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity: TEAM.parse().unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(removed, PackageHostOutcome::OverrideRemoved);
+    let snapshot = live.host.snapshot().await;
+    assert!(snapshot.revision > written);
+    assert!(
+        snapshot.registrations.is_empty(),
+        "the bundled Package already runs, so nothing waits for a restart"
+    );
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09
+#[tokio::test]
+async fn a_hand_written_entry_for_a_team_identity_is_removed_and_the_bundled_package_returns() {
+    let live = Live::open().await;
+    let build = live.package("team-build", TEAM, Ports::None);
+    live.host
+        .execute(PackageHostCommand::WriteOverride(WriteOverride {
+            directory: build,
+            expected_identity: TEAM.parse().unwrap(),
+            accepted_risks: RISKS.map(str::to_owned).to_vec(),
+        }))
+        .await
+        .unwrap();
+    // A person edits the file by hand and drops `overrideApplication`.
+    let path = live.fixture._private.join("packages/registrations.v1.json");
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    file["registrations"][0]["overrideApplication"] = serde_json::json!(false);
+    fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let config = live.fixture.config.clone();
+    let core = live.fixture.core.clone();
+    live.host
+        .execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+    let host = PackageHost::open(config.clone(), core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    assert!(
+        !snapshot
+            .packages
+            .iter()
+            .any(|package| package.identity.as_str() == TEAM),
+        "the entry makes the Team identity unavailable"
+    );
+    let registration = &snapshot.registrations[0];
+    assert_eq!(registration.expected_identity, TEAM);
+    assert_eq!(
+        registration.status,
+        RegistrationStatus::Refused {
+            code: PackageErrorCode::OverrideRequired
+        }
+    );
+
+    // Reload and a live Remove are refused clearly and change nothing.
+    let revision = snapshot.revision;
+    for command in [
+        PackageHostCommand::ReloadPersonal(ReloadPersonal {
+            identity: TEAM.parse().unwrap(),
+        }),
+        PackageHostCommand::RemovePersonal(RemovePersonal {
+            identity: TEAM.parse().unwrap(),
+        }),
+    ] {
+        let refused = host.execute(command).await.unwrap_err();
+        assert_eq!(refused.code, PackageErrorCode::OverrideRequired);
+    }
+    assert_eq!(host.snapshot().await.revision, revision);
+
+    let removed = host
+        .execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity: TEAM.parse().unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(removed, PackageHostOutcome::OverrideRemoved);
+    let snapshot = host.snapshot().await;
+    assert!(snapshot.revision > revision);
+    assert_eq!(
+        snapshot.registrations[0].status,
+        RegistrationStatus::PendingRestart {
+            change: PendingRegistrationChange::Removed
+        }
+    );
+    let file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(file["registrations"], serde_json::json!([]));
+
+    host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+    let restored = PackageHost::open(config, core).await.unwrap();
+    let snapshot = restored.snapshot().await;
+    assert!(snapshot.registrations.is_empty());
+    assert_eq!(
+        snapshot
+            .packages
+            .iter()
+            .find(|package| package.identity.as_str() == TEAM)
+            .map(|package| package.source),
+        Some(PackageSourceKind::Bundled),
+        "the bundled Package returns after the restart"
     );
     restored
         .execute(PackageHostCommand::Shutdown(ShutdownHost))

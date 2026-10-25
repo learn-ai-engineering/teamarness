@@ -349,6 +349,49 @@ describe("Package page", () => {
     expect(test.calls.at(-1)).toBe("app-restart");
   });
 
+  it("shows a removed override as applying after restart, with Restart Teamarness and no second Remove", async () => {
+    const pending = snapshot({
+      registrations: [{
+        directory: "/Users/person/Packages/tutorial", expectedIdentity: TUTORIAL, override: true, tier: "team",
+        status: { kind: "pending_restart", change: "removed" },
+      }],
+      packages: [...snapshot().packages, {
+        identity: TUTORIAL, version: "9.0.0", displayName: "Tutorial", source: "local", trust: "trusted_native_code_v1", uiContractDigest: "digest",
+      }],
+      instances: [instance(TUTORIAL, "active")],
+    });
+    const test = harness(pending);
+    await test.open(TUTORIAL);
+    expect(test.html()).toContain("Applies after restart: removed from this device.");
+    expect(actions(test.html())).toEqual(["restart-app"]);
+    await test.act("remove");
+    expect(test.calls).not.toContain(`remove:${TUTORIAL}`);
+    await test.act("restart-app");
+    expect(test.calls.at(-1)).toBe("app-restart");
+  });
+
+  it("offers Remove, not Reload, for an entry written by hand for a Team Package identity", async () => {
+    const handWritten = snapshot({
+      registrations: [{
+        directory: "/Users/person/Packages/tutorial", expectedIdentity: TUTORIAL, override: false, tier: "personal",
+        status: { kind: "refused", code: "override_required" },
+      }],
+      instances: [],
+    });
+    const test = harness(handWritten, {
+      remove: async (identity) => { test.calls.push(`remove:${identity}`); return { revision: null, restartRequired: true }; },
+    });
+    await test.open(TUTORIAL);
+    expect(test.html()).toContain("Team Package");
+    expect(actions(test.html())).toEqual(["remove"]);
+    await test.act("remove");
+    expect(test.html()).toContain(`Remove this entry? The Team Package ${TUTORIAL} returns after Teamarness restarts. Data is kept.`);
+    await test.act("confirm-remove");
+    expect(test.calls).toContain(`remove:${TUTORIAL}`);
+    expect(test.removed).toEqual([]);
+    expect(test.html()).toContain("Restart Teamarness to use the Team Package again.");
+  });
+
   it("calls the right commands for Reload, Restart, Pause, Resume, and Start", async () => {
     const test = harness();
     await test.open(AGENT);

@@ -7,12 +7,13 @@ use tauri::{AppHandle, Manager, State, ipc::Channel};
 use tauri_plugin_dialog::DialogExt;
 use teamarness_package_host::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    HostRevision, InstallPersonal, OpenUiMount, OpenUiSubscription, PackageErrorCode,
-    PackageErrorStage, PackageHost, PackageHostCommand, PackageHostNotification,
-    PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey,
-    PackageUiView, PackageValue, RecoverPackage, ReloadPersonal, RemoveOverride, RemovePersonal,
-    ReportUiFault, RestartPersonal, SuspendPackage, UiMountId, UiRequest, UiRequestId,
-    UiSubscriptionId, WorkspaceId, WriteOverride,
+    HostRevision, InstallPersonal, InstallationRegistrationSnapshot, OpenUiMount,
+    OpenUiSubscription, PackageErrorCode, PackageErrorStage, PackageHost, PackageHostCommand,
+    PackageHostNotification, PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity,
+    PackageInstanceKey, PackageTier, PackageUiView, PackageValue, RecoverPackage,
+    RegistrationStatus, ReloadPersonal, RemoveOverride, RemovePersonal, ReportUiFault,
+    RestartPersonal, SuspendPackage, UiMountId, UiRequest, UiRequestId, UiSubscriptionId,
+    WorkspaceId, WriteOverride,
 };
 
 use crate::DesktopState;
@@ -420,7 +421,8 @@ pub async fn package_reload(
     reload(&host, identity).await
 }
 
-/// Removes a Personal Package now, or an override at the next start. Data is kept.
+/// Removes a Personal Package now, or the file entry of a Team Package identity
+/// (an override, or one written by hand without it) at the next start. Data is kept.
 #[tauri::command]
 pub async fn package_remove(
     identity: String,
@@ -513,27 +515,59 @@ async fn remove(
     identity: String,
 ) -> Result<PackageChangeDto, PackageBridgeError> {
     let identity = parse_identity(identity)?;
-    let removed = host
-        .execute(PackageHostCommand::RemovePersonal(RemovePersonal {
-            identity: identity.clone(),
+    // The snapshot registration says which tier the entry changes. An entry for
+    // a Team Package identity (an override, or one written by hand without it)
+    // is removed from the file and applies at the next start.
+    let team_entry = host
+        .snapshot()
+        .await
+        .registrations
+        .iter()
+        .any(|registration| {
+            registration.expected_identity == identity.as_str() && team_identity_entry(registration)
+        });
+    if team_entry {
+        let identity_text = identity.as_str().to_owned();
+        host.execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity,
         }))
-        .await;
-    match removed {
-        Ok(PackageHostOutcome::PersonalRemoved { revision }) => {
-            Ok(PackageChangeDto::live(revision))
+        .await
+        .map_err(PackageBridgeError::from)?;
+        let snapshot = host.snapshot().await;
+        // An override removed before it applied leaves the bundled Package running as it is.
+        if !snapshot
+            .registrations
+            .iter()
+            .any(|registration| registration.expected_identity == identity_text)
+        {
+            return Ok(PackageChangeDto::live(snapshot.revision));
         }
-        Ok(_) => unreachable!("RemovePersonal has one success outcome"),
-        // A Team identity changes only through its override, which applies at the next start.
-        Err(error) if error.code == PackageErrorCode::OverrideRequired => {
-            host.execute(PackageHostCommand::RemoveOverride(RemoveOverride {
-                identity,
-            }))
-            .await
-            .map_err(PackageBridgeError::from)?;
-            Ok(PackageChangeDto::after_restart())
-        }
-        Err(error) => Err(error.into()),
+        return Ok(PackageChangeDto::after_restart());
     }
+    let outcome = host
+        .execute(PackageHostCommand::RemovePersonal(RemovePersonal {
+            identity,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    let PackageHostOutcome::PersonalRemoved { revision } = outcome else {
+        unreachable!("RemovePersonal has one success outcome")
+    };
+    Ok(PackageChangeDto::live(revision))
+}
+
+/// Whether a registration is a file entry for a Team Package identity, which
+/// changes only at the next start.
+fn team_identity_entry(registration: &InstallationRegistrationSnapshot) -> bool {
+    registration.override_application
+        || registration.tier == PackageTier::Team
+        || matches!(
+            registration.status,
+            RegistrationStatus::PendingRestart { .. }
+                | RegistrationStatus::Refused {
+                    code: PackageErrorCode::OverrideRequired
+                }
+        )
 }
 
 async fn write_override(
@@ -894,6 +928,31 @@ mod tests {
         (root, core, host)
     }
 
+    /// Shuts `host` down and opens a new Host over the same directories.
+    async fn reopen(
+        root: &tempfile::TempDir,
+        core: &Arc<CoreRuntime>,
+        host: Arc<PackageHost>,
+    ) -> Arc<PackageHost> {
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+        let application = root.path().join("application");
+        Arc::new(
+            PackageHost::open(
+                PackageHostConfig::new(
+                    application.clone(),
+                    application.join("application-packages.v1.json"),
+                    root.path().join("private"),
+                    InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
+                ),
+                Arc::clone(core),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
     const FIXTURE: &str = "com.example.desktop-fixture";
     const PERSONAL: &str = "com.example.desktop-personal";
     const RISKS: [&str; 3] = ["filesystem", "network", "process"];
@@ -1116,22 +1175,77 @@ mod tests {
             let file: serde_json::Value =
                 serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
             assert_eq!(file["registrations"][0]["overrideApplication"], true);
+            // No Instance changes; the snapshot publishes the pending override.
             let after = host.snapshot().await;
-            assert_eq!(after.revision, before.revision);
+            assert!(after.revision > before.revision);
             assert_eq!(
                 after.instances[0].process_generation,
                 before.instances[0].process_generation
             );
+            let pending = serde_json::to_value(PackageHostSnapshotDto::from(after)).unwrap();
+            assert_eq!(
+                pending["registrations"][0]["status"],
+                serde_json::json!({"kind": "pending_restart", "change": "written"})
+            );
 
-            // Remove of a Team identity removes its override, also on restart.
+            // Removing the override before it applied leaves nothing to restart for.
             let removed = remove(&host, FIXTURE.into()).await.unwrap();
             assert_eq!(
                 serde_json::to_value(removed).unwrap()["restartRequired"],
-                true
+                false
+            );
+            assert!(host.snapshot().await.registrations.is_empty());
+            let file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            assert_eq!(file["registrations"], serde_json::json!([]));
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn a_hand_written_entry_for_a_team_identity_is_removed_for_the_next_start() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/team-build");
+            write_package(&directory, FIXTURE);
+            write_override(
+                &host,
+                directory.to_string_lossy().into_owned(),
+                FIXTURE.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap();
+            // A person drops `overrideApplication` by hand.
+            let path = root.path().join("private/packages/registrations.v1.json");
+            let mut file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            file["registrations"][0]["overrideApplication"] = serde_json::json!(false);
+            fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+            let host = reopen(&root, &core, host).await;
+            assert_eq!(identities(&host).await, Vec::<String>::new());
+
+            let reloaded = reload(&host, FIXTURE.into()).await.unwrap_err();
+            assert_eq!(code(reloaded), "override_required");
+
+            let removed = remove(&host, FIXTURE.into()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(removed).unwrap(),
+                serde_json::json!({"revision": null, "restartRequired": true})
             );
             let file: serde_json::Value =
                 serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
             assert_eq!(file["registrations"], serde_json::json!([]));
+            let snapshot =
+                serde_json::to_value(PackageHostSnapshotDto::from(host.snapshot().await)).unwrap();
+            assert_eq!(
+                snapshot["registrations"][0]["status"],
+                serde_json::json!({"kind": "pending_restart", "change": "removed"})
+            );
+
+            let host = reopen(&root, &core, host).await;
             assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
             close(root, core, host).await;
         });

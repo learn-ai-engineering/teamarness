@@ -102,7 +102,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 1024,
-          "pattern": "^[^\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f]*$"
+          "pattern": "^[^\\x00-\\x20\\x7f-\\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000](?:[^\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f]*[^\\x00-\\x20\\x7f-\\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000])?$"
         },
         "author": {
           "type": "string",

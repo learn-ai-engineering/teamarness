@@ -95,6 +95,7 @@ pub struct PackageRegistrationDto {
 pub enum PackageRegistrationStatusDto {
     Admitted,
     Refused { code: String },
+    PendingRestart { change: String },
 }
 
 impl From<InstallationRegistrationSnapshot> for PackageRegistrationDto {
@@ -109,6 +110,11 @@ impl From<InstallationRegistrationSnapshot> for PackageRegistrationDto {
                 RegistrationStatus::Refused { code } => PackageRegistrationStatusDto::Refused {
                     code: wire_name(code),
                 },
+                RegistrationStatus::PendingRestart { change } => {
+                    PackageRegistrationStatusDto::PendingRestart {
+                        change: wire_name(change),
+                    }
+                }
             },
         }
     }
@@ -586,6 +592,24 @@ mod tests {
             )["status"],
             serde_json::json!({"kind": "refused", "code": "port_provider_conflict"})
         );
+        for (change, wire) in [
+            (
+                teamarness_package_host::PendingRegistrationChange::Written,
+                "written",
+            ),
+            (
+                teamarness_package_host::PendingRegistrationChange::Removed,
+                "removed",
+            ),
+        ] {
+            assert_eq!(
+                registration(
+                    teamarness_package_host::PackageTier::Team,
+                    RegistrationStatus::PendingRestart { change }
+                )["status"],
+                serde_json::json!({"kind": "pending_restart", "change": wire})
+            );
+        }
     }
 
     #[test]
