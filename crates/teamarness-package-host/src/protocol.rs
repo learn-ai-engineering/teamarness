@@ -548,7 +548,36 @@ pub(crate) struct HostStreamSender {
     state: SharedState,
 }
 
+#[cfg(test)]
+pub(crate) struct TestStreamOutput(mpsc::Receiver<QueuedFrame>);
+
+#[cfg(test)]
+impl TestStreamOutput {
+    pub(crate) async fn recv(&mut self) -> Option<Value> {
+        self.0.recv().await.map(|queued| queued.frame.as_value())
+    }
+}
+
 impl HostStreamSender {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, TestStreamOutput) {
+        let (control, _) = mpsc::channel(CONTROL_QUEUE);
+        let (data, receiver) = mpsc::channel(DATA_QUEUE);
+        (
+            Self {
+                writer: Writer {
+                    control,
+                    data,
+                    control_bytes: Arc::new(Semaphore::new(CONTROL_BYTES)),
+                    data_bytes: Arc::new(Semaphore::new(DATA_BYTES)),
+                    terminal_bytes: Arc::new(Semaphore::new(TERMINAL_RESERVE_BYTES)),
+                },
+                state: Arc::new(Mutex::new(ContractState::default())),
+            },
+            TestStreamOutput(receiver),
+        )
+    }
+
     pub(crate) async fn event(
         &self,
         stream_id: &str,

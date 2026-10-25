@@ -612,6 +612,8 @@ impl GenerationCapabilities {
                     all_streams,
                     self.cancelled.subscribe(),
                     grant.minor,
+                    #[cfg(test)]
+                    None,
                 ));
             }
             _ => {
@@ -1720,6 +1722,36 @@ impl StateTracking {
 /// While catching up, a state event is sent at most every this many records.
 const RECORDS_PER_STATE: usize = 128;
 
+/// Controlled page/idle boundaries for actual-stream tests, absent from production builds.
+#[cfg(test)]
+struct RecordStreamStep {
+    idle: bool,
+    refreshed_after_empty: bool,
+    resume: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+async fn record_stream_step(
+    steps: &Option<mpsc::Sender<RecordStreamStep>>,
+    idle: bool,
+    refreshed_after_empty: bool,
+) {
+    if let Some(steps) = steps {
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        if steps
+            .send(RecordStreamStep {
+                idle,
+                refreshed_after_empty,
+                resume,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = paused.await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_record_stream(
     core: Arc<CoreRuntime>,
@@ -1733,15 +1765,23 @@ async fn run_record_stream(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
     negotiated_minor: u16,
+    #[cfg(test)] steps: Option<mpsc::Sender<RecordStreamStep>>,
 ) {
     let subscribe_core = core.clone();
     let subscribe_package = package.clone();
     let opened = tokio::task::spawn_blocking(move || {
-        subscribe_core.subscribe_records(workspace, &subscribe_package, after)
+        let subscription =
+            subscribe_core.subscribe_records(workspace, &subscribe_package, after)?;
+        // Page/availability reads acknowledge their receiver. Keep one independent,
+        // queue-free subscription solely for notifications, opened in the same
+        // admitted scope before any state is reported. It never reads or emits records.
+        let notifications =
+            subscribe_core.subscribe_records(workspace, &subscribe_package, after)?;
+        Ok((subscription, notifications))
     })
     .await;
-    let mut subscription = match opened {
-        Ok(Ok(subscription)) => subscription,
+    let (mut subscription, mut notifications) = match opened {
+        Ok(Ok(subscriptions)) => subscriptions,
         // A cursor from another journal, or beyond this one, is the Package's
         // to reset: it clears the cursor and replays by record identity.
         Ok(Err(
@@ -1855,6 +1895,8 @@ async fn run_record_stream(
             need_state = false;
             continue;
         }
+        #[cfg(test)]
+        record_stream_step(&steps, false, refreshed_after_empty).await;
         let limit = usize::try_from(credit.min(RECORD_PAGE)).unwrap_or(1);
         let read = tokio::task::spawn_blocking(move || {
             let page = subscription.next_page(limit);
@@ -1918,15 +1960,17 @@ async fn run_record_stream(
             continue;
         }
         // Nothing was ready. The availability is re-read once, so a stream that
-        // has caught up says so, and then the subscription waits on the journal
-        // head rather than polling storage.
+        // has caught up says so, and then the independent notification receiver
+        // waits without letting this final page read consume its wakeup.
         if !refreshed_after_empty {
             refreshed_after_empty = true;
             need_state = true;
             continue;
         }
+        #[cfg(test)]
+        record_stream_step(&steps, true, refreshed_after_empty).await;
         tokio::select! {
-            changed = subscription.changed() => {
+            changed = notifications.changed() => {
                 if changed.is_err() {
                     break;
                 }
@@ -2078,6 +2122,229 @@ mod tests {
     use std::time::Duration;
 
     use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+
+    struct RecordStreamFixture {
+        _directory: tempfile::TempDir,
+        core: Arc<CoreRuntime>,
+        workspace: teamarness_core::WorkspaceId,
+        output: crate::protocol::TestStreamOutput,
+        commands: mpsc::Sender<StreamCommand>,
+        cancelled: watch::Sender<bool>,
+        streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
+        steps: mpsc::Receiver<RecordStreamStep>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RecordStreamFixture {
+        const PACKAGE: &str = "dev.teamarness.fixture";
+
+        async fn new(with_peer: bool) -> (Self, Option<teamarness_core::PublicIdentity>) {
+            let directory = tempfile::tempdir().unwrap();
+            let core = Arc::new(
+                CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(
+                    directory.path().join("core"),
+                ))
+                .await
+                .unwrap(),
+            );
+            core.pause_sync_scheduler_for_tests(true);
+            let workspace = core.create_workspace("Idle handoff").unwrap().id();
+            let peer = with_peer.then(|| core.admit_unreachable_member_for_tests(workspace));
+            let (sender, output) = HostStreamSender::for_test();
+            let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
+            let streams = Arc::new(Mutex::new(BTreeMap::from([(
+                "p:idle".into(),
+                commands.clone(),
+            )])));
+            let (cancelled, cancellation) = watch::channel(false);
+            // One outstanding boundary handshake: the stream awaits its resume
+            // before it can reach another controlled boundary.
+            const PROBE_CAPACITY: usize = 1;
+            let (probe, steps) = mpsc::channel(PROBE_CAPACITY);
+            let task = tokio::spawn(run_record_stream(
+                core.clone(),
+                workspace,
+                Self::PACKAGE.into(),
+                "p:idle".into(),
+                None,
+                MAX_STREAM_CREDIT,
+                receiver,
+                sender,
+                streams.clone(),
+                cancellation,
+                0,
+                Some(probe),
+            ));
+            (
+                Self {
+                    _directory: directory,
+                    core,
+                    workspace,
+                    output,
+                    commands,
+                    cancelled,
+                    streams,
+                    steps,
+                    task,
+                },
+                peer,
+            )
+        }
+
+        async fn event(&mut self) -> Value {
+            tokio::time::timeout(Duration::from_secs(2), self.output.recv())
+                .await
+                .expect("Host stream must deliver the event")
+                .expect("stream output")
+        }
+
+        async fn boundary(&mut self, idle: bool) -> RecordStreamStep {
+            loop {
+                let step = tokio::time::timeout(Duration::from_secs(2), self.steps.recv())
+                    .await
+                    .expect("Host reaches the controlled boundary")
+                    .unwrap();
+                if step.refreshed_after_empty && step.idle == idle {
+                    return step;
+                }
+                step.resume.send(()).unwrap();
+            }
+        }
+
+        async fn quiet(&mut self) {
+            // A bounded negative observation, not a delay used to cause a transition.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    tokio::select! {
+                        _ = self.output.recv() => {},
+                        _ = self.steps.recv() => {},
+                    }
+                })
+                .await
+                .is_err(),
+                "idle stream emitted again or polled Core without a change"
+            );
+        }
+
+        async fn finish(self, cancel: bool) {
+            if cancel {
+                self.cancelled.send(true).unwrap();
+            } else {
+                self.commands.send(StreamCommand::Close).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), self.task)
+                .await
+                .expect("stream owns prompt watcher teardown")
+                .unwrap();
+            assert!(self.streams.lock().await.is_empty());
+            self.core.shutdown().await.unwrap();
+        }
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R07
+    #[tokio::test]
+    async fn record_stream_delivers_state_only_change_before_last_empty_page() {
+        let (mut fixture, peer) = RecordStreamFixture::new(true).await;
+        let first = fixture.event().await;
+        assert_eq!(first["payload"]["availability"], "catching_up");
+        assert_eq!(first["payload"]["pendingRecordCount"], "0");
+        let boundary = fixture.boundary(false).await;
+        // The stream has refreshed its last state and is about to read the final
+        // empty page. Core publishes only health here: no record can wake it later.
+        fixture.core.set_peer_outcome_for_tests(
+            fixture.workspace,
+            RecordStreamFixture::PACKAGE,
+            peer.unwrap(),
+            "reachable",
+        );
+        boundary.resume.send(()).unwrap();
+        fixture.boundary(true).await.resume.send(()).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), fixture.output.recv()).await;
+        // Release all owned work even on the expected pre-fix negative observation.
+        if received.is_err() {
+            fixture.finish(false).await;
+            panic!("state-only Current notification was lost at the empty-page/idle handoff");
+        }
+        let current = received.unwrap().unwrap();
+        assert_eq!(current["sequence"], "2");
+        assert_eq!(current["payload"]["kind"], "state");
+        assert_eq!(current["payload"]["availability"], "current");
+        fixture.boundary(true).await.resume.send(()).unwrap();
+        fixture.quiet().await;
+        fixture.finish(false).await;
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R07
+    #[tokio::test]
+    async fn record_stream_idle_arrival_preserves_credit_order_and_cancellation() {
+        let (mut fixture, _) = RecordStreamFixture::new(false).await;
+        assert_eq!(fixture.event().await["payload"]["availability"], "current");
+        let idle = fixture.boundary(true).await;
+        // Commit after the final empty page but before idle waiting begins.
+        let mut expected = Vec::new();
+        for index in 0..35 {
+            let appended = fixture
+                .core
+                .append_record(
+                    fixture.workspace,
+                    RecordStreamFixture::PACKAGE,
+                    "fixture.record",
+                    format!("record-{index}").as_bytes(),
+                )
+                .unwrap();
+            expected.push(appended.record_id().to_string());
+        }
+        idle.resume.send(()).unwrap();
+        let catching_up = fixture.event().await;
+        assert_eq!(catching_up["sequence"], "2");
+        assert_eq!(catching_up["payload"]["availability"], "catching_up");
+        assert_eq!(catching_up["payload"]["pendingRecordCount"], "35");
+        let mut records = Vec::new();
+        // Two state events leave credit for thirty records, not thirty-two.
+        // Drive only explicit barriers, never timing, while consuming the real writer.
+        while records.len() < 30 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    step = fixture.steps.recv() => { step.unwrap().resume.send(()).unwrap(); },
+                    event = fixture.output.recv() => {
+                        let event = event.unwrap();
+                        assert_eq!(event["sequence"], (records.len() + 3).to_string());
+                        assert_eq!(event["payload"]["kind"], "record");
+                        records.push(event["payload"]["recordId"].as_str().unwrap().to_owned());
+                    }
+                }
+            })
+            .await
+            .expect("credited records arrive");
+        }
+        assert_eq!(records, expected[..30]);
+        fixture.quiet().await;
+        fixture
+            .commands
+            .send(StreamCommand::Credit(5))
+            .await
+            .unwrap();
+        while records.len() < 35 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    step = fixture.steps.recv() => { step.unwrap().resume.send(()).unwrap(); },
+                    event = fixture.output.recv() => {
+                        let event = event.unwrap();
+                        assert_eq!(event["sequence"], (records.len() + 3).to_string());
+                        records.push(event["payload"]["recordId"].as_str().unwrap().to_owned());
+                    }
+                }
+            })
+            .await
+            .expect("returned credit releases the remaining records");
+        }
+        assert_eq!(
+            records, expected,
+            "no record is replayed by the notification watcher"
+        );
+        fixture.quiet().await;
+        fixture.finish(true).await;
+    }
 
     /// Binds the immutable-record capability against a real Core runtime with
     /// one Workspace, and returns the generation and its grant.
