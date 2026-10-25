@@ -70,6 +70,18 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Exhibits Package (slice 1 delivered; slice 2 planned)
+
+Slice 1 was implemented on 2026-10-25 on branch `don-smith/link_and_show`, workstream `exhibits-package`. Its Verify and the developer's manual checks are outstanding, and it is not integrated into `main`. An Agent, or any Port Consumer acting for a Person, authors an Exhibit: a multi-page, interactive web experience whose files are all bundled. The bundled Exhibits Package (`dev.teamarness.exhibits`, on-demand activation) stores Drafts in its Package Data Directory and provides the `dev.teamarness.exhibits` 1.0 Port Contract: chunked, content-addressed uploads, atomic Draft updates with revision checks, paged list and read, and a `runtime.guide` query that publishes the enforced limits (`TEAM.SYS.PKG-R18`). Its UI lists Exhibits newest first and shows the selected Draft in a nested frame, replacing it when a newer revision arrives.
+
+Two generic seams carry the content, and neither names Exhibits. The Host capability `teamarness.content-views` 1.0 serves verified files from a Package's own Package Data Directory (`TEAM.SYS.PKG-R16`). The Shell scheme `teamarness-content:` serves them with an opaque origin and scripts only, and only a Package that declares the capability may frame it (`TEAM.SYS.PKG-R17`, ADR 0033). The packaged-app smoke renders a Draft through the real Ports, Host and scheme, and its isolation probe finds no breach, with or without a `sandbox` attribute on the frame. Content frames can still reach the network through navigation and WebRTC; see [DELTA-014](.delta/DELTA-014-exhibit-content-network-access.md).
+
+**Outcome:** A Person sees an Agent's multi-page Exhibit inside Teamarness, interacts with it, and sees the Agent's next revision without reopening it.
+
+**Depends on:** Package interface, Agent Package (ADR 0030 actor).
+
+**Slice 2 (planned after slice 1 passes Verify):** a Person takes an immutable Snapshot of a Draft to share it with the Workspace. Snapshots are manifest records on the immutable record log. Their files travel through a new Core-native blob capability family (`teamarness.synchronization.blobs`) as content-addressed, Content-Key-sealed blobs. Slice 2 also adds Snapshot history, continuing from any Snapshot, and local remove and restore. Teaching the standalone Agent Package to call the Exhibits Ports is a separate workstream in that Package's repository.
+
 ### Agent Package (complete, verified locally)
 
 Completed and verified on 2026-10-24, including incoming local main `a947a17` merged into the feature branch and constructor/provenance correction `a67f3c4`. The final merged Root checks, all four explicit external-Agent/Host cases, and focused independent review pass. The standalone Agent's verified runtime is `ed3c016`. The developer approved fast-forward integration into local `main`. No source push or publication is authorized.
@@ -123,13 +135,14 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - CI-published updates that reach every Member within one hour (vision success criterion 6), with code signing, notarization, and CI/CD (`TEAM.DEL`).
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
-- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
+- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted eager Package runs one Backend per Workspace (5 eager bundled Packages × 3 Workspaces = 15 processes); the on-demand Exhibits Package starts only on first use. Measure before scheduling.
 - Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0027).
 - Document log compaction via the reserved `document.snapshot` record kind (ADR 0027).
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
 - Agent Package: streaming replies, tool use beyond declared Ports, Documents participation, and unprompted or scheduled posts (non-goals of the `agent-package` workstream).
+- Network denial for Exhibit content frames: a navigation handler and WebRTC denial beside the content policy's `connect-src` ([DELTA-014](.delta/DELTA-014-exhibit-content-network-access.md), ADR 0033).
 - Package platform authoring contracts: align the immutable-record-log 1.1 JSON request schema with the optional `principal` selector already supported by Host and SDK. See [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). This inherited mismatch is not resolved by the Agent integration.
 
 ## Not planned

@@ -124,6 +124,8 @@ The default outputs are:
 - `target/release/bundle/macos/Teamarness.app`
 - `target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg` on Apple silicon
 
+The DMG step styles the disk-image window through Finder, so the launching terminal needs Automation permission for Finder. Without it, the `dmg` bundle fails with `Not authorised to send Apple events to Finder`, and `--bundles app` still builds the `.app`.
+
 These artifacts are for local verification. Signing, notarization, distribution, auto-update, tray, and native-menu infrastructure are intentionally out of scope.
 
 After the bundle command succeeds, run the automated packaged-app smoke on Apple silicon macOS:
@@ -132,7 +134,17 @@ After the bundle command succeeds, run the automated packaged-app smoke on Apple
 npm run verify:packaged-app
 ```
 
-The smoke mounts the DMG for inspection, compares every bundled Package Directory with its staged bytes, launches the `.app` twice with private temporary data, creates a Workspace, checks that every bundled Package Backend launches from the application bundle, selects the bundled reference Package through macOS accessibility, checks its admitted UI and protocol response, and verifies process-group reaping after each graceful exit. It requires Accessibility permission for the launching terminal. The developer-owned app and DMG walkthroughs remain separate Verify checks.
+The smoke mounts the DMG for inspection, compares every bundled Package Directory with its staged bytes, launches the `.app` twice with private temporary data, creates a Workspace, checks that every bundled Package Backend launches from the application bundle, selects the bundled reference Package through macOS accessibility, checks its admitted UI and protocol response, and verifies process-group reaping after each graceful exit. Its Exhibits stage registers the test-only Exhibits fixture consumer, publishes Drafts through the real Exhibits Ports, and checks that the Draft renders and navigates in the Exhibits UI and that its content, framed with or without a `sandbox` attribute, cannot read the Package UI or the Shell and reaches no Tauri command. It requires Accessibility permission for the launching terminal. The developer-owned app and DMG walkthroughs remain separate Verify checks.
+
+To try Exhibits by hand in a development profile, register the same test-only fixture consumer. Run `npm run build` first, because it stages the Exhibits Package:
+
+```sh
+npm run build
+node scripts/exhibits-fixture-consumer/prepare.mjs exhibits
+npm run dev -- exhibits
+```
+
+`prepare.mjs` builds the consumer with Cargo and adds it to the profile's local Package Registrations, keeping the others. It also accepts an absolute data directory for a packaged-app launch with `--data-dir`. The consumer appears as **Exhibits fixture consumer** under **Personal Packages**. Its buttons publish fixture Drafts that **Exhibits** under **Team Packages** then lists. The consumer never ships in the application bundle.
 
 To run two packaged Installations with separate absolute directories, launch the application bundle twice:
 
@@ -151,7 +163,7 @@ The runtime refuses a data directory that still holds retired version-1 protecti
 
 Start with [Build your first Package with an agent](docs/build-your-first-package.md). It begins with the finished Tutorial, explains the boundary between the Teamarness Core Runtime and a Package, then walks through generating, building, registering, and using an external Emojart project. Generate Emojart outside the Teamarness repository with `npm run create:package -- --output <directory> --identity dev.teamarness.emojart --display-name Emojart`. Read the [Package author guide](docs/package-author-guide.md) for the full Package Directory, Backend, UI, contract, and application-distribution rules. Read the UI SDK's [Package UI theme and CSS kit](packages/teamarness-package-ui-sdk/README.md) guidance for the exact semantic tokens, opt-in classes, cleanup contract, and Package-owned header and navigation model. Run `npm run validate:packages` to apply Package Admission's manifest and UI contract rules to every bundled Package's source and staged directory, with a Backend smoke launch, without starting the application; a generated project runs the same validator as `npm run validate`. Read [Local Package registration](docs/local-package-registration.md) for other registration layouts, restart rules, digest invalidation, and Package Data Directory continuity. A local registration does not grant Workspace enablement or synchronize, share, network, or collaborate Package code or data.
 
-The application build composes the Reference, Tutorial, Conversations, Repo-aware, and Documents Packages into one verified index. Agent is built independently and registered locally. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
+The application build composes the Reference, Tutorial, Conversations, Repo-aware, Documents, and Exhibits Packages into one verified index. Agent is built independently and registered locally. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
 
 The protocol and supported Rust tooling have separate contracts:
 
@@ -173,6 +185,6 @@ The runtime exclusively owns one private `core.sqlite3`. Uncertain commit outcom
 - `context/` is the canonical requirements, ontology, roadmap, and decision tree.
 - `crates/teamarness-core/` contains the Core Runtime library, API documentation, and tests.
 - `crates/teamarness-package-host/`, `crates/teamarness-package-protocol/`, and `crates/teamarness-package-sdk/` contain the Package runtime and supported Rust tooling.
-- `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, `packages/repo-aware/`, and `packages/documents-package/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
+- `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, `packages/repo-aware/`, `packages/documents-package/`, and `packages/exhibits-package/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
 - `apps/teamarness-desktop/` contains the typed Tauri adapter and Shell.
 - `p2p-local-first-user-management.md` is the supporting P2P membership research baseline.

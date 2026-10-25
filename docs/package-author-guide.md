@@ -82,6 +82,7 @@ The Shell runs each Package UI Mount in its own sandboxed frame with an opaque o
 - There are no popups, no `window.open`, and no `alert`, `confirm`, or `prompt`.
 - A `position: fixed` overlay covers the Package pane, not the window.
 - Navigating the frame away faults the mount.
+- Nested frames are denied unless your Package declares `teamarness.content-views`; see [Show content in a nested frame](#show-content-in-a-nested-frame).
 - Any uncaught error or unhandled rejection anywhere in the frame is a UI fault, not only one attributed to your module.
 - The `__teamarness/` path of the resource URL is reserved for the Shell-owned frame document, stylesheet, and runtime. A declared asset under that path is shadowed.
 
@@ -186,9 +187,56 @@ Core clears the binding when this Installation removes the Agent, and `current` 
 
 For a Provider, accept `ports::PortActor::Agent { principal, identity }` where your contract allows it and pass `principal` to `RecordLog::append_with_principal`; refuse the kind with your own code where it does not. Do not store bindings and do not select a signer from request content.
 
+## Show content in a nested frame
+
+Use `teamarness.content-views` 1.0 to show web content your Package did not write, for example a set of HTML, CSS, script, image and media files that an Agent produced. The Host serves the files from your Package Data Directory and the Shell isolates them from your Package UI. Your Backend answers no request per file. The [capability reference](../contracts/package-capabilities/v1/README.md#teamarnesscontent-views-10) is normative for the request shape, path rules, bounds, error codes and media-type allowlist. ADR 0033 records the design.
+
+Declare the family in the manifest:
+
+```json
+{ "identity": "teamarness.content-views", "major": 1, "minMinor": 0, "maxMinor": 0 }
+```
+
+The declaration is also your Package UI's only opt-in to nesting. The Host reports `nestedContent: true` on your UI mounts, and the Shell gives those mounts `frame-src teamarness-content:` in place of `frame-src 'none'`. No other frame policy changes. A Package that does not declare the family cannot frame content.
+
+### Open a view and frame it
+
+1. Store each file in your Package Data Directory, and keep its size and lowercase SHA-256.
+2. Call `open` with the entry path and one `{path, sha256, size, source:{kind:"file", path}}` per file. `path` is the file's path inside the view. `source.path` is relative to your Package Data Directory.
+3. Send the returned `url` to your Package UI and set it as a nested frame's `src`.
+4. Call `close` with the returned `view` when nothing shows the view any more. `close` is idempotent.
+
+In Rust, build `capabilities::content_views::ContentViews::from_initialization(activation.initialization(), activation.capabilities().clone())`; see the [Rust SDK](../crates/teamarness-package-sdk/README.md#semantic-capabilities).
+
+A view holds 1 to 1,000 files, at most 16 MiB each and 64 MiB in total, with content paths of at most 128 bytes. The extension of each path chooses its media type from the allowlist, in lowercase only: `image.PNG` is refused. To refuse a file before you store it, with the verdict the Host would give, call `teamarness_package_contract::media_types` (`media_type_for_path`, `is_valid_content_path`, and the `MAX_CONTENT_*` constants).
+
+Keep these rules in mind:
+
+- Every `open` returns a new token and URL, even for the same files.
+- The Host checks each file's size and SHA-256 on its first read. A file that changes after `open` is not served any more. To show changed files, open a new view.
+- A process generation holds at most 32 open views. Opening a 33rd closes the least recently opened one, and every view closes when the generation ends. After a Backend restart, open the view again.
+- An unknown or ended view, an unlisted path and a file that fails verification all return the same `404`.
+
+### Nest the frame safely
+
+Create the frame with `sandbox="allow-scripts"`, and set `sandbox` before `src`:
+
+```ts
+const frame = document.createElement("iframe");
+frame.setAttribute("sandbox", "allow-scripts");
+frame.setAttribute("referrerpolicy", "no-referrer");
+frame.src = url;
+```
+
+The Shell's content policy carries the CSP directive `sandbox allow-scripts` on every response, so content keeps an opaque origin even without the attribute. Set the attribute anyway. Trust no message from the frame: install no `message` listener that acts on messages whose `source` is the content window. Content cannot reach your bridge, your DOM, the Shell or another Package.
+
+Content can run inline scripts, script files, inline styles, stylesheets and WebAssembly. It cannot use `eval`, `new Function`, workers, plugins, forms or storage. A frame inside content cannot nest a further frame, because the content policy keeps `frame-src 'none'`. Subresources load only from `teamarness-content:`, `data:` and `blob:` URLs, and `fetch` reaches only `teamarness-content:`. The content policy does not yet control navigation or WebRTC, so content can reach the network. See [DELTA-014](../context/.delta/DELTA-014-exhibit-content-network-access.md). Content frames, like Package UI Frames, can see `webkit.messageHandlers.ipc`; only the Tauri invoke key rejects their posts (ADR 0015).
+
+The Exhibits Package (`packages/exhibits-package/`) follows this pattern. It reuses one frame across revisions and opens a new view when a newer revision arrives.
+
 ## Capabilities and local data
 
-Declare only the capabilities you call. Teamarness provides Workspace context, canonical membership with membership transitions and historical membership checks, Workspace Principals, the Agent Binding, domain-separated signing, and the immutable record log for Package-defined synchronized records. Each is a capability **family** with a version: a Package declares a family and the versions it accepts, and the Host grants one. Grants bind one Package Identity, Workspace, Installation, and process generation. A Package cannot select another scope. Private keys, Core database handles, Core types, raw secret bytes, and Iroh handles never cross this interface.
+Declare only the capabilities you call. Teamarness provides Workspace context, canonical membership with membership transitions and historical membership checks, Workspace Principals, the Agent Binding, content views, domain-separated signing, and the immutable record log for Package-defined synchronized records. Each is a capability **family** with a version: a Package declares a family and the versions it accepts, and the Host grants one. Grants bind one Package Identity, Workspace, Installation, and process generation. A Package cannot select another scope. Private keys, Core database handles, Core types, raw secret bytes, and Iroh handles never cross this interface.
 
 The `initialize` frame grants an absolute Package Data Directory, which the SDK gives an activation hook as `Activation::data_directory()`. Your Backend owns that directory's files, schema, and migration policy. The directory remains bound to Installation, Workspace, and Package Identity across Package source changes, versions, process generations, disposal, and application restarts. Teamarness does not inspect, migrate, back up, or delete Package-owned data.
 

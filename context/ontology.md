@@ -79,6 +79,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Source Label** | A presentation alias shown by the Shell: `Team` for Package Source `bundled`, `Personal` for `local`. It is not a trust verdict and does not define Registration Scope, Workspace enablement, or sharing |
 | **Port Contract** | A versioned, digest-verified document independent of Package Identity. It names exact commands, queries, and events with closed schemas; the Host admits and grants declared Consumers against one Provider per contract |
 | **Port Observation** | An optional, bounded, payload-free, process-local diagnostic joining a Consumer's `p:` route to a Provider's `h:` route. Multiple Consumer streams can share one Provider event stream; missing or lagged observations do not determine domain outcomes |
+| **Content View** | A Host-served, read-only set of files from one Package Data Directory, opened through `teamarness.content-views` and loaded in a nested frame at `teamarness-content://localhost/<token>/<entry>`. The Host verifies each listed file's size and SHA-256 and assigns its media type from a shared allowlist. The Shell serves it with an opaque origin and scripts only. A view ends with its process generation, and a changed file needs a new view (ADR 0033) |
 
 ## Conversations
 
@@ -99,6 +100,14 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Document Edit** | An immutable record carrying one Loro update for one Document's body. Edits converge in any arrival order; a Document is editable once every locally known Document Edit has been opened |
 | **Comment** | An immutable Markdown remark anchored to one Document, optionally quoting an excerpt and optionally replying to a parent Comment on the same Document. Comments can be resolved and reopened and are never deleted |
 | **Archive** | Hiding a Collection or Document from the default listing by a record; archived entries remain openable and can be restored. Documents are never purged |
+
+## Exhibits
+
+| Term | Definition |
+|---|---|
+| **Exhibit** | A named, multi-page, interactive web experience (HTML, CSS, JavaScript, images, media, and WebAssembly, all bundled) that an Agent or a Person authors through the Exhibits Package's Ports and a Person views inside Teamarness in a Content View. Its Exhibit ID has at most 48 characters: runs of lowercase letters and digits separated by single hyphens. Its title is a separate display string of at most 120 characters |
+| **Draft** | An Exhibit's revisable, Installation-local state: a title, an entry page and a complete file list, stored in the Exhibits Package Data Directory and never replicated. Each update replaces the whole Draft atomically and increments its revision. A Person and a bound Workspace Agent can both update a Draft |
+| **Snapshot** | An immutable, shared copy of an Exhibit that a Person takes from a Draft so other Members can view it and continue from it. Only a Person takes a Snapshot, never an Agent. The term is defined now; Exhibits slice 2 delivers it, and slice 1 has Drafts only |
 
 ## Synchronization and Protection
 
