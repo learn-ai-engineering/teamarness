@@ -125,7 +125,7 @@ The Core Runtime public API is `teamarness_core::CoreRuntime`. Identity secrets,
 
 ## Current-platform bundles
 
-Build unsigned local macOS application and disk-image bundles with:
+Build ordinary local macOS application and disk-image bundles (production updates Disabled) with:
 
 ```sh
 npm run tauri build -- --bundles app,dmg
@@ -134,9 +134,35 @@ npm run tauri build -- --bundles app,dmg
 The default outputs are:
 
 - `target/release/bundle/macos/Teamarness.app`
-- `target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg` on Apple silicon
+- `target/release/bundle/dmg/Teamarness_<desktop-version>_aarch64.dmg` on Apple silicon
 
-These artifacts are for local verification. Signing, notarization, distribution, auto-update, tray, and native-menu infrastructure are intentionally out of scope.
+These ordinary artifacts are for local verification, not production update distribution. The stable release/update work is in progress (ADR 0031); hosted publication and real installed updates are not yet qualified. Developer ID signing, notarization, tray and native menus remain deferred.
+
+### Local release artifact qualification
+
+Use exact Rust 1.99.1 and Node 24.20.0 on native Apple Silicon macOS. Desktop versions have one contract; independent Package versions are not changed:
+
+```sh
+node scripts/release/version.mjs check --tag v0.1.0
+node scripts/release/version.mjs set 0.1.1  # when deliberately preparing the next desktop version
+```
+
+The explicit release configuration opts into `production-release`, updater archives, mandatory signed versions and macOS ad-hoc signing. It preserves the base identifier, resources, frame CSP and main-only capability. Supply a separate reviewed public-key JSON overlay with `plugins.updater.pubkey`; the tracked release config intentionally has no key. A non-debug production build with a missing/malformed key fails with a redacted error. Debug/all-features checks need no key. The public key and fixed public GitHub endpoint compile into the client, with no runtime override.
+
+```sh
+# PRIVATE_SIGNING_KEY_FILE/PASSWORD are supplied only to this signing step.
+# Never echo their values or retain private material with build outputs.
+TAURI_SIGNING_PRIVATE_KEY="$PRIVATE_SIGNING_KEY_FILE" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$PRIVATE_SIGNING_KEY_PASSWORD" \
+npm run tauri build -- --config src-tauri/tauri.release.conf.json --config /private/path/public-key-overlay.json --bundles app,dmg
+npm run verify:release-artifacts -- --directory target/release/distribution --tag v0.1.1 --public-key /private/path/public-key.txt --collect
+```
+
+The release staging path signs temporary Backend copies **before** generating Package size/digest declarations. It bundles those exact Package Directories as resources; redundant Tauri sidecar copies are omitted only in the release configuration. Never re-sign or otherwise edit the resulting app. Rerun qualification before any later publication. `CI=true` may be used with the pinned Tauri CLI when Finder Automation is unavailable; it skips only DMG cosmetic layout, not artifact checks.
+
+`--collect` copies the exact version-derived DMG, `Teamarness.app.tar.gz`, and its complete `.sig`, then generates bounded `latest.json` with both macOS target keys. Without `--collect`, the same command revalidates existing output. Optional `--notes FILE` accepts at most 4 KiB of plain text. No arbitrary output directory or extra assets are accepted. Qualification uses the pinned official Rust verifier on real archive bytes for both targets, safely extracts the archive, mounts the DMG readonly, compares both whole application trees against the built app, and checks every declared Package's bytes/digests/modes, arm64 executable signatures, and real admission/Backend handshake. Missing staged Packages fail; there is no Accessibility dependency.
+
+Only the four distribution assets belong in a future public release. `qualification.json` is a **CI-only**, source-SHA/dirty-source/digest record, never a public asset. No private key, log, or runtime data belongs in `target/release/distribution`. This command publishes nothing. A passing local qualifier does not prove Gatekeeper/quarantine behavior, real WKWebView isolation, cleanup, or installed update continuity. Don must still run the packaged smoke against the release-style app, open the DMG, and launch a copied writable app; record those observations separately. Ad-hoc signing and updater cryptographic signatures are not Developer ID signing or notarization.
 
 After the bundle command succeeds, run the automated packaged-app smoke on Apple silicon macOS:
 

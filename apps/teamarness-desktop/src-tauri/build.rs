@@ -25,7 +25,56 @@ const COMMANDS: &[&str] = &[
     "package_report_ui_fault",
 ];
 
+fn production_release_inputs() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    const ENDPOINT: &str =
+        "https://github.com/learn-ai-engineering/teamarness/releases/latest/download/latest.json";
+    println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
+    let production = std::env::var_os("CARGO_FEATURE_PRODUCTION_RELEASE").is_some()
+        && std::env::var("DEBUG").as_deref() == Ok("false");
+    println!("cargo:rustc-env=TEAMARNESS_PRODUCTION_RELEASE={production}");
+    if !production {
+        return;
+    }
+    // Only reviewed build inputs compile into the client. Never include key/config values in errors.
+    fn invalid() -> ! {
+        panic!(
+            "production release requires reviewed release configuration and a valid public updater key (values redacted)"
+        );
+    }
+    let configuration: serde_json::Value = std::env::var("TAURI_CONFIG")
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| invalid());
+    let updater = &configuration["plugins"]["updater"];
+    let key = updater["pubkey"].as_str().unwrap_or_else(|| invalid());
+    let decoded = STANDARD.decode(key.trim()).unwrap_or_else(|_| invalid());
+    let decoded = std::str::from_utf8(&decoded).unwrap_or_else(|_| invalid());
+    let lines: Vec<_> = decoded.lines().collect();
+    if lines.len() != 2 || !lines[0].starts_with("untrusted comment: ") {
+        invalid();
+    }
+    let packet = STANDARD.decode(lines[1]).unwrap_or_else(|_| invalid());
+    if packet.len() != 42 || &packet[..2] != b"Ed" {
+        invalid();
+    }
+    if updater["requireSignedVersion"] != true
+        || updater["endpoints"] != serde_json::json!([ENDPOINT])
+        || configuration["bundle"]["createUpdaterArtifacts"] != true
+        || configuration["bundle"]["macOS"]["signingIdentity"] != "-"
+        || std::env::var("TARGET").as_deref() != Ok("aarch64-apple-darwin")
+    {
+        invalid();
+    }
+    println!(
+        "cargo:rustc-env=TEAMARNESS_UPDATE_PUBLIC_KEY={}",
+        key.trim()
+    );
+    println!("cargo:rustc-env=TEAMARNESS_UPDATE_ENDPOINT={ENDPOINT}");
+}
+
 fn main() {
+    production_release_inputs();
     let frame_runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../frame-dist/package-frame-runtime.js");
     println!("cargo:rerun-if-changed={}", frame_runtime.display());

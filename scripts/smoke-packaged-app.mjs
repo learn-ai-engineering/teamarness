@@ -8,6 +8,8 @@ import { STAGING_ROOT, readBundledPackages, repositoryRoot } from "./bundled-pac
 import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 import { compareDeclaredPackageBytes } from "./package-directory.mjs";
 import { prepareUiIsolationProbe } from "./ui-isolation-probe/prepare.mjs";
+import { checkVersion } from "./release/version.mjs";
+import { assetNames } from "./release/manifest.mjs";
 
 const app = join(repositoryRoot, "target/release/bundle/macos/Teamarness.app");
 const executable = join(app, "Contents/MacOS/teamarness-desktop");
@@ -18,7 +20,8 @@ const bundledPackages = (await readBundledPackages(repositoryRoot)).map(({ ident
   staged: join(repositoryRoot, STAGING_ROOT, identity),
   backendPath: manifest.backends[0].path,
 }));
-const dmg = join(repositoryRoot, "target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg");
+const version = await checkVersion();
+const dmg = join(repositoryRoot, "target/release/bundle/dmg", assetNames(`v${version}`)[0]);
 const diagnosticOutputLimit = 4_096;
 
 class SmokeTimeoutError extends Error {}

@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
-import { chmod, cp, lstat, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+
+export async function adhocSignBackend(path) {
+  if (process.platform !== "darwin" || process.arch !== "arm64") throw new Error("Release Backend signing requires native Apple Silicon macOS");
+  const result = spawnSync("codesign", ["--force", "-s", "-", "--options", "runtime", path], { encoding: "utf8", shell: false });
+  if (result.status !== 0) throw new Error(`Backend ad-hoc signing failed: ${result.stderr}`);
+}
 
 export async function stagePackageDirectory({
   manifestPath,
@@ -11,9 +19,21 @@ export async function stagePackageDirectory({
   uiAssets = [],
   outputDirectory,
   version,
+  backendSigner,
 }) {
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const backend = await readFile(backendPath);
+  let backend;
+  if (backendSigner) {
+    const temporary = await mkdtemp(join(tmpdir(), "teamarness-backend-sign-"));
+    try {
+      // Never mutate Cargo output. Sign the final-named copy before declaring its bytes.
+      const signed = join(temporary, basename(manifest.backends[0].path));
+      await copyFile(backendPath, signed);
+      await chmod(signed, 0o700);
+      await backendSigner(signed);
+      backend = await readFile(signed);
+    } finally { await rm(temporary, { recursive: true, force: true }); }
+  } else backend = await readFile(backendPath);
   const entrypoint = await readFile(uiEntrypointPath);
   const contract = await readFile(contractPath);
   if (version !== undefined) manifest.version = version;

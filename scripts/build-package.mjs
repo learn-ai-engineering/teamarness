@@ -18,6 +18,7 @@ export async function buildPackage({
   outputDirectory,
   skipBuilds = false,
   skipUiBuild = false,
+  backendSigner,
   version,
 } = {}) {
   if (!sourceDirectory) throw new Error("Package sourceDirectory is required");
@@ -55,6 +56,7 @@ export async function buildPackage({
     uiEntrypointPath: uiBuildOutput(source, manifest.ui.entrypoint.path),
     uiAssets,
     outputDirectory: output,
+    backendSigner,
     version,
   });
   const verified = await verifyPackageDirectory(output);

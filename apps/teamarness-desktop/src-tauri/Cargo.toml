@@ -13,8 +13,13 @@ crate-type = ["lib", "cdylib", "staticlib"]
 name = "qualify-update"
 test = true
 
+[features]
+production-release = []
+
 [build-dependencies]
 tauri-build.workspace = true
+base64.workspace = true
+serde_json.workspace = true
 
 [dependencies]
 teamarness-core = { path = "../../../crates/teamarness-core" }

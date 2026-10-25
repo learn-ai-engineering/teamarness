@@ -96,6 +96,23 @@ test("builder stages a declared nested Port document path", async () => {
   });
 });
 
+test("builder declares signed Backend bytes without mutating Cargo output", async () => {
+  await withRoot("teamarness-package-build-sign-", async (root) => {
+    const [entry] = bundledPackages;
+    const { backend } = await packageFixture(root, entry);
+    const original = await readFile(backend);
+    const output = await buildPackage({
+      repositoryRoot: root, sourceDirectory: entry.sourceDirectory, backendPath: backend,
+      skipBuilds: true, skipUiBuild: true,
+      backendSigner: async (path) => { await writeFile(path, Buffer.concat([original, Buffer.from("signed")])); },
+    });
+    const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
+    assert.equal(manifest.backends[0].size, original.length + 6);
+    assert.equal(await readFile(join(output, manifest.backends[0].path), "utf8"), `${original}signed`);
+    assert.deepEqual(await readFile(backend), original);
+  });
+});
+
 test("builder applies an explicit Package version", async () => {
   await withRoot("teamarness-package-build-version-", async (root) => {
     const [entry] = bundledPackages;

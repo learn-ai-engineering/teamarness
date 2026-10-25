@@ -11,7 +11,7 @@ import {
   serializeJson,
 } from "./bundled-packages.mjs";
 import { buildPackage } from "./build-package.mjs";
-import { compareDeclaredPackageBytes, copyPackageDirectory } from "./package-directory.mjs";
+import { adhocSignBackend, compareDeclaredPackageBytes, copyPackageDirectory } from "./package-directory.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 export const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -21,6 +21,7 @@ export async function buildApplicationPackages({
   skipBuilds = false,
   skipUiBuild = false,
   backendPaths = {},
+  release = false,
 } = {}) {
   const packages = await readBundledPackages(root);
   const outputRoot = join(root, STAGING_ROOT);
@@ -37,6 +38,7 @@ export async function buildApplicationPackages({
       outputDirectory: join(outputRoot, identity),
       skipBuilds,
       skipUiBuild,
+      backendSigner: release ? adhocSignBackend : undefined,
     }));
   }
   const indexPath = join(root, APPLICATION_INDEX_PATH);
@@ -56,7 +58,9 @@ export async function buildApplicationPackages({
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
-  buildApplicationPackages().then(({ directories }) => {
+  const args = process.argv.slice(2);
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--release")) throw new Error("Usage: build-application-packages.mjs [--release]");
+  buildApplicationPackages({ release: args[0] === "--release" }).then(({ directories }) => {
     console.log(`Application Packages staged and verified: ${directories.join(", ")}`);
   }).catch((error) => {
     console.error(error.message);
