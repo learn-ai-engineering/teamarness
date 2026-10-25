@@ -204,9 +204,7 @@ fn generations(instances: &[PackageInstanceSnapshot]) -> Vec<Option<u64>> {
 
 async fn mount(host: &PackageHost, key: PackageInstanceKey) -> UiMountId {
     match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: key,
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(key)))
         .await
         .unwrap()
     {

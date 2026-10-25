@@ -506,9 +506,9 @@ pub async fn open_mount(
     key: &PackageInstanceKey,
 ) -> teamarness_package_host::UiMountId {
     match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: key.clone(),
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            key.clone(),
+        )))
         .await
         .unwrap()
     {

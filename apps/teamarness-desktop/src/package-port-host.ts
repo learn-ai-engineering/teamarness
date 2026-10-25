@@ -1,4 +1,4 @@
-import type { PackagePresentation, PackageValue, WorkspacePresentation } from "@teamarness/package-ui-sdk";
+import type { PackagePresentation, PackageUiView, PackageValue, WorkspacePresentation } from "@teamarness/package-ui-sdk";
 import type { PackageHostTransport, PackageInstanceKey } from "./package-contracts";
 import {
   MAX_OPEN_SUBSCRIPTIONS,
@@ -40,6 +40,7 @@ export type PackageMountMessage = Readonly<{
   entrypoint: string;
   package: PackagePresentation;
   workspace: WorkspacePresentation;
+  view: PackageUiView;
   uiHostVersion: number;
   theme: ThemeSnapshot;
 }>;
@@ -115,6 +116,7 @@ export class PackagePortHost {
       entrypoint: input.entrypoint,
       package: input.package,
       workspace: input.workspace,
+      view: input.view,
       uiHostVersion: input.uiHostVersion,
       theme: input.theme,
     });

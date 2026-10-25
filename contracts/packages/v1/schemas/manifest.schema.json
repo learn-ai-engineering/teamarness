@@ -210,6 +210,15 @@
             }
           },
           "additionalProperties": false
+        },
+        "views": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "settings"
+            ]
+          }
         }
       },
       "additionalProperties": false

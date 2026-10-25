@@ -135,7 +135,8 @@ describe("Package UI bridge protocol", () => {
         entrypoint: "ui/index.js",
         package: presentation,
         workspace: { id: "ff".repeat(16), name: "Workspace" },
-        uiHostVersion: 1,
+        view: "main",
+        uiHostVersion: 2,
         theme: themeSnapshot(),
       },
       { kind: "theme", theme: themeSnapshot() },
@@ -175,6 +176,34 @@ describe("Package UI bridge protocol", () => {
     expect(parseShellMessage({ kind: "response", id: 1, ok: true, value: undefined })).toBeNull();
     expect(parseShellMessage({ kind: "event", id: 1, sequence: "1", payload: undefined })).toBeNull();
     expect(parseShellMessage({ kind: "unmount", mount: "mount-1" })).toBeNull();
+  });
+
+  it("carries the mount view and rejects a mount without a known view", () => {
+    const mount = {
+      kind: "mount",
+      entrypoint: "ui/index.js",
+      package: {
+        identity: "dev.teamarness.reference",
+        version: "1.0.0",
+        displayName: "Reference Package",
+        source: "bundled",
+        trust: "application_bundled",
+        lifecycle: "active",
+        processGeneration: "1",
+      },
+      workspace: { id: "ff".repeat(16), name: "Workspace" },
+      view: "settings",
+      uiHostVersion: 2,
+      theme: themeSnapshot(),
+    };
+    const parsed = parseShellMessage(mount);
+    expect(parsed?.kind === "mount" ? parsed.view : null).toBe("settings");
+    const withoutView: Record<string, unknown> = { ...mount };
+    delete withoutView.view;
+    expect(parseShellMessage(withoutView)).toBeNull();
+    for (const view of ["preferences", "Settings", "", 1, null]) {
+      expect(parseShellMessage({ ...mount, view })).toBeNull();
+    }
   });
 
   it("rebuilds a bridge error envelope field by field and rejects partial envelopes", () => {

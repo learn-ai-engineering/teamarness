@@ -133,6 +133,7 @@ function startBridge(env: FrameEnvironment, port: PortLike): void {
         root,
         package: message.package,
         workspace: message.workspace,
+        view: message.view,
         uiHostVersion: message.uiHostVersion,
         themeTokens: TEAMARNESS_THEME_TOKENS,
         client: bridge.client,

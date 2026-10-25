@@ -117,6 +117,7 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
   const calls: string[] = [];
   let latest = current;
   const removed: PackagePageTarget[] = [];
+  const opened: string[] = [];
   const bridge: PackageManagementBridge = {
     chooseDirectory: async () => null,
     inspectDirectory: async () => { throw new Error("unused"); },
@@ -142,11 +143,13 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
     ...hooks,
     removed: (target) => { removed.push(target); },
     copy: async (value) => { calls.push(`copy:${value}`); },
+    openView: (target, view) => { opened.push(`${target.packageIdentity}:${target.workspaceId}:${view}`); },
   });
   return {
     page,
     calls,
     removed,
+    opened,
     setSnapshot: (value: PackageHostSnapshot) => { latest = value; },
     open: async (packageIdentity: string) => {
       page.open({ workspaceId: WORKSPACE, packageIdentity }, latest);
@@ -159,6 +162,47 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
 
 const actions = (html: string): string[] =>
   [...html.matchAll(/data-package-page-action="([a-z-]+)"/g)].map(([, action]) => action!);
+
+describe("Package page settings view", () => {
+  const declaring = (packages: PackageHostSnapshot["packages"]): PackageHostSnapshot["packages"] =>
+    packages.map((entry) => entry.identity === AGENT ? { ...entry, views: ["settings"] } : entry);
+
+  it("offers Open settings only when the Package declares a settings view", async () => {
+    const plain = harness();
+    await plain.open(AGENT);
+    expect(actions(plain.html())).not.toContain("open-settings");
+    await plain.act("open-settings");
+    expect(plain.opened).toEqual([]);
+
+    const current = snapshot();
+    const test = harness(snapshot({ packages: declaring(current.packages) }));
+    await test.open(AGENT);
+    const html = test.html();
+    expect(html).toContain('data-package-page-action="open-settings" aria-label="Open settings Agent">Open settings</button>');
+    expect(html.indexOf("open-settings")).toBeLessThan(html.indexOf("</header>"));
+    await test.act("open-settings");
+    expect(test.opened).toEqual([`${AGENT}:${WORKSPACE}:settings`]);
+  });
+
+  it("does not offer settings for a Package that does not run in this Workspace", async () => {
+    const current = snapshot();
+    const test = harness(snapshot({
+      packages: declaring(current.packages),
+      instances: current.instances.filter(({ key }) => !(key.packageIdentity === AGENT && key.workspaceId === WORKSPACE)),
+    }));
+    await test.open(AGENT);
+    expect(actions(test.html())).not.toContain("open-settings");
+    await test.act("open-settings");
+    expect(test.opened).toEqual([]);
+  });
+
+  it("presents the settings view from the catalog entry", () => {
+    const current = snapshot();
+    const target = { workspaceId: WORKSPACE, packageIdentity: AGENT };
+    expect(buildPackagePagePresentation(current, target)?.settings).toBe(false);
+    expect(buildPackagePagePresentation(snapshot({ packages: declaring(current.packages) }), target)?.settings).toBe(true);
+  });
+});
 
 describe("Package page", () => {
   it("renders a Team Package's About, trust, Ports, and Instance state without Personal controls", async () => {

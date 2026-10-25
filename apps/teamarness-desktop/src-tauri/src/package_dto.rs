@@ -37,6 +37,8 @@ pub struct PackageCatalogEntryDto {
     source: String,
     trust: String,
     ui_contract_digest: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    views: Vec<String>,
 }
 
 impl From<PackageCatalogEntry> for PackageCatalogEntryDto {
@@ -51,6 +53,7 @@ impl From<PackageCatalogEntry> for PackageCatalogEntryDto {
             source: wire_name(value.source),
             trust: wire_name(value.trust),
             ui_contract_digest: value.ui_contract_digest,
+            views: value.views.into_iter().map(wire_name).collect(),
         }
     }
 }
@@ -144,6 +147,7 @@ pub struct UiLoaderDto {
     pub contract_digest: String,
     pub package: UiPackageContextDto,
     pub workspace: UiWorkspaceContextDto,
+    pub view: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -185,6 +189,7 @@ impl From<UiLoaderDescriptor> for UiLoaderDto {
                 id: value.workspace.id.into(),
                 name: value.workspace.name,
             },
+            view: wire_name(value.view),
         }
     }
 }
@@ -499,6 +504,7 @@ mod tests {
                 source: teamarness_package_host::PackageSourceKind::Local,
                 trust: teamarness_package_host::PackageTrustKind::TrustedNativeCodeV1,
                 ui_contract_digest: "a".repeat(64),
+                views: vec![],
             })
         };
         let full = serde_json::to_value(entry(
@@ -516,6 +522,31 @@ mod tests {
         for key in ["description", "author", "homepage"] {
             assert!(bare.get(key).is_none(), "{key} is omitted when absent");
         }
+    }
+
+    // Verifies: TEAM.SYS.PKG-R01
+    #[test]
+    fn catalog_dto_lists_declared_views_and_omits_none() {
+        let entry = |views| {
+            serde_json::to_value(PackageCatalogEntryDto::from(PackageCatalogEntry {
+                identity: "com.example.fixture".parse().unwrap(),
+                version: "1.0.0".into(),
+                display_name: "Fixture".into(),
+                description: None,
+                author: None,
+                homepage: None,
+                source: teamarness_package_host::PackageSourceKind::Bundled,
+                trust: teamarness_package_host::PackageTrustKind::ApplicationBundled,
+                ui_contract_digest: "a".repeat(64),
+                views,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            entry(vec![teamarness_package_host::PackageUiView::Settings])["views"],
+            serde_json::json!(["settings"])
+        );
+        assert!(entry(vec![]).get("views").is_none());
     }
 
     // Verifies: TEAM.SYS.PKG-R09
@@ -568,7 +599,7 @@ mod tests {
             )
             .unwrap(),
             entrypoint: "ui/index.js".into(),
-            ui_host_version: 1,
+            ui_host_version: 2,
             contract_digest: "a".repeat(64),
             package: teamarness_package_host::UiPackageContext {
                 identity: "com.example.fixture".parse().unwrap(),
@@ -584,6 +615,7 @@ mod tests {
                     .unwrap(),
                 name: "Fixture Workspace".into(),
             },
+            view: teamarness_package_host::PackageUiView::Settings,
         };
         assert_eq!(
             serde_json::to_value(UiLoaderDto::from(descriptor)).unwrap(),

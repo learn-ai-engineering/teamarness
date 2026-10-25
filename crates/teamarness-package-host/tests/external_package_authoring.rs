@@ -183,7 +183,7 @@ async fn request(
     operation: &str,
 ) -> PackageValue {
     let (mount, loader) = match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount { instance }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(instance)))
         .await
         .unwrap()
     {

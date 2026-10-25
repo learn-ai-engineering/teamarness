@@ -130,7 +130,8 @@ function mountMessage(entrypoint = "ui/index.js", theme = themeSnapshot()): unkn
       processGeneration: "1",
     },
     workspace: { id: "ff".repeat(16), name: "Workspace" },
-    uiHostVersion: 1,
+    view: "main",
+    uiHostVersion: 2,
     theme,
   };
 }
@@ -186,7 +187,8 @@ describe("Package UI frame runtime", () => {
     expect(context?.root).toBe(test.shadowRoots[0]);
     expect(Object.isFrozen(context)).toBe(true);
     expect(context?.themeTokens).toBe(TEAMARNESS_THEME_TOKENS);
-    expect(context?.uiHostVersion).toBe(1);
+    expect(context?.uiHostVersion).toBe(2);
+    expect(context?.view).toBe("main");
     expect(context?.package.displayName).toBe("Reference Package");
     expect(context?.workspace.name).toBe("Workspace");
     expect(JSON.stringify({ ...context, client: null, root: null })).not.toContain(TOKEN);
@@ -310,7 +312,7 @@ describe("Package UI frame runtime", () => {
     expect(test.sheets).toHaveLength(2);
     expect(test.env.document.adoptedStyleSheets).toEqual([test.sheets[1]]);
     expect(test.sheets[1]?.cssText).toContain("--teamarness-color-accent: #7de2c4;");
-    expect(events).toEqual(["root", "package", "workspace", "uiHostVersion", "themeTokens", "client"]);
+    expect(events).toEqual(["root", "package", "workspace", "view", "uiHostVersion", "themeTokens", "client"]);
     expect(test.posted.filter((message) => message.kind === "fault")).toEqual([]);
   });
 });

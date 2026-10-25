@@ -403,6 +403,23 @@ pub struct PackageCatalogEntry {
     pub source: PackageSourceKind,
     pub trust: PackageTrustKind,
     pub ui_contract_digest: String,
+    /// The optional UI views the manifest declares beside `main`, in declaration order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<PackageUiView>,
+}
+
+/// A Package UI view a mount shows.
+///
+/// Every Package UI has `main`. `settings` exists only when the manifest declares it in
+/// `ui.views`, and a catalog entry lists it in `views`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageUiView {
+    #[default]
+    Main,
+    Settings,
 }
 
 /// Public state for one Package Instance.

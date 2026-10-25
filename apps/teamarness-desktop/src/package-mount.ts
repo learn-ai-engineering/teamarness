@@ -1,5 +1,5 @@
 import { TEAMARNESS_THEME_TOKENS, type TeamarnessThemeToken } from "@teamarness/package-ui-sdk";
-import type { OpenPackageMount, PackageHostTransport, PackageInstanceKey } from "./package-contracts";
+import type { OpenPackageMount, PackageHostTransport, PackageInstanceKey, PackageUiView } from "./package-contracts";
 import { CONNECT_KIND, FRAME_BRIDGE_PROTOCOL, type ThemeSnapshot } from "./package-frame/protocol";
 import { PackagePortHost, type PackageUiFaultSource } from "./package-port-host";
 import { browserThemeSource, type PackageThemeSource } from "./package-theme";
@@ -11,7 +11,8 @@ export const UNMOUNT_ACK_TIMEOUT_MS = 5_000;
 
 export interface PackageMountBridge {
   readonly transport: PackageHostTransport;
-  openMount(instance: PackageInstanceKey): Promise<OpenPackageMount>;
+  /** Opens a mount of `view`; the Host refuses a view the Package does not declare. */
+  openMount(instance: PackageInstanceKey, view: PackageUiView): Promise<OpenPackageMount>;
   closeMount(input: Readonly<{ mount: string }>): Promise<void>;
   reportUiFault(input: Readonly<{ mount: string; code: "ui_exception" }>): Promise<void>;
   suspendBackend(instance: PackageInstanceKey): Promise<void>;
@@ -101,8 +102,9 @@ export class PackageMountController {
     instance: PackageInstanceKey,
     target: unknown,
     onFailure: () => void = () => undefined,
+    view: PackageUiView = "main",
   ): Promise<MountedPackageUi> {
-    const operation = this.transition.then(() => this.mountNow(instance, target, onFailure));
+    const operation = this.transition.then(() => this.mountNow(instance, target, onFailure, view));
     this.transition = operation.then(() => undefined, () => undefined);
     return operation;
   }
@@ -111,9 +113,10 @@ export class PackageMountController {
     instance: PackageInstanceKey,
     target: unknown,
     onFailure: () => void,
+    view: PackageUiView,
   ): Promise<MountedPackageUi> {
     await this.current?.unmount();
-    const opened = await this.bridge.openMount(instance);
+    const opened = await this.bridge.openMount(instance, view);
     const loader = opened.loader;
 
     let host: PackagePortHost | null = null;
@@ -160,7 +163,7 @@ export class PackageMountController {
 
     const frame = this.dom.create(target, {
       src: `teamarness-package://localhost/${loader.token}/__teamarness/frame.html`,
-      title: `${loader.package.displayName} interface`,
+      title: loader.view === "settings" ? `${loader.package.displayName} settings` : `${loader.package.displayName} interface`,
     });
     const stopWatchingLoad = frame.onLoad(() => {
       if (frameLoaded) {
@@ -199,6 +202,7 @@ export class PackageMountController {
           // DTO still reports a number.
           package: { ...loader.package, processGeneration: String(loader.package.processGeneration) },
           workspace: loader.workspace,
+          view: loader.view,
           uiHostVersion: loader.uiHostVersion,
           theme: this.theme.current(),
         });

@@ -579,7 +579,8 @@ describe("Shell-side Package UI port host", () => {
         processGeneration: "1",
       },
       workspace: { id: instance.workspaceId, name: "Workspace" },
-      uiHostVersion: 1,
+      view: "main",
+      uiHostVersion: 2,
       theme: { colorScheme: "light", values: {} } as never,
     });
     test.fromFrame({ kind: "request", id: 1, operation: "reference.read", payload: {} });

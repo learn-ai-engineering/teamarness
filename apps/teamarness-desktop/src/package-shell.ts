@@ -2,6 +2,7 @@ import type {
   PackageHostSnapshot,
   PackageHostStateNotification,
   PackageInstanceKey,
+  PackageUiView,
 } from "./package-contracts";
 import type { PackageMountController } from "./package-mount";
 
@@ -36,7 +37,7 @@ export type PackageLifecycleResult = Readonly<{
 }>;
 
 interface MountController {
-  mount(instance: PackageInstanceKey, target: unknown, onFailure: () => void): Promise<unknown>;
+  mount(instance: PackageInstanceKey, target: unknown, onFailure: () => void, view: PackageUiView): Promise<unknown>;
   unmount(): Promise<void>;
   suspendBackend(instance: PackageInstanceKey): Promise<void>;
   recoverBackend(instance: PackageInstanceKey): Promise<void>;
@@ -45,6 +46,7 @@ interface MountController {
 
 export class PackageShell {
   private selected: PackageInstanceKey | null = null;
+  private selectedView: PackageUiView = "main";
   private acceptedSnapshot: PackageHostSnapshot | null = null;
   private snapshotObserver: PackageSnapshotObserver | null = null;
   private snapshotStartup: Promise<void> | null = null;
@@ -101,8 +103,9 @@ export class PackageShell {
     return this.acceptedSnapshot;
   }
 
-  public async select(instance: PackageInstanceKey): Promise<void> {
+  public async select(instance: PackageInstanceKey, view: PackageUiView = "main"): Promise<void> {
     this.selected = instance;
+    this.selectedView = view;
     await this.loadSelected();
   }
 
@@ -224,7 +227,7 @@ export class PackageShell {
       this.view.showFailure(this.recoveryActions());
     };
     try {
-      await this.mounts.mount(this.selected, this.view.mountTarget, showFailure);
+      await this.mounts.mount(this.selected, this.view.mountTarget, showFailure, this.selectedView);
     } catch {
       showFailure();
     }

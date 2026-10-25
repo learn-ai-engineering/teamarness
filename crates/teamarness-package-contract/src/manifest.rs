@@ -24,6 +24,8 @@
 //! | `manifest.capability_duplicate` | `manifest_malformed` | a capability is requested twice |
 //! | `manifest.capability_range` | `manifest_unsupported` | a capability version range is invalid |
 //! | `manifest.ui_bounds` | `manifest_malformed` | a declared UI size or count exceeds its bound |
+//! | `manifest.ui_view` | `manifest_malformed` | a declared UI view is not `"settings"` |
+//! | `manifest.ui_view_duplicate` | `manifest_malformed` | a UI view is declared twice |
 //! | `manifest.target_missing` | `target_unsupported` | no single backend artifact matches the target |
 //! | `manifest.duplicate_target` | `target_unsupported` | two backend artifacts declare the same target |
 //! | `manifest.backend_target` | `manifest_malformed` | a backend artifact has an empty target |
@@ -85,6 +87,8 @@ pub struct ManifestDocument {
     pub capabilities: Vec<CapabilityRequirement>,
     pub consumed_ports: Vec<ConsumedContract>,
     pub activation: ActivationPolicy,
+    /// The optional UI views declared beside the main view, in declaration order.
+    pub ui_views: Vec<UiView>,
     port_contract: Option<DigestFile>,
     backends: Vec<FileArtifact>,
     ui: UiDocument,
@@ -180,6 +184,30 @@ pub struct LoadedUi {
     pub entrypoint: VerifiedFile,
     pub assets: Vec<LoadedAsset>,
     pub contract: VerifiedFile,
+    /// The optional views declared beside the main view, in declaration order.
+    pub views: Vec<UiView>,
+}
+
+/// An optional Package UI view a manifest declares in `ui.views`.
+///
+/// Every Package UI has a main view; it is never declared. Version 1 defines one optional view.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UiView {
+    /// A view where a person changes the Package's settings.
+    Settings,
+}
+
+impl UiView {
+    /// The wire name of the view.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+        }
+    }
 }
 
 /// A verified UI asset and its declared media type.
@@ -287,6 +315,8 @@ struct UiDocument {
     #[serde(default)]
     assets: Vec<AssetDocument>,
     contract: DigestFile,
+    #[serde(default)]
+    views: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +403,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
     {
         return Err(malformed("manifest.ui_bounds").at("/ui"));
     }
+    let ui_views = validate_ui_views(&document.ui.views)?;
 
     let mut seen_targets = BTreeSet::new();
     for artifact in &document.backends {
@@ -447,6 +478,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
         capabilities: document.capabilities,
         consumed_ports: document.consumed_ports,
         activation: document.activation,
+        ui_views,
         port_contract: document.port_contract,
         backends: document.backends,
         ui: document.ui,
@@ -568,6 +600,7 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
             entrypoint,
             assets,
             contract,
+            views: document.ui_views,
         },
         capabilities: document.capabilities,
         consumed_ports: document.consumed_ports,
@@ -646,6 +679,22 @@ fn validate_homepage(value: &str) -> Result<(), ContractError> {
         return Err(refused());
     }
     Ok(())
+}
+
+/// Accepts each declared view once. Version 1 knows only `"settings"`; the main view is implicit.
+fn validate_ui_views(values: &[Value]) -> Result<Vec<UiView>, ContractError> {
+    let mut views = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let view = match value.as_str() {
+            Some("settings") => UiView::Settings,
+            _ => return Err(malformed("manifest.ui_view").at(format!("/ui/views/{index}"))),
+        };
+        if views.contains(&view) {
+            return Err(malformed("manifest.ui_view_duplicate").at(format!("/ui/views/{index}")));
+        }
+        views.push(view);
+    }
+    Ok(views)
 }
 
 fn validate_range(range: VersionRange, rule: &'static str) -> Result<(), ContractError> {

@@ -38,7 +38,8 @@
     "contract": {
       "path": "ui/contract.json",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-    }
+    },
+    "views": ["settings"]
   },
   "capabilities": [
     {

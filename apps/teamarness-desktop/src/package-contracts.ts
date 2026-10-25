@@ -5,6 +5,9 @@ export type PackageInstanceKey = Readonly<{
   workspaceId: string;
 }>;
 
+/** A Package UI view. Every Package has `main`; `settings` only when its manifest declares it. */
+export type PackageUiView = "main" | "settings";
+
 export type PackageCatalogEntry = Readonly<{
   identity: string;
   version: string;
@@ -15,6 +18,8 @@ export type PackageCatalogEntry = Readonly<{
   source: "bundled" | "local";
   trust: "application_bundled" | "trusted_native_code_v1";
   uiContractDigest: string;
+  /** The optional UI views the manifest declares beside `main`; absent when none are declared. */
+  views?: readonly PackageUiView[];
 }>;
 
 export type PackageInstance = Readonly<{
@@ -120,6 +125,7 @@ export type PackageLoader = Readonly<{
     processGeneration: number;
   }>;
   workspace: Readonly<{ id: string; name: string }>;
+  view: PackageUiView;
 }>;
 
 export type OpenPackageMount = Readonly<{ mount: string; loader: PackageLoader }>;

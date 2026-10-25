@@ -33,7 +33,7 @@ A version 1 manifest declares:
 - `presentation.displayName`, and optionally `presentation.description`, `presentation.author`, and `presentation.homepage`;
 - one Package Process Protocol major and minor range;
 - Backend files with exact target, path, size, and digest;
-- the ESM entrypoint, assets, and UI contract;
+- the ESM entrypoint, assets, and UI contract, and optionally `ui.views`;
 - every required versioned Semantic Capability;
 - optional Package-owned metadata under reverse-DNS `extensions` keys.
 
@@ -85,7 +85,34 @@ The contract file may use at most 1 MiB. Each generic request, response, subscri
 
 Build one UTF-8 ESM entrypoint of at most 8 MiB. Declare at most 64 static assets, each at most 8 MiB. The entrypoint, assets, and contract may total at most 32 MiB. Do not emit undeclared chunks or remote imports.
 
-Export `mount(context)`. The context provides a fresh Shadow Root inside the Package UI Frame, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. `context.client` gives requests, cancellation, ordered subscriptions, and post-listener acknowledgement; `@teamarness/package-ui-sdk` supplies the types and the optional CSS kit.
+Export `mount(context)`. The context provides a fresh Shadow Root inside the Package UI Frame, Package and Workspace presentation, the view to show, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. `context.client` gives requests, cancellation, ordered subscriptions, and post-listener acknowledgement; `@teamarness/package-ui-sdk` supplies the types and the optional CSS kit.
+
+### Settings view
+
+Every Package UI has a main view. A Package can also offer a settings view:
+
+1. Add `"views": ["settings"]` to the `ui` object of the manifest. `views` is optional. In version 1, `"settings"` is its only value, and it can appear once.
+2. In `mount(context)`, read `context.view`. It is `"main"` or `"settings"`. Render your settings when it is `"settings"`.
+
+```json
+"ui": {
+  "entrypoint": { "path": "ui/index.js", "size": 0, "sha256": "..." },
+  "assets": [],
+  "contract": { "path": "ui/contract.json", "sha256": "..." },
+  "views": ["settings"]
+}
+```
+
+```ts
+export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
+  if (context.view === "settings") return mountSettings(context);
+  return mountMain(context);
+}
+```
+
+The Package page in the Shell then shows **Open settings**. It opens the settings view of the Package in the current Workspace. The Shell names the view above the frame and offers a way back to the main view. Both views use the same Backend, client, and UI contract.
+
+A manifest with another value, or with `"settings"` twice, fails admission with `manifest_malformed` and a pointer such as `/ui/views/0`. When the Shell asks for a view the manifest does not declare, the Host refuses the mount with `ui_view_not_declared`. A UI that declares no views can ignore `context.view`, because it is always `"main"`. In tests, `createTestMountContext({ root, client, view: "settings" })` from `@teamarness/package-ui-sdk/testing` builds a settings context. The view defaults to `"main"`.
 
 ### Package UI frame restrictions
 
@@ -215,7 +242,7 @@ Three things cross the Package boundary, and each carries its own version.
 |---|---|---|
 | Package Process Protocol | 1.0 | the frame set, the lifecycle operations, the `initialize` handshake |
 | Semantic Capability family | one per family, for example the record log's | that family's request and event shapes, bounds, vocabularies, and error codes |
-| Package UI bridge | `uiHostVersion` 1 | the mount contract your `mount(context)` is given |
+| Package UI bridge | `uiHostVersion` 2 | the mount contract your `mount(context)` is given. Version 2 added `context.view`; a UI written for version 1 keeps working |
 
 A capability is negotiated at activation: you declare a family and the versions of it you accept, the Host offers a major and a range of minors, and the highest minor both accept is granted. Within a major, a minor only adds — new optional request fields, new event kinds you may ignore, wider bounds. Nothing is removed or narrowed, and a value added to a closed vocabulary such as the record log's `availability` states is a new major, not a minor, so your Package never has to interpret a state it does not know.
 

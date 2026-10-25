@@ -169,7 +169,8 @@ function context(root: FakeElement): PackageMountContext {
     root,
     package: { displayName: "Tutorial" },
     workspace: { id: "workspace", name: "Test" },
-    uiHostVersion: 1,
+    view: "main",
+    uiHostVersion: 2,
     themeTokens: [],
     client,
   } as unknown as PackageMountContext;

@@ -10,9 +10,9 @@ use teamarness_package_host::{
     HostRevision, InstallPersonal, OpenUiMount, OpenUiSubscription, PackageErrorCode,
     PackageErrorStage, PackageHost, PackageHostCommand, PackageHostNotification,
     PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey,
-    PackageValue, RecoverPackage, ReloadPersonal, RemoveOverride, RemovePersonal, ReportUiFault,
-    RestartPersonal, SuspendPackage, UiMountId, UiRequest, UiRequestId, UiSubscriptionId,
-    WorkspaceId, WriteOverride,
+    PackageUiView, PackageValue, RecoverPackage, ReloadPersonal, RemoveOverride, RemovePersonal,
+    ReportUiFault, RestartPersonal, SuspendPackage, UiMountId, UiRequest, UiRequestId,
+    UiSubscriptionId, WorkspaceId, WriteOverride,
 };
 
 use crate::DesktopState;
@@ -80,14 +80,17 @@ pub async fn package_subscribe_host_state(
 #[tauri::command]
 pub async fn package_open_mount(
     instance: PackageInstanceKeyDto,
+    view: Option<String>,
     state: State<'_, DesktopState>,
 ) -> Result<OpenUiMountDto, PackageBridgeError> {
     let instance = parse_instance(instance)?;
+    let view = parse_view(view.as_deref())?;
     state.remove_instance_tokens(&instance).await;
     let outcome = state
         .package_host()?
         .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
             instance: instance.clone(),
+            view,
         }))
         .await
         .map_err(PackageBridgeError::from)?;
@@ -604,6 +607,19 @@ fn parse_instance(value: PackageInstanceKeyDto) -> Result<PackageInstanceKey, Pa
     Ok(PackageInstanceKey::new(package_identity, workspace_id))
 }
 
+/// An absent view is the main view. A name the mount contract does not define is refused like
+/// an undeclared view, since no Package can declare it.
+fn parse_view(value: Option<&str>) -> Result<PackageUiView, PackageBridgeError> {
+    match value {
+        None | Some("main") => Ok(PackageUiView::Main),
+        Some("settings") => Ok(PackageUiView::Settings),
+        Some(_) => Err(invalid_input(
+            PackageErrorCode::UiViewNotDeclared,
+            PackageErrorStage::Ui,
+        )),
+    }
+}
+
 fn parse_mount(value: String) -> Result<UiMountId, PackageBridgeError> {
     UiMountId::new(value).map_err(|_| ui_input_error())
 }
@@ -643,6 +659,21 @@ mod tests {
     }
 
     #[test]
+    fn an_absent_view_opens_main_and_an_unknown_view_is_refused() {
+        assert_eq!(parse_view(None).unwrap(), PackageUiView::Main);
+        assert_eq!(parse_view(Some("main")).unwrap(), PackageUiView::Main);
+        assert_eq!(
+            parse_view(Some("settings")).unwrap(),
+            PackageUiView::Settings
+        );
+        for unknown in ["", "Settings", "preferences"] {
+            let error = serde_json::to_value(parse_view(Some(unknown)).unwrap_err()).unwrap();
+            assert_eq!(error["code"], "ui_view_not_declared", "{unknown}");
+            assert_eq!(error["stage"], "ui", "{unknown}");
+        }
+    }
+
+    #[test]
     fn sequences_cross_the_desktop_boundary_as_decimal_strings() {
         assert!("18446744073709551615".parse::<u64>().is_ok());
         assert!("1.0".parse::<u64>().is_err());
@@ -656,9 +687,9 @@ mod tests {
             let instance = initial.instances[0].key.clone();
             let generation = initial.instances[0].process_generation;
             let opened = host
-                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                    instance: instance.clone(),
-                }))
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                    instance.clone(),
+                )))
                 .await
                 .unwrap();
             let PackageHostOutcome::UiMountOpened { mount, .. } = opened else {
@@ -720,9 +751,9 @@ mod tests {
             let (root, core, host) = fixture().await;
             let before = host.snapshot().await.instances[0].clone();
             let opened = host
-                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                    instance: before.key.clone(),
-                }))
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                    before.key.clone(),
+                )))
                 .await
                 .unwrap();
             let PackageHostOutcome::UiMountOpened { mount, .. } = opened else {

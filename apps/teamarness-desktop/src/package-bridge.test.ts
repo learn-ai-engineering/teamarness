@@ -1,6 +1,6 @@
 import type { Channel } from "@tauri-apps/api/core";
 import { describe, expect, it } from "vitest";
-import { createTauriPackageHostTransport, createTauriPackageManagementBridge } from "./package-bridge";
+import { createTauriPackageHostTransport, createTauriPackageManagementBridge, createTauriPackageShellBridge } from "./package-bridge";
 
 describe("desktop Tauri Package transport", () => {
   it("maps a terminal Tauri stream message to termination rather than delivery", async () => {
@@ -96,6 +96,25 @@ describe("desktop Tauri Package management bridge", () => {
       ["app_restart", undefined],
       ["package_restart", { instance: { packageIdentity: "com.example.p", workspaceId: "w1" } }],
       ["package_authoring_catalog", undefined],
+    ]);
+  });
+});
+
+describe("desktop Tauri Package Shell bridge", () => {
+  it("opens a mount with the requested view", async () => {
+    const calls: Array<readonly [string, unknown]> = [];
+    const bridge = createTauriPackageShellBridge((async (command: string, input: unknown) => {
+      calls.push([command, input]);
+      return null;
+    }) as never);
+    const instance = { packageIdentity: "com.example.fixture", workspaceId: "00112233445566778899aabbccddeeff" };
+
+    await bridge.openMount(instance, "settings");
+    await bridge.openMount(instance, "main");
+
+    expect(calls).toEqual([
+      ["package_open_mount", { instance, view: "settings" }],
+      ["package_open_mount", { instance, view: "main" }],
     ]);
   });
 });

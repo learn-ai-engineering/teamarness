@@ -1,4 +1,4 @@
-import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge } from "./package-contracts";
+import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge, PackageUiView } from "./package-contracts";
 import { PackageManagementController } from "./package-install";
 import { PackagePageController } from "./package-page";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
@@ -17,19 +17,22 @@ import { renderShell, type ShellModel } from "./view";
 export type ShellRoute =
   | Readonly<{ kind: "workspace-chooser" }>
   | Readonly<{ kind: "workspace-settings"; workspaceId: string }>
-  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>
+  /** An open Package UI. `view` is `main` when absent; `settings` only for a Package that declares it. */
+  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey; view?: PackageUiView }>
   | Readonly<{ kind: "package-page"; workspaceId: string; packageIdentity: string }>;
 
 export type ShellFrame = Readonly<{
   workspaceRail: HTMLElement;
   contextualNavigation: HTMLElement;
   shellScreen: HTMLElement;
+  /** Above an open Package UI: names a view other than `main` and leads back to it. */
+  packageViewBar: HTMLElement;
   packageMount: HTMLElement;
 }>;
 
 type PackageRouter = Readonly<{
   refresh(): Promise<PackageHostSnapshot>;
-  select(instance: PackageInstanceKey): Promise<void>;
+  select(instance: PackageInstanceKey, view?: PackageUiView): Promise<void>;
   hide(): Promise<void>;
   suspendBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   recoverBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
@@ -87,6 +90,7 @@ export class Shell {
     private readonly options: ShellOptions,
   ) {
     this.shellFrame.packageMount.hidden = true;
+    this.shellFrame.packageViewBar.hidden = true;
     this.packageManagement = new PackageManagementController(options.packageManagement, {
       changed: () => { this.renderPackageConsumers(); },
       refresh: async () => {
@@ -113,6 +117,13 @@ export class Shell {
         }
       },
       removed: (target) => { void this.navigate({ kind: "workspace-settings", workspaceId: target.workspaceId }); },
+      openView: (target, view) => {
+        void this.navigate({
+          kind: "package-instance",
+          instance: { packageIdentity: target.packageIdentity, workspaceId: target.workspaceId },
+          view,
+        });
+      },
       copy: (value) => (this.options.copy ?? ((text) => navigator.clipboard.writeText(text)))(value),
     });
   }
@@ -160,11 +171,13 @@ export class Shell {
       this.shellFrame.shellScreen.hidden = true;
       this.shellFrame.packageMount.hidden = false;
       this.renderContextualNavigation();
-      await this.options.packageShell.select(route.instance);
+      this.renderPackageViewBar();
+      await this.options.packageShell.select(route.instance, route.view ?? "main");
       return;
     }
 
     await this.options.packageShell.hide();
+    this.renderPackageViewBar();
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
     if (await this.preparePresentation()) this.renderAll();
@@ -293,7 +306,31 @@ export class Shell {
       void this.options.packageShell.hide().catch(() => undefined);
     }
     this.shellFrame.packageMount.hidden = true;
+    this.shellFrame.packageViewBar.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
+  }
+
+  /**
+   * Names the open view when it is not `main`, and offers the way back to `main`. The Package UI
+   * frame owns everything inside the mount, so this bar sits above it.
+   */
+  private renderPackageViewBar(): void {
+    const bar = this.shellFrame.packageViewBar;
+    const route = this.selectedRoute;
+    if (route.kind !== "package-instance" || (route.view ?? "main") === "main") {
+      bar.hidden = true;
+      bar.innerHTML = "";
+      return;
+    }
+    const instance = route.instance;
+    const name = this.packageSnapshot?.packages.find(({ identity }) => identity === instance.packageIdentity)?.displayName
+      ?? instance.packageIdentity;
+    bar.innerHTML = `<p class="package-view-bar__title"><span class="eyebrow">Settings</span><strong>${escape(`${name} settings`)}</strong></p><button type="button" class="secondary" data-package-view-main aria-label="${escape(`Back to ${name}`)}">${escape(`Back to ${name}`)}</button>`;
+    bar.hidden = false;
+    if (!hasQueries(bar)) return;
+    bar.querySelector<HTMLButtonElement>("[data-package-view-main]")?.addEventListener("click", () => {
+      void this.navigate({ kind: "package-instance", instance });
+    });
   }
 
   private renderSelectedScreen(): void {
@@ -542,11 +579,12 @@ export function shellFrameFromDocument(root: ParentNode = document): ShellFrame 
   const workspaceRail = root.querySelector<HTMLElement>("#workspace-rail");
   const contextualNavigation = root.querySelector<HTMLElement>("#contextual-navigation");
   const shellScreen = root.querySelector<HTMLElement>("#shell-screen");
+  const packageViewBar = root.querySelector<HTMLElement>("#package-view-bar");
   const packageMount = root.querySelector<HTMLElement>("#package-mount");
-  if (!workspaceRail || !contextualNavigation || !shellScreen || !packageMount) {
+  if (!workspaceRail || !contextualNavigation || !shellScreen || !packageViewBar || !packageMount) {
     throw new Error("Shell frame is unavailable");
   }
-  return Object.freeze({ workspaceRail, contextualNavigation, shellScreen, packageMount });
+  return Object.freeze({ workspaceRail, contextualNavigation, shellScreen, packageViewBar, packageMount });
 }
 
 function hasQueries(element: HTMLElement): boolean {

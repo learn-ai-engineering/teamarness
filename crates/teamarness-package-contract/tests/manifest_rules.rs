@@ -463,3 +463,98 @@ fn the_schema_publishes_the_presentation_metadata_bounds() {
         );
     }
 }
+
+fn ui_views(views: Value) -> Value {
+    json!({"ui": {
+        "entrypoint": {"path": "ui/index.js", "size": 7, "sha256": "0".repeat(64)},
+        "assets": [],
+        "contract": {"path": "ui/contract.json", "sha256": "0".repeat(64)},
+        "views": views,
+    }})
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn ui_views_are_optional_and_settings_is_the_only_declarable_view() {
+    use teamarness_package_contract::manifest::UiView;
+
+    assert!(accept(json!({})).ui_views.is_empty());
+    assert!(accept(ui_views(json!([]))).ui_views.is_empty());
+    assert_eq!(
+        accept(ui_views(json!(["settings"]))).ui_views,
+        vec![UiView::Settings]
+    );
+
+    assert_refused(
+        ui_views(json!(["settings", "settings"])),
+        "manifest.ui_view_duplicate",
+        "/ui/views/1",
+    );
+    for (views, pointer) in [
+        (json!(["main"]), "/ui/views/0"),
+        (json!(["preferences"]), "/ui/views/0"),
+        (json!(["settings", "Settings"]), "/ui/views/1"),
+        (json!([""]), "/ui/views/0"),
+        (json!([1]), "/ui/views/0"),
+        (json!([null]), "/ui/views/0"),
+    ] {
+        assert_refused(ui_views(views), "manifest.ui_view", pointer);
+    }
+    let error = reject(ui_views(json!("settings")));
+    assert_eq!(error.code, ContractErrorCode::ManifestMalformed);
+    assert_eq!(error.rule, "manifest.malformed");
+}
+
+/// The published schema and the semantic rule agree on `ui.views`.
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn the_schema_publishes_the_ui_views_rule() {
+    let schema: Value = serde_json::from_slice(
+        &fs::read(repository_root().join("contracts/packages/v1/schemas/manifest.schema.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&schema)
+        .unwrap();
+    for (views, valid) in [
+        (json!([]), true),
+        (json!(["settings"]), true),
+        (json!(["settings", "settings"]), false),
+        (json!(["main"]), false),
+        (json!(["preferences"]), false),
+        (json!([1]), false),
+        (json!("settings"), false),
+    ] {
+        let document = manifest(ui_views(views.clone()));
+        assert_eq!(validator.is_valid(&document), valid, "schema: {views}");
+        assert_eq!(
+            parse_manifest(&serde_json::to_vec(&document).unwrap()).is_ok(),
+            valid,
+            "rule: {views}"
+        );
+    }
+}
+
+/// A loaded Package Directory carries its declared views.
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn a_loaded_package_directory_carries_its_declared_views() {
+    use teamarness_package_contract::manifest::UiView;
+
+    let contract = br#"{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}"#;
+    let root = TempDir::new().unwrap();
+    write_directory(root.path(), b"backend", b"export {}", contract);
+    let mut document: Value =
+        serde_json::from_slice(&fs::read(root.path().join("teamarness.package.json")).unwrap())
+            .unwrap();
+    document["ui"]["views"] = json!(["settings"]);
+    fs::write(
+        root.path().join("teamarness.package.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    let loaded = load_package_directory(root.path(), TARGET).unwrap();
+    assert_eq!(loaded.ui.views, vec![UiView::Settings]);
+}

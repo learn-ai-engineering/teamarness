@@ -263,6 +263,8 @@ describe("author surface", () => {
     const surface = await import("./index");
     expect(Object.keys(surface).sort()).toEqual([
       "PACKAGE_REQUEST_ERROR_KIND",
+      "PACKAGE_UI_HOST_VERSION",
+      "PACKAGE_UI_VIEWS",
       "TEAMARNESS_THEME_TOKENS",
       "adoptPackageStyles",
       "describePackageError",
@@ -272,6 +274,15 @@ describe("author surface", () => {
       "packageErrorCode",
       "typedPackageClient",
     ]);
+  });
+});
+
+describe("mount contract version and views", () => {
+  it("is mount contract version 2 with a main and a settings view", async () => {
+    const surface = await import("./index");
+    expect(surface.PACKAGE_UI_HOST_VERSION).toBe(2);
+    expect(surface.PACKAGE_UI_VIEWS).toEqual(["main", "settings"]);
+    expect(Object.isFrozen(surface.PACKAGE_UI_VIEWS)).toBe(true);
   });
 });
 

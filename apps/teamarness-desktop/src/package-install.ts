@@ -342,6 +342,7 @@ const REFUSALS: Readonly<Record<string, string>> = {
   capability_version_unsupported: "This Package asks for a capability version Teamarness does not offer.",
   ui_entrypoint_missing: "The Package UI entrypoint is missing. Rebuild the Package.",
   ui_contract_violation: "The Package UI contract is invalid. Rebuild the Package.",
+  ui_view_not_declared: "This Package does not offer that view.",
   data_directory_unavailable: "Teamarness could not write its Package data on this device.",
   data_directory_permission: "Teamarness Package data on this device has unsafe permissions.",
   spawn_failed: "The Package Backend could not start.",

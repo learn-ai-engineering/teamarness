@@ -11,13 +11,14 @@ import type {
   PackageHostStateNotification,
   PackageHostTransport,
   PackageInstanceKey,
+  PackageUiView,
 } from "./package-contracts";
 
 export interface PackageShellBridge {
   readonly transport: PackageHostTransport;
   snapshot(): Promise<PackageHostSnapshot>;
   subscribeHostState(afterRevision: number, listener: (event: PackageHostStateNotification) => void): Promise<void>;
-  openMount(instance: PackageInstanceKey): Promise<OpenPackageMount>;
+  openMount(instance: PackageInstanceKey, view: PackageUiView): Promise<OpenPackageMount>;
   closeMount(input: Readonly<{ mount: string }>): Promise<void>;
   reportUiFault(input: Readonly<{ mount: string; code: "ui_exception" }>): Promise<void>;
   suspendBackend(instance: PackageInstanceKey): Promise<void>;
@@ -55,22 +56,26 @@ export function createTauriPackageHostTransport(
   return Object.freeze(transport);
 }
 
-const tauriPackageBridge: PackageShellBridge = {
-  transport: createTauriPackageHostTransport(),
-  snapshot: () => invoke<PackageHostSnapshot>("package_catalog_snapshot"),
-  subscribeHostState: async (afterRevision, listener) => {
-    const onEvent = new Channel(listener);
-    await invoke("package_subscribe_host_state", { afterRevision, onEvent });
-  },
-  openMount: (instance) => invoke<OpenPackageMount>("package_open_mount", { instance }),
-  closeMount: async ({ mount }) => { await invoke("package_close_mount", { mount }); },
-  reportUiFault: async ({ mount, code }) => { await invoke("package_report_ui_fault", { mount, code }); },
-  suspendBackend: async (instance) => { await invoke("package_suspend", { instance }); },
-  recoverBackend: async (instance) => { await invoke("package_recover", { instance }); },
-  disposeBackend: async (instance) => { await invoke("package_dispose", { instance }); },
-};
+/** The Shell's Package Host commands for snapshots, mounts, and Instance lifecycle. */
+export function createTauriPackageShellBridge(call: typeof invoke = invoke): PackageShellBridge {
+  const shellBridge: PackageShellBridge = {
+    transport: createTauriPackageHostTransport(call),
+    snapshot: () => call<PackageHostSnapshot>("package_catalog_snapshot"),
+    subscribeHostState: async (afterRevision, listener) => {
+      const onEvent = new Channel(listener);
+      await call("package_subscribe_host_state", { afterRevision, onEvent });
+    },
+    openMount: (instance, view) => call<OpenPackageMount>("package_open_mount", { instance, view }),
+    closeMount: async ({ mount }) => { await call("package_close_mount", { mount }); },
+    reportUiFault: async ({ mount, code }) => { await call("package_report_ui_fault", { mount, code }); },
+    suspendBackend: async (instance) => { await call("package_suspend", { instance }); },
+    recoverBackend: async (instance) => { await call("package_recover", { instance }); },
+    disposeBackend: async (instance) => { await call("package_dispose", { instance }); },
+  };
+  return Object.freeze(shellBridge);
+}
 
-export const packageBridge = Object.freeze(tauriPackageBridge);
+export const packageBridge = createTauriPackageShellBridge();
 
 /** The Shell's own Package management commands. No Package UI Frame can reach them. */
 export function createTauriPackageManagementBridge(call: typeof invoke = invoke): PackageManagementBridge {

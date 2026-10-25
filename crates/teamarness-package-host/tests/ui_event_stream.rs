@@ -16,7 +16,7 @@ fn empty() -> PackageValue {
 async fn mount(host: &PackageHost, index: usize) -> teamarness_package_host::UiMountId {
     let instance = host.snapshot().await.instances[index].key.clone();
     match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount { instance }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(instance)))
         .await
         .unwrap()
     {

@@ -35,9 +35,7 @@ fn declare(fixture: &common::Fixture, directory: &str, provider: bool) {
 
 async fn mount(host: &PackageHost, key: PackageInstanceKey) -> UiMountId {
     let result = host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: key,
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(key)))
         .await
         .unwrap();
     let PackageHostOutcome::UiMountOpened { mount, .. } = result else {

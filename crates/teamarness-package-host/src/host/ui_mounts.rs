@@ -6,12 +6,18 @@ use crate::errors::{
     PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, host_error, instance_error,
 };
 use crate::values::{
-    LifecycleState, PackageInstanceKey, UiMountId, UiResourceToken, UiSubscriptionId,
+    LifecycleState, PackageInstanceKey, PackageUiView, UiMountId, UiResourceToken, UiSubscriptionId,
 };
 use crate::{
     CloseUiMount, MountLease, OpenUiMount, PackageHost, PackageHostOutcome, ReadUiResource,
     ReportUiFault, UiLoaderDescriptor, UiPackageContext, UiWorkspaceContext, instance,
 };
+
+/// The author-visible Package UI mount contract version.
+///
+/// Version 2 adds `view` to the mount context. A UI written for version 1 ignores it and keeps
+/// working.
+const UI_HOST_VERSION: u16 = 2;
 
 #[allow(clippy::result_large_err)]
 impl PackageHost {
@@ -21,6 +27,23 @@ impl PackageHost {
     ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
         let _gate = self.inner.mount_management.lock().await;
         let actor = self.actor(&input.instance).await?;
+        if input.view != PackageUiView::Main {
+            let declared = self
+                .inner
+                .data
+                .lock()
+                .await
+                .packages
+                .iter()
+                .find(|package| package.identity == input.instance.package_identity)
+                .is_some_and(|package| package.views.contains(&input.view));
+            if !declared {
+                return Err(host_error(
+                    PackageErrorCode::UiViewNotDeclared,
+                    PackageErrorStage::Ui,
+                ));
+            }
+        }
         let replaced = {
             let data = self.inner.data.lock().await;
             data.mounts
@@ -59,7 +82,7 @@ impl PackageHost {
         let loader = UiLoaderDescriptor {
             token: token.clone(),
             entrypoint: ui.cache.entrypoint.clone(),
-            ui_host_version: 1,
+            ui_host_version: UI_HOST_VERSION,
             contract_digest: ui.cache.contract_digest.clone(),
             package: UiPackageContext {
                 identity: input.instance.package_identity.clone(),
@@ -74,6 +97,7 @@ impl PackageHost {
                 id: input.instance.workspace_id.clone(),
                 name: actor.workspace_name().to_owned(),
             },
+            view: input.view,
         };
         self.inner.data.lock().await.mounts.insert(
             mount.clone(),

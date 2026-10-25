@@ -43,9 +43,9 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
     assert_eq!(lease_count(), 1, "lease is durable before active use");
 
     let opened = host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: instance.clone(),
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            instance.clone(),
+        )))
         .await
         .unwrap();
     let (mount, opened_revision) = match opened {

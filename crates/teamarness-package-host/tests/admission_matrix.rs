@@ -11,7 +11,7 @@ pub use teamarness_package_host::{
     DiagnosticId, HostRevision, InspectedCapability, InstallationPublicIdentity,
     InstallationRegistrationSnapshot, PackageCatalogEntry, PackageErrorCode, PackageErrorEnvelope,
     PackageErrorStage, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
-    PackageSourceKind, PackageTier, PackageTrustKind, PackageValue, RecoveryAction,
+    PackageSourceKind, PackageTier, PackageTrustKind, PackageUiView, PackageValue, RecoveryAction,
     RegistrationStatus,
 };
 

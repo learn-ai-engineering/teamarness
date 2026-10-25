@@ -321,9 +321,9 @@ async fn open_mount(
     teamarness_package_host::UiLoaderDescriptor,
 ) {
     match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: key.clone(),
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            key.clone(),
+        )))
         .await
         .unwrap()
     {

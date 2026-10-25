@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::values::{
     HostRevision, LifecycleState, PackageIdentity, PackageInstanceKey, PackageSourceKind,
-    PackageTrustKind, PackageValue, UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId,
-    WorkspaceId,
+    PackageTrustKind, PackageUiView, PackageValue, UiMountId, UiRequestId, UiResourceToken,
+    UiSubscriptionId, WorkspaceId,
 };
 
 /// Activates every admitted Package for every Workspace Core lists. Never disposes
@@ -25,9 +25,26 @@ pub struct RecoverPackage {
 pub struct DisposePackage {
     pub instance: PackageInstanceKey,
 }
+/// Opens one UI mount of an Instance, showing `view`.
+///
+/// `view` defaults to `main`. Any other view must be declared in the Package's manifest, or the
+/// mount is refused with `ui_view_not_declared`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenUiMount {
     pub instance: PackageInstanceKey,
+    #[serde(default)]
+    pub view: PackageUiView,
+}
+
+impl OpenUiMount {
+    /// Opens the main view of `instance`.
+    #[must_use]
+    pub const fn main(instance: PackageInstanceKey) -> Self {
+        Self {
+            instance,
+            view: PackageUiView::Main,
+        }
+    }
 }
 
 /// Package presentation values bound to one UI mount.
@@ -61,6 +78,8 @@ pub struct UiLoaderDescriptor {
     pub contract_digest: String,
     pub package: UiPackageContext,
     pub workspace: UiWorkspaceContext,
+    /// The view this mount shows.
+    pub view: PackageUiView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

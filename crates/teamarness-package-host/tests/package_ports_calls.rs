@@ -79,9 +79,7 @@ fn declare_non_object_ports(fixture: &common::Fixture) {
 
 async fn mount(host: &PackageHost, key: PackageInstanceKey) -> UiMountId {
     match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: key,
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(key)))
         .await
         .unwrap()
     {

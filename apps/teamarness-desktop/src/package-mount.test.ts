@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { TEAMARNESS_THEME_TOKENS } from "@teamarness/package-ui-sdk";
-import type { OpenPackageMount, PackageHostTransport, PackageInstanceKey } from "./package-contracts";
+import type { OpenPackageMount, PackageHostTransport, PackageInstanceKey, PackageUiView } from "./package-contracts";
 import { CONNECT_KIND, FRAME_BRIDGE_PROTOCOL, type ThemeSnapshot } from "./package-frame/protocol";
 import {
   browserFrameDom,
@@ -31,13 +31,14 @@ function transport(): PackageHostTransport {
   };
 }
 
-function descriptor(number: number): OpenPackageMount {
+function descriptor(number: number, view: PackageUiView = "main"): OpenPackageMount {
   return {
     mount: `mount-${number}`,
     loader: {
       token: String(number).repeat(32),
       entrypoint: "ui/index.js",
-      uiHostVersion: 1,
+      view,
+      uiHostVersion: 2,
       contractDigest: "a".repeat(64),
       package: {
         identity: instance.packageIdentity,
@@ -138,6 +139,7 @@ type Harness = {
   bridge: PackageMountBridge;
   dom: PackageFrameDom;
   calls: string[];
+  views: PackageUiView[];
   frames: FakeFrame[];
   timers: FakeTimers;
   theme: PackageThemeSource;
@@ -154,9 +156,10 @@ function harness(): Harness {
   const timers = fakeTimers();
   const themeListeners = new Set<(theme: ThemeSnapshot) => void>();
   let opened = 0;
+  const views: PackageUiView[] = [];
   const bridge: PackageMountBridge = {
     transport: transport(),
-    openMount: async () => descriptor(++opened),
+    openMount: async (_instance, view) => { views.push(view); return descriptor(++opened, view); },
     closeMount: async ({ mount }) => { calls.push(`close:${mount}`); },
     reportUiFault: async ({ mount }) => { calls.push(`fault:${mount}`); },
     suspendBackend: async (selected) => { calls.push(`suspend:${selected.packageIdentity}`); },
@@ -182,6 +185,7 @@ function harness(): Harness {
     bridge,
     dom,
     calls,
+    views,
     frames,
     timers,
     theme,
@@ -214,12 +218,17 @@ function scriptFrame(frame: FakeFrame): ScriptedFrame {
   return { received, port, send: (message) => { port.postMessage(message); } };
 }
 
-async function mountThrough(test: Harness, controller: PackageMountController, onFailure?: () => void): Promise<{
+async function mountThrough(
+  test: Harness,
+  controller: PackageMountController,
+  onFailure?: () => void,
+  view?: PackageUiView,
+): Promise<{
   mounted: Promise<{ unmount(): Promise<void> }>;
   frame: FakeFrame;
   scripted: ScriptedFrame;
 }> {
-  const mounted = controller.mount(instance, {}, onFailure);
+  const mounted = controller.mount(instance, {}, onFailure, view);
   await settle();
   const frame = test.frames[test.frames.length - 1];
   if (frame === undefined) throw new Error("no frame was created");
@@ -318,6 +327,22 @@ describe("generic Package UI mount", () => {
     expect(frame.posted).toHaveLength(1);
   });
 
+  it("opens the requested view and gives the frame the view the Host returned", async () => {
+    const main = harness();
+    const opened = await mountThrough(main, main.controller());
+    await opened.mounted;
+    expect(main.views).toEqual(["main"]);
+    expect(opened.frame.source.title).toBe("Fixture interface");
+    expect(opened.scripted.received[0]?.view).toBe("main");
+
+    const settings = harness();
+    const shown = await mountThrough(settings, settings.controller(), undefined, "settings");
+    await shown.mounted;
+    expect(settings.views).toEqual(["settings"]);
+    expect(shown.frame.source.title).toBe("Fixture settings");
+    expect(shown.scripted.received[0]).toMatchObject({ kind: "mount", view: "settings", uiHostVersion: 2 });
+  });
+
   it("mounts with the generic context, entrypoint and current theme values", async () => {
     const test = harness();
     const controller = test.controller();
@@ -338,7 +363,8 @@ describe("generic Package UI mount", () => {
         processGeneration: "1",
       },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
-      uiHostVersion: 1,
+      view: "main",
+      uiHostVersion: 2,
       theme: themeSnapshot("#0b725d"),
     });
     expect(JSON.stringify(scripted.received)).not.toContain("1".repeat(32));

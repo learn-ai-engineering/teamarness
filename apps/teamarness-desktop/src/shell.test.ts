@@ -227,12 +227,15 @@ function harness(
     workspaceRail,
     contextualNavigation,
     shellScreen,
+    packageViewBar: new AttributeRegion() as unknown as HTMLElement,
     packageMount: new Region() as unknown as HTMLElement,
   };
   const shell = new Shell(frame, {
     packageShell: {
       refresh: packageBehavior.refresh ?? (async () => packages),
-      select: async (instance) => { calls.push(`mount:${instance.packageIdentity}`); },
+      select: async (instance, view = "main") => {
+        calls.push(view === "main" ? `mount:${instance.packageIdentity}` : `mount:${instance.packageIdentity}:${view}`);
+      },
       hide: async () => { calls.push("unmount"); },
       suspendBackend: async (instance) => {
         calls.push(`suspend:${instance.packageIdentity}`);
@@ -914,5 +917,60 @@ describe("Package page route", () => {
     screen.control("data-package-registration-page", "0").click();
     await vi.waitFor(() => expect(screen.innerHTML).toContain("It could not start: A file changed after the manifest was written."));
     expect(test.shell.route()).toEqual({ kind: "package-page", workspaceId: workspace.id, packageIdentity: "com.example.broken" });
+  });
+});
+
+describe("Package settings view", () => {
+  const declaring: PackageHostSnapshot = {
+    ...packages,
+    packages: packages.packages.map((entry) => entry.identity === packageKey.packageIdentity ? { ...entry, views: ["settings"] } : entry),
+  };
+
+  it("opens settings from the Package page, names the view, and goes back to the main view", async () => {
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => declaring });
+    const bar = test.frame.packageViewBar as unknown as AttributeRegion;
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity });
+    expect(bar.hidden).toBe(true);
+
+    screen.control("data-package-page-action", "open-settings").click();
+    await vi.waitFor(() => expect(test.shell.route()).toEqual({ kind: "package-instance", instance: packageKey, view: "settings" }));
+    expect(test.calls).toContain("mount:com.example.one:settings");
+    expect(test.frame.packageMount.hidden).toBe(false);
+    expect(test.frame.shellScreen.hidden).toBe(true);
+    expect(bar.hidden).toBe(false);
+    expect(bar.innerHTML).toContain("<strong>One settings</strong>");
+    expect(bar.innerHTML).toContain('data-package-view-main aria-label="Back to One">Back to One</button>');
+
+    bar.control("data-package-view-main", "").click();
+    await vi.waitFor(() => expect(test.calls.at(-1)).toBe("mount:com.example.one"));
+    expect(test.shell.route()).toEqual({ kind: "package-instance", instance: packageKey });
+    expect(bar.hidden).toBe(true);
+    expect(bar.innerHTML).toBe("");
+  });
+
+  it("offers no Open settings for a Package that declares no settings view", async () => {
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity });
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Capabilities and Ports"));
+    expect(screen.innerHTML).not.toContain("open-settings");
+  });
+
+  it("hides the view bar when the person leaves the settings view for a Shell screen", async () => {
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => declaring });
+    const bar = test.frame.packageViewBar as unknown as AttributeRegion;
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey, view: "settings" });
+    expect(bar.hidden).toBe(false);
+
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(test.calls.at(-1)).toBe("unmount");
+    expect(bar.hidden).toBe(true);
   });
 });

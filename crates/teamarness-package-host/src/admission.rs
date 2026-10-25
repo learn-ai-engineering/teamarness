@@ -11,7 +11,7 @@ use crate::{
     DiagnosticId, HostRevision, InstallationRegistrationSnapshot, PackageCatalogEntry,
     PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, PackageHostConfig,
     PackageHostSnapshot, PackageHostState, PackageIdentity, PackageSourceKind, PackageTier,
-    PackageTrustKind, RecoveryAction, RegistrationStatus,
+    PackageTrustKind, PackageUiView, RecoveryAction, RegistrationStatus,
 };
 
 pub(crate) struct AdmissionReport {
@@ -1233,6 +1233,15 @@ fn finalize(
         source: candidate.source,
         trust: candidate.trust,
         ui_contract_digest: candidate.manifest.ui.contract.digest.clone(),
+        views: candidate
+            .manifest
+            .ui
+            .views
+            .iter()
+            .map(|view| match view {
+                teamarness_package_contract::manifest::UiView::Settings => PackageUiView::Settings,
+            })
+            .collect(),
     };
     let backend_path = candidate
         .root

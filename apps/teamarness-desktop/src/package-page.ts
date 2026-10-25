@@ -3,6 +3,7 @@ import type {
   PackageHostSnapshot,
   PackageInstanceKey,
   PackageManagementBridge,
+  PackageUiView,
 } from "./package-contracts";
 import {
   packageRefusalMessage,
@@ -18,7 +19,7 @@ export type PackagePageTarget = Readonly<{ workspaceId: string; packageIdentity:
 /** Every control a Package page can offer. Each page offers only the ones its Package allows. */
 export type PackagePageAction =
   | "reload" | "restart" | "pause" | "resume" | "start" | "remove" | "confirm-remove" | "cancel-remove"
-  | "recover" | "dispose" | "restart-app" | "retry-catalog" | "copy-homepage";
+  | "recover" | "dispose" | "restart-app" | "retry-catalog" | "copy-homepage" | "open-settings";
 
 /** The Instance lifecycle commands; each re-reads the snapshot and throws when the operation failed. */
 export type PackagePageLifecycle = Readonly<{
@@ -36,6 +37,8 @@ type PackagePageHooks = Readonly<{
   removed(target: PackagePageTarget): void;
   /** Copies text to the clipboard. */
   copy(value: string): Promise<void>;
+  /** Opens one view of this Package's UI in the page's Workspace. */
+  openView(target: PackagePageTarget, view: PackageUiView): void;
 }>;
 
 type CatalogState =
@@ -64,6 +67,8 @@ export type PackagePagePresentation = Readonly<{
   instance: Readonly<{ availability: string; generation: number | null }> | null;
   diagnostics: readonly string[];
   controls: readonly PackagePageAction[];
+  /** Whether the Package declares a settings view and runs in this Workspace, so it can be opened. */
+  settings: boolean;
 }>;
 
 /**
@@ -133,6 +138,9 @@ export class PackagePageController {
     switch (action) {
       case "retry-catalog":
         await this.loadCatalog(snapshot?.revision ?? null);
+        return;
+      case "open-settings":
+        if (presentation.settings) this.hooks.openView(target, "settings");
         return;
       case "copy-homepage":
         if (!presentation.homepage) return;
@@ -333,6 +341,7 @@ export function buildPackagePagePresentation(
       : null,
     diagnostics,
     controls,
+    settings: instance !== undefined && (entry?.views ?? []).includes("settings"),
   };
 }
 
@@ -355,6 +364,7 @@ const ACTION_LABELS: Readonly<Record<PackagePageAction, string>> = {
   "restart-app": "Restart Teamarness",
   "retry-catalog": "Retry",
   "copy-homepage": "Copy",
+  "open-settings": "Open settings",
 };
 
 type RenderState = Readonly<{
@@ -397,16 +407,16 @@ function renderPackagePage(presentation: PackagePagePresentation, state: RenderS
     : `<h3>Diagnostics</h3><ul class="package-page-diagnostics">${presentation.diagnostics.map((message) => `<li>${escape(message)}</li>`).join("")}</ul>`;
   const status = `<section class="screen-section" aria-labelledby="package-page-status-heading"><h2 id="package-page-status-heading">In this Workspace</h2>${refusal}${instance}${diagnostics}${renderControls(presentation, state, button)}</section>`;
 
-  return `<section class="shell-screen package-page" aria-labelledby="package-page-heading"><header class="screen-heading"><button type="button" class="package-page-back secondary" data-package-page-back>Back to Workspace</button><p class="eyebrow">${escape(presentation.personal ? "Personal Package" : "Team Package")}</p><h1 id="package-page-heading" tabindex="-1" data-package-page-focus>${escape(presentation.name)}</h1>${presentation.description === null ? "" : `<p>${escape(presentation.description)}</p>`}${renderSettingsEntry()}</header>
+  return `<section class="shell-screen package-page" aria-labelledby="package-page-heading"><header class="screen-heading"><button type="button" class="package-page-back secondary" data-package-page-back>Back to Workspace</button><p class="eyebrow">${escape(presentation.personal ? "Personal Package" : "Team Package")}</p><h1 id="package-page-heading" tabindex="-1" data-package-page-focus>${escape(presentation.name)}</h1>${presentation.description === null ? "" : `<p>${escape(presentation.description)}</p>`}${renderSettingsEntry(presentation, button)}</header>
     ${about}${status}${renderCatalog(presentation, state, button)}</section>`;
 }
 
-/**
- * Where **Open settings** goes once a Package can declare a settings view.
- * Nothing is offered until then.
- */
-function renderSettingsEntry(): string {
-  return "";
+/** **Open settings**, offered only when the Package declares a settings view and runs in this Workspace. */
+function renderSettingsEntry(
+  presentation: PackagePagePresentation,
+  button: (action: PackagePageAction, secondary?: boolean, label?: string) => string,
+): string {
+  return presentation.settings ? `<div class="package-instance-actions">${button("open-settings")}</div>` : "";
 }
 
 function renderControls(

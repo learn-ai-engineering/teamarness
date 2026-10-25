@@ -190,9 +190,7 @@ async fn on_demand_mount_and_parallel_explicit_activation_start_one_generation()
         LifecycleState::Admitted
     );
     let result = reopened
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: key,
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(key)))
         .await
         .unwrap();
     assert!(matches!(

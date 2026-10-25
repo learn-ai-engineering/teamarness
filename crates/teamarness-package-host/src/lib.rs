@@ -61,9 +61,9 @@ pub use crate::values::{
     InspectedPresentation, InstallationPublicIdentity, InstallationRegistrationSnapshot,
     LifecycleState, MountState, PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot,
     PackageHostState, PackageIdentity, PackageInstanceKey, PackageInstanceSnapshot,
-    PackageSourceKind, PackageTier, PackageTrustKind, PackageValue, RegistrationRequest,
-    RegistrationStatus, UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError,
-    WorkspaceId,
+    PackageSourceKind, PackageTier, PackageTrustKind, PackageUiView, PackageValue,
+    RegistrationRequest, RegistrationStatus, UiMountId, UiRequestId, UiResourceToken,
+    UiSubscriptionId, ValueParseError, WorkspaceId,
 };
 
 use crate::errors::host_error;
@@ -321,9 +321,9 @@ mod tests {
         let instances = host.snapshot().await.instances;
         assert_eq!(instances.len(), 2, "both Packages activated");
         for instance in instances {
-            host.execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                instance: instance.key,
-            }))
+            host.execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                instance.key,
+            )))
             .await
             .unwrap();
         }

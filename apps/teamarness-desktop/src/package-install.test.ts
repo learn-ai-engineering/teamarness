@@ -257,6 +257,7 @@ describe("Add Personal Package flow", () => {
     ["override_required", "can only be replaced by an override"],
     ["registration_file_invalid", "will not change it"],
     ["port_contract_missing", "requires is not available"],
+    ["ui_view_not_declared", "does not offer that view"],
   ])("maps %s to a readable message", (code, wording) => {
     expect(packageRefusalMessage(code)).toContain(wording);
   });

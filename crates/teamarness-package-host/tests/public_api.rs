@@ -52,9 +52,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
         PackageHostCommand::Dispose(DisposePackage {
             instance: instance.clone(),
         }),
-        PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: instance.clone(),
-        }),
+        PackageHostCommand::OpenUiMount(OpenUiMount::main(instance.clone())),
         PackageHostCommand::CloseUiMount(CloseUiMount {
             mount: mount.clone(),
         }),
@@ -160,7 +158,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             loader: teamarness_package_host::UiLoaderDescriptor {
                 token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
                 entrypoint: "ui/index.js".into(),
-                ui_host_version: 1,
+                ui_host_version: 2,
                 contract_digest: "digest".into(),
                 package: teamarness_package_host::UiPackageContext {
                     identity: PackageIdentity::from_str("dev.teamarness.reference").unwrap(),
@@ -175,6 +173,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
                     id: teamarness_package_host::WorkspaceId::new("workspace").unwrap(),
                     name: "Workspace".into(),
                 },
+                view: teamarness_package_host::PackageUiView::Main,
             },
             revision: HostRevision::INITIAL,
         },
@@ -365,11 +364,12 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PortResponseInvalid,
         PackageErrorCode::PortEventInvalid,
         PackageErrorCode::UiLoadFailed,
+        PackageErrorCode::UiViewNotDeclared,
         PackageErrorCode::UiException,
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 58);
+    assert_eq!(codes.len(), 59);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -427,6 +427,7 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PortResponseInvalid
             | PackageErrorCode::PortEventInvalid
             | PackageErrorCode::UiLoadFailed
+            | PackageErrorCode::UiViewNotDeclared
             | PackageErrorCode::UiException
             | PackageErrorCode::StaleMount
             | PackageErrorCode::EventLagged => {}

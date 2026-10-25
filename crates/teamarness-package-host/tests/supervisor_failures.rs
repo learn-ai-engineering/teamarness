@@ -39,9 +39,9 @@ async fn package_error_preserves_generation_and_unrelated_instance() {
     let target = before.instances[0].clone();
     let other = before.instances[1].clone();
     let opened = host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: target.key.clone(),
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            target.key.clone(),
+        )))
         .await
         .unwrap();
     let mount = match opened {
@@ -152,9 +152,9 @@ async fn exit_invalidates_generation_without_replaying_the_request_and_explicit_
         .unwrap();
     let instance = host.snapshot().await.instances[0].key.clone();
     let mount = match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: instance.clone(),
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            instance.clone(),
+        )))
         .await
         .unwrap()
     {
@@ -233,9 +233,9 @@ async fn malformed_protocol_generation_fails_without_restarting_or_harming_anoth
         .unwrap()
         .clone();
     let mount = match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: bad.key.clone(),
-        }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            bad.key.clone(),
+        )))
         .await
         .unwrap()
     {

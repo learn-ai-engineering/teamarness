@@ -77,7 +77,8 @@ function mountContext(root: ShadowRoot): PackageMountContext {
       processGeneration: "1",
     },
     workspace: { id: "workspace", name: "Workspace" },
-    uiHostVersion: 1,
+    view: "main",
+    uiHostVersion: 2,
     themeTokens: TEAMARNESS_THEME_TOKENS,
     client: {
       request: async () => ({
@@ -215,6 +216,59 @@ describe("reference Package error fixture", () => {
 
     expect(value?.textContent).toBe("Package error: reference.requested_failure");
     expect(value?.getAttribute("aria-label")).toBe("Package error: reference.requested_failure");
+    await unmount();
+  });
+});
+
+describe("reference Package settings view", () => {
+  it("renders its settings view when mounted with view settings, and cleans it up", async () => {
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    vi.stubGlobal("document", { createElement: (tagName: string) => fakeElement(tagName) });
+    vi.stubGlobal("getComputedStyle", vi.fn(computedStyle));
+    const sheetBefore = new FakeCSSStyleSheet() as unknown as CSSStyleSheet;
+    const root = { adoptedStyleSheets: [sheetBefore], append: vi.fn() } as unknown as ShadowRoot;
+    const operations: string[] = [];
+    const context = mountContext(root);
+    const settings = {
+      ...context,
+      view: "settings",
+      client: {
+        ...context.client,
+        request: async (operation: string) => {
+          operations.push(operation);
+          return context.client.request(operation, {});
+        },
+        subscribe: async () => { throw new Error("the settings view does not subscribe"); },
+      },
+    } as unknown as PackageMountContext;
+
+    const unmount = await mount(settings);
+
+    const heading = createdElements.find((element) => element.tagName === "H1");
+    expect(heading?.textContent).toBe("Reference Package settings");
+    expect(createdElements.some((element) => element.textContent === "Increment counter")).toBe(false);
+    const terms = createdElements.filter((element) => element.tagName === "DT");
+    expect(terms.map((element) => element.textContent)).toEqual(["Counter"]);
+    expect(createdElements.filter((element) => element.tagName === "DD")[0]?.textContent).toBe("0");
+    expect(operations).toEqual(["reference.read"]);
+    expect(root.adoptedStyleSheets).toHaveLength(3);
+
+    await unmount();
+    await unmount();
+    expect(root.adoptedStyleSheets).toEqual([sheetBefore]);
+    expect(createdElements.find((element) => element.tagName === "ARTICLE")?.removed).toBe(true);
+  });
+
+  it("renders the main view when mounted with view main", async () => {
+    vi.stubGlobal("CSSStyleSheet", FakeCSSStyleSheet);
+    vi.stubGlobal("document", { createElement: (tagName: string) => fakeElement(tagName) });
+    vi.stubGlobal("getComputedStyle", vi.fn(computedStyle));
+    const root = { adoptedStyleSheets: [], append: vi.fn() } as unknown as ShadowRoot;
+
+    const unmount = await mount(mountContext(root));
+
+    expect(createdElements.find((element) => element.tagName === "H1")?.textContent).toBe("Reference Package");
+    expect(createdElements.some((element) => element.textContent === "Increment counter")).toBe(true);
     await unmount();
   });
 });

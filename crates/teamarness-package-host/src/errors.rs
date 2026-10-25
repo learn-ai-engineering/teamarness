@@ -69,6 +69,8 @@ pub enum PackageErrorCode {
     PortResponseInvalid,
     PortEventInvalid,
     UiLoadFailed,
+    /// A mount asked for a UI view the Package's manifest does not declare.
+    UiViewNotDeclared,
     UiException,
     StaleMount,
     EventLagged,
@@ -180,7 +182,9 @@ pub(crate) fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> Pa
         | PackageErrorCode::UiContractViolation
         | PackageErrorCode::EventLagged
         | PackageErrorCode::UiLoadFailed => RecoveryAction::ReloadUi,
-        PackageErrorCode::ShuttingDown => RecoveryAction::None,
+        PackageErrorCode::ShuttingDown | PackageErrorCode::UiViewNotDeclared => {
+            RecoveryAction::None
+        }
         PackageErrorCode::RegistrationFileInvalid | PackageErrorCode::NotRegistered => {
             RecoveryAction::CorrectRegistration
         }

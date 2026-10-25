@@ -25,7 +25,7 @@
   "loader": {
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "entrypoint": "ui/index.js",
-    "uiHostVersion": 1,
+    "uiHostVersion": 2,
     "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "package": {
       "identity": "com.example.fixture",
@@ -39,7 +39,8 @@
     "workspace": {
       "id": "00112233445566778899aabbccddeeff",
       "name": "Fixture Workspace"
-    }
+    },
+    "view": "settings"
   },
   "event": {
     "mount": "mount-1",
