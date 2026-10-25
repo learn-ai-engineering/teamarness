@@ -128,7 +128,7 @@ Verify attempt 3 passed at `b5202d0`. Two corrective phases fixed issues that ea
 
 **Remaining before Close**
 
-- The developer's real-app checks, with Exhibits installed and then not installed:
+- The developer's real-app checks passed on 2026-10-26 for chat with Exhibits, enable and disable, the not-installed case and Channel replies. These were planned with Exhibits installed and then not installed:
   - the Packages list and "Unavailable" marker;
   - an Exhibits chat answer that shows its activity line;
   - exactly one Channel reply;
@@ -145,6 +145,7 @@ The system test `agent_reply_flow.rs::enqueued_reply_keeps_old_actor_during_rebi
 
 These are recorded in the `agent-harness` Verify reports:
 
+- an Agent can't create an Exhibit yet, because the Agent withholds `file.put` (and `file.read`). Uploads were judged too large for the turn bounds, but a small HTML Exhibit fits. The developer confirmed the gap in a manual check on 2026-10-26. The fix is either to stop withholding `file.put` and let the turn bounds refuse an oversized chunk with a stable code, or to wait for the Exhibits slice 2 blob capability;
 - a command in flight at the deadline is missing from the failed-turn activity;
 - an interrupted chat turn drops the activity of tool calls that already finished;
 - the final model call is still offered tools it can't use;
