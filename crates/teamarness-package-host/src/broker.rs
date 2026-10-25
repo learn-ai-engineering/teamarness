@@ -31,6 +31,12 @@ const _: () = {
 
 pub(crate) struct PortBroker {
     #[cfg(feature = "test-hooks")]
+    pub(crate) authorized_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) delivery_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
     pub(crate) selection_pause:
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::PortSelectionPause>)>>,
     authority_generations:
@@ -43,6 +49,8 @@ pub(crate) struct PortBroker {
     #[cfg(feature = "test-hooks")]
     pub(crate) record_availability_pause:
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    pub(crate) subscription_leases:
+        std::sync::Mutex<Vec<Weak<crate::port_access::SubscriptionLease>>>,
     pub(crate) access: crate::port_access::PortAccess,
     metadata_revision: [u8; 32],
     graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
@@ -75,7 +83,12 @@ impl PortBroker {
         let mut metadata_revision = [0; 32];
         getrandom::fill(&mut metadata_revision).expect("Host metadata revision entropy");
         Arc::new(Self {
+            #[cfg(feature = "test-hooks")]
+            authorized_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            delivery_pause: std::sync::Mutex::new(None),
             access,
+            subscription_leases: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "test-hooks")]
             selection_pause: std::sync::Mutex::new(None),
             metadata_revision,
@@ -101,6 +114,29 @@ impl PortBroker {
             event_bytes: Arc::new(Semaphore::new(subscriptions::EVENT_BYTES)),
             event_open_locks: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_port_work(&self, package: &PackageIdentity, delivery: bool) {
+        let pending = if delivery {
+            &self.delivery_pause
+        } else {
+            &self.authorized_pause
+        };
+        let pause = {
+            let mut pending = pending.lock().expect("test pause poisoned");
+            if pending
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
     }
 
     #[cfg(feature = "test-hooks")]
@@ -409,6 +445,7 @@ impl PortBroker {
             major,
             minor,
             actor,
+            lease: _,
         } = route;
         schemas
             .validate(contract, port, "request", request)
@@ -492,7 +529,11 @@ impl PortBroker {
             major,
             minor,
             actor,
+            lease,
         } = route;
+        if let Some(lease) = &lease {
+            lease.enqueue(|| ())?;
+        }
         let descriptor = schemas
             .contracts
             .iter()
@@ -518,6 +559,7 @@ impl PortBroker {
                 contract.to_owned(),
                 port.to_owned(),
                 permits,
+                lease,
             )
             .await
             .map_err(|error| error.code)

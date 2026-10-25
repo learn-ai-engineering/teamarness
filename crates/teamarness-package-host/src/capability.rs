@@ -422,6 +422,10 @@ impl GenerationCapabilities {
                         );
                         CapabilityFailure::certain(code)
                     })?;
+                    #[cfg(feature = "test-hooks")]
+                    broker
+                        .pause_port_work(&self.scope.package_identity, false)
+                        .await;
                     broker
                         .call(
                             &self.scope.package_identity,
@@ -510,6 +514,10 @@ impl GenerationCapabilities {
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
             let route = self.authorize_port(&broker, object).await?;
+            #[cfg(feature = "test-hooks")]
+            broker
+                .pause_port_work(&self.scope.package_identity, false)
+                .await;
             if object.get("kind").and_then(Value::as_str) == Some("event") {
                 let subscription = broker
                     .subscribe_event(
@@ -856,6 +864,8 @@ impl GenerationCapabilities {
             .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
         let package = self.scope.package_identity.as_str().to_owned();
         let core = Arc::clone(&self.core);
+        let broker = self.broker.clone();
+        let key = self.instance_key();
         #[cfg(feature = "test-hooks")]
         if matches!(method, "bind" | "unbind")
             && let Some(broker) = self.broker.upgrade()
@@ -917,6 +927,10 @@ impl GenerationCapabilities {
                     .run(&self.limiter, started, move || {
                         core.bind_agent_package(workspace, id, &package)
                             .map_err(binding_error)?;
+                        if let Some(broker) = broker.upgrade() {
+                            broker
+                                .reconcile_binding(&key, &crate::port_access::actor(&core, &key)?);
+                        }
                         current_binding(&core, workspace, &package)
                     })
                     .await?
@@ -927,6 +941,10 @@ impl GenerationCapabilities {
                     .run(&self.limiter, started, move || {
                         core.unbind_agent_package(workspace, &package)
                             .map_err(binding_error)?;
+                        if let Some(broker) = broker.upgrade() {
+                            broker
+                                .reconcile_binding(&key, &crate::port_access::actor(&core, &key)?);
+                        }
                         Ok(json!({"agent":Value::Null}))
                     })
                     .await?
@@ -1008,17 +1026,97 @@ impl GenerationCapabilities {
         object: &Map<String, Value>,
     ) -> Result<crate::port_access::ResolvedPort, PackageErrorCode> {
         let key = self.instance_key();
+        // Subscribe before reading authority, so accepted membership loss cannot be missed
+        // between issuing a lease and starting its idle-stream watcher.
+        let changes = if object.contains_key("method") {
+            None
+        } else {
+            let core = self.core.clone();
+            let workspace = teamarness_core::WorkspaceId::from_str(key.workspace_id.as_str())
+                .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+            Some(
+                tokio::task::spawn_blocking(move || core.subscribe_principals(workspace))
+                    .await
+                    .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
+                    .map_err(binding_error)?,
+            )
+        };
         let input = object.clone();
-        broker
+        let resolved_key = key.clone();
+        let generation = self.generation;
+        let authority_revision = self.authority.revision();
+        let route = broker
             .access_work(
                 self.core.clone(),
                 key.clone(),
                 &self.authority,
                 move |broker, _, state| {
-                    broker.resolve_access(&key.package_identity, &key.workspace_id, &input, &state)
+                    broker.reconcile_binding(&resolved_key, &state.actor);
+                    let mut route = broker.resolve_access(
+                        &resolved_key.package_identity,
+                        &resolved_key.workspace_id,
+                        &input,
+                        &state,
+                    )?;
+                    if !input.contains_key("method") {
+                        route.lease = Some(broker.subscription_lease(
+                            resolved_key,
+                            &input,
+                            &route,
+                            generation,
+                            authority_revision,
+                        ));
+                    }
+                    Ok(route)
                 },
             )
-            .await
+            .await?;
+        if !matches!(
+            route.provider.snapshot().await.lifecycle,
+            crate::LifecycleState::Admitted
+                | crate::LifecycleState::Active
+                | crate::LifecycleState::Activating
+                | crate::LifecycleState::Recovering
+        ) {
+            return Err(PackageErrorCode::PortUnavailable);
+        }
+        if let (Some(mut changes), Some(lease)) = (changes, &route.lease) {
+            let mut ended = lease.watch();
+            let weak = Arc::downgrade(lease);
+            let broker = Arc::downgrade(broker);
+            let core = self.core.clone();
+            let authority = self.authority.clone();
+            let limiter = self.limiter.clone();
+            let mut cancelled = self.cancelled.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    if ended.borrow().is_some() || *cancelled.borrow() {
+                        break;
+                    }
+                    tokio::select! {
+                        change = changes.changed() => if change.is_err() { break; },
+                        _ = ended.changed() => break,
+                        _ = cancelled.changed() => break,
+                    }
+                    let Some(broker) = broker.upgrade() else {
+                        break;
+                    };
+                    if weak.strong_count() == 0 {
+                        break;
+                    }
+                    let core = core.clone();
+                    let key = key.clone();
+                    let _ = authority
+                        .run(&limiter, Arc::new(AtomicBool::new(false)), move || {
+                            if let Ok(actor) = crate::port_access::actor(&core, &key) {
+                                broker.reconcile_binding(&key, &actor);
+                            }
+                        })
+                        .await;
+                }
+            });
+        }
+        Ok(route)
     }
 
     async fn port_selection(
@@ -1277,6 +1375,13 @@ impl GenerationCapabilities {
 impl Drop for GenerationCapabilities {
     fn drop(&mut self) {
         self.cancelled.send_replace(true);
+        if let Some(broker) = self.broker.upgrade() {
+            broker.revoke_consumer(
+                &self.instance_key(),
+                self.generation,
+                self.authority.revision(),
+            );
+        }
     }
 }
 
@@ -1560,23 +1665,39 @@ async fn run_port_query(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let mut revocation = query.receiver.revocation();
+    let mut terminal = query.receiver.terminal();
     let mut credit = MAX_STREAM_CREDIT;
     let mut sequence = 0;
     let reason = loop {
-        if *cancelled.borrow()
-            || !drain_commands(&mut commands, &mut credit).await
-            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
-        {
+        if *cancelled.borrow() || !drain_commands(&mut commands, &mut credit).await {
             break "closed";
+        }
+        if credit == 0 {
+            if let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
+                break crate::protocol::capability_code(code);
+            }
+            if let Some(end) = terminal.borrow().clone() {
+                break match end {
+                    StreamEnd::Completed => "completed",
+                    StreamEnd::Host(code) => crate::protocol::capability_code(code),
+                    _ => "provider_exited",
+                };
+            }
         }
         tokio::select! {
             biased;
+            _ = async {
+                if let Some(watch) = &mut revocation { let _ = watch.changed().await; }
+                else { std::future::pending::<()>().await; }
+            }, if credit == 0 => {},
+            _ = terminal.changed(), if credit == 0 => {},
             change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => credit += amount,
                 Some(StreamCommand::Close) | None => break "closed",
             },
-            event = query.receiver.changed() => match event {
+            event = query.receiver.changed(), if credit > 0 => match event {
                 Ok(event) => {
                     sequence += 1;
                     credit -= 1;
@@ -1590,6 +1711,9 @@ async fn run_port_query(
                 Err(StreamEnd::Completed) => break "completed",
                 Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
                 Err(StreamEnd::Host(PackageErrorCode::Overloaded)) => break "overloaded",
+                Err(StreamEnd::Host(PackageErrorCode::PortNotEnabled)) => break "port_not_enabled",
+                Err(StreamEnd::Host(PackageErrorCode::AgentNotBound)) => break "agent_not_bound",
+                Err(StreamEnd::Host(PackageErrorCode::AgentBindingChanged)) => break "agent_binding_changed",
                 Err(_) => break "provider_exited",
             },
         }

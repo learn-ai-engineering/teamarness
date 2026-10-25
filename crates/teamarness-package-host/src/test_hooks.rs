@@ -24,6 +24,35 @@ impl AuthorityPause {
 }
 
 impl PackageHost {
+    /// Holds authorized work after its leases are issued but before Provider dispatch/open.
+    pub fn pause_next_port_authorized_for_tests(
+        &self,
+        package: PackageIdentity,
+    ) -> Arc<AuthorityPause> {
+        let pause = Arc::new(AuthorityPause::default());
+        *self
+            .inner
+            .port_broker
+            .authorized_pause
+            .lock()
+            .expect("test pause poisoned") = Some((package, pause.clone()));
+        pause
+    }
+    /// Holds one already accepted event before forwarding it to the Consumer writer.
+    pub fn pause_next_port_delivery_for_tests(
+        &self,
+        package: PackageIdentity,
+    ) -> Arc<AuthorityPause> {
+        let pause = Arc::new(AuthorityPause::default());
+        *self
+            .inner
+            .port_broker
+            .delivery_pause
+            .lock()
+            .expect("test pause poisoned") = Some((package, pause.clone()));
+        pause
+    }
+
     /// Holds the next record stream after its empty-page availability read, before another page.
     pub fn pause_next_record_availability_for_tests(
         &self,

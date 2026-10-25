@@ -32,6 +32,10 @@ impl AuthorityGeneration {
 }
 
 impl GenerationAuthority {
+    pub(crate) fn revision(&self) -> u64 {
+        self.expected
+    }
+
     pub(crate) async fn leases(
         &self,
     ) -> Result<

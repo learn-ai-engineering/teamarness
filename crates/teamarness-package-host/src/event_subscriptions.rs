@@ -59,6 +59,7 @@ struct Subscriber {
     events: mpsc::Sender<QueuedEvent>,
     terminal: watch::Sender<Option<&'static str>>,
     bytes: Arc<Semaphore>,
+    lease: Option<Arc<crate::port_access::SubscriptionLease>>,
 }
 
 struct QueuedEvent {
@@ -77,6 +78,7 @@ pub(crate) struct EventSubscription {
     consumer_generation: u64,
     provider_id: String,
     generation: u64,
+    lease: Option<Arc<crate::port_access::SubscriptionLease>>,
     _slot: OwnedSemaphorePermit,
     _provider_slot: OwnedSemaphorePermit,
 }
@@ -114,8 +116,12 @@ impl PortBroker {
             schemas,
             major,
             minor,
+            lease,
             ..
         } = route;
+        if let Some(lease) = &lease {
+            lease.enqueue(|| ())?;
+        }
         let slot = self
             .event_subscribers
             .clone()
@@ -297,6 +303,7 @@ impl PortBroker {
                     events: sender,
                     terminal,
                     bytes: Arc::new(Semaphore::new(SUBSCRIBER_BYTES)),
+                    lease: lease.clone(),
                 },
             );
         let upstream = registry.streams.get(&key).expect("upstream inserted");
@@ -309,6 +316,7 @@ impl PortBroker {
             consumer_generation,
             provider_id: upstream.provider_id.clone(),
             generation: upstream.generation,
+            lease,
             _slot: slot,
             _provider_slot: provider_slot,
         })
@@ -353,6 +361,8 @@ impl PortBroker {
         mut cancelled: watch::Receiver<bool>,
     ) {
         use super::super::capability::StreamCommand;
+        let mut revocation = subscription.lease.as_ref().map(|lease| lease.watch());
+        let mut revoked = false;
         let mut credit = INITIAL_STREAM_CREDIT as u64;
         let mut sequence = 0;
         let observation = |stage, code| {
@@ -371,14 +381,38 @@ impl PortBroker {
             })
         };
         let reason = loop {
+            if !revoked && let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
+                let mut registry = self.events.lock().await;
+                if let Some(upstream) = registry.streams.get_mut(&subscription.key) {
+                    if let Some(subscriber) = upstream.subscribers.remove(&subscription.subscriber)
+                    {
+                        subscriber
+                            .terminal
+                            .send_replace(Some(crate::protocol::capability_code(code)));
+                    }
+                    if upstream.subscribers.is_empty() {
+                        upstream.closing = true;
+                        upstream.stopped.notify_one();
+                    }
+                }
+                revoked = true;
+            }
             if *cancelled.borrow() {
                 break "closed";
+            }
+            // A revoked consumer cannot keep scarce permits by withholding credit.
+            if revoked && credit == 0 {
+                break subscription.terminal.borrow().unwrap_or("closed");
             }
             if subscription.events.is_closed() && subscription.events.is_empty() {
                 break subscription.terminal.borrow().unwrap_or("provider_exited");
             }
             tokio::select! {
                 biased;
+                _ = async {
+                    if let Some(watch) = &mut revocation { let _ = watch.changed().await; }
+                    else { std::future::pending::<()>().await; }
+                }, if !revoked => {},
                 change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
                 command = commands.recv() => match command {
                     Some(StreamCommand::Credit(amount)) => credit += amount,
@@ -386,6 +420,8 @@ impl PortBroker {
                 },
                 event = subscription.events.recv(), if credit > 0 => match event {
                     Some(event) => {
+                        #[cfg(feature = "test-hooks")]
+                        self.pause_port_work(&subscription.consumer_package.parse().expect("admitted consumer"), true).await;
                         sequence += 1;
                         credit -= 1;
                         if output.event(&id, sequence, event.payload).await.is_err() { break "process_exited"; }
@@ -492,6 +528,21 @@ fn offer_event(
     global_bytes: &Arc<Semaphore>,
     provider_bytes: &Arc<Semaphore>,
 ) -> Result<(), &'static str> {
+    if let Some(lease) = &subscriber.lease {
+        return lease
+            .enqueue(|| enqueue_event(subscriber, payload, bytes, global_bytes, provider_bytes))
+            .map_err(crate::protocol::capability_code)?;
+    }
+    enqueue_event(subscriber, payload, bytes, global_bytes, provider_bytes)
+}
+
+fn enqueue_event(
+    subscriber: &Subscriber,
+    payload: &Value,
+    bytes: u32,
+    global_bytes: &Arc<Semaphore>,
+    provider_bytes: &Arc<Semaphore>,
+) -> Result<(), &'static str> {
     let global = global_bytes
         .clone()
         .try_acquire_many_owned(bytes)
@@ -573,11 +624,13 @@ mod tests {
             events: slow_sender,
             terminal: slow_end,
             bytes: Arc::new(Semaphore::new(SUBSCRIBER_BYTES)),
+            lease: None,
         };
         let fast = Subscriber {
             events: fast_sender,
             terminal: fast_end,
             bytes: Arc::new(Semaphore::new(SUBSCRIBER_BYTES)),
+            lease: None,
         };
         let payload = json!({"order":1});
         let actual_bytes = serde_json::to_vec(&payload).unwrap().len() as u32;

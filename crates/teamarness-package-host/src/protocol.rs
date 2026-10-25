@@ -190,6 +190,7 @@ pub(crate) struct UiEventRoute {
     state: Mutex<UiEventRouteState>,
     contract: EventContract,
     operation: String,
+    lease: Option<Arc<PortStreamLease>>,
 }
 
 enum EventContract {
@@ -198,6 +199,39 @@ enum EventContract {
         schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
         contract: String,
     },
+}
+
+/// Enqueue and revocation share a lock; only already accepted events may drain.
+pub(crate) struct PortStreamLease {
+    state: std::sync::Mutex<Option<PackageErrorCode>>,
+    terminal: watch::Sender<Option<PackageErrorCode>>,
+}
+impl Default for PortStreamLease {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(None),
+            terminal: watch::channel(None).0,
+        }
+    }
+}
+impl PortStreamLease {
+    pub(crate) fn watch(&self) -> watch::Receiver<Option<PackageErrorCode>> {
+        self.terminal.subscribe()
+    }
+    pub(crate) fn enqueue<T>(&self, work: impl FnOnce() -> T) -> Result<T, PackageErrorCode> {
+        let state = self.state.lock().expect("subscription lease poisoned");
+        if let Some(code) = *state {
+            return Err(code);
+        }
+        Ok(work())
+    }
+    pub(crate) fn revoke(&self, code: PackageErrorCode) {
+        let mut state = self.state.lock().expect("subscription lease poisoned");
+        if state.is_none() {
+            *state = Some(code);
+            self.terminal.send_replace(Some(code));
+        }
+    }
 }
 
 pub(crate) struct PortQueryStream {
@@ -220,12 +254,20 @@ struct UiEventRouteState {
 }
 
 impl UiEventReceiver {
+    pub(crate) fn revocation(&self) -> Option<watch::Receiver<Option<PackageErrorCode>>> {
+        self.route.lease.as_ref().map(|lease| lease.watch())
+    }
+
     pub(crate) fn terminal(&self) -> watch::Receiver<Option<StreamEnd>> {
         self.terminal.clone()
     }
 
     pub(crate) async fn changed(&mut self) -> Result<UiEvent, StreamEnd> {
+        let mut revocation = self.route.lease.as_ref().map(|lease| lease.watch());
         loop {
+            if let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
+                self.route.terminate(StreamEnd::Host(code));
+            }
             let terminal = self.terminal.borrow().clone();
             if let Some(end) = terminal {
                 // A Package-owned end, like a completion, drains what the Package already sent.
@@ -247,6 +289,10 @@ impl UiEventReceiver {
             }
             tokio::select! {
                 biased;
+                _ = async {
+                    if let Some(watch) = &mut revocation { let _ = watch.changed().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {},
                 result = self.terminal.changed() => {
                     if result.is_err() {
                         return Err(StreamEnd::Host(PackageErrorCode::ProcessExited));
@@ -267,15 +313,20 @@ impl UiEventRoute {
         schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
         contract: String,
         operation: String,
+        lease: Option<Arc<PortStreamLease>>,
     ) -> (Arc<Self>, UiEventReceiver) {
-        Self::new_internal(EventContract::Port { schemas, contract }, operation)
+        Self::new_internal(EventContract::Port { schemas, contract }, operation, lease)
     }
 
     fn new(contract: Arc<AdmittedUi>, operation: String) -> (Arc<Self>, UiEventReceiver) {
-        Self::new_internal(EventContract::Ui(contract), operation)
+        Self::new_internal(EventContract::Ui(contract), operation, None)
     }
 
-    fn new_internal(contract: EventContract, operation: String) -> (Arc<Self>, UiEventReceiver) {
+    fn new_internal(
+        contract: EventContract,
+        operation: String,
+        lease: Option<Arc<PortStreamLease>>,
+    ) -> (Arc<Self>, UiEventReceiver) {
         let (events, receiver) = mpsc::channel(UI_EVENT_CAPACITY);
         let (terminal, terminal_receiver) = watch::channel(None);
         let port_overhead = if matches!(&contract, EventContract::Port { .. }) {
@@ -293,6 +344,7 @@ impl UiEventRoute {
             }),
             contract,
             operation,
+            lease,
         });
         let event_receiver = UiEventReceiver {
             events: receiver,
@@ -314,6 +366,13 @@ impl UiEventRoute {
     /// byte budget both hold the whole credit window, and credit returns only
     /// for an event the subscriber has acknowledged.
     fn event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
+        if let Some(lease) = &self.lease {
+            return lease.enqueue(|| self.enqueue_event(sequence, value))?;
+        }
+        self.enqueue_event(sequence, value)
+    }
+
+    fn enqueue_event(&self, sequence: u64, value: Value) -> Result<(), PackageErrorCode> {
         let payload: PackageValue = serde_json::from_value(value.clone())
             .map_err(|_| PackageErrorCode::UiContractViolation)?;
         match &self.contract {
@@ -1402,6 +1461,11 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::UiContractViolation => "ui_contract_violation",
         PackageErrorCode::EventLagged => "event_lagged",
         PackageErrorCode::PortEventInvalid => "port_event_invalid",
+        PackageErrorCode::PortNotEnabled => "port_not_enabled",
+        PackageErrorCode::AgentNotBound => "agent_not_bound",
+        PackageErrorCode::AgentBindingChanged => "agent_binding_changed",
+        PackageErrorCode::ProcessExited => "provider_exited",
+        PackageErrorCode::Cancelled => "cancelled",
         _ => "protocol_violation",
     }
 }
@@ -1438,6 +1502,7 @@ pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::PortCatalogChanged => "port_catalog_changed",
         PackageErrorCode::PortNotEnabled => "port_not_enabled",
         PackageErrorCode::AgentNotBound => "agent_not_bound",
+        PackageErrorCode::AgentBindingChanged => "agent_binding_changed",
         PackageErrorCode::PortVersionMismatch => "port_version_mismatch",
         PackageErrorCode::PortUngranted => "ungranted_port",
         PackageErrorCode::PortRequestInvalid => "port_request_invalid",
@@ -1468,6 +1533,7 @@ fn protocol_code(error: teamarness_package_protocol::ProtocolError) -> PackageEr
 }
 
 impl ProcessClient {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_port_stream(
         &self,
         id: String,
@@ -1476,8 +1542,9 @@ impl ProcessClient {
         schemas: Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
         contract: String,
         port: String,
+        lease: Option<Arc<PortStreamLease>>,
     ) -> Result<UiEventReceiver, WireFailure> {
-        let (route, receiver) = UiEventRoute::new_port(schemas, contract, port);
+        let (route, receiver) = UiEventRoute::new_port(schemas, contract, port, lease);
         self.ui_event_routes
             .lock()
             .await

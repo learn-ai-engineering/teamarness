@@ -326,6 +326,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PortCatalogChanged,
         PackageErrorCode::PortNotEnabled,
         PackageErrorCode::AgentNotBound,
+        PackageErrorCode::AgentBindingChanged,
         PackageErrorCode::PortUngranted,
         PackageErrorCode::PortRequestInvalid,
         PackageErrorCode::PortResponseInvalid,
@@ -335,7 +336,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 63);
+    assert_eq!(codes.len(), 64);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -392,6 +393,7 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PortCatalogChanged
             | PackageErrorCode::PortNotEnabled
             | PackageErrorCode::AgentNotBound
+            | PackageErrorCode::AgentBindingChanged
             | PackageErrorCode::PortUnavailable
             | PackageErrorCode::PortUngranted
             | PackageErrorCode::PortRequestInvalid
@@ -513,6 +515,10 @@ fn agent_binding_errors_keep_capability_stage_and_recovery() {
     for (code, expected) in [
         (PackageErrorCode::AgentNotStewarded, "agent_not_stewarded"),
         (PackageErrorCode::AgentNotFound, "agent_not_found"),
+        (
+            PackageErrorCode::AgentBindingChanged,
+            "agent_binding_changed",
+        ),
     ] {
         let envelope = PackageErrorEnvelope::new(
             code,

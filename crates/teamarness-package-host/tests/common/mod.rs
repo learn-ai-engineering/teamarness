@@ -106,7 +106,7 @@ pub fn write_node_package_with_capabilities(
     fs::write(&backend_path, &backend).unwrap();
     fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
     let entrypoint = b"export function mount() { return async () => {}; }";
-    let contract = serde_json::to_vec(&serde_json::json!({
+    let mut contract = serde_json::json!({
         "schemaVersion": 1,
         "$defs": {},
         "requests": {
@@ -155,8 +155,14 @@ pub fn write_node_package_with_capabilities(
             "fixture.rejected_stream": {"request": {}, "event": {}},
             "fixture.saturation": {"request": {}, "event": {}}
         }
-    }))
-    .unwrap();
+    });
+    contract["requests"]["fixture.port_query_stats"] =
+        serde_json::json!({"request":{},"response":{}});
+    contract["requests"]["fixture.port_query_emit"] =
+        serde_json::json!({"request":{},"response":{}});
+    contract["requests"]["fixture.port_last_actor"] =
+        serde_json::json!({"request":{},"response":{}});
+    let contract = serde_json::to_vec(&contract).unwrap();
     fs::write(root.join("ui/index.js"), entrypoint).unwrap();
     fs::write(root.join("ui/icon.svg"), b"<svg/>").unwrap();
     fs::write(root.join("ui/contract.json"), &contract).unwrap();

@@ -27,6 +27,7 @@ pub(crate) struct ResolvedPort {
     pub(crate) major: u16,
     pub(crate) minor: u16,
     pub(crate) actor: Value,
+    pub(crate) lease: Option<Arc<SubscriptionLease>>,
 }
 
 pub(crate) fn actor(
@@ -133,6 +134,9 @@ impl PortBroker {
                     major,
                 )
                 .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
+            if major.is_none() {
+                broker.revoke_contract(&key, &contract);
+            }
             #[cfg(feature = "test-hooks")]
             if failed_completion {
                 return Err(PackageErrorCode::CapabilityUnavailable);
@@ -247,6 +251,134 @@ impl PortBroker {
             major,
             minor,
             actor: state.actor.clone(),
+            lease: None,
         })
+    }
+}
+
+/// One authorization's delivery gate. Enqueue and revocation use this same lock;
+/// accepted bounded queues may drain, but a revoked lease cannot accept a new value.
+pub(crate) struct SubscriptionLease {
+    key: PackageInstanceKey,
+    provider: PackageInstanceKey,
+    contract: String,
+    binding: Option<String>,
+    enabled: bool,
+    access: String,
+    generation: u64,
+    authority_revision: u64,
+    pub(crate) delivery: Arc<crate::protocol::PortStreamLease>,
+}
+
+impl SubscriptionLease {
+    pub(crate) fn watch(&self) -> tokio::sync::watch::Receiver<Option<PackageErrorCode>> {
+        self.delivery.watch()
+    }
+    pub(crate) fn enqueue<T>(&self, work: impl FnOnce() -> T) -> Result<T, PackageErrorCode> {
+        self.delivery.enqueue(work)
+    }
+    fn revoke(&self, code: PackageErrorCode) {
+        self.delivery.revoke(code);
+    }
+}
+
+impl PortBroker {
+    pub(crate) fn subscription_lease(
+        &self,
+        key: PackageInstanceKey,
+        input: &Map<String, Value>,
+        route: &ResolvedPort,
+        generation: u64,
+        authority_revision: u64,
+    ) -> Arc<SubscriptionLease> {
+        let contract = input["contract"]
+            .as_str()
+            .expect("resolved contract")
+            .to_owned();
+        let lease = Arc::new(SubscriptionLease {
+            provider: PackageInstanceKey::new(
+                route.provider.identity().clone(),
+                key.workspace_id.clone(),
+            ),
+            generation,
+            authority_revision,
+            access: input["access"]
+                .as_str()
+                .expect("resolved access")
+                .to_owned(),
+            key,
+            enabled: route.actor["kind"] == "agent" && route.schemas.has_guide(&contract),
+            binding: route.actor["principal"].as_str().map(str::to_owned),
+            contract,
+            delivery: Arc::new(crate::protocol::PortStreamLease::default()),
+        });
+        let mut leases = self
+            .subscription_leases
+            .lock()
+            .expect("subscription registry poisoned");
+        leases.retain(|lease| lease.strong_count() > 0);
+        leases.push(Arc::downgrade(&lease));
+        lease
+    }
+
+    fn revoke_subscriptions(
+        &self,
+        reason: impl Fn(&SubscriptionLease) -> Option<PackageErrorCode>,
+    ) {
+        self.subscription_leases
+            .lock()
+            .expect("subscription registry poisoned")
+            .retain(|weak| {
+                let Some(lease) = weak.upgrade() else {
+                    return false;
+                };
+                if let Some(code) = reason(&lease) {
+                    lease.revoke(code);
+                }
+                true
+            });
+    }
+    pub(crate) fn revoke_contract(&self, key: &PackageInstanceKey, contract: &str) {
+        self.revoke_subscriptions(|lease| {
+            (lease.key == *key
+                && lease.enabled
+                && matches!(lease.access.as_str(), "agent" | "declared")
+                && lease.contract == contract)
+                .then_some(PackageErrorCode::PortNotEnabled)
+        });
+    }
+    /// Called inside the same operation gate as the durable local binding transition.
+    pub(crate) fn reconcile_binding(&self, key: &PackageInstanceKey, actor: &Value) {
+        self.revoke_subscriptions(|lease| {
+            if lease.key != *key
+                || lease.binding.is_none()
+                || lease.binding.as_deref() == actor["principal"].as_str()
+            {
+                return None;
+            }
+            Some(if actor["kind"] == "agent" {
+                PackageErrorCode::AgentBindingChanged
+            } else {
+                PackageErrorCode::AgentNotBound
+            })
+        });
+    }
+    pub(crate) fn revoke_consumer(
+        &self,
+        key: &PackageInstanceKey,
+        generation: u64,
+        authority_revision: u64,
+    ) {
+        self.revoke_subscriptions(|lease| {
+            (lease.key == *key
+                && lease.generation == generation
+                && lease.authority_revision == authority_revision)
+                .then_some(PackageErrorCode::Cancelled)
+        });
+    }
+    pub(crate) fn revoke_provider(&self, key: &PackageInstanceKey) {
+        self.revoke_subscriptions(|lease| {
+            (lease.provider == *key).then_some(PackageErrorCode::ProcessExited)
+        });
     }
 }

@@ -372,6 +372,8 @@ async function serve() {
   const providerEventStreams = new Map();
   let providerEventOpens = 0;
   let providerEventCloses = 0;
+  let lastCommandActor;
+  let portCommands = 0;
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -431,7 +433,9 @@ async function serve() {
           providerEventOpens += 1;
           providerEventStreams.set(frame.id, { sequence: 0, credit: frame.initialCredit });
         } else if (frame.topic === "teamarness.port.query.v1") {
-          if (frame.payload.port === "message.title_watch") {
+          if (frame.payload.port === "message.idle_watch") {
+            // Kept open until explicit close or process lifecycle loss.
+          } else if (frame.payload.port === "message.title_watch") {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1, $teamarnessPortValue: [1, 2] } });
           } else if (frame.payload.port === "message.marker_watch") {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1,
@@ -445,8 +449,10 @@ async function serve() {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: packageIdentity === "com.example.invalid" ? "invalid" : 1 } });
             if (packageIdentity !== "com.example.invalid") send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
           }
-          send({ kind: "stream_close", streamId: frame.id, code: "completed" });
-          uiStreams.delete(frame.id);
+          if (frame.payload.port !== "message.idle_watch") {
+            send({ kind: "stream_close", streamId: frame.id, code: "completed" });
+            uiStreams.delete(frame.id);
+          }
         }
         else if (frame.topic === "fixture.close") {
           send({ kind: "stream_close", streamId: frame.id, code: "closed" });
@@ -603,6 +609,7 @@ async function serve() {
         immutableStream = undefined;
         send({ kind: "response", id: frame.id, payload: { closed: true } });
       } else if (frame.kind === "request" && ["teamarness.port.command.v1", "teamarness.port.query.v1"].includes(frame.operation)) {
+        if (frame.operation === "teamarness.port.command.v1") { lastCommandActor = frame.payload.actor; portCommands += 1; }
         if (frame.payload.request.text === "stall") {
           delayedRequest = frame;
         } else if (frame.payload.request.text === "exit") {
@@ -642,6 +649,17 @@ async function serve() {
           payload: { grant: capabilityGrants.get("teamarness.package-ports"),
             access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
         send({ kind: "response", id: frame.id, payload: { opened: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_query_emit") {
+        for (const [streamId, stream] of uiStreams) {
+          if (stream.topic !== "teamarness.port.query.v1") continue;
+          stream.sequence += 1;
+          send({ kind: "event", streamId, sequence: String(stream.sequence), payload: { order: frame.payload.order } });
+        }
+        send({ kind: "response", id: frame.id, payload: { emitted: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_last_actor") {
+        send({ kind: "response", id: frame.id, payload: { actor: lastCommandActor ?? null, commands: portCommands } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_query_stats") {
+        send({ kind: "response", id: frame.id, payload: { active: [...uiStreams.values()].filter(s => s.topic === "teamarness.port.query.v1").length } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_events") {
         send({ kind: "response", id: frame.id, payload: frame.payload.summary
           ? { count: portEvents.length, firstLength: portEvents[0]?.$teamarnessPortValue?.length ?? null, closeCode: portCloseCode }

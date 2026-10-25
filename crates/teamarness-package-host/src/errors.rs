@@ -66,6 +66,7 @@ pub enum PackageErrorCode {
     PortCatalogChanged,
     PortNotEnabled,
     AgentNotBound,
+    AgentBindingChanged,
     PortUngranted,
     PortRequestInvalid,
     PortResponseInvalid,
