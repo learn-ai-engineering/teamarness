@@ -307,6 +307,12 @@ pub(crate) fn router_observing(
             context.blocking(move |_| state.channel_list_value()).await
         },
     )
+    .port_request(
+        "dev.teamarness.conversations", "runtime.guide", "query",
+        |_context: Context<ConversationsActive>, _actor: PortActor, _: Empty| async move {
+            Ok(crate::guide::response(CHANNEL_LIST_LIMIT))
+        },
+    )
     .port_event(
         "dev.teamarness.conversations", "messages.changed",
         |context: Context<ConversationsActive>, _actor: PortActor| async move {
@@ -1172,6 +1178,183 @@ mod session_tests {
         }
     }
 
+    // Verifies: TEAM.SYS.CONV-R20
+    #[tokio::test]
+    async fn runtime_guide_is_schema_valid_bounded_and_explains_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let response = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":3,
+                    "port":"runtime.guide", "actor":{"kind":"person","identity":ALICE},
+                    "request":{}
+                }),
+            )
+            .await
+            .expect("the actual public Port router serves runtime.guide");
+        let guide = &response["$teamarnessPortValue"];
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        assert!(contract.has_guide("dev.teamarness.conversations"));
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "runtime.guide",
+                    "response",
+                    guide
+                )
+                .is_ok()
+        );
+        let provided = &contract.contracts[0];
+        let list = provided
+            .ports
+            .iter()
+            .find(|port| port.name == "channel.list")
+            .unwrap();
+        assert_eq!(
+            list.response.as_ref().unwrap()["properties"]["channels"]["maxItems"],
+            CHANNEL_LIST_LIMIT
+        );
+        assert_eq!(
+            contract.definitions["changes"]["properties"]["events"]["maxItems"],
+            PAGE_SIZE
+        );
+        let post = provided
+            .ports
+            .iter()
+            .find(|port| port.name == "message.post")
+            .unwrap();
+        assert_eq!(
+            post.request.as_ref().unwrap()["properties"]["markdown"]["maxLength"],
+            crate::domain::MAX_MARKDOWN
+        );
+        assert!(serde_json::to_vec(guide).unwrap().len() <= 32 * 1024);
+        // Include the process envelope in the size qualification, not just the Markdown.
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 32 * 1024);
+        let markdown = guide["markdown"].as_str().unwrap();
+        for advice in [
+            format!("at most {CHANNEL_LIST_LIMIT} visible Channels"),
+            format!("at most {PAGE_SIZE} raw rows"),
+            format!("at most {PAGE_SIZE} changes"),
+            format!("{} UTF-8 bytes", crate::domain::MAX_MARKDOWN),
+            "Subscribe to messages.changed before the initial message.page".into(),
+            "epoch and revision".into(),
+            "continuation".into(),
+            "highWater".into(),
+            "acknowledged prefix".into(),
+            "pending".into(),
+            "unavailable".into(),
+            "resyncRequired".into(),
+            "reconstruct".into(),
+            "do not mark Channels read".into(),
+            "Host-derived actor".into(),
+            "conversations.channel_hidden".into(),
+            "provider_error".into(),
+            "details.provider.code".into(),
+            "outcomeUncertain".into(),
+            "Never automatically retry an uncertain message.post".into(),
+        ] {
+            assert!(markdown.contains(&advice), "missing guidance: {advice}");
+        }
+        for invalid in [
+            json!({}),
+            json!({"markdown":true}),
+            json!({"markdown":"x","extra":0}),
+            json!({"markdown":"x".repeat(32769)}),
+        ] {
+            assert!(
+                contract
+                    .validate(
+                        "dev.teamarness.conversations",
+                        "runtime.guide",
+                        "response",
+                        &invalid
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "runtime.guide",
+                    "request",
+                    &json!({"extra":0})
+                )
+                .is_err()
+        );
+        // The guide distinguishes the schema's character bound from enforced UTF-8 bytes.
+        let oversized = json!({"channelId":hex_id(GENERAL_ID), "markdown":"é".repeat(crate::domain::MAX_MARKDOWN / 2 + 1)});
+        assert!(
+            contract
+                .validate(
+                    "dev.teamarness.conversations",
+                    "message.post",
+                    "request",
+                    &oversized
+                )
+                .is_ok()
+        );
+        let refused = session
+            .harness
+            .request(
+                "teamarness.port.command.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":3,
+                    "port":"message.post", "actor":{"kind":"person","identity":ALICE},
+                    "request":oversized
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "conversations.invalid_markdown");
+        assert!(!refused.outcome_uncertain());
+        assert_eq!(session.store().record_count().unwrap(), 0);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.CONV-R20, TEAM.SYS.PKG-R12
+    #[test]
+    fn runtime_guide_preserves_the_five_existing_operation_shapes() {
+        use std::collections::BTreeSet;
+        let mut contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            (contract.contracts[0].major, contract.contracts[0].minor),
+            (1, 3)
+        );
+        assert_eq!(contract.contracts[0].ports.len(), 6);
+        // Snapshot of the five operations at 9985fd9: names, kinds, schemas and all
+        // reachable definitions. Ignore descriptions and the additive minor only.
+        let names = BTreeSet::from([
+            "channel.list".into(),
+            "message.changes".into(),
+            "message.page".into(),
+            "message.post".into(),
+            "messages.changed".into(),
+        ]);
+        contract.contracts[0].minor = 0;
+        contract.contracts[0].description = "Operation shape snapshot".into();
+        for port in &mut contract.contracts[0].ports {
+            port.description = "Operation shape snapshot".into();
+        }
+        let metadata = contract
+            .project_metadata("dev.teamarness.conversations", Some(&names))
+            .unwrap();
+        assert_eq!(
+            metadata.sha256,
+            "3afcd9a8669e41a6d601d9f0b2f9133ee75e8318cee2c6b80eab854bc96c81be"
+        );
+    }
+
     #[test]
     fn public_port_contract_has_exact_closed_bounded_shapes() {
         let contract = teamarness_package_contract::port_contract::compile_port_contracts(
@@ -1181,8 +1364,8 @@ mod session_tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, "dev.teamarness.conversations");
-        assert_eq!((provided.major, provided.minor), (1, 2));
-        assert_eq!(provided.ports.len(), 5);
+        assert_eq!((provided.major, provided.minor), (1, 3));
+        assert_eq!(provided.ports.len(), 6);
         let list = |direction: &str, value: &JsonValue| {
             contract.validate(
                 "dev.teamarness.conversations",
@@ -1463,7 +1646,7 @@ mod session_tests {
         let old =
             compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.1.json")).unwrap();
         let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
-        assert_eq!(new.contracts[0].minor, 2);
+        assert_eq!(new.contracts[0].minor, 3);
         check_additive_minor_documents(&old, &new, "dev.teamarness.conversations").unwrap();
         for before in &old.contracts[0].ports {
             let after = new.contracts[0]
@@ -1522,7 +1705,7 @@ mod session_tests {
 
     // Verifies: TEAM.SYS.PKG-R12
     #[test]
-    fn port_contract_1_2_is_additive_over_the_shipped_1_0_document() {
+    fn current_port_contract_is_additive_over_the_shipped_1_0_document() {
         use teamarness_package_contract::port_contract::{
             check_additive_minor_documents, compile_port_contracts,
         };
@@ -1530,7 +1713,7 @@ mod session_tests {
             compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.0.json")).unwrap();
         let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
         assert_eq!((old.contracts[0].major, old.contracts[0].minor), (1, 0));
-        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 2));
+        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 3));
         check_additive_minor_documents(&old, &new, "dev.teamarness.conversations").unwrap();
         for name in ["message.post", "message.page", "messages.changed"] {
             let before = old.contracts[0]

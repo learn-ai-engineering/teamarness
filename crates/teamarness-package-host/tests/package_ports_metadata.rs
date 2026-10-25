@@ -280,3 +280,109 @@ async fn declared_metadata_is_complete_bounded_scoped_and_does_not_activate_prov
         .await
         .unwrap();
 }
+
+// Verifies: TEAM.SYS.CONV-R20, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn conversations_declared_metadata_exposes_guide_without_granting_agent_access() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "dev.example.provider"),
+            ("consumer", "dev.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    let root = fixture.config.application_root();
+    let bytes = include_bytes!("../../../packages/conversations-package/ports.json");
+    fs::write(root.join("provider/ports.json"), bytes).unwrap();
+    for directory in ["provider", "consumer"] {
+        let path = root.join(directory).join("teamarness.package.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        if directory == "provider" {
+            manifest["portContract"] = json!({"path":"ports.json","sha256":common::digest(bytes)});
+            manifest["activation"] = json!("on_demand");
+        } else {
+            manifest["consumedPorts"] = json!([{
+                "identity":"dev.teamarness.conversations","major":1,"minMinor":3,"maxMinor":3,
+                "ports":[{"name":"runtime.guide","kind":"query"}]
+            }]);
+        }
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    assert!(
+        host.snapshot()
+            .await
+            .instances
+            .iter()
+            .any(|i| i.key.package_identity.as_str() == "dev.example.consumer"),
+        "Host must admit a consumer declaring Conversations 1.3 runtime.guide"
+    );
+    let target = mount(&host, "dev.example.consumer").await;
+    let available = call(&host, &target, "available", json!({"access":"declared"})).await;
+    let summary = &available["result"]["contracts"][0];
+    assert_eq!(
+        summary["contract"], "dev.teamarness.conversations",
+        "{available}"
+    );
+    assert_eq!(summary["minor"], 3);
+    let described = call(
+        &host,
+        &target,
+        "describe",
+        json!({
+            "access":"declared","contract":"dev.teamarness.conversations",
+            "metadataSha256":summary["metadataSha256"],"offset":0
+        }),
+    )
+    .await;
+    let projected = STANDARD
+        .decode(described["result"]["data"].as_str().unwrap())
+        .unwrap();
+    let contract =
+        teamarness_package_contract::port_contract::compile_port_contracts(&projected).unwrap();
+    assert!(contract.has_guide("dev.teamarness.conversations"));
+    assert_eq!(contract.contracts[0].ports.len(), 1);
+    let key = host
+        .snapshot()
+        .await
+        .instances
+        .into_iter()
+        .find(|i| i.key.package_identity.as_str() == "dev.example.consumer")
+        .unwrap()
+        .key;
+    let workspace = teamarness_core::WorkspaceId::from_str(key.workspace_id.as_str()).unwrap();
+    let agent = fixture.core.add_agent(workspace, "Guide Agent").unwrap();
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "dev.example.consumer")
+        .unwrap();
+    for access in ["declared", "agent"] {
+        let denied = call(
+            &host,
+            &target,
+            "invoke",
+            json!({
+                "access":access,"contract":"dev.teamarness.conversations","major":1,
+                "port":"runtime.guide","kind":"query","request":{}
+            }),
+        )
+        .await;
+        assert_eq!(denied["error"], "port_not_enabled", "{denied}");
+    }
+    assert!(
+        host.snapshot()
+            .await
+            .instances
+            .iter()
+            .filter(|i| i.key.package_identity.as_str() == "dev.example.provider")
+            .all(|i| i.process_generation.is_none())
+    );
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
