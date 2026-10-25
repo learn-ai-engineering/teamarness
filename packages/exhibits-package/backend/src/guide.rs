@@ -97,8 +97,9 @@ Exhibit IDs match `{ID_PATTERN}`, at most {MAX_ID_CHARS} characters. Titles are 
 
 A command may fail with `outcome_unknown`: it may or may not have taken effect. Never assume \
 either. After an uncertain `file.put`, call `files.missing` and send only the chunks it \
-reports. After an uncertain `draft.update`, call `exhibit.read` and compare the revision and \
-files before trying again.
+reports. If a re-sent chunk fails with `exhibits.content_mismatch`, the chunks received did \
+not form the file and were discarded: upload the whole file again. After an uncertain \
+`draft.update`, call `exhibit.read` and compare the revision and files before trying again.
 
 ## Reading back
 

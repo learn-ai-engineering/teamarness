@@ -110,7 +110,7 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 **Question:** Where does an Agent learn how to use a Package's Ports well: what is possible, what to do, what not to do? Ports give an Agent the capability; each Package also knows best how that capability should be used.
 
-**Current state:** Port Contracts (`ports.json`) declare exact shapes, with bounded descriptions of at most 512 characters. The standalone Agent Package is the harness for tools and skills, and it has tools only for Conversations. Documents Port Contract 1.1 accepts a bound Agent on `document.revise` (ADR 0033), but no Agent tool calls it yet.
+**Current state:** Port Contracts (`ports.json`) declare exact shapes, with bounded descriptions of at most 512 characters. The standalone Agent Package is the harness for tools and skills, and it has tools only for Conversations. Documents Port Contract 1.1 accepts a bound Agent on `document.revise` (ADR 0033), but no Agent tool calls it yet. The Exhibits Port Contract 1.0 ships a `runtime.guide` query that publishes its limits and usage rules (`TEAM.SYS.PKG-R18`), one working instance of Package-shipped guidance.
 
 **Options:**
 - Each Package ships agent guidance (skills, tool descriptions, perhaps a small library) beside its Port Contract, and an Agent discovers it from the Package at run time.

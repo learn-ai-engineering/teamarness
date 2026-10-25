@@ -58,7 +58,7 @@
         } },
         "response": { "type": "object", "additionalProperties": false, "required": ["complete"], "properties": { "complete": { "type": "boolean" } } }
       },
-      { "name": "files.missing", "kind": "query", "description": "Report which of up to 256 files are not yet stored completely: chunks is \"all\" when nothing was received, or the chunk indices still missing. Files already stored are left out, so an empty list means every file is present. Use it before uploading, to skip files another Exhibit already stored, and to resume after an uncertain file.put.",
+      { "name": "files.missing", "kind": "query", "description": "Report which of up to 256 files are not yet stored completely: chunks is \"all\" when nothing was received, or the chunk indices to send. Files already stored are left out, so an empty list means every file is present. Use it before uploading, to skip files another Exhibit already stored, and to resume after an uncertain file.put.",
         "request": { "type": "object", "additionalProperties": false, "required": ["sha256s"], "properties": {
           "sha256s": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/sha256" } }
         } },
