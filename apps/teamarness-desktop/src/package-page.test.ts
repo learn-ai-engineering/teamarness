@@ -147,6 +147,7 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
   });
   return {
     page,
+    management,
     calls,
     removed,
     opened,
@@ -347,6 +348,36 @@ describe("Package page", () => {
     expect(test.html()).toContain("Restart Teamarness to use the Team Package again.");
     await test.act("restart-app");
     expect(test.calls.at(-1)).toBe("app-restart");
+  });
+
+  it("keeps the Team label for a written override over the running Team Package, and offers to cancel it", async () => {
+    const written = snapshot({
+      registrations: [{
+        directory: "/Users/person/Packages/tutorial", expectedIdentity: TUTORIAL, override: true, tier: "team",
+        status: { kind: "pending_restart", change: "written" },
+      }],
+      packages: [...snapshot().packages, {
+        identity: TUTORIAL, version: "1.0.0", displayName: "Tutorial", source: "bundled", trust: "application_bundled", uiContractDigest: "digest",
+      }],
+      instances: [instance(TUTORIAL, "active")],
+    });
+    const test = harness(written, {
+      remove: async (identity) => { test.calls.push(`remove:${identity}`); return { revision: 8, restartRequired: false }; },
+    });
+    await test.open(TUTORIAL);
+    expect(test.html()).toContain("<dt>Source</dt><dd>Team</dd>");
+    expect(test.html()).not.toContain("replaced on this device");
+    expect(test.html()).toContain("Applies after restart: this override replaces the Team Package Tutorial when Teamarness restarts.");
+    expect(test.html()).toContain(">Cancel override</button>");
+    expect(test.html()).not.toContain("Remove override");
+
+    await test.act("remove");
+    expect(test.html()).toContain("Cancel the override? It has not applied yet, so the Team Package Tutorial keeps running. Data is kept.");
+    expect(test.html()).not.toContain("after Teamarness restarts. Data is kept.");
+    await test.act("confirm-remove");
+    expect(test.calls).toContain(`remove:${TUTORIAL}`);
+    expect(test.management.registrationState(TUTORIAL).feedback?.message)
+      .toBe("The override is cancelled. The Team Package keeps running.");
   });
 
   it("shows a removed override as applying after restart, with Restart Teamarness and no second Remove", async () => {

@@ -81,7 +81,7 @@ A local Package with the Package Identity of a bundled Package replaces it only 
 3. Read the second confirmation and select the replace button. It names the Team Package, for example **Replace Tutorial after restart**.
 4. Select **Restart Teamarness**, or select **Later** to apply the override at the next start.
 
-Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The bundled Package keeps running.
+Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The bundled Package keeps running, and its Package page still labels its source as "Team". To change your mind before the restart, select **Cancel override**. The bundled Package keeps running and no restart is needed.
 
 After the restart, the override runs in the Team tier, so the sidebar lists it under **Team Packages**. The sidebar groups Packages by tier, and its source label follows Package Source, so the override's label reads `Personal`. Its Package page labels its source as "Team, replaced on this device by an override". It has no Personal controls.
 

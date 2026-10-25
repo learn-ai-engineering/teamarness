@@ -420,7 +420,8 @@ fn a_homepage_is_an_absolute_bounded_https_url() {
 }
 
 /// The published schema agrees with the semantic rules on every case it can express.
-/// Trimming is a semantic check only, as it is for `displayName`.
+/// The `description` pattern also enforces trimming, so the schema refuses
+/// leading or trailing whitespace there as the semantic rules do.
 // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn the_schema_publishes_the_presentation_metadata_bounds() {

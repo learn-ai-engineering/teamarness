@@ -123,7 +123,16 @@ export class PackageManagementController {
     await this.inspect(directory, true);
   }
 
-  public async registrationAction(action: string | undefined, identity: string): Promise<void> {
+  /**
+   * Runs one registration action for `identity`. The snapshot tells whether
+   * the identity is a Team Package's file entry, which chooses the copy for a
+   * removal.
+   */
+  public async registrationAction(
+    action: string | undefined,
+    identity: string,
+    snapshot: PackageHostSnapshot | null = null,
+  ): Promise<void> {
     if (this.workingRegistration) return;
     switch (action) {
       case "remove":
@@ -135,13 +144,19 @@ export class PackageManagementController {
         this.confirmingRemoval = null;
         this.hooks.changed();
         return;
-      case "confirm-remove":
+      case "confirm-remove": {
         if (this.confirmingRemoval !== identity) return;
         this.confirmingRemoval = null;
+        const registration = snapshot?.registrations.find(({ expectedIdentity }) => expectedIdentity === identity);
+        // A Team Package's entry removed without a restart had not applied, so the Team Package kept running.
+        const liveCopy = registration === undefined || !isTeamIdentityEntry(registration)
+          ? `Removed. ${REMOVE_KEEPS_DATA_COPY}`
+          : registration.override ? OVERRIDE_CANCELLED_COPY : TEAM_ENTRY_REMOVED_COPY;
         await this.runRegistration(identity, () => this.bridge.remove(identity), (change) => change.restartRequired
           ? REMOVED_FOR_RESTART_COPY
-          : `Removed. ${REMOVE_KEEPS_DATA_COPY}`);
+          : liveCopy);
         return;
+      }
       case "reload":
         await this.runRegistration(identity, () => this.bridge.reload(identity), () => "Reloaded.");
         return;
@@ -395,12 +410,34 @@ export function pendingRestartCopy(change: "written" | "removed", name: string):
     : `Applies after restart: removed from this device. The Team Package ${name} returns when Teamarness restarts. Data is kept.`;
 }
 
+/**
+ * Whether the Team Package itself runs for `identity`. Its file entry then has
+ * not applied yet, so removing the entry needs no restart.
+ */
+export function teamPackageRuns(snapshot: PackageHostSnapshot | null, identity: string): boolean {
+  return snapshot?.packages.some((entry) => entry.identity === identity && entry.source === "bundled") ?? false;
+}
+
 /** The question before removing a Team Package identity's file entry. */
-export function teamEntryRemoveQuestion(registration: PackageRegistration, name: string): string {
+export function teamEntryRemoveQuestion(registration: PackageRegistration, name: string, teamRuns: boolean): string {
+  if (teamRuns) {
+    return registration.override
+      ? `Cancel the override? It has not applied yet, so the Team Package ${name} keeps running. Data is kept.`
+      : `Remove this entry? The Team Package ${name} keeps running. Data is kept.`;
+  }
   return registration.override
     ? `Remove the override? ${name} returns to the Team Package after Teamarness restarts. Data is kept.`
     : `Remove this entry? The Team Package ${name} returns after Teamarness restarts. Data is kept.`;
 }
+
+/** The label of the control that removes a registration's file entry. */
+export function registrationRemoveLabel(registration: PackageRegistration, teamRuns: boolean): string {
+  if (!registration.override) return "Remove";
+  return teamRuns ? "Cancel override" : "Remove override";
+}
+
+export const OVERRIDE_CANCELLED_COPY = "The override is cancelled. The Team Package keeps running.";
+export const TEAM_ENTRY_REMOVED_COPY = "Removed from this device. The Team Package keeps running.";
 
 export const REMOVED_FOR_RESTART_COPY = "Removed from this device. Restart Teamarness to use the Team Package again.";
 
@@ -501,15 +538,17 @@ function renderRegistration(
   const summary = registration.override
     ? `<p>Override of a Team Package, from ${escape(registration.directory)}. Changes to an override apply after Teamarness restarts.</p>`
     : team
-      ? `<p>Entry for the Team Package identity ${escape(identity)}, from ${escape(registration.directory)}, without an override. The Team Package stays unavailable until you remove it and restart Teamarness.</p>`
+      ? `<p>Entry for the Team Package identity ${escape(identity)}, from ${escape(registration.directory)}, without an override.${pending === "removed" ? "" : " The Team Package stays unavailable until you remove it and restart Teamarness."}</p>`
       : `<p>Personal Package from ${escape(registration.directory)}. It could not start.</p>`;
   const pendingNote = pending ? `<p class="package-install-note" role="status">${escape(pendingRestartCopy(pending, name))}</p>` : "";
   const working = state.working ? '<p role="status" aria-live="polite">Working…</p>' : "";
-  // A row that waits for a restart has its own Restart Teamarness control.
-  const feedback = state.feedback
+  // A row that waits for a restart has its own Restart Teamarness control,
+  // and its pending note already says what a successful change did.
+  const feedback = state.feedback && !(pending && !state.feedback.failed)
     ? `<div class="${state.feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${state.feedback.failed ? "alert" : "status"}"><p>${escape(state.feedback.message)}</p>${state.feedback.restart && !pending ? action("restart", "Restart Teamarness") : ""}</div>`
     : "";
-  const removeLabel = registration.override ? "Remove override" : "Remove";
+  const teamRuns = team && teamPackageRuns(snapshot, identity);
+  const removeLabel = registrationRemoveLabel(registration, teamRuns);
   const buttons = [
     pending ? action("restart", "Restart Teamarness") : "",
     team ? "" : action("reload", "Reload"),
@@ -518,7 +557,7 @@ function renderRegistration(
   ].join("");
   const controls = state.confirming && pending !== "removed"
     ? `<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${name}`)}"><p>${escape(team
-      ? teamEntryRemoveQuestion(registration, name)
+      ? teamEntryRemoveQuestion(registration, name, teamRuns)
       : `Remove ${name} from this device? ${REMOVE_KEEPS_DATA_COPY}`)}</p><div class="package-instance-actions">${action("confirm-remove", removeLabel)}${action("cancel-remove", "Keep it", true)}</div></div>`
     : `<div class="package-instance-actions">${buttons}</div>`;
   return `<article class="package-instance" aria-labelledby="package-registration-name-${index}"><div><h4 id="package-registration-name-${index}"><button type="button" class="package-instance-link" data-package-registration-page="${index}" aria-label="${escape(`About ${name}`)}">${escape(name)}</button></h4>${summary}${refused}${pendingNote}</div>${working}${feedback}${controls}</article>`;

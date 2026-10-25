@@ -10,8 +10,10 @@ import {
   packageRefusalMessage,
   pendingRestartChange,
   pendingRestartCopy,
+  registrationRemoveLabel,
   REMOVE_KEEPS_DATA_COPY,
   teamEntryRemoveQuestion,
+  teamPackageRuns,
   type PackageManagementController,
   type RegistrationState,
 } from "./package-install";
@@ -63,7 +65,8 @@ export type PackagePagePresentation = Readonly<{
   sourceLabel: string;
   trustLabel: string | null;
   personal: boolean;
-  override: boolean;
+  /** The label of Remove: **Cancel override** for an override that has not applied yet. */
+  removeLabel: string;
   /** The question before removing this Team Package identity's file entry, when it has one to remove. */
   teamEntryRemoveQuestion: string | null;
   /** What waits for a restart, when the registration file changed while Teamarness ran. */
@@ -163,11 +166,11 @@ export class PackagePageController {
       case "cancel-remove":
         if (!allowed("remove")) return;
         this.feedback = null;
-        await this.management.registrationAction(action, identity);
+        await this.management.registrationAction(action, identity, snapshot);
         return;
       case "confirm-remove": {
         if (!allowed("remove")) return;
-        await this.management.registrationAction("confirm-remove", identity);
+        await this.management.registrationAction("confirm-remove", identity, snapshot);
         const feedback = this.management.registrationState(identity).feedback;
         if (this.target === target && feedback && !feedback.failed && !feedback.restart) {
           this.removed = true;
@@ -291,8 +294,10 @@ export function buildPackagePagePresentation(
   const entry = snapshot.packages.find((value) => value.identity === identity);
   const registration = snapshot.registrations.find((value) => value.expectedIdentity === identity);
   if (!entry && !registration) return null;
-  const override = registration?.override === true;
   const teamEntry = registration !== undefined && isTeamIdentityEntry(registration);
+  const teamRuns = teamEntry && teamPackageRuns(snapshot, identity);
+  // A written override replaces the Team Package only once it runs, after a restart.
+  const overrideRuns = registration?.override === true && entry?.source === "local";
   const pending = registration ? pendingRestartChange(registration) : null;
   const personal = registration !== undefined && registration.tier === "personal" && !teamEntry;
   const name = entry?.displayName ?? identity;
@@ -343,11 +348,11 @@ export function buildPackagePagePresentation(
     description: entry?.description ?? null,
     author: entry?.author ?? null,
     homepage: entry?.homepage ?? null,
-    sourceLabel: override ? "Team, replaced on this device by an override" : personal ? "Personal" : "Team",
+    sourceLabel: overrideRuns ? "Team, replaced on this device by an override" : personal ? "Personal" : "Team",
     trustLabel: entry ? TRUST_LABELS[entry.trust] : null,
     personal,
-    override,
-    teamEntryRemoveQuestion: teamEntry && pending !== "removed" ? teamEntryRemoveQuestion(registration, name) : null,
+    removeLabel: registration ? registrationRemoveLabel(registration, teamRuns) : "Remove",
+    teamEntryRemoveQuestion: teamEntry && pending !== "removed" ? teamEntryRemoveQuestion(registration, name, teamRuns) : null,
     pending: pending ? pendingRestartCopy(pending, name) : null,
     directory: personal ? registration.directory : null,
     refusal: registration?.status.kind === "refused" ? packageRefusalMessage(registration.status.code) : null,
@@ -454,7 +459,7 @@ function renderControls(
     : "";
   const controls = presentation.controls;
   if (controls.length === 0) return `${pendingHtml}${working}${feedbackHtml}`;
-  const removeLabel = presentation.override ? "Remove override" : "Remove";
+  const removeLabel = presentation.removeLabel;
   if (registration.confirming && controls.includes("remove")) {
     const question = presentation.teamEntryRemoveQuestion
       ?? `Remove ${presentation.name} from this device? It stops in all your Workspaces. ${REMOVE_KEEPS_DATA_COPY}`;

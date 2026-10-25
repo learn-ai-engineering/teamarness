@@ -388,7 +388,13 @@ export class Shell {
           this.packageSnapshot,
           Number(button.dataset.packageRegistrationIndex),
         );
-        if (identity) void this.packageManagement.registrationAction(button.dataset.packageRegistrationAction, identity);
+        if (identity) {
+          void this.packageManagement.registrationAction(
+            button.dataset.packageRegistrationAction,
+            identity,
+            this.packageSnapshot,
+          );
+        }
       });
     });
     screen.querySelector<HTMLButtonElement>("[data-package-change-restart]")?.addEventListener("click", () => {
