@@ -16,7 +16,7 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 | `TEAM.SYS.REPO` | `02-system/06-repos/` | The Repo-aware Package: repository registration, local read-only Git inspection, and repository views. No repository replication |
 | `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package frame mounting, workspace controls, theming |
 | `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
-| `TEAM.SYS.DOCS` | `02-system/09-documents/` | The Documents Package: Collections, Documents with a collaborative rendered body and Canonical Markdown interchange, Comments, record validation and projections, Documents Port Contract 1.0, and its UI. Consumes the immutable-record Synchronization Capability (ADRs 0027 and 0031) |
+| `TEAM.SYS.DOCS` | `02-system/09-documents/` | The Documents Package: Collections, Documents with a collaborative rendered body and Canonical Markdown interchange, Comments, record validation and projections, Documents Port Contract 1.0, and its UI. Consumes the immutable-record Synchronization Capability (ADRs 0027 and 0032) |
 | `TEAM.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
 | `TEAM.CONTRIB` | `04-contributing/` | Development setup, contribution workflow, code standards |
 
@@ -31,4 +31,4 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 
 ## Current state
 
-The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, Package Foundation, Conversations Package, Repository Integration, Shell and Package UI polish, architecture review, and Workspace Principals workstream are complete. Phase 5 Membership Management and Hardening remains next for the core roadmap. See `roadmap.md` for workstream status and `open-questions.md` for unresolved design questions.
+The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, Package Foundation, Conversations Package, Repository Integration, Shell and Package UI polish, architecture review, and Workspace Principals workstream are complete. The Agent Package workstream (ADR 0030) is complete and verified locally, including revision-based recovery, standalone Personal distribution, dispatch ownership and Host generation safeguards, and incoming-main integration. Automated checks and focused independent review pass; developer observations cover a limited real-endpoint and restart/offline flow, not the full manual matrix. The developer approved local integration only; remote delivery and publication require separate decisions. Phase 5 Membership Management and Hardening remains next for the core roadmap. See `roadmap.md` for workstream status and `open-questions.md` for unresolved design questions.

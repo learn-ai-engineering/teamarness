@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/agent-binding.schema.json",
+  "title": "Agent Binding capability 1.0",
+  "description": "A Package Instance's own Agent Binding: Installation-local configuration, held by Core, that names the Workspace Agent this Package acts as on Ports and record-log appends. The grant fixes the Package and Workspace, so no request names a Package. Only an Agent this Installation stewards can be bound; the binding reads as absent once that Agent is no longer current.",
+  "$defs": {
+    "identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "agent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["principalId", "identity", "name"],
+      "properties": {
+        "principalId": { "$ref": "#/$defs/principalId" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] }
+      }
+    },
+    "candidate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["principalId", "identity", "name", "bound"],
+      "properties": {
+        "principalId": { "$ref": "#/$defs/principalId" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+        "bound": { "type": "boolean" }
+      }
+    },
+    "binding": { "type": "object", "additionalProperties": false, "required": ["agent"], "properties": { "agent": { "anyOf": [{ "$ref": "#/$defs/agent" }, { "type": "null" }] } } },
+    "currentCall": { "type": "object", "additionalProperties": false, "required": ["method"], "properties": { "method": { "const": "current" } } },
+    "candidatesCall": { "type": "object", "additionalProperties": false, "required": ["method"], "properties": { "method": { "const": "candidates" } } },
+    "candidatesResult": { "type": "object", "additionalProperties": false, "required": ["agents"], "properties": { "agents": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/candidate" } } } },
+    "bindCall": { "type": "object", "additionalProperties": false, "required": ["method", "principalId"], "properties": { "method": { "const": "bind" }, "principalId": { "$ref": "#/$defs/principalId" } } },
+    "unbindCall": { "type": "object", "additionalProperties": false, "required": ["method"], "properties": { "method": { "const": "unbind" } } },
+    "errorCodes": { "enum": ["agent_not_stewarded", "agent_not_found", "capability_request_invalid", "capability_unavailable"] }
+  }
+}

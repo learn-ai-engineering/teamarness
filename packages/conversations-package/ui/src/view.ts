@@ -11,6 +11,48 @@ const KIT_CLASS = {
   noticeDanger: "teamarness-notice teamarness-notice--danger",
 } as const;
 
+function agentAttribution(description: string, tooltipId: string): HTMLElement {
+  const wrapper = document.createElement("span");
+  wrapper.className = "message-agent-attribution";
+  const info = document.createElement("button");
+  info.type = "button";
+  info.className = "message-agent-info";
+  info.setAttribute("aria-label", "About this Agent");
+  info.setAttribute("aria-describedby", tooltipId);
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("aria-hidden", "true");
+  icon.setAttribute("focusable", "false");
+  const circle = document.createElementNS(icon.namespaceURI, "circle");
+  circle.setAttribute("cx", "12");
+  circle.setAttribute("cy", "12");
+  circle.setAttribute("r", "9");
+  const detail = document.createElementNS(icon.namespaceURI, "path");
+  detail.setAttribute("d", "M12 11v6m0-10h.01");
+  icon.append(circle, detail);
+  info.append(icon);
+  const tooltip = document.createElement("span");
+  tooltip.id = tooltipId;
+  tooltip.className = "message-agent-tooltip";
+  tooltip.setAttribute("role", "tooltip");
+  tooltip.textContent = description;
+  tooltip.hidden = true;
+  let hovered = false;
+  let focused = false;
+  let dismissed = false;
+  const update = (): void => { tooltip.hidden = dismissed || !(hovered || focused); };
+  wrapper.addEventListener("mouseenter", () => { hovered = true; dismissed = false; update(); });
+  wrapper.addEventListener("mouseleave", () => { hovered = false; update(); });
+  info.addEventListener("focus", () => { focused = true; dismissed = false; update(); });
+  info.addEventListener("blur", () => { focused = false; update(); });
+  info.addEventListener("click", () => { dismissed = false; tooltip.hidden = false; });
+  info.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { dismissed = true; update(); event.stopPropagation(); }
+  });
+  wrapper.append(info, tooltip);
+  return wrapper;
+}
+
 /**
  * Builds the Conversations DOM once and updates regions in-place.
  * The composer (textarea + send button) is created during construction and
@@ -46,6 +88,7 @@ export class ConversationsView {
   private readonly observedRowHeights = new WeakMap<Element, number>();
   private readingAnchor: { id: string; offset: number; atBottom: boolean } | null = null;
   private disposed = false;
+  private tooltipSequence = 0;
 
   constructor(
     root: ShadowRoot | HTMLElement,
@@ -512,6 +555,9 @@ export class ConversationsView {
     const focusedAuthorId = !openedChannel && focusedElement instanceof HTMLElement
       && focusedElement.classList.contains("message-author")
       ? focusedElement.closest<HTMLElement>(".message")?.dataset.messageId : undefined;
+    const focusedAgentInfoId = !openedChannel && focusedElement instanceof HTMLElement
+      && focusedElement.classList.contains("message-agent-info")
+      ? focusedElement.closest<HTMLElement>(".message")?.dataset.messageId : undefined;
     const focusedLinkRow = !openedChannel && focusedElement instanceof HTMLAnchorElement
       && this.history.contains(focusedElement)
       ? focusedElement.closest<HTMLElement>(".message") : null;
@@ -575,18 +621,16 @@ export class ConversationsView {
         author.textContent = message.author;
       });
 
-      row.append(author);
+      const authorLine = document.createElement("div");
+      authorLine.className = "message-author-line";
+      authorLine.append(author);
       if (!message.isLocal && principal?.kind === "agent") {
-        const indicator = document.createElement("span");
-        indicator.className = "message-agent-indicator";
-        indicator.textContent = "Agent";
         const steward = state.principals.principals.find(candidate =>
           candidate.kind === "person" && candidate.principalId === principal.stewardPrincipalId);
-        const stewardLabel = document.createElement("span");
-        stewardLabel.className = "message-agent-steward";
-        stewardLabel.textContent = `stewarded by ${steward?.name || shortenedIdentity(steward?.identity ?? principal.stewardPrincipalId ?? message.author)}`;
-        row.append(indicator, stewardLabel);
+        const description = `Agent · stewarded by ${steward?.name || shortenedIdentity(steward?.identity ?? principal.stewardPrincipalId ?? message.author)}`;
+        authorLine.append(agentAttribution(description, `agent-attribution-${this.tooltipSequence++}`));
       }
+      row.append(authorLine);
 
       const body = document.createElement("div");
       body.className = "message-markdown";
@@ -596,6 +640,9 @@ export class ConversationsView {
       this.history.append(row);
       this.resizeObserver?.observe(row);
       if (message.id === focusedAuthorId) author.focus({ preventScroll: true });
+      if (message.id === focusedAgentInfoId) {
+        row.querySelector<HTMLButtonElement>(".message-agent-info")?.focus({ preventScroll: true });
+      }
       if (message.id === focusedLinkId && focusedLinkIndex >= 0) {
         row.querySelectorAll<HTMLAnchorElement>(".message-markdown a")[focusedLinkIndex]
           ?.focus({ preventScroll: true });

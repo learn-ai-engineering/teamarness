@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::capability::{
-    AppendFence, CapabilityRequirement, CapabilityScope, GenerationCapabilities,
+    AppendFence, CapabilityRequirement, CapabilityScope, GenerationCapabilities, GenerationGuards,
 };
 use crate::diag::fault;
 use crate::host_store::{HostStore, HostStoreHandle, ProcessLease};
@@ -58,6 +58,7 @@ pub(crate) struct CallEnvironment {
 
 #[derive(Clone)]
 pub(crate) struct ProcessSpec {
+    pub(crate) authority: crate::authority::AuthorityGeneration,
     pub(crate) template: ProcessTemplate,
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) workspace_name: String,
@@ -88,6 +89,7 @@ pub(crate) async fn spawn(
     recovering: bool,
     append_fence: Arc<AppendFence>,
 ) -> Result<ProcessGeneration, WireFailure> {
+    let authority = spec.authority.advance().await.map_err(WireFailure::new)?;
     let capabilities = GenerationCapabilities::bind(
         spec.core.clone(),
         CapabilityScope {
@@ -99,7 +101,10 @@ pub(crate) async fn spawn(
         &spec.template.capabilities,
         generation,
         spec.calls.limiter.clone(),
-        append_fence,
+        GenerationGuards {
+            append_fence,
+            authority,
+        },
         spec.broker.clone(),
     )
     .map_err(WireFailure::new)?;
@@ -430,6 +435,7 @@ mod tests {
             .unwrap(),
         );
         let spec = ProcessSpec {
+            authority: crate::authority::AuthorityGeneration::default(),
             template: ProcessTemplate {
                 package_identity: "dev.teamarness.orphan".parse().unwrap(),
                 package_version: "1.0.0".into(),

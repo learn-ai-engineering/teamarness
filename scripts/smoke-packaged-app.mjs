@@ -144,6 +144,10 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
         set createButton to my namedDescendant(selectedContent, "Create", "AXButton")
         set focused of workspaceNameField to true
         keystroke "Packaged smoke"
+        set personNameField to my namedDescendant(selectedContent, "Your name in this Workspace", "AXTextField")
+        set focused of personNameField to true
+        keystroke "Smoke Person"
+        delay 0.3
         click createButton
       `), "Workspace creation");
       assert.equal(await registrationExists(dataDirectory), false, "fresh bundled Tutorial created a registration file");

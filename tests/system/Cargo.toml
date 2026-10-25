@@ -30,6 +30,9 @@ path = "../../packages/documents-package/backend/src/main.rs"
 name = "documents-port-consumer-under-test"
 path = "src/bin/documents_port_consumer.rs"
 
+# The optional standalone Agent is qualified through an explicitly supplied Package Directory;
+# it is not a source dependency or prerequisite of the default Teamarness suite.
+
 [dependencies]
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
 teamarness-documents-package = { path = "../../packages/documents-package/backend" }
@@ -45,7 +48,8 @@ sha2.workspace = true
 # the default suite reaches no public relay. It is a dev-dependency: the
 # feature never ships in the application.
 teamarness-core = { path = "../../crates/teamarness-core", features = ["test-hooks"] }
-teamarness-package-host = { path = "../../crates/teamarness-package-host" }
+teamarness-package-host = { path = "../../crates/teamarness-package-host", features = ["test-hooks"] }
 teamarness-package-protocol = { path = "../../crates/teamarness-package-protocol" }
 tempfile.workspace = true
-tokio.workspace = true
+# `net` is for the stub completion endpoint the Agent reply flow binds on loopback.
+tokio = { workspace = true, features = ["net"] }

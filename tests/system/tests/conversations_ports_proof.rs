@@ -149,11 +149,14 @@ async fn real_sdk_consumer_posts_invalidates_recovers_and_converges() {
         .expect("real Conversations appears in the authoring catalog");
     let provided = serde_json::to_value(&provider.provided).unwrap();
     assert_eq!(provided[0]["identity"], PACKAGE_ID);
-    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 3);
+    assert_eq!(provided[0]["minor"], 2);
+    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 5);
     for (name, kind) in [
         ("message.post", "command"),
         ("message.page", "query"),
+        ("message.changes", "query"),
         ("messages.changed", "event"),
+        ("channel.list", "query"),
     ] {
         assert!(provided[0]["ports"].as_array().unwrap().iter().any(|port| {
             port["name"] == name
@@ -243,6 +246,7 @@ async fn real_sdk_consumer_posts_invalidates_recovers_and_converges() {
     assert_eq!(result["initialQuiet"], true);
     assert_eq!(result["lateReplay"], false);
     assert_eq!(result["denied"], "ungranted_port");
+    assert_eq!(result["undeclaredChanges"], "ungranted_port");
     assert_eq!(result["malformed"], "port_request_invalid");
     assert_eq!(result["forged"], "capability_request_invalid");
     assert_eq!(result["hidden"], "provider_error");

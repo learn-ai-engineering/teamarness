@@ -17,8 +17,9 @@ fn declare(fixture: &common::Fixture, directory: &str, provided: bool) {
                 "identity":"com.example.messages","major":1,"minor":0,"description":"Fixture messages",
                 "ports":[
                     {"name":"message.post","kind":"command","description":"Post a message", "request":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},"response":{"type":"object","properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"additionalProperties":false}},
-                    {"name":"message.list","kind":"query","description":"List messages", "request":{"type":"object","additionalProperties":false},"response":{"type":"object","properties":{"accepted":{"type":"boolean"},"actor":{"type":"object","properties":{"kind":{"const":"person"},"identity":{"type":"string"}},"required":["kind","identity"],"additionalProperties":false}},"required":["accepted","actor"],"additionalProperties":false}},
-                    {"name":"message.watch","kind":"query","description":"Watch messages", "request":{"type":"object","additionalProperties":false},"event":{"type":"object","properties":{"order":{"type":"integer"}},"required":["order"],"additionalProperties":false}}
+                    {"name":"message.list","kind":"query","description":"List messages", "request":{"type":"object","additionalProperties":false},"response":{"type":"object","properties":{"accepted":{"type":"boolean"},"actor":{"type":"object","properties":{"kind":{"enum":["person","agent"]},"identity":{"type":"string"},"principal":{"type":"string"}},"required":["kind","identity"],"additionalProperties":false}},"required":["accepted","actor"],"additionalProperties":false}},
+                    {"name":"message.watch","kind":"query","description":"Watch messages", "request":{"type":"object","additionalProperties":false},"event":{"type":"object","properties":{"order":{"type":"integer"}},"required":["order"],"additionalProperties":false}},
+                    {"name":"message.actor_watch","kind":"query","description":"Watch as the Host-derived actor", "request":{"type":"object","additionalProperties":false},"event":{"type":"object","properties":{"actor":{"type":"object"}},"required":["actor"],"additionalProperties":false}}
                 ]
             }]
         })).unwrap();
@@ -29,7 +30,7 @@ fn declare(fixture: &common::Fixture, directory: &str, provided: bool) {
     } else {
         manifest["consumedPorts"] = serde_json::json!([{
             "identity":"com.example.messages","major":1,"minMinor":0,"maxMinor":0,
-            "ports":[{"name":"message.post","kind":"command"},{"name":"message.list","kind":"query"},{"name":"message.watch","kind":"query"}]
+            "ports":[{"name":"message.post","kind":"command"},{"name":"message.list","kind":"query"},{"name":"message.watch","kind":"query"},{"name":"message.actor_watch","kind":"query"}]
         }]);
     }
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -169,6 +170,118 @@ async fn concurrent_first_calls_share_on_demand_provider_activation() {
         .find(|slot| slot.key.package_identity.as_str() == "com.example.provider")
         .unwrap();
     assert_eq!(provider.process_generation, Some(1));
+}
+
+/// Opens the `message.actor_watch` live query and returns the actor the
+/// Provider saw in its first event.
+async fn live_actor(host: &PackageHost, mount: &UiMountId, id: &str) -> serde_json::Value {
+    let opened = request(
+        host,
+        mount,
+        id,
+        "fixture.port_open",
+        serde_json::json!({"port":"message.actor_watch"}),
+    )
+    .await;
+    assert_eq!(opened["opened"], true, "{opened}");
+    let polls = std::sync::atomic::AtomicUsize::new(0);
+    let events = || async {
+        let poll = polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        request(
+            host,
+            mount,
+            &format!("{id}-events-{poll}"),
+            "fixture.port_events",
+            serde_json::json!({}),
+        )
+        .await
+    };
+    common::eventually(
+        std::time::Duration::from_secs(5),
+        "the live query completes",
+        || async { events().await["closeCode"] == "completed" },
+    )
+    .await;
+    events().await["events"][0]["actor"].clone()
+}
+
+/// Verifies: TEAM.SYS.PKG-R13 (Host-derived actor, ADR 0030)
+#[tokio::test]
+async fn a_bound_consumer_presents_an_agent_actor_and_an_unbound_one_its_person() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+        &[serde_json::json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+    ).await;
+    declare(&fixture, "provider", true);
+    declare(&fixture, "consumer", false);
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let agent = fixture.core.add_agent(workspace, "Bound Agent").unwrap();
+    let agent_key = fixture
+        .core
+        .principal(workspace, agent)
+        .unwrap()
+        .unwrap()
+        .keys()[0];
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = host
+        .snapshot()
+        .await
+        .instances
+        .iter()
+        .find(|slot| slot.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key
+        .clone();
+    let mount = mount(&host, consumer).await;
+    let person =
+        serde_json::json!({"kind":"person","identity":fixture.core.public_identity().to_string()});
+    let as_agent = serde_json::json!({"kind":"agent","principal":agent.to_string(),"identity":agent_key.to_string()});
+    let query = |id: &'static str| {
+        request(
+            &host,
+            &mount,
+            id,
+            "fixture.capability",
+            serde_json::json!({
+                "capability":"teamarness.package-ports","method":"invoke",
+                "arguments":{"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+            }),
+        )
+    };
+    assert_eq!(query("unbound").await["result"]["actor"], person);
+    assert_eq!(live_actor(&host, &mount, "unbound-live").await, person);
+
+    // Binding is read per dispatch: no restart, no cache.
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "com.example.consumer")
+        .unwrap();
+    assert_eq!(query("bound").await["result"]["actor"], as_agent);
+    assert_eq!(live_actor(&host, &mount, "bound-live").await, as_agent);
+    // A different bound Package does not change this caller's actor, and a
+    // caller-supplied actor is still refused.
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "com.example.other")
+        .unwrap();
+    let forged = request(&host, &mount, "forged-agent", "fixture.capability", serde_json::json!({
+        "capability":"teamarness.package-ports","method":"invoke",
+        "arguments":{"contract":"com.example.messages","port":"message.list","kind":"query","request":{},
+            "actor":person}
+    })).await;
+    assert_eq!(forged["error"], "capability_request_invalid");
+
+    fixture
+        .core
+        .unbind_agent_package(workspace, "com.example.consumer")
+        .unwrap();
+    assert_eq!(query("unbound-again").await["result"]["actor"], person);
+    assert_eq!(
+        live_actor(&host, &mount, "unbound-again-live").await,
+        person
+    );
 }
 
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
@@ -849,7 +962,7 @@ async fn optional_absence_is_filtered_and_an_attempt_cannot_dispatch() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        4
     );
     let result = request(&host, &mount, "missing", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports", "method":"invoke",

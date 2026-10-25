@@ -3,6 +3,7 @@ import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { Installation, Membership, PrincipalsSnapshot, Workspace } from "./contracts";
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
 import type { PackageLifecycleResult } from "./package-shell";
+import { createInstallationPackageVisibility, type InstallationPackageVisibility } from "./package-visibility";
 import { Shell, type ShellFrame, type ShellRoute } from "./shell";
 import type { ShellModel } from "./view";
 
@@ -190,6 +191,7 @@ function harness(
   workspaceRail: HTMLElement = new Region() as unknown as HTMLElement,
   contextualNavigation: HTMLElement = new Region() as unknown as HTMLElement,
   agentActions: Readonly<{ addAgent?: (id: string, name: string) => Promise<void>; removeAgent?: (id: string, agentId: string) => Promise<void>; renameAgent?: (id: string, agentId: string, name: string) => Promise<void> }> = {},
+  packageVisibility: InstallationPackageVisibility = createInstallationPackageVisibility({ storage: null }),
 ): {
   shell: Shell;
   frame: ShellFrame;
@@ -223,6 +225,7 @@ function harness(
       selectPreference: (preference) => { calls.push(`theme:${preference}`); },
       subscribe: () => () => undefined,
     },
+    packageVisibility,
     workspaceActions: {
       selectWorkspace: (workspaceId) => { calls.push(`workspace:${workspaceId}`); },
       createWorkspace: async () => undefined,
@@ -586,5 +589,54 @@ describe("Workspace Agent Shell controls", () => {
       `remove:${workspace.id}:${agentId}`,
       `rename:${workspace.id}:${agentId}:Helper renamed`,
     ]);
+  });
+});
+
+class VisibilityRegion extends Region {
+  public readonly toggle = new TestControl();
+  public focusedSelector: string | null = null;
+
+  public querySelector(selector: string): (TestControl & { focus(): void }) | null {
+    if (!selector.startsWith("[data-package-visibility-index=")) return null;
+    return Object.assign(new TestControl(), { focus: () => { this.focusedSelector = selector; } });
+  }
+
+  public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector !== "[data-package-visibility-index]") return [];
+    this.toggle.dataset.packageVisibilityIndex = "0";
+    return [this.toggle];
+  }
+}
+
+describe("Installation Package visibility", () => {
+  it("omits hidden Package Instances from navigation but keeps them in settings", async () => {
+    const visibility = createInstallationPackageVisibility({ storage: null });
+    visibility.setHidden(packageKey, true);
+    const test = harness(undefined, {}, undefined, undefined, {}, visibility);
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    expect(test.frame.contextualNavigation.innerHTML).not.toContain("<span>One</span>");
+    expect(test.frame.contextualNavigation.innerHTML).toContain("<span>Private One</span>");
+    expect(test.frame.shellScreen.innerHTML).toContain('aria-label="Show One in navigation"');
+    expect(test.frame.shellScreen.innerHTML).toContain('aria-label="Hide Private One in navigation"');
+  });
+
+  it("toggles a Package Instance from settings and keeps focus on the toggle", async () => {
+    const screen = new VisibilityRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(test.frame.contextualNavigation.innerHTML).toContain("<span>One</span>");
+
+    screen.toggle.click();
+    expect(test.frame.contextualNavigation.innerHTML).not.toContain("<span>One</span>");
+    expect(screen.innerHTML).toContain('aria-label="Show One in navigation"');
+    expect(screen.focusedSelector).toBe('[data-package-visibility-index="0"]');
+
+    screen.toggle.click();
+    expect(test.frame.contextualNavigation.innerHTML).toContain("<span>One</span>");
   });
 });

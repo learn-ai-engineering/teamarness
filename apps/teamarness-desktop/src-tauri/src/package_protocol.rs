@@ -45,7 +45,7 @@ const FRAME_RUNTIME: &[u8] = include_bytes!(concat!(
 /// Carried on every Package resource response, so a Package UI Frame can load
 /// only Shell-owned and Package-declared resources and can reach no network.
 /// `'wasm-unsafe-eval'` lets it compile WebAssembly from bytes it already holds
-/// (ADR 0030); `eval` and `new Function` stay refused.
+/// (ADR 0031); `eval` and `new Function` stay refused.
 const FRAME_DOCUMENT_CSP: &str = "default-src 'none'; script-src teamarness-package: 'wasm-unsafe-eval'; style-src teamarness-package:; img-src teamarness-package: data:; font-src teamarness-package:; media-src teamarness-package:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
 #[derive(Debug)]

@@ -15,7 +15,10 @@ impl CoreRuntime {
         self.append_record_as_principal(workspace_id, package_identity, purpose, canonical, None)
     }
 
-    /// Appends as a locally bound Agent when a Principal selector is supplied.
+    /// Appends as a Workspace Agent when a Principal selector is supplied.
+    /// The Agent signs for any Package Instance on this Installation while it
+    /// is current, this Installation stewards it, and at least one Package is
+    /// bound to it (ADR 0030); otherwise `PrincipalNotBound`.
     pub fn append_record_as_principal(
         &self,
         workspace_id: WorkspaceId,
@@ -56,17 +59,21 @@ impl CoreRuntime {
                 .memberships
                 .get(&workspace_id)
                 .ok_or(crate::SynchronizationError::PrincipalNotBound)?;
-            let row = crate::principals::lookup_id(&state.connection, projection, id)
-                .map_err(fault!(crate::SynchronizationError::RuntimeUnavailable))?
+            let registry = crate::principals::registry(projection);
+            let (_, agent_identity, kind, steward, _) = registry
+                .iter()
+                .copied()
+                .find(|(candidate, _, _, _, _)| *candidate == id)
                 .ok_or(crate::SynchronizationError::PrincipalNotBound)?;
-            if row.kind() != crate::PrincipalKind::Agent {
+            let stewarded_here = registry.iter().any(|(person, key, _, _, _)| {
+                Some(*person) == steward && *key == self.public_identity
+            });
+            if kind != crate::PrincipalKind::Agent || !stewarded_here {
                 return Err(crate::SynchronizationError::PrincipalNotBound);
             }
-            let bound: bool = state.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_package_bindings WHERE workspace_id=?1 AND agent_principal_id=?2 AND package_identity=?3)",
-                rusqlite::params![workspace_id.as_bytes().as_slice(), id.as_bytes().as_slice(), package_identity],
-                |r| r.get(0),
-            ).map_err(fault!(crate::SynchronizationError::Storage(crate::StorageError::Database)))?;
+            let bound =
+                crate::principals::agent_keys::has_binding(&state.connection, workspace_id, id)
+                    .map_err(crate::SynchronizationError::Storage)?;
             if !bound {
                 return Err(crate::SynchronizationError::PrincipalNotBound);
             }
@@ -74,7 +81,7 @@ impl CoreRuntime {
                 &state.connection,
                 workspace_id,
                 id,
-                row.keys()[0],
+                agent_identity,
             )
             .map_err(crate::SynchronizationError::Storage)?
             .ok_or(crate::SynchronizationError::PrincipalNotBound)?;

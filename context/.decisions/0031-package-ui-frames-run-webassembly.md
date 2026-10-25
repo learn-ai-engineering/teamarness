@@ -1,4 +1,4 @@
-# 0030 — Package UI Frames may run WebAssembly
+# 0031 — Package UI Frames may run WebAssembly
 
 **Status:** accepted (2026-10-24)
 **Supersedes:** ADR 0015 (Decision, second paragraph: the clause "denies … dynamic code", only as it applies to WebAssembly compilation)

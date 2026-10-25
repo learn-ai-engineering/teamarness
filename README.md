@@ -48,7 +48,7 @@ npm run dev:instance -- bob
 
 Each profile owns a distinct Installation identity and `core.sqlite3`. When creating or joining a Workspace, choose a Workspace-specific Person name. You can rename your Person in Workspace settings. Add a Workspace Agent by name in the same settings screen; Core creates and keeps its signing key locally. The Agent appears with its Steward in the member roster. A Steward can rename or remove their Agent, and the Workspace creator can remove another Person's Agent without removing that Person. The creator cannot rename someone else's Agent.
 
-Conversations shows remote authors' current Principal names and updates displayed Messages after a rename. A missing or duplicate name keeps an inspectable author-identity fallback; your own Messages remain **You**. An Agent-authored Message can be signed by a bound Package Instance, but the desktop Shell does not yet offer Agent Package binding or Agent Message composition. Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
+Conversations shows remote authors' current Principal names and updates displayed Messages after a rename. A missing or duplicate name keeps an inspectable author-identity fallback; your own Messages remain **You**. An Agent posts in Conversations through the optional Personal Agent Package; see [Run a Workspace Agent](#run-a-workspace-agent). Reuse the same profile name to verify restart behavior, and never share one profile between running processes. The production runtime uses Iroh's default relay configuration; launching can complete while offline, but creating an invitation requires relay readiness.
 
 An absolute directory is available as an expert override. Arbitrary relative paths are rejected:
 
@@ -62,6 +62,35 @@ The lower-level `npm run tauri dev` command remains available for an ordinary la
 ```sh
 target/debug/teamarness-desktop --data-dir /absolute/private/teamarness-two
 ```
+
+## Run a Workspace Agent
+
+The optional **Agent** Personal Package (`dev.teamarness.agent`) runs one of your Workspace Agents against an OpenAI-compatible chat-completions endpoint and replies in Conversations when a Member addresses the Agent by name. Configuration lives in the Package's own UI on the Steward's Installation. The Shell has no Agent settings, and binding is never replicated.
+
+First build the standalone Agent project outside this repository and [register its Package Directory locally](docs/local-package-registration.md). It is not shipped in the application bundle. Keep `dev.teamarness.agent` unchanged when switching an existing installation from bundled to local: its settings, key and progress remain in the same Package Data Directory. Restart after registration or a rebuild.
+
+1. In Workspace settings, add an Agent by name under **Add agent**. You are its Steward.
+2. Select **Agent** under **Personal Packages**. In the **Agent** section, choose the Agent and select **Use this Agent**. Only Agents you steward on this Installation are offered.
+3. In **Model endpoint**, enter the base URL (default `https://openrouter.ai/api/v1`; the Package appends `/chat/completions`), the model slug your provider expects (for example a DeepSeek model on OpenRouter), an optional system prompt, and how many earlier Messages a reply sees (0 to 64, default 20). Select **Save settings**.
+4. In **API key**, paste the key and select **Store key**. The key is written once and never shown again; the UI reports only whether a key is stored.
+
+The **Status** section shows one of five states:
+
+| State | Meaning |
+|---|---|
+| `unconfigured` | The endpoint, model, or key is missing. |
+| `no_agent` | No Agent is bound, or the bound Agent was removed from the Workspace. Choose another Agent. |
+| `ready` | The Agent replies when a Person writes its current name as a whole word, with or without a leading `@`, in any letter case. |
+| `replying` | A completion is in flight. |
+| `error` | The code identifies the failure: `agent.endpoint_unreachable` (connection, timeout, or 5xx), `agent.endpoint_rejected` (401 or 403), `agent.model_error` (invalid completion), `agent.post_failed` (refused or uncertain post), `agent.capability_unavailable`, `agent.storage_failed`, or `agent.progress_invalid` (lost projection continuity). Ordinary errors can clear after configuration changes or a successful reply. Unsafe dispatch and invalid progress have stricter recovery limits below. |
+
+The Agent replies once per mention, only in the Channel it was addressed in, with at most one reply in flight per Channel. It does not answer Messages from before the Package first ran, Messages from other Agents, or a mention whose reply failed or was cancelled. A failed or uncertain reply is never retried by the Agent. Settings, the binding, and per-Channel progress survive a restart, so the Agent resumes without re-entry. Other Installations need no setup: they show the reply attributed to the Agent with its Steward, like any Agent-authored Message.
+
+Conversations 1.2 supplies revision-based catch-up. The Agent saves each Channel's projection epoch and acknowledged revision, so an offline Message is still processed when it arrives before older Messages in display order. Each pass examines at most four batches of 32 changes per Channel and schedules further catch-up without discarding the backlog. Temporary read failures and pending content are safely queried again; a settled model/post attempt is never retried. Invalid saved progress stops the harness with `agent.progress_invalid` rather than silently replaying history. Changing endpoint settings does not repair that lost continuity.
+
+Pending posts refuse binding changes with `agent.post_failed` rather than risk attributing a reply to another Agent. A failed or uncertain post, or an uncertain binding write, can stop further dispatch and binding changes. Settings edits and suspend/resume do not clear that safety state. Restart the full application process for conservative recovery; do not delete progress or profile data. Backend-only replacement requires the Host's generation safeguards: queued obsolete authority work rejects, and running Core authority work finishes before replacement initializes. Stuck Core work can delay replacement of that Instance. This does not retract arbitrary effects already dispatched to another Package.
+
+The Package keeps three files in its Package Data Directory, `packages/data/v1/<installation>/<workspace>/<SHA-256 of dev.teamarness.agent>/` under the profile's private data directory: `settings.json`, `api-key` (the raw key, file mode `0600`), and `progress.json` (per-Channel projection epoch and acknowledged revision). The key is protected only by that file mode and the private data directory, so any process running as your user can read it. Select **Clear key** before you share or delete a profile. The Package sends network traffic only to the configured endpoint, over TLS with the platform's trust roots for `https://` URLs; `http://` is accepted for local test endpoints. Completion redirects are not followed. A completion is limited to 60 seconds and 256 KiB. Streaming replies, tool use, and unprompted posts are not supported.
 
 ## Checks
 
@@ -126,13 +155,13 @@ Teamarness stores the Installation secret and Content Keys unencrypted in `core.
 
 The runtime refuses a data directory that still holds retired version-1 protection controls. If a disposable development profile is refused, reset it with `rm -rf .teamarness-dev/<profile>`. For a disposable packaged-app profile, reset `~/Library/Application\ Support/dev.teamarness.desktop`. Back up any data you need before removing a profile.
 
-The Documents record format changed incompatibly when Document bodies became structured trees (ADR 0031): a `document.create` record now carries a body genesis, and plain-text body records are no longer read. A development data directory that holds Documents from before that change must be reset in the same way. There is no migration, because no released build wrote those records.
+The Documents record format changed incompatibly when Document bodies became structured trees (ADR 0032): a `document.create` record now carries a body genesis, and plain-text body records are no longer read. A development data directory that holds Documents from before that change must be reset in the same way. There is no migration, because no released build wrote those records.
 
 ## Package development
 
 Start with [Build your first Package with an agent](docs/build-your-first-package.md). It begins with the finished Tutorial, explains the boundary between the Teamarness Core Runtime and a Package, then walks through generating, building, registering, and using an external Emojart project. Generate Emojart outside the Teamarness repository with `npm run create:package -- --output <directory> --identity dev.teamarness.emojart --display-name Emojart`. Read the [Package author guide](docs/package-author-guide.md) for the full Package Directory, Backend, UI, contract, and application-distribution rules. Read the UI SDK's [Package UI theme and CSS kit](packages/teamarness-package-ui-sdk/README.md) guidance for the exact semantic tokens, opt-in classes, cleanup contract, and Package-owned header and navigation model. Run `npm run validate:packages` to apply Package Admission's manifest and UI contract rules to every bundled Package's source and staged directory, with a Backend smoke launch, without starting the application; a generated project runs the same validator as `npm run validate`. Read [Local Package registration](docs/local-package-registration.md) for other registration layouts, restart rules, digest invalidation, and Package Data Directory continuity. A local registration does not grant Workspace enablement or synchronize, share, network, or collaborate Package code or data.
 
-The application build composes the Reference, Tutorial, Conversations, Repo-aware, and Documents Packages into one verified index. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
+The application build composes the Reference, Tutorial, Conversations, Repo-aware, and Documents Packages into one verified index. Agent is built independently and registered locally. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
 
 The protocol and supported Rust tooling have separate contracts:
 

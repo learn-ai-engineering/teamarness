@@ -28,6 +28,13 @@ const _: () = {
 };
 
 pub(crate) struct PortBroker {
+    authority_generations:
+        std::sync::Mutex<BTreeMap<PackageInstanceKey, crate::authority::AuthorityGeneration>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) binding_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) actor_pause: std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
     observations: broadcast::Sender<PortObservation>,
     consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
@@ -55,6 +62,11 @@ impl PortBroker {
         contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(feature = "test-hooks")]
+            actor_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            binding_pause: std::sync::Mutex::new(None),
+            authority_generations: std::sync::Mutex::new(BTreeMap::new()),
             graph,
             observations: crate::port_observation::channel(),
             consumed,
@@ -72,6 +84,47 @@ impl PortBroker {
         })
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_command_actor(
+        &self,
+        package: &PackageIdentity,
+        object: &Map<String, Value>,
+    ) {
+        let pause = {
+            let mut pending = self.actor_pause.lock().expect("test pause poisoned");
+            if object.get("kind").and_then(Value::as_str) == Some("command")
+                && pending
+                    .as_ref()
+                    .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_binding_write(&self, package: &PackageIdentity) {
+        let pause = {
+            let mut pending = self.binding_pause.lock().expect("test pause poisoned");
+            if pending
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
     pub(crate) fn observe(&self) -> PortObservations {
         self.observations.subscribe()
     }
@@ -79,6 +132,19 @@ impl PortBroker {
     fn record(&self, observation: PortObservation) {
         // `send` refuses if nobody subscribed, and never waits for a slow receiver.
         let _ = self.observations.send(observation);
+    }
+
+    /// Host-lifetime ownership survives any InstanceActor/ProcessSpec reconstruction.
+    pub(crate) fn authority_generation(
+        &self,
+        key: &PackageInstanceKey,
+    ) -> crate::authority::AuthorityGeneration {
+        self.authority_generations
+            .lock()
+            .expect("authority registry poisoned")
+            .entry(key.clone())
+            .or_default()
+            .clone()
     }
 
     pub(crate) fn register(&self, key: PackageInstanceKey, actor: &Arc<InstanceActor>) {
@@ -222,7 +288,7 @@ impl PortBroker {
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        installation: &str,
+        actor: &Value,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         consumer_id: &str,
@@ -233,7 +299,7 @@ impl PortBroker {
             .call_inner(
                 caller,
                 workspace,
-                installation,
+                actor,
                 input,
                 dispatched,
                 consumer_id,
@@ -293,7 +359,7 @@ impl PortBroker {
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        installation: &str,
+        actor: &Value,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         consumer_id: &str,
@@ -317,15 +383,16 @@ impl PortBroker {
         let request = input
             .get("request")
             .ok_or_else(|| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
-        let (actor, schemas, major, minor) = self
+        let (provider, schemas, major, minor) = self
             .resolve(caller, workspace, contract, port, kind)
             .map_err(WireFailure::new)?;
         schemas
             .validate(contract, port, "request", request)
             .map_err(|_| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
         let permit = self.permit(request).map_err(WireFailure::new)?;
+        // `actor` is Host-authored from the caller's binding, never from the request.
         let payload = json!({"contract":contract,"major":major,"minor":minor,"port":port,
-            "actor":{"kind":"person","identity":installation},"request":request});
+            "actor":actor,"request":request});
         let payload: PackageValue = serde_json::from_value(payload)
             .map_err(|_| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
         let observations = self.observations.clone();
@@ -333,7 +400,7 @@ impl PortBroker {
         let port_name = port.to_owned();
         let consumer = consumer_id.to_owned();
         let caller_name = caller.as_str().to_owned();
-        let result = actor
+        let result = provider
             .port_request(kind, payload, permit, dispatched, move |id, generation| {
                 *provider_id.lock().expect("port observation poisoned") =
                     Some((id.clone(), generation));
@@ -371,7 +438,7 @@ impl PortBroker {
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        installation: &str,
+        actor: &Value,
         input: &Map<String, Value>,
     ) -> Result<PortQueryStream, PackageErrorCode> {
         if input.len() != 5
@@ -395,7 +462,7 @@ impl PortBroker {
         let request = input
             .get("request")
             .ok_or(PackageErrorCode::PortRequestInvalid)?;
-        let (actor, schemas, major, minor) =
+        let (provider, schemas, major, minor) =
             self.resolve(caller, workspace, contract, port, PortKind::Query)?;
         let descriptor = schemas
             .contracts
@@ -412,10 +479,10 @@ impl PortBroker {
         let permits = self.permit(request)?;
         let payload: PackageValue = serde_json::from_value(
             json!({"contract":contract,"major":major,"minor":minor,"port":port,
-            "actor":{"kind":"person","identity":installation},"request":request}),
+            "actor":actor,"request":request}),
         )
         .map_err(|_| PackageErrorCode::PortRequestInvalid)?;
-        actor
+        provider
             .port_query_stream(
                 payload,
                 schemas,

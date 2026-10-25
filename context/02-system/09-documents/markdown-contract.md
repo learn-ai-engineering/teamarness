@@ -1,6 +1,6 @@
 # 02-system/09-documents — Markdown Contract
 
-This contract is normative. It defines how a Document body converts to and from Markdown, and how a Markdown revision merges into a body. ADR 0031 decides that the Documents backend is the only Markdown authority. The implementation is the Markdown core, `packages/documents-package/backend/src/markdown/`.
+This contract is normative. It defines how a Document body converts to and from Markdown, and how a Markdown revision merges into a body. ADR 0032 decides that the Documents backend is the only Markdown authority. The implementation is the Markdown core, `packages/documents-package/backend/src/markdown/`.
 
 The key words SHALL, SHALL NOT and MAY are used as in the Documents requirements.
 

@@ -3,7 +3,7 @@
 // It runs inside a Package UI Frame in the packaged application and reports, in
 // text the packaged smoke can read through Accessibility, whether the frame can
 // reach Tauri, the Shell realm, storage or the network, and whether the frame
-// policy admits WebAssembly while still refusing other dynamic code (ADR 0030).
+// policy admits WebAssembly while still refusing other dynamic code (ADR 0031).
 // It also attempts two real command posts through the WKWebView message
 // handler; the smoke checks afterwards that neither of them created a Workspace.
 

@@ -2050,6 +2050,16 @@ pub(crate) fn persist_candidate_rows(
     // Both direct membership acceptance and invitation redemption use this
     // transaction. Never commit a roster change without its name invalidation.
     crate::principals::refresh(transaction, candidate).map_err(MembershipError::Storage)?;
+    // An Agent Binding is local configuration for a current Agent: a removal
+    // commits with its bindings cleared, in this transaction (ADR 0030).
+    if let MembershipAction::RemoveAgentKey { agent, .. } = &envelope.action {
+        crate::principals::agent_keys::clear_bindings_for_key(
+            transaction,
+            envelope.workspace_id,
+            *agent,
+        )
+        .map_err(MembershipError::Storage)?;
+    }
     if envelope.action.changes_roster() {
         crate::principals::edit::advance_generation(transaction, envelope.workspace_id).map_err(
             |error| match error {

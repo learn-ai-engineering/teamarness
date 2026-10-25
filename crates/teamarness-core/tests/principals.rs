@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use teamarness_core::{CoreRuntime, CoreRuntimeConfig, PersonNameError, PrincipalKind};
+use teamarness_core::{
+    CoreRuntime, CoreRuntimeConfig, PersonNameError, PrincipalKind, SynchronizationError,
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 fn directory() -> std::path::PathBuf {
@@ -125,6 +127,13 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
         Err(PersonNameError::NotOwnPerson)
     );
     let mut steward_principals = steward.subscribe_principals(workspace).unwrap();
+    steward
+        .bind_agent_package(workspace, first, "agent.runtime")
+        .unwrap();
+    assert_eq!(
+        steward.bound_agent(workspace, "agent.runtime").unwrap(),
+        Some(first)
+    );
     manager.remove_agent(workspace, first).unwrap();
     assert!(manager.principal(workspace, first).unwrap().is_none());
     let (removed_cursor, removed_rows) = manager.principals_snapshot(workspace).unwrap();
@@ -148,6 +157,24 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
     .unwrap();
     let (_, steward_rows) = steward.principals_snapshot(workspace).unwrap();
     assert!(!steward_rows.iter().any(|row| row.id() == first));
+    // A peer-removed Agent has left the registry: the binding read is None and
+    // the key never signs again, whatever local rows remain.
+    assert_eq!(
+        steward.bound_agent(workspace, "agent.runtime").unwrap(),
+        None
+    );
+    assert_eq!(
+        steward
+            .append_record_as_principal(
+                workspace,
+                "agent.runtime",
+                "message.post",
+                b"late",
+                Some(first)
+            )
+            .err(),
+        Some(SynchronizationError::PrincipalNotBound)
+    );
     assert_eq!(
         steward
             .principal(workspace, second)
@@ -171,6 +198,10 @@ async fn non_steward_cannot_rename_or_bind_remote_agent_but_manager_can_remove_o
     steward
         .bind_agent_package(workspace, second, "agent.runtime")
         .unwrap();
+    assert_eq!(
+        steward.bound_agent(workspace, "agent.runtime").unwrap(),
+        Some(second)
+    );
     manager
         .revoke_member(workspace, steward.public_identity())
         .unwrap();
@@ -326,5 +357,156 @@ async fn principal_roster_reads_one_transition_not_two_separate_epochs() {
     assert_eq!(snapshot.members().len(), 1);
     assert_eq!(rows.len(), 1);
     runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+fn binding_rows(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let db = rusqlite::Connection::open(path.join("core.sqlite3")).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT package_identity, agent_principal_id FROM agent_package_bindings ORDER BY package_identity",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+// Verifies: TEAM.SYS.ID-R10, TEAM.SYS.PKG-R10
+async fn bound_agent_signs_for_any_local_package_until_unbound_or_removed() {
+    let path = directory();
+    let runtime = open(&path).await;
+    let workspace = runtime
+        .create_workspace_with_person_name("Team", "Steward")
+        .unwrap()
+        .id();
+    let person = runtime
+        .workspace_person(workspace, runtime.public_identity())
+        .unwrap()
+        .unwrap()
+        .id();
+    let first = runtime.add_agent(workspace, "First").unwrap();
+    let second = runtime.add_agent(workspace, "Second").unwrap();
+    let second_key = runtime
+        .principal(workspace, second)
+        .unwrap()
+        .unwrap()
+        .keys()[0];
+    let sign = |package: &str, principal| {
+        runtime
+            .append_record_as_principal(
+                workspace,
+                package,
+                "message.post",
+                b"hello",
+                Some(principal),
+            )
+            .map(|record| record.author())
+    };
+
+    assert_eq!(runtime.bound_agent(workspace, "pkg.one").unwrap(), None);
+    assert_eq!(
+        runtime.bound_agent(workspace, "not-ascii-\u{1F980}"),
+        Err(PersonNameError::InvalidPackageIdentity)
+    );
+    assert_eq!(
+        runtime.unbind_agent_package(workspace, "internal:teamarness.principals"),
+        Err(PersonNameError::InvalidPackageIdentity)
+    );
+    assert_eq!(
+        sign("pkg.one", first),
+        Err(SynchronizationError::PrincipalNotBound)
+    );
+
+    // A Package maps to one Agent; a later bind replaces the earlier one.
+    runtime
+        .bind_agent_package(workspace, first, "pkg.one")
+        .unwrap();
+    runtime
+        .bind_agent_package(workspace, second, "pkg.one")
+        .unwrap();
+    assert_eq!(
+        runtime.bound_agent(workspace, "pkg.one").unwrap(),
+        Some(second)
+    );
+    assert_eq!(
+        sign("pkg.one", first),
+        Err(SynchronizationError::PrincipalNotBound)
+    );
+
+    // Two Packages share one Agent; the signing rule ignores the caller.
+    runtime
+        .bind_agent_package(workspace, second, "pkg.two")
+        .unwrap();
+    assert_eq!(
+        runtime.bound_agent(workspace, "pkg.two").unwrap(),
+        Some(second)
+    );
+    assert_eq!(sign("pkg.one", second), Ok(second_key));
+    assert_eq!(sign("pkg.two", second), Ok(second_key));
+    assert_eq!(sign("pkg.three", second), Ok(second_key));
+    assert_eq!(
+        sign("pkg.one", person),
+        Err(SynchronizationError::PrincipalNotBound)
+    );
+    assert_eq!(
+        binding_rows(&path),
+        vec![
+            ("pkg.one".to_string(), second.as_bytes().to_vec()),
+            ("pkg.two".to_string(), second.as_bytes().to_vec()),
+        ]
+    );
+
+    // Unbinding one Package leaves the other binding, and the authority, in place.
+    runtime.unbind_agent_package(workspace, "pkg.two").unwrap();
+    runtime.unbind_agent_package(workspace, "pkg.two").unwrap();
+    assert_eq!(runtime.bound_agent(workspace, "pkg.two").unwrap(), None);
+    assert_eq!(sign("pkg.two", second), Ok(second_key));
+    runtime.unbind_agent_package(workspace, "pkg.one").unwrap();
+    assert_eq!(
+        sign("pkg.one", second),
+        Err(SynchronizationError::PrincipalNotBound)
+    );
+    assert!(binding_rows(&path).is_empty());
+
+    // Own removal clears this Installation's rows for the Agent.
+    runtime
+        .bind_agent_package(workspace, second, "pkg.one")
+        .unwrap();
+    runtime
+        .bind_agent_package(workspace, first, "pkg.two")
+        .unwrap();
+    runtime.remove_agent(workspace, second).unwrap();
+    assert_eq!(runtime.bound_agent(workspace, "pkg.one").unwrap(), None);
+    assert_eq!(
+        runtime.bound_agent(workspace, "pkg.two").unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        binding_rows(&path),
+        vec![("pkg.two".to_string(), first.as_bytes().to_vec())]
+    );
+    assert_eq!(
+        sign("pkg.one", second),
+        Err(SynchronizationError::PrincipalNotBound)
+    );
+    assert_eq!(
+        runtime.bind_agent_package(workspace, second, "pkg.one"),
+        Err(PersonNameError::AgentNotFound)
+    );
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    // Bindings are durable local configuration.
+    let reopened = open(&path).await;
+    assert_eq!(
+        reopened.bound_agent(workspace, "pkg.two").unwrap(),
+        Some(first)
+    );
+    assert_eq!(reopened.bound_agent(workspace, "pkg.one").unwrap(), None);
+    reopened.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }

@@ -242,7 +242,8 @@ pub(crate) fn router_observing(
     .request(
         "conversations.message.post",
         |context: Context<ConversationsActive>, request: PostRequest| async move {
-            post(&context, request).await
+            let author = Author::person(context.state().installation.clone());
+            post(&context, author, request).await
         },
     )
     .request(
@@ -283,14 +284,27 @@ pub(crate) fn router_observing(
     .port_request(
         "dev.teamarness.conversations", "message.post", "command",
         |context: Context<ConversationsActive>, actor: PortActor, request: PostRequest| async move {
-            authorize_person(&context, actor)?;
-            post(&context, request).await
+            let author = authorize_actor(&context, actor)?;
+            post(&context, author, request).await
         },
     )
     .port_request(
         "dev.teamarness.conversations", "message.page", "query",
         |context: Context<ConversationsActive>, _actor: PortActor, request: PageRequest| async move {
             page(&context, request).await
+        },
+    )
+    .port_request(
+        "dev.teamarness.conversations", "message.changes", "query",
+        |context: Context<ConversationsActive>, _actor: PortActor, request: ChangesRequest| async move {
+            changes(&context, request).await
+        },
+    )
+    .port_request(
+        "dev.teamarness.conversations", "channel.list", "query",
+        |context: Context<ConversationsActive>, _actor: PortActor, _: Empty| async move {
+            let state = context.state().clone();
+            context.blocking(move |_| state.channel_list_value()).await
         },
     )
     .port_event(
@@ -490,20 +504,72 @@ impl ConversationsActive {
             "warnings": warnings,
         }))
     }
+
+    /// The `channel.list` Port answer: the Channels the UI snapshot shows, as `{id, name}`.
+    ///
+    /// TEAM.SYS.CONV-R18: same visibility as the snapshot (hidden Channels excluded, creation
+    /// order, `#general` first), bounded to the contract's 64 rows.
+    fn channel_list_value(&self) -> Result<JsonValue, BackendError> {
+        let channels = self.store.channels().map_err(|_| storage_failed())?;
+        let visible: Vec<JsonValue> = channels
+            .into_iter()
+            .filter(|channel| !channel.hidden)
+            .take(CHANNEL_LIST_LIMIT)
+            .map(|channel| json!({ "id": channel.id, "name": channel.slug }))
+            .collect();
+        Ok(json!({ "channels": visible }))
+    }
 }
 
-fn authorize_person(
+/// The most Channels one `channel.list` answer carries, which the Port Contract also pins.
+const CHANNEL_LIST_LIMIT: usize = 64;
+
+/// Who a Message is written as: the record's declared author and, for an Agent, the Principal
+/// Core signs for.
+struct Author {
+    /// The signing key the record names as its author, which Core must sign with.
+    identity: String,
+    /// The Agent's Principal ID for a record-log 1.1 append; `None` for the Installation Person.
+    principal: Option<String>,
+}
+
+impl Author {
+    fn person(identity: String) -> Self {
+        Self {
+            identity,
+            principal: None,
+        }
+    }
+}
+
+/// Turns the Host-authored actor into the author a post is written as.
+///
+/// A Person must be this Installation. An Agent actor is Host-derived from the calling Package
+/// Instance's Agent Binding (ADR 0030), so it is accepted as given: the record names the Agent's
+/// key and Core signs with that key, or refuses with `principal_not_bound`, when the Package
+/// appends with its Principal ID.
+fn authorize_actor(
     context: &Context<ConversationsActive>,
     actor: PortActor,
-) -> Result<(), BackendError> {
+) -> Result<Author, BackendError> {
     match actor {
-        PortActor::Person { identity } if identity == context.state().installation => Ok(()),
-        _ => Err(error("conversations.actor_unauthorized", false)),
+        PortActor::Person { identity } if identity == context.state().installation => {
+            Ok(Author::person(identity))
+        }
+        PortActor::Agent {
+            principal,
+            identity,
+        } => Ok(Author {
+            identity,
+            principal: Some(principal),
+        }),
+        PortActor::Person { .. } => Err(error("conversations.actor_unauthorized", false)),
     }
 }
 
 async fn post(
     context: &Context<ConversationsActive>,
+    author: Author,
     request: PostRequest,
 ) -> Result<JsonValue, BackendError> {
     let channel = decode_id(&request.channel_id)
@@ -520,24 +586,35 @@ async fn post(
     if !active {
         return Err(error("conversations.channel_hidden", false));
     }
-    // The actor never selects the signer: the Core capability signs for this Installation.
-    let author = context.state().installation.clone();
-    let record = DomainRecord::message_post(channel, &author, request.markdown)
+    // The caller never selects the signer: Core signs for this Installation, or for the bound
+    // Agent whose Principal ID the Host-derived actor named.
+    let record = DomainRecord::message_post(channel, &author.identity, request.markdown)
         .map_err(|_| error("conversations.invalid_markdown", false))?;
-    append(context, "message.post", record).await
+    append_as(context, "message.post", record, author.principal.as_deref()).await
 }
 
-/// Appends one domain record and projects it locally.
+/// Appends one domain record signed by this Installation and projects it locally.
 async fn append(
     context: &Context<ConversationsActive>,
     purpose: &'static str,
     record: DomainRecord,
 ) -> Result<JsonValue, BackendError> {
+    append_as(context, purpose, record, None).await
+}
+
+/// Appends one domain record, signed by the named Agent when `principal` is given, and projects
+/// it locally.
+async fn append_as(
+    context: &Context<ConversationsActive>,
+    purpose: &'static str,
+    record: DomainRecord,
+    principal: Option<&str>,
+) -> Result<JsonValue, BackendError> {
     let canonical = record.encode();
     let appended = context
         .state()
         .log
-        .append(purpose, &canonical)
+        .append_with_principal(purpose, &canonical, principal)
         .await
         .map_err(|cause| capability_error(purpose, cause))?;
     let state = context.state().clone();
@@ -996,6 +1073,10 @@ mod session_tests {
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
     const CHANNEL: [u8; 16] = [1; 16];
     const ALICE: &str = "alice";
+    /// A Workspace Agent Alice stewards: its Principal ID and its current signing key.
+    const AGENT_PRINCIPAL: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const AGENT_KEY: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
     fn hex(length: usize, seed: u64) -> String {
         format!("{:0width$x}", seed, width = length)
@@ -1022,10 +1103,18 @@ mod session_tests {
             }
             "append" => {
                 let seed = appended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Core signs with the Agent's key when the 1.1 `principal` names a bound Agent.
+                let author = match payload.get("principal").and_then(JsonValue::as_str) {
+                    Some(AGENT_PRINCIPAL) => AGENT_KEY,
+                    Some(_) => {
+                        return Err(BackendError::new("principal_not_bound", false, json!({})));
+                    }
+                    None => ALICE,
+                };
                 Ok(json!({
                     "recordId": hex(64, seed),
                     "orderKey": hex(82, seed),
-                    "author": ALICE,
+                    "author": author,
                     "signature": "c2ln",
                     "sealedRecord": "c2VhbGVk",
                     "durability": "committed",
@@ -1066,7 +1155,7 @@ mod session_tests {
                 .package_identity("dev.teamarness.conversations")
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
-                .capability(RECORD_LOG, scripted.clone())
+                .capability_minor(RECORD_LOG, scripted.clone(), 1)
                 .capability("teamarness.principals", ScriptedCapability::new())
                 .start()
                 .await;
@@ -1092,7 +1181,38 @@ mod session_tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, "dev.teamarness.conversations");
-        assert_eq!(provided.ports.len(), 3);
+        assert_eq!((provided.major, provided.minor), (1, 2));
+        assert_eq!(provided.ports.len(), 5);
+        let list = |direction: &str, value: &JsonValue| {
+            contract.validate(
+                "dev.teamarness.conversations",
+                "channel.list",
+                direction,
+                value,
+            )
+        };
+        assert!(list("request", &json!({})).is_ok());
+        assert!(list("request", &json!({"limit": 1})).is_err());
+        let channel = json!({"id": hex_id(GENERAL_ID), "name": "general"});
+        assert!(list("response", &json!({"channels": [channel]})).is_ok());
+        assert!(list("response", &json!({"channels": []})).is_ok());
+        assert!(list("response", &json!({"channels": vec![channel.clone(); 64]})).is_ok());
+        assert!(list("response", &json!({"channels": vec![channel.clone(); 65]})).is_err());
+        assert!(list("response", &json!({})).is_err());
+        assert!(
+            list(
+                "response",
+                &json!({"channels": [{"id": hex_id(GENERAL_ID)}]})
+            )
+            .is_err()
+        );
+        assert!(
+            list(
+                "response",
+                &json!({"channels": [{"id": hex_id(GENERAL_ID), "name": "general", "unreadCount": 1}]})
+            )
+            .is_err()
+        );
         assert!(
             contract
                 .validate(
@@ -1262,6 +1382,397 @@ mod session_tests {
             .unwrap();
         assert!(session.store().read_ordinal(&hex_id(GENERAL_ID)).unwrap() > 0);
         events.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.CONV-R19
+    #[tokio::test]
+    async fn message_changes_port_reuses_revision_recovery_without_marking_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let (entered, _) = std::sync::mpsc::channel();
+        let (_, release) = std::sync::mpsc::channel();
+        let mut session = start(
+            directory.path(),
+            paused_history_log(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                entered,
+                release,
+            ),
+        )
+        .await;
+        let store = session.store();
+        commit_history_row(&store, 100);
+        let (epoch, baseline) = store.history_head().unwrap();
+        let late_id = commit_history_row(&store, 2);
+        let next_id = commit_history_row(&store, 3);
+        let envelope = |request: JsonValue| {
+            json!({
+                "contract": "dev.teamarness.conversations", "major": 1, "minor": 2,
+                "port": "message.changes", "actor": {"kind":"person", "identity": ALICE},
+                "request": request,
+            })
+        };
+        let request = json!({"channelId": hex_id(GENERAL_ID), "epoch": epoch,
+            "after": baseline.to_string(), "limit": 1});
+        let ui = session
+            .harness
+            .request("conversations.channel.changes", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(ui["events"][0]["id"], late_id);
+        assert_eq!(ui["events"][0]["position"], hex(82, 2));
+        assert_eq!(ui["events"][0]["message"]["markdown"], "row 2");
+        let port = session
+            .harness
+            .request("teamarness.port.query.v1", envelope(request))
+            .await
+            .unwrap();
+        assert_eq!(port["$teamarnessPortValue"], ui);
+        let second = session.harness.request("teamarness.port.query.v1", envelope(json!({
+            "channelId": hex_id(GENERAL_ID), "epoch": epoch, "after": ui["continuation"], "limit": 1,
+        }))).await.unwrap()["$teamarnessPortValue"].clone();
+        assert_eq!(second["events"][0]["id"], next_id);
+        assert_eq!(second["continuation"], "3");
+        let terminal = session.harness.request("teamarness.port.query.v1", envelope(json!({
+            "channelId": hex_id(GENERAL_ID), "epoch": epoch, "after": second["continuation"],
+        }))).await.unwrap()["$teamarnessPortValue"].clone();
+        assert_eq!(terminal["events"], json!([]));
+        assert_eq!(terminal["continuation"], terminal["highWater"]);
+        let stale = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                envelope(json!({
+                    "channelId": hex_id(GENERAL_ID), "epoch": "0".repeat(32), "after": "0",
+                })),
+            )
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        assert_eq!(stale["resyncRequired"], true);
+        assert_eq!(store.read_ordinal(&hex_id(GENERAL_ID)).unwrap(), 0);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.PKG-R12, TEAM.SYS.CONV-R19
+    #[test]
+    fn message_changes_port_is_closed_bounded_and_additive_over_1_1() {
+        use teamarness_package_contract::port_contract::{
+            check_additive_minor_documents, compile_port_contracts,
+        };
+        let old =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.1.json")).unwrap();
+        let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
+        assert_eq!(new.contracts[0].minor, 2);
+        check_additive_minor_documents(&old, &new, "dev.teamarness.conversations").unwrap();
+        for before in &old.contracts[0].ports {
+            let after = new.contracts[0]
+                .ports
+                .iter()
+                .find(|port| port.name == before.name)
+                .unwrap();
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.request, after.request);
+            assert_eq!(before.response, after.response);
+            assert_eq!(before.event, after.event);
+        }
+        let validate = |direction, value: &JsonValue| {
+            new.validate(
+                "dev.teamarness.conversations",
+                "message.changes",
+                direction,
+                value,
+            )
+        };
+        let request = json!({"channelId": hex_id(GENERAL_ID), "epoch": "a".repeat(32), "after": "0", "limit": 32});
+        assert!(validate("request", &request).is_ok());
+        for (field, value) in [
+            ("limit", json!(0)),
+            ("limit", json!(33)),
+            ("after", json!("-1")),
+            ("actor", json!({})),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = value;
+            assert!(validate("request", &invalid).is_err());
+        }
+        let event = json!({"id":"message", "position":"01", "kind":"insert", "revision":"1", "status":"pending"});
+        assert!(
+            validate(
+                "response",
+                &json!({"events": vec![event.clone();32], "continuation":"1", "highWater":"1"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "response",
+                &json!({"events": vec![event;33], "continuation":"1", "highWater":"1"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                "response",
+                &json!({"events":[], "continuation":"1", "highWater":"1", "unexpected":true})
+            )
+            .is_err()
+        );
+    }
+
+    // Verifies: TEAM.SYS.PKG-R12
+    #[test]
+    fn port_contract_1_2_is_additive_over_the_shipped_1_0_document() {
+        use teamarness_package_contract::port_contract::{
+            check_additive_minor_documents, compile_port_contracts,
+        };
+        let old =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.0.json")).unwrap();
+        let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
+        assert_eq!((old.contracts[0].major, old.contracts[0].minor), (1, 0));
+        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 2));
+        check_additive_minor_documents(&old, &new, "dev.teamarness.conversations").unwrap();
+        for name in ["message.post", "message.page", "messages.changed"] {
+            let before = old.contracts[0]
+                .ports
+                .iter()
+                .find(|port| port.name == name)
+                .unwrap();
+            let after = new.contracts[0]
+                .ports
+                .iter()
+                .find(|port| port.name == name)
+                .unwrap();
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.request, after.request);
+            assert_eq!(before.response, after.response);
+            assert_eq!(before.event, after.event);
+        }
+    }
+
+    // Verifies: TEAM.SYS.CONV-R18
+    #[tokio::test]
+    async fn agent_actor_post_appends_with_principal_and_projects_the_agent_author() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let command = |actor: JsonValue, markdown: &str| {
+            json!({
+                "contract": "dev.teamarness.conversations", "major": 1, "minor": 1,
+                "port": "message.post", "actor": actor,
+                "request": {"channelId": hex_id(GENERAL_ID), "markdown": markdown}
+            })
+        };
+        let agent = json!({"kind":"agent","principal":AGENT_PRINCIPAL,"identity":AGENT_KEY});
+        assert_eq!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    command(agent.clone(), "as agent")
+                )
+                .await
+                .unwrap()["$teamarnessPortValue"],
+            json!({"ok": true})
+        );
+        assert_eq!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    command(json!({"kind":"person","identity":ALICE}), "as person")
+                )
+                .await
+                .unwrap()["$teamarnessPortValue"],
+            json!({"ok": true})
+        );
+        let appends: Vec<_> = session
+            .scripted
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| call.method == "append")
+            .collect();
+        assert_eq!(appends.len(), 2);
+        assert_eq!(appends[0].payload["principal"], AGENT_PRINCIPAL);
+        assert_eq!(appends[0].payload["purpose"], "message.post");
+        assert!(appends[1].payload.get("principal").is_none());
+        let rows = session
+            .store()
+            .message_rows(&hex_id(GENERAL_ID), None, 8)
+            .unwrap();
+        let authors: Vec<&str> = rows.iter().map(|row| row.2.as_str()).collect();
+        assert_eq!(authors, vec![ALICE, AGENT_KEY], "newest first");
+        for (call, signer) in appends.iter().zip([AGENT_KEY, ALICE]) {
+            let canonical = URL_SAFE_NO_PAD
+                .decode(call.payload["canonical"].as_str().unwrap())
+                .unwrap();
+            let DomainRecord::MessagePost { author, .. } =
+                DomainRecord::decode(&canonical).unwrap()
+            else {
+                panic!("a Message record");
+            };
+            assert_eq!(author, signer, "payload author equals the signed author");
+        }
+        assert!(!session.store().has_projection_warnings().unwrap());
+
+        // A Person from another Installation is still refused, and an Agent actor that the Host
+        // did not fully author (no principal) never reaches the handler.
+        let stranger = session
+            .harness
+            .request(
+                "teamarness.port.command.v1",
+                command(json!({"kind":"person","identity":"stranger"}), "forbidden"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stranger.code(), "conversations.actor_unauthorized");
+        assert!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.command.v1",
+                    command(json!({"kind":"agent","identity":AGENT_KEY}), "forbidden")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session
+                .scripted
+                .recorded_calls()
+                .into_iter()
+                .filter(|call| call.method == "append")
+                .count(),
+            2
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.CONV-R18
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channel_list_matches_snapshot_visibility_and_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        wait_for_opens(&session.scripted, 1).await;
+        session
+            .harness
+            .request("conversations.channel.create", json!({ "slug": "mine" }))
+            .await
+            .unwrap();
+        let remote = DomainRecord::channel_create_with_id([2; 16], "bob", "theirs").unwrap();
+        assert!(
+            session
+                .scripted
+                .stream()
+                .send(record_frame(7, "bob", "channel.create", &remote.encode()))
+                .await
+        );
+        wait_until(
+            || session.store().record_count().unwrap_or(0) == 2,
+            "both Channels",
+        )
+        .await;
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", empty_payload())
+            .await
+            .unwrap();
+        let mine = snapshot["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|channel| channel["slug"] == "mine")
+            .unwrap()["id"]
+            .clone();
+        session
+            .harness
+            .request(
+                "conversations.channel.hide",
+                json!({ "channelId": mine, "confirm": true }),
+            )
+            .await
+            .unwrap();
+
+        let list = |actor: JsonValue| {
+            json!({
+                "contract": "dev.teamarness.conversations", "major": 1, "minor": 1,
+                "port": "channel.list", "actor": actor, "request": {}
+            })
+        };
+        let expected = |snapshot: &JsonValue, limit: usize| -> JsonValue {
+            JsonValue::Array(
+                snapshot["channels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .take(limit)
+                    .map(|channel| json!({"id": channel["id"], "name": channel["slug"]}))
+                    .collect(),
+            )
+        };
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", empty_payload())
+            .await
+            .unwrap();
+        assert_eq!(snapshot["channels"].as_array().unwrap().len(), 2);
+        let person = json!({"kind":"person","identity":ALICE});
+        let listed = session
+            .harness
+            .request("teamarness.port.query.v1", list(person.clone()))
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        assert_eq!(listed, json!({"channels": expected(&snapshot, 64)}));
+        assert_eq!(listed["channels"][0]["name"], "general");
+        assert_eq!(listed["channels"][1]["name"], "theirs");
+        let as_agent = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                list(json!({"kind":"agent","principal":AGENT_PRINCIPAL,"identity":AGENT_KEY})),
+            )
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        assert_eq!(as_agent, listed);
+        assert!(
+            session
+                .harness
+                .request(
+                    "teamarness.port.query.v1",
+                    json!({
+                        "contract": "dev.teamarness.conversations", "major": 1, "minor": 1,
+                        "port": "channel.list", "actor": person.clone(), "request": {"limit": 1}
+                    }),
+                )
+                .await
+                .is_err()
+        );
+
+        for n in 0..70 {
+            session
+                .harness
+                .request(
+                    "conversations.channel.create",
+                    json!({ "slug": format!("room-{n}") }),
+                )
+                .await
+                .unwrap();
+        }
+        let snapshot = session
+            .harness
+            .request("conversations.snapshot", empty_payload())
+            .await
+            .unwrap();
+        assert_eq!(snapshot["channels"].as_array().unwrap().len(), 72);
+        let listed = session
+            .harness
+            .request("teamarness.port.query.v1", list(person))
+            .await
+            .unwrap()["$teamarnessPortValue"]
+            .clone();
+        assert_eq!(listed["channels"].as_array().unwrap().len(), 64);
+        assert_eq!(listed, json!({"channels": expected(&snapshot, 64)}));
         session.harness.shutdown().await.unwrap();
     }
 
@@ -2073,6 +2584,38 @@ mod session_tests {
         assert_eq!(delta["events"][1]["status"], "pending");
         assert_eq!(delta["continuation"], "2");
         assert_eq!(delta["highWater"], "4");
+        let port = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":2,
+                    "port":"message.changes", "actor":{"kind":"person","identity":ALICE},
+                    "request":{"channelId":channel_id,"epoch":head["epoch"],"after":"0","limit":2}
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(port["$teamarnessPortValue"], delta);
+        let unavailable = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                json!({
+                    "contract":"dev.teamarness.conversations", "major":1, "minor":2,
+                    "port":"message.changes", "actor":{"kind":"person","identity":ALICE},
+                    "request":{"channelId":channel_id,"epoch":head["epoch"],"after":"2","limit":2}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            unavailable["$teamarnessPortValue"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|event| event["status"] == "unavailable")
+        );
         let stale = session
             .harness
             .request(

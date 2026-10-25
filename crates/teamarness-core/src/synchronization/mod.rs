@@ -809,7 +809,9 @@ impl fmt::Display for SynchronizationError {
             Self::WorkspaceNotFound => "synchronization workspace was not found",
             Self::NotCurrentMember => "only a current workspace member may append",
             Self::RevokedMember => "a revoked workspace member may not append",
-            Self::PrincipalNotBound => "Principal is not bound to this Package Instance",
+            Self::PrincipalNotBound => {
+                "Principal is not a Workspace Agent bound on this Installation"
+            }
             Self::InvalidInput => "invalid immutable record input",
             Self::WrongScope => "sealed record belongs to another scope",
             Self::ContentKeyUnavailable => "the package content key has not been received yet",

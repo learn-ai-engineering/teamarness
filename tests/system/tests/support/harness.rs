@@ -61,7 +61,7 @@ impl PackageStage {
             backend: backend_executable(),
             backend_file: "backend/teamarness-conversations-package-aarch64-apple-darwin",
             source: "packages/conversations-package",
-            record_log_minor: 0,
+            record_log_minor: 1,
         }
     }
 }

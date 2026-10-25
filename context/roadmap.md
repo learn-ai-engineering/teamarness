@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0030 and 0031) is implemented on its branch and pends Verify and integration. Phase 5 is next for the core.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0031 and 0032) is implemented on its branch and pends Verify and integration. Phase 5 is next for the core.
 
 ## Phases
 
@@ -70,6 +70,20 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Agent Package (complete, verified locally)
+
+Completed and verified on 2026-10-24, including incoming local main `a947a17` merged into the feature branch and constructor/provenance correction `a67f3c4`. The final merged Root checks, all four explicit external-Agent/Host cases, and focused independent review pass. The standalone Agent's verified runtime is `ed3c016`. The developer approved fast-forward integration into local `main`. No source push or publication is authorized.
+
+Implemented on 2026-10-24 on branch `don-smith/agent_package`, workstream `agent-package`. ADR 0030 (accepted 2026-10-24) makes a bound Agent a standing local signer: Core signs with an Agent's key for any Package Instance on the Steward's Installation once the Agent has a binding there, bindings are keyed by Package through the new `teamarness.agent-binding` 1.0 capability, and the Host derives an Agent actor for a bound caller's Port calls. Conversations 1.1 accepts that actor on `message.post` and adds `channel.list`. The optional standalone Personal Agent Package `dev.teamarness.agent` is the harness for one Agent per Package Instance: the Steward picks the Agent and enters an OpenAI-compatible endpoint, model and API key in the Package's own UI; the Agent replies once when a Person addresses it by name, keeps per-Channel progress so a restart never re-replies, and reports endpoint failures as Package-owned status codes without retrying.
+
+The delivery correction adds Conversations 1.2 `message.changes`, exposing the existing UI projection journal through a query Port. Agent catch-up now persists epoch/revision progress rather than Message display positions, processes late lower-order arrivals and bounded backlog across passes, and retries safe reads without retrying settled model/post attempts. Automated regression and two-profile tests cover offline lower-order delivery and a 257-Message backlog. No hypothetical legacy binding/progress migration is introduced. Bounded cleanup also fixes rebind attribution, startup/reconnect roster reconciliation, completion redirects, status ordering and blocking storage paths. Independently owned dispatch and binding work survives local waiter cancellation; private Host authority generations fence obsolete work across Backend replacement. Main's append-generation retirement and qualified replay are preserved. A failed or uncertain post or binding write can stop dispatch until full application-process restart; configuration changes do not bypass that safety state.
+
+**Outcome:** A Member on another Installation addresses the Agent by name in Conversations, and both Installations show the reply attributed to the Agent with its Steward.
+
+**Depends on:** Workspace Principals, Package interface.
+
+Automated coverage spans Core, Host, SDK, Conversations and Agent tests, a 257-Message two-profile backlog, queued-post actor attribution, and cancelled-binding-waiter ownership against a real test Host. The final merged validation and review are `verify/20261024T092503Z_post-merge-{validation,review}.md` in the `agent-package` workstream. No current Agent or merge findings remain. The developer observed real-endpoint replies, Personal Package discovery, retained configuration after restart, and an offline-addressed reply visible at the first inspection after Alice returned. These observations are not a complete manual matrix, measured latency, or duplicate audit. They were not repeated after integration. Incoming Documents limitations remain separate. The inherited record-log authoring-schema mismatch is tracked in [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). Key custody, streaming, tools, Documents participation, scheduled posts, SDK publication, and stronger Package isolation remain separate Scopes under Later.
+
 ### Workspace Principals (complete)
 
 Verified on 2026-10-23 on branch `don-smith/agent_invite`, workstream `agent-invite`. ADR 0023 (accepted 2026-10-21) defines Workspace Principals: a Workspace Person is a key group nested in the Workspace group, a Workspace Agent is a Principal whose key the Steward's Installation custodies, and attribution is the signer key resolved to its Principal. The workstream replaces the names capability of ADR 0022 with `teamarness.principals` 1.0, adds the optional `principal` selector to `teamarness.synchronization.immutable-record-log` 1.1, lets any Member add an Agent by name from the Shell without a Manager, lists Agents with their Steward, and shows Agent authors in Conversations. The agent runtime Package, cross-Package reads, and Shell-driven Package binding are the next workstream.
@@ -102,7 +116,7 @@ Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Pac
 
 #### Documents rendered editing (implemented on branch; pending Verify and integration)
 
-Implemented on 2026-10-25 on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, in seven commits from `e6b2afc`. It is not yet verified or integrated into `main`. ADR 0031 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0030 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
+Implemented on 2026-10-25 on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, in seven commits from `e6b2afc`. It is not yet verified or integrated into `main`. ADR 0032 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0031 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
 
 - the Rust Markdown core: Canonical Markdown export and base-versioned merge, proven by property tests, with the [Markdown contract](02-system/09-documents/markdown-contract.md);
 - the Body Genesis in `document.create`, Backend-allocated peers, the 160 KiB record bound, and validation before append;
@@ -126,12 +140,14 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
-- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes as Markdown revisions merged against a base version (follow-up to Phase 7, ADRs 0027 and 0031).
-- View earlier Document versions and copy from them, built on the immutable record history. A change too large to undo in one record is not undoable (ADR 0031), and this is how a Member recovers from one.
-- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027). It must keep Port Contract version tokens resolvable or refuse stale ones explicitly (ADR 0031).
+- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes as Markdown revisions merged against a base version (follow-up to Phase 7, ADRs 0027 and 0032).
+- View earlier Document versions and copy from them, built on the immutable record history. A change too large to undo in one record is not undoable (ADR 0032), and this is how a Member recovers from one.
+- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027). It must keep Port Contract version tokens resolvable or refuse stale ones explicitly (ADR 0032).
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
-- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers).
+- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
+- Agent Package: streaming replies, tool use beyond declared Ports, Documents participation, and unprompted or scheduled posts (non-goals of the `agent-package` workstream).
+- Package platform authoring contracts: align the immutable-record-log 1.1 JSON request schema with the optional `principal` selector already supported by Host and SDK. See [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). This inherited mismatch is not resolved by the Agent integration.
 
 ## Not planned
 
@@ -174,7 +190,7 @@ The agreed sequence is four workstreams. Each needs its own Scope.
 
 Implementation in progress: the declaration, admission, scoped broker, and live event phases are committed on `package-interface`. The final source-built Conversations proof, local observations, documentation, and full verification are in progress. ADR 0026 records the Host-brokered interface.
 
-A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract exposes a Person-only post, read-only page, and live coalescible invalidation. The Host derives actor context, but cannot delegate another Package's Agent signing key. Agent runtime, Instance binding, and Agent-authored posts need a separate Agent Package workstream. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
+A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract shipped a Person-only post, read-only page, and live coalescible invalidation; the Host derived a Person actor only. The Agent Package workstream (ADR 0030, see **Current work**) then added the Host-derived Agent actor, Conversations 1.1 with Agent-authored posts and `channel.list`, and the Agent runtime. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
 
 #### Data format versioning
 

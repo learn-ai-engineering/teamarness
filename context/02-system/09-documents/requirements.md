@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.DOCS`
 
-The Documents Package (`dev.teamarness.documents`) provides Workspace Collections, Documents, and Comments. See ADR 0027 and ADR 0031.
+The Documents Package (`dev.teamarness.documents`) provides Workspace Collections, Documents, and Comments. See ADR 0027 and ADR 0032.
 
 ## TEAM.SYS.DOCS-R01 — Package Boundary
 
@@ -24,7 +24,7 @@ Any current Member SHALL be able to create a Collection with a name of 1 to 128 
 
 ## TEAM.SYS.DOCS-R05 — Collaborative Body
 
-A Document body SHALL be a Loro tree of the shared body schema (ADR 0031, `markdown-contract.md`), with Canonical Markdown as its interchange (R11). Its first update SHALL be a body genesis, carried in the `document.create` record: one update from a fresh peer holding the root map, its attributes, the `children` list and one empty paragraph. A create record without a genesis, or with anything other than exactly a genesis, SHALL be rejected at decode, and every Installation SHALL import the genesis before any edit, so no editor initialises an empty body.
+A Document body SHALL be a Loro tree of the shared body schema (ADR 0032, `markdown-contract.md`), with Canonical Markdown as its interchange (R11). Its first update SHALL be a body genesis, carried in the `document.create` record: one update from a fresh peer holding the root map, its attributes, the `children` list and one empty paragraph. A create record without a genesis, or with anything other than exactly a genesis, SHALL be rejected at decode, and every Installation SHALL import the genesis before any edit, so no editor initialises an empty body.
 
 Every Loro peer SHALL be a random 64-bit identity that the Backend allocates for one genesis, Markdown merge or editor session. A newly allocated peer SHALL be absent from the Document's version vector and from the peers already allocated in that process, and SHALL NOT be derived from the Installation. The only reuse SHALL be an Editor Session resuming as its own peer (`resumePeer`, below). Peers carry no authority; the Installation signer signs every record.
 
@@ -106,4 +106,4 @@ A Member SHALL edit a Document body in rendered form, and no Markdown source SHA
 
 Undo and redo SHALL be per person: `LoroUndoPlugin` on Mod-z, Shift-Mod-z and Mod-y, and the toolbar's Undo and Redo, SHALL revert only the session's own changes, never another Member's, another view's or a port revision's, within the bounds of R09. Typing SHALL undo in bursts: consecutive plain-text insertion, backspace and delete within one textblock SHALL be one undo step, which ends at an idle gap of 750 ms, at any other change (such as a paste, a structural change or a mark), at a selection jump, at an undo or redo, and before an import of another peer's changes, so no step spans another peer's change. Each other local change SHALL be its own undo step (the undo manager merges nothing by time), except that the pieces of a split paste SHALL be one step. A burst SHALL grow only while its undo still fits one record (R09). The undo history SHALL hold at most 500 steps, dropping the oldest. A change too large to undo in one record is not undoable (R09); recovering from one is left to a future way to view earlier Document versions and copy from them. Undoing an agent's or another Member's edits is out of scope. `prosemirror-history` SHALL NOT be used.
 
-The editor SHALL run within the frame policy of ADR 0030: its styles come from the declared stylesheet asset, it injects no `<style>` element, and it writes no inline style markup (CSSOM property writes only). Its behaviour in real browsers under that policy SHALL be checked by `npm run verify:documents-editor` (frame scenarios in WebKit and Chromium), which is outside `npm test` because it downloads browsers. Known frame-policy divergences are recorded in [DELTA-012](../../.delta/DELTA-012-package-ui-frame-form-and-select-behaviour.md). Accepted gaps in the editor's size estimates and undo budget are recorded in [DELTA-013](../../.delta/DELTA-013-documents-editor-accepted-tech-debt.md).
+The editor SHALL run within the frame policy of ADR 0031: its styles come from the declared stylesheet asset, it injects no `<style>` element, and it writes no inline style markup (CSSOM property writes only). Its behaviour in real browsers under that policy SHALL be checked by `npm run verify:documents-editor` (frame scenarios in WebKit and Chromium), which is outside `npm test` because it downloads browsers. Known frame-policy divergences are recorded in [DELTA-012](../../.delta/DELTA-012-package-ui-frame-form-and-select-behaviour.md). Accepted gaps in the editor's size estimates and undo budget are recorded in [DELTA-013](../../.delta/DELTA-013-documents-editor-accepted-tech-debt.md).

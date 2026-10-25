@@ -120,7 +120,7 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
         "message.post",
         "command",
         |_context, actor, _: Empty| async move {
-            let teamarness_package_sdk::ports::PortActor::Person { identity } = actor;
+            let identity = actor.identity().to_owned();
             Ok(serde_json::json!({"actor": identity}))
         },
     )
@@ -165,7 +165,7 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
         "message.created",
         |_context, actor| async move {
             let (sender, subscription) = event_channel(2);
-            let teamarness_package_sdk::ports::PortActor::Person { identity } = actor;
+            let identity = actor.identity().to_owned();
             tokio::spawn(async move {
                 let _ = sender.send(serde_json::json!({"actor":identity})).await;
             });
@@ -177,7 +177,7 @@ fn counting_router(hooks: Arc<Hooks>) -> Router<State> {
         "message.watch",
         |_context, actor, _: Empty| async move {
             let (sender, subscription) = event_channel(2);
-            let teamarness_package_sdk::ports::PortActor::Person { identity } = actor;
+            let identity = actor.identity().to_owned();
             tokio::spawn(async move {
                 let _ = sender.send(serde_json::json!({"actor":identity})).await;
             });

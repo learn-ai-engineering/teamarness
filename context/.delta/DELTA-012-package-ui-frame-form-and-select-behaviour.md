@@ -4,7 +4,7 @@
 
 ## Divergence
 
-`TEAM.SYS.DOCS-R04`, `TEAM.SYS.DOCS-R13` and ADR 0015 expect Package UI controls to work inside a sandboxed `allow-scripts` frame under the frame document policy (ADR 0030). Three browser behaviours break that for some controls:
+`TEAM.SYS.DOCS-R04`, `TEAM.SYS.DOCS-R13` and ADR 0015 expect Package UI controls to work inside a sandboxed `allow-scripts` frame under the frame document policy (ADR 0031). Three browser behaviours break that for some controls:
 
 1. **`<select>` under the frame policy (WebKit).** WebKit reports a `style-src-attr` Content-Security-Policy violation whenever a `<select>` element is created in a frame under the policy. The rendered editor's block-style control uses buttons to avoid it. The Documents move control (a `<select>` of Collections) has the same latent issue. No frame scenario reaches it, so its visible effect is unobserved.
 2. **Form submission in sandboxed frames (Chromium).** Without the `allow-forms` sandbox token, Chromium does not fire `submit` for a form in the frame, as the HTML specification requires. WebKit still fires it. The link prompt's Apply button and the Comment button act on click, with `submit` kept as a fallback. The other inline forms in the Documents UI, such as create and rename, still rely on `submit`. They work in the packaged WKWebView, but would fail in a Chromium-based frame.
@@ -20,6 +20,6 @@ Replace the remaining `<select>` controls with button or listbox controls that c
 
 ## Tracking
 
-- `TEAM.SYS.DOCS-R04`, `TEAM.SYS.DOCS-R13`; ADRs 0015 and 0030
+- `TEAM.SYS.DOCS-R04`, `TEAM.SYS.DOCS-R13`; ADRs 0015 and 0031
 - `packages/documents-package/ui/frame-scenarios/` (`npm run verify:documents-editor`); `scripts/ui-isolation-probe/ui/index.js`
 - `rendered-document-editing` workstream: Phase 4 and Phase 6 findings in the plan's Context Checkpoint

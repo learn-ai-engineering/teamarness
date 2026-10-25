@@ -125,7 +125,7 @@ async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     let violations: i64 = connection
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -352,7 +352,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     for column in [
         "scope_id",
         "log_id",
@@ -427,7 +427,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -764,7 +764,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     connection
         .execute(
             insert,
@@ -802,7 +802,7 @@ async fn migration_0017_replaces_names_with_principals_from_v16() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        18
+        19
     );
     assert_eq!(
         connection
@@ -847,7 +847,7 @@ async fn migration_0018_opens_v17_and_is_idempotent() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     let columns: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('deferred_principal_names')",
@@ -865,7 +865,98 @@ async fn migration_0018_opens_v17_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn migration_0018_rejects_future_schema_versions() {
+// Verifies: TEAM.SYS.ID-R10
+async fn migration_0019_rekeys_agent_bindings_by_package_and_preserves_rows() {
+    let directory = private_data_directory("migration-v18-agent-bindings");
+    let config = CoreRuntimeConfig::new(&directory);
+    let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    let workspace = runtime.create_workspace("Bindings").unwrap().id();
+    let agent = runtime.add_agent(workspace, "Agent").unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    // Restore the v17 shape, keyed by Agent, with one bound Package.
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE agent_package_bindings;
+             CREATE TABLE agent_package_bindings (
+                 workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
+                 agent_principal_id BLOB NOT NULL CHECK(length(agent_principal_id)=32),
+                 package_identity TEXT NOT NULL,
+                 PRIMARY KEY(workspace_id,agent_principal_id),
+                 FOREIGN KEY(workspace_id,agent_principal_id) REFERENCES agent_keys(workspace_id,agent_principal_id)
+             ) STRICT;
+             PRAGMA user_version=18;",
+        )
+        .unwrap();
+    let workspace_bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT workspace_id FROM agent_keys WHERE agent_principal_id=?1",
+            [agent.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_package_bindings (workspace_id, agent_principal_id, package_identity) VALUES (?1, ?2, ?3)",
+            params![
+                workspace_bytes.as_slice(),
+                agent.as_bytes().as_slice(),
+                "dev.teamarness.agent"
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let reopened = CoreRuntime::open_loopback_for_tests(config.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .bound_agent(workspace, "dev.teamarness.agent")
+            .unwrap(),
+        Some(agent)
+    );
+    reopened.shutdown().await.unwrap();
+    drop(reopened);
+    let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 19);
+    let primary_key: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM pragma_table_info('agent_package_bindings') WHERE pk > 0 ORDER BY pk",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(primary_key, ["workspace_id", "package_identity"]);
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_package_bindings WHERE workspace_id=?1 AND package_identity=?2 AND agent_principal_id=?3",
+            params![
+                workspace_bytes.as_slice(),
+                "dev.teamarness.agent",
+                agent.as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    let indexes: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='agent_package_bindings_agent'", [], |row| row.get(0)).unwrap();
+    assert_eq!(indexes, 1);
+    drop(connection);
+    let runtime = CoreRuntime::open_loopback_for_tests(config).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn migration_0019_rejects_future_schema_versions() {
     let directory = private_data_directory("migration-future-schema");
     let config = CoreRuntimeConfig::new(&directory);
     let runtime = CoreRuntime::open_loopback_for_tests(config.clone())
@@ -874,7 +965,7 @@ async fn migration_0018_rejects_future_schema_versions() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.pragma_update(None, "user_version", 19).unwrap();
+    connection.pragma_update(None, "user_version", 20).unwrap();
     drop(connection);
     assert!(matches!(
         CoreRuntime::open_loopback_for_tests(config).await,
@@ -925,7 +1016,7 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();

@@ -1,8 +1,8 @@
-# 0031 — Document bodies are structured Loro trees edited in the UI, with Markdown as the interchange
+# 0032 — Document bodies are structured Loro trees edited in the UI, with Markdown as the interchange
 
 **Status:** accepted (2026-10-24)
 **Supersedes:** ADR 0027 (Decision, the **Body records** bullet: "Legacy kind 10 remains readable", "The live Loro is changed only after an export on a deep fork fits one record" as applied to backend-made text edits, and "The Loro peer id is derived from the Installation identity"; Rejected alternatives, the bullet "Rich text, a UI-side CRDT, or exact text-range comment anchors" except its exact-range-anchor clause; Consequences, the 256 KiB bullet's "bounded full-text chunks")
-**Refines:** ADR 0026 (a second Person-only Port Contract), ADR 0029 (adds a schema-violation import disposition), ADR 0030 (consumes WebAssembly in frames)
+**Refines:** ADR 0026 (a second Person-only Port Contract), ADR 0029 (adds a schema-violation import disposition), ADR 0031 (consumes WebAssembly in frames)
 
 ## Context
 

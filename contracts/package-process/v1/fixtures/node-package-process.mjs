@@ -439,6 +439,8 @@ async function serve() {
           } else if (frame.payload.port === "message.large_watch") {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1,
               $teamarnessPortValue: "x".repeat(262142) } });
+          } else if (frame.payload.port === "message.actor_watch") {
+            send({ kind: "event", streamId: frame.id, sequence: "1", payload: { actor: frame.payload.actor } });
           } else {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: packageIdentity === "com.example.invalid" ? "invalid" : 1 } });
             if (packageIdentity !== "com.example.invalid") send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
