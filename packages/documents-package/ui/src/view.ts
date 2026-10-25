@@ -1,5 +1,6 @@
-import type { Collection, Comment, Document, TextEvent } from "./contract.generated";
+import type { Collection, Comment, Document } from "./contract.generated";
 import type { DocumentsController } from "./controller";
+import { DocumentEditor, hasBody } from "./editor/view";
 import { renderMarkdown } from "./markdown";
 
 const KIT = {
@@ -18,19 +19,6 @@ const AVAILABILITY_LABEL = {
   waiting_for_history_access: "Waiting for history access",
 } as const;
 
-function boundedQuote(selection: string): string | null {
-  const encoder = new TextEncoder();
-  let quote = "";
-  let bytes = 0;
-  for (const character of selection.trim()) {
-    const size = encoder.encode(character).length;
-    if (bytes + size > 2048) break;
-    quote += character;
-    bytes += size;
-  }
-  return quote || null;
-}
-
 function button(label: string, className: string, onClick: () => void): HTMLButtonElement {
   const element = document.createElement("button");
   element.type = "button";
@@ -48,8 +36,7 @@ const ICON_PATHS = {
   eyeOff: "M3 3l18 18 M10.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a16 16 0 0 1-3.1 4.1 M6.1 6.1C3.4 8 2 12 2 12s3.5 7 10 7c1.5 0 2.9-.4 4.1-1",
   reply: "M9 17 4 12l5-5 M4 12h10a6 6 0 0 1 6 6v1",
   resolve: "M4 12l5 5L20 6", reopen: "M4 11a8 8 0 1 1 2 6 M4 5v6h6",
-  preview: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
-  edit: "M4 20h4l12-12-4-4L4 16v4z M14 6l4 4", clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
+  clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
 } as const;
 
 function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
@@ -81,6 +68,37 @@ function updateIcon(control: HTMLButtonElement, name: keyof typeof ICON_PATHS, l
   control.querySelector("path")?.setAttribute("d", ICON_PATHS[name]);
   const hint = control.querySelector(".control-tooltip");
   if (hint) hint.textContent = label;
+}
+
+/**
+ * Whether this frame may use the asynchronous clipboard. Engines that publish their permissions
+ * policy say so; asking one that refuses would only log a policy violation.
+ */
+function clipboardAllowed(): boolean {
+  if (typeof navigator === "undefined" || navigator.clipboard === undefined) return false;
+  type Policy = { allowsFeature(feature: string): boolean };
+  const published = document as unknown as { permissionsPolicy?: Policy; featurePolicy?: Policy };
+  const policy = published.permissionsPolicy ?? published.featurePolicy;
+  return policy === undefined || policy.allowsFeature("clipboard-write");
+}
+
+/**
+ * Copies `text` through the document's copy command, inside the current user gesture. Returns
+ * whether the command ran.
+ */
+function copyWithCommand(text: string): boolean {
+  const onCopy = (event: ClipboardEvent): void => {
+    event.clipboardData?.setData("text/plain", text);
+    event.preventDefault();
+  };
+  document.addEventListener("copy", onCopy, true);
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    document.removeEventListener("copy", onCopy, true);
+  }
 }
 
 /** A one-field form built once; the view only patches its disabled state. */
@@ -144,7 +162,15 @@ export class DocumentsView {
   private readonly editorPane: HTMLElement;
   private readonly editorTitle: HTMLElement;
   private readonly editorStatus: HTMLElement;
-  private readonly textarea: HTMLTextAreaElement;
+  /** Says why no body is shown: the session is opening, or the body waits for history. */
+  private readonly editorPlaceholder: HTMLElement;
+  private readonly editor: DocumentEditor;
+  private readonly copyStatus: HTMLElement;
+  private readonly copyPanel: HTMLElement;
+  private readonly copyText: HTMLTextAreaElement;
+  private copySequence = 0;
+  /** The selection quote of the Comment being written. */
+  private draftQuote: string | null = null;
   private readonly rail: HTMLElement;
   private readonly shell: HTMLElement;
   private readonly leftHandle: HTMLElement;
@@ -153,8 +179,6 @@ export class DocumentsView {
   private readonly resizeObserver: ResizeObserver | null;
   private readonly showNavigation: HTMLButtonElement;
   private readonly commentsToggle: HTMLButtonElement;
-  private readonly previewButton: HTMLButtonElement;
-  private readonly preview: HTMLElement;
   private readonly commentsPanel: HTMLElement;
   private readonly commentList: HTMLElement;
   private readonly commentForm: HTMLFormElement;
@@ -162,7 +186,6 @@ export class DocumentsView {
   private readonly commentQuote: HTMLElement;
   private readonly commentSubmit: HTMLButtonElement;
   private readonly controller: DocumentsController;
-  private draftQuote: string | null = null;
   private replyTo: string | null = null;
   private composerDocumentId: string | null = null;
   private readonly expanded = new Set<string>();
@@ -291,32 +314,52 @@ export class DocumentsView {
     this.editorStatus = document.createElement("span");
     this.editorStatus.className = "editor-status";
     this.editorStatus.setAttribute("role", "status");
-    this.previewButton = icon("preview", "Preview", () => controller.togglePreview(), true);
-    this.previewButton.disabled = true;
-    this.previewButton.setAttribute("aria-pressed", "false");
-    editorHeader.append(this.editorTitle, this.editorStatus, this.previewButton);
-    this.preview = document.createElement("article");
-    this.preview.className = "editor-preview";
-    this.preview.setAttribute("aria-label", "Rendered document");
-    this.preview.hidden = true;
-    this.textarea = document.createElement("textarea");
-    this.textarea.className = `${KIT.input} editor-textarea`;
-    this.textarea.setAttribute("aria-label", "Document text (Markdown)");
-    this.textarea.spellcheck = false;
-    this.textarea.addEventListener("input", () => {
-      controller.openEditor?.input(this.textarea.value);
-    });
-    const clearCollapsedQuote = () => {
-      if (this.draftQuote !== null && this.textarea.selectionStart === this.textarea.selectionEnd) {
-        this.draftQuote = null;
+    editorHeader.append(this.editorTitle, this.editorStatus);
+    this.copyStatus = document.createElement("span");
+    this.copyStatus.className = "editor-copy-status";
+    this.copyStatus.setAttribute("role", "status");
+    editorHeader.append(this.copyStatus);
+    this.editorPlaceholder = document.createElement("div");
+    this.editorPlaceholder.className = "editor-placeholder";
+    this.editorPlaceholder.textContent = "Opening…";
+    this.editor = new DocumentEditor({
+      guard: {
+        unsentBytes: () => controller.editorSession?.unexportedBytes ?? 0,
+        flush: () => controller.editorSession?.flush(),
+      },
+      onCopyMarkdown: () => this.copyMarkdown(),
+      onComment: () => {
+        this.draftQuote = this.editor.quote();
         this.renderComposer();
-      }
-    };
-    this.textarea.addEventListener("select", clearCollapsedQuote);
-    this.textarea.addEventListener("keyup", clearCollapsedQuote);
-    this.textarea.addEventListener("pointerup", clearCollapsedQuote);
-    this.editorPane.append(editorHeader, this.textarea, this.preview);
-    controller.textListener = (event: TextEvent) => this.onTextEvent(event);
+        if (!this.commentsOpen) { this.commentsOpen = true; this.renderRails(); }
+        this.commentInput.focus();
+      },
+    });
+    this.copyPanel = document.createElement("section");
+    this.copyPanel.className = "markdown-copy";
+    this.copyPanel.setAttribute("aria-label", "Copy as Markdown");
+    this.copyPanel.hidden = true;
+    const copyHint = document.createElement("p");
+    copyHint.className = "markdown-copy-hint";
+    copyHint.textContent = "This window may not write to the clipboard. Press Copy, or select the text below and copy it.";
+    this.copyText = document.createElement("textarea");
+    this.copyText.className = `${KIT.input} markdown-copy-text`;
+    this.copyText.readOnly = true;
+    this.copyText.rows = 6;
+    this.copyText.setAttribute("aria-label", "Document as Markdown");
+    const copyActions = document.createElement("div");
+    copyActions.className = "markdown-copy-actions";
+    copyActions.append(
+      button("Copy", KIT.primary, () => {
+        const copied = copyWithCommand(this.copyText.value);
+        this.copyStatus.textContent = copied ? "Copied as Markdown" : "Select the text and copy it.";
+        if (copied) this.closeCopyPanel();
+        else this.copyText.select();
+      }),
+      button("Close", KIT.secondary, () => this.closeCopyPanel()),
+    );
+    this.copyPanel.append(copyHint, this.copyText, copyActions);
+    this.editorPane.append(editorHeader, this.copyPanel, this.editorPlaceholder, this.editor.element);
 
     // --- comments (built once; the list is rebuilt per render, the composer persists) ---
     this.commentsPanel = document.createElement("section");
@@ -338,10 +381,11 @@ export class DocumentsView {
     this.commentInput.placeholder = "Add a comment (Markdown)";
     this.commentInput.setAttribute("aria-label", "New comment");
     this.commentInput.addEventListener("focus", () => {
-      if (this.controller.state.openDocumentId === null || !this.controller.openEditor
-        || this.textarea.hidden || this.textarea.disabled) return;
-      this.draftQuote = this.selectedEditorQuote();
-      this.renderComposer();
+      const quote = this.editor.quote();
+      if (quote !== null) {
+        this.draftQuote = quote;
+        this.renderComposer();
+      }
     });
     this.commentSubmit = document.createElement("button");
     this.commentSubmit.type = "submit";
@@ -351,25 +395,25 @@ export class DocumentsView {
     composeActions.className = "comment-compose-actions";
     composeActions.append(this.commentSubmit);
     this.commentForm.append(this.commentQuote, this.commentInput, composeActions);
-    this.commentForm.addEventListener("submit", (event) => {
+    // A sandboxed frame may not submit forms, so pressing Comment posts; the submit event is
+    // handled too, for engines that still fire it.
+    const post = (event: Event): void => {
       event.preventDefault();
       const markdown = this.commentInput.value.trim();
       if (!markdown) return;
       const documentId = controller.state.openDocumentId;
-      if (this.draftQuote !== null && this.selectedEditorQuote() === null) {
-        this.draftQuote = null;
-        this.renderComposer();
-      }
       void controller.addComment(markdown, this.draftQuote, this.replyTo).then((ok) => {
         if (ok && controller.state.openDocumentId === documentId) {
           this.commentInput.value = "";
-          this.collapseEditorSelection();
+          if (this.draftQuote !== null) this.editor.collapseSelection();
           this.draftQuote = null;
           this.replyTo = null;
           this.renderComposer();
         }
       });
-    });
+    };
+    this.commentSubmit.addEventListener("click", post);
+    this.commentForm.addEventListener("submit", post);
     this.commentsPanel.append(commentsHeading, this.commentList, this.commentForm);
     this.shell.append(this.rail, this.leftHandle, this.editorPane, this.rightHandle, this.commentsPanel);
     this.page.append(header, this.warnings, this.error, this.shell);
@@ -383,38 +427,11 @@ export class DocumentsView {
     this.resizeObserver?.observe(this.shell);
   }
 
-  /** Routes a text event through the controller with the live caret, then syncs the textarea. */
-  private onTextEvent(event: TextEvent): void {
-    const focused = this.textarea.ownerDocument.activeElement === this.textarea
-      || (this.textarea.getRootNode() as ShadowRoot).activeElement === this.textarea;
-    const caret = focused ? { start: this.textarea.selectionStart, end: this.textarea.selectionEnd } : null;
-    const next = this.controller.receiveText(event, caret);
-    this.syncTextarea(next);
-  }
-
-  private syncTextarea(caret: { start: number; end: number } | null): void {
-    const editor = this.controller.openEditor;
-    if (!editor) return;
-    const visible = editor.current.reason === "import_failure" ? editor.current.text : editor.value;
-    if (this.textarea.value !== visible) {
-      this.textarea.value = visible;
-      if (caret) this.textarea.setSelectionRange(caret.start, caret.end);
-    }
-  }
-
-  private selectedEditorQuote(): string | null {
-    return boundedQuote(this.textarea.value.slice(this.textarea.selectionStart, this.textarea.selectionEnd));
-  }
-
-  private collapseEditorSelection(): void {
-    this.textarea.setSelectionRange(this.textarea.selectionEnd, this.textarea.selectionEnd);
-  }
-
   private renderComposer(): void {
     const root = this.commentQuote.getRootNode() as ShadowRoot;
     const focusedCue = this.commentQuote.contains(root.activeElement)
       ? root.activeElement?.getAttribute("aria-label") : null;
-    this.commentQuote.hidden = this.draftQuote === null && this.replyTo === null;
+    this.commentQuote.hidden = this.replyTo === null && this.draftQuote === null;
     this.commentQuote.replaceChildren();
     if (this.replyTo !== null) {
       const reply = document.createElement("span");
@@ -434,7 +451,6 @@ export class DocumentsView {
       quote.textContent = this.draftQuote;
       this.commentQuote.append(cue, quote, icon("x", "Clear quote", () => {
         this.draftQuote = null;
-        this.collapseEditorSelection();
         this.renderComposer();
       }));
     }
@@ -560,44 +576,48 @@ export class DocumentsView {
 
   private renderEditor(): void {
     const open = this.controller.openDocument;
-    const editor = this.controller.openEditor;
+    const session = this.controller.openSession;
     this.editorPane.hidden = false;
-    this.previewButton.disabled = open === null;
     this.commentsPanel.hidden = open === null || !this.commentsOpen;
     this.rightHandle.hidden = this.commentsPanel.hidden;
-    if (open === null) { this.editorTitle.textContent = "Choose a Document"; this.textarea.hidden = true; this.preview.hidden = true; return; }
-    this.renderComments();
-    this.editorTitle.textContent = open.title;
-    if (!editor) {
-      this.editorStatus.textContent = "Opening…";
-      this.textarea.disabled = true;
+    const loro = this.controller.editorSession?.doc ?? null;
+    const shown = open !== null && session !== null && session.phase === "ready" && loro !== null && hasBody(loro)
+      && session.reason !== "identity_conflict";
+    this.editor.bind(shown ? loro : null, shown && session.editable);
+    this.editor.element.hidden = !shown;
+    this.editorPlaceholder.hidden = open === null || shown;
+    if (open === null) {
+      this.editorTitle.textContent = "Choose a Document";
+      this.editorStatus.textContent = "";
+      this.closeCopyPanel();
       return;
     }
-    const { editable, sending, error, reason } = editor.current;
-    this.textarea.disabled = !editable;
+    this.renderComments();
+    this.editorTitle.textContent = open.title;
+    if (session === null || session.phase !== "ready") {
+      this.editorPlaceholder.textContent = "Opening…";
+      this.editorStatus.textContent = "Opening…";
+      this.editorStatus.classList.remove("editor-status-failure");
+      return;
+    }
+    const { editable, reason } = session;
+    this.editorPlaceholder.textContent = reason === "identity_conflict" ? "This Document is unavailable." : "Waiting for history";
     this.editorStatus.textContent = reason === "identity_conflict"
-      ? "Conflicting edit history — document unavailable. Unsaved draft remains only in this window."
+      ? "Conflicting edit history — document unavailable."
       : reason === "import_failure"
-        ? `Incomplete edit history — read only. Last known-good text; record ${editor.current.diagnosticRecordId ?? "unknown"}. Unsaved draft remains only in this window.`
-        : error ?? (!editable ? "Waiting for history" : sending || editor.value !== editor.current.text ? "Saving…" : "Saved");
+        ? `Incomplete edit history — read only. Last known-good text; record ${session.diagnosticRecordId ?? "unknown"}.`
+        : !editable ? "Waiting for history" : "";
     this.editorStatus.classList.toggle("editor-status-failure", reason === "import_failure");
-    this.syncTextarea(null);
-    const preview = this.controller.state.preview;
-    this.previewButton.setAttribute("aria-pressed", String(preview));
-    updateIcon(this.previewButton, preview ? "edit" : "preview", preview ? "Edit" : "Preview");
-    this.textarea.hidden = preview;
-    this.preview.hidden = !preview;
-    if (preview) this.preview.innerHTML = reason === "identity_conflict" ? ""
-      : renderMarkdown(reason === "import_failure" ? editor.current.text : editor.value);
   }
 
   render(): void {
     const { snapshot, busy, error, showArchived, openDocumentId } = this.controller.state;
     if (this.composerDocumentId !== openDocumentId) {
-      this.collapseEditorSelection();
       this.composerDocumentId = openDocumentId;
-      this.draftQuote = null;
       this.replyTo = null;
+      this.draftQuote = null;
+      this.copySequence += 1;
+      this.copyStatus.textContent = "";
     }
     this.status.textContent = AVAILABILITY_LABEL[snapshot.availability];
     updateIcon(this.archivedToggle, showArchived ? "eye" : "eyeOff", showArchived ? "Hide archived" : "Show archived");
@@ -630,11 +650,56 @@ export class DocumentsView {
   }
 
   dispose(): void {
+    this.editor.destroy();
     this.resizeObserver?.disconnect();
     this.page.getRootNode().removeEventListener("click", this.onOutsideClick);
     this.page.getRootNode().removeEventListener("keydown", this.onEscape);
     document.removeEventListener("click", this.onOutsideClick);
     this.page.remove();
+  }
+
+  /**
+   * Copies the open Document as Markdown. The clipboard write starts inside the click, with the
+   * text still being read, because a frame may write only during a user gesture. When the write
+   * is refused, the text is shown for the Member to copy.
+   */
+  private copyMarkdown(): void {
+    const sequence = ++this.copySequence;
+    this.copyStatus.textContent = "Copying…";
+    const text = this.controller.documentMarkdown();
+    const clipboard = clipboardAllowed() ? navigator.clipboard : undefined;
+    let written: Promise<void>;
+    try {
+      written = typeof ClipboardItem !== "undefined" && typeof clipboard?.write === "function"
+        ? clipboard.write([new ClipboardItem({ "text/plain": text.then((value) => new Blob([value], { type: "text/plain" })) })])
+        : typeof clipboard?.writeText === "function"
+          ? text.then((value) => clipboard.writeText(value))
+          : Promise.reject(new Error("The clipboard is unavailable"));
+    } catch (error) {
+      written = Promise.reject(error);
+    }
+    written.then(() => {
+      if (sequence === this.copySequence) this.copyStatus.textContent = "Copied as Markdown";
+    }, async () => {
+      let value: string;
+      try {
+        value = await text;
+      } catch (error) {
+        if (sequence === this.copySequence) this.copyStatus.textContent = error instanceof Error ? error.message : "Copy failed";
+        return;
+      }
+      if (sequence !== this.copySequence) return;
+      this.copyStatus.textContent = "";
+      this.copyText.value = value;
+      this.copyPanel.hidden = false;
+      this.copyText.focus();
+      this.copyText.select();
+    });
+  }
+
+  private closeCopyPanel(): void {
+    this.copyPanel.hidden = true;
+    this.copyText.value = "";
   }
 
   private renderRails(): void {

@@ -1,4 +1,4 @@
-//! The generic `teamarness-content:` scheme (ADR 0033).
+//! The generic `teamarness-content:` scheme (ADR 0034).
 //!
 //! Serves `teamarness-content://localhost/<token>/<path>` from a Host content
 //! view. The Shell owns the response policy: every response, including every

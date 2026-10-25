@@ -1,4 +1,4 @@
-# 0033 — Content views are served through a Shell-owned content scheme
+# 0034 — Content views are served through a Shell-owned content scheme
 
 **Status:** accepted (2026-10-25)
 **Supersedes:** –
@@ -46,7 +46,7 @@ The handler answers a single `bytes=a-b`, `bytes=a-` or `bytes=-n` range with `2
 - **The Shell reads a Package's storage layout directly.** The Shell would learn Package storage, which breaks the generic Shell rule.
 - **`srcdoc`, `blob:` URLs or a reserved path on `teamarness-package:`.** `srcdoc` and `blob:` break relative navigation. A reserved path would widen `frame-src` for every Package and share the Package frame's policy.
 - **A scheme named after one Package.** The Shell and Host would name one Package, and a second user would need a rename.
-- **`frame-src teamarness-content:` for every Package.** Nesting changes the isolation surface, so it is opted into by declaration. This differs from the rendered-document-editing decision that allows `'wasm-unsafe-eval'` in Package UI Frames (its ADR number is assigned when that workstream is integrated), which changes no boundary.
+- **`frame-src teamarness-content:` for every Package.** Nesting changes the isolation surface, so it is opted into by declaration. This differs from ADR 0031, which allows `'wasm-unsafe-eval'` in Package UI Frames and changes no boundary.
 - **Relying on the embedding frame's `sandbox` attribute.** A Package UI could omit it. The CSP `sandbox` directive comes from the Shell on every response.
 
 ## Consequences

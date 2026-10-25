@@ -30,6 +30,7 @@
     "test:dev-profile": "node --test scripts/dev-profile.test.mjs",
     "verify:reference-webkit-probe:prepare": "npm run build && node packages/reference-package/ui/prepare-webkit-probe.mjs",
     "verify:conversations": "node scripts/verify-conversations.mjs",
+    "verify:documents-editor": "node packages/documents-package/ui/frame-scenarios/run.mjs",
     "verify:packaged-app": "node scripts/smoke-packaged-app.mjs",
     "tauri": "npm --workspace teamarness-desktop run tauri --"
   }

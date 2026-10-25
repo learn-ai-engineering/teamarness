@@ -46,13 +46,15 @@ const FRAME_RUNTIME: &[u8] = include_bytes!(concat!(
 
 /// Carried on every Package resource response, so a Package UI Frame can load
 /// only Shell-owned and Package-declared resources and can reach no network.
-const FRAME_DOCUMENT_CSP: &str = "default-src 'none'; script-src teamarness-package:; style-src teamarness-package:; img-src teamarness-package: data:; font-src teamarness-package:; media-src teamarness-package:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+/// `'wasm-unsafe-eval'` lets it compile WebAssembly from bytes it already holds
+/// (ADR 0031); `eval` and `new Function` stay refused.
+const FRAME_DOCUMENT_CSP: &str = "default-src 'none'; script-src teamarness-package: 'wasm-unsafe-eval'; style-src teamarness-package:; img-src teamarness-package: data:; font-src teamarness-package:; media-src teamarness-package:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
 /// The one directive a mount's frame policy varies on.
 const DENIED_FRAME_SRC: &str = "frame-src 'none'";
 
 /// A mount whose Package declares `teamarness.content-views` may nest
-/// Shell-served content frames, and nothing else (ADR 0033).
+/// Shell-served content frames, and nothing else (ADR 0034).
 const NESTED_CONTENT_FRAME_SRC: &str = "frame-src teamarness-content:";
 
 static NESTED_CONTENT_FRAME_DOCUMENT_CSP: LazyLock<String> =
@@ -437,6 +439,36 @@ mod tests {
         ] {
             assert!(!FRAME_DOCUMENT_CSP.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn frame_document_policy_is_exactly_the_reviewed_directive_set() {
+        let directives: Vec<(&str, Vec<&str>)> = FRAME_DOCUMENT_CSP
+            .split(';')
+            .map(|directive| {
+                let mut parts = directive.split_whitespace();
+                let name = parts.next().expect("a directive has a name");
+                (name, parts.collect())
+            })
+            .collect();
+        let expected: Vec<(&str, Vec<&str>)> = vec![
+            ("default-src", vec!["'none'"]),
+            (
+                "script-src",
+                vec!["teamarness-package:", "'wasm-unsafe-eval'"],
+            ),
+            ("style-src", vec!["teamarness-package:"]),
+            ("img-src", vec!["teamarness-package:", "data:"]),
+            ("font-src", vec!["teamarness-package:"]),
+            ("media-src", vec!["teamarness-package:"]),
+            ("connect-src", vec!["'none'"]),
+            ("frame-src", vec!["'none'"]),
+            ("worker-src", vec!["'none'"]),
+            ("object-src", vec!["'none'"]),
+            ("base-uri", vec!["'none'"]),
+            ("form-action", vec!["'none'"]),
+        ];
+        assert_eq!(directives, expected);
     }
 
     #[test]

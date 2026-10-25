@@ -1,0 +1,28 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "Alice wrote thisBob wrote that"
+    }
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "marks": [
+      {
+       "type": "strong"
+      }
+     ],
+     "text": "and more"
+    }
+   ]
+  }
+ ]
+}

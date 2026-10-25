@@ -32,12 +32,22 @@ path = "../../packages/exhibits-package/backend/src/main.rs"
 name = "exhibits-port-consumer-under-test"
 path = "src/bin/exhibits_port_consumer.rs"
 
+# The Documents Backend is built the same way, from the Package's own `src/main.rs`.
+[[bin]]
+name = "documents-backend-under-test"
+path = "../../packages/documents-package/backend/src/main.rs"
+
+[[bin]]
+name = "documents-port-consumer-under-test"
+path = "src/bin/documents_port_consumer.rs"
+
 # The optional standalone Agent is qualified through an explicitly supplied Package Directory;
 # it is not a source dependency or prerequisite of the default Teamarness suite.
 
 [dependencies]
 base64.workspace = true
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
+teamarness-documents-package = { path = "../../packages/documents-package/backend" }
 teamarness-exhibits-package = { path = "../../packages/exhibits-package/backend" }
 teamarness-package-sdk = { path = "../../crates/teamarness-package-sdk" }
 serde.workspace = true
@@ -46,6 +56,7 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+loro.workspace = true
 # `test-hooks` is what binds an Installation's Iroh endpoint to loopback, so
 # the default suite reaches no public relay. It is a dev-dependency: the
 # feature never ships in the application.

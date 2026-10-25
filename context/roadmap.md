@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Phase 5 is next for the core.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0031, 0032 and 0033) passed Verify and was integrated into `main` on 2026-10-25. Phase 5 is next for the core.
 
 ## Phases
 
@@ -74,7 +74,7 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 Slice 1 was implemented on 2026-10-25 on branch `don-smith/link_and_show`, workstream `exhibits-package`. Its Verify and the developer's manual checks are outstanding, and it is not integrated into `main`. An Agent, or any Port Consumer acting for a Person, authors an Exhibit: a multi-page, interactive web experience whose files are all bundled. The bundled Exhibits Package (`dev.teamarness.exhibits`, on-demand activation) stores Drafts in its Package Data Directory and provides the `dev.teamarness.exhibits` 1.0 Port Contract: chunked, content-addressed uploads, atomic Draft updates with revision checks, paged list and read, and a `runtime.guide` query that publishes the enforced limits (`TEAM.SYS.PKG-R18`). Its UI lists Exhibits newest first and shows the selected Draft in a nested frame, replacing it when a newer revision arrives.
 
-Two generic seams carry the content, and neither names Exhibits. The Host capability `teamarness.content-views` 1.0 serves verified files from a Package's own Package Data Directory (`TEAM.SYS.PKG-R16`). The Shell scheme `teamarness-content:` serves them with an opaque origin and scripts only, and only a Package that declares the capability may frame it (`TEAM.SYS.PKG-R17`, ADR 0033). The packaged-app smoke renders a Draft through the real Ports, Host and scheme, changes the open Draft to its next revision without reselecting it, and its isolation probe finds no breach, with or without a `sandbox` attribute on the frame. The frame without the attribute is nested in the Shell's sandboxed Package UI Frame and inherits its flags, so the smoke proves the end-to-end result; the `content_protocol.rs` tests prove the CSP `sandbox` directive itself at header level. Content frames can still reach the network through navigation and WebRTC; see [DELTA-014](.delta/DELTA-014-exhibit-content-network-access.md).
+Two generic seams carry the content, and neither names Exhibits. The Host capability `teamarness.content-views` 1.0 serves verified files from a Package's own Package Data Directory (`TEAM.SYS.PKG-R16`). The Shell scheme `teamarness-content:` serves them with an opaque origin and scripts only, and only a Package that declares the capability may frame it (`TEAM.SYS.PKG-R17`, ADR 0034). The packaged-app smoke renders a Draft through the real Ports, Host and scheme, changes the open Draft to its next revision without reselecting it, and its isolation probe finds no breach, with or without a `sandbox` attribute on the frame. The frame without the attribute is nested in the Shell's sandboxed Package UI Frame and inherits its flags, so the smoke proves the end-to-end result; the `content_protocol.rs` tests prove the CSP `sandbox` directive itself at header level. Content frames can still reach the network through navigation and WebRTC; see [DELTA-015](.delta/DELTA-015-exhibit-content-network-access.md).
 
 **Outcome:** A Person sees an Agent's multi-page Exhibit inside Teamarness, interacts with it, and sees the Agent's next revision without reopening it.
 
@@ -126,6 +126,22 @@ Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Pac
 
 **Depends on:** Phase 4. Follow-up: folder mapping, so a mapped folder lets any editor or CLI agent edit documents.
 
+#### Documents rendered editing (verified and integrated 2026-10-25)
+
+Implemented on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, from `e6b2afc`; it passed Verify and was integrated into `main` on 2026-10-25. ADR 0032 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0031 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
+
+- the Rust Markdown core: Canonical Markdown export and base-versioned merge, proven by property tests, with the [Markdown contract](02-system/09-documents/markdown-contract.md);
+- the Body Genesis in `document.create`, Backend-allocated peers, the 160 KiB record bound, and validation before append;
+- Editor Sessions fed by snapshots, with relay, resync, and peer resume;
+- the rendered editor, with per-person undo, split-then-refuse paste guards, copy as Markdown, and comment on selection;
+- Documents Port Contract 1.1 (`document.list`, `document.markdown`, `document.revise`, `documents.changed`), proven through the Host broker, where a Workspace Agent bound on the Installation revises a Document as itself (ADR 0033).
+
+The record format changed incompatibly, so development data directories that hold Documents must be reset. Automated checks pass, including the WebKit and Chromium frame scenarios (`npm run verify:documents-editor`). The long property run passed in Verify, and the developer checked live sync and an offline-then-online merge across two instances. The packaged-app isolation probe, IME input, and the two-second latency observation were not run before integration and remain open checks. Frame-policy findings are recorded in [DELTA-014](.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md). Edge cases that Verify confirmed and the developer accepted as tech debt are recorded in [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md). Agent document tools, Agent mentions and Comment ports are tracked under **Agent participation in Package Ports**, and the remaining editor work is tracked under **Documents editor maintenance**, both in Planned follow-up workstreams.
+
+**Outcome:** Members edit a Document in rendered form and converge, and another Package reads and revises it as Markdown against a base version.
+
+**Depends on:** Phase 7 (Documents Package), Package interface (ADR 0026).
+
 ## Later (unscheduled)
 
 Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
@@ -136,13 +152,14 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted eager Package runs one Backend per Workspace (5 eager bundled Packages × 3 Workspaces = 15 processes); the on-demand Exhibits Package starts only on first use. Measure before scheduling.
-- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes through the text CRDT (follow-up to Phase 7, ADR 0027).
-- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027).
+- Folder mapping for Documents: a mapped folder lets any editor or CLI agent edit documents, importing external changes as Markdown revisions merged against a base version (follow-up to Phase 7, ADRs 0027 and 0032).
+- View earlier Document versions and copy from them, built on the immutable record history. A change too large to undo in one record is not undoable (ADR 0032), and this is how a Member recovers from one.
+- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027). It must keep Port Contract version tokens resolvable or refuse stale ones explicitly (ADR 0032).
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
-- Agent Package: streaming replies, tool use beyond declared Ports, Documents participation, and unprompted or scheduled posts (non-goals of the `agent-package` workstream).
-- Network denial for Exhibit content frames: a navigation handler and WebRTC denial beside the content policy's `connect-src` ([DELTA-014](.delta/DELTA-014-exhibit-content-network-access.md), ADR 0033).
+- Agent Package: streaming replies, tool use beyond declared Ports, and unprompted or scheduled posts (non-goals of the `agent-package` workstream). Documents participation is tracked under **Agent participation in Package Ports**.
+- Network denial for Exhibit content frames: a navigation handler and WebRTC denial beside the content policy's `connect-src` ([DELTA-015](.delta/DELTA-015-exhibit-content-network-access.md), ADR 0034).
 - Package platform authoring contracts: align the immutable-record-log 1.1 JSON request schema with the optional `principal` selector already supported by Host and SDK. See [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). This inherited mismatch is not resolved by the Agent integration.
 
 ## Not planned
@@ -203,6 +220,63 @@ Author signature over the Package artifact, a team endorsement of an exact diges
 ### Workspace Principal maintenance (unscheduled)
 
 Start a separate Scope if sustained name-delivery or membership churn becomes an ordinary workload. Two bounded deferred-name replay schedules can starve an eligible name while churn continues; finite backlogs converge. That Scope should also decide whether to use or retire the unused deferred-reference target index. A smaller Core maintenance change can reuse one clock sample for local Agent removal. Clarify the ontology's Agent Identity keypair wording without changing key custody. Diagnose the intermittent `names_converge_without_package_instance_after_restart` test failure before changing a deadline or claiming that a passing retry fixed it. The `agent-invite` final Verify report owns the evidence; these are follow-ups, not unverified passes or blockers to the completed supported flow.
+
+### Agent participation in Package Ports (discuss before Scope)
+
+Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package does not yet have tools that call those Ports. The developer's direction, which is not yet designed, is open question [TEAM-DQ10](open-questions.md):
+
+- Every Package assumes that Agents will use it, and ships agent-facing guidance with its Port Contract: what is possible, what to do and what not to do, tool descriptions, and possibly skills or a small library. An Agent can discover the guidance from the Package, or a Steward can enable it for an Agent. The aim is loose coupling and high cohesion across Conversations, Documents, Exhibits and later Packages.
+- Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
+- Agent mentions and Comment Ports for Documents. The Documents Port Contract has no Comment operations today.
+- A developer check once tools exist: an Agent revises a Document that a Member has open, and the change appears live.
+
+### Documents editor maintenance (unscheduled)
+
+Start a separate Scope if prioritized. These items were left open when rendered Document editing closed on 2026-10-25.
+
+- **Accepted tech debt:** [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md) records the editor's size-estimate and undo-budget gaps, pasted link addresses, the concurrent-open session leak, and the retained test and naming items.
+- **Frame-policy divergences:** [DELTA-014](.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md) records the form-submit and `<select>` behaviour.
+- **Manual checks not yet run:**
+  - the packaged-app isolation probe (`npm run tauri build -- --bundles app,dmg`, then `npm run verify:packaged-app`);
+  - IME input in WKWebView;
+  - the two-second remote-edit latency observation (`TEAM.SYS.DOCS-R06`);
+  - the large-paste and delete-all undo checks.
+- **Robustness:**
+  - CPU and SQLite work run on async workers, and import costs grow with records × body size (`CR-006`).
+  - The hub-wide `identity_lookup_lock` is held across the Core append, which serialises local writes (`CR-007`).
+  - The growth budget counts only text (`CR-009`).
+  - A split paste continues after one piece is refused (`CR-103`).
+  - Exact measurement runs on keystrokes in large lists (`CR-104`).
+  - A revise merges before its cheap refusals while it holds the append lock (`CR-105`).
+  - A recovered poisoned gate can leave a body missing a committed record without a diagnostic (`CR-106`).
+  - A shared 256-slot session channel can cause a storm of snapshot reopens (`CR-204`).
+  - An Agent's refusal before the append is reported as outcome-uncertain rather than certain (`CR-501`). A refused Agent write also leaves no diagnostic.
+- **Contract and records:**
+  - `document.revise` can return undeclared `documents.document_too_large` and retryable `documents.edit_failed` (`SF-102`).
+  - `markdown-contract.md` omits the diff time budget (`SF-103`).
+  - The system proof never reaches the Provider's `actor_unauthorized` (`SF-205`).
+  - Conversations and Documents report Core's `principal_not_bound` in different shapes.
+- **Maintainability:**
+  - Cross-language bounds and the mark-expand configuration are hand-copied between TypeScript and Rust (`SM-003`, `SM-004`).
+  - The frame-scenario harness re-implements the Backend session protocol, uses fixed sleeps, and is not linted or type-checked (`SM-005`–`SM-007`).
+  - Loro parity is checked twice (`SM-008`).
+  - `skipLibCheck` is undocumented (`SM-009`).
+  - `backend.rs` holds the Editor Session seam without a module boundary (`SM-010`).
+  - `adopt_import` copies fields by hand (`SM-103`).
+  - There is duplication from corrective commits (`SM-105`).
+  - The Agent revise path is a boolean flag inside the shared write path (`SM-503`).
+- **Test gaps:**
+  - the undo growth refusal (`SM-106`);
+  - `Verifies:` citations in the TypeScript tests (`SM-206`);
+  - an uncertain Agent append failure, and an Agent revision relayed to an open Editor Session (`SM-504`).
+
+### Core test reliability (unscheduled)
+
+Three Core tests failed or hung under machine load during rendered Document editing Verify, and passed when run alone. That branch changed no Core files. Diagnose before changing them:
+
+- `runtime_tests::async_boundary::inbound_log_sync_receiver_calls_do_not_block_the_executor` hangs intermittently.
+- `runtime_tests::sync_authorization::names_converge_without_package_instance_after_restart` fails with "connection lost".
+- `sync_bounds::revocation_during_backoff_prevents_redial` fails once under load.
 
 ## Maintenance rule
 
