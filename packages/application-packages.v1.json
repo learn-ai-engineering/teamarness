@@ -15,6 +15,9 @@
     },
     {
       "directory": "packages/dev.teamarness.documents"
+    },
+    {
+      "directory": "packages/dev.teamarness.exhibits"
     }
   ]
 }

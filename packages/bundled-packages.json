@@ -5,6 +5,7 @@
     { "sourceDirectory": "packages/tutorial", "cargoPackage": "teamarness-tutorial-package" },
     { "sourceDirectory": "packages/conversations-package", "cargoPackage": "teamarness-conversations-package" },
     { "sourceDirectory": "packages/repo-aware", "cargoPackage": "teamarness-repo-aware-package" },
-    { "sourceDirectory": "packages/documents-package", "cargoPackage": "teamarness-documents-package" }
+    { "sourceDirectory": "packages/documents-package", "cargoPackage": "teamarness-documents-package" },
+    { "sourceDirectory": "packages/exhibits-package", "cargoPackage": "teamarness-exhibits-package" }
   ]
 }
