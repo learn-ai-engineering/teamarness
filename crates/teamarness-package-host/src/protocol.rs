@@ -1430,6 +1430,7 @@ pub(crate) fn decode_port_value(value: &Value) -> &Value {
 pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
     match code {
         PackageErrorCode::CapabilityUnavailable => "capability_unavailable",
+        PackageErrorCode::Cancelled => "cancelled",
         PackageErrorCode::CapabilityVersionUnsupported => "capability_version_unsupported",
         PackageErrorCode::DeadlineExceeded => "deadline_exceeded",
         PackageErrorCode::Overloaded => "overloaded",

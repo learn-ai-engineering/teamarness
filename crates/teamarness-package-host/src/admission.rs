@@ -18,6 +18,7 @@ pub(crate) struct AdmissionReport {
     pub(crate) admissions: Vec<Admission>,
     pub(crate) graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
     pub(crate) catalog: Vec<crate::AuthoringCatalogEntry>,
+    pub(crate) providers: BTreeMap<String, PackageIdentity>,
 }
 
 #[derive(Clone)]
@@ -316,6 +317,10 @@ pub(crate) fn admit(
         .collect();
     let mut packages = Vec::new();
     let mut admissions = Vec::new();
+    let admitted_providers = providers
+        .into_iter()
+        .filter(|(_, p)| remaining.contains(p))
+        .collect();
     for identity in remaining {
         let (catalog, admission) = eligible.remove(&identity).expect("selected identity");
         packages.push(catalog);
@@ -338,6 +343,7 @@ pub(crate) fn admit(
             diagnostics,
         },
         admissions,
+        providers: admitted_providers,
         graph,
         catalog,
     })

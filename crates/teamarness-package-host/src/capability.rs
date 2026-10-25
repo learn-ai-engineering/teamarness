@@ -378,7 +378,8 @@ impl GenerationCapabilities {
                 .map_err(CapabilityFailure::certain)?;
             return match method {
                 "available" | "describe" => {
-                    self.check_port_access(object)
+                    let state = self
+                        .port_access_state(&broker, object)
                         .await
                         .map_err(CapabilityFailure::certain)?;
                     let result = if method == "available" {
@@ -387,6 +388,7 @@ impl GenerationCapabilities {
                                 &self.scope.package_identity,
                                 &self.scope.workspace_id,
                                 object,
+                                &state,
                             )
                             .await
                     } else {
@@ -395,31 +397,35 @@ impl GenerationCapabilities {
                                 &self.scope.package_identity,
                                 &self.scope.workspace_id,
                                 object,
+                                &state,
                             )
                             .await
                     };
                     result.map_err(CapabilityFailure::certain)
                 }
+                "enable" | "disable" => self
+                    .port_selection(&broker, method, object)
+                    .await
+                    .map_err(CapabilityFailure::certain),
                 "invoke" => {
                     #[cfg(feature = "test-hooks")]
                     broker
                         .pause_command_actor(&self.scope.package_identity, object)
                         .await;
-                    self.check_port_access(object)
-                        .await
-                        .map_err(CapabilityFailure::certain)?;
-                    let actor = self
-                        .port_actor()
-                        .await
-                        .map_err(CapabilityFailure::certain)?;
-                    broker
-                        .deny_disabled_guide(&self.scope.package_identity, object, &actor)
-                        .map_err(CapabilityFailure::certain)?;
+                    let route = self.authorize_port(&broker, object).await.map_err(|code| {
+                        broker.record_call_refusal(
+                            &self.scope.package_identity,
+                            consumer_id,
+                            self.generation,
+                            object,
+                            code,
+                        );
+                        CapabilityFailure::certain(code)
+                    })?;
                     broker
                         .call(
                             &self.scope.package_identity,
-                            &self.scope.workspace_id,
-                            &actor,
+                            route,
                             object,
                             started,
                             consumer_id,
@@ -503,15 +509,14 @@ impl GenerationCapabilities {
                 .broker
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
-            self.check_port_access(object).await?;
-            let actor = self.port_actor().await?;
-            broker.deny_disabled_guide(&self.scope.package_identity, object, &actor)?;
+            let route = self.authorize_port(&broker, object).await?;
             if object.get("kind").and_then(Value::as_str) == Some("event") {
                 let subscription = broker
                     .subscribe_event(
                         &self.scope.package_identity,
                         &self.scope.workspace_id,
                         &self.core.public_identity().to_string(),
+                        route,
                         object,
                         self.generation,
                     )
@@ -542,14 +547,7 @@ impl GenerationCapabilities {
                 });
                 return Ok(());
             }
-            let query = broker
-                .query_stream(
-                    &self.scope.package_identity,
-                    &self.scope.workspace_id,
-                    &actor,
-                    object,
-                )
-                .await?;
+            let query = broker.query_stream(route, object).await?;
             let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
             let mut streams = self.streams.lock().await;
             if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
@@ -972,20 +970,97 @@ impl GenerationCapabilities {
         }
     }
 
-    // Agent-only access never becomes Person composition when the binding is absent.
-    async fn check_port_access(&self, object: &Map<String, Value>) -> Result<(), PackageErrorCode> {
-        match object.get("access").and_then(Value::as_str) {
-            Some("declared") => Ok(()),
-            Some("agent") => {
-                let actor = self.port_actor().await?;
-                if actor.get("kind").and_then(Value::as_str) == Some("agent") {
-                    Err(PackageErrorCode::PortNotEnabled)
-                } else {
-                    Err(PackageErrorCode::AgentNotBound)
-                }
-            }
-            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+    fn instance_key(&self) -> crate::PackageInstanceKey {
+        crate::PackageInstanceKey::new(
+            self.scope.package_identity.clone(),
+            self.scope.workspace_id.clone(),
+        )
+    }
+
+    async fn port_access_state(
+        &self,
+        broker: &Arc<crate::broker::PortBroker>,
+        object: &Map<String, Value>,
+    ) -> Result<crate::port_access::AccessState, PackageErrorCode> {
+        let agent = match object.get("access").and_then(Value::as_str) {
+            Some("agent") => true,
+            Some("declared") => false,
+            _ => return Err(PackageErrorCode::CapabilityRequestInvalid),
+        };
+        broker
+            .access_work(
+                self.core.clone(),
+                self.instance_key(),
+                &self.authority,
+                move |_, _, state| {
+                    if agent && state.actor["kind"] != "agent" {
+                        return Err(PackageErrorCode::AgentNotBound);
+                    }
+                    Ok(state)
+                },
+            )
+            .await
+    }
+
+    async fn authorize_port(
+        &self,
+        broker: &Arc<crate::broker::PortBroker>,
+        object: &Map<String, Value>,
+    ) -> Result<crate::port_access::ResolvedPort, PackageErrorCode> {
+        let key = self.instance_key();
+        let input = object.clone();
+        broker
+            .access_work(
+                self.core.clone(),
+                key.clone(),
+                &self.authority,
+                move |broker, _, state| {
+                    broker.resolve_access(&key.package_identity, &key.workspace_id, &input, &state)
+                },
+            )
+            .await
+    }
+
+    async fn port_selection(
+        &self,
+        broker: &Arc<crate::broker::PortBroker>,
+        method: &str,
+        object: &Map<String, Value>,
+    ) -> Result<Value, PackageErrorCode> {
+        let enable = method == "enable";
+        exact_fields(
+            object,
+            if enable {
+                &["method", "contract", "major"]
+            } else {
+                &["method", "contract"]
+            },
+        )?;
+        let contract = string_field(object, "contract")?.to_owned();
+        if !teamarness_package_contract::identity::is_valid_package_identity(&contract) {
+            return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
+        let major = if enable {
+            Some(
+                object
+                    .get("major")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u16::try_from(v).ok())
+                    .filter(|v| *v != 0)
+                    .ok_or(PackageErrorCode::CapabilityRequestInvalid)?,
+            )
+        } else {
+            None
+        };
+        broker
+            .select_contract(
+                self.core.clone(),
+                self.instance_key(),
+                &self.authority,
+                contract,
+                major,
+            )
+            .await
     }
 
     /// The Host-authored actor for a Port dispatch by this generation: the
@@ -993,32 +1068,13 @@ impl GenerationCapabilities {
     /// Installation Person (ADR 0030). Read once per dispatch; the lookup
     /// never marks the command as started, because nothing has reached the
     /// Provider yet.
+    #[cfg(test)]
     async fn port_actor(&self) -> Result<Value, PackageErrorCode> {
-        let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
-            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-        let package = self.scope.package_identity.as_str().to_owned();
-        let core = Arc::clone(&self.core);
+        let key = self.instance_key();
+        let core = self.core.clone();
         self.authority
             .run(&self.limiter, Arc::new(AtomicBool::new(false)), move || {
-                let person = json!({"kind":"person","identity":core.public_identity().to_string()});
-                let Some(agent) = core
-                    .bound_agent(workspace, &package)
-                    .map_err(binding_error)?
-                else {
-                    return Ok(person);
-                };
-                let Some(principal) = core.principal(workspace, agent).map_err(binding_error)?
-                else {
-                    return Ok(person);
-                };
-                let Some(identity) = principal.keys().first() else {
-                    return Ok(person);
-                };
-                Ok(json!({
-                    "kind":"agent",
-                    "principal":agent.to_string(),
-                    "identity":identity.to_string(),
-                }))
+                crate::port_access::actor(&core, &key)
             })
             .await?
     }
@@ -1480,7 +1536,7 @@ fn current_binding(
 }
 
 /// Core's binding and registry errors in the capability's own vocabulary.
-fn binding_error(error: teamarness_core::PersonNameError) -> PackageErrorCode {
+pub(crate) fn binding_error(error: teamarness_core::PersonNameError) -> PackageErrorCode {
     match error {
         teamarness_core::PersonNameError::NotOwnPerson => PackageErrorCode::AgentNotStewarded,
         teamarness_core::PersonNameError::AgentNotFound => PackageErrorCode::AgentNotFound,
@@ -2242,8 +2298,7 @@ mod tests {
             package.clone(),
             WorkspaceId::new(workspace.id().to_string()).unwrap(),
         );
-        let broker =
-            crate::broker::PortBroker::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let broker = crate::broker::empty_broker().await;
         let scope = CapabilityScope {
             package_identity: package.clone(),
             workspace_id: key.workspace_id.clone(),

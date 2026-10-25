@@ -69,3 +69,55 @@ impl PackageHost {
         pause
     }
 }
+
+/// Holds actual blocking selection work while it owns the operation and generation leases.
+#[derive(Default)]
+pub struct PortSelectionPause {
+    reached: tokio::sync::Notify,
+    release: std::sync::Condvar,
+    outcome: std::sync::Mutex<Option<bool>>,
+}
+
+impl PortSelectionPause {
+    pub async fn paused(&self) {
+        self.reached.notified().await;
+    }
+    pub fn resume(&self) {
+        self.finish(false);
+    }
+    /// Simulates loss of the completion acknowledgement after SQLite committed.
+    pub fn fail_completion(&self) {
+        self.finish(true);
+    }
+    fn finish(&self, failed: bool) {
+        *self.outcome.lock().expect("selection pause poisoned") = Some(failed);
+        self.release.notify_one();
+    }
+    pub(crate) fn wait(&self) -> bool {
+        self.reached.notify_one();
+        let mut outcome = self.outcome.lock().expect("selection pause poisoned");
+        while outcome.is_none() {
+            outcome = self
+                .release
+                .wait(outcome)
+                .expect("selection pause poisoned");
+        }
+        outcome.expect("released outcome")
+    }
+}
+
+impl PackageHost {
+    pub fn pause_next_port_selection_for_tests(
+        &self,
+        package: PackageIdentity,
+    ) -> Arc<PortSelectionPause> {
+        let pause = Arc::new(PortSelectionPause::default());
+        *self
+            .inner
+            .port_broker
+            .selection_pause
+            .lock()
+            .expect("selection pause poisoned") = Some((package, pause.clone()));
+        pause
+    }
+}

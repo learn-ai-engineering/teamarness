@@ -640,7 +640,7 @@ async function serve() {
         portEvents.length = 0;
         send({ kind: "stream_open", id: portQueryStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: capabilityGrants.get("teamarness.package-ports"),
-            access: "declared", major: frame.payload.major ?? 1, contract: "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
+            access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
         send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_events") {
         send({ kind: "response", id: frame.id, payload: frame.payload.summary
@@ -653,7 +653,7 @@ async function serve() {
         portEventClose = null;
         send({ kind: "stream_open", id: portEventStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: frame.payload.grant ?? capabilityGrants.get("teamarness.package-ports"),
-            access: "declared", major: frame.payload.major ?? 1, contract: "com.example.messages", port: frame.payload.port ?? "message.created", kind: "event",
+            access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.created", kind: "event",
             ...(frame.payload.extra ?? {}) } });
         send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_event_events") {

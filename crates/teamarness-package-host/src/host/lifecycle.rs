@@ -67,8 +67,15 @@ impl PackageHost {
                 )
             })
             .collect();
-        let port_broker =
-            broker::PortBroker::new(report.graph.clone(), consumed, port_contracts.clone());
+        let port_broker = broker::PortBroker::new(
+            report.graph.clone(),
+            consumed,
+            port_contracts.clone(),
+            crate::port_access::PortAccess {
+                store: store.clone(),
+                providers: report.providers.clone(),
+            },
+        );
         let (templates, admitted_ui) = Self::build_process_templates(&config, &mut report)?;
         // One permit pool, one set of protocol bounds and one content view
         // table for every Package in this Host.

@@ -84,7 +84,7 @@ impl PortClient {
         }
     }
 
-    /// Retrieves one bounded summary page. Agent discovery is qualified in a later milestone.
+    /// Retrieves one bounded summary page. Agent access requires a current binding.
     pub async fn available(
         &self,
         access: PortAccess,
@@ -148,12 +148,58 @@ impl PortClient {
 
     /// Lists the caller's actual declared dependencies, without requiring an Agent Binding.
     pub async fn declared_contracts(&self) -> Result<Vec<ContractSummary>, BackendError> {
+        self.contracts(PortAccess::Declared).await
+    }
+
+    /// Lists eligible Agent contracts and retained selections without waking Providers.
+    pub async fn agent_contracts(&self) -> Result<Vec<ContractSummary>, BackendError> {
+        self.contracts(PortAccess::Agent).await
+    }
+
+    /// Durably selects a major for this harness in its granted Workspace.
+    pub async fn enable(&self, contract: &str, major: u16) -> Result<(), BackendError> {
+        if !teamarness_package_contract::identity::is_valid_package_identity(contract) || major == 0
+        {
+            return Err(invalid_request());
+        }
+        let result = self
+            .capabilities
+            .call(
+                &self.grant,
+                "enable",
+                serde_json::json!({"contract":contract,"major":major}),
+            )
+            .await?;
+        if result != serde_json::json!({"contract":contract,"major":major,"enabled":true}) {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+
+    /// Removes this harness's selection, including when its Provider is unavailable.
+    pub async fn disable(&self, contract: &str) -> Result<(), BackendError> {
+        if !teamarness_package_contract::identity::is_valid_package_identity(contract) {
+            return Err(invalid_request());
+        }
+        let result = self
+            .capabilities
+            .call(
+                &self.grant,
+                "disable",
+                serde_json::json!({"contract":contract}),
+            )
+            .await?;
+        if result != serde_json::json!({"contract":contract,"enabled":false}) {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+
+    async fn contracts(&self, access: PortAccess) -> Result<Vec<ContractSummary>, BackendError> {
         let mut rows: Vec<ContractSummary> = Vec::new();
         let mut cursor = None::<String>;
         loop {
-            let page = self
-                .available(PortAccess::Declared, cursor.as_deref())
-                .await?;
+            let page = self.available(access, cursor.as_deref()).await?;
             let entries: Vec<ContractSummary> = serde_json::from_value(page["contracts"].clone())
                 .map_err(|_| invalid_response())?;
             if entries.is_empty() && page.get("nextCursor").is_some() {
@@ -167,7 +213,9 @@ impl PortClient {
                     return Err(invalid_response());
                 }
                 rows.push(entry);
-                if rows.len() > teamarness_package_contract::manifest::MAX_CONSUMED_CONTRACTS {
+                if matches!(access, PortAccess::Declared)
+                    && rows.len() > teamarness_package_contract::manifest::MAX_CONSUMED_CONTRACTS
+                {
                     return Err(invalid_response());
                 }
             }

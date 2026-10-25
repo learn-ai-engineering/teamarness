@@ -51,19 +51,11 @@ impl PortBroker {
             .map_err(|_| PackageErrorCode::PortUnavailable)
     }
 
-    async fn metadata_available(
+    pub(crate) async fn provider_available(
         &self,
-        caller: &PackageIdentity,
         workspace: &WorkspaceId,
-        contract: &str,
+        provider: Option<&PackageIdentity>,
     ) -> bool {
-        let provider = self
-            .graph
-            .get(caller)
-            .into_iter()
-            .flatten()
-            .find(|r| r.contract == contract && r.unavailable.is_none())
-            .and_then(|r| r.provider.as_ref());
         let actor = provider.and_then(|provider| {
             self.instances
                 .read()
@@ -83,16 +75,17 @@ impl PortBroker {
         }
     }
 
-    fn cursor(&self, caller: &PackageIdentity, workspace: &WorkspaceId, last: &str) -> String {
+    fn cursor(
+        &self,
+        caller: &PackageIdentity,
+        workspace: &WorkspaceId,
+        access: &str,
+        last: &str,
+    ) -> String {
         // The random Host-open revision makes every previous admission snapshot stale.
         // Hash the exact scope and last identity with that private revision; no client state.
-        let bytes = serde_json::to_vec(&json!([
-            caller.as_str(),
-            workspace.as_str(),
-            "declared",
-            last
-        ]))
-        .expect("JSON scope");
+        let bytes = serde_json::to_vec(&json!([caller.as_str(), workspace.as_str(), access, last]))
+            .expect("JSON scope");
         let mut hash = Sha256::new();
         hash.update(&bytes);
         hash.update(self.metadata_revision);
@@ -105,11 +98,21 @@ impl PortBroker {
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
         input: &Map<String, Value>,
+        state: &crate::port_access::AccessState,
     ) -> Result<Value, PackageErrorCode> {
         if input.len() != 2 + usize::from(input.contains_key("cursor"))
-            || input.get("access").and_then(Value::as_str) != Some("declared")
+            || !matches!(
+                input.get("access").and_then(Value::as_str),
+                Some("declared" | "agent")
+            )
         {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
+        }
+        let access = input["access"]
+            .as_str()
+            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        if access == "agent" && state.actor["kind"] != "agent" {
+            return Err(PackageErrorCode::AgentNotBound);
         }
         let last = if let Some(cursor) = input.get("cursor") {
             let cursor = cursor
@@ -125,48 +128,86 @@ impl PortBroker {
             let scope: Vec<String> =
                 serde_json::from_slice(&bytes).map_err(|_| PackageErrorCode::PortCatalogChanged)?;
             let last = scope.get(3).ok_or(PackageErrorCode::PortCatalogChanged)?;
-            if cursor != self.cursor(caller, workspace, last) {
+            if cursor != self.cursor(caller, workspace, access, last) {
                 return Err(PackageErrorCode::PortCatalogChanged);
             }
             Some(last.clone())
         } else {
             None
         };
-        let mut declarations: Vec<_> = self.consumed.get(caller).into_iter().flatten().collect();
-        declarations.sort_by(|a, b| a.identity.cmp(&b.identity));
-        let remaining: Vec<_> = declarations
-            .into_iter()
-            .filter(|c| last.as_ref().is_none_or(|last| c.identity > *last))
-            .collect();
-        let mut rows = Vec::new();
-        let mut page = json!({"contracts":[]});
-        for (index, declaration) in remaining.iter().enumerate() {
-            let metadata = self.declared_metadata(caller, &declaration.identity).ok();
-            let route = self
-                .graph
+        let mut identities: BTreeSet<String> = if access == "declared" {
+            self.consumed
                 .get(caller)
                 .into_iter()
                 .flatten()
-                .find(|r| r.contract == declaration.identity);
-            let description = route
-                .and_then(|r| r.provider.as_ref())
-                .and_then(|p| self.contracts.get(p))
-                .and_then(|s| {
-                    s.contracts
-                        .iter()
-                        .find(|c| c.identity == declaration.identity)
-                })
-                .map(|c| c.description.as_str());
+                .map(|c| c.identity.clone())
+                .collect()
+        } else {
+            self.access
+                .providers
+                .keys()
+                .filter(|c| self.agent_contract(c).is_ok())
+                .cloned()
+                .chain(state.selections.keys().cloned())
+                .collect()
+        };
+        identities.retain(|c| last.as_ref().is_none_or(|last| c > last));
+        let remaining: Vec<_> = identities.into_iter().collect();
+        let mut rows = Vec::new();
+        let mut page = json!({"contracts":[]});
+        for (index, contract) in remaining.iter().enumerate() {
+            let (provider, metadata, major, minor, description) = if access == "declared" {
+                let declaration = self.consumed[caller]
+                    .iter()
+                    .find(|c| &c.identity == contract)
+                    .expect("declared identity");
+                let route = self
+                    .graph
+                    .get(caller)
+                    .into_iter()
+                    .flatten()
+                    .find(|r| &r.contract == contract);
+                let provider = route.and_then(|r| r.provider.clone());
+                let description = provider
+                    .as_ref()
+                    .and_then(|p| self.contracts.get(p))
+                    .and_then(|s| s.contracts.iter().find(|c| &c.identity == contract))
+                    .map(|c| c.description.clone());
+                (
+                    provider,
+                    self.declared_metadata(caller, contract).ok(),
+                    declaration.major,
+                    route.and_then(|r| r.minor),
+                    description,
+                )
+            } else if let Ok((provider, schemas, major, minor)) = self.agent_contract(contract) {
+                let description = schemas
+                    .contracts
+                    .iter()
+                    .find(|c| &c.identity == contract)
+                    .map(|c| c.description.clone());
+                (
+                    Some(provider),
+                    schemas.project_metadata(contract, None).ok(),
+                    major,
+                    Some(minor),
+                    description,
+                )
+            } else {
+                (None, None, state.selections[contract], None, None)
+            };
             let available = metadata.is_some()
-                && self
-                    .metadata_available(caller, workspace, &declaration.identity)
-                    .await;
-            rows.push(json!({"contract":declaration.identity,"major":declaration.major,"minor":route.and_then(|r| r.minor),
-                "description":description,"available":available,"enabled":false,"enabledMajor":null,"metadataSha256":metadata.map(|m| m.sha256)}));
+                && self.provider_available(workspace, provider.as_ref()).await
+                && (access == "declared"
+                    || state
+                        .selections
+                        .get(contract)
+                        .is_none_or(|saved| *saved == major));
+            let enabled_major = state.selections.get(contract);
+            rows.push(json!({"contract":contract,"major":major,"minor":minor,"description":description,"available":available,"enabled":enabled_major.is_some(),"enabledMajor":enabled_major,"metadataSha256":metadata.map(|m| m.sha256)}));
             let mut candidate = json!({"contracts":rows});
             if index + 1 < remaining.len() {
-                candidate["nextCursor"] =
-                    json!(self.cursor(caller, workspace, &declaration.identity));
+                candidate["nextCursor"] = json!(self.cursor(caller, workspace, access, contract));
             }
             if serde_json::to_vec(&candidate)
                 .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
@@ -188,8 +229,14 @@ impl PortBroker {
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
         input: &Map<String, Value>,
+        state: &crate::port_access::AccessState,
     ) -> Result<Value, PackageErrorCode> {
-        if input.len() != 5 || input.get("access").and_then(Value::as_str) != Some("declared") {
+        if input.len() != 5
+            || !matches!(
+                input.get("access").and_then(Value::as_str),
+                Some("declared" | "agent")
+            )
+        {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
         let text = |key| {
@@ -205,8 +252,35 @@ impl PortBroker {
             .and_then(Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
-        let metadata = self.declared_metadata(caller, contract)?;
-        if !self.metadata_available(caller, workspace, contract).await {
+        let (metadata, provider) = if input["access"] == "agent" {
+            if state.actor["kind"] != "agent" {
+                return Err(PackageErrorCode::AgentNotBound);
+            }
+            let (provider, schemas, _, _) = self.agent_contract(contract).map_err(|code| {
+                if state.selections.contains_key(contract) {
+                    PackageErrorCode::PortUnavailable
+                } else {
+                    code
+                }
+            })?;
+            (
+                schemas
+                    .project_metadata(contract, None)
+                    .map_err(|_| PackageErrorCode::PortUnavailable)?,
+                Some(provider),
+            )
+        } else {
+            let metadata = self.declared_metadata(caller, contract)?;
+            let provider = self
+                .graph
+                .get(caller)
+                .into_iter()
+                .flatten()
+                .find(|r| r.contract == contract)
+                .and_then(|r| r.provider.clone());
+            (metadata, provider)
+        };
+        if !self.provider_available(workspace, provider.as_ref()).await {
             return Err(PackageErrorCode::PortUnavailable);
         }
         if digest != metadata.sha256 {

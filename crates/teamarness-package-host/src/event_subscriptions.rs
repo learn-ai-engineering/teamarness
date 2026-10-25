@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
-use teamarness_package_contract::port_contract::PortKind;
 use teamarness_package_protocol::{
     INITIAL_STREAM_CREDIT, MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION, MAX_WRITER_BYTES,
 };
@@ -88,6 +87,7 @@ impl PortBroker {
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
         installation: &str,
+        route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
         consumer_generation: u64,
     ) -> Result<EventSubscription, PackageErrorCode> {
@@ -109,9 +109,13 @@ impl PortBroker {
         if input.get("kind").and_then(Value::as_str) != Some("event") {
             return Err(PackageErrorCode::PortUngranted);
         }
-        let (actor, schemas, major, minor) =
-            self.resolve(caller, workspace, contract, port, PortKind::Event)?;
-        self.check_declared_access(input, major)?;
+        let crate::port_access::ResolvedPort {
+            provider: actor,
+            schemas,
+            major,
+            minor,
+            ..
+        } = route;
         let slot = self
             .event_subscribers
             .clone()

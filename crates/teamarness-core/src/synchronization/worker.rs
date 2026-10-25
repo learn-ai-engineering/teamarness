@@ -550,15 +550,15 @@ impl Driver {
                     Err(_) => return,
                 }
             }
-            if self.paused.load(Ordering::Acquire) {
-                continue;
-            }
             #[cfg(test)]
             {
                 *self
                     .snapshot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = core.snapshot();
+            }
+            if self.paused.load(Ordering::Acquire) {
+                continue;
             }
             let now = Instant::now();
             while let Some(job) = core.next_dispatch(now) {
@@ -1309,6 +1309,37 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("timed out waiting until {what}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_scheduler_snapshot_observes_in_flight_completion() {
+        let fixture = Fixture::open("paused-completion-snapshot");
+        let runner = FakeRunner::new(SessionOutcome::Failed);
+        runner.hold.store(true, Ordering::Release);
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        until("held session starts", || !runner.dispatches().is_empty()).await;
+        worker.wake.notify_one();
+        until("snapshot observes in-flight session", || {
+            worker.snapshot_for_test().iter().any(|peer| peer.in_flight)
+        })
+        .await;
+        worker.pause_for_test(true);
+        runner.release.notify_waiters();
+        until("paused snapshot observes completion", || {
+            worker
+                .snapshot_for_test()
+                .iter()
+                .all(|peer| !peer.in_flight)
+        })
+        .await;
+        assert_eq!(
+            runner.dispatches().len(),
+            1,
+            "pause does not dispatch another job"
+        );
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
     }
 
     // Verifies: TEAM.SYS.TRANS-R08

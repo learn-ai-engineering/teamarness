@@ -793,10 +793,12 @@ async fn peer_saturation_preserves_reachable_unknown_and_failed_health() {
         pause_scheduling(&cluster, &["a", "b"]);
         cluster
             .wait_until("outbound sessions are idle", DEFAULT_DEADLINE, |c| {
-                c.node("b")
-                    .scheduler_snapshot_for_test()
-                    .iter()
-                    .all(|peer| !peer.in_flight)
+                ["a", "b"].iter().all(|name| {
+                    c.node(name)
+                        .scheduler_snapshot_for_test()
+                        .iter()
+                        .all(|peer| !peer.in_flight)
+                })
             })
             .await;
         let _origin = cluster
@@ -835,6 +837,18 @@ async fn peer_saturation_preserves_reachable_unknown_and_failed_health() {
             None,
         );
         assert_eq!(subscription.availability().unwrap().availability, expected);
+        // Reading the application acknowledgement completes the initiator before
+        // the responder's send.stopped() necessarily releases its inbound slot.
+        cluster
+            .wait_until(
+                "setup responder slots are released",
+                DEFAULT_DEADLINE,
+                |c| {
+                    c.node("a").inbound_package_sessions_for_test() == 0
+                        && c.node("b").inbound_package_sessions_for_test() == 0
+                },
+            )
+            .await;
         // Hold the real responder's two per-peer slots before Hello. The third
         // connection is refused as busy while the peer stays alive and reachable.
         let first = cluster

@@ -246,6 +246,58 @@ async fn declared_metadata_is_complete_bounded_scoped_and_does_not_activate_prov
         .core
         .bind_agent_package(workspace, agent, "dev.example.consumer")
         .unwrap();
+    let mut agent_page =
+        call(&host, &mount, "available", json!({"access":"agent"})).await["result"].clone();
+    let agent_cursor = agent_page["nextCursor"].as_str().unwrap().to_owned();
+    let mut agent_rows = Vec::new();
+    loop {
+        assert!(serde_json::to_vec(&agent_page).unwrap().len() <= 32 * 1024);
+        let entries = agent_page["contracts"].as_array().unwrap();
+        assert!(entries.len() <= 32);
+        agent_rows.extend(entries.clone());
+        let Some(cursor) = agent_page.get("nextCursor") else {
+            break;
+        };
+        agent_page = call(
+            &host,
+            &mount,
+            "available",
+            json!({"access":"agent","cursor":cursor}),
+        )
+        .await["result"]
+            .clone();
+    }
+    assert_eq!(agent_rows.len(), 30);
+    let agent_chunk = call(&host, &mount, "describe", json!({"access":"agent","contract":contract,"metadataSha256":agent_rows[0]["metadataSha256"],"offset":0})).await;
+    assert!(
+        STANDARD
+            .decode(agent_chunk["result"]["data"].as_str().unwrap())
+            .unwrap()
+            .len()
+            <= 64 * 1024
+    );
+    assert_ne!(
+        agent_rows[0]["metadataSha256"], digest,
+        "Agent projection includes the undeclared guide"
+    );
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "dev.example.other")
+        .unwrap();
+    for (target, access, cursor) in [
+        (&other, "agent", agent_cursor.clone()),
+        (&mount, "declared", agent_cursor),
+        (&mount, "agent", cursor.clone()),
+    ] {
+        let response = call(
+            &host,
+            target,
+            "available",
+            json!({"access":access,"cursor":cursor}),
+        )
+        .await;
+        assert_eq!(response["error"], "port_catalog_changed", "{response}");
+    }
     let denied = call(&host, &mount, "invoke", json!({"access":"declared","contract":contract,"major":1,"port":"value.read","kind":"query","request":{}})).await;
     assert_eq!(denied["error"], "port_not_enabled", "{denied}");
     assert!(
