@@ -351,9 +351,9 @@ impl ExhibitStore {
     /// For each hash, whether the store is missing all of the file, some chunks, or nothing.
     /// Hashes the store holds completely are left out; duplicates are reported once.
     ///
-    /// A partial upload whose chunks are all present but which was never assembled (the
-    /// process ended during assembly) is assembled here: it is left out when it verifies, and
-    /// reported as missing all of the file when it does not.
+    /// This is a query and changes nothing. A partial upload whose chunks are all present but
+    /// which was never assembled (the process ended during assembly) reports its last chunk,
+    /// so re-sending that chunk with `file.put` finishes the upload.
     ///
     /// # Errors
     /// `exhibits.invalid_request` for a malformed hash or more than 256 hashes, or
@@ -388,18 +388,12 @@ impl ExhibitStore {
                         .is_ok_and(|metadata| metadata.len() == chunk_length(to_u64(size), *chunk))
                 })
                 .collect();
-            if !chunks.is_empty() {
-                missing.push((sha256.clone(), Missing::Chunks(chunks)));
-                continue;
-            }
-            let now = (self.clock)();
-            match self.finish_partial(&connection, sha256, to_u64(size), to_u64(count), now) {
-                Ok(()) => {}
-                Err(ExhibitsError::ContentMismatch) => {
-                    missing.push((sha256.clone(), Missing::All));
-                }
-                Err(error) => return Err(error),
-            }
+            let chunks = if chunks.is_empty() {
+                vec![to_u64(count) - 1]
+            } else {
+                chunks
+            };
+            missing.push((sha256.clone(), Missing::Chunks(chunks)));
         }
         Ok(missing)
     }

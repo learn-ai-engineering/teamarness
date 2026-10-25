@@ -290,7 +290,7 @@ fn files_missing_reports_all_or_chunks_and_bounds_the_query() {
 }
 
 #[test]
-fn files_missing_assembles_a_partial_whose_chunks_are_all_present() {
+fn files_missing_reports_the_last_chunk_of_an_unassembled_partial_without_writing() {
     let fixture = fixture();
     // Every chunk is on disk but assembly never ran, as after a crash during assembly: the
     // last chunk is placed by hand where `file.put` would have put it.
@@ -329,19 +329,46 @@ fn files_missing_assembles_a_partial_whose_chunks_are_all_present() {
     )
     .unwrap();
 
+    // `files.missing` is a query: it reports the last chunk so that re-sending it finishes
+    // the upload, and it changes nothing.
     let missing = fixture
         .store
         .missing(&[good_sha.clone(), wrong_sha.clone()])
         .unwrap();
-    assert_eq!(missing, vec![(wrong_sha.clone(), Missing::All)]);
+    assert_eq!(
+        missing,
+        vec![
+            (good_sha.clone(), Missing::Chunks(vec![1])),
+            (wrong_sha.clone(), Missing::Chunks(vec![1])),
+        ]
+    );
+    assert!(fixture.partial(&good_sha));
+    assert!(!fixture.complete(&good_sha));
+    assert!(fixture.partial(&wrong_sha));
+
+    // Re-sending the reported chunk assembles and promotes a partial that verifies.
+    assert!(
+        fixture
+            .store
+            .put_chunk(&good_sha, good.len() as u64, 1, 2, chunk(&good, 1))
+            .unwrap()
+    );
     assert!(fixture.complete(&good_sha));
     assert!(!fixture.partial(&good_sha));
-    assert!(!fixture.complete(&wrong_sha));
-    assert!(!fixture.partial(&wrong_sha));
     assert_eq!(
         fixture.store.read_chunk(&good_sha, 1).unwrap().0,
         chunk(&good, 1)
     );
+
+    // Re-sending the chunk of a partial that does not verify discards it.
+    assert!(matches!(
+        fixture
+            .store
+            .put_chunk(&wrong_sha, wrong.len() as u64, 1, 2, chunk(&wrong, 1)),
+        Err(ExhibitsError::ContentMismatch)
+    ));
+    assert!(!fixture.complete(&wrong_sha));
+    assert!(!fixture.partial(&wrong_sha));
     assert_eq!(
         fixture
             .store
