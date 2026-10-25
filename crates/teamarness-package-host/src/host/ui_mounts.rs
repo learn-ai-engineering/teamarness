@@ -42,10 +42,7 @@ impl PackageHost {
             .await
             .map_err(|failure| instance_error(failure, &input.instance))?;
         let ui = self
-            .inner
-            .admitted_ui
-            .get(&input.instance.package_identity)
-            .cloned()
+            .admitted_ui(&input.instance.package_identity)
             .ok_or_else(|| host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui))?;
         let token =
             random_resource_token().map_err(|code| host_error(code, PackageErrorStage::Ui))?;

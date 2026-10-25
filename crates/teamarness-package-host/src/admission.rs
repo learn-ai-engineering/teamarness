@@ -19,6 +19,12 @@ pub(crate) struct AdmissionReport {
     pub(crate) admissions: Vec<Admission>,
     pub(crate) graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
     pub(crate) catalog: Vec<crate::AuthoringCatalogEntry>,
+    /// The tier of every admitted Package and of every authoring catalog entry.
+    pub(crate) tiers: BTreeMap<PackageIdentity, PackageTier>,
+    /// Contract identity to the Provider the Team tier selected.
+    pub(crate) team_providers: BTreeMap<String, PackageIdentity>,
+    /// Contract identity to the Provider the Personal tier selected.
+    pub(crate) personal_providers: BTreeMap<String, PackageIdentity>,
 }
 
 #[derive(Clone)]
@@ -46,7 +52,7 @@ pub(crate) enum AdmissionMode {
 }
 
 /// The installed graph's per-declaration availability, before generation grants exist.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortAvailability {
     pub contract: String,
@@ -280,6 +286,15 @@ pub(crate) fn admit_installation(
         &mut diagnostics,
     )?;
 
+    let mut tiers: BTreeMap<PackageIdentity, PackageTier> = BTreeMap::new();
+    for entry in &personal.catalog {
+        tiers.insert(entry.package.identity.clone(), PackageTier::Personal);
+    }
+    for entry in &team.catalog {
+        tiers.insert(entry.package.identity.clone(), PackageTier::Team);
+    }
+    let team_providers = team.providers.clone();
+    let personal_providers = personal.providers.clone();
     let mut graph = team.graph;
     graph.extend(personal.graph);
     let mut catalog = team.catalog;
@@ -352,7 +367,127 @@ pub(crate) fn admit_installation(
         admissions,
         graph,
         catalog,
+        tiers,
+        team_providers,
+        personal_providers,
     })
+}
+
+/// One Personal Package admitted against the running tiers.
+pub(crate) struct LiveAdmission {
+    pub(crate) entry: PackageCatalogEntry,
+    pub(crate) admission: Admission,
+    /// The Package's own consumed-Port routes.
+    pub(crate) graph: Vec<PortAvailability>,
+    /// The contracts it now provides.
+    pub(crate) providers: BTreeMap<String, PackageIdentity>,
+}
+
+/// The verdict of admitting one Personal registration while the Host runs.
+pub(crate) struct LiveVerdict {
+    /// The admitted Package, or the code that refused it.
+    pub(crate) result: Result<LiveAdmission, PackageErrorCode>,
+    /// Its authoring catalog entry, which a graph refusal keeps.
+    pub(crate) catalog: Option<crate::AuthoringCatalogEntry>,
+    /// Every diagnostic about the candidate.
+    pub(crate) diagnostics: Vec<PackageErrorEnvelope>,
+}
+
+/// Admits one Personal registration against the running Host (ADR 0031).
+///
+/// `running` holds every admitted Package except the candidate's own identity:
+/// the Team tier and the other running Personal Packages, with `providers`
+/// their selected Provider map. Every contract a running Package provides is
+/// reserved, so a candidate that claims one is refused with
+/// `port_provider_conflict`: a live operation never displaces a running
+/// Provider. A running Personal Package whose required Port has since become
+/// unavailable stays reserved but is not offered as a Provider.
+pub(crate) fn admit_live_personal(
+    config: &PackageHostConfig,
+    store: &HostStore,
+    running: &Eligible,
+    providers: &BTreeMap<String, PackageIdentity>,
+    registration: &InstallationRegistration,
+    mode: AdmissionMode,
+) -> Result<LiveVerdict, AdmissionFailure> {
+    let expected = PackageIdentity::from_str(&registration.expected_identity).ok();
+    let mut diagnostics = Vec::new();
+    let candidate = match load_installation(registration, config.target()) {
+        Ok(candidate) => candidate,
+        Err(code) => {
+            diagnostics.push(diagnostic(code, PackageErrorStage::Admission, expected));
+            return Ok(LiveVerdict {
+                result: Err(code),
+                catalog: None,
+                diagnostics,
+            });
+        }
+    };
+    let identity = candidate.manifest.identity.clone();
+    let view: View<'_> = running
+        .iter()
+        .map(|(identity, entry)| (identity.clone(), entry))
+        .collect();
+    let mut healthy: BTreeSet<_> = view.keys().cloned().collect();
+    settle_required(&view, providers, &mut healthy);
+    let graph = FixedGraph {
+        admitted: view
+            .into_iter()
+            .filter(|(identity, _)| healthy.contains(identity))
+            .collect(),
+        providers: providers
+            .iter()
+            .filter(|(_, provider)| healthy.contains(*provider))
+            .map(|(contract, provider)| (contract.clone(), provider.clone()))
+            .collect(),
+        reserved: running
+            .values()
+            .flat_map(|(_, admission)| provided_contracts(admission))
+            .collect(),
+    };
+    let mut outcome = admit_personal(
+        config,
+        store,
+        &graph,
+        vec![candidate],
+        mode,
+        &mut diagnostics,
+    )?;
+    let catalog = outcome.catalog.pop();
+    let result = match (
+        outcome.admitted.remove(&identity),
+        outcome.graph.remove(&identity),
+    ) {
+        (Some((entry, admission)), Some(graph)) => Ok(LiveAdmission {
+            entry,
+            admission,
+            graph,
+            providers: outcome.providers,
+        }),
+        _ => Err(diagnostics
+            .iter()
+            .rev()
+            .find(|error| error.affected_package.as_ref() == Some(&identity))
+            .map_or(PackageErrorCode::InvalidRegistration, |error| error.code)),
+    };
+    Ok(LiveVerdict {
+        result,
+        catalog,
+        diagnostics,
+    })
+}
+
+/// Resolves `consumed` against `providers`, where every Package in `admitted` is running.
+pub(crate) fn resolve_routes(
+    consumed: &[teamarness_package_contract::manifest::ConsumedContract],
+    providers: &BTreeMap<String, PackageIdentity>,
+    admitted: &View<'_>,
+) -> Vec<PortAvailability> {
+    let remaining: BTreeSet<_> = admitted.keys().cloned().collect();
+    consumed
+        .iter()
+        .map(|request| resolve(request, providers, admitted, &remaining))
+        .collect()
 }
 
 /// Admits the Team tier, selecting Providers among Team Packages only.
@@ -1128,7 +1263,7 @@ fn admission_digest(manifest: &LoadedManifest, source: PackageSourceKind) -> Str
     sha256(content.as_bytes())
 }
 
-fn diagnostic(
+pub(crate) fn diagnostic(
     code: PackageErrorCode,
     stage: PackageErrorStage,
     package: Option<PackageIdentity>,

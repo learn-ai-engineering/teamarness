@@ -39,9 +39,10 @@ use tokio::sync::{Mutex, watch};
 pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome, ReadUiResource,
-    ReconcileWorkspaces, RecoverPackage, ReportUiFault, ShutdownHost, SuspendPackage,
-    UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext,
+    InstallPersonal, OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome,
+    ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal, RemovePersonal,
+    ReportUiFault, ShutdownHost, SuspendPackage, UiLoaderDescriptor, UiPackageContext, UiRequest,
+    UiWorkspaceContext,
 };
 pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
@@ -95,15 +96,19 @@ struct PackageHostInner {
     revisions: watch::Sender<HostRevision>,
     config: PackageHostConfig,
     core: Arc<teamarness_core::CoreRuntime>,
+    // The Team tier, fixed at open and never changed while the Host runs (ADR 0031).
+    team: host::personal::TeamTier,
     templates: Vec<supervisor::ProcessTemplate>,
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
     authoring_catalog: Vec<AuthoringCatalogEntry>,
     port_graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
-    port_broker: Arc<broker::PortBroker>,
     port_contracts: BTreeMap<
         PackageIdentity,
         Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
     >,
+    /// The live Personal tier: its lock and its per-identity entries.
+    personal: host::personal::PersonalTier,
+    port_broker: Arc<broker::PortBroker>,
     reconciliation: Mutex<()>,
     mount_management: Mutex<()>,
 }
@@ -168,6 +173,8 @@ impl PackageHost {
                 entry.definitions = compiled.definitions.clone();
             }
         }
+        entries.extend(self.inner.personal.catalog());
+        entries.sort_by(|left, right| left.package.identity.cmp(&right.package.identity));
         entries
     }
 
@@ -241,6 +248,9 @@ impl PackageHost {
             }
             PackageHostCommand::ReportUiFault(input) => self.report_ui_fault(input).await,
             PackageHostCommand::ReadUiResource(input) => self.read_ui_resource(input).await,
+            PackageHostCommand::InstallPersonal(input) => self.install_personal(input).await,
+            PackageHostCommand::ReloadPersonal(input) => self.reload_personal(input).await,
+            PackageHostCommand::RemovePersonal(input) => self.remove_personal(input).await,
             PackageHostCommand::Shutdown(_) => self.shutdown_host().await,
         }
     }

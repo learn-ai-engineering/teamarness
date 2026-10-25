@@ -111,6 +111,32 @@ pub struct ReadUiResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownHost;
 
+/// Registers and admits a Personal Package while the Host runs (ADR 0031).
+///
+/// The directory must inspect as `expected_identity`, the risks must be exactly
+/// the `trusted_native_code_v1` set, and the identity must not belong to the
+/// Team tier: replacing a Team Package is an override, applied on restart. An
+/// already registered Personal identity is replaced by the new directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallPersonal {
+    pub directory: std::path::PathBuf,
+    pub expected_identity: PackageIdentity,
+    pub accepted_risks: Vec<String>,
+}
+
+/// Re-admits a registered Personal Package from its directory, after a rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadPersonal {
+    pub identity: PackageIdentity,
+}
+
+/// Stops a Personal Package and removes its registration. Its data is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovePersonal {
+    pub identity: PackageIdentity,
+}
+
 /// Complete closed command vocabulary for the operational Package Host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "input", rename_all = "snake_case")]
@@ -128,6 +154,9 @@ pub enum PackageHostCommand {
     CloseUiSubscription(CloseUiSubscription),
     ReportUiFault(ReportUiFault),
     ReadUiResource(ReadUiResource),
+    InstallPersonal(InstallPersonal),
+    ReloadPersonal(ReloadPersonal),
+    RemovePersonal(RemovePersonal),
     Shutdown(ShutdownHost),
 }
 
@@ -168,6 +197,15 @@ pub enum PackageHostOutcome {
     UiResource {
         bytes: Vec<u8>,
         media_type: String,
+    },
+    PersonalInstalled {
+        revision: HostRevision,
+    },
+    PersonalReloaded {
+        revision: HostRevision,
+    },
+    PersonalRemoved {
+        revision: HostRevision,
     },
     Shutdown,
 }

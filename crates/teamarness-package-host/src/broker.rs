@@ -1,5 +1,5 @@
 //! Installation-scoped, generation-limited routing for exact consumed Ports.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, Weak};
 
 use serde_json::{Map, Value, json};
@@ -35,10 +35,13 @@ pub(crate) struct PortBroker {
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) actor_pause: std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
-    graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    /// Callers whose entries were inserted at construction and are never changed:
+    /// the Team tier (ADR 0031).
+    fixed: BTreeSet<PackageIdentity>,
+    graph: RwLock<BTreeMap<PackageIdentity, Vec<PortAvailability>>>,
     observations: broadcast::Sender<PortObservation>,
-    consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
-    contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
+    consumed: RwLock<BTreeMap<PackageIdentity, Vec<ConsumedContract>>>,
+    contracts: RwLock<BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>>,
     instances: RwLock<BTreeMap<PackageInstanceKey, Weak<InstanceActor>>>,
     routes: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
@@ -56,10 +59,13 @@ pub(crate) struct RoutePermits {
 }
 
 impl PortBroker {
+    /// Builds the broker over every admitted Package. The entries of `fixed`
+    /// callers are never replaced or removed; every other caller's are.
     pub(crate) fn new(
         graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
         consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
         contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
+        fixed: BTreeSet<PackageIdentity>,
     ) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(feature = "test-hooks")]
@@ -67,10 +73,11 @@ impl PortBroker {
             #[cfg(feature = "test-hooks")]
             binding_pause: std::sync::Mutex::new(None),
             authority_generations: std::sync::Mutex::new(BTreeMap::new()),
-            graph,
+            fixed,
+            graph: RwLock::new(graph),
             observations: crate::port_observation::channel(),
-            consumed,
-            contracts,
+            consumed: RwLock::new(consumed),
+            contracts: RwLock::new(contracts),
             instances: RwLock::new(BTreeMap::new()),
             routes: Arc::new(Semaphore::new(ROUTES)),
             bytes: Arc::new(Semaphore::new(ROUTE_BYTES)),
@@ -154,6 +161,103 @@ impl PortBroker {
             .insert(key, Arc::downgrade(actor));
     }
 
+    /// Makes one Instance unreachable for new routes. A call that already
+    /// resolved it keeps its own reference and ends under the R14 rules.
+    pub(crate) fn unregister(&self, key: &PackageInstanceKey) {
+        debug_assert!(!self.fixed.contains(&key.package_identity));
+        self.instances
+            .write()
+            .expect("port registry poisoned")
+            .remove(key);
+    }
+
+    /// Adds or replaces one changeable caller's routes, consumed Ports, and provided contracts.
+    pub(crate) fn insert_caller(
+        &self,
+        caller: &PackageIdentity,
+        routes: Vec<PortAvailability>,
+        consumed: Vec<ConsumedContract>,
+        contracts: Option<Arc<CompiledPortContracts>>,
+    ) {
+        if self.fixed.contains(caller) {
+            debug_assert!(false, "a fixed caller's entries never change");
+            return;
+        }
+        self.graph
+            .write()
+            .expect("port graph poisoned")
+            .insert(caller.clone(), routes);
+        self.consumed
+            .write()
+            .expect("port graph poisoned")
+            .insert(caller.clone(), consumed);
+        let mut provided = self.contracts.write().expect("port graph poisoned");
+        match contracts {
+            Some(contracts) => {
+                provided.insert(caller.clone(), contracts);
+            }
+            None => {
+                provided.remove(caller);
+            }
+        }
+    }
+
+    /// Replaces one changeable caller's selected routes.
+    pub(crate) fn set_routes(&self, caller: &PackageIdentity, routes: Vec<PortAvailability>) {
+        if self.fixed.contains(caller) {
+            debug_assert!(false, "a fixed caller's routes never change");
+            return;
+        }
+        self.graph
+            .write()
+            .expect("port graph poisoned")
+            .insert(caller.clone(), routes);
+    }
+
+    /// Removes one changeable caller's entries, so new calls from or to it are refused.
+    pub(crate) fn remove_caller(&self, caller: &PackageIdentity) {
+        if self.fixed.contains(caller) {
+            debug_assert!(false, "a fixed caller's entries are never removed");
+            return;
+        }
+        self.graph
+            .write()
+            .expect("port graph poisoned")
+            .remove(caller);
+        self.consumed
+            .write()
+            .expect("port graph poisoned")
+            .remove(caller);
+        self.contracts
+            .write()
+            .expect("port graph poisoned")
+            .remove(caller);
+    }
+
+    /// One caller's consumed Ports with each selected route, read under the lock.
+    fn declared_routes(
+        &self,
+        caller: &PackageIdentity,
+    ) -> Vec<(ConsumedContract, PortAvailability)> {
+        let consumed = self.consumed.read().expect("port graph poisoned");
+        let graph = self.graph.read().expect("port graph poisoned");
+        consumed
+            .get(caller)
+            .into_iter()
+            .flatten()
+            .filter_map(|consumed| {
+                graph
+                    .get(caller)
+                    .and_then(|routes| {
+                        routes
+                            .iter()
+                            .find(|entry| entry.contract == consumed.identity)
+                    })
+                    .map(|route| (consumed.clone(), route.clone()))
+            })
+            .collect()
+    }
+
     /// Only declared ports occur in this view; an optional absence has no callable route.
     pub(crate) async fn availability(
         &self,
@@ -161,14 +265,7 @@ impl PortBroker {
         workspace: &WorkspaceId,
     ) -> Value {
         let mut entries = Vec::new();
-        for consumed in self.consumed.get(caller).into_iter().flatten() {
-            let Some(route) = self.graph.get(caller).and_then(|routes| {
-                routes
-                    .iter()
-                    .find(|entry| entry.contract == consumed.identity)
-            }) else {
-                continue;
-            };
+        for (consumed, route) in self.declared_routes(caller) {
             let available = if route.unavailable.is_none() {
                 let actor = route.provider.as_ref().and_then(|provider| {
                     self.instances
@@ -206,12 +303,10 @@ impl PortBroker {
         port: &str,
         kind: PortKind,
     ) -> Result<(Arc<InstanceActor>, Arc<CompiledPortContracts>, u16, u16), PackageErrorCode> {
-        let requested = self
-            .consumed
-            .get(caller)
+        let (requested, route) = self
+            .declared_routes(caller)
             .into_iter()
-            .flatten()
-            .find(|entry| entry.identity == contract)
+            .find(|(entry, _)| entry.identity == contract)
             .ok_or(PackageErrorCode::PortUngranted)?;
         if !requested
             .ports
@@ -220,13 +315,6 @@ impl PortBroker {
         {
             return Err(PackageErrorCode::PortUngranted);
         }
-        let route = self
-            .graph
-            .get(caller)
-            .into_iter()
-            .flatten()
-            .find(|entry| entry.contract == contract)
-            .ok_or(PackageErrorCode::PortUnavailable)?;
         if route.unavailable.is_some() {
             return Err(PackageErrorCode::PortUnavailable);
         }
@@ -246,6 +334,8 @@ impl PortBroker {
             .ok_or(PackageErrorCode::PortUnavailable)?;
         let schemas = self
             .contracts
+            .read()
+            .expect("port graph poisoned")
             .get(provider)
             .cloned()
             .ok_or(PackageErrorCode::PortUnavailable)?;
@@ -510,7 +600,12 @@ mod tests {
 
     #[test]
     fn optional_observer_lag_does_not_consume_route_capacity_or_copy_payload() {
-        let broker = PortBroker::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let broker = PortBroker::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
         let mut slow = broker.observe();
         let observation = PortObservation {
             kind: "command",
@@ -539,7 +634,12 @@ mod tests {
     // Verifies: TEAM.SYS.PKG-R14
     #[test]
     fn maximum_frame_and_aggregate_bytes_bound_routes_before_dispatch() {
-        let broker = PortBroker::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let broker = PortBroker::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
         assert!(matches!(
             broker.permit(&json!({"value":"x".repeat(MAX_FRAME_BYTES)})),
             Err(PackageErrorCode::PortRequestInvalid)

@@ -3,11 +3,11 @@ use std::str::FromStr;
 
 use teamarness_package_host::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    HostRevision, LifecycleState, MountState, OpenUiMount, OpenUiSubscription, PackageErrorCode,
-    PackageErrorEnvelope, PackageErrorStage, PackageHostCommand, PackageHostConfig,
-    PackageHostOutcome, PackageHostSnapshot, PackageHostState, PackageIdentity, ReadUiResource,
-    ReconcileWorkspaces, RecoverPackage, RecoveryAction, ReportUiFault, ShutdownHost,
-    SuspendPackage, UiRequest, UiResourceToken,
+    HostRevision, InstallPersonal, LifecycleState, MountState, OpenUiMount, OpenUiSubscription,
+    PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, PackageHostCommand,
+    PackageHostConfig, PackageHostOutcome, PackageHostSnapshot, PackageHostState, PackageIdentity,
+    ReadUiResource, ReconcileWorkspaces, RecoverPackage, RecoveryAction, ReloadPersonal,
+    RemovePersonal, ReportUiFault, ShutdownHost, SuspendPackage, UiRequest, UiResourceToken,
 };
 
 #[test]
@@ -91,9 +91,20 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
             relative_path: "ui/index.js".into(),
         }),
+        PackageHostCommand::InstallPersonal(InstallPersonal {
+            directory: PathBuf::from("/packages/reference"),
+            expected_identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
+            accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+        }),
+        PackageHostCommand::ReloadPersonal(ReloadPersonal {
+            identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
+        }),
+        PackageHostCommand::RemovePersonal(RemovePersonal {
+            identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
+        }),
         PackageHostCommand::Shutdown(ShutdownHost),
     ];
-    assert_eq!(commands.len(), 14);
+    assert_eq!(commands.len(), 17);
     for command in &commands {
         match command {
             PackageHostCommand::ReconcileWorkspaces(_)
@@ -109,6 +120,9 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostCommand::CloseUiSubscription(_)
             | PackageHostCommand::ReportUiFault(_)
             | PackageHostCommand::ReadUiResource(_)
+            | PackageHostCommand::InstallPersonal(_)
+            | PackageHostCommand::ReloadPersonal(_)
+            | PackageHostCommand::RemovePersonal(_)
             | PackageHostCommand::Shutdown(_) => {}
         }
     }
@@ -166,9 +180,18 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             bytes: vec![],
             media_type: "text/javascript".into(),
         },
+        PackageHostOutcome::PersonalInstalled {
+            revision: HostRevision::INITIAL,
+        },
+        PackageHostOutcome::PersonalReloaded {
+            revision: HostRevision::INITIAL,
+        },
+        PackageHostOutcome::PersonalRemoved {
+            revision: HostRevision::INITIAL,
+        },
         PackageHostOutcome::Shutdown,
     ];
-    assert_eq!(outcomes.len(), 14);
+    assert_eq!(outcomes.len(), 17);
     for outcome in &outcomes {
         match outcome {
             PackageHostOutcome::Reconciled { .. }
@@ -184,6 +207,9 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostOutcome::UiSubscriptionClosed
             | PackageHostOutcome::UiFaultRecorded { .. }
             | PackageHostOutcome::UiResource { .. }
+            | PackageHostOutcome::PersonalInstalled { .. }
+            | PackageHostOutcome::PersonalReloaded { .. }
+            | PackageHostOutcome::PersonalRemoved { .. }
             | PackageHostOutcome::Shutdown => {}
         }
     }

@@ -5,8 +5,10 @@
 //! [`crate::catalog`]. It refuses to rewrite a file that breaks the file policy
 //! or does not parse, so an entry a person wrote by hand is never lost. A write
 //! is committed only after a preflight admission, which writes no Host state,
-//! shows that the candidate would be admitted. These functions change the file
-//! only: a running Host admits the change when it next opens.
+//! shows that the candidate would be admitted. The public functions change the
+//! file only, and a running Host admits that change when it next opens. The
+//! Host's live Personal commands use the same store under the Personal tier
+//! lock (`crate::host::personal`).
 
 // Every Host operation returns the full, payload-free error envelope, as the Host facade does.
 #![allow(clippy::result_large_err)]
@@ -277,7 +279,7 @@ fn application_identities(config: &PackageHostConfig) -> BTreeSet<PackageIdentit
 }
 
 /// The current entries. A missing file has none; a file the reader would refuse is an error.
-fn read_entries(
+pub(crate) fn read_entries(
     config: &PackageHostConfig,
 ) -> Result<Vec<InstallationEntry>, PackageErrorEnvelope> {
     catalog::read_installation_entries(config)
@@ -293,7 +295,7 @@ fn read_entries(
 
 /// Replaces the registration file atomically: a `0600` temporary file in the same
 /// `0700` directory, synced, renamed into place, then the directory synced.
-fn write_entries(
+pub(crate) fn write_entries(
     config: &PackageHostConfig,
     entries: &[InstallationEntry],
 ) -> Result<(), PackageErrorEnvelope> {
@@ -349,7 +351,7 @@ fn write_entries(
 }
 
 /// A registration-store refusal, with the recovery a person can take.
-fn refusal(
+pub(crate) fn refusal(
     code: PackageErrorCode,
     stage: PackageErrorStage,
     package: Option<PackageIdentity>,

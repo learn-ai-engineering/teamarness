@@ -9,9 +9,10 @@ use crate::errors::{
     PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, activation_error, host_error,
     instance_error,
 };
+use crate::host::personal;
 use crate::values::{
     HostRevision, PackageHostConfig, PackageHostState, PackageIdentity, PackageInstanceKey,
-    PackageSourceKind, PackageTrustKind, WorkspaceId,
+    PackageSourceKind, PackageTier, PackageTrustKind, WorkspaceId,
 };
 use crate::{
     DisposePackage, HostData, PackageHost, PackageHostInner, PackageHostOutcome,
@@ -23,11 +24,26 @@ use crate::{
 /// Instance may be activated for it.
 type BlockedInstances = BTreeSet<(String, String)>;
 
-/// The spawn templates and admitted UI bundles one admission report yields.
-type AdmittedPackages = (
-    Vec<supervisor::ProcessTemplate>,
-    BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
-);
+/// The admitted Packages of one admission report, divided by tier.
+struct AdmittedTiers {
+    team_templates: Vec<supervisor::ProcessTemplate>,
+    team_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
+    team_admitted: admission::Eligible,
+    personal: Vec<personal::PersonalPackage>,
+}
+
+/// The immutable Team tier fields of a new Host.
+struct Team {
+    tier: personal::TeamTier,
+    templates: Vec<supervisor::ProcessTemplate>,
+    admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
+    authoring_catalog: Vec<crate::AuthoringCatalogEntry>,
+    port_graph: BTreeMap<PackageIdentity, Vec<crate::PortAvailability>>,
+    port_contracts: BTreeMap<
+        PackageIdentity,
+        Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
+    >,
+}
 
 #[allow(clippy::result_large_err)]
 impl PackageHost {
@@ -56,7 +72,6 @@ impl PackageHost {
             })
             .collect();
         debug_assert_eq!(report.graph.len(), report.snapshot.packages.len());
-        let authoring_catalog = report.catalog.clone();
         let consumed = report
             .admissions
             .iter()
@@ -67,9 +82,25 @@ impl PackageHost {
                 )
             })
             .collect();
-        let port_broker =
-            broker::PortBroker::new(report.graph.clone(), consumed, port_contracts.clone());
-        let (templates, admitted_ui) = Self::build_process_templates(&config, &mut report)?;
+        let team_identities: BTreeSet<PackageIdentity> = report
+            .tiers
+            .iter()
+            .filter(|(_, tier)| **tier == PackageTier::Team)
+            .map(|(identity, _)| identity.clone())
+            .collect();
+        let port_broker = broker::PortBroker::new(
+            report.graph.clone(),
+            consumed,
+            port_contracts.clone(),
+            team_identities.clone(),
+        );
+        let tiers = Self::split_tiers(&config, &mut report, &team_identities)?;
+        let templates: Vec<_> = tiers
+            .team_templates
+            .iter()
+            .chain(tiers.personal.iter().map(|package| &package.template))
+            .cloned()
+            .collect();
         // One permit pool and one set of protocol bounds for every Package in
         // this Host.
         let calls = supervisor::CallEnvironment {
@@ -90,16 +121,37 @@ impl PackageHost {
             &port_broker,
         )
         .await?;
+        let (team_catalog, personal_catalog): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut report.catalog)
+                .into_iter()
+                .partition(|entry| team_identities.contains(&entry.package.identity));
+        let mut team_graph = std::mem::take(&mut report.graph);
+        team_graph.retain(|identity, _| team_identities.contains(identity));
+        let mut team_contracts = port_contracts;
+        team_contracts.retain(|identity, _| team_identities.contains(identity));
+        let personal = personal::PersonalTier::new(
+            tiers.personal,
+            std::mem::take(&mut report.personal_providers),
+            personal_catalog,
+        );
+        let team = personal::TeamTier {
+            admitted: tiers.team_admitted,
+            providers: std::mem::take(&mut report.team_providers),
+        };
         Ok(Self::assemble(
             config,
             core,
             store,
             calls,
-            templates,
-            admitted_ui,
-            authoring_catalog,
-            report.graph,
-            port_contracts,
+            Team {
+                tier: team,
+                templates: tiers.team_templates,
+                admitted_ui: tiers.team_ui,
+                authoring_catalog: team_catalog,
+                port_graph: team_graph,
+                port_contracts: team_contracts,
+            },
+            personal,
             port_broker,
             report.snapshot.packages,
             report.snapshot.diagnostics,
@@ -156,7 +208,7 @@ impl PackageHost {
             .collect())
     }
 
-    async fn list_core_workspaces(
+    pub(crate) async fn list_core_workspaces(
         core: &Arc<teamarness_core::CoreRuntime>,
     ) -> Result<Vec<teamarness_core::WorkspaceSummary>, PackageErrorEnvelope> {
         let listing = core.clone();
@@ -177,13 +229,19 @@ impl PackageHost {
     }
 
     /// Turns every admission into the process template its Instances are spawned
-    /// from, paired with the admitted UI bundle the mounts serve.
-    fn build_process_templates(
+    /// from, and divides the admitted Packages between the immutable Team tier
+    /// and the live Personal tier.
+    fn split_tiers(
         config: &PackageHostConfig,
         report: &mut admission::AdmissionReport,
-    ) -> Result<AdmittedPackages, PackageErrorEnvelope> {
-        let mut templates = Vec::new();
-        let mut admitted_ui = BTreeMap::new();
+        team: &BTreeSet<PackageIdentity>,
+    ) -> Result<AdmittedTiers, PackageErrorEnvelope> {
+        let mut tiers = AdmittedTiers {
+            team_templates: Vec::new(),
+            team_ui: BTreeMap::new(),
+            team_admitted: BTreeMap::new(),
+            personal: Vec::new(),
+        };
         for admission in std::mem::take(&mut report.admissions) {
             debug_assert!(
                 report
@@ -203,45 +261,24 @@ impl PackageHost {
                         PackageErrorCode::InvalidRegistration,
                         PackageErrorStage::Admission,
                     )
-                })?;
-            let source_label = match catalog.source {
-                PackageSourceKind::Bundled => "bundled",
-                PackageSourceKind::Local => "local",
-            };
-            let trust_label = match catalog.trust {
-                PackageTrustKind::ApplicationBundled => "application_bundled",
-                PackageTrustKind::TrustedNativeCodeV1 => "trusted_native_code_v1",
-            };
-            admitted_ui.insert(admission.manifest.identity.clone(), admission.ui.clone());
-            templates.push(supervisor::ProcessTemplate {
-                package_identity: admission.manifest.identity.clone(),
-                package_version: admission.manifest.version.to_string(),
-                manifest_digest: admission.manifest.manifest_digest.clone(),
-                backend_digest: admission.manifest.backend.digest.clone(),
-                ui_contract_digest: admission.manifest.ui.contract.digest.clone(),
-                backend_path: admission.backend_path,
-                private_data_directory: config.private_data_directory().to_owned(),
-                source_label: source_label.to_owned(),
-                trust_label: trust_label.to_owned(),
-                protocol: (
-                    admission.manifest.protocol.major,
-                    admission.manifest.protocol.max_minor,
-                ),
-                activation: admission.manifest.activation,
-                capabilities: admission
-                    .manifest
-                    .capabilities
-                    .iter()
-                    .map(|requirement| capability::CapabilityRequirement {
-                        family: requirement.family.clone(),
-                        major: requirement.major,
-                        min_minor: requirement.min_minor,
-                        max_minor: requirement.max_minor,
-                    })
-                    .collect(),
-            });
+                })?
+                .clone();
+            let identity = admission.manifest.identity.clone();
+            let template = process_template(config, &catalog, &admission);
+            if team.contains(&identity) {
+                tiers.team_templates.push(template);
+                tiers.team_ui.insert(identity.clone(), admission.ui.clone());
+                tiers.team_admitted.insert(identity, (catalog, admission));
+            } else {
+                let routes = report.graph.get(&identity).cloned().unwrap_or_default();
+                tiers.personal.push(personal::PersonalPackage {
+                    admitted: (catalog, admission),
+                    template,
+                    routes,
+                });
+            }
         }
-        Ok((templates, admitted_ui))
+        Ok(tiers)
     }
 
     /// The eager activation loop that runs before the Host exists. It skips a
@@ -278,7 +315,7 @@ impl PackageHost {
                     continue;
                 }
                 let (key, actor) =
-                    prepare_instance(config, core, calls, store, template, workspace, broker)
+                    prepare_instance(config, core, calls, store, template, workspace, broker, 0)
                         .await?;
                 broker.register(key.clone(), &actor);
                 instances.insert(key, actor);
@@ -306,14 +343,8 @@ impl PackageHost {
         core: Arc<teamarness_core::CoreRuntime>,
         store: host_store::HostStoreHandle,
         calls: supervisor::CallEnvironment,
-        templates: Vec<supervisor::ProcessTemplate>,
-        admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
-        authoring_catalog: Vec<crate::AuthoringCatalogEntry>,
-        port_graph: BTreeMap<PackageIdentity, Vec<crate::PortAvailability>>,
-        port_contracts: BTreeMap<
-            PackageIdentity,
-            Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
-        >,
+        team: Team,
+        personal: personal::PersonalTier,
         port_broker: Arc<broker::PortBroker>,
         packages: Vec<crate::PackageCatalogEntry>,
         diagnostics: Vec<PackageErrorEnvelope>,
@@ -339,11 +370,13 @@ impl PackageHost {
                 revisions,
                 config,
                 core,
-                templates,
-                admitted_ui,
-                authoring_catalog,
-                port_graph,
-                port_contracts,
+                team: team.tier,
+                templates: team.templates,
+                admitted_ui: team.admitted_ui,
+                authoring_catalog: team.authoring_catalog,
+                port_graph: team.port_graph,
+                port_contracts: team.port_contracts,
+                personal,
                 port_broker,
                 reconciliation: Mutex::new(()),
                 mount_management: Mutex::new(()),
@@ -353,14 +386,25 @@ impl PackageHost {
 
     /// Activates every admitted Package for every Workspace Core now lists, and
     /// leaves every existing Instance alone.
+    ///
+    /// It holds the Personal tier lock, so it sees either all or none of a live
+    /// Personal operation and never creates a second Instance for a key.
     pub(crate) async fn reconcile_workspaces(
         &self,
         _input: ReconcileWorkspaces,
     ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
+        let tier = self.inner.personal.lock().await;
         let _gate = self.inner.reconciliation.lock().await;
         let workspaces = Self::list_core_workspaces(&self.inner.core).await?;
+        let templates: Vec<_> = self
+            .inner
+            .templates
+            .iter()
+            .cloned()
+            .chain(self.inner.personal.templates())
+            .collect();
         let mut eager = Vec::new();
-        for template in &self.inner.templates {
+        for template in &templates {
             for workspace in &workspaces {
                 let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
                     host_error(
@@ -380,6 +424,7 @@ impl PackageHost {
                     template,
                     workspace,
                     &self.inner.port_broker,
+                    tier.last_generation(&key),
                 )
                 .await?;
                 self.inner.port_broker.register(key.clone(), &actor);
@@ -448,6 +493,9 @@ impl PackageHost {
     }
 
     pub(crate) async fn shutdown_host(&self) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
+        // A Personal operation or reconciliation that is creating Instances
+        // finishes first, so every Instance it creates is shut down below.
+        let _tier = self.inner.personal.lock().await;
         {
             let mut data = self.inner.data.lock().await;
             data.state = PackageHostState::ShuttingDown;
@@ -515,7 +563,51 @@ impl PackageHost {
     }
 }
 
+/// The spawn template for one admitted Package.
+pub(crate) fn process_template(
+    config: &PackageHostConfig,
+    catalog: &crate::PackageCatalogEntry,
+    admission: &admission::Admission,
+) -> supervisor::ProcessTemplate {
+    let source_label = match catalog.source {
+        PackageSourceKind::Bundled => "bundled",
+        PackageSourceKind::Local => "local",
+    };
+    let trust_label = match catalog.trust {
+        PackageTrustKind::ApplicationBundled => "application_bundled",
+        PackageTrustKind::TrustedNativeCodeV1 => "trusted_native_code_v1",
+    };
+    supervisor::ProcessTemplate {
+        package_identity: admission.manifest.identity.clone(),
+        package_version: admission.manifest.version.to_string(),
+        manifest_digest: admission.manifest.manifest_digest.clone(),
+        backend_digest: admission.manifest.backend.digest.clone(),
+        ui_contract_digest: admission.manifest.ui.contract.digest.clone(),
+        backend_path: admission.backend_path.clone(),
+        private_data_directory: config.private_data_directory().to_owned(),
+        source_label: source_label.to_owned(),
+        trust_label: trust_label.to_owned(),
+        protocol: (
+            admission.manifest.protocol.major,
+            admission.manifest.protocol.max_minor,
+        ),
+        activation: admission.manifest.activation,
+        capabilities: admission
+            .manifest
+            .capabilities
+            .iter()
+            .map(|requirement| capability::CapabilityRequirement {
+                family: requirement.family.clone(),
+                major: requirement.major,
+                min_minor: requirement.min_minor,
+                max_minor: requirement.max_minor,
+            })
+            .collect(),
+    }
+}
+
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_instance(
     config: &PackageHostConfig,
     core: &Arc<teamarness_core::CoreRuntime>,
@@ -524,6 +616,7 @@ pub(crate) async fn prepare_instance(
     template: &supervisor::ProcessTemplate,
     workspace: &teamarness_core::WorkspaceSummary,
     broker: &Arc<broker::PortBroker>,
+    initial_generation: u64,
 ) -> Result<(PackageInstanceKey, Arc<instance::InstanceActor>), PackageErrorEnvelope> {
     let workspace_id = WorkspaceId::new(workspace.id().to_string()).map_err(|_| {
         host_error(
@@ -564,6 +657,6 @@ pub(crate) async fn prepare_instance(
     };
     Ok((
         key.clone(),
-        Arc::new(instance::InstanceActor::new(key, spec)),
+        Arc::new(instance::InstanceActor::new(key, spec, initial_generation)),
     ))
 }

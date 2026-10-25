@@ -2136,8 +2136,12 @@ mod tests {
             package.clone(),
             WorkspaceId::new(workspace.id().to_string()).unwrap(),
         );
-        let broker =
-            crate::broker::PortBroker::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let broker = crate::broker::PortBroker::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+        );
         let scope = CapabilityScope {
             package_identity: package.clone(),
             workspace_id: key.workspace_id.clone(),

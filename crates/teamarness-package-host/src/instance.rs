@@ -22,6 +22,10 @@ use crate::{
 pub(crate) struct InstanceActor {
     key: PackageInstanceKey,
     spec: ProcessSpec,
+    /// The process generation this actor started from. A re-admitted Package
+    /// continues from its previous actor's generation, so generation guards stay
+    /// monotonic for the Host's lifetime.
+    initial_generation: u64,
     state: Mutex<InstanceState>,
     lifecycle_gate: Mutex<()>,
 }
@@ -53,13 +57,15 @@ struct SubscriptionState {
 }
 
 impl InstanceActor {
-    pub(crate) fn new(key: PackageInstanceKey, spec: ProcessSpec) -> Self {
+    /// An actor whose first process generation is `initial_generation + 1`.
+    pub(crate) fn new(key: PackageInstanceKey, spec: ProcessSpec, initial_generation: u64) -> Self {
         Self {
             key,
             spec,
+            initial_generation,
             state: Mutex::new(InstanceState {
                 lifecycle: LifecycleState::Admitted,
-                generation: 0,
+                generation: initial_generation,
                 process: None,
                 append_fence: None,
                 failures: VecDeque::new(),
@@ -119,7 +125,7 @@ impl InstanceActor {
                 }
                 state.generation += 1;
                 state.append_fence = Some(append_fence.clone());
-                state.lifecycle = if recovering || state.generation > 1 {
+                state.lifecycle = if recovering || state.generation > self.initial_generation + 1 {
                     LifecycleState::Recovering
                 } else {
                     LifecycleState::Activating
@@ -129,7 +135,7 @@ impl InstanceActor {
             match supervisor::spawn(
                 &self.spec,
                 generation,
-                recovering || generation > 1,
+                recovering || generation > self.initial_generation + 1,
                 append_fence,
             )
             .await
@@ -183,7 +189,8 @@ impl InstanceActor {
         PackageInstanceSnapshot {
             key: self.key.clone(),
             lifecycle: state.lifecycle,
-            process_generation: (state.generation > 0).then_some(state.generation),
+            process_generation: (state.generation > self.initial_generation)
+                .then_some(state.generation),
             mount_state: state
                 .mounts
                 .values()
@@ -277,6 +284,39 @@ impl InstanceActor {
             LifecycleState::Disposed => Err(WireFailure::new(PackageErrorCode::Disposed)),
             _ => Err(WireFailure::new(PackageErrorCode::InvalidLifecycleState)),
         }
+    }
+
+    /// Replaces a running or failed process with a new generation, so the
+    /// Package starts again over its current Port routes. An Instance that never
+    /// started, is suspended, or has ended is left alone: it reads the current
+    /// routes whenever it next starts.
+    pub(crate) async fn restart(self: &Arc<Self>) -> Result<(), WireFailure> {
+        let _gate = self.lifecycle_gate.lock().await;
+        let process = {
+            let mut state = self.state.lock().await;
+            if !matches!(
+                state.lifecycle,
+                LifecycleState::Active | LifecycleState::Failed | LifecycleState::CrashLoop
+            ) || state.shutting_down
+            {
+                return Ok(());
+            }
+            // The failure monitor sees a different generation and leaves the exit alone.
+            let process = state.process.clone();
+            clear_process_state(&mut state);
+            state.failures.clear();
+            state.lifecycle = LifecycleState::Recovering;
+            process
+        };
+        if let Some(process) = process {
+            process.shutdown().await;
+        }
+        self.start_generation(true, false).await
+    }
+
+    /// The process generation the newest spawn used, or the seed before any spawn.
+    pub(crate) async fn generation(&self) -> u64 {
+        self.state.lock().await.generation
     }
 
     pub(crate) async fn dispose(&self) -> Result<(), WireFailure> {
