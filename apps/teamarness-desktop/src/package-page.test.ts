@@ -8,7 +8,8 @@ import type {
   PackageRegistration,
 } from "./package-contracts";
 import { PackageManagementController, REMOVE_KEEPS_DATA_COPY } from "./package-install";
-import { buildPackagePagePresentation, PackagePageController, type PackagePageTarget } from "./package-page";
+import { buildPackagePagePresentation, PackagePageController, type PackagePageTab, type PackagePageTarget } from "./package-page";
+import { STATUS_MESSAGE_HIDE_MS, type StatusMessageTimers } from "./status-message";
 
 const WORKSPACE = "00112233445566778899aabbccddeeff";
 const OTHER_WORKSPACE = "ffeeddccbbaa99887766554433221100";
@@ -113,11 +114,34 @@ const catalog: readonly PackageAuthoringEntry[] = [
 
 type Behavior = Partial<Pick<PackageManagementBridge, "authoringCatalog" | "restartPackage" | "remove" | "reload">>;
 
+/** A clock the test advances by hand, so message timing needs no waiting. */
+function manualTimers(): StatusMessageTimers & { advance(ms: number): void } {
+  let now = 0;
+  let nextHandle = 1;
+  const scheduled = new Map<number, Readonly<{ at: number; callback: () => void }>>();
+  return {
+    setTimeout: (callback, ms) => {
+      const handle = nextHandle++;
+      scheduled.set(handle, { at: now + ms, callback });
+      return handle;
+    },
+    clearTimeout: (handle) => { scheduled.delete(handle as number); },
+    advance: (ms) => {
+      now += ms;
+      for (const [handle, timer] of [...scheduled]) {
+        if (timer.at > now) continue;
+        scheduled.delete(handle);
+        timer.callback();
+      }
+    },
+  };
+}
+
 function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior = {}) {
   const calls: string[] = [];
   let latest = current;
   const removed: PackagePageTarget[] = [];
-  const opened: string[] = [];
+  const timers = manualTimers();
   const bridge: PackageManagementBridge = {
     chooseDirectory: async () => null,
     inspectDirectory: async () => { throw new Error("unused"); },
@@ -133,7 +157,7 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
     changed: () => undefined,
     refresh: async () => { calls.push("refresh"); },
   };
-  const management = new PackageManagementController(bridge, hooks);
+  const management = new PackageManagementController(bridge, hooks, timers);
   const lifecycle = (name: string) => async (key: PackageInstanceKey) => { calls.push(`${name}:${key.packageIdentity}:${key.workspaceId}`); };
   const page = new PackagePageController(bridge, {
     suspend: lifecycle("suspend"),
@@ -143,20 +167,19 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
     ...hooks,
     removed: (target) => { removed.push(target); },
     copy: async (value) => { calls.push(`copy:${value}`); },
-    openView: (target, view) => { opened.push(`${target.packageIdentity}:${target.workspaceId}:${view}`); },
-  });
+  }, timers);
   return {
     page,
     management,
     calls,
     removed,
-    opened,
+    timers,
     setSnapshot: (value: PackageHostSnapshot) => { latest = value; },
     open: async (packageIdentity: string) => {
       page.open({ workspaceId: WORKSPACE, packageIdentity }, latest);
       await vi.waitFor(() => expect(page.render(latest)).not.toContain("Loading capabilities and Ports"));
     },
-    html: () => page.render(latest),
+    html: (tab?: PackagePageTab) => page.render(latest, tab),
     act: (action: string) => page.action(action, latest),
   };
 }
@@ -164,37 +187,73 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
 const actions = (html: string): string[] =>
   [...html.matchAll(/data-package-page-action="([a-z-]+)"/g)].map(([, action]) => action!);
 
-describe("Package page settings view", () => {
+/** The text between two markers, to check where something renders. */
+const between = (html: string, from: string, to: string): string => {
+  const start = html.indexOf(from);
+  return start < 0 ? "" : html.slice(start, html.indexOf(to, start));
+};
+
+describe("Package page layout", () => {
   const declaring = (packages: PackageHostSnapshot["packages"]): PackageHostSnapshot["packages"] =>
     packages.map((entry) => entry.identity === AGENT ? { ...entry, views: ["settings"] } : entry);
 
-  it("offers Open settings only when the Package declares a settings view", async () => {
-    const plain = harness();
-    await plain.open(AGENT);
-    expect(actions(plain.html())).not.toContain("open-settings");
-    await plain.act("open-settings");
-    expect(plain.opened).toEqual([]);
+  it("puts the kind label, name, and description first, then the tabs, the message area, and the About groups", async () => {
+    const test = harness();
+    await test.open(AGENT);
+    const html = test.html();
+    const order = [
+      '<p class="package-page-kind">Personal Package</p>',
+      '<h1 id="package-page-heading" class="package-page-title" tabindex="-1" data-package-page-focus>Agent</h1>',
+      '<p class="package-page-subtitle">Answers questions.</p>',
+      'role="tablist"',
+      'class="status-message-slot"',
+      'role="tabpanel" aria-labelledby="package-page-tab-about"',
+      ">Details</h2>",
+      ">Capabilities and Ports</h2>",
+      ">This Workspace</h2>",
+      ">Diagnostics</h2>",
+      ">Manage</h2>",
+    ].map((part) => html.indexOf(part));
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect([...order].sort((left, right) => left - right)).toEqual(order);
+    expect(html).not.toContain("screen-section");
+    expect(html).not.toContain("Back to");
+    expect(html).not.toContain("data-package-page-back");
+  });
 
+  it("offers only About for a Package that declares no settings view", async () => {
+    const test = harness();
+    await test.open(AGENT);
+    const html = test.html();
+    expect(html).toContain('role="tab" id="package-page-tab-about" aria-controls="package-page-panel-about" aria-selected="true" tabindex="0" data-package-page-tab="about">About</button>');
+    expect(html).not.toContain("Configuration");
+    // Asking for Configuration falls back to About.
+    expect(test.html("configuration")).toContain('role="tabpanel" aria-labelledby="package-page-tab-about"');
+  });
+
+  it("offers Configuration when the Package declares a settings view and runs in this Workspace", async () => {
     const current = snapshot();
     const test = harness(snapshot({ packages: declaring(current.packages) }));
     await test.open(AGENT);
-    const html = test.html();
-    expect(html).toContain('data-package-page-action="open-settings" aria-label="Open settings Agent">Open settings</button>');
-    expect(html.indexOf("open-settings")).toBeLessThan(html.indexOf("</header>"));
-    await test.act("open-settings");
-    expect(test.opened).toEqual([`${AGENT}:${WORKSPACE}:settings`]);
+    expect(test.html()).toContain('role="tab" id="package-page-tab-configuration" aria-controls="package-mount" aria-selected="false" tabindex="-1" data-package-page-tab="configuration">Configuration</button>');
+
+    // The Shell mounts the settings view below the tabs, so the page renders no About panel for it.
+    const configuration = test.html("configuration");
+    expect(configuration).toContain('aria-selected="true" tabindex="0" data-package-page-tab="configuration"');
+    expect(configuration).toContain('aria-selected="false" tabindex="-1" data-package-page-tab="about"');
+    expect(configuration).not.toContain('role="tabpanel"');
+    expect(configuration).not.toContain(">Details</h2>");
+    expect(configuration).toContain('class="status-message-slot"');
   });
 
-  it("does not offer settings for a Package that does not run in this Workspace", async () => {
+  it("does not offer Configuration for a Package that does not run in this Workspace", async () => {
     const current = snapshot();
     const test = harness(snapshot({
       packages: declaring(current.packages),
       instances: current.instances.filter(({ key }) => !(key.packageIdentity === AGENT && key.workspaceId === WORKSPACE)),
     }));
     await test.open(AGENT);
-    expect(actions(test.html())).not.toContain("open-settings");
-    await test.act("open-settings");
-    expect(test.opened).toEqual([]);
+    expect(test.html()).not.toContain("Configuration");
   });
 
   it("presents the settings view from the catalog entry", () => {
@@ -205,13 +264,78 @@ describe("Package page settings view", () => {
   });
 });
 
+describe("Package page messages", () => {
+  it("keeps the message area when nothing is shown", async () => {
+    const test = harness();
+    await test.open(AGENT);
+    expect(test.html()).toContain('<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>');
+  });
+
+  it("shows a success at the top and hides it after five seconds", async () => {
+    const test = harness();
+    await test.open(AGENT);
+    await test.act("pause");
+    const html = test.html();
+    expect(between(html, "status-message-slot", "role=\"tabpanel\"")).toContain('role="status" aria-live="polite"><p>Paused Agent.</p>');
+    expect(between(html, ">Manage</h2>", "</section>")).not.toContain("Paused Agent.");
+
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS - 1);
+    expect(test.html()).toContain("Paused Agent.");
+    test.timers.advance(1);
+    expect(test.html()).not.toContain("Paused Agent.");
+  });
+
+  it("hides a Reload result after five seconds", async () => {
+    const test = harness();
+    await test.open(AGENT);
+    await test.act("reload");
+    expect(test.html()).toContain("<p>Reloaded.</p>");
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS);
+    expect(test.html()).not.toContain("Reloaded.");
+  });
+
+  it("keeps an error until it is dismissed", async () => {
+    const test = harness(snapshot(), {
+      restartPackage: async () => { throw { code: "invalid_lifecycle_state" }; },
+    });
+    await test.open(AGENT);
+    await test.act("restart");
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS * 10);
+    const html = test.html();
+    expect(html).toContain('role="alert" aria-live="assertive"><p>This Package cannot do that in its current state.');
+    expect(actions(html)).toContain("dismiss-message");
+
+    await test.act("dismiss-message");
+    expect(test.html()).not.toContain("This Package cannot do that");
+    expect(test.html()).toContain('<div class="status-message" role="status" aria-live="polite"></div>');
+  });
+
+  it("replaces an error with the next action's result", async () => {
+    let fail = true;
+    const test = harness(snapshot(), {
+      reload: async (identity) => {
+        test.calls.push(`reload:${identity}`);
+        if (fail) throw { code: "artifact_changed" };
+        return { revision: 8, restartRequired: false };
+      },
+    });
+    await test.open(AGENT);
+    await test.act("reload");
+    expect(test.html()).toContain('role="alert" aria-live="assertive"><p>A file changed after the manifest was written.');
+    fail = false;
+    await test.act("reload");
+    expect(test.html()).not.toContain("A file changed");
+    expect(test.html()).toContain("<p>Reloaded.</p>");
+  });
+});
+
 describe("Package page", () => {
   it("renders a Team Package's About, trust, Ports, and Instance state without Personal controls", async () => {
     const test = harness();
     await test.open(TEAM);
     const html = test.html();
 
-    expect(html).toContain('<h1 id="package-page-heading" tabindex="-1" data-package-page-focus>Conversations</h1>');
+    expect(html).toContain('<h1 id="package-page-heading" class="package-page-title" tabindex="-1" data-package-page-focus>Conversations</h1>');
     expect(html).toContain("Team Package");
     expect(html).toContain("<dt>Version</dt><dd>1.4.0</dd>");
     expect(html).toContain("<dt>Author</dt><dd>Teamarness</dd>");
@@ -222,6 +346,12 @@ describe("Package page", () => {
     expect(html).toContain("teamarness.package-ports 1.0");
     expect(html).toContain("dev.teamarness.conversations 1.1 — Conversations");
     expect(html).toContain("<dt>Availability</dt><dd>Available</dd>");
+    expect(html).toContain('<p class="package-page-kind">Team Package</p>');
+    expect(html).toContain('<p class="package-page-subtitle">Talk with your team.</p>');
+    for (const heading of ["Details", "Capabilities and Ports", "This Workspace"]) expect(html).toContain(`>${heading}</h2>`);
+    // No diagnostics for this Package, and nothing to manage while it is healthy.
+    expect(html).not.toContain(">Diagnostics</h2>");
+    expect(html).not.toContain(">Manage</h2>");
     expect(actions(html)).toEqual(["copy-homepage"]);
   });
 
@@ -235,6 +365,7 @@ describe("Package page", () => {
 
     await test.act("recover");
     expect(test.calls.at(-1)).toBe(`recover:${TEAM}:${WORKSPACE}`);
+    expect(between(test.html(), ">Manage</h2>", "</section>")).toContain('data-package-page-action="recover"');
   });
 
   it("renders a Personal Package with its folder, trust, Ports availability, diagnostics, and controls", async () => {
@@ -250,10 +381,10 @@ describe("Package page", () => {
     expect(html).toContain("com.example.answers 1.2 — Answers for other Packages");
     expect(html).toContain("dev.teamarness.conversations 1.0–1.1<br><small>Available from Conversations, version 1.1</small>");
     expect(html).toContain("com.example.search 2.0 (optional)<br><small>Unavailable: A Port this Package requires is not available.</small>");
-    expect(html).toContain("<h3>Diagnostics</h3>");
+    expect(between(html, ">Diagnostics</h2>", ">Manage</h2>")).toContain("A Port this Package requires is not available.");
     expect(html).toContain("<dt>Process generation</dt><dd>3</dd>");
     expect(actions(html)).toEqual(["copy-homepage", "reload", "pause", "restart", "remove"]);
-    expect(html).toContain("its process keeps running until you Resume it");
+    expect(between(html, ">Manage</h2>", "</section>")).toContain("its process keeps running until you Resume it");
   });
 
   it("renders a manifest without optional metadata", async () => {
@@ -282,6 +413,8 @@ describe("Package page", () => {
     expect(html).toContain("<dt>Package folder</dt><dd>/Users/person/Packages/broken</dd>");
     expect(html).toContain("This Package is not running in this Workspace.");
     expect(html).toContain("Not available, because this Package is not admitted.");
+    expect(between(html, ">This Workspace</h2>", ">Manage</h2>")).toContain("It could not start:");
+    expect(html).toContain('<p class="package-page-kind">Personal Package</p>');
     expect(actions(html)).toEqual(["reload", "remove"]);
   });
 
@@ -338,7 +471,10 @@ describe("Package page", () => {
       remove: async (identity) => { test.calls.push(`remove:${identity}`); return { revision: null, restartRequired: true }; },
     });
     await test.open(TUTORIAL);
-    expect(test.html()).toContain("<dt>Source</dt><dd>Team, replaced on this device by an override</dd>");
+    expect(test.html()).toContain('<p class="package-page-kind">Team Package</p>');
+    expect(between(test.html(), ">Details</h2>", ">Capabilities and Ports</h2>"))
+      .toContain("<dt>Source</dt><dd>Team, replaced on this device by an override</dd>");
+    expect(between(test.html(), ">Manage</h2>", "</section>")).toContain(">Remove override</button>");
     expect(actions(test.html())).toEqual(["remove"]);
 
     await test.act("remove");
@@ -455,7 +591,7 @@ describe("Package page", () => {
     });
     await test.open(AGENT);
     await test.act("restart");
-    expect(test.html()).toContain('role="alert"><p>This Package cannot do that in its current state.');
+    expect(test.html()).toContain('role="alert" aria-live="assertive"><p>This Package cannot do that in its current state.');
   });
 
   it("copies the homepage as text", async () => {
@@ -492,6 +628,7 @@ describe("Package page", () => {
     const test = harness();
     test.page.open({ workspaceId: WORKSPACE, packageIdentity: "com.example.gone" }, snapshot());
     expect(test.html()).toContain("This Package is no longer installed on this device.");
-    expect(test.html()).toContain("data-package-page-back");
+    expect(test.html()).not.toContain("data-package-page-back");
+    expect(test.html()).not.toContain("Back to");
   });
 });

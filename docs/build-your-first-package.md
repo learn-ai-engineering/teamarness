@@ -356,7 +356,7 @@ For each change to Emojart:
 
 1. edit and test in the Emojart project;
 2. run `npm run build` to replace the Package Directory;
-3. open the Emojart Package page, for example with **About** beside Emojart in the sidebar; and
+3. open the Emojart Package page, for example by selecting Emojart in the **Package Instances** section of the Workspace page; and
 4. select **Reload**.
 
 Reload admits the new build in every Workspace and keeps Emojart's saved pieces. Teamarness keeps running. There is no hot reload: Teamarness does not watch the Package Directory, so a rebuild takes effect only when you select **Reload** or restart Teamarness.

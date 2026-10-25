@@ -14,6 +14,7 @@ import {
   REMOVE_KEEPS_DATA_COPY,
   TRUSTED_NATIVE_CODE_RISKS,
 } from "./package-install";
+import { STATUS_MESSAGE_HIDE_MS, type StatusMessageTimers } from "./status-message";
 
 const full: InspectedPackage = {
   directory: "/Users/person/Packages/agent",
@@ -72,6 +73,29 @@ function snapshot(
 
 type Call = readonly [string, unknown?];
 
+/** A clock the test advances by hand, so message timing needs no waiting. */
+function manualTimers(): StatusMessageTimers & { advance(ms: number): void } {
+  let now = 0;
+  let nextHandle = 1;
+  const scheduled = new Map<number, Readonly<{ at: number; callback: () => void }>>();
+  return {
+    setTimeout: (callback, ms) => {
+      const handle = nextHandle++;
+      scheduled.set(handle, { at: now + ms, callback });
+      return handle;
+    },
+    clearTimeout: (handle) => { scheduled.delete(handle as number); },
+    advance: (ms) => {
+      now += ms;
+      for (const [handle, timer] of [...scheduled]) {
+        if (timer.at > now) continue;
+        scheduled.delete(handle);
+        timer.callback();
+      }
+    },
+  };
+}
+
 function harness(behavior: Partial<PackageManagementBridge> & { inspected?: InspectedPackage } = {}) {
   const calls: Call[] = [];
   let renders = 0;
@@ -97,12 +121,14 @@ function harness(behavior: Partial<PackageManagementBridge> & { inspected?: Insp
     restartPackage: async () => { calls.push(["restart-package"]); },
     authoringCatalog: async () => [],
   };
+  const timers = manualTimers();
   const controller = new PackageManagementController(bridge, {
     changed: () => { renders += 1; },
     refresh: async () => { refreshes += 1; },
-  });
+  }, timers);
   return {
     controller,
+    timers,
     calls,
     names: () => calls.map(([name]) => name),
     renders: () => renders,
@@ -358,19 +384,21 @@ describe("registrations that need attention", () => {
     await test.controller.registrationAction("confirm-remove", refused.expectedIdentity);
     expect(test.calls).toEqual([["remove", refused.expectedIdentity]]);
     expect(test.refreshes()).toBe(1);
-    // The row is gone from the next snapshot; its result stays visible.
-    const after = test.controller.renderRegistrations(snapshot([]));
-    expect(after).toContain("Removed. Its data stays on this device");
-    expect(after).toContain('role="status"');
+    // The row is gone from the next snapshot; its result shows at the top of the section, named.
+    expect(test.controller.renderRegistrations(snapshot([]))).toBe("");
+    const after = test.controller.renderMessage(snapshot([]));
+    expect(after).toContain("<p>com.example.broken: Removed. Its data stays on this device");
+    expect(after).toContain('role="status" aria-live="polite"');
   });
 
   it("reloads a refused registration and reports a new refusal readably", async () => {
     const test = harness({ reload: async () => { throw { code: "artifact_missing" }; } });
     await test.controller.registrationAction("reload", refused.expectedIdentity);
     expect(test.refreshes()).toBe(1);
-    const html = test.controller.renderRegistrations(snapshot([refused]));
-    expect(html).toContain('role="alert"');
-    expect(html).toContain("A file the manifest lists is missing. Rebuild the Package.");
+    expect(test.controller.renderRegistrations(snapshot([refused]))).not.toContain('role="alert"');
+    const html = test.controller.renderMessage(snapshot([refused]));
+    expect(html).toContain('role="alert" aria-live="assertive"');
+    expect(html).toContain("com.example.broken: A file the manifest lists is missing. Rebuild the Package.");
   });
 
   it("offers Remove override, not Reload, for a Team Package override and then a restart", async () => {
@@ -386,10 +414,10 @@ describe("registrations that need attention", () => {
     expect(test.controller.renderRegistrations(running))
       .toContain("Remove the override? Tutorial returns to the Team Package after Teamarness restarts. Data is kept.");
     await test.controller.registrationAction("confirm-remove", override.expectedIdentity, running);
-    const after = test.controller.renderRegistrations(running);
-    expect(after).toContain("Restart Teamarness to use the Team Package again.");
-    expect(after).toContain('data-package-registration-action="restart"');
-    await test.controller.registrationAction("restart", override.expectedIdentity);
+    const after = test.controller.renderMessage(running);
+    expect(after).toContain("Tutorial: Removed from this device. Restart Teamarness to use the Team Package again.");
+    expect(after).toContain("data-package-change-restart");
+    await test.controller.restartAfterChange();
     expect(test.names().at(-1)).toBe("restart");
   });
 
@@ -428,8 +456,8 @@ describe("registrations that need attention", () => {
     await test.controller.registrationAction("remove", written.expectedIdentity, snapshot([written]));
     await test.controller.registrationAction("confirm-remove", written.expectedIdentity, snapshot([written]));
     expect(test.calls).toEqual([["remove", written.expectedIdentity]]);
-    // The row leaves the snapshot; its result stays visible for the section.
-    const after = test.controller.renderRegistrations(snapshot([]));
+    // The row leaves the snapshot; its result shows at the top of the section.
+    const after = test.controller.renderMessage(snapshot([]));
     expect(after).toContain("The override is cancelled. The Team Package keeps running.");
     expect(after).not.toContain("installing it again resumes");
     expect(after).not.toContain("data-package-change-restart");
@@ -439,7 +467,7 @@ describe("registrations that need attention", () => {
     const test = harness();
     await test.controller.registrationAction("remove", "com.example.broken", snapshot([refused]));
     await test.controller.registrationAction("confirm-remove", "com.example.broken", snapshot([refused]));
-    expect(test.controller.renderRegistrations(snapshot([]))).toContain(`Removed. ${REMOVE_KEEPS_DATA_COPY}`);
+    expect(test.controller.renderMessage(snapshot([]))).toContain(`Removed. ${REMOVE_KEEPS_DATA_COPY}`);
   });
 
   it("re-reads the snapshot after an override is written, so it shows as pending", async () => {
@@ -478,10 +506,65 @@ describe("registrations that need attention", () => {
     expect(test.calls).toEqual([["remove", identity]]);
     const after = test.controller.renderRegistrations(snapshot([{ ...handWritten, status: { kind: "pending_restart", change: "removed" } }], null));
     expect(after).toContain(`Applies after restart: removed from this device. The Team Package ${identity} returns when Teamarness restarts.`);
-    // The pending note replaces both the "stays unavailable" line and the success feedback.
+    // The pending note replaces both the "stays unavailable" line and the success message.
     expect(after).not.toContain("stays unavailable");
-    expect(after).not.toContain("Removed from this device. Restart Teamarness to use the Team Package again.");
+    expect(test.controller.renderMessage(snapshot([{ ...handWritten, status: { kind: "pending_restart", change: "removed" } }], null)))
+      .not.toContain("Removed from this device. Restart Teamarness to use the Team Package again.");
     expect(after.match(/data-package-registration-action="restart"/g)).toHaveLength(1);
     expect(after).not.toContain('data-package-registration-action="remove"');
+  });
+});
+
+describe("the Packages section message area", () => {
+  const refused: PackageRegistration = {
+    directory: "/Users/person/Packages/broken",
+    expectedIdentity: "com.example.broken",
+    override: false,
+    tier: "personal",
+    status: { kind: "refused", code: "artifact_changed" },
+  };
+
+  it("keeps its space when there is no message", () => {
+    const test = harness();
+    expect(test.controller.renderMessage(snapshot([refused])))
+      .toBe('<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>');
+  });
+
+  it("hides a success after five seconds and renders again", async () => {
+    const test = harness();
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    expect(test.controller.renderMessage(snapshot([refused]))).toContain("com.example.broken: Reloaded.");
+    const renders = test.renders();
+
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS - 1);
+    expect(test.controller.renderMessage(snapshot([refused]))).toContain("Reloaded.");
+    test.timers.advance(1);
+    expect(test.controller.renderMessage(snapshot([refused]))).not.toContain("Reloaded.");
+    expect(test.renders()).toBe(renders + 1);
+  });
+
+  it("keeps an error until it is dismissed, or until the next action replaces it", async () => {
+    let fail = true;
+    const test = harness({
+      reload: async () => {
+        if (fail) throw { code: "artifact_missing" };
+        return { revision: 6, restartRequired: false };
+      },
+    });
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS * 10);
+    const error = test.controller.renderMessage(snapshot([refused]));
+    expect(error).toContain("A file the manifest lists is missing.");
+    expect(error).toContain('data-package-message-dismiss aria-label="Dismiss message"');
+
+    test.controller.dismissMessage();
+    expect(test.controller.renderMessage(snapshot([refused]))).not.toContain("A file the manifest lists is missing.");
+
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    fail = false;
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    const replaced = test.controller.renderMessage(snapshot([refused]));
+    expect(replaced).not.toContain("A file the manifest lists is missing.");
+    expect(replaced).toContain("Reloaded.");
   });
 });

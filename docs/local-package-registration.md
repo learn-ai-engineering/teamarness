@@ -27,10 +27,21 @@ If Teamarness refuses the folder, nothing is registered. The Shell names the fai
 Every Package has a Package page. To open it, do one of these:
 
 - Select the Package name in the **Package Instances** section of the Workspace page.
-- Select **About** (the information button) beside the Package in the sidebar. The sidebar Package button itself still opens the Package UI.
 - Select the Package name in **Needs attention on this device**.
 
-The page shows the name, Package Identity, version, description, author, homepage, source, trust, declared capabilities, provided Ports, and consumed Ports with their availability. A Personal Package page also shows the Package folder and the Instance state in this Workspace.
+The sidebar shows each Package as its name and its status, for example "Available". Selecting a Package in the sidebar opens its Package UI, not its Package page.
+
+The page starts with a header: the kind of Package ("Team Package" or "Personal Package"), the Package name, and its description. Below the header are the **About** tab and, when the Package declares a settings view, the **Configuration** tab. The page has no back button. Use the sidebar or the Workspace settings button to leave it.
+
+The **About** tab has these groups:
+
+- **Details:** Package Identity, version, author, homepage, source, trust, and, for a Personal Package, the Package folder.
+- **Capabilities and Ports:** declared capabilities, provided Ports, and consumed Ports with their availability.
+- **This Workspace:** the Instance state in this Workspace, or why the registration could not start.
+- **Diagnostics:** shown only when the Package Host reported a diagnostic for the Package.
+- **Manage:** the controls this Package allows.
+
+Results of these controls appear in a message area at the top of the page, below the tabs. A success message hides after 5 seconds. An error stays until you select **Dismiss** or take the next action. The **Package Instances** section of the Workspace page shows the results of **Reload** and **Remove** in the same way.
 
 A Personal Package page has these controls:
 
@@ -44,7 +55,7 @@ A Personal Package page has these controls:
 
 A Team Package page shows the same information but no Personal controls. It offers **Recover Backend** and **Dispose** only when the Instance needs recovery.
 
-If the Package declares a settings view, the page shows **Open settings**. It opens the settings view of the Package in the current Workspace. A bar above the Package UI names the view. To return to the main view, select the **Back to** button, for example **Back to Reference Package**. A Package without an Instance in the current Workspace shows no **Open settings**.
+If the Package declares a settings view, the page shows the **Configuration** tab. It shows the settings view of the Package in the current Workspace, below the page header and tabs. Select **About** to return to the Package information; the settings view closes. A Package without an Instance in the current Workspace shows no **Configuration** tab.
 
 ## Fix a refused registration
 
@@ -83,7 +94,7 @@ A local Package with the Package Identity of a bundled Package replaces it only 
 
 Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The bundled Package keeps running, and its Package page still labels its source as "Team". To change your mind before the restart, select **Cancel override**. The bundled Package keeps running and no restart is needed.
 
-After the restart, the override runs in the Team tier, so the sidebar lists it under **Team Packages**. The sidebar groups Packages by tier, and its source label follows Package Source, so the override's label reads `Personal`. Its Package page labels its source as "Team, replaced on this device by an override". It has no Personal controls.
+After the restart, the override runs in the Team tier, so the sidebar lists it under **Team Packages**, because the sidebar groups Packages by tier. In the **Package Instances** section of the Workspace page, its source label follows Package Source, so it reads `Personal`. Its Package page is labelled "Team Package", and the source in **Details** reads "Team, replaced on this device by an override". It has no Personal controls.
 
 To return to the bundled Package, select **Remove override** on the Package page or under **Needs attention on this device**. The override then shows "Applies after restart" and keeps running until you select **Restart Teamarness**.
 

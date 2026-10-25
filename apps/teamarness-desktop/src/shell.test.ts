@@ -5,6 +5,7 @@ import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge }
 import type { PackageLifecycleResult } from "./package-shell";
 import { createInstallationPackageVisibility, type InstallationPackageVisibility } from "./package-visibility";
 import { Shell, type ShellFrame, type ShellRoute } from "./shell";
+import { STATUS_MESSAGE_HIDE_MS, type StatusMessageTimers } from "./status-message";
 import type { ShellModel } from "./view";
 
 const installation = fixture.installation as Installation;
@@ -57,6 +58,10 @@ const packages: PackageHostSnapshot = {
 class Region {
   public innerHTML = "";
   public hidden = false;
+  public readonly attributes = new Map<string, string>();
+
+  public setAttribute(name: string, value: string): void { this.attributes.set(name, value); }
+  public removeAttribute(name: string): void { this.attributes.delete(name); }
 }
 
 class TestControl {
@@ -70,6 +75,34 @@ class TestControl {
   public click(): void {
     this.listener?.({ preventDefault: () => undefined } as unknown as Event);
   }
+
+  /** Delivers a key press to a keydown listener. */
+  public press(key: string): void {
+    this.listener?.({ key, preventDefault: () => undefined } as unknown as Event);
+  }
+}
+
+/** A clock the test advances by hand, so message timing needs no waiting. */
+function manualTimers(): StatusMessageTimers & { advance(ms: number): void } {
+  let now = 0;
+  let nextHandle = 1;
+  const scheduled = new Map<number, Readonly<{ at: number; callback: () => void }>>();
+  return {
+    setTimeout: (callback, ms) => {
+      const handle = nextHandle++;
+      scheduled.set(handle, { at: now + ms, callback });
+      return handle;
+    },
+    clearTimeout: (handle) => { scheduled.delete(handle as number); },
+    advance: (ms) => {
+      now += ms;
+      for (const [handle, timer] of [...scheduled]) {
+        if (timer.at > now) continue;
+        scheduled.delete(handle);
+        timer.callback();
+      }
+    },
+  };
 }
 
 class SettingsRegion extends Region {
@@ -220,14 +253,15 @@ function harness(
   frame: ShellFrame;
   calls: string[];
   routes: ShellRoute[];
+  timers: ReturnType<typeof manualTimers>;
 } {
   const calls: string[] = [];
   const routes: ShellRoute[] = [];
+  const timers = manualTimers();
   const frame: ShellFrame = {
     workspaceRail,
     contextualNavigation,
     shellScreen,
-    packageViewBar: new AttributeRegion() as unknown as HTMLElement,
     packageMount: new Region() as unknown as HTMLElement,
   };
   const shell = new Shell(frame, {
@@ -270,8 +304,9 @@ function harness(
       retry: async () => { calls.push("retry"); },
     },
     onRouteChange: (route) => { routes.push(route); },
+    timers,
   });
-  return { shell, frame, calls, routes };
+  return { shell, frame, calls, routes, timers };
 }
 
 describe("persistent Shell frame", () => {
@@ -330,7 +365,7 @@ describe("persistent Shell frame", () => {
     expect(test.frame.shellScreen.hidden).toBe(false);
   });
 
-  it("renders fixed landmarks, active-Workspace Package groups, safe availability, and the labelled local marker", async () => {
+  it("renders fixed landmarks, active-Workspace Package groups as name and status, and source markers only in settings", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
@@ -343,15 +378,18 @@ describe("persistent Shell frame", () => {
     expect(test.frame.contextualNavigation.innerHTML).not.toContain("Overview");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Team Packages");
     expect(test.frame.contextualNavigation.innerHTML).toContain("Personal Packages");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Package source: Team");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Package source: Personal");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("One");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Available");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Private One");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Needs recovery");
-    expect(test.frame.contextualNavigation.innerHTML).toContain("Runs only on this Installation");
+    // Each sidebar row is two lines: the name, then the status.
+    expect(test.frame.contextualNavigation.innerHTML).toContain('<li><button type="button" data-package-index="0"><span>One</span><small>Available</small></button></li>');
+    expect(test.frame.contextualNavigation.innerHTML).toContain('<li><button type="button" data-package-index="1"><span>Private One</span><small>Needs recovery</small></button></li>');
+    for (const removed of ["Package source", "Runs only on this Installation", "package-about", "About ", "data-package-page-index", "package-nav-row"]) {
+      expect(test.frame.contextualNavigation.innerHTML).not.toContain(removed);
+    }
     expect(test.frame.contextualNavigation.innerHTML).not.toContain("Other");
     expect(test.frame.contextualNavigation.innerHTML).toContain('aria-current="page"');
+    // Workspace settings rows keep their source and Installation markers.
+    expect(test.frame.shellScreen.innerHTML).toContain("Package source: Team");
+    expect(test.frame.shellScreen.innerHTML).toContain("Package source: Personal");
+    expect(test.frame.shellScreen.innerHTML).toContain("Runs only on this Installation");
   });
 
   it("renders empty Package groups and an intentional empty settings state", async () => {
@@ -794,7 +832,10 @@ class AttributeRegion extends Region {
   }
 
   public querySelector(selector: string): (TestControl & { focus(): void }) | null {
-    const found = this.querySelectorAll(selector)[0];
+    const valued = /^\[(data-[a-z-]+)="([^"]*)"\]$/.exec(selector);
+    const found = valued
+      ? this.querySelectorAll(`[${valued[1]}]`).find((control) => control.dataset[camel(valued[1]!)] === valued[2])
+      : this.querySelectorAll(selector)[0];
     if (!found) return null;
     return Object.assign(found, { focus: () => { this.focusedSelector = selector; } });
   }
@@ -824,7 +865,7 @@ describe("Package page route", () => {
     }],
   };
 
-  it("opens from a Package row on the Workspace page and goes back", async () => {
+  it("opens from a Package row on the Workspace page, with no back control", async () => {
     const screen = new AttributeRegion();
     const calls: string[] = [];
     const test = harness(screen as unknown as HTMLElement, { refresh: async () => personal }, undefined, undefined, {}, undefined, unusedPackageManagement(calls));
@@ -848,28 +889,22 @@ describe("Package page route", () => {
     screen.control("data-package-page-action", "pause").click();
     await vi.waitFor(() => expect(test.calls).toContain(`suspend:${privatePackageKey.packageIdentity}`));
 
-    screen.control("data-package-page-back", "").click();
-    await vi.waitFor(() => expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id }));
-    expect(screen.innerHTML).toContain("Package Instances");
+    expect(screen.innerHTML).not.toContain("data-package-page-back");
+    expect(screen.innerHTML).not.toContain("Back to");
   });
 
-  it("keeps the sidebar opening the Package UI and adds an About button for its page", async () => {
+  it("keeps the sidebar opening the Package UI, with no About button", async () => {
     const nav = new AttributeRegion();
     const test = harness(new AttributeRegion() as unknown as HTMLElement, {}, undefined, nav as unknown as HTMLElement);
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
+    expect(nav.querySelectorAll("[data-package-page-index]")).toEqual([]);
 
     nav.control("data-package-index", "0").click();
     await vi.waitFor(() => expect(test.calls).toContain("mount:com.example.one"));
     expect(test.shell.route()).toEqual({ kind: "package-instance", instance: packageKey });
-
-    nav.control("data-package-page-index", "0").click();
-    await vi.waitFor(() => expect(test.shell.route()).toEqual({
-      kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity,
-    }));
-    expect(test.calls.at(-1)).toBe("unmount");
-    expect(test.frame.packageMount.hidden).toBe(true);
-    expect(nav.innerHTML).toContain('aria-label="About One" title="About One" aria-current="page"');
+    expect(test.frame.shellScreen.hidden).toBe(true);
+    expect(test.frame.packageMount.hidden).toBe(false);
   });
 
   it("returns to the Workspace page after Remove, which says the data is kept", async () => {
@@ -920,57 +955,174 @@ describe("Package page route", () => {
   });
 });
 
-describe("Package settings view", () => {
+describe("Package page Configuration tab", () => {
   const declaring: PackageHostSnapshot = {
     ...packages,
     packages: packages.packages.map((entry) => entry.identity === packageKey.packageIdentity ? { ...entry, views: ["settings"] } : entry),
   };
+  const page: ShellRoute = { kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity };
+  const configuration: ShellRoute = { ...page, tab: "configuration" };
+  const mountAttributes = (test: ReturnType<typeof harness>): Map<string, string> =>
+    (test.frame.packageMount as unknown as Region).attributes;
 
-  it("opens settings from the Package page, names the view, and goes back to the main view", async () => {
+  it("mounts the settings view below the page header and tabs, and unmounts it for About", async () => {
     const screen = new AttributeRegion();
     const test = harness(screen as unknown as HTMLElement, { refresh: async () => declaring });
-    const bar = test.frame.packageViewBar as unknown as AttributeRegion;
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(declaring);
-    await test.shell.navigate({ kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity });
-    expect(bar.hidden).toBe(true);
+    await test.shell.navigate(page);
+    await vi.waitFor(() => expect(screen.innerHTML).toContain(">Details</h2>"));
+    expect(screen.innerHTML).toContain('data-package-page-tab="configuration">Configuration</button>');
+    expect(test.frame.packageMount.hidden).toBe(true);
 
-    screen.control("data-package-page-action", "open-settings").click();
-    await vi.waitFor(() => expect(test.shell.route()).toEqual({ kind: "package-instance", instance: packageKey, view: "settings" }));
-    expect(test.calls).toContain("mount:com.example.one:settings");
+    screen.control("data-package-page-tab", "configuration").click();
+    await vi.waitFor(() => expect(test.shell.route()).toEqual(configuration));
+    await vi.waitFor(() => expect(test.calls).toContain("mount:com.example.one:settings"));
+    await vi.waitFor(() => expect(screen.focusedSelector).toBe('[data-package-page-tab="configuration"]'));
+    // The page header and tabs stay; the settings view is the tab panel below them.
+    expect(test.frame.shellScreen.hidden).toBe(false);
     expect(test.frame.packageMount.hidden).toBe(false);
-    expect(test.frame.shellScreen.hidden).toBe(true);
-    expect(bar.hidden).toBe(false);
-    expect(bar.innerHTML).toContain("<strong>One settings</strong>");
-    expect(bar.innerHTML).toContain('data-package-view-main aria-label="Back to One">Back to One</button>');
+    expect(screen.innerHTML).toContain('aria-selected="true" tabindex="0" data-package-page-tab="configuration"');
+    expect(screen.innerHTML).toContain('data-package-page-focus>One</h1>');
+    expect(screen.innerHTML).not.toContain(">Details</h2>");
+    expect(screen.innerHTML).not.toContain("Back to");
+    expect(mountAttributes(test).get("data-placement")).toBe("package-page");
+    expect(mountAttributes(test).get("role")).toBe("tabpanel");
+    expect(mountAttributes(test).get("aria-labelledby")).toBe("package-page-tab-configuration");
+    expect(screen.focusedSelector).toBe('[data-package-page-tab="configuration"]');
 
-    bar.control("data-package-view-main", "").click();
-    await vi.waitFor(() => expect(test.calls.at(-1)).toBe("mount:com.example.one"));
-    expect(test.shell.route()).toEqual({ kind: "package-instance", instance: packageKey });
-    expect(bar.hidden).toBe(true);
-    expect(bar.innerHTML).toBe("");
+    screen.control("data-package-page-tab", "about").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain(">Details</h2>"));
+    expect(test.shell.route()).toEqual(page);
+    expect(test.calls.at(-1)).toBe("unmount");
+    expect(test.frame.packageMount.hidden).toBe(true);
+    expect(mountAttributes(test).get("data-placement")).toBeUndefined();
+    expect(mountAttributes(test).get("aria-label")).toBe("Package interface");
+    expect(screen.innerHTML).toContain(">Details</h2>");
+
+    // Switching back mounts the settings view again.
+    screen.control("data-package-page-tab", "configuration").click();
+    await vi.waitFor(() => expect(test.calls.filter((call) => call === "mount:com.example.one:settings")).toHaveLength(2));
   });
 
-  it("offers no Open settings for a Package that declares no settings view", async () => {
+  it("moves between tabs with the arrow keys", async () => {
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => declaring });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate(page);
+
+    screen.control("data-package-page-tabs", "").press("ArrowRight");
+    await vi.waitFor(() => expect(test.shell.route()).toEqual(configuration));
+    screen.control("data-package-page-tabs", "").press("Home");
+    await vi.waitFor(() => expect(test.shell.route()).toEqual(page));
+    await vi.waitFor(() => expect(screen.focusedSelector).toBe('[data-package-page-tab="about"]'));
+  });
+
+  it("unmounts the settings view when the person leaves the page", async () => {
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => declaring });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate(configuration);
+    expect(test.calls).toEqual(["mount:com.example.one:settings"]);
+
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(test.calls.at(-1)).toBe("unmount");
+    expect(test.frame.packageMount.hidden).toBe(true);
+
+    // The sidebar still opens the main view, in the whole pane.
+    await test.shell.navigate(configuration);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    expect(test.calls.at(-1)).toBe("mount:com.example.one");
+    expect(mountAttributes(test).get("data-placement")).toBeUndefined();
+    expect(test.frame.shellScreen.hidden).toBe(true);
+  });
+
+  it("unmounts the settings view when the active Workspace switches", async () => {
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => declaring });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate(configuration);
+    await test.shell.updateWorkspace(model(otherWorkspace.id));
+    expect(test.calls.at(-1)).toBe("unmount");
+    expect(test.frame.packageMount.hidden).toBe(true);
+  });
+
+  it("offers no Configuration and mounts nothing for a Package that declares no settings view", async () => {
     const screen = new AttributeRegion();
     const test = harness(screen as unknown as HTMLElement);
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
-    await test.shell.navigate({ kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity });
+    await test.shell.navigate(configuration);
+    expect(test.shell.route()).toEqual(page);
     await vi.waitFor(() => expect(screen.innerHTML).toContain("Capabilities and Ports"));
-    expect(screen.innerHTML).not.toContain("open-settings");
+    expect(screen.innerHTML).not.toContain("Configuration");
+    expect(test.calls).not.toContain("mount:com.example.one:settings");
+    expect(test.frame.packageMount.hidden).toBe(true);
   });
 
-  it("hides the view bar when the person leaves the settings view for a Shell screen", async () => {
+  it("closes Configuration when the Instance leaves this Workspace", async () => {
     const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => declaring });
-    const bar = test.frame.packageViewBar as unknown as AttributeRegion;
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(declaring);
-    await test.shell.navigate({ kind: "package-instance", instance: packageKey, view: "settings" });
-    expect(bar.hidden).toBe(false);
-
-    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    await test.shell.navigate(configuration);
+    test.shell.updatePackages({
+      ...declaring,
+      revision: declaring.revision + 1,
+      instances: declaring.instances.filter(({ key }) => key.packageIdentity !== packageKey.packageIdentity || key.workspaceId !== workspace.id),
+    });
+    await vi.waitFor(() => expect(test.shell.route()).toEqual(page));
     expect(test.calls.at(-1)).toBe("unmount");
-    expect(bar.hidden).toBe(true);
+    expect(test.frame.packageMount.hidden).toBe(true);
+  });
+});
+
+describe("Packages section messages on the Workspace page", () => {
+  const refused = {
+    ...packages,
+    registrations: [{
+      directory: "/Users/person/Packages/broken",
+      expectedIdentity: "com.example.broken",
+      override: false,
+      tier: "personal" as const,
+      status: { kind: "refused" as const, code: "artifact_changed" },
+    }],
+  };
+
+  it("reserves the message area, shows a result at the top, and hides a success after five seconds", async () => {
+    const screen = new ManagementRegion();
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => refused });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(refused);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    const empty = '<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>';
+    expect(screen.innerHTML).toContain(empty);
+    expect(screen.innerHTML.indexOf(empty)).toBeLessThan(screen.innerHTML.indexOf("package-instance-list"));
+
+    screen.control("registration:reload:0").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("<p>com.example.broken: Reloaded.</p>"));
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS);
+    expect(screen.innerHTML).not.toContain("Reloaded.");
+    expect(screen.innerHTML).toContain(empty);
+  });
+
+  it("keeps an error until the person dismisses it", async () => {
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => refused }, undefined, undefined, {}, undefined, {
+      ...unusedPackageManagement(),
+      reload: async () => { throw { code: "artifact_missing" }; },
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(refused);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.control("data-package-registration-action", "reload").dataset.packageRegistrationIndex = "0";
+    screen.control("data-package-registration-action", "reload").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain('role="alert" aria-live="assertive"><p>com.example.broken: A file the manifest lists is missing.'));
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS * 10);
+    expect(screen.innerHTML).toContain("A file the manifest lists is missing.");
+
+    screen.control("data-package-message-dismiss", "").click();
+    expect(screen.innerHTML).not.toContain("A file the manifest lists is missing.");
   });
 });

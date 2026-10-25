@@ -3,7 +3,6 @@ import type {
   PackageHostSnapshot,
   PackageInstanceKey,
   PackageManagementBridge,
-  PackageUiView,
 } from "./package-contracts";
 import {
   isTeamIdentityEntry,
@@ -18,14 +17,18 @@ import {
   type RegistrationState,
 } from "./package-install";
 import { lifecycleDescriptor } from "./presentation";
+import { renderStatusMessageSlot, StatusMessageSlot, type StatusMessageTimers } from "./status-message";
 
 /** The Package a Package page shows, in the Workspace it was opened from. */
 export type PackagePageTarget = Readonly<{ workspaceId: string; packageIdentity: string }>;
 
+/** The tabs of a Package page. **Configuration** embeds the Package's settings view. */
+export type PackagePageTab = "about" | "configuration";
+
 /** Every control a Package page can offer. Each page offers only the ones its Package allows. */
 export type PackagePageAction =
   | "reload" | "restart" | "pause" | "resume" | "start" | "remove" | "confirm-remove" | "cancel-remove"
-  | "recover" | "dispose" | "restart-app" | "retry-catalog" | "copy-homepage" | "open-settings";
+  | "recover" | "dispose" | "restart-app" | "retry-catalog" | "copy-homepage" | "dismiss-message";
 
 /** The Instance lifecycle commands; each re-reads the snapshot and throws when the operation failed. */
 export type PackagePageLifecycle = Readonly<{
@@ -43,8 +46,6 @@ type PackagePageHooks = Readonly<{
   removed(target: PackagePageTarget): void;
   /** Copies text to the clipboard. */
   copy(value: string): Promise<void>;
-  /** Opens one view of this Package's UI in the page's Workspace. */
-  openView(target: PackagePageTarget, view: PackageUiView): void;
 }>;
 
 type CatalogState =
@@ -78,7 +79,7 @@ export type PackagePagePresentation = Readonly<{
   instance: Readonly<{ availability: string; generation: number | null }> | null;
   diagnostics: readonly string[];
   controls: readonly PackagePageAction[];
-  /** Whether the Package declares a settings view and runs in this Workspace, so it can be opened. */
+  /** Whether the Package declares a settings view and runs in this Workspace, so **Configuration** is offered. */
   settings: boolean;
 }>;
 
@@ -93,7 +94,7 @@ export class PackagePageController {
   private catalogRevision: number | null = null;
   private catalogRequest = 0;
   private working: PackagePageAction | null = null;
-  private feedback: PageFeedback | null = null;
+  private readonly feedback: StatusMessageSlot<PageFeedback>;
   private removed = false;
   private focusRequested = false;
 
@@ -102,14 +103,17 @@ export class PackagePageController {
     private readonly lifecycle: PackagePageLifecycle,
     private readonly management: PackageManagementController,
     private readonly hooks: PackagePageHooks,
-  ) {}
+    timers?: StatusMessageTimers,
+  ) {
+    this.feedback = new StatusMessageSlot(() => { this.hooks.changed(); }, timers);
+  }
 
   public current(): PackagePageTarget | null { return this.target; }
 
   /** Opens the page for one Package and reads its declared capabilities and Ports. */
   public open(target: PackagePageTarget, snapshot: PackageHostSnapshot | null): void {
     this.target = target;
-    this.feedback = null;
+    this.feedback.clear();
     this.working = null;
     this.removed = false;
     this.focusRequested = true;
@@ -121,6 +125,7 @@ export class PackagePageController {
   public close(): void {
     if (!this.target) return;
     if (!this.removed) this.management.dismissFeedback();
+    this.feedback.clear();
     this.target = null;
     this.removed = false;
   }
@@ -150,8 +155,10 @@ export class PackagePageController {
       case "retry-catalog":
         await this.loadCatalog(snapshot?.revision ?? null);
         return;
-      case "open-settings":
-        if (presentation.settings) this.hooks.openView(target, "settings");
+      case "dismiss-message":
+        this.feedback.clear();
+        this.management.dismissMessage();
+        this.hooks.changed();
         return;
       case "copy-homepage":
         if (!presentation.homepage) return;
@@ -159,13 +166,13 @@ export class PackagePageController {
         return;
       case "reload":
         if (!allowed("reload")) return;
-        this.feedback = null;
-        await this.management.registrationAction("reload", identity);
+        this.feedback.clear();
+        await this.management.registrationAction("reload", identity, snapshot);
         return;
       case "remove":
       case "cancel-remove":
         if (!allowed("remove")) return;
-        this.feedback = null;
+        this.feedback.clear();
         await this.management.registrationAction(action, identity, snapshot);
         return;
       case "confirm-remove": {
@@ -179,7 +186,7 @@ export class PackagePageController {
         return;
       }
       case "restart-app":
-        await this.management.registrationAction("restart", identity);
+        await this.management.registrationAction("restart", identity, snapshot);
         return;
       case "restart":
         if (!allowed("restart")) return;
@@ -220,15 +227,21 @@ export class PackagePageController {
     }
   }
 
-  public render(snapshot: PackageHostSnapshot | null): string {
+  /**
+   * Renders the page header, its tabs, and the message area, with the About
+   * groups when `tab` is `about`. The Shell mounts the settings view below
+   * them for `configuration`, so that tab renders no panel here.
+   */
+  public render(snapshot: PackageHostSnapshot | null, tab: PackagePageTab = "about"): string {
     const target = this.target;
     if (!target) return "";
     const presentation = buildPackagePagePresentation(snapshot, target);
     if (!presentation) return renderMissing(snapshot === null);
     return renderPackagePage(presentation, {
+      tab: tab === "configuration" && presentation.settings ? "configuration" : "about",
       catalog: this.catalog,
       working: this.working,
-      feedback: this.feedback,
+      feedback: this.feedback.current(),
       registration: this.management.registrationState(target.packageIdentity),
       packageNames: new Map(snapshot?.packages.map(({ identity, displayName }) => [identity, displayName]) ?? []),
     });
@@ -242,7 +255,7 @@ export class PackagePageController {
     showWorking = true,
   ): Promise<void> {
     this.working = action;
-    this.feedback = null;
+    this.feedback.clear();
     if (showWorking) this.hooks.changed();
     let feedback: PageFeedback;
     try {
@@ -252,7 +265,7 @@ export class PackagePageController {
       feedback = { message: failureMessage(error, failure), failed: true };
     }
     this.working = null;
-    this.feedback = feedback;
+    this.feedback.set(feedback);
     this.hooks.changed();
   }
 
@@ -384,10 +397,11 @@ const ACTION_LABELS: Readonly<Record<PackagePageAction, string>> = {
   "restart-app": "Restart Teamarness",
   "retry-catalog": "Retry",
   "copy-homepage": "Copy",
-  "open-settings": "Open settings",
+  "dismiss-message": "Dismiss",
 };
 
 type RenderState = Readonly<{
+  tab: PackagePageTab;
   catalog: CatalogState;
   working: PackagePageAction | null;
   feedback: PageFeedback | null;
@@ -395,62 +409,86 @@ type RenderState = Readonly<{
   packageNames: ReadonlyMap<string, string>;
 }>;
 
+type ButtonRenderer = (action: PackagePageAction, secondary?: boolean, label?: string) => string;
+
 function renderPackagePage(presentation: PackagePagePresentation, state: RenderState): string {
   const busy = state.working !== null || state.registration.working;
-  const button = (action: PackagePageAction, secondary = false, label = ACTION_LABELS[action]): string =>
+  const button: ButtonRenderer = (action, secondary = false, label = ACTION_LABELS[action]) =>
     `<button type="button"${secondary ? ' class="secondary"' : ""} data-package-page-action="${action}" aria-label="${escape(`${label} ${presentation.name}`)}"${busy ? " disabled" : ""}>${escape(label)}</button>`;
-  const row = (term: string, value: string | null): string =>
-    value === null ? "" : `<div><dt>${escape(term)}</dt><dd>${escape(value)}</dd></div>`;
+  const header = `<header class="package-page-header"><p class="package-page-kind">${escape(presentation.personal ? "Personal Package" : "Team Package")}</p><h1 id="package-page-heading" class="package-page-title" tabindex="-1" data-package-page-focus>${escape(presentation.name)}</h1>${presentation.description === null ? "" : `<p class="package-page-subtitle">${escape(presentation.description)}</p>`}</header>`;
+  const panel = state.tab === "about"
+    ? `<div id="package-page-panel-about" class="package-page-panel" role="tabpanel" aria-labelledby="package-page-tab-about">${[
+      renderDetails(presentation, button),
+      renderCatalog(presentation, state, button),
+      renderWorkspaceState(presentation),
+      renderDiagnostics(presentation),
+      renderManage(presentation, state, button),
+    ].join("")}</div>`
+    : "";
+  return `<section class="shell-screen package-page" aria-labelledby="package-page-heading" data-package-page-tab-selected="${state.tab}">${header}${renderTabs(presentation, state.tab)}${renderMessage(presentation, state, button)}${panel}</section>`;
+}
+
+/** The underline tabs. **Configuration** is there only when the Package declares a settings view and runs here. */
+function renderTabs(presentation: PackagePagePresentation, selected: PackagePageTab): string {
+  const tab = (id: PackagePageTab, label: string, controls: string): string => {
+    const current = id === selected;
+    return `<button type="button" class="package-page-tab" role="tab" id="package-page-tab-${id}" aria-controls="${controls}" aria-selected="${current ? "true" : "false"}" tabindex="${current ? "0" : "-1"}" data-package-page-tab="${id}">${label}</button>`;
+  };
+  return `<div class="package-page-tabs" role="tablist" aria-label="${escape(`${presentation.name} sections`)}" data-package-page-tabs>${tab("about", "About", "package-page-panel-about")}${presentation.settings ? tab("configuration", "Configuration", "package-mount") : ""}</div>`;
+}
+
+/** The result of the last action, at the top of the page in a space that is always kept. */
+function renderMessage(presentation: PackagePagePresentation, state: RenderState, button: ButtonRenderer): string {
+  const registration = state.registration;
+  const feedback = state.feedback ?? registration.feedback;
+  // A page that waits for a restart already offers Restart Teamarness.
+  const restartOffered = presentation.controls.includes("restart-app");
+  const restart = registration.feedback?.restart && !state.feedback && !restartOffered ? button("restart-app") : "";
+  return renderStatusMessageSlot(feedback, 'data-package-page-action="dismiss-message"', restart);
+}
+
+/** One About group: its title on the left and its content on the right. */
+function group(id: string, title: string, intro: string, body: string): string {
+  return `<section class="package-page-group" aria-labelledby="package-page-${id}-heading"><div class="package-page-group-intro"><h2 id="package-page-${id}-heading">${escape(title)}</h2><p>${escape(intro)}</p></div><div class="package-page-group-body">${body}</div></section>`;
+}
+
+function row(term: string, value: string | null): string {
+  return value === null ? "" : `<div><dt>${escape(term)}</dt><dd>${escape(value)}</dd></div>`;
+}
+
+function renderDetails(presentation: PackagePagePresentation, button: ButtonRenderer): string {
   const homepage = presentation.homepage === null
     ? ""
     : `<div><dt>Homepage</dt><dd class="package-page-copyable"><input readonly aria-label="Homepage of ${escape(presentation.name)}" value="${escape(presentation.homepage)}">${button("copy-homepage", true)}</dd></div>`;
-  const about = `<section class="screen-section settings-panel" aria-labelledby="package-page-about-heading"><h2 id="package-page-about-heading">About</h2><dl>${[
-    row("Name", presentation.name),
+  return group("details", "Details", "What this Package is and where it comes from.", `<dl>${[
     row("Package Identity", presentation.identity),
     row("Version", presentation.version),
-    row("Description", presentation.description),
     row("Author", presentation.author),
   ].join("")}${homepage}${[
     row("Source", presentation.sourceLabel),
     row("Trust", presentation.trustLabel),
     row("Package folder", presentation.directory),
-  ].join("")}</dl></section>`;
+  ].join("")}</dl>`);
+}
 
+function renderWorkspaceState(presentation: PackagePagePresentation): string {
   const instance = presentation.instance
     ? `<dl>${row("Availability", presentation.instance.availability)}${row("Process generation", presentation.instance.generation === null ? null : String(presentation.instance.generation))}</dl>`
     : '<p class="empty-state">This Package is not running in this Workspace.</p>';
   const refusal = presentation.refusal
     ? `<p class="error">It could not start: ${escape(presentation.refusal)}</p>`
     : "";
-  const diagnostics = presentation.diagnostics.length === 0
-    ? ""
-    : `<h3>Diagnostics</h3><ul class="package-page-diagnostics">${presentation.diagnostics.map((message) => `<li>${escape(message)}</li>`).join("")}</ul>`;
-  const status = `<section class="screen-section" aria-labelledby="package-page-status-heading"><h2 id="package-page-status-heading">In this Workspace</h2>${refusal}${instance}${diagnostics}${renderControls(presentation, state, button)}</section>`;
-
-  return `<section class="shell-screen package-page" aria-labelledby="package-page-heading"><header class="screen-heading"><button type="button" class="package-page-back secondary" data-package-page-back>Back to Workspace</button><p class="eyebrow">${escape(presentation.personal ? "Personal Package" : "Team Package")}</p><h1 id="package-page-heading" tabindex="-1" data-package-page-focus>${escape(presentation.name)}</h1>${presentation.description === null ? "" : `<p>${escape(presentation.description)}</p>`}${renderSettingsEntry(presentation, button)}</header>
-    ${about}${status}${renderCatalog(presentation, state, button)}</section>`;
+  return group("workspace", "This Workspace", "The Package Instance in the Workspace you opened this page from.", `${refusal}${instance}`);
 }
 
-/** **Open settings**, offered only when the Package declares a settings view and runs in this Workspace. */
-function renderSettingsEntry(
-  presentation: PackagePagePresentation,
-  button: (action: PackagePageAction, secondary?: boolean, label?: string) => string,
-): string {
-  return presentation.settings ? `<div class="package-instance-actions">${button("open-settings")}</div>` : "";
+function renderDiagnostics(presentation: PackagePagePresentation): string {
+  if (presentation.diagnostics.length === 0) return "";
+  return group("diagnostics", "Diagnostics", "What the Package Host reported about this Package.",
+    `<ul class="package-page-diagnostics">${presentation.diagnostics.map((message) => `<li>${escape(message)}</li>`).join("")}</ul>`);
 }
 
-function renderControls(
-  presentation: PackagePagePresentation,
-  state: RenderState,
-  button: (action: PackagePageAction, secondary?: boolean, label?: string) => string,
-): string {
+function renderManage(presentation: PackagePagePresentation, state: RenderState, button: ButtonRenderer): string {
   const registration = state.registration;
-  const feedback = state.feedback ?? registration.feedback;
-  // A page that waits for a restart already offers Restart Teamarness.
-  const restartOffered = presentation.controls.includes("restart-app");
-  const feedbackHtml = feedback
-    ? `<div class="${feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${feedback.failed ? "alert" : "status"}"><p>${escape(feedback.message)}</p>${registration.feedback?.restart && !state.feedback && !restartOffered ? button("restart-app") : ""}</div>`
-    : "";
   const pendingHtml = presentation.pending
     ? `<p class="package-install-note" role="status">${escape(presentation.pending)}</p>`
     : "";
@@ -458,28 +496,31 @@ function renderControls(
     ? '<p role="status" aria-live="polite">Working…</p>'
     : "";
   const controls = presentation.controls;
-  if (controls.length === 0) return `${pendingHtml}${working}${feedbackHtml}`;
+  if (controls.length === 0 && !pendingHtml && !working) return "";
+  const manage = (body: string): string => group(
+    "manage",
+    "Manage",
+    presentation.personal ? "Run, update, or remove this Personal Package." : "Recover this Package or apply a change.",
+    `${pendingHtml}${working}${body}`,
+  );
+  if (controls.length === 0) return manage("");
   const removeLabel = presentation.removeLabel;
   if (registration.confirming && controls.includes("remove")) {
     const question = presentation.teamEntryRemoveQuestion
       ?? `Remove ${presentation.name} from this device? It stops in all your Workspaces. ${REMOVE_KEEPS_DATA_COPY}`;
-    return `${pendingHtml}${working}${feedbackHtml}<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${presentation.name}`)}"><p>${escape(question)}</p><div class="package-instance-actions">${button("confirm-remove", false, removeLabel)}${button("cancel-remove", true)}</div></div>`;
+    return manage(`<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${presentation.name}`)}"><p>${escape(question)}</p><div class="package-instance-actions">${button("confirm-remove", false, removeLabel)}${button("cancel-remove", true)}</div></div>`);
   }
   const buttons = controls.map((action) =>
     action === "remove" ? button("remove", true, removeLabel) : button(action, action === "dispose")).join("");
   const hint = presentation.personal
     ? '<p class="package-page-hint">Pause asks the Package to stop its work; its process keeps running until you Resume it. Restart starts a new process. Pause, Resume, and Restart apply to this Workspace. Reload and Remove apply in all your Workspaces.</p>'
     : "";
-  return `${pendingHtml}${working}${feedbackHtml}<div class="package-instance-actions">${buttons}</div>${hint}`;
+  return manage(`<div class="package-instance-actions">${buttons}</div>${hint}`);
 }
 
-function renderCatalog(
-  presentation: PackagePagePresentation,
-  state: RenderState,
-  button: (action: PackagePageAction, secondary?: boolean, label?: string) => string,
-): string {
+function renderCatalog(presentation: PackagePagePresentation, state: RenderState, button: ButtonRenderer): string {
   const section = (body: string): string =>
-    `<section class="screen-section" aria-labelledby="package-page-ports-heading"><h2 id="package-page-ports-heading">Capabilities and Ports</h2>${body}</section>`;
+    group("ports", "Capabilities and Ports", "What the Package may use, and the Ports it provides and uses.", body);
   if (state.catalog.kind === "loading") return section('<p class="empty-state">Loading capabilities and Ports…</p>');
   if (state.catalog.kind === "failed") {
     return section(`<div class="package-lifecycle-feedback" role="alert"><p>Capabilities and Ports could not be read.</p>${button("retry-catalog", true)}</div>`);
@@ -512,7 +553,7 @@ function renderMissing(loading: boolean): string {
   const message = loading
     ? "Package information is loading."
     : "This Package is no longer installed on this device.";
-  return `<section class="shell-screen package-page" aria-labelledby="package-page-heading"><header class="screen-heading"><button type="button" class="package-page-back secondary" data-package-page-back>Back to Workspace</button><h1 id="package-page-heading" tabindex="-1" data-package-page-focus>Package</h1><p>${message}</p></header></section>`;
+  return `<section class="shell-screen package-page" aria-labelledby="package-page-heading"><header class="package-page-header"><h1 id="package-page-heading" class="package-page-title" tabindex="-1" data-package-page-focus>Package</h1><p class="package-page-subtitle">${message}</p></header></section>`;
 }
 
 /** A Package Host refusal names its rule; anything else gets the action's own message. */

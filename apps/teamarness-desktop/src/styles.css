@@ -199,36 +199,31 @@ button:disabled { cursor: wait; opacity: 0.6; }
 .package-group li { color: var(--teamarness-color-text-muted); font-size: 0.9rem; }
 .package-group button span,
 .package-group button small { display: block; }
-.package-group button small,
+.package-group button small { margin-top: 0.2rem; color: var(--teamarness-color-text-muted); font-size: 0.72rem; font-weight: 500; }
 .package-source,
 .package-installation-marker { display: block; margin-top: 0.2rem; color: var(--teamarness-color-text-muted); font-size: 0.72rem; font-weight: 500; }
 .package-source { font-weight: 700; text-transform: uppercase; }
 
 .selected-content {
+  --shell-screen-padding: clamp(1.25rem, 4vw, 3rem);
   height: 100%;
   color: var(--teamarness-color-text);
   background: var(--teamarness-color-background);
   overflow-y: auto;
   outline: none;
 }
-#shell-screen { min-height: 100%; padding: clamp(1.25rem, 4vw, 3rem); }
+#shell-screen { min-height: 100%; padding: var(--shell-screen-padding); }
 #package-mount { width: 100%; min-height: 100%; height: 100%; }
-.package-view-bar {
-  box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  height: 3.5rem;
-  padding: 0 clamp(1.25rem, 4vw, 3rem);
-  border-bottom: 1px solid var(--teamarness-color-border);
-  background: var(--teamarness-color-panel);
+/* A Package page's Configuration tab: the page header and tabs, then the settings view filling the rest. */
+.selected-content:has(> #package-mount[data-placement="package-page"]:not([hidden])) { display: flex; flex-direction: column; }
+.selected-content:has(> #package-mount[data-placement="package-page"]:not([hidden])) > #shell-screen { flex: none; min-height: 0; padding-bottom: 0; }
+#package-mount[data-placement="package-page"] {
+  flex: 1 1 auto;
+  width: max(calc((100% - 2 * var(--shell-screen-padding)) * 0.75), min(calc(100% - 2 * var(--shell-screen-padding)), 40rem));
+  height: auto;
+  min-height: 20rem;
+  margin-inline: auto;
 }
-.package-view-bar[hidden] { display: none; }
-.package-view-bar__title { display: flex; align-items: baseline; gap: 0.6rem; margin: 0; min-width: 0; }
-.package-view-bar__title .eyebrow { margin: 0; }
-.package-view-bar__title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.package-view-bar:not([hidden]) + #package-mount { height: calc(100% - 3.5rem); min-height: 0; }
 .package-ui-frame { display: block; width: 100%; height: 100%; border: 0; background: transparent; }
 #package-mount > .error { margin: clamp(1.25rem, 4vw, 3rem); }
 #package-mount > button { margin: 0 0 0 clamp(1.25rem, 4vw, 3rem); }
@@ -330,14 +325,6 @@ h1, h2, p { margin-top: 0; }
 .package-preview dd { margin: 0; overflow-wrap: anywhere; }
 .package-risks { display: grid; gap: 0.35rem; margin: 0; padding-left: 1.2rem; }
 .package-remove-confirmation { display: grid; gap: 0.65rem; }
-.package-action-feedback {
-  padding: 0.75rem;
-  background: var(--teamarness-color-background);
-  border: 1px solid var(--teamarness-color-border);
-  border-radius: var(--teamarness-radius-control);
-}
-.package-action-feedback p { margin-bottom: 0.65rem; }
-.package-action-feedback p:last-child { margin-bottom: 0; }
 button.secondary {
   color: var(--teamarness-color-text);
   background: transparent;
@@ -390,19 +377,6 @@ textarea:focus-visible {
 .error { color: var(--teamarness-color-danger); }
 .shell-status, .sensitive { color: var(--teamarness-color-accent); }
 .sensitive { margin: 0.8rem 0 0; font-weight: 700; }
-.package-group li.package-nav-row { display: flex; align-items: flex-start; gap: 0.15rem; }
-.package-group li.package-nav-row > button:first-child { flex: 1 1 auto; min-width: 0; }
-.package-group button.package-about {
-  display: grid;
-  flex: none;
-  width: 2rem;
-  height: 2rem;
-  margin-top: 0.3rem;
-  place-items: center;
-  padding: 0;
-  color: var(--teamarness-color-text-muted);
-}
-.package-group button.package-about svg { width: 1rem; height: 1rem; }
 .package-instance-link {
   padding: 0;
   color: inherit;
@@ -416,16 +390,72 @@ textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 .package-instance-link:hover { color: var(--teamarness-color-accent); text-decoration-color: currentColor; }
-.package-page .screen-heading h1:focus { outline: none; }
-.package-page .screen-heading h1:focus-visible { outline: 3px solid var(--teamarness-color-focus); outline-offset: 2px; }
-.package-page-back { margin-bottom: 0.75rem; }
-.package-page dl { display: grid; gap: 0.8rem; margin: 0 0 1rem; }
+/* The Package page: a centred page with its header, underline tabs, and two-column groups. */
+.shell-screen.package-page { width: max(75%, min(100%, 40rem)); margin-inline: auto; }
+.package-page-header { display: block; }
+.package-page-kind {
+  margin: 0 0 0.4rem;
+  color: var(--teamarness-color-text-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.shell-screen h1.package-page-title { margin: 0 0 0.5rem; }
+.package-page-title:focus { outline: none; }
+.package-page-title:focus-visible { outline: 3px solid var(--teamarness-color-focus); outline-offset: 2px; }
+.package-page-subtitle { max-width: 40rem; margin: 0; color: var(--teamarness-color-text-muted); }
+.package-page-tabs { display: flex; gap: 0.25rem; margin-top: 1.5rem; border-bottom: 1px solid var(--teamarness-color-border); }
+.package-page-tab {
+  margin-bottom: -1px;
+  padding: 0.55rem 0.9rem;
+  color: var(--teamarness-color-text-muted);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  font-weight: 600;
+}
+.package-page-tab:hover { color: var(--teamarness-color-text); }
+.package-page-tab[aria-selected="true"] { color: var(--teamarness-color-text); border-bottom-color: var(--teamarness-color-accent); }
+.package-page-group {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) minmax(0, 2.2fr);
+  gap: 1rem 3rem;
+  padding-block: 2rem;
+  border-top: 1px solid var(--teamarness-color-border);
+}
+.package-page-group:first-child { padding-top: 0.5rem; border-top: 0; }
+.package-page-group h2 { margin: 0 0 0.35rem; font-size: 1rem; font-weight: 600; }
+.package-page-group-intro p { margin: 0; color: var(--teamarness-color-text-muted); }
+.package-page-group-body { display: flex; flex-direction: column; gap: 1.1rem; min-width: 0; max-width: 40rem; }
+.package-page-group-body > p { margin: 0; }
+.package-page-group-body > .empty-state { padding: 0; }
+@media (max-width: 52rem) { .package-page-group { grid-template-columns: 1fr; gap: 0.75rem; } }
+.package-page dl { display: grid; gap: 0.8rem; margin: 0; }
 .package-page dl div { display: grid; grid-template-columns: minmax(6rem, 0.4fr) 1fr; gap: 1rem; }
 .package-page dt { color: var(--teamarness-color-text-muted); font-weight: 700; }
 .package-page dd { margin: 0; overflow-wrap: anywhere; }
-.package-page h3 { margin: 1rem 0 0.4rem; font-size: 0.95rem; }
+.package-page h3 { margin: 0 0 0.4rem; font-size: 0.95rem; }
 .package-page ul { display: grid; gap: 0.4rem; margin: 0; padding-left: 1.2rem; overflow-wrap: anywhere; }
 .package-page-copyable { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .package-page-copyable input { flex: 1 1 12rem; min-width: 0; }
-.package-page-hint { margin: 0.75rem 0 0; color: var(--teamarness-color-text-muted); font-size: 0.9rem; }
-.package-page .package-instance-actions { margin-top: 0.75rem; }
+.package-page-hint { margin: 0; color: var(--teamarness-color-text-muted); font-size: 0.9rem; }
+
+/* The message area at the top of a screen keeps its height, so a message never moves the page. */
+.status-message-slot { min-height: 3.25rem; margin: 0.75rem 0; }
+.status-message:empty { display: none; }
+.status-message {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  min-height: 3.25rem;
+  padding: 0.5rem 0.75rem;
+  color: var(--teamarness-color-text);
+  border-left: 3px solid var(--teamarness-color-accent);
+}
+.status-message--error { border-left-color: var(--teamarness-color-danger); }
+.status-message p { flex: 1 1 16rem; margin: 0; overflow-wrap: anywhere; }
+.status-message--error p { color: var(--teamarness-color-danger); }
+.status-message button { flex: none; padding: 0.35rem 0.7rem; }

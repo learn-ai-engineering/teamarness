@@ -4,6 +4,7 @@ import type {
   PackageManagementBridge,
   PackageRegistration,
 } from "./package-contracts";
+import { renderStatusMessageSlot, StatusMessageSlot, type StatusMessageTimers } from "./status-message";
 
 /** The risks a person accepts for `trusted_native_code_v1`, exactly as the Host checks them. */
 export const TRUSTED_NATIVE_CODE_RISKS = ["filesystem", "network", "process"] as const;
@@ -25,6 +26,8 @@ export type PackageInstallStep =
 /** What the person did last to one registration row, and how it went. */
 export type RegistrationFeedback = Readonly<{
   identity: string;
+  /** The Package's name when the action ran, because a removed Package leaves the snapshot. */
+  name: string;
   message: string;
   failed: boolean;
   restart: boolean;
@@ -58,13 +61,16 @@ export class PackageManagementController {
   private step: PackageInstallStep = { kind: "closed" };
   private confirmingRemoval: string | null = null;
   private workingRegistration: string | null = null;
-  private feedback: RegistrationFeedback | null = null;
+  private readonly feedback: StatusMessageSlot<RegistrationFeedback>;
   private focusRequested = false;
 
   public constructor(
     private readonly bridge: PackageManagementBridge,
     private readonly hooks: ManagementHooks,
-  ) {}
+    timers?: StatusMessageTimers,
+  ) {
+    this.feedback = new StatusMessageSlot(() => { this.hooks.changed(); }, timers);
+  }
 
   public state(): PackageInstallStep { return this.step; }
 
@@ -134,10 +140,11 @@ export class PackageManagementController {
     snapshot: PackageHostSnapshot | null = null,
   ): Promise<void> {
     if (this.workingRegistration) return;
+    const name = packageName(snapshot, identity);
     switch (action) {
       case "remove":
         this.confirmingRemoval = identity;
-        this.feedback = null;
+        this.feedback.clear();
         this.hooks.changed();
         return;
       case "cancel-remove":
@@ -152,32 +159,32 @@ export class PackageManagementController {
         const liveCopy = registration === undefined || !isTeamIdentityEntry(registration)
           ? `Removed. ${REMOVE_KEEPS_DATA_COPY}`
           : registration.override ? OVERRIDE_CANCELLED_COPY : TEAM_ENTRY_REMOVED_COPY;
-        await this.runRegistration(identity, () => this.bridge.remove(identity), (change) => change.restartRequired
+        await this.runRegistration(identity, name, () => this.bridge.remove(identity), (change) => change.restartRequired
           ? REMOVED_FOR_RESTART_COPY
           : liveCopy);
         return;
       }
       case "reload":
-        await this.runRegistration(identity, () => this.bridge.reload(identity), () => "Reloaded.");
+        await this.runRegistration(identity, name, () => this.bridge.reload(identity), () => "Reloaded.");
         return;
       case "restart":
-        await this.restartApplication(identity);
+        await this.restartApplication(identity, name);
         return;
     }
   }
 
   /** Restarts Teamarness after a removed override, from the section-level result. */
   public async restartAfterChange(): Promise<void> {
-    const feedback = this.feedback;
-    if (feedback?.restart) await this.restartApplication(feedback.identity);
+    const feedback = this.feedback.current();
+    if (feedback?.restart) await this.restartApplication(feedback.identity, feedback.name);
   }
 
   /** Restarts Teamarness so a change that waits for a restart applies. A failure is shown for `identity`. */
-  private async restartApplication(identity: string): Promise<void> {
+  private async restartApplication(identity: string, name: string): Promise<void> {
     try {
       await this.bridge.restart();
     } catch (error: unknown) {
-      this.feedback = { identity, message: refusalMessage(error), failed: true, restart: true };
+      this.feedback.set({ identity, name, message: refusalMessage(error), failed: true, restart: true });
       this.hooks.changed();
     }
   }
@@ -187,22 +194,39 @@ export class PackageManagementController {
     return renderInstallStep(this.step, snapshot);
   }
 
+  /**
+   * The message area at the top of the Workspace page's Packages section. It
+   * shows the last registration result, named, and keeps its space when empty.
+   */
+  public renderMessage(snapshot: PackageHostSnapshot | null): string {
+    const feedback = this.feedback.current();
+    const registration = feedback
+      ? snapshot?.registrations.find(({ expectedIdentity }) => expectedIdentity === feedback.identity)
+      : undefined;
+    // A row that waits for a restart already says what a successful change did, and offers the restart.
+    const pending = registration !== undefined && pendingRestartChange(registration) !== null;
+    if (!feedback || (pending && !feedback.failed)) return renderStatusMessageSlot(null, MESSAGE_DISMISS);
+    const restart = feedback.restart && !pending
+      ? '<button type="button" data-package-change-restart>Restart Teamarness</button>'
+      : "";
+    return renderStatusMessageSlot(
+      { message: `${feedback.name}: ${feedback.message}`, failed: feedback.failed },
+      MESSAGE_DISMISS,
+      restart,
+    );
+  }
+
   /** Personal registrations that failed to admit, Team Package overrides, and entries waiting for a restart. */
   public renderRegistrations(snapshot: PackageHostSnapshot | null): string {
     const rows = attentionRegistrations(snapshot);
-    const feedback = this.feedback;
-    // A removed registration leaves the list, so its result is shown for the section.
-    const detached = feedback && !rows.some(({ expectedIdentity }) => expectedIdentity === feedback.identity)
-      ? `<div class="${feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${feedback.failed ? "alert" : "status"}"><p>${escape(feedback.message)}</p>${feedback.restart ? '<button type="button" data-package-change-restart>Restart Teamarness</button>' : ""}</div>`
-      : "";
-    if (rows.length === 0) return detached;
+    if (rows.length === 0) return "";
     const items = rows.map((registration, index) => renderRegistration(
       registration,
       index,
       snapshot,
       this.registrationState(registration.expectedIdentity),
     )).join("");
-    return `<section class="package-registrations" aria-labelledby="package-registrations-heading"><h3 id="package-registrations-heading">Needs attention on this device</h3>${detached}<div class="package-instance-list">${items}</div></section>`;
+    return `<section class="package-registrations" aria-labelledby="package-registrations-heading"><h3 id="package-registrations-heading">Needs attention on this device</h3><div class="package-instance-list">${items}</div></section>`;
   }
 
   /** Whether Remove waits for confirmation, an action runs, and how the last one went, for one identity. */
@@ -210,15 +234,22 @@ export class PackageManagementController {
     return {
       confirming: this.confirmingRemoval === identity,
       working: this.workingRegistration === identity,
-      feedback: this.feedback?.identity === identity ? this.feedback : null,
+      feedback: this.feedback.current()?.identity === identity ? this.feedback.current() : null,
     };
   }
 
   /** Forgets the last registration result and any pending Remove confirmation. */
   public dismissFeedback(): void {
     if (this.workingRegistration) return;
-    this.feedback = null;
+    this.feedback.clear();
     this.confirmingRemoval = null;
+  }
+
+  /** Dismisses the shown message, for the person's dismiss control. */
+  public dismissMessage(): void {
+    if (!this.feedback.current()) return;
+    this.feedback.clear();
+    this.hooks.changed();
   }
 
   /** The identity behind a rendered registration row. */
@@ -297,23 +328,24 @@ export class PackageManagementController {
 
   private async runRegistration(
     identity: string,
+    name: string,
     operation: () => Promise<Readonly<{ restartRequired: boolean }>>,
     success: (change: Readonly<{ restartRequired: boolean }>) => string,
   ): Promise<void> {
     this.workingRegistration = identity;
-    this.feedback = null;
+    this.feedback.clear();
     this.hooks.changed();
     let feedback: RegistrationFeedback;
     try {
       const change = await operation();
-      feedback = { identity, message: success(change), failed: false, restart: change.restartRequired };
+      feedback = { identity, name, message: success(change), failed: false, restart: change.restartRequired };
     } catch (error: unknown) {
-      feedback = { identity, message: refusalMessage(error), failed: true, restart: false };
+      feedback = { identity, name, message: refusalMessage(error), failed: true, restart: false };
     }
     // After a refusal the Host may have changed the registration's status, so read it again either way.
     await this.refreshQuietly();
     this.workingRegistration = null;
-    this.feedback = feedback;
+    this.feedback.set(feedback);
     this.hooks.changed();
   }
 
@@ -441,7 +473,11 @@ export const TEAM_ENTRY_REMOVED_COPY = "Removed from this device. The Team Packa
 
 export const REMOVED_FOR_RESTART_COPY = "Removed from this device. Restart Teamarness to use the Team Package again.";
 
-function teamPackageName(snapshot: PackageHostSnapshot | null, identity: string): string {
+/** The attribute of the Workspace page's dismiss control. */
+const MESSAGE_DISMISS = "data-package-message-dismiss";
+
+/** A Package's display name, or its identity when the snapshot has no such Package. */
+function packageName(snapshot: PackageHostSnapshot | null, identity: string): string {
   return snapshot?.packages.find((entry) => entry.identity === identity)?.displayName ?? identity;
 }
 
@@ -477,7 +513,7 @@ function renderInstallStep(step: PackageInstallStep, snapshot: PackageHostSnapsh
       return panel(`Trust ${step.inspected.displayName}?`, `<p>${escape(step.inspected.displayName)} runs as native code on this device, with your permissions. Teamarness does not sandbox it. It can use:</p><ul class="package-risks">${risks}</ul><p>Install it only if you trust where it came from.</p>${actions(button("trust", label), button("cancel", "Cancel", true))}`);
     }
     case "override": {
-      const team = teamPackageName(snapshot, step.inspected.identity);
+      const team = packageName(snapshot, step.inspected.identity);
       return panel(`Replace ${team}?`, `<p>This is a second, separate confirmation. ${escape(step.inspected.displayName)} from this folder replaces the Team Package ${escape(team)} on this device, in all your Workspaces. The change applies after Teamarness restarts. Data is kept.</p><p>To return to the Team Package later, remove the override and restart.</p>${actions(button("override", `Replace ${team} after restart`), button("cancel", "Cancel", true))}`);
     }
     case "installed":
@@ -498,7 +534,7 @@ function renderPreview(inspected: InspectedPackage, snapshot: PackageHostSnapsho
   const provided = list(inspected.provided.map(({ identity, major, minor }) => `${identity} ${major}.${minor}`));
   const consumed = list(inspected.consumed.map(({ identity, major, required }) =>
     `${identity} ${major}${required ? "" : " (optional)"}`));
-  const team = teamPackageName(snapshot, inspected.identity);
+  const team = packageName(snapshot, inspected.identity);
   const notes: Readonly<Record<InspectedPackage["kind"], string>> = {
     new: "",
     reload: "This folder is already registered. Installing it again restarts it with the current build.",
@@ -529,7 +565,7 @@ function renderRegistration(
   const identity = registration.expectedIdentity;
   const team = isTeamIdentityEntry(registration);
   const pending = pendingRestartChange(registration);
-  const name = team ? teamPackageName(snapshot, identity) : identity;
+  const name = team ? packageName(snapshot, identity) : identity;
   const action = (value: PackageRegistrationAction, label: string, secondary = false): string =>
     `<button type="button"${secondary ? ' class="secondary"' : ""} data-package-registration-action="${value}" data-package-registration-index="${index}" aria-label="${escape(`${label} ${name}`)}"${state.working ? " disabled" : ""}>${escape(label)}</button>`;
   const refused = registration.status.kind === "refused"
@@ -542,11 +578,6 @@ function renderRegistration(
       : `<p>Personal Package from ${escape(registration.directory)}. It could not start.</p>`;
   const pendingNote = pending ? `<p class="package-install-note" role="status">${escape(pendingRestartCopy(pending, name))}</p>` : "";
   const working = state.working ? '<p role="status" aria-live="polite">Working…</p>' : "";
-  // A row that waits for a restart has its own Restart Teamarness control,
-  // and its pending note already says what a successful change did.
-  const feedback = state.feedback && !(pending && !state.feedback.failed)
-    ? `<div class="${state.feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${state.feedback.failed ? "alert" : "status"}"><p>${escape(state.feedback.message)}</p>${state.feedback.restart && !pending ? action("restart", "Restart Teamarness") : ""}</div>`
-    : "";
   const teamRuns = team && teamPackageRuns(snapshot, identity);
   const removeLabel = registrationRemoveLabel(registration, teamRuns);
   const buttons = [
@@ -560,7 +591,7 @@ function renderRegistration(
       ? teamEntryRemoveQuestion(registration, name, teamRuns)
       : `Remove ${name} from this device? ${REMOVE_KEEPS_DATA_COPY}`)}</p><div class="package-instance-actions">${action("confirm-remove", removeLabel)}${action("cancel-remove", "Keep it", true)}</div></div>`
     : `<div class="package-instance-actions">${buttons}</div>`;
-  return `<article class="package-instance" aria-labelledby="package-registration-name-${index}"><div><h4 id="package-registration-name-${index}"><button type="button" class="package-instance-link" data-package-registration-page="${index}" aria-label="${escape(`About ${name}`)}">${escape(name)}</button></h4>${summary}${refused}${pendingNote}</div>${working}${feedback}${controls}</article>`;
+  return `<article class="package-instance" aria-labelledby="package-registration-name-${index}"><div><h4 id="package-registration-name-${index}"><button type="button" class="package-instance-link" data-package-registration-page="${index}" aria-label="${escape(`About ${name}`)}">${escape(name)}</button></h4>${summary}${refused}${pendingNote}</div>${working}${controls}</article>`;
 }
 
 function escape(value: string): string {

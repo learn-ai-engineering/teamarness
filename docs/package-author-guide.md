@@ -110,7 +110,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
 }
 ```
 
-The Package page in the Shell then shows **Open settings**. It opens the settings view of the Package in the current Workspace. The Shell names the view above the frame and offers a way back to the main view. Both views use the same Backend, client, and UI contract.
+The Package page in the Shell then shows a **Configuration** tab. It mounts the settings view of the Package in the current Workspace, below the Shell's page header and tabs. Selecting **About** or leaving the page unmounts it. Both views use the same Backend, client, and UI contract.
 
 A manifest with another value, or with `"settings"` twice, fails admission with `manifest_malformed` and a pointer such as `/ui/views/0`. When the Shell asks for a view the manifest does not declare, the Host refuses the mount with `ui_view_not_declared`. A UI that declares no views can ignore `context.view`, because it is always `"main"`. In tests, `createTestMountContext({ root, client, view: "settings" })` from `@teamarness/package-ui-sdk/testing` builds a settings context. The view defaults to `"main"`.
 
@@ -266,7 +266,7 @@ A Package UI runs in a sandboxed frame with an opaque origin, so it reaches neit
 2. Build the final Backend executable, ESM entrypoint, declared assets, and UI contract in the Package repository.
 3. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`. `npm run build` does both and validates the result.
 4. Install the Package Directory from the Shell: on the Workspace page, select **+** (**Add Personal Package**), choose the folder, check the preview, and select **Trust and install**. It starts without a restart. [Local Package registration](local-package-registration.md) describes the flow, the Package page, and the hand-written registration file.
-5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. The Package page offers **Restart**, **Pause**, and **Resume**, and **Open settings** when you declare a settings view. The Workspace page offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
+5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. The Package page offers **Restart**, **Pause**, and **Resume**, and a **Configuration** tab when you declare a settings view. The Workspace page offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
 6. Rebuild in place when needed, then select **Reload** on the Package page. Reload admits the new bytes in every Workspace and keeps the Package Data Directory. There is no source watch: Teamarness admits new bytes only when you reload or restart it.
 
 ## Promotion to application distribution

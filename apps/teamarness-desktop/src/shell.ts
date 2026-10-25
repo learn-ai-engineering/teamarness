@@ -1,6 +1,6 @@
 import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge, PackageUiView } from "./package-contracts";
 import { PackageManagementController } from "./package-install";
-import { PackagePageController } from "./package-page";
+import { buildPackagePagePresentation, PackagePageController, type PackagePageTab } from "./package-page";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import type { InstallationPackageVisibility } from "./package-visibility";
 import {
@@ -10,6 +10,7 @@ import {
   type PackageNavigationPresentation,
   type ShellPresentation,
 } from "./presentation";
+import type { StatusMessageTimers } from "./status-message";
 import type { InstallationThemeController, ThemePreference } from "./theme";
 import { THEME_OPTIONS } from "./theme-icons";
 import { renderShell, type ShellModel } from "./view";
@@ -17,16 +18,18 @@ import { renderShell, type ShellModel } from "./view";
 export type ShellRoute =
   | Readonly<{ kind: "workspace-chooser" }>
   | Readonly<{ kind: "workspace-settings"; workspaceId: string }>
-  /** An open Package UI. `view` is `main` when absent; `settings` only for a Package that declares it. */
-  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey; view?: PackageUiView }>
-  | Readonly<{ kind: "package-page"; workspaceId: string; packageIdentity: string }>;
+  /** The main view of an open Package UI. */
+  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>
+  /**
+   * A Package page. `tab` is About when absent. Configuration mounts the
+   * Package's settings view below the page header.
+   */
+  | Readonly<{ kind: "package-page"; workspaceId: string; packageIdentity: string; tab?: PackagePageTab }>;
 
 export type ShellFrame = Readonly<{
   workspaceRail: HTMLElement;
   contextualNavigation: HTMLElement;
   shellScreen: HTMLElement;
-  /** Above an open Package UI: names a view other than `main` and leads back to it. */
-  packageViewBar: HTMLElement;
   packageMount: HTMLElement;
 }>;
 
@@ -69,6 +72,8 @@ type ShellOptions = Readonly<{
   onRouteChange?: (route: ShellRoute) => void;
   /** Copies text for the person; defaults to the clipboard. */
   copy?: (value: string) => Promise<void>;
+  /** The timer that hides success messages; defaults to the browser's. */
+  timers?: StatusMessageTimers;
 }>;
 
 export class Shell {
@@ -82,6 +87,7 @@ export class Shell {
   private packageActionTargets: readonly PackageInstanceKey[] = [];
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
+  private packagePageTabFocus = false;
   private readonly packageManagement: PackageManagementController;
   private readonly packagePage: PackagePageController;
 
@@ -90,7 +96,6 @@ export class Shell {
     private readonly options: ShellOptions,
   ) {
     this.shellFrame.packageMount.hidden = true;
-    this.shellFrame.packageViewBar.hidden = true;
     this.packageManagement = new PackageManagementController(options.packageManagement, {
       changed: () => { this.renderPackageConsumers(); },
       refresh: async () => {
@@ -101,7 +106,7 @@ export class Shell {
           throw error;
         }
       },
-    });
+    }, options.timers);
     this.packagePage = new PackagePageController(options.packageManagement, {
       suspend: (instance) => this.runPageLifecycle(() => this.options.packageShell.suspendBackend(instance)),
       recover: (instance) => this.runPageLifecycle(() => this.options.packageShell.recoverBackend(instance)),
@@ -117,15 +122,8 @@ export class Shell {
         }
       },
       removed: (target) => { void this.navigate({ kind: "workspace-settings", workspaceId: target.workspaceId }); },
-      openView: (target, view) => {
-        void this.navigate({
-          kind: "package-instance",
-          instance: { packageIdentity: target.packageIdentity, workspaceId: target.workspaceId },
-          view,
-        });
-      },
       copy: (value) => (this.options.copy ?? ((text) => navigator.clipboard.writeText(text)))(value),
-    });
+    }, options.timers);
   }
 
   public frame(): ShellFrame { return this.shellFrame; }
@@ -165,22 +163,61 @@ export class Shell {
     this.renderPackageConsumers();
   }
 
-  public async navigate(route: ShellRoute): Promise<void> {
+  public async navigate(requested: ShellRoute): Promise<void> {
+    const route = this.availableRoute(requested);
     this.setRoute(route);
     if (route.kind === "package-instance") {
+      placePackageMount(this.shellFrame.packageMount, "pane");
       this.shellFrame.shellScreen.hidden = true;
       this.shellFrame.packageMount.hidden = false;
       this.renderContextualNavigation();
-      this.renderPackageViewBar();
-      await this.options.packageShell.select(route.instance, route.view ?? "main");
+      await this.options.packageShell.select(route.instance, "main");
+      return;
+    }
+
+    if (route.kind === "package-page" && route.tab === "configuration") {
+      // The settings view mounts below the page header and its tabs.
+      placePackageMount(this.shellFrame.packageMount, "package-page");
+      this.shellFrame.shellScreen.hidden = false;
+      this.shellFrame.packageMount.hidden = false;
+      // Select before awaiting anything, so a later route's unmount is ordered after this mount.
+      const selected = this.options.packageShell.select(
+        { packageIdentity: route.packageIdentity, workspaceId: route.workspaceId },
+        "settings",
+      );
+      if (await this.preparePresentation()) this.renderAll();
+      await selected;
       return;
     }
 
     await this.options.packageShell.hide();
-    this.renderPackageViewBar();
+    placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
     if (await this.preparePresentation()) this.renderAll();
+  }
+
+  /** The Configuration tab needs a declared settings view and an Instance here; otherwise the page opens on About. */
+  private availableRoute(route: ShellRoute): ShellRoute {
+    if (route.kind !== "package-page" || route.tab === undefined) return route;
+    if (route.tab === "configuration" && buildPackagePagePresentation(this.packageSnapshot, route)?.settings === true) {
+      return route;
+    }
+    return { kind: "package-page", workspaceId: route.workspaceId, packageIdentity: route.packageIdentity };
+  }
+
+  /** Selects a Package page tab and keeps keyboard focus on it, because rendering replaces the tabs. */
+  private async selectPackagePageTab(tab: string | undefined): Promise<void> {
+    const route = this.selectedRoute;
+    if (route.kind !== "package-page" || (tab !== "about" && tab !== "configuration")) return;
+    if ((route.tab ?? "about") === tab) return;
+    this.packagePageTabFocus = true;
+    await this.navigate({
+      kind: "package-page",
+      workspaceId: route.workspaceId,
+      packageIdentity: route.packageIdentity,
+      ...(tab === "configuration" ? { tab } : {}),
+    });
   }
 
   private setRoute(route: ShellRoute): void {
@@ -297,56 +334,39 @@ export class Shell {
         if (instance) void this.navigate({ kind: "package-instance", instance });
       });
     });
-    this.bindPackagePageLinks(this.shellFrame.contextualNavigation);
     this.bindPackageSnapshotRetry(this.shellFrame.contextualNavigation);
   }
 
   private deactivatePackage(): void {
-    if (this.selectedRoute.kind === "package-instance") {
+    if (this.selectedRoute.kind === "package-instance" || isPackageConfiguration(this.selectedRoute)) {
       void this.options.packageShell.hide().catch(() => undefined);
     }
+    placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
-    this.shellFrame.packageViewBar.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
-  }
-
-  /**
-   * Names the open view when it is not `main`, and offers the way back to `main`. The Package UI
-   * frame owns everything inside the mount, so this bar sits above it.
-   */
-  private renderPackageViewBar(): void {
-    const bar = this.shellFrame.packageViewBar;
-    const route = this.selectedRoute;
-    if (route.kind !== "package-instance" || (route.view ?? "main") === "main") {
-      bar.hidden = true;
-      bar.innerHTML = "";
-      return;
-    }
-    const instance = route.instance;
-    const name = this.packageSnapshot?.packages.find(({ identity }) => identity === instance.packageIdentity)?.displayName
-      ?? instance.packageIdentity;
-    bar.innerHTML = `<p class="package-view-bar__title"><span class="eyebrow">Settings</span><strong>${escape(`${name} settings`)}</strong></p><button type="button" class="secondary" data-package-view-main aria-label="${escape(`Back to ${name}`)}">${escape(`Back to ${name}`)}</button>`;
-    bar.hidden = false;
-    if (!hasQueries(bar)) return;
-    bar.querySelector<HTMLButtonElement>("[data-package-view-main]")?.addEventListener("click", () => {
-      void this.navigate({ kind: "package-instance", instance });
-    });
   }
 
   private renderSelectedScreen(): void {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
     if (this.selectedRoute.kind === "package-page") {
       this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute, {
-        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot)}`,
+        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}`,
       });
       this.bindSelectedScreen();
-      if (this.packagePage.takeFocusRequest() && hasQueries(this.shellFrame.shellScreen)) {
+      const pageOpened = this.packagePage.takeFocusRequest();
+      const tabSelected = this.packagePageTabFocus;
+      this.packagePageTabFocus = false;
+      if (!hasQueries(this.shellFrame.shellScreen)) return;
+      if (pageOpened) {
         this.shellFrame.shellScreen.querySelector<HTMLElement>("[data-package-page-focus]")?.focus();
+      } else if (tabSelected) {
+        // Rendering replaced the tabs, so return keyboard focus to the selected one.
+        this.shellFrame.shellScreen.querySelector<HTMLElement>(`[data-package-page-tab="${this.selectedRoute.tab ?? "about"}"]`)?.focus();
       }
       return;
     }
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
-      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
+      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
         this.packageActionTargets,
         this.packageLifecycleFeedback,
@@ -400,6 +420,9 @@ export class Shell {
     screen.querySelector<HTMLButtonElement>("[data-package-change-restart]")?.addEventListener("click", () => {
       void this.packageManagement.restartAfterChange();
     });
+    screen.querySelector<HTMLButtonElement>("[data-package-message-dismiss]")?.addEventListener("click", () => {
+      this.packageManagement.dismissMessage();
+    });
     screen.querySelectorAll<HTMLButtonElement>("[data-package-registration-page]").forEach((button) => {
       button.addEventListener("click", () => {
         const identity = this.packageManagement.registrationIdentity(
@@ -415,9 +438,14 @@ export class Shell {
         void this.packagePage.action(button.dataset.packagePageAction, this.packageSnapshot);
       });
     });
-    screen.querySelector<HTMLButtonElement>("[data-package-page-back]")?.addEventListener("click", () => {
-      const workspaceId = routeWorkspaceId(this.selectedRoute);
-      if (workspaceId) void this.navigate({ kind: "workspace-settings", workspaceId });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-page-tab]").forEach((button) => {
+      button.addEventListener("click", () => { void this.selectPackagePageTab(button.dataset.packagePageTab); });
+    });
+    screen.querySelector<HTMLElement>("[data-package-page-tabs]")?.addEventListener("keydown", (event) => {
+      const tab = adjacentPackagePageTab(this.selectedRoute, screen, (event as KeyboardEvent).key);
+      if (!tab) return;
+      event.preventDefault();
+      void this.selectPackagePageTab(tab);
     });
     this.bindPackagePageLinks(screen);
   }
@@ -540,6 +568,12 @@ export class Shell {
   }
 
   private renderPackageConsumers(): void {
+    const route = this.selectedRoute;
+    // Configuration closes when its settings view is no longer available, for example after a Dispose.
+    if (isPackageConfiguration(route) && this.availableRoute(route) !== route) {
+      void this.navigate(route);
+      return;
+    }
     this.renderContextualNavigation();
     if (this.selectedRoute.kind === "workspace-settings" || this.selectedRoute.kind === "package-page") {
       this.renderSelectedScreen();
@@ -585,12 +619,47 @@ export function shellFrameFromDocument(root: ParentNode = document): ShellFrame 
   const workspaceRail = root.querySelector<HTMLElement>("#workspace-rail");
   const contextualNavigation = root.querySelector<HTMLElement>("#contextual-navigation");
   const shellScreen = root.querySelector<HTMLElement>("#shell-screen");
-  const packageViewBar = root.querySelector<HTMLElement>("#package-view-bar");
   const packageMount = root.querySelector<HTMLElement>("#package-mount");
-  if (!workspaceRail || !contextualNavigation || !shellScreen || !packageViewBar || !packageMount) {
+  if (!workspaceRail || !contextualNavigation || !shellScreen || !packageMount) {
     throw new Error("Shell frame is unavailable");
   }
-  return Object.freeze({ workspaceRail, contextualNavigation, shellScreen, packageViewBar, packageMount });
+  return Object.freeze({ workspaceRail, contextualNavigation, shellScreen, packageMount });
+}
+
+function isPackageConfiguration(route: ShellRoute): route is Extract<ShellRoute, { kind: "package-page" }> {
+  return route.kind === "package-page" && route.tab === "configuration";
+}
+
+/**
+ * Where the Package mount sits: the whole pane for a Package UI, or below a
+ * Package page's header as that page's Configuration tab panel.
+ */
+function placePackageMount(mount: HTMLElement, placement: "pane" | "package-page"): void {
+  if (typeof mount.setAttribute !== "function") return;
+  if (placement === "package-page") {
+    mount.setAttribute("data-placement", "package-page");
+    mount.setAttribute("role", "tabpanel");
+    mount.setAttribute("aria-labelledby", "package-page-tab-configuration");
+    mount.removeAttribute("aria-label");
+  } else {
+    mount.removeAttribute("data-placement");
+    mount.removeAttribute("role");
+    mount.removeAttribute("aria-labelledby");
+    mount.setAttribute("aria-label", "Package interface");
+  }
+}
+
+/** The tab an arrow, Home, or End key moves to, among the tabs the page shows. */
+function adjacentPackagePageTab(route: ShellRoute, screen: HTMLElement, key: string): PackagePageTab | null {
+  if (route.kind !== "package-page") return null;
+  const tabs = [...screen.querySelectorAll<HTMLElement>("[data-package-page-tab]")]
+    .map((tab) => tab.dataset.packagePageTab)
+    .filter((tab): tab is PackagePageTab => tab === "about" || tab === "configuration");
+  const index = tabs.indexOf(route.tab ?? "about");
+  if (index < 0 || tabs.length === 0) return null;
+  const step = key === "ArrowRight" ? 1 : key === "ArrowLeft" ? -1 : 0;
+  const next = key === "Home" ? tabs[0] : key === "End" ? tabs.at(-1) : step ? tabs[(index + step + tabs.length) % tabs.length] : undefined;
+  return next ?? null;
 }
 
 function hasQueries(element: HTMLElement): boolean {
@@ -618,8 +687,6 @@ function isThemePreference(value: string): value is ThemePreference {
 
 const SETTINGS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 
-const INFO_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
-
 const EYE_OPEN_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 
 const EYE_CLOSED_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c6.5 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3.5 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="M2 2l20 20"/></svg>';
@@ -635,17 +702,7 @@ function packageButton(
     && route.instance.workspaceId === instance.workspaceId
     ? ' aria-current="page"'
     : "";
-  const localMarker = row.installationLocal
-    ? '<span class="package-installation-marker">Runs only on this Installation</span>'
-    : "";
-  const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
-  const pageCurrent = route.kind === "package-page" && instance
-    && route.packageIdentity === instance.packageIdentity
-    && route.workspaceId === instance.workspaceId
-    ? ' aria-current="page"'
-    : "";
-  const about = `<button type="button" class="package-about" data-package-page-index="${row.actionIndex}" aria-label="${escape(`About ${row.name}`)}" title="${escape(`About ${row.name}`)}"${pageCurrent}>${INFO_ICON}</button>`;
-  return `<li class="package-nav-row"><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${sourceMarker}${localMarker}</button>${about}</li>`;
+  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small></button></li>`;
 }
 
 function renderPackageInstanceSettings(
