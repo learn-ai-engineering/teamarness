@@ -79,6 +79,7 @@ struct Inner {
     exit_allowed: bool,
 }
 struct Shared {
+    runtime: tokio::runtime::Handle,
     inner: Mutex<Inner>,
     changes: watch::Sender<u64>,
     cancel: watch::Sender<bool>,
@@ -102,7 +103,13 @@ impl Drop for Lease {
 }
 impl Lifecycle {
     pub(crate) fn new() -> Self {
+        Self::on_runtime(tauri::async_runtime::handle().inner().clone())
+    }
+    // Retain the native runtime explicitly; synchronous callbacks have no entered runtime.
+    // A private handle also keeps paused-clock tests on their owning executor.
+    fn on_runtime(runtime: tokio::runtime::Handle) -> Self {
         Self(Arc::new(Shared {
+            runtime,
             inner: Mutex::new(Inner {
                 status: Status {
                     revision: 0,
@@ -237,7 +244,7 @@ impl Lifecycle {
         adapter.stop_updates();
         self.signal(inner);
         let lifecycle = self.clone();
-        tokio::spawn(async move {
+        self.0.runtime.spawn(async move {
             lifecycle.run(pending, adapter).await;
         });
     }

@@ -9,6 +9,7 @@ fn manifest(version: &str) -> serde_json::Value {
     json!({"version": version, "notes": "A stable update", "platforms": {"darwin-aarch64": platform, "darwin-aarch64-app": platform}})
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
 #[test]
 fn update_metadata_requires_newer_canonical_stable_and_exact_repository() {
     let installed = semver::Version::new(1, 0, 0);
@@ -100,6 +101,20 @@ fn fixture(
     failure: bool,
     block: Option<Arc<Notify>>,
 ) -> (UpdateService, Arc<FixtureTransfer>) {
+    let (system, transfer) = fixture_system(feed, bytes, failure, block);
+    let service = UpdateService::on_runtime(
+        Version::new(1, 0, 0),
+        Some(system),
+        tokio::runtime::Handle::current(),
+    );
+    (service, transfer)
+}
+fn fixture_system(
+    feed: serde_json::Value,
+    bytes: &[u8],
+    failure: bool,
+    block: Option<Arc<Notify>>,
+) -> (System, Arc<FixtureTransfer>) {
     let transfer = Arc::new(FixtureTransfer {
         feed: serde_json::to_vec(&feed).unwrap(),
         bytes: bytes.to_vec(),
@@ -107,16 +122,16 @@ fn fixture(
         failure,
         block,
     });
-    let service = UpdateService::new(
-        Version::new(1, 0, 0),
-        Some(System {
+    (
+        System {
             clock: Arc::new(SystemClock),
             transfer: transfer.clone(),
             verifier: official(),
-        }),
-    );
-    (service, transfer)
+        },
+        transfer,
+    )
 }
+
 async fn wait_state(service: &UpdateService, state: State) {
     // Yield to the owned blocking verifier; a wall deadline reports a missing transition,
     // never causes it. No fixture delay or timing-based race trigger.
@@ -143,7 +158,7 @@ async fn wait_calls(transfer: &FixtureTransfer, count: usize) {
     panic!("missing transfer call {count}");
 }
 
-// Verifies: TEAM-R10. Background discovery never owns ordinary runtime dispatch.
+// Verifies: TEAM-R10, TEAM.SYS.SHELL-R07. Background discovery never owns ordinary runtime dispatch.
 #[tokio::test(start_paused = true)]
 async fn update_schedule_launch_six_hours_resume_coalescing_and_explicit_rate_limit() {
     let block = Arc::new(Notify::new());
@@ -183,6 +198,7 @@ async fn update_schedule_launch_six_hours_resume_coalescing_and_explicit_rate_li
     assert!(service.inner.lock().unwrap().pending.is_none());
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test(start_paused = true)]
 async fn update_real_signed_candidate_ready_suspends_acquisition_and_exit_loses_bytes() {
     let (service, transfer) = fixture(manifest("1.2.3"), BYTES, false, None);
@@ -208,6 +224,7 @@ async fn update_real_signed_candidate_ready_suspends_acquisition_and_exit_loses_
     assert!(service.status().revision > snapshot.revision);
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test]
 async fn update_real_verifier_rejects_all_negative_signatures_through_service() {
     let mut altered = BYTES.to_vec();
@@ -250,6 +267,7 @@ impl Verifier for GatedVerifier {
         self.actual.verify(metadata, bytes)
     }
 }
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test]
 async fn update_progress_and_late_successful_verification_cannot_publish_ready_after_quit() {
     let entered = Arc::new(Notify::new());
@@ -282,6 +300,7 @@ async fn update_progress_and_late_successful_verification_cannot_publish_ready_a
     assert!(service.inner.lock().unwrap().pending.is_none());
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test]
 async fn update_apply_admission_only_transfers_same_verified_candidate_once() {
     let (service, _) = fixture(manifest("1.2.3"), BYTES, false, None);
@@ -313,6 +332,7 @@ impl Transfer for DiscoveryResult {
         })
     }
 }
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test]
 async fn update_invalid_discovery_never_downloads_or_marks_ready() {
     let mut cases = vec![
@@ -383,6 +403,7 @@ impl Transfer for LateArchive {
         })
     }
 }
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test]
 async fn update_quit_fences_late_transfer_progress_and_candidate() {
     let entered = Arc::new(Notify::new());
@@ -414,6 +435,7 @@ async fn update_quit_fences_late_transfer_progress_and_candidate() {
     assert_eq!(service.status().state, State::Stopped);
     assert!(service.inner.lock().unwrap().pending.is_none());
 }
+/// Verifies: TEAM.SYS.SHELL-R07
 #[test]
 fn update_debug_environment_cannot_enable_production() {
     if std::env::var_os("TEAMARNESS_TEST_UPDATE_ENV_PROBE").is_some() {
@@ -444,6 +466,7 @@ fn update_debug_environment_cannot_enable_production() {
     );
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
 #[test]
 fn update_default_application_initializes_without_updater_configuration() {
     // The ordinary bundle has no updater key/configuration. Merely registering
@@ -456,6 +479,7 @@ fn update_default_application_initializes_without_updater_configuration() {
     assert!(!service.request_check());
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
 #[tokio::test]
 async fn update_apply_rechecks_pending_version_and_lifecycle_quit_cancels_download() {
     let (service, _) = fixture(manifest("1.2.3"), BYTES, false, None);
@@ -506,4 +530,50 @@ pub(super) async fn ready_for_commands() -> UpdateService {
     service.request_check();
     wait_state(&service, State::Ready).await;
     service
+}
+
+/// Verifies: TEAM.SYS.SHELL-R07
+#[test]
+fn native_enabled_startup_and_check_after_returned_block_on_launch_acquisition() {
+    tauri::async_runtime::block_on(async {});
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    // Same enabled scheduler launch used by start(), without installed-bundle or network access.
+    let (system, transfer) = fixture_system(manifest("1.2.3"), BYTES, true, None);
+    let service = UpdateService::new(Version::new(1, 0, 0), Some(system));
+    service.start_scheduler();
+    // Idle is also the initial state: wait for the launch publication, not just that state.
+    tauri::async_runtime::block_on(async {
+        wait_calls(&transfer, 1).await;
+        wait_state(&service, State::Idle).await;
+    });
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    assert!(service.request_check());
+    assert!(!service.request_check());
+    tauri::async_runtime::block_on(async {
+        wait_calls(&transfer, 2).await;
+        wait_state(&service, State::Idle).await;
+    });
+    assert_eq!(transfer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(service.status().error, Some(ErrorCategory::Network));
+    service.stop();
+    assert!(!service.request_check());
+}
+
+/// Verifies: TEAM.SYS.SHELL-R07
+#[test]
+fn native_explicit_check_after_returned_block_on_reaches_verified_ready() {
+    tauri::async_runtime::block_on(async {});
+    let (system, _) = fixture_system(manifest("1.2.3"), BYTES, false, None);
+    let service = UpdateService::new(Version::new(1, 0, 0), Some(system));
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    assert!(service.request_check());
+    assert!(!service.request_check());
+    tauri::async_runtime::block_on(async { wait_state(&service, State::Ready).await });
+    let generation = service.status().pending_generation.unwrap();
+    assert!(service.admit_apply("stale").is_err());
+    let pending = service.admit_apply(&generation).unwrap();
+    assert_eq!(pending.bytes, BYTES);
+    assert_eq!(pending.update.version, "1.2.3");
+    assert!(service.admit_apply(&generation).is_err());
+    assert!(!service.request_check());
 }

@@ -6,6 +6,7 @@ import { applicationUpdateBridge } from "./application-update-bridge";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => undefined) }));
 
+// Verifies: TEAM.SYS.SHELL-R07
 it("maps only four main-Shell controls and an opaque restart generation across the real bridge boundary", async () => {
   await applicationUpdateBridge.status();
   await applicationUpdateBridge.check();

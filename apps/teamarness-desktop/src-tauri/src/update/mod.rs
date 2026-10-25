@@ -204,6 +204,7 @@ struct System {
 }
 #[derive(Clone)]
 pub(crate) struct UpdateService {
+    runtime: tokio::runtime::Handle,
     inner: Arc<Mutex<Inner>>,
     system: Option<Arc<System>>,
     cancel: Cancellation,
@@ -212,10 +213,24 @@ pub(crate) struct UpdateService {
 }
 impl UpdateService {
     fn new(installed: Version, system: Option<System>) -> Self {
+        Self::on_runtime(
+            installed,
+            system,
+            tauri::async_runtime::handle().inner().clone(),
+        )
+    }
+    // Native setup and synchronous Check callbacks do not enter Tokio. Retain
+    // their task runtime; private clock fixtures can supply their paused executor.
+    fn on_runtime(
+        installed: Version,
+        system: Option<System>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
         let now = system
             .as_ref()
             .map_or_else(Instant::now, |system| system.clock.now());
         Self {
+            runtime,
             inner: Arc::new(Mutex::new(Inner {
                 snapshot: Snapshot {
                     revision: 0,
@@ -276,13 +291,16 @@ impl UpdateService {
         };
         let service = Self::new(app.package_info().version.clone(), system);
         service.inner.lock().unwrap().snapshot.error = error;
-        if service.system.is_some() {
-            let scheduler = service.clone();
-            tokio::spawn(async move {
+        service.start_scheduler();
+        service
+    }
+    fn start_scheduler(&self) {
+        if self.system.is_some() {
+            let scheduler = self.clone();
+            self.runtime.spawn(async move {
                 scheduler.schedule().await;
             });
         }
-        service
     }
 
     #[cfg(feature = "ui-isolation-probe")]
@@ -371,7 +389,7 @@ impl UpdateService {
         self.snapshots.send_replace(inner.snapshot.revision);
         drop(inner);
         let service = self.clone();
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             service.acquire().await;
         });
         true

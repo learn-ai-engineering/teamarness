@@ -158,6 +158,7 @@ mod tests {
     use super::*;
     use crate::lifecycle::{Lifecycle, Phase};
 
+    /// Verifies: TEAM.SYS.SHELL-R07
     #[test]
     fn application_update_permissions_are_exact_main_only_and_no_plugin_authority() {
         let capability: serde_json::Value =
@@ -182,11 +183,13 @@ mod tests {
         );
     }
 
+    /// Verifies: TEAM.SYS.SHELL-R07
     #[test]
     fn application_update_recovery_quit_is_denied_while_running() {
         assert!(!recovery_quit_allowed(&Lifecycle::new().status()));
     }
 
+    /// Verifies: TEAM.SYS.SHELL-R07
     #[test]
     fn application_update_snapshot_has_no_archive_or_credentials_and_status_bypasses_admission() {
         let lifecycle = Lifecycle::new();
@@ -228,10 +231,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn application_update_command_adapters_validate_generation_join_duplicates_and_allow_only_recovery_quit()
+    /// Verifies: TEAM.SYS.SHELL-R07
+    #[test]
+    fn native_application_update_command_adapters_validate_generation_join_duplicates_and_allow_only_recovery_quit()
      {
-        let updates = update::UpdateService::ready_for_commands().await;
+        let updates = tauri::async_runtime::block_on(update::UpdateService::ready_for_commands());
+        assert!(tokio::runtime::Handle::try_current().is_err());
         let lifecycle = Lifecycle::new();
         let terminal = Arc::new(Terminal::default());
         assert_eq!(
@@ -253,7 +258,11 @@ mod tests {
         );
         assert!(lifecycle.admit().is_err());
         assert!(snapshot(&lifecycle, &updates).revision > before);
-        lifecycle.finished().await;
+        tauri::async_runtime::block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), lifecycle.finished())
+                .await
+                .unwrap();
+        });
         assert!(recovery_quit_allowed(&lifecycle.status()));
         assert_eq!(
             terminal.installs.load(std::sync::atomic::Ordering::SeqCst),
@@ -268,6 +277,7 @@ mod tests {
     }
 
     #[cfg(feature = "ui-isolation-probe")]
+    /// Verifies: TEAM.SYS.SHELL-R07
     #[test]
     fn application_update_probe_real_fixture_is_ready_without_transport_and_never_production_selectable()
      {
