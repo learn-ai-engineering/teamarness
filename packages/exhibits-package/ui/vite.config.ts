@@ -2,7 +2,11 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   base: "./",
-  test: { css: true },
+  test: {
+    css: true,
+    // The viewer's frame points at `teamarness-content:`, which only the Shell serves.
+    environmentOptions: { happyDOM: { settings: { disableIframePageLoading: true } } },
+  },
   build: {
     assetsInlineLimit: 0,
     lib: {

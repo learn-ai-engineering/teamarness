@@ -8,6 +8,7 @@ import { STAGING_ROOT, readBundledPackages, repositoryRoot } from "./bundled-pac
 import { waitForDesktopCleanup } from "./packaged-app-cleanup.mjs";
 import { compareDeclaredPackageBytes } from "./package-directory.mjs";
 import { prepareUiIsolationProbe } from "./ui-isolation-probe/prepare.mjs";
+import { buildExhibitsFixtureConsumer, prepareExhibitsFixtureConsumer } from "./exhibits-fixture-consumer/prepare.mjs";
 
 const app = join(repositoryRoot, "target/release/bundle/macos/Teamarness.app");
 const executable = join(app, "Contents/MacOS/teamarness-desktop");
@@ -17,7 +18,24 @@ const bundledPackages = (await readBundledPackages(repositoryRoot)).map(({ ident
   resources: join(app, "Contents/Resources/packages", identity),
   staged: join(repositoryRoot, STAGING_ROOT, identity),
   backendPath: manifest.backends[0].path,
+  onDemand: manifest.activation === "on_demand",
 }));
+const exhibitsPackage = bundledPackages.find(({ identity }) => identity === "dev.teamarness.exhibits");
+assert.ok(exhibitsPackage, "the Exhibits Package is not bundled");
+
+// The checks the Exhibits revision 1 fixture reports, each as visible `PASS <name>` text.
+const EXHIBIT_RENDERING_CHECKS = [
+  "inline-script", "inline-style", "relative-stylesheet", "css-import", "png-image", "svg-image", "inline-svg",
+  "module-static-import", "module-dynamic-import", "fetch-own-json", "wasm-instantiate-streaming",
+  "wasm-compile-bytes", "navigated-to-page-2-and-back",
+];
+// The checks the content isolation probe reports, in the Exhibits viewer and in a frame
+// created without a `sandbox` attribute.
+const CONTENT_ISOLATION_CHECKS = [
+  "opaque-origin", "no-tauri-internals", "no-tauri-global", "no-window-ipc", "parent-document-blocked",
+  "top-document-blocked", "top-location-blocked", "storage-blocked", "ipc-fetch-blocked",
+  "forged-bridge-connect-ignored",
+];
 const dmg = join(repositoryRoot, "target/release/bundle/dmg/Teamarness_0.1.0_aarch64.dmg");
 const diagnosticOutputLimit = 4_096;
 
@@ -39,9 +57,11 @@ try {
   await smokeLaunch(dataDirectory, true);
   await smokeLaunch(dataDirectory, false);
   await probeLaunch(dataDirectory);
+  await exhibitsLaunch(dataDirectory);
   console.log(
     "Packaged app smoke passed twice with admitted UI, protocol traffic, and clean process reaping, "
-    + "and the WKWebView UI isolation probe reached neither Tauri nor the Shell.",
+    + "the WKWebView UI isolation probe reached neither Tauri nor the Shell, "
+    + "and Exhibits rendered a Draft whose content, sandboxed or not, reached neither.",
   );
 } finally {
   await chmod(dataDirectory, 0o700).catch(() => {});
@@ -160,14 +180,23 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
       return name of referencePackage
     `), "bundled reference Package navigation");
 
-    // The Package Host eagerly activates every admitted Package, so every bundled Backend must launch.
-    for (const { identity, displayName, resources, backendPath } of bundledPackages) {
+    // The Package Host eagerly activates every admitted Package that is not `on_demand`, so each
+    // of those bundled Backends must launch. An `on_demand` Backend (Exhibits) starts when it is
+    // first used; the Exhibits stage observes it.
+    for (const { identity, displayName, resources, backendPath } of bundledPackages.filter(({ onDemand }) => !onDemand)) {
       const backend = join(resources, backendPath);
       const stage = `bundled Package Backend ${identity}`;
       const backendPid = await atStage(stage, () => waitFor(() => bundledBackend(childPid, backend), stage));
       backendPids.push(backendPid);
       assertBundledBackend(backendPid, childPid, backend, displayName);
     }
+
+    await waitForAccessible(accessibilityScript(childPid, `
+      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
+      set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
+      set exhibitsNavigation to my namedDescendantStartingWith(teamPackages, "${exhibitsPackage.displayName}", "AXButton")
+      return name of exhibitsNavigation
+    `), "bundled Exhibits navigation");
 
     await waitForAccessible(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
@@ -280,6 +309,118 @@ async function probeLaunch(dataDirectory) {
     countWorkspaces(database, "name = 'Packaged smoke'"),
     1,
     "the isolation probe database check did not observe the smoke Workspace",
+  );
+}
+
+/**
+ * The Exhibits stage. The test-only fixture consumer publishes the content isolation probe and
+ * fixture revision 1 through the real Exhibits Ports, and frames its own content view of the
+ * probe without a `sandbox` attribute. Exhibits then lists both Drafts and opens each in its
+ * sandboxed viewer frame. Every verdict is read through Accessibility, and the Core database
+ * must hold no Workspace a content frame tried to create.
+ */
+async function exhibitsLaunch(dataDirectory) {
+  const backend = buildExhibitsFixtureConsumer();
+  const { displayName } = await prepareExhibitsFixtureConsumer(dataDirectory, { backend });
+  await withDesktop(dataDirectory, async ({ childPid, desktop, diagnostics, atStage, waitForAccessible, backendPids }) => {
+    const contents = () => {
+      const result = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
+        set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
+        set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
+        return entire contents of packageInterface
+      `)], { encoding: "utf8" });
+      if (result.status !== 0) {
+        diagnostics.lastAccessibilityFailure = appleScriptFailure(result);
+        return undefined;
+      }
+      return result.stdout;
+    };
+    const selectPackage = async (group, name, label) => {
+      const find = `
+        set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
+        set packageGroup to my namedDescendant(activeWorkspaceNavigation, "${group}", "AXGroup")
+        set packageButton to my namedDescendantStartingWith(packageGroup, "${name}", "AXButton")`;
+      await waitForAccessible(accessibilityScript(childPid, `${find}
+        return name of packageButton`), `${label} navigation`);
+      diagnostics.activeStage = `${label} selection`;
+      await runAppleScript(accessibilityScript(childPid, `${find}
+        click packageButton`), `${label} selection`);
+    };
+    const clickInPackage = async (name, label) => {
+      const find = `
+        set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
+        set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
+        set target to my namedDescendantStartingWith(packageInterface, "${name}", "AXButton")`;
+      await waitForAccessible(accessibilityScript(childPid, `${find}
+        return name of target`), label);
+      diagnostics.activeStage = label;
+      await runAppleScript(accessibilityScript(childPid, `${find}
+        click target`), label);
+    };
+    const waitForText = (text, label) => atStage(label, () => waitFor(() => {
+      const visible = contents();
+      if (visible?.includes("failed: ")) {
+        const failed = visible.split(",").map((entry) => entry.trim()).filter((entry) => entry.includes("failed: "));
+        throw new Error(`${label}: ${failed.join(", ")}`);
+      }
+      return visible?.includes(text);
+    }, label));
+    // Waits for a probe or fixture verdict, then requires `PASS <name>` for every expected check.
+    const waitForVerdict = (verdict, checks, label) => atStage(label, () => waitFor(() => {
+      const visible = contents();
+      if (!visible) return undefined;
+      const failed = [...visible.matchAll(/FAIL ([a-z0-9-]+)/gu)].map((match) => match[1]);
+      if (failed.length > 0 || /probe FAIL/u.test(visible)) {
+        throw new Error(`${label} failed: ${failed.join(", ") || "verdict FAIL"}`);
+      }
+      if (!visible.includes(verdict)) return undefined;
+      const missing = checks.filter((name) => !visible.includes(`PASS ${name}`));
+      if (missing.length > 0) return undefined;
+      return true;
+    }, label, 45_000));
+
+    await waitForAccessible(accessibilityScript(childPid, `
+      set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
+      return name of workspaceSwitcher
+    `), "desktop Shell readiness");
+
+    await selectPackage("Personal Packages", displayName, "Exhibits fixture consumer");
+    await clickInPackage("Publish isolation probe", "isolation probe publication");
+    await waitForText("Published fixture-isolation-probe revision 1", "isolation probe publication result");
+
+    // The publication went through the Exhibits Ports, so the on-demand Exhibits Backend runs
+    // from its bundled Package Directory now.
+    const exhibitsBackend = join(exhibitsPackage.resources, exhibitsPackage.backendPath);
+    const exhibitsPid = await atStage("on-demand Exhibits Backend", () =>
+      waitFor(() => bundledBackend(childPid, exhibitsBackend), "on-demand Exhibits Backend"));
+    backendPids.push(exhibitsPid);
+    assertBundledBackend(exhibitsPid, childPid, exhibitsBackend, exhibitsPackage.displayName);
+
+    await clickInPackage("Publish revision 1", "revision 1 publication");
+    await waitForText("Published fixture-revision-1 revision 1", "revision 1 publication result");
+    await clickInPackage("Open unsandboxed frame probe", "unsandboxed frame probe");
+    await waitForVerdict("Unsandboxed content frame probe PASS", CONTENT_ISOLATION_CHECKS, "unsandboxed content frame probe");
+
+    await selectPackage("Team Packages", exhibitsPackage.displayName, "Exhibits");
+    await clickInPackage("Exhibit isolation probe", "Exhibits isolation probe Draft");
+    await waitForVerdict("Content isolation probe PASS", CONTENT_ISOLATION_CHECKS, "Exhibits content isolation probe");
+    await clickInPackage("Exhibit fixture (revision 1)", "Exhibits revision 1 Draft");
+    await waitForText("Exhibit fixture revision 1", "Exhibits revision 1 entry page");
+    await waitForVerdict("PASS navigated-to-page-2-and-back", EXHIBIT_RENDERING_CHECKS, "Exhibits revision 1 rendering");
+
+    await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });
+  });
+
+  const database = await findCoreDatabase(dataDirectory);
+  assert.equal(
+    countWorkspaces(database, "name LIKE 'content-isolation-breach%'"),
+    0,
+    "an Exhibit content frame reached a Shell command in the packaged application",
+  );
+  assert.equal(
+    countWorkspaces(database, "name = 'Packaged smoke'"),
+    1,
+    "the content isolation database check did not observe the smoke Workspace",
   );
 }
 

@@ -42,6 +42,12 @@
       "major": 1,
       "minMinor": 0,
       "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.content-views",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
     }
   ],
   "consumedPorts": [

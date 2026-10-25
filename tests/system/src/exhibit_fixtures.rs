@@ -11,6 +11,11 @@
 //!   `testsrc2` and `sine` lavfi sources (`-c:v libx264 -preset slow -profile:v baseline
 //!   -pix_fmt yuv420p -b:v 400k -g 24 -c:a aac -b:a 64k -movflags +faststart -map_metadata -1
 //!   -fflags +bitexact`).
+//! - `isolation-probe`: a content page that checks it is opaque-origin, sees no Tauri globals,
+//!   cannot read `parent` or `top`, gets no reply to a forged bridge connect, and attempts
+//!   message-handler and `ipc:` posts that must create no Workspace. It reports in visible text;
+//!   with the `#unsandboxed` fragment it labels itself as a frame created without a `sandbox`
+//!   attribute.
 
 /// One file of a fixture: its path inside the Exhibit and its bytes.
 pub type FixtureFile = (&'static str, &'static [u8]);
@@ -25,7 +30,7 @@ macro_rules! file {
 }
 
 /// The fixture names [`fixture`] accepts.
-pub const FIXTURES: &[&str] = &["revision-1", "revision-2", "media"];
+pub const FIXTURES: &[&str] = &["revision-1", "revision-2", "media", "isolation-probe"];
 
 const SHARED: &[FixtureFile] = &[
     file!("revision-1", "assets/data.json"),
@@ -49,6 +54,11 @@ const MEDIA: &[FixtureFile] = &[
     file!("media", "assets/clip.mp4"),
 ];
 
+const ISOLATION_PROBE: &[FixtureFile] = &[
+    file!("isolation-probe", "index.html"),
+    file!("isolation-probe", "probe.js"),
+];
+
 /// A fixture's files, entry page first, or `None` for an unknown name.
 #[must_use]
 pub fn fixture(name: &str) -> Option<Vec<FixtureFile>> {
@@ -56,6 +66,7 @@ pub fn fixture(name: &str) -> Option<Vec<FixtureFile>> {
         "revision-1" => file!("revision-1", "index.html"),
         "revision-2" => file!("revision-2", "index.html"),
         "media" => return Some(MEDIA.to_vec()),
+        "isolation-probe" => return Some(ISOLATION_PROBE.to_vec()),
         _ => return None,
     };
     let mut files = vec![entry];
@@ -70,6 +81,7 @@ pub fn title(name: &str) -> &'static str {
         "revision-1" => "Exhibit fixture (revision 1)",
         "revision-2" => "Exhibit fixture (revision 2)",
         "media" => "Exhibit media fixture",
+        "isolation-probe" => "Exhibit isolation probe",
         _ => "Exhibit fixture",
     }
 }

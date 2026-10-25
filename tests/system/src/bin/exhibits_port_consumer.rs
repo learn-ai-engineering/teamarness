@@ -12,7 +12,12 @@
 //!   `agent.unbind` clears it. The Host then derives the Port actor from the binding.
 //! - `proof.start {prefix}` runs the system Port proof in the background, and `proof.result`
 //!   reports `idle`, `running` or `done` with the proof's report.
+//! - `frame.probe` serves the `isolation-probe` fixture from this Package's own content view and
+//!   returns its URL. The Consumer declares `teamarness.content-views`, so its UI may frame that
+//!   URL; the packaged smoke has the UI do so *without* a `sandbox` attribute, to observe that
+//!   the content scheme alone keeps content opaque-origin.
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +27,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use teamarness_package_sdk::capabilities::agent_binding::AgentBinding;
+use teamarness_package_sdk::capabilities::content_views::{
+    ContentFile, ContentSource, ContentViews,
+};
 use teamarness_package_sdk::{BackendError, Context, Empty, Router, ports::PortClient};
 use teamarness_system_tests::exhibit_fixtures::{self, FixtureFile};
 
@@ -31,6 +39,8 @@ const CHUNK: usize = 131_072;
 struct Consumer {
     ports: PortClient,
     binding: AgentBinding,
+    views: ContentViews,
+    data_directory: PathBuf,
     proof: Arc<Mutex<ProofState>>,
 }
 
@@ -104,9 +114,13 @@ async fn main() -> ExitCode {
         let ports = PortClient::new(activation.capabilities().clone(), grant);
         let binding =
             AgentBinding::from_initialization(&initialization, activation.capabilities().clone())?;
+        let views =
+            ContentViews::from_initialization(&initialization, activation.capabilities().clone())?;
         Ok(Consumer {
             ports,
             binding,
+            views,
+            data_directory: initialization.data_directory().path().to_owned(),
             proof: Arc::new(Mutex::new(ProofState::Idle)),
         })
     })
@@ -125,6 +139,35 @@ async fn main() -> ExitCode {
             let current = current_revision(ports, &id).await?;
             let (revision, sent) = publish(ports, &id, &title, &files, Some(current)).await?;
             Ok(json!({"exhibitId": id, "revision": revision, "chunksSent": sent}))
+        },
+    )
+    .request(
+        "frame.probe",
+        |context: Context<Consumer>, _: Empty| async move {
+            let state = context.state();
+            let files = exhibit_fixtures::fixture("isolation-probe")
+                .ok_or_else(|| failure("fixture.unknown", json!({})))?;
+            let mut listed = Vec::with_capacity(files.len());
+            for (path, bytes) in &files {
+                let source = format!("frame-probe/{path}");
+                let target = state.data_directory.join(&source);
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|_| failure("fixture.storage_failed", json!({})))?;
+                }
+                tokio::fs::write(&target, bytes)
+                    .await
+                    .map_err(|_| failure("fixture.storage_failed", json!({})))?;
+                listed.push(ContentFile {
+                    path: (*path).to_owned(),
+                    sha256: sha(bytes),
+                    size: bytes.len() as u64,
+                    source: ContentSource::File { path: source },
+                });
+            }
+            let view = state.views.open(files[0].0, &listed).await?;
+            Ok(json!({"url": view.url}))
         },
     )
     .request(

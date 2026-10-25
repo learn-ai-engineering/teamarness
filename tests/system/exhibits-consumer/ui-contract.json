@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "$defs": {
     "exhibitId": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 },
-    "fixture": { "type": "string", "enum": ["revision-1", "revision-2", "media"] }
+    "fixture": { "type": "string", "enum": ["revision-1", "revision-2", "media", "isolation-probe"] }
   },
   "requests": {
     "fixture.publish": {
@@ -25,6 +25,15 @@
           "revision": { "type": "integer", "minimum": 1 },
           "chunksSent": { "type": "integer", "minimum": 0 }
         }
+      }
+    },
+    "frame.probe": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url"],
+        "properties": { "url": { "type": "string", "pattern": "^teamarness-content://localhost/[0-9a-f]{32}/index\\.html$" } }
       }
     },
     "agent.bind": {

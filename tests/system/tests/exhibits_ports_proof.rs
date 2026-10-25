@@ -96,11 +96,11 @@ fn stage_consumer(application: &Path) {
     );
     manifest["backends"][0]["size"] = json!(backend.len());
     manifest["backends"][0]["sha256"] = json!(digest(&backend));
-    let ui = b"export function mount() { return async () => {}; }";
+    let ui = fs::read(source.join("ui/index.js")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
-    fs::write(root.join("ui/index.js"), ui).unwrap();
+    fs::write(root.join("ui/index.js"), &ui).unwrap();
     manifest["ui"]["entrypoint"]["size"] = json!(ui.len());
-    manifest["ui"]["entrypoint"]["sha256"] = json!(digest(ui));
+    manifest["ui"]["entrypoint"]["sha256"] = json!(digest(&ui));
     let contract = fs::read(source.join("ui-contract.json")).unwrap();
     fs::write(root.join("ui-contract.json"), &contract).unwrap();
     manifest["ui"]["contract"]["sha256"] = json!(digest(&contract));
@@ -195,8 +195,8 @@ async fn read_content(host: &PackageHost, token: &str, path: &str) -> (Vec<u8>, 
 async fn prove(host: &PackageHost, workspace: &str, prefix: &str, expected_author: (&str, &str)) {
     let (consumer_mount, consumer_nests) = mount(host, &key(CONSUMER, workspace)).await;
     assert!(
-        !consumer_nests,
-        "only a content-views Package may nest content frames"
+        consumer_nests,
+        "the Consumer declares content-views for the packaged smoke's unsandboxed frame probe"
     );
     let consumer = ConversationClient {
         host,
@@ -365,6 +365,27 @@ async fn person_and_bound_agent_author_drafts_through_the_exhibits_ports() {
     assert_eq!(second["revision"], 2);
     let media = ui(&consumer, "fixture.publish", json!({"fixture": "media"})).await;
     assert_eq!(media["revision"], 1);
+    let probe = ui(
+        &consumer,
+        "fixture.publish",
+        json!({"fixture": "isolation-probe"}),
+    )
+    .await;
+    assert_eq!(probe["exhibitId"], "fixture-isolation-probe");
+    assert_eq!(probe["revision"], 1);
+
+    // The Consumer's own content view of the probe, which the packaged smoke frames without a
+    // `sandbox` attribute.
+    let framed = ui(&consumer, "frame.probe", json!({})).await;
+    let url = framed["url"].as_str().unwrap();
+    let (token, entry) = url
+        .strip_prefix("teamarness-content://localhost/")
+        .and_then(|rest| rest.split_once('/'))
+        .expect("a content view URL");
+    assert_eq!(entry, "index.html");
+    for (path, bytes) in exhibit_fixtures::fixture("isolation-probe").unwrap() {
+        assert_eq!(read_content(&host, token, path).await.0, bytes, "{path}");
+    }
 
     shutdown(host).await;
     core.shutdown().await.unwrap();

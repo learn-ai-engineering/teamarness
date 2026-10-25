@@ -2,8 +2,25 @@
 :host { display: block; height: 100vh; height: 100dvh; color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
 * { box-sizing: border-box; }
 .exhibits-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
+.exhibits-page.teamarness-page > * + * { margin-top: 0; }
 .exhibits-page .teamarness-page-header { flex: none; border-bottom: 1px solid var(--teamarness-color-border); padding: .85rem 1.4rem; }
 .exhibits-page .teamarness-page-title { margin: 0; font-size: 1.4rem; }
-.exhibits-list { margin: 0; padding: 1rem 1.4rem; list-style: none; }
-.exhibits-list li { padding: .35rem 0; }
-.exhibits-empty { margin: 0; padding: 1.25rem 1.4rem; color: var(--teamarness-color-text-muted); }
+.exhibits-body { display: flex; flex: 1; min-height: 0; }
+.exhibits-sidebar { flex: 0 0 18rem; overflow-y: auto; border-right: 1px solid var(--teamarness-color-border); padding: .75rem; }
+.exhibits-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: .25rem; }
+.exhibits-item {
+  display: flex; flex-direction: column; gap: .15rem; width: 100%; text-align: left;
+  border: 1px solid transparent; border-radius: var(--teamarness-radius-control);
+  background: transparent; color: inherit; font: inherit; padding: .5rem .65rem; cursor: pointer;
+}
+.exhibits-item:hover { background: var(--teamarness-color-panel); }
+.exhibits-item[aria-current="true"] { border-color: var(--teamarness-color-accent); background: var(--teamarness-color-panel); }
+.exhibits-item:focus-visible { outline: 3px solid var(--teamarness-color-focus); outline-offset: 2px; }
+.exhibits-item-title { font-weight: 600; overflow-wrap: anywhere; }
+.exhibits-item-meta { color: var(--teamarness-color-text-muted); font-size: .8rem; }
+.exhibits-older { margin-top: .75rem; width: 100%; }
+.exhibits-error p { margin: 0 0 .5rem; }
+.exhibits-empty, .exhibits-placeholder { margin: 0; padding: .5rem; color: var(--teamarness-color-text-muted); }
+.exhibits-viewer { display: flex; flex: 1; min-width: 0; min-height: 0; padding: .75rem; }
+.exhibits-viewer > .teamarness-notice { align-self: flex-start; }
+.exhibits-frame { flex: 1; width: 100%; height: 100%; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-panel); background: #fff; }
