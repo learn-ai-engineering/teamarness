@@ -6,7 +6,7 @@ Active. This file records the expected sequence of major work and the reason for
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0031 and 0032) is implemented on its branch and pends Verify and integration. Phase 5 is next for the core.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0031, 0032 and 0033) passed Verify and was integrated into `main` on 2026-10-25. Phase 5 is next for the core.
 
 ## Phases
 
@@ -114,9 +114,9 @@ Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Pac
 
 **Depends on:** Phase 4. Follow-up: folder mapping, so a mapped folder lets any editor or CLI agent edit documents.
 
-#### Documents rendered editing (implemented on branch; pending Verify and integration)
+#### Documents rendered editing (verified and integrated 2026-10-25)
 
-Implemented on 2026-10-25 on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, in seven commits from `e6b2afc`. It is not yet verified or integrated into `main`. ADR 0032 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0031 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
+Implemented on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, from `e6b2afc`; it passed Verify and was integrated into `main` on 2026-10-25. ADR 0032 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0031 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
 
 - the Rust Markdown core: Canonical Markdown export and base-versioned merge, proven by property tests, with the [Markdown contract](02-system/09-documents/markdown-contract.md);
 - the Body Genesis in `document.create`, Backend-allocated peers, the 160 KiB record bound, and validation before append;
@@ -124,7 +124,7 @@ Implemented on 2026-10-25 on branch `don-smith/rendered_doc_editing`, workstream
 - the rendered editor, with per-person undo, split-then-refuse paste guards, copy as Markdown, and comment on selection;
 - Documents Port Contract 1.1 (`document.list`, `document.markdown`, `document.revise`, `documents.changed`), proven through the Host broker, where a Workspace Agent bound on the Installation revises a Document as itself (ADR 0033).
 
-The record format changed incompatibly, so development data directories that hold Documents must be reset. Automated checks pass, including the WebKit and Chromium frame scenarios (`npm run verify:documents-editor`). Verify owns the two-profile desktop check, the packaged-app isolation probe, IME input, the two-second latency observation, and the long property run. Frame-policy findings are recorded in [DELTA-012](.delta/DELTA-012-package-ui-frame-form-and-select-behaviour.md). Edge cases that Verify confirmed and the developer accepted as tech debt are recorded in [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md). Agent document tools in the Agent Package, Agent mentions, and Comment ports are the follow-on workstream.
+The record format changed incompatibly, so development data directories that hold Documents must be reset. Automated checks pass, including the WebKit and Chromium frame scenarios (`npm run verify:documents-editor`). The long property run passed in Verify, and the developer checked live sync and an offline-then-online merge across two instances. The packaged-app isolation probe, IME input, and the two-second latency observation were not run before integration and remain open checks. Frame-policy findings are recorded in [DELTA-012](.delta/DELTA-012-package-ui-frame-form-and-select-behaviour.md). Edge cases that Verify confirmed and the developer accepted as tech debt are recorded in [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md). Agent document tools in the Agent Package, Agent mentions, and Comment ports are the follow-on workstream.
 
 **Outcome:** Members edit a Document in rendered form and converge, and another Package reads and revises it as Markdown against a base version.
 
