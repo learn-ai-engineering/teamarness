@@ -85,7 +85,7 @@ The Shell runs each Package UI Mount in its own sandboxed frame with an opaque o
 - Any uncaught error or unhandled rejection anywhere in the frame is a UI fault, not only one attributed to your module.
 - The `__teamarness/` path of the resource URL is reserved for the Shell-owned frame document, stylesheet, and runtime. A declared asset under that path is shadowed.
 - WebAssembly can run: the frame's policy allows `'wasm-unsafe-eval'` and nothing more ([ADR 0031](../context/.decisions/0031-package-ui-frames-run-webassembly.md)). Ship the module's bytes in your entrypoint or a declared asset; you cannot fetch it. `eval` and `new Function` stay refused, and workers stay denied. A runaway module freezes the Shell as runaway JavaScript does.
-- Some controls misbehave under the frame policy ([DELTA-012](../context/.delta/DELTA-012-package-ui-frame-form-and-select-behaviour.md)). Creating a `<select>` element makes WebKit report a `style-src-attr` violation, so use buttons or a listbox built from other elements. Chromium does not fire `submit` in the sandboxed frame, so make every form act on its button's click and keep `submit` only as a fallback.
+- Some controls misbehave under the frame policy ([DELTA-014](../context/.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md)). Creating a `<select>` element makes WebKit report a `style-src-attr` violation, so use buttons or a listbox built from other elements. Chromium does not fire `submit` in the sandboxed frame, so make every form act on its button's click and keep `submit` only as a fallback.
 
 ### Theme and Package-owned composition
 

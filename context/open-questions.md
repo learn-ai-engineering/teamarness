@@ -99,3 +99,26 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 **Note:** the Core Runtime already gates every capability call on current membership, so this is a lifecycle and resource question, not an authorization one. A revoked Installation's Packages cannot read or write Workspace data; they merely keep running.
 
 **Owner:** roadmap Phase 5.
+
+---
+
+## TEAM-DQ10 - How Packages offer agent-facing guidance for their Ports
+
+**Status:** open (raised 2026-10-25).
+
+**Blocks:** Agent tools for Documents and later Packages (roadmap: **Agent participation in Package Ports**).
+
+**Question:** Where does an Agent learn how to use a Package's Ports well: what is possible, what to do, what not to do? Ports give an Agent the capability; each Package also knows best how that capability should be used.
+
+**Current state:** Port Contracts (`ports.json`) declare exact shapes, with bounded descriptions of at most 512 characters. The standalone Agent Package is the harness for tools and skills, and it has tools only for Conversations. Documents Port Contract 1.1 accepts a bound Agent on `document.revise` (ADR 0033), but no Agent tool calls it yet.
+
+**Options:**
+- Each Package ships agent guidance (skills, tool descriptions, perhaps a small library) beside its Port Contract, and an Agent discovers it from the Package at run time.
+- Packages publish guidance that a Steward imports and enables for an Agent, choosing from the skills available.
+- The Agent Package owns per-Package tools.
+
+The developer prefers loose coupling with high cohesion across the ecosystem, so that Agents engage with every Package naturally.
+
+**Answer looks like:** a design (and an ADR if it adds a contract or capability) that says where guidance lives, how it is versioned with the Port Contract, how an Agent or Steward finds and enables it, and how it is bounded and trusted.
+
+**Owner:** a new Scope, after a developer discussion.

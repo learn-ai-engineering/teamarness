@@ -1,4 +1,4 @@
-# DELTA-012 — Some Package UI controls misbehave under the frame policy
+# DELTA-014 — Some Package UI controls misbehave under the frame policy
 
 **Status:** open (2026-10-25). Found by the rendered Document editing frame scenarios; not yet fixed.
 
