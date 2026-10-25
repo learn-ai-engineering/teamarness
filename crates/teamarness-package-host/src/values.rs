@@ -394,6 +394,12 @@ pub struct PackageCatalogEntry {
     pub identity: PackageIdentity,
     pub version: String,
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
     pub source: PackageSourceKind,
     pub trust: PackageTrustKind,
     pub ui_contract_digest: String,

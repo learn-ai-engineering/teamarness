@@ -9,6 +9,9 @@ export type PackageCatalogEntry = Readonly<{
   identity: string;
   version: string;
   displayName: string;
+  description?: string;
+  author?: string;
+  homepage?: string;
   source: "bundled" | "local";
   trust: "application_bundled" | "trusted_native_code_v1";
   uiContractDigest: string;

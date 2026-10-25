@@ -30,12 +30,27 @@ A version 1 manifest declares:
 
 - `identity`, a lowercase reverse-DNS Package Identity;
 - a strict Semantic Version in `version`;
-- `presentation.displayName`;
+- `presentation.displayName`, and optionally `presentation.description`, `presentation.author`, and `presentation.homepage`;
 - one Package Process Protocol major and minor range;
 - Backend files with exact target, path, size, and digest;
 - the ESM entrypoint, assets, and UI contract;
 - every required versioned Semantic Capability;
 - optional Package-owned metadata under reverse-DNS `extensions` keys.
+
+The optional presentation fields describe the Package to the people who install it. The Host publishes them in its Package catalog. Admission refuses a manifest when one of them breaks its bound:
+
+- `description`: 1 to 1024 characters, no leading or trailing whitespace, and no control characters except line feeds.
+- `author`: 1 to 128 characters and no control characters.
+- `homepage`: an absolute `https://` URL of at most 2048 characters.
+
+```json
+"presentation": {
+  "displayName": "Emojart",
+  "description": "Generates emoji art for a Workspace.",
+  "author": "Example Author",
+  "homepage": "https://example.com/emojart"
+}
+```
 
 Source, trust, override policy, installation paths, and data paths do not belong in the manifest. Keep registration metadata outside the Package Directory.
 

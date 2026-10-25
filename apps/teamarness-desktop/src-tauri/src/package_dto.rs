@@ -27,6 +27,12 @@ pub struct PackageCatalogEntryDto {
     identity: String,
     version: String,
     display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    homepage: Option<String>,
     source: String,
     trust: String,
     ui_contract_digest: String,
@@ -38,6 +44,9 @@ impl From<PackageCatalogEntry> for PackageCatalogEntryDto {
             identity: value.identity.into(),
             version: value.version,
             display_name: value.display_name,
+            description: value.description,
+            author: value.author,
+            homepage: value.homepage,
             source: wire_name(value.source),
             trust: wire_name(value.trust),
             ui_contract_digest: value.ui_contract_digest,
@@ -232,6 +241,39 @@ mod tests {
         let encoded = serde_json::to_string(&dto).unwrap();
         for forbidden in ["sourcePath", "cachePath", "dataPath", "processHandle"] {
             assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    // Verifies: TEAM.SYS.PKG-R01
+    #[test]
+    fn catalog_dto_carries_optional_presentation_metadata_in_camel_case() {
+        let entry = |description: Option<&str>, author: Option<&str>, homepage: Option<&str>| {
+            PackageCatalogEntryDto::from(PackageCatalogEntry {
+                identity: "com.example.fixture".parse().unwrap(),
+                version: "1.0.0".into(),
+                display_name: "Fixture".into(),
+                description: description.map(str::to_owned),
+                author: author.map(str::to_owned),
+                homepage: homepage.map(str::to_owned),
+                source: teamarness_package_host::PackageSourceKind::Local,
+                trust: teamarness_package_host::PackageTrustKind::TrustedNativeCodeV1,
+                ui_contract_digest: "a".repeat(64),
+            })
+        };
+        let full = serde_json::to_value(entry(
+            Some("Describes the fixture."),
+            Some("Example Author"),
+            Some("https://example.com/fixture"),
+        ))
+        .unwrap();
+        assert_eq!(full["displayName"], "Fixture");
+        assert_eq!(full["description"], "Describes the fixture.");
+        assert_eq!(full["author"], "Example Author");
+        assert_eq!(full["homepage"], "https://example.com/fixture");
+
+        let bare = serde_json::to_value(entry(None, None, None)).unwrap();
+        for key in ["description", "author", "homepage"] {
+            assert!(bare.get(key).is_none(), "{key} is omitted when absent");
         }
     }
 

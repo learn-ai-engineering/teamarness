@@ -265,3 +265,201 @@ fn activation_policy_is_closed_and_legacy_default_is_eager() {
         );
     }
 }
+
+fn presentation(extra: Value) -> Value {
+    let mut value = json!({"displayName": "Fixture"});
+    let (Value::Object(base), Value::Object(extra)) = (&mut value, extra) else {
+        return value;
+    };
+    base.extend(extra);
+    json!({"presentation": value})
+}
+
+fn accept(patch: Value) -> teamarness_package_contract::manifest::ManifestDocument {
+    parse_manifest(&serde_json::to_vec(&manifest(patch)).unwrap())
+        .unwrap_or_else(|error| panic!("rejected: {error}"))
+}
+
+fn assert_refused(patch: Value, rule: &str, pointer: &str) {
+    let error = reject(patch);
+    assert_eq!(error.code, ContractErrorCode::ManifestMalformed);
+    assert_eq!(error.rule, rule);
+    assert_eq!(error.pointer.as_deref(), Some(pointer));
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn presentation_metadata_is_optional() {
+    let document = accept(json!({}));
+    assert_eq!(document.description, None);
+    assert_eq!(document.author, None);
+    assert_eq!(document.homepage, None);
+
+    let document = accept(presentation(json!({
+        "description": "Reads and writes fixtures.",
+        "author": "Example Author",
+        "homepage": "https://example.com/fixture",
+    })));
+    assert_eq!(
+        document.description.as_deref(),
+        Some("Reads and writes fixtures.")
+    );
+    assert_eq!(document.author.as_deref(), Some("Example Author"));
+    assert_eq!(
+        document.homepage.as_deref(),
+        Some("https://example.com/fixture")
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn an_unknown_presentation_key_is_still_refused() {
+    let error = reject(presentation(json!({"tagline": "Unknown"})));
+    assert_eq!(error.code, ContractErrorCode::ManifestMalformed);
+    assert_eq!(error.rule, "manifest.malformed");
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn a_description_is_bounded_trimmed_and_allows_only_newline_controls() {
+    let longest = "é".repeat(1024);
+    assert_eq!(
+        accept(presentation(json!({"description": longest.clone()}))).description,
+        Some(longest)
+    );
+    assert_eq!(
+        accept(presentation(json!({"description": "x"}))).description,
+        Some("x".to_owned())
+    );
+    assert_eq!(
+        accept(presentation(
+            json!({"description": "First line.\nSecond line."})
+        ))
+        .description,
+        Some("First line.\nSecond line.".to_owned())
+    );
+    for refused in [
+        String::new(),
+        "é".repeat(1025),
+        " padded".to_owned(),
+        "padded\n".to_owned(),
+        "tab\there".to_owned(),
+        "carriage\rreturn".to_owned(),
+        "bell\u{7}".to_owned(),
+    ] {
+        assert_refused(
+            presentation(json!({"description": refused})),
+            "manifest.description",
+            "/presentation/description",
+        );
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn an_author_is_bounded_and_has_no_control_characters() {
+    let longest = "é".repeat(128);
+    assert_eq!(
+        accept(presentation(json!({"author": longest.clone()}))).author,
+        Some(longest)
+    );
+    assert_eq!(
+        accept(presentation(json!({"author": "A"}))).author,
+        Some("A".to_owned())
+    );
+    for refused in [
+        String::new(),
+        "é".repeat(129),
+        "two\nlines".to_owned(),
+        "tab\there".to_owned(),
+    ] {
+        assert_refused(
+            presentation(json!({"author": refused})),
+            "manifest.author",
+            "/presentation/author",
+        );
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn a_homepage_is_an_absolute_bounded_https_url() {
+    let prefix = "https://example.com/";
+    let longest = format!("{prefix}{}", "a".repeat(2048 - prefix.len()));
+    assert_eq!(longest.len(), 2048);
+    assert_eq!(
+        accept(presentation(json!({"homepage": longest.clone()}))).homepage,
+        Some(longest.clone())
+    );
+    assert_eq!(
+        accept(presentation(json!({"homepage": "https://example.com"}))).homepage,
+        Some("https://example.com".to_owned())
+    );
+    for refused in [
+        format!("{longest}a"),
+        String::new(),
+        "http://example.com/".to_owned(),
+        "/relative/path".to_owned(),
+        "example.com/path".to_owned(),
+        "//example.com/path".to_owned(),
+        "https://".to_owned(),
+        "https:///path".to_owned(),
+        "HTTPS://example.com/".to_owned(),
+        "https://example.com/with space".to_owned(),
+        " https://example.com/".to_owned(),
+        "https://example.com/\n".to_owned(),
+        "mailto:author@example.com".to_owned(),
+        "javascript:alert(1)".to_owned(),
+    ] {
+        assert_refused(
+            presentation(json!({"homepage": refused})),
+            "manifest.homepage",
+            "/presentation/homepage",
+        );
+    }
+}
+
+/// The published schema agrees with the semantic rules on every case it can express.
+/// Trimming is a semantic check only, as it is for `displayName`.
+// Verifies: TEAM.SYS.PKG-R01
+#[test]
+fn the_schema_publishes_the_presentation_metadata_bounds() {
+    let schema: Value = serde_json::from_slice(
+        &fs::read(repository_root().join("contracts/packages/v1/schemas/manifest.schema.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&schema)
+        .unwrap();
+    let longest_homepage = format!("https://example.com/{}", "a".repeat(2028));
+    let cases = [
+        (json!({"description": "é".repeat(1024)}), true),
+        (json!({"description": "One.\nTwo."}), true),
+        (json!({"description": ""}), false),
+        (json!({"description": "é".repeat(1025)}), false),
+        (json!({"description": "tab\there"}), false),
+        (json!({"author": "é".repeat(128)}), true),
+        (json!({"author": "é".repeat(129)}), false),
+        (json!({"author": "two\nlines"}), false),
+        (json!({"homepage": "https://example.com"}), true),
+        (json!({"homepage": longest_homepage.clone()}), true),
+        (json!({"homepage": format!("{longest_homepage}a")}), false),
+        (json!({"homepage": "http://example.com/"}), false),
+        (json!({"homepage": "/relative/path"}), false),
+        (json!({"homepage": "https:///path"}), false),
+        (json!({"homepage": "https://user@example.com/"}), false),
+        (json!({"homepage": "https://example.com/with space"}), false),
+        (json!({"tagline": "Unknown"}), false),
+    ];
+    for (extra, valid) in cases {
+        let document = manifest(presentation(extra.clone()));
+        assert_eq!(validator.is_valid(&document), valid, "schema: {extra}");
+        assert_eq!(
+            parse_manifest(&serde_json::to_vec(&document).unwrap()).is_ok(),
+            valid,
+            "rule: {extra}"
+        );
+    }
+}

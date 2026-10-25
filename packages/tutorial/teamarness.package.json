@@ -3,7 +3,10 @@
   "identity": "dev.teamarness.tutorial",
   "version": "1.0.0",
   "presentation": {
-    "displayName": "Tutorial"
+    "displayName": "Tutorial",
+    "description": "A worked example Package that renders pixel artworks from an algorithm, palette, and seed, and saves the recipes in its Package Data Directory.",
+    "author": "Teamarness",
+    "homepage": "https://github.com/learn-ai-engineering/teamarness/tree/main/packages/tutorial"
   },
   "protocol": {
     "major": 1,

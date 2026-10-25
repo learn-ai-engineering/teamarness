@@ -619,3 +619,86 @@ fn port_file_symlink_oversize_and_invalid_schema_fail_locally() {
     );
     assert_eq!(code(&temp), PackageErrorCode::PortContractViolation);
 }
+
+async fn open_catalog(
+    patch: serde_json::Value,
+) -> Vec<teamarness_package_host::PackageCatalogEntry> {
+    use std::sync::Arc;
+    use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+    use teamarness_package_host::{
+        InstallationPublicIdentity, PackageHost, PackageHostCommand, PackageHostConfig,
+        ShutdownHost,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let application = root.path().join("application");
+    let private = root.path().join("private");
+    fs::create_dir(&application).unwrap();
+    fs::create_dir(&private).unwrap();
+    let temp = valid_package();
+    write_manifest(&temp, patch);
+    fs::rename(temp.path(), application.join("one")).unwrap();
+    let index = application.join("application-packages.v1.json");
+    fs::write(
+        &index,
+        br#"{"schemaVersion":1,"packages":[{"directory":"one"}]}"#,
+    )
+    .unwrap();
+    let core = Arc::new(
+        CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
+            .await
+            .unwrap(),
+    );
+    let installation = InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap();
+    let host = PackageHost::open(
+        PackageHostConfig::new(&application, &index, &private, installation),
+        core,
+    )
+    .await
+    .unwrap();
+    let packages = host.snapshot().await.packages;
+    host.execute(PackageHostCommand::Shutdown(ShutdownHost {}))
+        .await
+        .unwrap();
+    packages
+}
+
+// Verifies: TEAM.SYS.PKG-R01
+#[tokio::test]
+async fn catalog_entry_carries_optional_presentation_metadata() {
+    let packages = open_catalog(serde_json::json!({
+        "presentation": {
+            "displayName": "Reference",
+            "description": "Shows the reference surface.\nSecond line.",
+            "author": "Teamarness",
+            "homepage": "https://example.com/reference"
+        }
+    }))
+    .await;
+    assert_eq!(packages.len(), 1);
+    let entry = &packages[0];
+    assert_eq!(
+        entry.description.as_deref(),
+        Some("Shows the reference surface.\nSecond line.")
+    );
+    assert_eq!(entry.author.as_deref(), Some("Teamarness"));
+    assert_eq!(
+        entry.homepage.as_deref(),
+        Some("https://example.com/reference")
+    );
+    let json = serde_json::to_value(entry).unwrap();
+    assert_eq!(json["description"], entry.description.as_deref().unwrap());
+    assert_eq!(json["author"], "Teamarness");
+    assert_eq!(json["homepage"], "https://example.com/reference");
+
+    let packages = open_catalog(serde_json::json!({})).await;
+    assert_eq!(packages.len(), 1);
+    let entry = &packages[0];
+    assert_eq!(entry.description, None);
+    assert_eq!(entry.author, None);
+    assert_eq!(entry.homepage, None);
+    let json = serde_json::to_value(entry).unwrap();
+    for key in ["description", "author", "homepage"] {
+        assert!(json.get(key).is_none(), "{key} is omitted when absent");
+    }
+}

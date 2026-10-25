@@ -3,7 +3,10 @@
   "identity": "dev.teamarness.conversations",
   "version": "1.0.0",
   "presentation": {
-    "displayName": "Conversations"
+    "displayName": "Conversations",
+    "description": "Shared Conversations for a Workspace: post messages, follow replies, and provide conversation Ports to other Packages.",
+    "author": "Teamarness",
+    "homepage": "https://github.com/learn-ai-engineering/teamarness/tree/main/packages/conversations-package"
   },
   "protocol": {
     "major": 1,

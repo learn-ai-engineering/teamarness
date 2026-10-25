@@ -97,6 +97,25 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f]*$"
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]*$"
+        },
+        "homepage": {
+          "type": "string",
+          "format": "uri",
+          "minLength": 9,
+          "maxLength": 2048,
+          "pattern": "^https://[^\\s\\x00-\\x1f\\x7f-\\x9f/?#@:][^\\s\\x00-\\x1f\\x7f-\\x9f/?#@]*(?:[/?#][^\\s\\x00-\\x1f\\x7f-\\x9f]*)?$"
         }
       },
       "additionalProperties": false

@@ -12,6 +12,14 @@ Admission permits at most 128 request operations, 128 subscription operations, a
 
 The UI entrypoint must be UTF-8 ESM and no larger than 8 MiB. A Package may declare at most 64 UI assets, each no larger than 8 MiB. The entrypoint, assets, and contract may total at most 32 MiB. The host copies admitted resources to its private cache and resolves them only through an opaque mount token. Source paths, cache paths, and admission digests are not public catalog values.
 
+`presentation` requires `displayName` and may declare three optional fields that the Host shows in its catalog:
+
+- `description` is 1 to 1024 characters with no leading or trailing whitespace. It may contain line feeds (`\n`) but no other control characters.
+- `author` is 1 to 128 characters with no control characters.
+- `homepage` is an absolute `https://` URL with a host and no user information, whitespace, or control characters, at most 2048 characters.
+
+Lengths count Unicode code points, as JSON Schema `maxLength` does. A field that breaks its rule fails with `manifest_malformed` and a pointer such as `/presentation/homepage`. A manifest without these fields remains valid.
+
 Unknown fields fail each host-owned document. A manifest may carry Package-owned values only inside `extensions`, whose keys are reverse-DNS namespaces. JSON objects reject duplicate keys before schema decoding.
 
 A manifest may additionally declare `portContract: {"path":"ports.json","sha256":"..."}` and `consumedPorts: [{"identity":"dev.example.conversations","major":1,"minMinor":0,"maxMinor":1,"required":true,"ports":[{"name":"conversation.list","kind":"query"}]}]`. `required` defaults to true. Every consumed entry names an exact nonempty set of ports and kinds, not an entire contract. The path uses the same normalized relative-path and no-symlink rule as the UI contract, and its file is digest-verified and limited to 1 MiB. See `contracts/package-ports/v1/README.md` for the separate provided contract profile. The optional `activation` field is `"eager"` or `"on_demand"`; absence defaults to eager startup. On-demand Instances are prepared at Host open and Workspace reconciliation, then start on an explicit activation or UI mount (and on first port use once broker routes are available). A running Instance stays active when its UI closes. New registrations are admitted on the next Host open, not live. Older manifests without these fields remain valid. Local declaration validation does not claim to have checked installation-wide provider availability or previous versions that were not supplied. The standard assembler copies a provided Port document to the declared path and computes `portContract.sha256` after building the Backend and UI. For example, `packages/conversations-package/ports.json` is staged beside its UI contract; changing its bytes requires a new manifest digest.

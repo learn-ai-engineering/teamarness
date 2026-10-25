@@ -3,7 +3,10 @@
   "identity": "dev.teamarness.reference",
   "version": "1.0.0",
   "presentation": {
-    "displayName": "Reference Package"
+    "displayName": "Reference Package",
+    "description": "Demonstrates the Package contract end to end: a durable counter, typed requests, failures, and a live change subscription.",
+    "author": "Teamarness",
+    "homepage": "https://github.com/learn-ai-engineering/teamarness/tree/main/packages/reference-package"
   },
   "protocol": {
     "major": 1,

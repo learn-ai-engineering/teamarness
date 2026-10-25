@@ -3,7 +3,10 @@
   "identity": "dev.teamarness.repo-aware",
   "version": "1.0.0",
   "presentation": {
-    "displayName": "Repo-aware Engineering"
+    "displayName": "Repo-aware Engineering",
+    "description": "Registers local Git repositories and shows a snapshot of each one: its current head, commit, origin remote, and whether the working tree is clean.",
+    "author": "Teamarness",
+    "homepage": "https://github.com/learn-ai-engineering/teamarness/tree/main/packages/repo-aware"
   },
   "protocol": {
     "major": 1,

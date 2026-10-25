@@ -3,7 +3,10 @@
   "identity": "dev.teamarness.documents",
   "version": "1.0.0",
   "presentation": {
-    "displayName": "Documents"
+    "displayName": "Documents",
+    "description": "Collaborative Markdown Documents for a Workspace, organized in Collections, with Comments.",
+    "author": "Teamarness",
+    "homepage": "https://github.com/learn-ai-engineering/teamarness/tree/main/packages/documents-package"
   },
   "protocol": {
     "major": 1,
