@@ -12,6 +12,11 @@ use crate::values::{DiagnosticId, PackageIdentity, PackageInstanceKey};
 #[serde(rename_all = "snake_case")]
 pub enum PackageErrorCode {
     InvalidRegistration,
+    /// The installation registration file breaks its file policy or does not parse, so the Host
+    /// refuses to rewrite it.
+    RegistrationFileInvalid,
+    /// No installation registration has the requested Package Identity.
+    NotRegistered,
     SourceNotFound,
     ManifestMalformed,
     ManifestUnsupported,
@@ -176,6 +181,9 @@ pub(crate) fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> Pa
         | PackageErrorCode::EventLagged
         | PackageErrorCode::UiLoadFailed => RecoveryAction::ReloadUi,
         PackageErrorCode::ShuttingDown => RecoveryAction::None,
+        PackageErrorCode::RegistrationFileInvalid | PackageErrorCode::NotRegistered => {
+            RecoveryAction::CorrectRegistration
+        }
         _ => RecoveryAction::CorrectPackageSource,
     };
     let mut random = [0_u8; 12];

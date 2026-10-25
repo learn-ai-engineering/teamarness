@@ -58,6 +58,7 @@ const snapshot: PackageHostSnapshot = {
     diagnosticId,
     packageError: null,
   }],
+  registrations: [],
 };
 
 function model(change: Partial<ShellModel> = {}): ShellModel {

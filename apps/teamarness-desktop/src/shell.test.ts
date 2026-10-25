@@ -51,6 +51,7 @@ const packages: PackageHostSnapshot = {
     diagnosticId: "secret-diagnostic-id",
     packageError: null,
   }],
+  registrations: [],
 };
 
 class Region {

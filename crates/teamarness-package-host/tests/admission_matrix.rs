@@ -8,10 +8,10 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 pub use teamarness_package_host::{
-    DiagnosticId, HostRevision, InstallationPublicIdentity, PackageCatalogEntry, PackageErrorCode,
-    PackageErrorEnvelope, PackageErrorStage, PackageHostConfig, PackageHostSnapshot,
-    PackageHostState, PackageIdentity, PackageSourceKind, PackageTrustKind, PackageValue,
-    RecoveryAction,
+    DiagnosticId, HostRevision, InstallationPublicIdentity, InstallationRegistrationSnapshot,
+    PackageCatalogEntry, PackageErrorCode, PackageErrorEnvelope, PackageErrorStage,
+    PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity, PackageSourceKind,
+    PackageTier, PackageTrustKind, PackageValue, RecoveryAction, RegistrationStatus,
 };
 
 pub struct AuthoringCatalogEntry {
@@ -1370,4 +1370,355 @@ fn additive_provider_minor_negotiates_highest_minor_in_consumers_range() {
         Some(1)
     );
     assert!(report.snapshot.diagnostics.is_empty());
+}
+
+fn registration_status(
+    report: &admission::AdmissionReport,
+    identity: &str,
+) -> (PackageTier, RegistrationStatus) {
+    let registration = report
+        .snapshot
+        .registrations
+        .iter()
+        .find(|registration| registration.expected_identity == identity)
+        .unwrap();
+    (registration.tier, registration.status)
+}
+
+/// Adds a Personal (non-override) installation registration with declared Ports.
+fn add_personal(
+    fixture: &mut Fixture,
+    identity: &str,
+    provided: Vec<serde_json::Value>,
+    consumed: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let path = fixture.add_local(identity, "1.0.0");
+    declare_ports(&path, provided, consumed);
+    local_entry(&path, identity, false)
+}
+
+// Verifies: TEAM.SYS.PKG-R09
+#[test]
+fn team_consumer_never_routes_to_a_personal_provider() {
+    let mut fixture = Fixture::new();
+    fixture.add_application("required", "com.example.required", "1.0.0");
+    fixture.add_application("optional", "com.example.optional", "1.0.0");
+    declare_ports(
+        &fixture.application.join("required"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            2,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    declare_ports(
+        &fixture.application.join("optional"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            2,
+            false,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let provider = add_personal(
+        &mut fixture,
+        "com.example.personal",
+        vec![provided("com.example.shared", 2)],
+        vec![],
+    );
+    fixture.registrations(vec![provider]);
+
+    let report = admit(&fixture.config()).unwrap();
+
+    assert_eq!(
+        package_ids(&report),
+        vec!["com.example.optional", "com.example.personal"]
+    );
+    assert!(codes(&report).contains(&(
+        "com.example.required".into(),
+        PackageErrorCode::PortContractMissing
+    )));
+    let optional = &report.graph[&"com.example.optional".parse().unwrap()][0];
+    assert_eq!(optional.provider, None);
+    assert_eq!(
+        optional.unavailable,
+        Some(PackageErrorCode::PortContractMissing)
+    );
+    assert_eq!(
+        registration_status(&report, "com.example.personal"),
+        (PackageTier::Personal, RegistrationStatus::Admitted)
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R09
+#[test]
+fn personal_claim_on_a_team_provided_contract_is_refused() {
+    let mut fixture = Fixture::new();
+    fixture.add_application("team", "com.example.team", "1.0.0");
+    declare_ports(
+        &fixture.application.join("team"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    // One Personal claim is only the Team contract; the other also provides a free one,
+    // and loses both, because a Package never provides part of its contracts.
+    let single = add_personal(
+        &mut fixture,
+        "com.example.single",
+        vec![provided("com.example.shared", 9)],
+        vec![],
+    );
+    let mixed = add_personal(
+        &mut fixture,
+        "com.example.mixed",
+        vec![
+            provided("com.example.free", 1),
+            provided("com.example.shared", 1),
+        ],
+        vec![],
+    );
+    fixture.registrations(vec![single, mixed]);
+
+    let report = admit(&fixture.config()).unwrap();
+
+    assert_eq!(package_ids(&report), vec!["com.example.team"]);
+    for identity in ["com.example.single", "com.example.mixed"] {
+        assert!(
+            codes(&report).contains(&(identity.into(), PackageErrorCode::PortProviderConflict))
+        );
+        assert_eq!(
+            registration_status(&report, identity),
+            (
+                PackageTier::Personal,
+                RegistrationStatus::Refused {
+                    code: PackageErrorCode::PortProviderConflict
+                }
+            )
+        );
+    }
+    // A refused claim never displaces the Team incumbent on a later open.
+    let again = admit(&fixture.config()).unwrap();
+    assert_eq!(package_ids(&again), vec!["com.example.team"]);
+}
+
+// Verifies: TEAM.SYS.PKG-R09
+#[test]
+fn personal_consumer_routes_to_a_team_provider() {
+    let mut fixture = Fixture::new();
+    fixture.add_application("team", "com.example.team", "1.0.0");
+    declare_ports(
+        &fixture.application.join("team"),
+        vec![provided("com.example.shared", 2)],
+        vec![],
+    );
+    let consumer = add_personal(
+        &mut fixture,
+        "com.example.personal",
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            1,
+            3,
+            true,
+            "fixture.read",
+            "query",
+        )],
+    );
+    fixture.registrations(vec![consumer]);
+
+    let report = admit(&fixture.config()).unwrap();
+
+    assert_eq!(
+        package_ids(&report),
+        vec!["com.example.personal", "com.example.team"]
+    );
+    assert!(report.snapshot.diagnostics.is_empty());
+    let route = &report.graph[&"com.example.personal".parse().unwrap()][0];
+    assert_eq!(route.provider, Some("com.example.team".parse().unwrap()));
+    assert_eq!(route.minor, Some(2));
+    assert_eq!(
+        registration_status(&report, "com.example.personal"),
+        (PackageTier::Personal, RegistrationStatus::Admitted)
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R09
+#[test]
+fn override_registration_is_admitted_in_the_team_tier() {
+    let mut fixture = Fixture::new();
+    fixture.add_application("provider", "com.example.provider", "1.0.0");
+    fixture.add_application("consumer", "com.example.consumer", "1.0.0");
+    declare_ports(
+        &fixture.application.join("provider"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    declare_ports(
+        &fixture.application.join("consumer"),
+        vec![],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            2,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let replacement = fixture.add_local("com.example.provider", "2.0.0");
+    declare_ports(
+        &replacement,
+        vec![provided("com.example.shared", 2)],
+        vec![],
+    );
+    fixture.registrations(vec![local_entry(
+        &replacement,
+        "com.example.provider",
+        true,
+    )]);
+
+    let report = admit(&fixture.config()).unwrap();
+
+    assert_eq!(
+        package_ids(&report),
+        vec!["com.example.consumer", "com.example.provider"]
+    );
+    assert!(report.snapshot.diagnostics.is_empty());
+    let provider = report
+        .snapshot
+        .packages
+        .iter()
+        .find(|package| package.identity.as_str() == "com.example.provider")
+        .unwrap();
+    assert_eq!(provider.source, PackageSourceKind::Local);
+    assert_eq!(provider.version, "2.0.0");
+    // The Team consumer routes to the override, which a Personal Package could never serve.
+    let route = &report.graph[&"com.example.consumer".parse().unwrap()][0];
+    assert_eq!(
+        route.provider,
+        Some("com.example.provider".parse().unwrap())
+    );
+    assert_eq!(route.minor, Some(2));
+    assert_eq!(
+        registration_status(&report, "com.example.provider"),
+        (PackageTier::Team, RegistrationStatus::Admitted)
+    );
+}
+
+fn store_rows(private: &Path, table: &str) -> i64 {
+    let connection =
+        rusqlite::Connection::open(private.join("packages/package-host.sqlite3")).unwrap();
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn ui_cache_entries(private: &Path) -> usize {
+    fs::read_dir(private.join("packages/ui-cache/v1"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+// Verifies: TEAM.SYS.PKG-R09
+#[test]
+fn preflight_admission_writes_no_host_state() {
+    let mut fixture = Fixture::new();
+    fixture.add_application("team", "com.example.team", "1.0.0");
+    declare_ports(
+        &fixture.application.join("team"),
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    let config = fixture.config();
+    let store = host_store::HostStore::open(config.private_data_directory()).unwrap();
+    let before = (
+        store_rows(&fixture.private, "admissions"),
+        store_rows(&fixture.private, "port_providers"),
+        store_rows(&fixture.private, "diagnostics"),
+        ui_cache_entries(&fixture.private),
+    );
+    assert_eq!(before, (0, 0, 0, 0));
+    let personal = add_personal(
+        &mut fixture,
+        "com.example.personal",
+        vec![provided("com.example.other", 1)],
+        vec![consumed(
+            "com.example.shared",
+            0,
+            1,
+            true,
+            "fixture.run",
+            "command",
+        )],
+    );
+    let conflicting = add_personal(
+        &mut fixture,
+        "com.example.conflict",
+        vec![provided("com.example.shared", 1)],
+        vec![],
+    );
+    let installations = catalog::registrations_from_entries(
+        serde_json::from_value(serde_json::json!([personal, conflicting])).unwrap(),
+    );
+
+    let report = admission::admit_installation(
+        &config,
+        &store,
+        Ok(installations),
+        admission::AdmissionMode::Preflight,
+    )
+    .unwrap();
+
+    // The preflight reaches the same verdicts a commit would...
+    assert_eq!(
+        package_ids(&report),
+        vec!["com.example.personal", "com.example.team"]
+    );
+    assert_eq!(
+        registration_status(&report, "com.example.conflict").1,
+        RegistrationStatus::Refused {
+            code: PackageErrorCode::PortProviderConflict
+        }
+    );
+    // ...and leaves no admissions row, Port provider, diagnostic, or UI cache entry.
+    let after = (
+        store_rows(&fixture.private, "admissions"),
+        store_rows(&fixture.private, "port_providers"),
+        store_rows(&fixture.private, "diagnostics"),
+        ui_cache_entries(&fixture.private),
+    );
+    assert_eq!(after, before);
+
+    let committed = admission::admit_installation(
+        &config,
+        &store,
+        Ok(report
+            .snapshot
+            .registrations
+            .iter()
+            .map(|registration| catalog::InstallationRegistration {
+                directory: registration.directory.clone().into(),
+                expected_identity: registration.expected_identity.clone(),
+                trust_complete: true,
+                override_application: registration.override_application,
+                path_error: None,
+            })
+            .collect()),
+        admission::AdmissionMode::Commit,
+    )
+    .unwrap();
+    assert_eq!(package_ids(&committed), package_ids(&report));
+    // A commit records every locally valid candidate, including the refused claimant.
+    assert_eq!(store_rows(&fixture.private, "admissions"), 3);
+    assert_eq!(ui_cache_entries(&fixture.private), 3);
+    assert_eq!(store_rows(&fixture.private, "port_providers"), 2);
 }

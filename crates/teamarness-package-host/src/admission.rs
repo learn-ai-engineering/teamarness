@@ -8,9 +8,10 @@ use crate::host_store::{HostStore, StoredAdmission};
 use crate::manifest::{self, LoadedManifest, sha256};
 use crate::ui::{self, AdmittedUi};
 use crate::{
-    DiagnosticId, HostRevision, PackageCatalogEntry, PackageErrorCode, PackageErrorEnvelope,
-    PackageErrorStage, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
-    PackageSourceKind, PackageTrustKind, RecoveryAction,
+    DiagnosticId, HostRevision, InstallationRegistrationSnapshot, PackageCatalogEntry,
+    PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, PackageHostConfig,
+    PackageHostSnapshot, PackageHostState, PackageIdentity, PackageSourceKind, PackageTier,
+    PackageTrustKind, RecoveryAction, RegistrationStatus,
 };
 
 pub(crate) struct AdmissionReport {
@@ -32,6 +33,18 @@ pub(crate) struct AdmissionFailure {
     pub(crate) code: PackageErrorCode,
 }
 
+/// Whether an admission pass may change Host state.
+///
+/// `Commit` populates the UI cache and records admissions, Port providers, and
+/// diagnostics in the Host store. `Preflight` compiles and selects exactly as
+/// `Commit` does but writes nothing, so a candidate can be checked before its
+/// registration exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionMode {
+    Commit,
+    Preflight,
+}
+
 /// The installed graph's per-declaration availability, before generation grants exist.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +55,7 @@ pub struct PortAvailability {
     pub unavailable: Option<PackageErrorCode>,
 }
 
-struct Candidate {
+pub(crate) struct Candidate {
     root: PathBuf,
     manifest: LoadedManifest,
     source: PackageSourceKind,
@@ -50,13 +63,91 @@ struct Candidate {
 }
 
 struct LocalCandidate {
+    index: usize,
     registration: InstallationRegistration,
     result: Result<Candidate, PackageErrorCode>,
 }
 
+/// One admitted tier: its Packages, its selected Providers, and what it reports.
+pub(crate) struct TierOutcome {
+    /// Admitted Packages of this tier only.
+    pub(crate) admitted: Eligible,
+    /// Contract identity to the admitted Provider this tier selected.
+    pub(crate) providers: BTreeMap<String, PackageIdentity>,
+    pub(crate) graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    pub(crate) catalog: Vec<crate::AuthoringCatalogEntry>,
+}
+
+/// The admitted Packages a later tier is selected against, which it cannot change.
+#[derive(Default)]
+pub(crate) struct FixedGraph<'a> {
+    /// Admitted Packages whose provided contracts a candidate may consume.
+    pub(crate) admitted: View<'a>,
+    /// Contract identity to its fixed Provider.
+    pub(crate) providers: BTreeMap<String, PackageIdentity>,
+    /// Contracts a candidate may not claim. A claim is refused with `port_provider_conflict`.
+    pub(crate) reserved: BTreeSet<String>,
+}
+
+impl<'a> FixedGraph<'a> {
+    /// The Team tier as the Personal tier sees it: every Team Provider is fixed and
+    /// every contract the Team tier provides is reserved (ADR 0031).
+    pub(crate) fn team(team: &'a TierOutcome) -> Self {
+        Self {
+            admitted: team
+                .admitted
+                .iter()
+                .map(|(identity, entry)| (identity.clone(), entry))
+                .collect(),
+            providers: team.providers.clone(),
+            reserved: team
+                .admitted
+                .values()
+                .flat_map(|(_, admission)| provided_contracts(admission))
+                .collect(),
+        }
+    }
+}
+
+fn provided_contracts(admission: &Admission) -> Vec<String> {
+    admission
+        .manifest
+        .port_contract
+        .iter()
+        .flat_map(|document| document.contracts.iter().map(|item| item.identity.clone()))
+        .collect()
+}
+
+/// What happened to one installation registration before tier selection.
+enum Disposition {
+    Refused(PackageErrorCode),
+    Candidate(PackageIdentity),
+}
+
+/// Admits the registered Package Sources at Host open.
 pub(crate) fn admit(
     config: &PackageHostConfig,
     store: &HostStore,
+) -> Result<AdmissionReport, AdmissionFailure> {
+    admit_installation(
+        config,
+        store,
+        catalog::installation_registrations(config),
+        AdmissionMode::Commit,
+    )
+}
+
+/// Admits the application registrations plus `installations` in two tiers.
+///
+/// Identity collisions are resolved across every registration first. The Team
+/// tier (bundled Packages and override registrations) is then admitted over Team
+/// Providers only. The Personal tier (every other installation registration) is
+/// admitted next against the fixed Team graph (ADR 0031).
+pub(crate) fn admit_installation(
+    config: &PackageHostConfig,
+    store: &HostStore,
+    installations: Result<Vec<InstallationRegistration>, catalog::CatalogFailure>,
+    mode: AdmissionMode,
 ) -> Result<AdmissionReport, AdmissionFailure> {
     let mut diagnostics = Vec::new();
     let applications = match catalog::application_registrations(config) {
@@ -66,7 +157,7 @@ pub(crate) fn admit(
             Vec::new()
         }
     };
-    let installations = match catalog::installation_registrations(config) {
+    let installations = match installations {
         Ok(registrations) => registrations,
         Err(error) => {
             diagnostics.push(diagnostic(error.code, PackageErrorStage::Discovery, None));
@@ -85,14 +176,19 @@ pub(crate) fn admit(
         }
     }
 
+    let mut dispositions: Vec<Option<Disposition>> = Vec::new();
+    let mut registrations = Vec::new();
     let mut local_by_expected: BTreeMap<String, Vec<LocalCandidate>> = BTreeMap::new();
-    for registration in installations {
+    for (index, registration) in installations.into_iter().enumerate() {
         let expected = registration.expected_identity.clone();
         let result = load_installation(&registration, config.target());
+        registrations.push(registration.clone());
+        dispositions.push(None);
         local_by_expected
             .entry(expected)
             .or_default()
             .push(LocalCandidate {
+                index,
                 registration,
                 result,
             });
@@ -100,20 +196,28 @@ pub(crate) fn admit(
 
     let mut all_identities: BTreeSet<PackageIdentity> =
         application_by_identity.keys().cloned().collect();
-    for expected in local_by_expected.keys() {
+    for (expected, locals) in &local_by_expected {
         match PackageIdentity::from_str(expected) {
             Ok(identity) => {
                 all_identities.insert(identity);
             }
-            Err(_) => diagnostics.push(diagnostic(
-                PackageErrorCode::InvalidPackageIdentity,
-                PackageErrorStage::Admission,
-                None,
-            )),
+            Err(_) => {
+                diagnostics.push(diagnostic(
+                    PackageErrorCode::InvalidPackageIdentity,
+                    PackageErrorStage::Admission,
+                    None,
+                ));
+                for local in locals {
+                    dispositions[local.index] = Some(Disposition::Refused(
+                        PackageErrorCode::InvalidPackageIdentity,
+                    ));
+                }
+            }
         }
     }
 
-    let mut selected = Vec::new();
+    let mut team = Vec::new();
+    let mut personal = Vec::new();
     for identity in all_identities {
         let mut applications = application_by_identity
             .remove(&identity)
@@ -127,35 +231,38 @@ pub(crate) fn admit(
                 PackageErrorStage::Admission,
                 Some(identity),
             ));
+            for local in &locals {
+                dispositions[local.index] =
+                    Some(Disposition::Refused(PackageErrorCode::DuplicateIdentity));
+            }
             continue;
         }
         let application = applications.pop();
         let local = locals.pop();
         match (application, local) {
-            (Some(application), None) => selected.push(application),
-            (None, Some(local)) => match local.result {
-                Ok(candidate) => selected.push(candidate),
-                Err(code) => diagnostics.push(diagnostic(
-                    code,
-                    PackageErrorStage::Admission,
-                    Some(identity),
-                )),
-            },
-            (Some(_), Some(local)) => {
-                if !local.registration.override_application {
-                    diagnostics.push(diagnostic(
-                        PackageErrorCode::OverrideRequired,
-                        PackageErrorStage::Admission,
-                        Some(identity),
-                    ));
+            (Some(application), None) => team.push(application),
+            (application, Some(local)) => {
+                let code = if application.is_some() && !local.registration.override_application {
+                    Err(PackageErrorCode::OverrideRequired)
                 } else {
-                    match local.result {
-                        Ok(candidate) => selected.push(candidate),
-                        Err(code) => diagnostics.push(diagnostic(
+                    local.result
+                };
+                match code {
+                    Ok(candidate) => {
+                        dispositions[local.index] = Some(Disposition::Candidate(identity.clone()));
+                        if local.registration.override_application {
+                            team.push(candidate);
+                        } else {
+                            personal.push(candidate);
+                        }
+                    }
+                    Err(code) => {
+                        dispositions[local.index] = Some(Disposition::Refused(code));
+                        diagnostics.push(diagnostic(
                             code,
                             PackageErrorStage::Admission,
                             Some(identity),
-                        )),
+                        ));
                     }
                 }
             }
@@ -163,10 +270,149 @@ pub(crate) fn admit(
         }
     }
 
+    let team = admit_team(config, store, team, mode, &mut diagnostics)?;
+    let personal = admit_personal(
+        config,
+        store,
+        &FixedGraph::team(&team),
+        personal,
+        mode,
+        &mut diagnostics,
+    )?;
+
+    let mut graph = team.graph;
+    graph.extend(personal.graph);
+    let mut catalog = team.catalog;
+    catalog.extend(personal.catalog);
+    catalog.sort_by(|left, right| left.package.identity.cmp(&right.package.identity));
+    let mut packages = Vec::new();
+    let mut admissions = Vec::new();
+    for (_, (entry, admission)) in team.admitted.into_iter().chain(personal.admitted) {
+        packages.push(entry);
+        admissions.push(admission);
+    }
+    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
+    admissions.sort_by(|left, right| left.manifest.identity.cmp(&right.manifest.identity));
+    let registrations = registrations
+        .into_iter()
+        .zip(dispositions)
+        .map(|(registration, disposition)| {
+            let status = match disposition {
+                Some(Disposition::Refused(code)) => RegistrationStatus::Refused { code },
+                Some(Disposition::Candidate(identity)) => {
+                    if packages.iter().any(|package| {
+                        package.identity == identity && package.source == PackageSourceKind::Local
+                    }) {
+                        RegistrationStatus::Admitted
+                    } else {
+                        RegistrationStatus::Refused {
+                            code: diagnostics
+                                .iter()
+                                .rev()
+                                .find(|error| error.affected_package.as_ref() == Some(&identity))
+                                .map_or(PackageErrorCode::InvalidRegistration, |error| error.code),
+                        }
+                    }
+                }
+                // Every registration is reached by the identity pass above.
+                None => RegistrationStatus::Refused {
+                    code: PackageErrorCode::InvalidRegistration,
+                },
+            };
+            InstallationRegistrationSnapshot {
+                directory: registration.directory.to_string_lossy().into_owned(),
+                expected_identity: registration.expected_identity,
+                override_application: registration.override_application,
+                tier: if registration.override_application {
+                    PackageTier::Team
+                } else {
+                    PackageTier::Personal
+                },
+                status,
+            }
+        })
+        .collect();
+    diagnostics.sort_by(|left, right| left.diagnostic_id.cmp(&right.diagnostic_id));
+    if mode == AdmissionMode::Commit {
+        for error in &diagnostics {
+            store
+                .record_diagnostic(error)
+                .map_err(|error| AdmissionFailure { code: error.code })?;
+        }
+    }
+    Ok(AdmissionReport {
+        snapshot: PackageHostSnapshot {
+            revision: HostRevision::INITIAL,
+            state: PackageHostState::Opening,
+            packages,
+            instances: Vec::new(),
+            diagnostics,
+            registrations,
+        },
+        admissions,
+        graph,
+        catalog,
+    })
+}
+
+/// Admits the Team tier, selecting Providers among Team Packages only.
+pub(crate) fn admit_team(
+    config: &PackageHostConfig,
+    store: &HostStore,
+    candidates: Vec<Candidate>,
+    mode: AdmissionMode,
+    diagnostics: &mut Vec<PackageErrorEnvelope>,
+) -> Result<TierOutcome, AdmissionFailure> {
+    admit_tier(
+        config,
+        store,
+        &FixedGraph::default(),
+        candidates,
+        mode,
+        diagnostics,
+    )
+}
+
+/// Admits Personal candidates against `fixed`, which they can consume but never change.
+///
+/// A candidate whose identity is already admitted in `fixed` is refused with
+/// `override_required`, and one that claims a reserved contract with
+/// `port_provider_conflict`. Fixed Packages never route to a candidate.
+pub(crate) fn admit_personal(
+    config: &PackageHostConfig,
+    store: &HostStore,
+    fixed: &FixedGraph<'_>,
+    candidates: Vec<Candidate>,
+    mode: AdmissionMode,
+    diagnostics: &mut Vec<PackageErrorEnvelope>,
+) -> Result<TierOutcome, AdmissionFailure> {
+    let mut accepted = Vec::new();
+    for candidate in candidates {
+        if fixed.admitted.contains_key(&candidate.manifest.identity) {
+            diagnostics.push(diagnostic(
+                PackageErrorCode::OverrideRequired,
+                PackageErrorStage::Admission,
+                Some(candidate.manifest.identity.clone()),
+            ));
+        } else {
+            accepted.push(candidate);
+        }
+    }
+    admit_tier(config, store, fixed, accepted, mode, diagnostics)
+}
+
+fn admit_tier(
+    config: &PackageHostConfig,
+    store: &HostStore,
+    fixed: &FixedGraph<'_>,
+    candidates: Vec<Candidate>,
+    mode: AdmissionMode,
+    diagnostics: &mut Vec<PackageErrorEnvelope>,
+) -> Result<TierOutcome, AdmissionFailure> {
     // Finalize local validity before considering any installation-wide Provider claim.
     let mut eligible = BTreeMap::new();
-    for candidate in selected {
-        match finalize(config, store, candidate) {
+    for candidate in candidates {
+        match finalize(config, store, candidate, mode) {
             Ok((catalog, admission)) => {
                 eligible.insert(catalog.identity.clone(), (catalog, admission));
             }
@@ -187,33 +433,64 @@ pub(crate) fn admit(
             )
         })
         .collect();
+    // A fixed Provider is never displaced: a claim on a reserved contract is refused.
+    let conflicting: Vec<_> = eligible
+        .iter()
+        .filter(|(_, (_, admission))| {
+            provided_contracts(admission)
+                .iter()
+                .any(|contract| fixed.reserved.contains(contract))
+        })
+        .map(|(identity, _)| identity.clone())
+        .collect();
+    for identity in conflicting {
+        eligible.remove(&identity);
+        diagnostics.push(diagnostic(
+            PackageErrorCode::PortProviderConflict,
+            PackageErrorStage::Admission,
+            Some(identity),
+        ));
+    }
+    let tier: BTreeSet<PackageIdentity> = eligible.keys().cloned().collect();
+    let mut view: View<'_> = fixed.admitted.clone();
+    view.extend(
+        eligible
+            .iter()
+            .map(|(identity, entry)| (identity.clone(), entry)),
+    );
     let incumbent = store
         .port_providers()
         .map_err(|error| AdmissionFailure { code: error.code })?;
     let mut claims: BTreeMap<String, Vec<PackageIdentity>> = BTreeMap::new();
     for (identity, (_, admission)) in &eligible {
-        if let Some(contracts) = &admission.manifest.port_contract {
-            for contract in &contracts.contracts {
-                claims
-                    .entry(contract.identity.clone())
-                    .or_default()
-                    .push(identity.clone());
-            }
+        for contract in provided_contracts(admission) {
+            claims.entry(contract).or_default().push(identity.clone());
         }
     }
-    let (providers, limited) = select_provider_graph(&eligible, &claims, &incumbent);
-    let selected: BTreeSet<_> = providers.values().cloned().collect();
+    let (selected_providers, limited) =
+        select_provider_graph(&view, &claims, &incumbent, &fixed.providers);
+    let selected: BTreeSet<_> = selected_providers.values().cloned().collect();
+    let mut providers = fixed.providers.clone();
+    providers.extend(selected_providers.clone());
     let claimants: BTreeSet<_> = claims.values().flatten().cloned().collect();
-    let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
+    let mut remaining: BTreeSet<_> = view.keys().cloned().collect();
     remaining.retain(|id| !claimants.contains(id) || selected.contains(id));
     // Preserve the original cycle verdict when every candidate in a required cycle
     // must be discarded; the final empty graph alone cannot reveal that cause.
-    let preferred = preferred_providers(&eligible, &claims, &incumbent);
-    let preferred_cycles = required_cycle_members(&eligible, &preferred);
-    for identity in required_cycle_members(&eligible, &providers) {
+    let mut preferred = fixed.providers.clone();
+    preferred.extend(preferred_providers(&view, &claims, &incumbent));
+    let preferred_cycles = required_cycle_members(&view, &preferred);
+    for identity in required_cycle_members(&view, &providers) {
         remaining.remove(&identity);
     }
-    settle_required(&eligible, &providers, &mut remaining);
+    settle_required(&view, &providers, &mut remaining);
+    debug_assert!(
+        fixed
+            .admitted
+            .keys()
+            .all(|identity| remaining.contains(identity)),
+        "a later tier never removes a fixed Package"
+    );
     for identity in &claimants {
         if selected.contains(identity) {
             continue;
@@ -221,17 +498,15 @@ pub(crate) fn admit(
         let code = if limited.contains(identity) {
             PackageErrorCode::PortGraphSearchLimit
         } else {
-            let missing = eligible[identity]
+            let missing = view[identity]
                 .1
                 .manifest
                 .consumed_ports
                 .iter()
                 .filter(|request| request.required)
-                .find_map(|request| {
-                    resolve(request, &providers, &eligible, &remaining).unavailable
-                });
+                .find_map(|request| resolve(request, &providers, &view, &remaining).unavailable);
             let has_winner = claims.iter().any(|(contract, candidates)| {
-                candidates.contains(identity) && providers.contains_key(contract)
+                candidates.contains(identity) && selected_providers.contains_key(contract)
             });
             if preferred_cycles.contains(identity) && !has_winner {
                 PackageErrorCode::PortDependencyCycle
@@ -245,18 +520,18 @@ pub(crate) fn admit(
             Some(identity.clone()),
         ));
     }
-    for identity in eligible
-        .keys()
+    for identity in tier
+        .iter()
         .filter(|identity| !claimants.contains(*identity))
     {
         if !remaining.contains(identity) {
-            let code = eligible[identity]
+            let code = view[identity]
                 .1
                 .manifest
                 .consumed_ports
                 .iter()
                 .filter(|request| request.required)
-                .find_map(|request| resolve(request, &providers, &eligible, &remaining).unavailable)
+                .find_map(|request| resolve(request, &providers, &view, &remaining).unavailable)
                 .unwrap_or(PackageErrorCode::PortDependencyCycle);
             diagnostics.push(diagnostic(
                 code,
@@ -265,22 +540,26 @@ pub(crate) fn admit(
             ));
         }
     }
-    let mut eligible = eligible;
     let graph = remaining
         .iter()
+        .filter(|identity| tier.contains(*identity))
         .map(|identity| {
-            let ports = eligible[identity]
+            let ports = view[identity]
                 .1
                 .manifest
                 .consumed_ports
                 .iter()
-                .map(|request| resolve(request, &providers, &eligible, &remaining))
+                .map(|request| resolve(request, &providers, &view, &remaining))
                 .collect();
             (identity.clone(), ports)
         })
         .collect();
-    for (contract, identity) in &providers {
-        if remaining.contains(identity) {
+    let tier_providers: BTreeMap<String, PackageIdentity> = selected_providers
+        .into_iter()
+        .filter(|(_, identity)| remaining.contains(identity))
+        .collect();
+    if mode == AdmissionMode::Commit {
+        for (contract, identity) in &tier_providers {
             store
                 .record_port_provider(contract, identity.as_str())
                 .map_err(|error| AdmissionFailure { code: error.code })?;
@@ -291,7 +570,7 @@ pub(crate) fn admit(
         .map(|(package, document, consumed)| {
             let availability = consumed
                 .iter()
-                .map(|request| resolve(request, &providers, &eligible, &remaining))
+                .map(|request| resolve(request, &providers, &view, &remaining))
                 .collect();
             let diagnostics = diagnostics
                 .iter()
@@ -314,40 +593,23 @@ pub(crate) fn admit(
             }
         })
         .collect();
-    let mut packages = Vec::new();
-    let mut admissions = Vec::new();
-    for identity in remaining {
-        let (catalog, admission) = eligible.remove(&identity).expect("selected identity");
-        packages.push(catalog);
-        admissions.push(admission);
-    }
-    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-    admissions.sort_by(|left, right| left.manifest.identity.cmp(&right.manifest.identity));
-    diagnostics.sort_by(|left, right| left.diagnostic_id.cmp(&right.diagnostic_id));
-    for error in &diagnostics {
-        store
-            .record_diagnostic(error)
-            .map_err(|error| AdmissionFailure { code: error.code })?;
-    }
-    Ok(AdmissionReport {
-        snapshot: PackageHostSnapshot {
-            revision: HostRevision::INITIAL,
-            state: PackageHostState::Opening,
-            packages,
-            instances: Vec::new(),
-            diagnostics,
-        },
-        admissions,
+    drop(view);
+    eligible.retain(|identity, _| remaining.contains(identity));
+    Ok(TierOutcome {
+        admitted: eligible,
+        providers: tier_providers,
         graph,
         catalog,
     })
 }
 
-type Eligible = BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>;
+pub(crate) type Eligible = BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>;
+/// Borrowed admitted entries: a tier's candidates plus the fixed Packages they may consume.
+pub(crate) type View<'a> = BTreeMap<PackageIdentity, &'a (PackageCatalogEntry, Admission)>;
 const MAX_GRAPH_STATES: usize = 4_096;
 
 fn preferred_providers(
-    eligible: &Eligible,
+    eligible: &View<'_>,
     claims: &BTreeMap<String, Vec<PackageIdentity>>,
     incumbent: &BTreeMap<String, String>,
 ) -> BTreeMap<String, PackageIdentity> {
@@ -370,7 +632,7 @@ fn preferred_providers(
 }
 
 fn settle_required(
-    eligible: &Eligible,
+    eligible: &View<'_>,
     providers: &BTreeMap<String, PackageIdentity>,
     remaining: &mut BTreeSet<PackageIdentity>,
 ) {
@@ -402,10 +664,11 @@ fn settle_required(
 }
 
 fn viable_selection(
-    eligible: &Eligible,
+    eligible: &View<'_>,
     claims: &BTreeMap<String, Vec<PackageIdentity>>,
     component: &[String],
     providers: &BTreeMap<String, PackageIdentity>,
+    fixed: &BTreeMap<String, PackageIdentity>,
 ) -> bool {
     let selected: BTreeSet<_> = providers.values().cloned().collect();
     // A Package cannot provide one of its contracts after losing another claim.
@@ -422,18 +685,20 @@ fn viable_selection(
         .collect();
     let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
     remaining.retain(|id| !claimants.contains(id) || selected.contains(id));
-    for identity in required_cycle_members(eligible, providers) {
+    let providers = with_fixed(fixed, providers);
+    for identity in required_cycle_members(eligible, &providers) {
         remaining.remove(&identity);
     }
-    settle_required(eligible, providers, &mut remaining);
+    settle_required(eligible, &providers, &mut remaining);
     selected.is_subset(&remaining)
 }
 
 struct GraphSearch<'a> {
-    eligible: &'a Eligible,
+    eligible: &'a View<'a>,
     claims: &'a BTreeMap<String, Vec<PackageIdentity>>,
     options: Vec<(String, Vec<Option<PackageIdentity>>)>,
     incumbent: &'a BTreeMap<String, String>,
+    fixed: &'a BTreeMap<String, PackageIdentity>,
     incumbent_total: usize,
     states: usize,
     exhausted: bool,
@@ -472,7 +737,7 @@ impl GraphSearch<'_> {
                 .iter()
                 .map(|(contract, _)| contract.clone())
                 .collect();
-            if viable_selection(self.eligible, self.claims, &component, chosen) {
+            if viable_selection(self.eligible, self.claims, &component, chosen, self.fixed) {
                 self.best_count = retained;
                 self.best = Some(chosen.clone());
             }
@@ -498,10 +763,13 @@ impl GraphSearch<'_> {
     }
 }
 
+/// Selects one Provider per claimed contract. `fixed` Providers are already settled:
+/// claimants may depend on them, but they are never chosen, replaced, or returned.
 fn select_provider_graph(
-    eligible: &Eligible,
+    eligible: &View<'_>,
     claims: &BTreeMap<String, Vec<PackageIdentity>>,
     incumbent: &BTreeMap<String, String>,
+    fixed: &BTreeMap<String, PackageIdentity>,
 ) -> (BTreeMap<String, PackageIdentity>, BTreeSet<PackageIdentity>) {
     // Dependency edges are undirected for search isolation: the Package claiming Y
     // may require X even when no claimant for X names Y.
@@ -515,6 +783,7 @@ fn select_provider_graph(
             .port_contract
             .iter()
             .flat_map(|document| document.contracts.iter().map(|item| item.identity.clone()))
+            .filter(|contract| claims.contains_key(contract))
             .collect();
         let related: Vec<_> = provided
             .iter()
@@ -562,10 +831,11 @@ fn select_provider_graph(
                 .map(|contract| (contract.clone(), claims[contract][0].clone()))
                 .collect();
             let mut remaining: BTreeSet<_> = eligible.keys().cloned().collect();
-            for identity in required_cycle_members(eligible, &chosen) {
+            let available = with_fixed(fixed, &chosen);
+            for identity in required_cycle_members(eligible, &available) {
                 remaining.remove(&identity);
             }
-            settle_required(eligible, &chosen, &mut remaining);
+            settle_required(eligible, &available, &mut remaining);
             providers.extend(
                 chosen
                     .into_iter()
@@ -600,6 +870,7 @@ fn select_provider_graph(
             claims,
             options,
             incumbent,
+            fixed,
             incumbent_total,
             states: 0,
             exhausted: false,
@@ -618,10 +889,24 @@ fn select_provider_graph(
     (providers, limited)
 }
 
+/// `chosen` Providers over the `fixed` ones a tier is selected against.
+fn with_fixed(
+    fixed: &BTreeMap<String, PackageIdentity>,
+    chosen: &BTreeMap<String, PackageIdentity>,
+) -> BTreeMap<String, PackageIdentity> {
+    let mut providers = fixed.clone();
+    providers.extend(
+        chosen
+            .iter()
+            .map(|(contract, id)| (contract.clone(), id.clone())),
+    );
+    providers
+}
+
 fn resolve(
     request: &teamarness_package_contract::manifest::ConsumedContract,
     providers: &BTreeMap<String, PackageIdentity>,
-    eligible: &BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>,
+    eligible: &View<'_>,
     remaining: &BTreeSet<PackageIdentity>,
 ) -> PortAvailability {
     let mut result = PortAvailability {
@@ -667,7 +952,7 @@ fn resolve(
 }
 
 fn required_cycle_members(
-    eligible: &BTreeMap<PackageIdentity, (PackageCatalogEntry, Admission)>,
+    eligible: &View<'_>,
     providers: &BTreeMap<String, PackageIdentity>,
 ) -> BTreeSet<PackageIdentity> {
     let all: BTreeSet<_> = eligible.keys().cloned().collect();
@@ -729,7 +1014,7 @@ fn load_application(
     })
 }
 
-fn load_installation(
+pub(crate) fn load_installation(
     registration: &InstallationRegistration,
     target: &str,
 ) -> Result<Candidate, PackageErrorCode> {
@@ -753,32 +1038,44 @@ fn load_installation(
     })
 }
 
+/// Compiles one candidate. Only `Commit` writes its UI cache and admissions row.
 fn finalize(
     config: &PackageHostConfig,
     store: &HostStore,
     candidate: Candidate,
+    mode: AdmissionMode,
 ) -> Result<(PackageCatalogEntry, Admission), (PackageErrorCode, PackageIdentity)> {
     let identity = candidate.manifest.identity.clone();
     let ui_contract = ui::compile_contract(&candidate.manifest.ui.contract.bytes)
         .map_err(|error| (error.code, identity.clone()))?;
     let admission_digest = admission_digest(&candidate.manifest, candidate.source);
-    let ui_cache = ui::populate_cache(
-        config.private_data_directory(),
-        &admission_digest,
-        &candidate.manifest,
-    )
-    .map_err(|error| (error.code, identity.clone()))?;
-    store
-        .record_admission(StoredAdmission {
-            admission_digest: &admission_digest,
-            package_identity: identity.as_str(),
-            package_version: &candidate.manifest.version.to_string(),
-            source: candidate.source,
-            manifest_digest: &candidate.manifest.manifest_digest,
-            backend_digest: &candidate.manifest.backend.digest,
-            ui_contract_digest: &candidate.manifest.ui.contract.digest,
-        })
-        .map_err(|error| (error.code, identity.clone()))?;
+    let ui_cache = match mode {
+        AdmissionMode::Commit => {
+            let cache = ui::populate_cache(
+                config.private_data_directory(),
+                &admission_digest,
+                &candidate.manifest,
+            )
+            .map_err(|error| (error.code, identity.clone()))?;
+            store
+                .record_admission(StoredAdmission {
+                    admission_digest: &admission_digest,
+                    package_identity: identity.as_str(),
+                    package_version: &candidate.manifest.version.to_string(),
+                    source: candidate.source,
+                    manifest_digest: &candidate.manifest.manifest_digest,
+                    backend_digest: &candidate.manifest.backend.digest,
+                    ui_contract_digest: &candidate.manifest.ui.contract.digest,
+                })
+                .map_err(|error| (error.code, identity.clone()))?;
+            cache
+        }
+        AdmissionMode::Preflight => ui::planned_cache(
+            config.private_data_directory(),
+            &admission_digest,
+            &candidate.manifest,
+        ),
+    };
     let catalog = PackageCatalogEntry {
         identity,
         version: candidate.manifest.version.to_string(),

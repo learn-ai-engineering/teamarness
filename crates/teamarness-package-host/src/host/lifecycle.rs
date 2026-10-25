@@ -103,6 +103,7 @@ impl PackageHost {
             port_broker,
             report.snapshot.packages,
             report.snapshot.diagnostics,
+            report.snapshot.registrations,
             instances,
         ))
     }
@@ -316,6 +317,7 @@ impl PackageHost {
         port_broker: Arc<broker::PortBroker>,
         packages: Vec<crate::PackageCatalogEntry>,
         diagnostics: Vec<PackageErrorEnvelope>,
+        registrations: Vec<crate::InstallationRegistrationSnapshot>,
         instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
     ) -> Self {
         let revision = HostRevision(1);
@@ -329,6 +331,7 @@ impl PackageHost {
                     revision,
                     packages,
                     diagnostics,
+                    registrations,
                     instances,
                     mounts: BTreeMap::new(),
                     ui_routes: BTreeMap::new(),

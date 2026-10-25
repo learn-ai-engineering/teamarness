@@ -38,6 +38,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0028](0028-qualified-record-replay-and-generation-fence.md) | Qualified immutable-record replay and Package generation append fence | accepted (2026-10-23; renumbered at integration) | – | – | In the ADR | Refines 0018 (additive minor), 0008/0009 (replay), and 0019 (generation retirement); see 0027 for Documents usage |
 | [0029](0029-document-import-failure.md) | A durable body edit may be unapplied on one Installation | accepted (2026-10-23; renumbered at integration) | – | – | In the ADR | Refines 0027/0028; local fail-loud import disposition, last-good incomplete text, no remote ACK or automatic repair |
 | [0030](0030-agent-standing-authority-and-binding.md) | Standing local Agent authority and Package-held Agent binding | accepted (2026-10-24) | 0023 (part), 0026 (part) | – | In the ADR | Refines 0017, 0023 and 0026; caller-independent Agent signing, binding keyed by Package, `teamarness.agent-binding` 1.0, Host-derived Agent actor |
+| [0031](0031-personal-package-tier.md) | Two Package admission tiers with a live Personal tier | accepted (2026-10-25) | – | – | In the ADR | Refines 0003, 0026 and `TEAM.SYS.PKG-R09`; Team tier fixed at open, Personal tier installed/reloaded/removed live, Team never routes to Personal, app-written v1 registration file |
 
 ### Parallel-branch numbering reconciliation
 

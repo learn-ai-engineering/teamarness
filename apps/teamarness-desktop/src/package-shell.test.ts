@@ -21,6 +21,7 @@ const snapshot: PackageHostSnapshot = {
     { key: second, lifecycle: "active", processGeneration: 9, mountState: null },
   ],
   diagnostics: [],
+  registrations: [],
 };
 
 function snapshotAt(revision: number): PackageHostSnapshot {

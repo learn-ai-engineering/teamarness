@@ -205,6 +205,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         packages: vec![],
         instances: vec![],
         diagnostics: vec![],
+        registrations: vec![],
     };
     assert!(snapshot.packages.is_empty());
 
@@ -261,6 +262,8 @@ fn snapshots_and_errors_expose_only_host_values() {
 
     let codes = [
         PackageErrorCode::InvalidRegistration,
+        PackageErrorCode::RegistrationFileInvalid,
+        PackageErrorCode::NotRegistered,
         PackageErrorCode::SourceNotFound,
         PackageErrorCode::ManifestMalformed,
         PackageErrorCode::ManifestUnsupported,
@@ -317,10 +320,12 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 56);
+    assert_eq!(codes.len(), 58);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
+            | PackageErrorCode::RegistrationFileInvalid
+            | PackageErrorCode::NotRegistered
             | PackageErrorCode::SourceNotFound
             | PackageErrorCode::ManifestMalformed
             | PackageErrorCode::ManifestUnsupported

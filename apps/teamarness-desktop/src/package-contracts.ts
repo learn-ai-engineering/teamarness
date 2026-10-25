@@ -24,12 +24,22 @@ export type PackageInstance = Readonly<{
   mountState: "opening" | "mounted" | "failed" | "closing" | "closed" | null;
 }>;
 
+/** One installation registration, with its admission tier and result (ADR 0031). */
+export type PackageRegistration = Readonly<{
+  directory: string;
+  expectedIdentity: string;
+  override: boolean;
+  tier: "team" | "personal";
+  status: Readonly<{ kind: "admitted" }> | Readonly<{ kind: "refused"; code: string }>;
+}>;
+
 export type PackageHostSnapshot = Readonly<{
   revision: number;
   state: "opening" | "running" | "shutting_down" | "stopped" | "failed";
   packages: readonly PackageCatalogEntry[];
   instances: readonly PackageInstance[];
   diagnostics: readonly PackageBridgeError[];
+  registrations: readonly PackageRegistration[];
 }>;
 
 export type PackageLoader = Readonly<{

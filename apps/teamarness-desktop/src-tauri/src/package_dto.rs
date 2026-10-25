@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use teamarness_package_host::{
-    HostStateNotification, PackageCatalogEntry, PackageHostSnapshot, PackageInstanceKey,
-    PackageInstanceSnapshot, PackageValue, UiEventNotification, UiLoaderDescriptor,
-    UiStreamCompletedNotification,
+    HostStateNotification, InstallationRegistrationSnapshot, PackageCatalogEntry,
+    PackageHostSnapshot, PackageInstanceKey, PackageInstanceSnapshot, PackageValue,
+    RegistrationStatus, UiEventNotification, UiLoaderDescriptor, UiStreamCompletedNotification,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +74,42 @@ impl From<PackageInstanceSnapshot> for PackageInstanceDto {
     }
 }
 
+/// One installation registration, with its admission tier and result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageRegistrationDto {
+    directory: String,
+    expected_identity: String,
+    #[serde(rename = "override")]
+    override_application: bool,
+    tier: String,
+    status: PackageRegistrationStatusDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PackageRegistrationStatusDto {
+    Admitted,
+    Refused { code: String },
+}
+
+impl From<InstallationRegistrationSnapshot> for PackageRegistrationDto {
+    fn from(value: InstallationRegistrationSnapshot) -> Self {
+        Self {
+            directory: value.directory,
+            expected_identity: value.expected_identity,
+            override_application: value.override_application,
+            tier: wire_name(value.tier),
+            status: match value.status {
+                RegistrationStatus::Admitted => PackageRegistrationStatusDto::Admitted,
+                RegistrationStatus::Refused { code } => PackageRegistrationStatusDto::Refused {
+                    code: wire_name(code),
+                },
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageHostSnapshotDto {
@@ -82,6 +118,7 @@ pub struct PackageHostSnapshotDto {
     packages: Vec<PackageCatalogEntryDto>,
     instances: Vec<PackageInstanceDto>,
     diagnostics: Vec<crate::package_error::PackageBridgeError>,
+    registrations: Vec<PackageRegistrationDto>,
 }
 
 impl From<PackageHostSnapshot> for PackageHostSnapshotDto {
@@ -92,6 +129,7 @@ impl From<PackageHostSnapshot> for PackageHostSnapshotDto {
             packages: value.packages.into_iter().map(Into::into).collect(),
             instances: value.instances.into_iter().map(Into::into).collect(),
             diagnostics: value.diagnostics.into_iter().map(Into::into).collect(),
+            registrations: value.registrations.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -275,6 +313,45 @@ mod tests {
         for key in ["description", "author", "homepage"] {
             assert!(bare.get(key).is_none(), "{key} is omitted when absent");
         }
+    }
+
+    // Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn registration_dto_carries_tier_and_status_in_camel_case() {
+        let registration = |tier, status| {
+            serde_json::to_value(PackageRegistrationDto::from(
+                InstallationRegistrationSnapshot {
+                    directory: "/Users/person/Packages/fixture".into(),
+                    expected_identity: "com.example.fixture".into(),
+                    override_application: tier == teamarness_package_host::PackageTier::Team,
+                    tier,
+                    status,
+                },
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            registration(
+                teamarness_package_host::PackageTier::Personal,
+                RegistrationStatus::Admitted
+            ),
+            serde_json::json!({
+                "directory": "/Users/person/Packages/fixture",
+                "expectedIdentity": "com.example.fixture",
+                "override": false,
+                "tier": "personal",
+                "status": {"kind": "admitted"}
+            })
+        );
+        assert_eq!(
+            registration(
+                teamarness_package_host::PackageTier::Team,
+                RegistrationStatus::Refused {
+                    code: teamarness_package_host::PackageErrorCode::PortProviderConflict
+                }
+            )["status"],
+            serde_json::json!({"kind": "refused", "code": "port_provider_conflict"})
+        );
     }
 
     #[test]

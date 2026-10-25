@@ -435,4 +435,108 @@ pub struct PackageHostSnapshot {
     pub packages: Vec<PackageCatalogEntry>,
     pub instances: Vec<PackageInstanceSnapshot>,
     pub diagnostics: Vec<PackageErrorEnvelope>,
+    /// Every installation registration the Host read, with its tier and admission result.
+    pub registrations: Vec<InstallationRegistrationSnapshot>,
+}
+
+/// The admission tier a Package belongs to (ADR 0031).
+///
+/// The Team tier is the bundled Packages plus installation registrations with
+/// `overrideApplication`. It is fixed when the Host opens. The Personal tier is
+/// every other installation registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageTier {
+    Team,
+    Personal,
+}
+
+/// Whether one installation registration was admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RegistrationStatus {
+    Admitted,
+    Refused {
+        code: crate::errors::PackageErrorCode,
+    },
+}
+
+/// One entry of the installation registration file, as the Host last admitted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationRegistrationSnapshot {
+    /// The registered Package Directory, canonical when it could be resolved.
+    pub directory: String,
+    /// The Package Identity the registration expects, exactly as written.
+    pub expected_identity: String,
+    /// Whether the registration replaces a bundled Package.
+    #[serde(rename = "override")]
+    pub override_application: bool,
+    pub tier: PackageTier,
+    pub status: RegistrationStatus,
+}
+
+/// What registering an inspected Package Directory would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectedPackageKind {
+    /// No registration or bundled Package has this identity.
+    New,
+    /// The identity is already registered at this directory.
+    Reload,
+    /// The identity is already registered at a different directory.
+    ReplacesRegistration,
+    /// A bundled Package has this identity, so registering it needs an override.
+    OverridesTeam,
+}
+
+/// The display metadata of an inspected Package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedPresentation {
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+}
+
+/// One Semantic Capability an inspected Package requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedCapability {
+    pub identity: String,
+    pub major: u16,
+    pub min_minor: u16,
+    pub max_minor: u16,
+}
+
+/// A Package Directory read for a preview. Inspecting never runs Package code.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedPackage {
+    /// The canonical Package Directory.
+    pub directory: PathBuf,
+    pub identity: PackageIdentity,
+    pub version: String,
+    pub presentation: InspectedPresentation,
+    pub capabilities: Vec<InspectedCapability>,
+    pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
+    pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+    pub kind: InspectedPackageKind,
+}
+
+/// A request to register a Package Directory in the installation registration file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationRequest {
+    /// An absolute path to the Package Directory.
+    pub directory: PathBuf,
+    /// The identity the person saw in the preview.
+    pub expected_identity: PackageIdentity,
+    /// The `trusted_native_code_v1` risks the person accepted.
+    pub accepted_risks: Vec<String>,
+    /// Whether the person confirmed replacing a bundled Package.
+    pub override_application: bool,
 }

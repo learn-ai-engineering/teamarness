@@ -19,7 +19,8 @@
       "processGeneration": 3,
       "mountState": null
     }],
-    "diagnostics": []
+    "diagnostics": [],
+    "registrations": []
   },
   "loader": {
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",

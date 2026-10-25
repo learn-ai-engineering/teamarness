@@ -25,6 +25,7 @@ mod host_store;
 mod instance;
 mod manifest;
 mod protocol;
+mod registrations;
 mod subscriptions;
 mod supervisor;
 mod ui;
@@ -46,16 +47,22 @@ pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
     PackageErrorEnvelope, PackageErrorStage, PackageOwnedError, RecoveryAction,
 };
+pub use crate::registrations::{
+    inspect_package_directory, remove_registration, write_registration,
+};
 pub use crate::subscriptions::{
     HostStateNotification, PackageHostNotification, PackageHostSubscription,
     PackageHostSubscriptionSelector, UiEventNotification, UiStreamCompletedNotification,
 };
 pub use crate::ui::MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 pub use crate::values::{
-    DiagnosticId, HostRevision, InstallationPublicIdentity, LifecycleState, MountState,
-    PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
-    PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTrustKind, PackageValue,
-    UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
+    DiagnosticId, HostRevision, InspectedCapability, InspectedPackage, InspectedPackageKind,
+    InspectedPresentation, InstallationPublicIdentity, InstallationRegistrationSnapshot,
+    LifecycleState, MountState, PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot,
+    PackageHostState, PackageIdentity, PackageInstanceKey, PackageInstanceSnapshot,
+    PackageSourceKind, PackageTier, PackageTrustKind, PackageValue, RegistrationRequest,
+    RegistrationStatus, UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError,
+    WorkspaceId,
 };
 
 use crate::errors::host_error;
@@ -106,6 +113,7 @@ struct HostData {
     revision: HostRevision,
     packages: Vec<PackageCatalogEntry>,
     diagnostics: Vec<PackageErrorEnvelope>,
+    registrations: Vec<InstallationRegistrationSnapshot>,
     instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
     mounts: BTreeMap<UiMountId, MountLease>,
     ui_routes: BTreeMap<(UiMountId, UiSubscriptionId), Option<protocol::UiEventReceiver>>,
@@ -123,13 +131,14 @@ struct MountLease {
 impl PackageHost {
     /// Returns the authoritative Package Host state.
     pub async fn snapshot(&self) -> PackageHostSnapshot {
-        let (state, revision, packages, diagnostics, instances) = {
+        let (state, revision, packages, diagnostics, registrations, instances) = {
             let data = self.inner.data.lock().await;
             (
                 data.state,
                 data.revision,
                 data.packages.clone(),
                 data.diagnostics.clone(),
+                data.registrations.clone(),
                 data.instances.values().cloned().collect::<Vec<_>>(),
             )
         };
@@ -143,6 +152,7 @@ impl PackageHost {
             packages,
             instances: snapshots,
             diagnostics,
+            registrations,
         }
     }
 
