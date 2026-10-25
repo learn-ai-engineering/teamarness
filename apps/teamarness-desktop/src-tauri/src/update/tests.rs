@@ -42,12 +42,10 @@ fn update_metadata_requires_newer_canonical_stable_and_exact_repository() {
     assert!(Metadata::parse(b"not JSON", &installed).is_err());
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
 struct FixtureTransfer {
     feed: Vec<u8>,
     bytes: Vec<u8>,
-    calls: AtomicUsize,
+    calls: watch::Sender<usize>,
     failure: bool,
     block: Option<Arc<Notify>>,
 }
@@ -60,7 +58,7 @@ impl Transfer for FixtureTransfer {
         progress: Progress,
     ) -> BoxFuture<'_, Result<Option<Vec<u8>>, ErrorCategory>> {
         Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.calls.send_modify(|calls| *calls += 1);
             if let Some(block) = &self.block {
                 tokio::select! { _ = cancel.cancelled() => return Err(ErrorCategory::Cancelled), _ = block.notified() => () }
             }
@@ -118,7 +116,7 @@ fn fixture_system(
     let transfer = Arc::new(FixtureTransfer {
         feed: serde_json::to_vec(&feed).unwrap(),
         bytes: bytes.to_vec(),
-        calls: AtomicUsize::new(0),
+        calls: watch::channel(0).0,
         failure,
         block,
     });
@@ -149,13 +147,55 @@ async fn wait_state(service: &UpdateService, state: State) {
     }
 }
 async fn wait_calls(transfer: &FixtureTransfer, count: usize) {
-    for _ in 0..10000 {
-        if transfer.calls.load(Ordering::SeqCst) >= count {
-            return;
-        }
-        tokio::task::yield_now().await;
+    let mut calls = transfer.calls.subscribe();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    tokio::select! {
+        biased;
+        // watch retains entries before subscription and registers changes with the predicate.
+        result = calls.wait_for(|calls| *calls >= count) => { result.unwrap(); }
+        // Keep paused-clock observers runnable while external workers progress. A Tokio
+        // timer could auto-advance and falsely expire; wall time bounds only failure.
+        _ = async {
+            while std::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+        } => panic!("missing transfer call {count}"),
     }
-    panic!("missing transfer call {count}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn update_fetch_entry_observation_retains_counts_before_and_after_subscription() {
+    let (_, transfer) = fixture_system(manifest("1.2.3"), BYTES, true, None);
+    let now = tokio::time::Instant::now();
+    let fetch = || {
+        transfer.fetch(
+            Url::parse(config::ENDPOINT).unwrap(),
+            Resource::Feed,
+            Cancellation::new(),
+            Arc::new(|_| {}),
+        )
+    };
+    assert_eq!(fetch().await, Err(ErrorCategory::Network));
+    wait_calls(&transfer, 1).await;
+
+    let mut second_entry = std::pin::pin!(wait_calls(&transfer, 2));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(second_entry.as_mut().poll(&mut context).is_pending());
+    let worker_transfer = transfer.clone();
+    let worker = tauri::async_runtime::spawn(async move {
+        worker_transfer
+            .fetch(
+                Url::parse(config::ENDPOINT).unwrap(),
+                Resource::Feed,
+                Cancellation::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+    });
+    second_entry.await;
+    assert_eq!(worker.await.unwrap(), Err(ErrorCategory::Network));
+    assert_eq!(*transfer.calls.borrow(), 2);
+    assert_eq!(tokio::time::Instant::now(), now);
 }
 
 // Verifies: TEAM-R10, TEAM.SYS.SHELL-R07. Background discovery never owns ordinary runtime dispatch.
@@ -173,7 +213,7 @@ async fn update_schedule_launch_six_hours_resume_coalescing_and_explicit_rate_li
     wait_state(&service, State::Idle).await;
     tokio::time::advance(PERIOD - Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
-    assert_eq!(transfer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*transfer.calls.borrow(), 1);
     tokio::time::advance(Duration::from_secs(1)).await;
     wait_calls(&transfer, 2).await;
     block.notify_one();
@@ -214,7 +254,7 @@ async fn update_real_signed_candidate_ready_suspends_acquisition_and_exit_loses_
     assert!(!service.request_check());
     tokio::time::advance(PERIOD * 10).await;
     tokio::task::yield_now().await;
-    assert_eq!(transfer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*transfer.calls.borrow(), 2);
     assert_eq!(service.status().revision, snapshot.revision);
     assert!(service.admit_apply("stale").is_err());
     service.stop();
@@ -281,7 +321,7 @@ async fn update_progress_and_late_successful_verification_cannot_publish_ready_a
     });
     assert!(service.request_check());
     entered.notified().await;
-    assert_eq!(transfer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*transfer.calls.borrow(), 2);
     assert_eq!(service.status().downloaded_bytes, BYTES.len());
     assert_eq!(service.status().state, State::Verifying);
     assert!(service.status().pending_generation.is_none());
@@ -494,7 +534,7 @@ async fn update_apply_rechecks_pending_version_and_lifecycle_quit_cancels_downlo
     let gate = Arc::new(Notify::new());
     let (service, transfer) = fixture(manifest("1.2.3"), BYTES, false, Some(gate.clone()));
     service.request_check();
-    while transfer.calls.load(Ordering::SeqCst) == 0 {
+    while *transfer.calls.borrow() == 0 {
         tokio::task::yield_now().await;
     }
     gate.notify_one();
@@ -553,7 +593,7 @@ fn native_enabled_startup_and_check_after_returned_block_on_launch_acquisition()
         wait_calls(&transfer, 2).await;
         wait_state(&service, State::Idle).await;
     });
-    assert_eq!(transfer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*transfer.calls.borrow(), 2);
     assert_eq!(service.status().error, Some(ErrorCategory::Network));
     service.stop();
     assert!(!service.request_check());

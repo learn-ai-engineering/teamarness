@@ -249,6 +249,8 @@ mod tests {
         );
         assert_eq!(lifecycle.status().phase, Phase::Running);
         let generation = updates.status().pending_generation.unwrap();
+        // Keep the refusing installer behind drain until admission assertions finish.
+        let lease = lifecycle.admit().unwrap();
         let before = snapshot(&lifecycle, &updates).revision;
         request_restart(&lifecycle, &updates, &generation, terminal.clone()).unwrap();
         request_restart(&lifecycle, &updates, &generation, terminal.clone()).unwrap();
@@ -258,6 +260,7 @@ mod tests {
         );
         assert!(lifecycle.admit().is_err());
         assert!(snapshot(&lifecycle, &updates).revision > before);
+        drop(lease);
         tauri::async_runtime::block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(10), lifecycle.finished())
                 .await
