@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use teamarness_package_host::{
-    HostRevision, HostStateNotification, InspectedPackage, InstallationRegistrationSnapshot,
-    PackageCatalogEntry, PackageHostSnapshot, PackageInstanceKey, PackageInstanceSnapshot,
-    PackageValue, RegistrationStatus, UiEventNotification, UiLoaderDescriptor,
-    UiStreamCompletedNotification,
+    AuthoringCatalogEntry, HostRevision, HostStateNotification, InspectedPackage,
+    InstallationRegistrationSnapshot, PackageCatalogEntry, PackageHostSnapshot, PackageInstanceKey,
+    PackageInstanceSnapshot, PackageValue, RegistrationStatus, UiEventNotification,
+    UiLoaderDescriptor, UiStreamCompletedNotification,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +282,84 @@ impl From<InspectedPackage> for InspectedPackageDto {
                 })
                 .collect(),
             kind: wire_name(value.kind),
+        }
+    }
+}
+
+/// One admitted Package's declared Semantic Capabilities and Ports, for its
+/// Package page. Port schemas are left out; the page shows only what a person reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageAuthoringEntryDto {
+    identity: String,
+    capabilities: Vec<InspectedCapabilityDto>,
+    provided: Vec<ProvidedPortContractDto>,
+    consumed: Vec<ConsumedPortAvailabilityDto>,
+}
+
+/// A consumed Port contract and whether the installed graph can route it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedPortAvailabilityDto {
+    identity: String,
+    major: u16,
+    min_minor: u16,
+    max_minor: u16,
+    required: bool,
+    /// The Package that provides it, when one is selected.
+    provider: Option<String>,
+    /// The selected minor version, when one is selected.
+    minor: Option<u16>,
+    /// Why it cannot be routed, as a Package Host error code.
+    unavailable: Option<String>,
+}
+
+impl From<AuthoringCatalogEntry> for PackageAuthoringEntryDto {
+    fn from(value: AuthoringCatalogEntry) -> Self {
+        let availability = value.availability;
+        Self {
+            identity: value.package.identity.into(),
+            capabilities: value
+                .capabilities
+                .into_iter()
+                .map(|capability| InspectedCapabilityDto {
+                    identity: capability.identity,
+                    major: capability.major,
+                    min_minor: capability.min_minor,
+                    max_minor: capability.max_minor,
+                })
+                .collect(),
+            provided: value
+                .provided
+                .into_iter()
+                .map(|contract| ProvidedPortContractDto {
+                    identity: contract.identity,
+                    major: contract.major,
+                    minor: contract.minor,
+                    description: contract.description,
+                })
+                .collect(),
+            consumed: value
+                .consumed
+                .into_iter()
+                .map(|contract| {
+                    let routed = availability
+                        .iter()
+                        .find(|availability| availability.contract == contract.identity);
+                    ConsumedPortAvailabilityDto {
+                        provider: routed
+                            .and_then(|routed| routed.provider.clone())
+                            .map(Into::into),
+                        minor: routed.and_then(|routed| routed.minor),
+                        unavailable: routed.and_then(|routed| routed.unavailable).map(wire_name),
+                        identity: contract.identity,
+                        major: contract.major,
+                        min_minor: contract.min_minor,
+                        max_minor: contract.max_minor,
+                        required: contract.required,
+                    }
+                })
+                .collect(),
         }
     }
 }

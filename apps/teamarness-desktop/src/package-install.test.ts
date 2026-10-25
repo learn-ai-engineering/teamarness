@@ -89,6 +89,8 @@ function harness(behavior: Partial<PackageManagementBridge> & { inspected?: Insp
       return { revision: null, restartRequired: true };
     }),
     restart: behavior.restart ?? (async () => { calls.push(["restart"]); }),
+    restartPackage: async () => { calls.push(["restart-package"]); },
+    authoringCatalog: async () => [],
   };
   const controller = new PackageManagementController(bridge, {
     changed: () => { renders += 1; },

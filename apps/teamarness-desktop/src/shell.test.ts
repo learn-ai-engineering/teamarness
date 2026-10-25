@@ -199,6 +199,8 @@ function unusedPackageManagement(calls: string[] = []): PackageManagementBridge 
     remove: async (identity) => { calls.push(`remove:${identity}`); return change; },
     writeOverride: async () => { calls.push("override"); return { revision: null, restartRequired: true }; },
     restart: async () => { calls.push("restart"); },
+    restartPackage: async (instance) => { calls.push(`restart-package:${instance.packageIdentity}`); },
+    authoringCatalog: async () => { calls.push("authoring-catalog"); return []; },
   };
 }
 
@@ -206,7 +208,7 @@ function harness(
   shellScreen: HTMLElement = new Region() as unknown as HTMLElement,
   packageBehavior: Readonly<{
     refresh?: () => Promise<PackageHostSnapshot>;
-    lifecycle?: (action: "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
+    lifecycle?: (action: "suspend" | "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
   }> = {},
   workspaceRail: HTMLElement = new Region() as unknown as HTMLElement,
   contextualNavigation: HTMLElement = new Region() as unknown as HTMLElement,
@@ -232,6 +234,10 @@ function harness(
       refresh: packageBehavior.refresh ?? (async () => packages),
       select: async (instance) => { calls.push(`mount:${instance.packageIdentity}`); },
       hide: async () => { calls.push("unmount"); },
+      suspendBackend: async (instance) => {
+        calls.push(`suspend:${instance.packageIdentity}`);
+        return packageBehavior.lifecycle?.("suspend", instance) ?? { snapshot: packages, failure: null };
+      },
       recoverBackend: async (instance) => {
         calls.push(`recover:${instance.packageIdentity}`);
         return packageBehavior.lifecycle?.("recover", instance) ?? { snapshot: packages, failure: null };
@@ -765,5 +771,148 @@ describe("Add and manage Personal Packages from the Workspace page", () => {
     await vi.waitFor(() => expect(screen.innerHTML).toContain("Its data stays on this device"));
     screen.control("registration:confirm-remove:0").click();
     await vi.waitFor(() => expect(calls.at(-1)).toBe("remove:com.example.broken"));
+  });
+});
+
+/** A region whose controls are found by their data attributes in the rendered HTML. */
+class AttributeRegion extends Region {
+  public focusedSelector: string | null = null;
+  private readonly controls = new Map<string, TestControl>();
+
+  public control(attribute: string, value: string): TestControl {
+    const key = `${attribute}=${value}`;
+    let control = this.controls.get(key);
+    if (!control) {
+      control = new TestControl();
+      control.dataset[camel(attribute)] = value;
+      this.controls.set(key, control);
+    }
+    return control;
+  }
+
+  public querySelector(selector: string): (TestControl & { focus(): void }) | null {
+    const found = this.querySelectorAll(selector)[0];
+    if (!found) return null;
+    return Object.assign(found, { focus: () => { this.focusedSelector = selector; } });
+  }
+
+  public querySelectorAll(selector: string): readonly TestControl[] {
+    const attribute = /^\[(data-[a-z-]+)\]$/.exec(selector)?.[1];
+    if (!attribute) return [];
+    return [...this.innerHTML.matchAll(new RegExp(`${attribute}(?:="([^"]*)")?[ >]`, "g"))]
+      .map(([, value]) => this.control(attribute, value ?? ""));
+  }
+}
+
+function camel(attribute: string): string {
+  return attribute.replace(/^data-/, "").replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
+}
+
+describe("Package page route", () => {
+  const personal = {
+    ...packages,
+    instances: [packages.instances[0]!, { ...packages.instances[1]!, lifecycle: "active" as const }],
+    registrations: [{
+      directory: "/Users/person/Packages/private",
+      expectedIdentity: privatePackageKey.packageIdentity,
+      override: false,
+      tier: "personal" as const,
+      status: { kind: "admitted" as const },
+    }],
+  };
+
+  it("opens from a Package row on the Workspace page and goes back", async () => {
+    const screen = new AttributeRegion();
+    const calls: string[] = [];
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => personal }, undefined, undefined, {}, undefined, unusedPackageManagement(calls));
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(personal);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(screen.innerHTML).toContain('data-package-page-index="1" aria-label="About Private One">Private One</button></h3>');
+
+    screen.control("data-package-page-index", "1").click();
+    await vi.waitFor(() => expect(test.shell.route()).toEqual({
+      kind: "package-page", workspaceId: workspace.id, packageIdentity: privatePackageKey.packageIdentity,
+    }));
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("<dt>Package folder</dt><dd>/Users/person/Packages/private</dd>"));
+    expect(screen.focusedSelector).toBe("[data-package-page-focus]");
+    expect(calls).toContain("authoring-catalog");
+    expect(screen.innerHTML).toContain('data-package-page-action="restart"');
+
+    screen.control("data-package-page-action", "restart").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Restarted Private One in this Workspace."));
+    expect(calls).toContain(`restart-package:${privatePackageKey.packageIdentity}`);
+    screen.control("data-package-page-action", "pause").click();
+    await vi.waitFor(() => expect(test.calls).toContain(`suspend:${privatePackageKey.packageIdentity}`));
+
+    screen.control("data-package-page-back", "").click();
+    await vi.waitFor(() => expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id }));
+    expect(screen.innerHTML).toContain("Package Instances");
+  });
+
+  it("keeps the sidebar opening the Package UI and adds an About button for its page", async () => {
+    const nav = new AttributeRegion();
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, {}, undefined, nav as unknown as HTMLElement);
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+
+    nav.control("data-package-index", "0").click();
+    await vi.waitFor(() => expect(test.calls).toContain("mount:com.example.one"));
+    expect(test.shell.route()).toEqual({ kind: "package-instance", instance: packageKey });
+
+    nav.control("data-package-page-index", "0").click();
+    await vi.waitFor(() => expect(test.shell.route()).toEqual({
+      kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity,
+    }));
+    expect(test.calls.at(-1)).toBe("unmount");
+    expect(test.frame.packageMount.hidden).toBe(true);
+    expect(nav.innerHTML).toContain('aria-label="About One" title="About One" aria-current="page"');
+  });
+
+  it("returns to the Workspace page after Remove, which says the data is kept", async () => {
+    const screen = new AttributeRegion();
+    const calls: string[] = [];
+    let current: PackageHostSnapshot = personal;
+    const management = unusedPackageManagement(calls);
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => current }, undefined, undefined, {}, undefined, {
+      ...management,
+      remove: async (identity) => {
+        calls.push(`remove:${identity}`);
+        current = { ...packages, instances: [packages.instances[0]!], registrations: [] };
+        return { revision: 2, restartRequired: false };
+      },
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(personal);
+    await test.shell.navigate({ kind: "package-page", workspaceId: workspace.id, packageIdentity: privatePackageKey.packageIdentity });
+
+    screen.control("data-package-page-action", "remove").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Its data stays on this device"));
+    screen.control("data-package-page-action", "confirm-remove").click();
+    await vi.waitFor(() => expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id }));
+    expect(calls).toContain(`remove:${privatePackageKey.packageIdentity}`);
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Removed. Its data stays on this device"));
+  });
+
+  it("opens a refused registration's page from its row", async () => {
+    const screen = new AttributeRegion();
+    const refused = {
+      ...packages,
+      registrations: [{
+        directory: "/Users/person/Packages/broken",
+        expectedIdentity: "com.example.broken",
+        override: false,
+        tier: "personal" as const,
+        status: { kind: "refused" as const, code: "artifact_changed" },
+      }],
+    };
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => refused });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(refused);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.control("data-package-registration-page", "0").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("It could not start: A file changed after the manifest was written."));
+    expect(test.shell.route()).toEqual({ kind: "package-page", workspaceId: workspace.id, packageIdentity: "com.example.broken" });
   });
 });

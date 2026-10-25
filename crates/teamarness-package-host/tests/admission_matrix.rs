@@ -8,14 +8,16 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 pub use teamarness_package_host::{
-    DiagnosticId, HostRevision, InstallationPublicIdentity, InstallationRegistrationSnapshot,
-    PackageCatalogEntry, PackageErrorCode, PackageErrorEnvelope, PackageErrorStage,
-    PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity, PackageSourceKind,
-    PackageTier, PackageTrustKind, PackageValue, RecoveryAction, RegistrationStatus,
+    DiagnosticId, HostRevision, InspectedCapability, InstallationPublicIdentity,
+    InstallationRegistrationSnapshot, PackageCatalogEntry, PackageErrorCode, PackageErrorEnvelope,
+    PackageErrorStage, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
+    PackageSourceKind, PackageTier, PackageTrustKind, PackageValue, RecoveryAction,
+    RegistrationStatus,
 };
 
 pub struct AuthoringCatalogEntry {
     package: PackageCatalogEntry,
+    capabilities: Vec<InspectedCapability>,
     provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
     definitions: serde_json::Map<String, serde_json::Value>,
     consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,

@@ -16,7 +16,8 @@ use teamarness_package_host::{
     PackageErrorEnvelope, PackageHost, PackageHostCommand, PackageHostOutcome, PackageIdentity,
     PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTier, PortStage,
     ReconcileWorkspaces, RegistrationStatus, ReloadPersonal, RemoveOverride, RemovePersonal,
-    ShutdownHost, UiMountId, UiRequest, UiRequestId, WriteOverride,
+    RestartPersonal, ShutdownHost, SuspendPackage, UiMountId, UiRequest, UiRequestId,
+    WriteOverride,
 };
 
 const TEAM: &str = "com.example.team";
@@ -313,13 +314,90 @@ async fn install_runs_a_personal_package_in_every_workspace_without_touching_tea
         registration_status(&live.host, "com.example.personal").await,
         Some(RegistrationStatus::Admitted)
     );
+    let catalog = live.host.authoring_catalog();
+    let entry = catalog
+        .iter()
+        .find(|entry| entry.package.identity.as_str() == "com.example.personal")
+        .expect("the authoring catalog lists the Personal Package");
     assert!(
-        live.host
-            .authoring_catalog()
+        entry
+            .capabilities
             .iter()
-            .any(|entry| entry.package.identity.as_str() == "com.example.personal")
+            .any(|capability| capability.identity == "teamarness.workspace-context"),
+        "the catalog carries the declared Semantic Capabilities"
     );
     live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09
+#[tokio::test]
+async fn restart_replaces_one_personal_process_and_refuses_a_team_instance() {
+    let live = Live::open().await;
+    let path = live.package("personal", "com.example.personal", Ports::None);
+    live.install(&path, "com.example.personal").await.unwrap();
+    let before = instances(&live.host, "com.example.personal").await;
+    assert_eq!(generations(&before), vec![Some(1), Some(1)]);
+    let target = before[0].key.clone();
+    let revision = live.host.snapshot().await.revision;
+
+    let outcome = live
+        .host
+        .execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+            instance: target.clone(),
+        }))
+        .await
+        .unwrap();
+
+    let PackageHostOutcome::PersonalRestarted {
+        revision: restarted,
+    } = outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert!(restarted > revision, "the restart bumps the revision");
+    let after = instances(&live.host, "com.example.personal").await;
+    assert_active(&after, 2);
+    assert_eq!(
+        generations(&after),
+        vec![Some(2), Some(1)],
+        "only the restarted Instance has a new process generation"
+    );
+    assert_eq!(after[0].key, target);
+
+    let team = live.team_before[0].key.clone();
+    let refused = live
+        .host
+        .execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+            instance: team,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, PackageErrorCode::OverrideRequired);
+    live.assert_team_undisturbed().await;
+
+    live.host
+        .execute(PackageHostCommand::Suspend(SuspendPackage {
+            instance: target.clone(),
+        }))
+        .await
+        .unwrap();
+    let paused = live
+        .host
+        .execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+            instance: target.clone(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        paused.code,
+        PackageErrorCode::InvalidLifecycleState,
+        "a paused Instance is not restarted silently"
+    );
+    assert_eq!(
+        generations(&instances(&live.host, "com.example.personal").await),
+        vec![Some(2), Some(1)]
+    );
     live.shutdown().await;
 }
 

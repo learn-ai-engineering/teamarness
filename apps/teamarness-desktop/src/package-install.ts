@@ -23,11 +23,18 @@ export type PackageInstallStep =
   | Readonly<{ kind: "restart"; message: string; refusal: string | null }>;
 
 /** What the person did last to one registration row, and how it went. */
-type RegistrationFeedback = Readonly<{
+export type RegistrationFeedback = Readonly<{
   identity: string;
   message: string;
   failed: boolean;
   restart: boolean;
+}>;
+
+/** The registration actions' state for one identity. */
+export type RegistrationState = Readonly<{
+  confirming: boolean;
+  working: boolean;
+  feedback: RegistrationFeedback | null;
 }>;
 
 type ManagementHooks = Readonly<{
@@ -170,12 +177,29 @@ export class PackageManagementController {
       ? `<div class="${feedback.failed ? "package-lifecycle-feedback" : "package-action-feedback"}" role="${feedback.failed ? "alert" : "status"}"><p>${escape(feedback.message)}</p>${feedback.restart ? '<button type="button" data-package-change-restart>Restart Teamarness</button>' : ""}</div>`
       : "";
     if (rows.length === 0) return detached;
-    const items = rows.map((registration, index) => renderRegistration(registration, index, snapshot, {
-      confirming: this.confirmingRemoval === registration.expectedIdentity,
-      working: this.workingRegistration === registration.expectedIdentity,
-      feedback: this.feedback?.identity === registration.expectedIdentity ? this.feedback : null,
-    })).join("");
+    const items = rows.map((registration, index) => renderRegistration(
+      registration,
+      index,
+      snapshot,
+      this.registrationState(registration.expectedIdentity),
+    )).join("");
     return `<section class="package-registrations" aria-labelledby="package-registrations-heading"><h3 id="package-registrations-heading">Needs attention on this device</h3>${detached}<div class="package-instance-list">${items}</div></section>`;
+  }
+
+  /** Whether Remove waits for confirmation, an action runs, and how the last one went, for one identity. */
+  public registrationState(identity: string): RegistrationState {
+    return {
+      confirming: this.confirmingRemoval === identity,
+      working: this.workingRegistration === identity,
+      feedback: this.feedback?.identity === identity ? this.feedback : null,
+    };
+  }
+
+  /** Forgets the last registration result and any pending Remove confirmation. */
+  public dismissFeedback(): void {
+    if (this.workingRegistration) return;
+    this.feedback = null;
+    this.confirmingRemoval = null;
   }
 
   /** The identity behind a rendered registration row. */
@@ -324,6 +348,7 @@ const REFUSALS: Readonly<Record<string, string>> = {
   handshake_timeout: "The Package Backend did not answer when it started.",
   handshake_mismatch: "The Package Backend speaks a protocol version Teamarness does not support.",
   shutting_down: "Teamarness is shutting down. Try again after reopening it.",
+  invalid_lifecycle_state: "This Package cannot do that in its current state. Wait a moment, then try again.",
 };
 
 function refusalMessage(error: unknown): string {
@@ -421,7 +446,7 @@ function renderRegistration(
   registration: PackageRegistration,
   index: number,
   snapshot: PackageHostSnapshot | null,
-  state: Readonly<{ confirming: boolean; working: boolean; feedback: RegistrationFeedback | null }>,
+  state: RegistrationState,
 ): string {
   const identity = registration.expectedIdentity;
   const name = registration.override ? teamPackageName(snapshot, identity) : identity;
@@ -443,7 +468,7 @@ function renderRegistration(
       ? `Remove the override? ${escape(name)} returns to the Team Package after Teamarness restarts. Data is kept.`
       : `Remove ${escape(name)} from this device? ${escape(REMOVE_KEEPS_DATA_COPY)}`}</p><div class="package-instance-actions">${action("confirm-remove", removeLabel)}${action("cancel-remove", "Keep it", true)}</div></div>`
     : `<div class="package-instance-actions">${registration.override ? "" : action("reload", "Reload")}${action("remove", removeLabel, true)}</div>`;
-  return `<article class="package-instance" aria-labelledby="package-registration-name-${index}"><div><h4 id="package-registration-name-${index}">${escape(name)}</h4>${summary}${refused}</div>${working}${feedback}${controls}</article>`;
+  return `<article class="package-instance" aria-labelledby="package-registration-name-${index}"><div><h4 id="package-registration-name-${index}"><button type="button" class="package-instance-link" data-package-registration-page="${index}" aria-label="${escape(`About ${name}`)}">${escape(name)}</button></h4>${summary}${refused}</div>${working}${feedback}${controls}</article>`;
 }
 
 function escape(value: string): string {

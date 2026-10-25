@@ -137,6 +137,15 @@ pub struct RemovePersonal {
     pub identity: PackageIdentity,
 }
 
+/// Replaces the running process of one Personal Package Instance with a new
+/// process generation (ADR 0031). Team Instances are refused with
+/// `override_required`; an Instance that is not running or failed is refused
+/// with `invalid_lifecycle_state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartPersonal {
+    pub instance: PackageInstanceKey,
+}
+
 /// Writes an override registration that replaces a Team Package at the next
 /// application start (ADR 0031). Nothing changes in the running Host.
 ///
@@ -179,6 +188,7 @@ pub enum PackageHostCommand {
     InstallPersonal(InstallPersonal),
     ReloadPersonal(ReloadPersonal),
     RemovePersonal(RemovePersonal),
+    RestartPersonal(RestartPersonal),
     WriteOverride(WriteOverride),
     RemoveOverride(RemoveOverride),
     Shutdown(ShutdownHost),
@@ -229,6 +239,9 @@ pub enum PackageHostOutcome {
         revision: HostRevision,
     },
     PersonalRemoved {
+        revision: HostRevision,
+    },
+    PersonalRestarted {
         revision: HostRevision,
     },
     /// The override is in the registration file and applies at the next start.

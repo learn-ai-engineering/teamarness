@@ -11,18 +11,18 @@ use teamarness_package_host::{
     PackageErrorStage, PackageHost, PackageHostCommand, PackageHostNotification,
     PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey,
     PackageValue, RecoverPackage, ReloadPersonal, RemoveOverride, RemovePersonal, ReportUiFault,
-    SuspendPackage, UiMountId, UiRequest, UiRequestId, UiSubscriptionId, WorkspaceId,
-    WriteOverride,
+    RestartPersonal, SuspendPackage, UiMountId, UiRequest, UiRequestId, UiSubscriptionId,
+    WorkspaceId, WriteOverride,
 };
 
 use crate::DesktopState;
 use crate::package_dto::{
-    HostStateNotificationDto, InspectedPackageDto, OpenUiMountDto, PackageChangeDto,
-    PackageHostSnapshotDto, PackageInstanceKeyDto, UiStreamMessageDto,
+    HostStateNotificationDto, InspectedPackageDto, OpenUiMountDto, PackageAuthoringEntryDto,
+    PackageChangeDto, PackageHostSnapshotDto, PackageInstanceKeyDto, UiStreamMessageDto,
 };
 use crate::package_error::{PackageBridgeError, invalid_input};
 
-pub const COMMAND_NAMES: [&str; 20] = [
+pub const COMMAND_NAMES: [&str; 22] = [
     "package_catalog_snapshot",
     "package_subscribe_host_state",
     "package_open_mount",
@@ -42,6 +42,8 @@ pub const COMMAND_NAMES: [&str; 20] = [
     "package_reload",
     "package_remove",
     "package_write_override",
+    "package_authoring_catalog",
+    "package_restart",
     "app_restart",
 ];
 
@@ -317,6 +319,46 @@ pub async fn package_report_ui_fault(
     Ok(())
 }
 
+/// Replaces the process of one Personal Package Instance with a new generation.
+/// A Team Instance is refused with `override_required`.
+#[tauri::command]
+pub async fn package_restart(
+    instance: PackageInstanceKeyDto,
+    state: State<'_, DesktopState>,
+) -> Result<(), PackageBridgeError> {
+    let host = state.package_host()?;
+    restart(&host, parse_instance(instance)?).await
+}
+
+async fn restart(
+    host: &PackageHost,
+    instance: PackageInstanceKey,
+) -> Result<(), PackageBridgeError> {
+    host.execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+        instance,
+    }))
+    .await
+    .map_err(PackageBridgeError::from)?;
+    Ok(())
+}
+
+/// The declared Semantic Capabilities and Ports of every admitted Package, for
+/// the Package page. Reading it starts no Package.
+#[tauri::command]
+pub async fn package_authoring_catalog(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<PackageAuthoringEntryDto>, PackageBridgeError> {
+    let host = state.package_host()?;
+    Ok(authoring_catalog(&host))
+}
+
+fn authoring_catalog(host: &PackageHost) -> Vec<PackageAuthoringEntryDto> {
+    host.authoring_catalog()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
 /// Shows the native folder picker. Returns the chosen absolute path, or `None`
 /// when the person cancels.
 #[tauri::command]
@@ -587,7 +629,7 @@ mod tests {
 
     #[test]
     fn command_registry_is_generic_and_exact() {
-        assert_eq!(COMMAND_NAMES.len(), 20);
+        assert_eq!(COMMAND_NAMES.len(), 22);
         let names = COMMAND_NAMES.join(" ");
         for forbidden in [
             "reference",
@@ -1060,6 +1102,74 @@ mod tests {
                 serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
             assert_eq!(file["registrations"], serde_json::json!([]));
             assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn the_authoring_catalog_lists_capabilities_and_restart_is_personal_only() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/personal");
+            write_package(&directory, PERSONAL);
+            install(
+                &host,
+                directory.to_string_lossy().into_owned(),
+                PERSONAL.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap();
+
+            let catalog = serde_json::to_value(authoring_catalog(&host)).unwrap();
+            let entries = catalog.as_array().unwrap();
+            assert_eq!(entries.len(), 2, "Team and Personal Packages are listed");
+            let personal = entries
+                .iter()
+                .find(|entry| entry["identity"] == PERSONAL)
+                .unwrap();
+            assert_eq!(
+                personal["capabilities"],
+                serde_json::json!([{
+                    "identity": "teamarness.workspace-context",
+                    "major": 1, "minMinor": 0, "maxMinor": 0
+                }])
+            );
+            assert_eq!(personal["provided"], serde_json::json!([]));
+            assert_eq!(personal["consumed"], serde_json::json!([]));
+            assert!(
+                personal.get("definitions").is_none(),
+                "Port schemas stay out of the Shell"
+            );
+
+            let snapshot = host.snapshot().await;
+            let key = |identity: &str| {
+                snapshot
+                    .instances
+                    .iter()
+                    .find(|instance| instance.key.package_identity.as_str() == identity)
+                    .unwrap()
+                    .clone()
+            };
+            let (team, personal) = (key(FIXTURE), key(PERSONAL));
+            restart(&host, personal.key.clone()).await.unwrap();
+            let refused = restart(&host, team.key.clone()).await.unwrap_err();
+            assert_eq!(code(refused), "override_required");
+            let after = host.snapshot().await;
+            let generation = |identity: &str| {
+                after
+                    .instances
+                    .iter()
+                    .find(|instance| instance.key.package_identity.as_str() == identity)
+                    .unwrap()
+                    .process_generation
+            };
+            assert_eq!(
+                generation(PERSONAL),
+                personal.process_generation.map(|value| value + 1)
+            );
+            assert_eq!(generation(FIXTURE), team.process_generation);
             close(root, core, host).await;
         });
     }

@@ -217,7 +217,7 @@ async fn open_runtime_modules(
 pub fn run() {
     debug_assert_eq!(
         commands::COMMAND_NAMES.len() + package_commands::COMMAND_NAMES.len(),
-        31
+        33
     );
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -261,6 +261,8 @@ pub fn run() {
             package_commands::package_reload,
             package_commands::package_remove,
             package_commands::package_write_override,
+            package_commands::package_authoring_catalog,
+            package_commands::package_restart,
             package_commands::app_restart,
         ])
         .setup(|app| {
@@ -347,7 +349,7 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| name.starts_with("allow-")))
                 .count(),
-            31
+            33
         );
     }
 
@@ -361,6 +363,8 @@ mod tests {
             "allow-package-reload",
             "allow-package-remove",
             "allow-package-write-override",
+            "allow-package-authoring-catalog",
+            "allow-package-restart",
             "allow-app-restart",
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");

@@ -64,6 +64,25 @@ export type PackageChange = Readonly<{
   restartRequired: boolean;
 }>;
 
+/** One admitted Package's declared Semantic Capabilities and Ports, for its Package page. */
+export type PackageAuthoringEntry = Readonly<{
+  identity: string;
+  capabilities: readonly Readonly<{ identity: string; major: number; minMinor: number; maxMinor: number }>[];
+  provided: readonly Readonly<{ identity: string; major: number; minor: number; description: string }>[];
+  consumed: readonly Readonly<{
+    identity: string;
+    major: number;
+    minMinor: number;
+    maxMinor: number;
+    required: boolean;
+    /** The Package that provides it, when one is selected. */
+    provider: string | null;
+    minor: number | null;
+    /** Why it cannot be routed, as a Package Host error code. */
+    unavailable: string | null;
+  }>[];
+}>;
+
 export type PackageRegistrationInput = Readonly<{
   directory: string;
   expectedIdentity: string;
@@ -78,7 +97,12 @@ export interface PackageManagementBridge {
   reload(identity: string): Promise<PackageChange>;
   remove(identity: string): Promise<PackageChange>;
   writeOverride(input: PackageRegistrationInput): Promise<PackageChange>;
+  /** Restarts Teamarness. */
   restart(): Promise<void>;
+  /** Replaces the process of one Personal Package Instance. A Team Instance is refused. */
+  restartPackage(instance: PackageInstanceKey): Promise<void>;
+  /** Declared Semantic Capabilities and Ports of every admitted Package. */
+  authoringCatalog(): Promise<readonly PackageAuthoringEntry[]>;
 }
 
 export type PackageLoader = Readonly<{

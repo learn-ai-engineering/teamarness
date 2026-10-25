@@ -273,6 +273,8 @@ const escape = (value: string): string => value
 
 export type ShellRendererInput = Readonly<{
   packageSettings?: string;
+  /** The rendered Package page, for the `package-page` route. */
+  packagePage?: string;
 }>;
 
 export function renderShell(
@@ -303,6 +305,10 @@ export function renderShell(
       <input id="workspace-name" required maxlength="64" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"><label for="create-person-name">Your name in this Workspace</label><input id="create-person-name" required maxlength="256" autocomplete="name"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
       <section class="screen-section"><h2>Join a Workspace</h2><form id="join-workspace"><label for="invitation-value">Workspace Invitation</label>
       <textarea id="invitation-value" required maxlength="8192" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"></textarea><label for="join-person-name">Your name in this Workspace</label><input id="join-person-name" required maxlength="256" autocomplete="name"><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
+  }
+
+  if (route.kind === "package-page") {
+    return `${feedback}${input.packagePage ?? '<section class="shell-screen"><p class="empty-state">Package information is loading.</p></section>'}`;
   }
 
   const workspace = presentation.workspace;

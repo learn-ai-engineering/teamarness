@@ -565,6 +565,17 @@ fn admit_tier(
                 package.clone(),
                 admission.manifest.port_contract.clone(),
                 admission.manifest.consumed_ports.clone(),
+                admission
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .map(|requirement| crate::InspectedCapability {
+                        identity: requirement.family.clone(),
+                        major: requirement.major,
+                        min_minor: requirement.min_minor,
+                        max_minor: requirement.max_minor,
+                    })
+                    .collect::<Vec<_>>(),
             )
         })
         .collect();
@@ -702,7 +713,7 @@ fn admit_tier(
     }
     let catalog = catalog_candidates
         .into_iter()
-        .map(|(package, document, consumed)| {
+        .map(|(package, document, consumed, capabilities)| {
             let availability = consumed
                 .iter()
                 .map(|request| resolve(request, &providers, &view, &remaining))
@@ -714,6 +725,7 @@ fn admit_tier(
                 .collect();
             crate::AuthoringCatalogEntry {
                 package,
+                capabilities,
                 provided: document
                     .as_ref()
                     .map_or_else(Vec::new, |document| document.contracts.clone()),

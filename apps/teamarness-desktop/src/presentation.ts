@@ -90,12 +90,13 @@ export function buildPackageNavigationPresentation(
   };
 }
 
-type LifecycleDescriptor = Pick<
+export type LifecycleDescriptor = Pick<
   PackageInstancePresentation,
   "availability" | "canRecover" | "canDispose"
 >;
 
-function lifecycleDescriptor(
+/** How one Package Instance lifecycle reads, and which recovery controls it allows. */
+export function lifecycleDescriptor(
   lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"],
 ): LifecycleDescriptor {
   switch (lifecycle) {

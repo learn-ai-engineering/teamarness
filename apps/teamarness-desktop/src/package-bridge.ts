@@ -4,6 +4,7 @@ import type {
   HostUiEvent,
   InspectedPackage,
   OpenPackageMount,
+  PackageAuthoringEntry,
   PackageChange,
   PackageManagementBridge,
   PackageHostSnapshot,
@@ -83,6 +84,8 @@ export function createTauriPackageManagementBridge(call: typeof invoke = invoke)
     writeOverride: ({ directory, expectedIdentity, acceptedRisks }) =>
       call<PackageChange>("package_write_override", { directory, expectedIdentity, acceptedRisks: [...acceptedRisks] }),
     restart: async () => { await call("app_restart"); },
+    restartPackage: async (instance) => { await call("package_restart", { instance }); },
+    authoringCatalog: () => call<readonly PackageAuthoringEntry[]>("package_authoring_catalog"),
   };
   return Object.freeze(management);
 }

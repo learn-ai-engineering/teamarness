@@ -29,6 +29,8 @@ const COMMANDS: &[&str] = &[
     "package_reload",
     "package_remove",
     "package_write_override",
+    "package_authoring_catalog",
+    "package_restart",
     "app_restart",
 ];
 

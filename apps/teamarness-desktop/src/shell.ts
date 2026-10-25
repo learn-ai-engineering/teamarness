@@ -1,5 +1,6 @@
 import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge } from "./package-contracts";
 import { PackageManagementController } from "./package-install";
+import { PackagePageController } from "./package-page";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import type { InstallationPackageVisibility } from "./package-visibility";
 import {
@@ -16,7 +17,8 @@ import { renderShell, type ShellModel } from "./view";
 export type ShellRoute =
   | Readonly<{ kind: "workspace-chooser" }>
   | Readonly<{ kind: "workspace-settings"; workspaceId: string }>
-  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>;
+  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>
+  | Readonly<{ kind: "package-page"; workspaceId: string; packageIdentity: string }>;
 
 export type ShellFrame = Readonly<{
   workspaceRail: HTMLElement;
@@ -29,6 +31,7 @@ type PackageRouter = Readonly<{
   refresh(): Promise<PackageHostSnapshot>;
   select(instance: PackageInstanceKey): Promise<void>;
   hide(): Promise<void>;
+  suspendBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   recoverBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   disposeBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
 }>;
@@ -61,6 +64,8 @@ type ShellOptions = Readonly<{
   packageVisibility: InstallationPackageVisibility;
   workspaceActions: WorkspaceActions;
   onRouteChange?: (route: ShellRoute) => void;
+  /** Copies text for the person; defaults to the clipboard. */
+  copy?: (value: string) => Promise<void>;
 }>;
 
 export class Shell {
@@ -75,6 +80,7 @@ export class Shell {
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
   private readonly packageManagement: PackageManagementController;
+  private readonly packagePage: PackagePageController;
 
   public constructor(
     private readonly shellFrame: ShellFrame,
@@ -91,6 +97,23 @@ export class Shell {
           throw error;
         }
       },
+    });
+    this.packagePage = new PackagePageController(options.packageManagement, {
+      suspend: (instance) => this.runPageLifecycle(() => this.options.packageShell.suspendBackend(instance)),
+      recover: (instance) => this.runPageLifecycle(() => this.options.packageShell.recoverBackend(instance)),
+      dispose: (instance) => this.runPageLifecycle(() => this.options.packageShell.disposeBackend(instance)),
+    }, this.packageManagement, {
+      changed: () => { this.renderPackageConsumers(); },
+      refresh: async () => {
+        try {
+          this.updatePackages(await this.options.packageShell.refresh());
+        } catch (error: unknown) {
+          this.updatePackageSnapshotFailure();
+          throw error;
+        }
+      },
+      removed: (target) => { void this.navigate({ kind: "workspace-settings", workspaceId: target.workspaceId }); },
+      copy: (value) => (this.options.copy ?? ((text) => navigator.clipboard.writeText(text)))(value),
     });
   }
 
@@ -117,6 +140,7 @@ export class Shell {
   public updatePackages(snapshot: PackageHostSnapshot): void {
     this.packageSnapshot = snapshot;
     this.packageSnapshotFailed = false;
+    this.packagePage.snapshotChanged(snapshot);
     if (this.packageLifecycleFeedback?.failure === "refresh") {
       this.packageLifecycleFeedback = null;
     } else if (this.packageLifecycleFeedback?.failure === "operation-and-refresh") {
@@ -147,6 +171,15 @@ export class Shell {
   }
 
   private setRoute(route: ShellRoute): void {
+    if (route.kind === "package-page") {
+      const current = this.packagePage.current();
+      if (!current || current.packageIdentity !== route.packageIdentity || current.workspaceId !== route.workspaceId) {
+        this.packagePage.close();
+        this.packagePage.open({ workspaceId: route.workspaceId, packageIdentity: route.packageIdentity }, this.packageSnapshot);
+      }
+    } else {
+      this.packagePage.close();
+    }
     this.selectedRoute = route;
     this.options.onRouteChange?.(route);
   }
@@ -251,6 +284,7 @@ export class Shell {
         if (instance) void this.navigate({ kind: "package-instance", instance });
       });
     });
+    this.bindPackagePageLinks(this.shellFrame.contextualNavigation);
     this.bindPackageSnapshotRetry(this.shellFrame.contextualNavigation);
   }
 
@@ -264,6 +298,16 @@ export class Shell {
 
   private renderSelectedScreen(): void {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
+    if (this.selectedRoute.kind === "package-page") {
+      this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute, {
+        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot)}`,
+      });
+      this.bindSelectedScreen();
+      if (this.packagePage.takeFocusRequest() && hasQueries(this.shellFrame.shellScreen)) {
+        this.shellFrame.shellScreen.querySelector<HTMLElement>("[data-package-page-focus]")?.focus();
+      }
+      return;
+    }
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
       ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
@@ -313,6 +357,51 @@ export class Shell {
     screen.querySelector<HTMLButtonElement>("[data-package-change-restart]")?.addEventListener("click", () => {
       void this.packageManagement.restartAfterChange();
     });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-registration-page]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const identity = this.packageManagement.registrationIdentity(
+          this.packageSnapshot,
+          Number(button.dataset.packageRegistrationPage),
+        );
+        const workspaceId = routeWorkspaceId(this.selectedRoute);
+        if (identity && workspaceId) void this.navigate({ kind: "package-page", workspaceId, packageIdentity: identity });
+      });
+    });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-page-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void this.packagePage.action(button.dataset.packagePageAction, this.packageSnapshot);
+      });
+    });
+    screen.querySelector<HTMLButtonElement>("[data-package-page-back]")?.addEventListener("click", () => {
+      const workspaceId = routeWorkspaceId(this.selectedRoute);
+      if (workspaceId) void this.navigate({ kind: "workspace-settings", workspaceId });
+    });
+    this.bindPackagePageLinks(screen);
+  }
+
+  /** Package rows open their Package page through `data-package-page-index`. */
+  private bindPackagePageLinks(region: HTMLElement): void {
+    region.querySelectorAll<HTMLButtonElement>("[data-package-page-index]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const instance = this.packageActionTargets[Number(button.dataset.packagePageIndex)];
+        if (instance) {
+          void this.navigate({ kind: "package-page", workspaceId: instance.workspaceId, packageIdentity: instance.packageIdentity });
+        }
+      });
+    });
+  }
+
+  /** Applies a lifecycle result for the Package page, and throws when the operation failed. */
+  private async runPageLifecycle(operation: () => Promise<PackageLifecycleResult>): Promise<void> {
+    const result = await operation();
+    if (result.snapshot) {
+      this.packageSnapshot = result.snapshot;
+      this.packageSnapshotFailed = false;
+    }
+    if (result.failure === "refresh" || result.failure === "operation-and-refresh") this.packageSnapshotFailed = true;
+    if (result.failure === "operation" || result.failure === "operation-and-refresh") {
+      throw new Error("Package lifecycle operation failed");
+    }
   }
 
   private bindSelectedScreen(): void {
@@ -409,7 +498,9 @@ export class Shell {
 
   private renderPackageConsumers(): void {
     this.renderContextualNavigation();
-    if (this.selectedRoute.kind === "workspace-settings") this.renderSelectedScreen();
+    if (this.selectedRoute.kind === "workspace-settings" || this.selectedRoute.kind === "package-page") {
+      this.renderSelectedScreen();
+    }
   }
 
   private bindPackageSnapshotRetry(region: HTMLElement): void {
@@ -483,6 +574,8 @@ function isThemePreference(value: string): value is ThemePreference {
 
 const SETTINGS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 
+const INFO_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
+
 const EYE_OPEN_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 
 const EYE_CLOSED_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c6.5 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3.5 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="M2 2l20 20"/></svg>';
@@ -502,7 +595,13 @@ function packageButton(
     ? '<span class="package-installation-marker">Runs only on this Installation</span>'
     : "";
   const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
-  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${sourceMarker}${localMarker}</button></li>`;
+  const pageCurrent = route.kind === "package-page" && instance
+    && route.packageIdentity === instance.packageIdentity
+    && route.workspaceId === instance.workspaceId
+    ? ' aria-current="page"'
+    : "";
+  const about = `<button type="button" class="package-about" data-package-page-index="${row.actionIndex}" aria-label="${escape(`About ${row.name}`)}" title="${escape(`About ${row.name}`)}"${pageCurrent}>${INFO_ICON}</button>`;
+  return `<li class="package-nav-row"><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${sourceMarker}${localMarker}</button>${about}</li>`;
 }
 
 function renderPackageInstanceSettings(
@@ -523,7 +622,7 @@ function renderPackageInstanceSettings(
       ? renderPackageLifecycleFeedback(row, feedback)
       : "";
     const visibilityToggle = instance ? packageVisibilityButton(row, visibility.isHidden(instance)) : "";
-    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div class="package-instance-summary"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>${visibilityToggle}</div>
+    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div class="package-instance-summary"><div><h3 id="package-instance-name-${row.actionIndex}"><button type="button" class="package-instance-link" data-package-page-index="${row.actionIndex}" aria-label="${escape(`About ${row.name}`)}">${escape(row.name)}</button></h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>${visibilityToggle}</div>
       ${rowFeedback}${renderPackageInstanceActions(row)}</article>`;
   }).join("")}</div>`;
 }

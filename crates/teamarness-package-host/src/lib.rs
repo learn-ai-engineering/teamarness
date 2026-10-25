@@ -41,8 +41,8 @@ pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     InstallPersonal, OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome,
     ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal, RemoveOverride,
-    RemovePersonal, ReportUiFault, ShutdownHost, SuspendPackage, UiLoaderDescriptor,
-    UiPackageContext, UiRequest, UiWorkspaceContext, WriteOverride,
+    RemovePersonal, ReportUiFault, RestartPersonal, ShutdownHost, SuspendPackage,
+    UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext, WriteOverride,
 };
 pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
@@ -74,6 +74,8 @@ use crate::errors::host_error;
 #[serde(rename_all = "camelCase")]
 pub struct AuthoringCatalogEntry {
     pub package: PackageCatalogEntry,
+    /// The Semantic Capabilities the manifest declares.
+    pub capabilities: Vec<InspectedCapability>,
     pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
     pub definitions: serde_json::Map<String, serde_json::Value>,
     pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
@@ -273,6 +275,7 @@ impl PackageHost {
             PackageHostCommand::InstallPersonal(input) => self.install_personal(input).await,
             PackageHostCommand::ReloadPersonal(input) => self.reload_personal(input).await,
             PackageHostCommand::RemovePersonal(input) => self.remove_personal(input).await,
+            PackageHostCommand::RestartPersonal(input) => self.restart_personal(input).await,
             PackageHostCommand::WriteOverride(input) => self.write_override(input).await,
             PackageHostCommand::RemoveOverride(input) => self.remove_override(input).await,
             PackageHostCommand::Shutdown(_) => self.shutdown_host().await,

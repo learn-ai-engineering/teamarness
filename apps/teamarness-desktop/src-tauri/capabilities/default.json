@@ -35,6 +35,8 @@
     "allow-package-reload",
     "allow-package-remove",
     "allow-package-write-override",
+    "allow-package-authoring-catalog",
+    "allow-package-restart",
     "allow-app-restart"
   ]
 }

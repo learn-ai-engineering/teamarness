@@ -38,13 +38,14 @@ use crate::errors::{activation_error, host_error, instance_error};
 use crate::host::lifecycle::{prepare_instance, process_template};
 use crate::registrations;
 use crate::values::{
-    InstallationRegistrationSnapshot, PackageCatalogEntry, PackageHostState, PackageIdentity,
-    PackageInstanceKey, PackageTier, RegistrationRequest, RegistrationStatus, WorkspaceId,
+    InstallationRegistrationSnapshot, LifecycleState, PackageCatalogEntry, PackageHostState,
+    PackageIdentity, PackageInstanceKey, PackageTier, RegistrationRequest, RegistrationStatus,
+    WorkspaceId,
 };
 use crate::{
     AuthoringCatalogEntry, InstallPersonal, PackageErrorCode, PackageErrorEnvelope,
     PackageErrorStage, PackageHost, PackageHostOutcome, PortAvailability, ReloadPersonal,
-    RemoveOverride, RemovePersonal, WriteOverride, instance, supervisor, ui,
+    RemoveOverride, RemovePersonal, RestartPersonal, WriteOverride, instance, supervisor, ui,
 };
 
 /// The Team tier as the Personal tier sees it: what it may consume, never change.
@@ -348,6 +349,48 @@ impl PackageHost {
             .retain(|registration| registration.expected_identity != identity.as_str());
         self.reresolve_consumers(None).await;
         Ok(PackageHostOutcome::PersonalRemoved {
+            revision: self.bump_revision().await,
+        })
+    }
+
+    /// Replaces the process of one Personal Instance with a new generation, over
+    /// its current Port routes. Its data and its registration are unchanged.
+    ///
+    /// A Team Instance is refused with `override_required`, as Reload and Remove
+    /// refuse a Team identity: a Team Package changes only through an override.
+    /// An Instance that is not active or failed (never started, paused, or ended)
+    /// is refused with `invalid_lifecycle_state`, so a refusal never looks like a
+    /// restart that happened.
+    pub(crate) async fn restart_personal(
+        &self,
+        input: RestartPersonal,
+    ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
+        let _tier = self.inner.personal.lock().await;
+        self.ensure_running().await?;
+        let key = input.instance;
+        let identity = &key.package_identity;
+        if self.inner.team.admitted.contains_key(identity) {
+            return Err(refusal(PackageErrorCode::OverrideRequired, identity));
+        }
+        if !self.inner.personal.read().packages.contains_key(identity) {
+            return Err(refusal(PackageErrorCode::NotRegistered, identity));
+        }
+        let actor = self.actor(&key).await?;
+        let lifecycle = actor.snapshot().await.lifecycle;
+        if !matches!(
+            lifecycle,
+            LifecycleState::Active | LifecycleState::Failed | LifecycleState::CrashLoop
+        ) {
+            return Err(instance_error(
+                crate::protocol::WireFailure::new(PackageErrorCode::InvalidLifecycleState),
+                &key,
+            ));
+        }
+        actor
+            .restart()
+            .await
+            .map_err(|failure| instance_error(failure, &key))?;
+        Ok(PackageHostOutcome::PersonalRestarted {
             revision: self.bump_revision().await,
         })
     }

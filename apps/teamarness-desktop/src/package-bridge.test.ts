@@ -84,6 +84,8 @@ describe("desktop Tauri Package management bridge", () => {
     await bridge.remove("com.example.p");
     await bridge.writeOverride(input);
     await bridge.restart();
+    await bridge.restartPackage({ packageIdentity: "com.example.p", workspaceId: "w1" });
+    await bridge.authoringCatalog();
     expect(calls).toEqual([
       ["package_choose_directory", undefined],
       ["package_inspect_directory", { directory: "/p" }],
@@ -92,6 +94,8 @@ describe("desktop Tauri Package management bridge", () => {
       ["package_remove", { identity: "com.example.p" }],
       ["package_write_override", input],
       ["app_restart", undefined],
+      ["package_restart", { instance: { packageIdentity: "com.example.p", workspaceId: "w1" } }],
+      ["package_authoring_catalog", undefined],
     ]);
   });
 });
