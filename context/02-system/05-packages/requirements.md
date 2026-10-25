@@ -75,7 +75,7 @@ Subscription leases SHALL identify Workspace, harness, contract, access basis, b
 
 Provider suspend, exit, disposal or generation replacement SHALL end affected live queries and events with `provider_exited`. Recover SHALL permit explicit reconnect without reviving old subscriptions or replaying commands. Settings SHALL remain unchanged. Already-authorized commands SHALL retain their actor and existing certainty verdict; subsequent authorization SHALL use current authority. Harness generation cleanup SHALL affect only that generation.
 
-**Milestone:** Phases 1–4 qualify complete metadata, durable authorization and lifecycle revocation. Generic-client, desktop delivery and external Agent UI qualification remain Phase 5 work. This is not a completed 2.0 release claim.
+**Qualification:** Host integration tests cover both access views, real durable settings and lifecycle revocation. `tests/system/tests/agent_port_discovery.rs` drives a source-built generic client with no consumed-Port declarations through complete metadata, Conversations guidance, Agent-attributed posts, reconnect recovery, disable, rebind, unbind and restart. Shared broker tests exercise validation, non-object values, isolation, actors, generation retirement, overload, event bounds and command uncertainty through both views. Scripted repository evidence and local desktop bundles do not qualify the external Agent UI or model endpoint. Those observations and fresh external build provenance remain required before claiming the full user journey.
 
 ## TEAM.SYS.PKG-R14 — Port Payloads and Live Delivery
 

@@ -67,6 +67,8 @@ target/debug/teamarness-desktop --data-dir /absolute/private/teamarness-two
 
 The optional **Agent** Personal Package (`dev.teamarness.agent`) runs one of your Workspace Agents against an OpenAI-compatible chat-completions endpoint and replies in Conversations when a Member addresses the Agent by name. Configuration lives in the Package's own UI on the Steward's Installation. The Shell has no Agent settings, and binding is never replicated.
 
+**Current interface:** the Host now offers only `teamarness.package-ports` 2.0. Rebuild the standalone harness's capability declaration and SDK before registering it. Bound-Agent Conversations access defaults to disabled, including manifest-declared Ports. Explicitly enable Conversations through the harness's own controls, then load its guide. The Host retains that selection across rebind and restart; disabling it ends Agent subscriptions without cancelling already-authorized command effects. This repository has not qualified a fresh external harness build, its current UI controls or model endpoint. The earlier reply-flow instructions below are not evidence that an old harness works with 2.0.
+
 First build the standalone Agent project outside this repository and [register its Package Directory locally](docs/local-package-registration.md). It is not shipped in the application bundle. Keep `dev.teamarness.agent` unchanged when switching an existing installation from bundled to local: its settings, key and progress remain in the same Package Data Directory. Restart after registration or a rebuild.
 
 1. In Workspace settings, add an Agent by name under **Add agent**. You are its Steward.
@@ -91,6 +93,16 @@ Conversations 1.2 supplies revision-based catch-up. The Agent saves each Channel
 Pending posts refuse binding changes with `agent.post_failed` rather than risk attributing a reply to another Agent. A failed or uncertain post, or an uncertain binding write, can stop further dispatch and binding changes. Settings edits and suspend/resume do not clear that safety state. Restart the full application process for conservative recovery; do not delete progress or profile data. Backend-only replacement requires the Host's generation safeguards: queued obsolete authority work rejects, and running Core authority work finishes before replacement initializes. Stuck Core work can delay replacement of that Instance. This does not retract arbitrary effects already dispatched to another Package.
 
 The Package keeps three files in its Package Data Directory, `packages/data/v1/<installation>/<workspace>/<SHA-256 of dev.teamarness.agent>/` under the profile's private data directory: `settings.json`, `api-key` (the raw key, file mode `0600`), and `progress.json` (per-Channel projection epoch and acknowledged revision). The key is protected only by that file mode and the private data directory, so any process running as your user can read it. Select **Clear key** before you share or delete a profile. The Package sends network traffic only to the configured endpoint, over TLS with the platform's trust roots for `https://` URLs; `http://` is accepted for local test endpoints. Completion redirects are not followed. A completion is limited to 60 seconds and 256 KiB. Streaming replies, tool use, and unprompted posts are not supported.
+
+## Generic Agent Port proof
+
+Run the source-built, test-only generic consumer against real Conversations:
+
+```sh
+cargo test -p teamarness-system-tests --test agent_port_discovery --locked
+```
+
+The consumer has no Provider-specific manifest or adapter. The script discovers complete metadata, explicitly enables Conversations, validates and loads its guide, posts with Host-derived Agent attribution, and reconciles after reconnect. Host safety tests exercise both access views. This proves repository interfaces, not a real-model loop or the standalone Agent UI. The optional `agent_reply_flow` tests require a freshly rebuilt external Package Directory; their default ignored status is not a pass. See the [author guide](docs/package-author-guide.md#act-as-a-workspace-agent).
 
 ## Checks
 

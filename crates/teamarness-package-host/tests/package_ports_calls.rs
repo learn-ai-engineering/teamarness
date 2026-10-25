@@ -105,7 +105,7 @@ async fn request(
             payload: serde_json::from_value(payload).unwrap(),
         }))
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{operation} {id}: {error:?}"));
     let PackageHostOutcome::UiResponse { payload } = result else {
         panic!("{result:?}")
     };
@@ -287,12 +287,19 @@ async fn a_bound_consumer_presents_an_agent_actor_and_an_unbound_one_its_person(
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn exact_scoped_calls_activate_provider_and_validate_request() {
+    for access in ["declared", "agent"] {
+        exact_scoped_calls_activate_provider_and_validate_request_for_access(access).await;
+    }
+}
+
+async fn exact_scoped_calls_activate_provider_and_validate_request_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
         &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     ).await;
     declare(&fixture, "provider", true);
     declare(&fixture, "consumer", false);
+    let actors = common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -311,13 +318,14 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
         .key
         .clone();
     let mount = mount(&host, consumer).await;
+    common::enable_agent_ports(&host, &mount, 1).await;
     let available = request(
         &host,
         &mount,
         "available",
         "fixture.capability",
         serde_json::json!({
-            "capability":"teamarness.package-ports", "method":"available","arguments":{"access":"declared"}
+            "capability":"teamarness.package-ports", "method":"available","arguments":{"access":access}
         }),
     )
     .await;
@@ -368,16 +376,14 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     ] {
         let value = request(&host, &mount, id, "fixture.capability", serde_json::json!({
             "capability":"teamarness.package-ports","method":"invoke",
-            "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":port,"kind":kind,"request":input}
+            "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":port,"kind":kind,"request":input}
         })).await;
         if expected == "accepted" {
             assert_eq!(value["result"]["accepted"], true, "{value}");
             if port == "message.list" {
                 assert_eq!(
                     value["result"]["actor"],
-                    serde_json::json!({
-                        "kind":"person", "identity":fixture.core.public_identity().to_string()
-                    })
+                    actors[&fixture.core.list_workspaces().unwrap()[0].id().to_string()]
                 );
             }
         } else {
@@ -426,13 +432,13 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
         &mount,
         "cancel-race",
         "fixture.port_cancel",
-        serde_json::json!({}),
+        serde_json::json!({"access":access}),
     )
     .await;
     assert_eq!(cancelled["cancelled"], true);
     let after_cancel = request(&host, &mount, "after-cancel", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
     })).await;
     assert_eq!(
         after_cancel["result"]["accepted"], true,
@@ -440,7 +446,7 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     );
     let bad_response = request(&host, &mount, "bad-response", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"bad_response"}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"bad_response"}}
     })).await;
     assert_eq!(bad_response["error"], "port_response_invalid");
     assert_eq!(bad_response["outcomeUncertain"], true);
@@ -457,13 +463,13 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     }));
     let owned = request(&host, &mount, "owned-error", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"provider_error"}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"provider_error"}}
     })).await;
     assert_eq!(owned["error"], "provider_error");
     assert_eq!(owned["details"]["provider"]["code"], "fixture.rejected");
     let committed = request(&host, &mount, "committed-error", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"committed_error"}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"committed_error"}}
     })).await;
     assert_eq!(committed["error"], "provider_error");
     assert_eq!(
@@ -474,14 +480,14 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     assert_eq!(committed["retryable"], false);
     let forged = request(&host, &mount, "forged", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command",
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command",
             "request":{"text":"hi"},"workspaceId":"other","actor":{"kind":"agent","identity":"forged"}}
     })).await;
     assert_eq!(forged["error"], "capability_request_invalid");
 
     let stalled = request(&host, &mount, "stalled", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"stall"}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"stall"}}
     })).await;
     assert_eq!(stalled["error"], "outcome_unknown");
     assert_eq!(stalled["outcomeUncertain"], true);
@@ -503,7 +509,7 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
         &mount,
         "live",
         "fixture.port_open",
-        serde_json::json!({}),
+        serde_json::json!({"access":access}),
     )
     .await;
     assert_eq!(result["opened"], true);
@@ -540,7 +546,7 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
     assert_eq!(provider.lifecycle, LifecycleState::Active);
     let exited = request(&host, &mount, "exited", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"exit"}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"exit"}}
     })).await;
     assert_eq!(exited["error"], "outcome_unknown");
     assert_eq!(exited["outcomeUncertain"], true);
@@ -600,6 +606,12 @@ fn port_attempts(root: &std::path::Path) -> usize {
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn major_two_port_values_round_trip_through_object_only_frames() {
+    for access in ["declared", "agent"] {
+        major_two_port_values_round_trip_through_object_only_frames_for_access(access).await;
+    }
+}
+
+async fn major_two_port_values_round_trip_through_object_only_frames_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
         &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
@@ -607,6 +619,7 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
     declare(&fixture, "provider", true);
     declare(&fixture, "consumer", false);
     declare_non_object_ports(&fixture);
+    common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -619,20 +632,21 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
         .unwrap()
         .key;
     let mount = mount(&host, consumer).await;
+    common::enable_agent_ports(&host, &mount, 2).await;
     let title = request(&host, &mount, "title", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":2,"contract":"com.example.messages","port":"message.title","kind":"query","request":{}}
+        "arguments":{"access":access,"major":2,"contract":"com.example.messages","port":"message.title","kind":"query","request":{}}
     })).await;
     assert_eq!(title["result"]["$teamarnessPortEnvelope"], 1);
     assert_eq!(title["result"]["$teamarnessPortValue"], "hello");
     let object = request(&host, &mount, "object", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":2,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+        "arguments":{"access":access,"major":2,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
     })).await;
     assert_eq!(object["result"]["accepted"], true);
     let marker = request(&host, &mount, "marker", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":2,"contract":"com.example.messages","port":"message.marker","kind":"query","request":{}}
+        "arguments":{"access":access,"major":2,"contract":"com.example.messages","port":"message.marker","kind":"query","request":{}}
     })).await;
     assert_eq!(
         marker["result"]["$teamarnessPortValue"],
@@ -643,7 +657,7 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
         &mount,
         "open-title",
         "fixture.port_open",
-        serde_json::json!({"major":2,"port":"message.title_watch"}),
+        serde_json::json!({"access":access,"major":2,"port":"message.title_watch"}),
     )
     .await;
     assert_eq!(opened["opened"], true);
@@ -675,7 +689,7 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
         &mount,
         "open-marker",
         "fixture.port_open",
-        serde_json::json!({"major":2,"port":"message.marker_watch"}),
+        serde_json::json!({"access":access,"major":2,"port":"message.marker_watch"}),
     )
     .await;
     assert_eq!(opened["opened"], true);
@@ -697,7 +711,7 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
         &mount,
         "open-large",
         "fixture.port_open",
-        serde_json::json!({"major":2,"port":"message.large_watch"}),
+        serde_json::json!({"access":access,"major":2,"port":"message.large_watch"}),
     )
     .await;
     assert_eq!(opened["opened"], true);
@@ -730,12 +744,19 @@ async fn major_two_port_values_round_trip_through_object_only_frames() {
 // Verifies: TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn invalid_live_query_event_ends_only_that_stream() {
+    for access in ["declared", "agent"] {
+        invalid_live_query_event_ends_only_that_stream_for_access(access).await;
+    }
+}
+
+async fn invalid_live_query_event_ends_only_that_stream_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[("provider", "com.example.invalid"), ("consumer", "com.example.consumer")],
         &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     ).await;
     declare(&fixture, "provider", true);
     declare(&fixture, "consumer", false);
+    common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -748,12 +769,13 @@ async fn invalid_live_query_event_ends_only_that_stream() {
         .unwrap()
         .key;
     let mount = mount(&host, consumer).await;
+    common::enable_agent_ports(&host, &mount, 1).await;
     let opened = request(
         &host,
         &mount,
         "invalid-live",
         "fixture.port_open",
-        serde_json::json!({}),
+        serde_json::json!({"access":access}),
     )
     .await;
     assert_eq!(opened["opened"], true);
@@ -782,7 +804,7 @@ async fn invalid_live_query_event_ends_only_that_stream() {
     .await;
     let query = request(&host, &mount, "still-usable", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
     })).await;
     assert_eq!(query["result"]["accepted"], true);
     assert_eq!(
@@ -800,6 +822,12 @@ async fn invalid_live_query_event_ends_only_that_stream() {
 // Verifies: TEAM.SYS.PKG-R13
 #[tokio::test]
 async fn a_consumer_wakes_only_its_own_workspace_provider() {
+    for access in ["declared", "agent"] {
+        a_consumer_wakes_only_its_own_workspace_provider_for_access(access).await;
+    }
+}
+
+async fn a_consumer_wakes_only_its_own_workspace_provider_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
         &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
@@ -807,6 +835,7 @@ async fn a_consumer_wakes_only_its_own_workspace_provider() {
     declare(&fixture, "provider", true);
     declare(&fixture, "consumer", false);
     let second = fixture.core.create_workspace("Second Workspace").unwrap();
+    common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -822,9 +851,10 @@ async fn a_consumer_wakes_only_its_own_workspace_provider() {
         .unwrap()
         .key;
     let mount = mount(&host, consumer).await;
+    common::enable_agent_ports(&host, &mount, 1).await;
     let value = request(&host, &mount, "second-workspace", "fixture.capability", serde_json::json!({
         "capability":"teamarness.package-ports","method":"invoke",
-        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+        "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
     })).await;
     assert_eq!(value["result"]["accepted"], true);
     let providers = host
@@ -857,10 +887,17 @@ async fn a_consumer_wakes_only_its_own_workspace_provider() {
 // Verifies: TEAM.SYS.PKG-R13
 #[tokio::test]
 async fn a_replacement_generation_rejects_its_predecessors_grant() {
+    for access in ["declared", "agent"] {
+        a_replacement_generation_rejects_its_predecessors_grant_for_access(access).await;
+    }
+}
+
+async fn a_replacement_generation_rejects_its_predecessors_grant_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[("consumer", "com.example.consumer")],
         &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     ).await;
+    common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -907,7 +944,7 @@ async fn a_replacement_generation_rejects_its_predecessors_grant() {
         "old-grant",
         "fixture.capability",
         serde_json::json!({
-            "grant":old_grant,"method":"available","arguments":{"access":"declared"}
+            "grant":old_grant,"method":"available","arguments":{"access":access}
         }),
     )
     .await;
@@ -918,7 +955,7 @@ async fn a_replacement_generation_rejects_its_predecessors_grant() {
         "current-grant",
         "fixture.capability",
         serde_json::json!({
-            "capability":"teamarness.package-ports","method":"available","arguments":{"access":"declared"}
+            "capability":"teamarness.package-ports","method":"available","arguments":{"access":access}
         }),
     )
     .await;
@@ -963,4 +1000,110 @@ async fn optional_absence_is_filtered_and_an_attempt_cannot_dispatch() {
         "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
     })).await;
     assert_eq!(result["error"], "port_unavailable");
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn saturated_routes_refuse_before_dispatch_and_release_without_command_replay() {
+    for access in ["declared", "agent"] {
+        let fixture = common::Fixture::node_with_capabilities(
+            &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+            &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+        ).await;
+        declare(&fixture, "provider", true);
+        declare(&fixture, "consumer", false);
+        common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let snapshot = host.snapshot().await;
+        let key = |package: &str| {
+            snapshot
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == package)
+                .unwrap()
+                .key
+                .clone()
+        };
+        let consumer = mount(&host, key("com.example.consumer")).await;
+        common::enable_agent_ports(&host, &consumer, 1).await;
+        let provider = mount(&host, key("com.example.provider")).await;
+        // Each call reserves one maximum response plus its nonempty request. Seven fit
+        // the documented eight-frame global byte budget; an eighth cannot dispatch.
+        let held = teamarness_package_protocol::MAX_IN_FLIGHT_EACH_DIRECTION / 4 - 1;
+        let mut pending = Vec::new();
+        for index in 0..held {
+            let host = host.clone();
+            let consumer = consumer.clone();
+            pending.push(tokio::spawn(async move {
+                request(&host, &consumer, &format!("held-{index}"), "fixture.capability", serde_json::json!({
+                    "capability":"teamarness.package-ports","method":"invoke",
+                    "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"hold"}}
+                })).await
+            }));
+        }
+        let mut receipt = 0;
+        common::eventually(
+            std::time::Duration::from_secs(3),
+            "Provider accepted held commands",
+            || {
+                receipt += 1;
+                let id = format!("receipt-{receipt}");
+                let host = &host;
+                let provider = &provider;
+                async move {
+                    request(
+                        host,
+                        provider,
+                        &id,
+                        "fixture.port_last_actor",
+                        serde_json::json!({}),
+                    )
+                    .await["commands"]
+                        == held
+                }
+            },
+        )
+        .await;
+        let refused = request(&host, &consumer, "saturated", "fixture.capability", serde_json::json!({
+            "capability":"teamarness.package-ports","method":"invoke",
+            "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"must-not-dispatch"}}
+        })).await;
+        assert_eq!(refused["error"], "overloaded", "{access}: {refused}");
+        let released = request(
+            &host,
+            &provider,
+            "release",
+            "fixture.port_release",
+            serde_json::json!({}),
+        )
+        .await;
+        for pending in pending {
+            assert_eq!(pending.await.unwrap()["result"]["accepted"], true);
+        }
+        assert_eq!(refused["outcomeUncertain"], false);
+        assert_eq!(released["released"], held);
+        assert_eq!(
+            request(
+                &host,
+                &provider,
+                "no-replay",
+                "fixture.port_last_actor",
+                serde_json::json!({})
+            )
+            .await["commands"],
+            held
+        );
+        let fresh = request(&host, &consumer, "fresh", "fixture.capability", serde_json::json!({
+            "capability":"teamarness.package-ports","method":"invoke",
+            "arguments":{"access":access,"major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"fresh"}}
+        })).await;
+        assert_eq!(fresh["result"]["accepted"], true);
+        host.execute(PackageHostCommand::Shutdown(
+            teamarness_package_host::ShutdownHost,
+        ))
+        .await
+        .unwrap();
+    }
 }

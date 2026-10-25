@@ -41,6 +41,10 @@ path = "../../packages/documents-package/backend/src/main.rs"
 name = "documents-port-consumer-under-test"
 path = "src/bin/documents_port_consumer.rs"
 
+[[bin]]
+name = "generic-port-consumer-under-test"
+path = "src/bin/generic_port_consumer.rs"
+
 # The optional standalone Agent is qualified through an explicitly supplied Package Directory;
 # it is not a source dependency or prerequisite of the default Teamarness suite.
 
