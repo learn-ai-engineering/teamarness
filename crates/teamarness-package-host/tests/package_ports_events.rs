@@ -123,7 +123,7 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -339,7 +339,7 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
             "health",
             "fixture.capability",
             json!({
-                "capability":"teamarness.package-ports","method":"available","arguments":{}
+                "capability":"teamarness.package-ports","method":"available","arguments":{"access":"declared"}
             })
         )
         .await["result"]["contracts"][0]["available"],
@@ -356,7 +356,7 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -457,7 +457,7 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
             &b,
             "health",
             "fixture.capability",
-            json!({"capability":"teamarness.package-ports","method":"available","arguments":{}})
+            json!({"capability":"teamarness.package-ports","method":"available","arguments":{"access":"declared"}})
         )
         .await["result"]["contracts"][0]["available"],
         true
@@ -473,7 +473,7 @@ async fn slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progre
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -597,7 +597,7 @@ async fn invalid_event_grant_and_churn_do_not_start_or_strand_upstreams() {
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -726,7 +726,7 @@ async fn replacing_provider_generation_revokes_streams_without_replay() {
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -869,7 +869,7 @@ async fn largest_schema_accepted_event_fits_bounded_process_and_fanout_queues() 
             ("provider", "com.example.provider"),
             ("consumer", "com.example.consumer"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     declare(&fixture, "provider", true);

@@ -2779,6 +2779,11 @@ async fn merge_off_lock(
             let _ = release.recv();
         }
         let merged = crate::body::merge_revision(&source, &base, &markdown, peer)?;
+        // Importing an invalid large update can outlast the Host command deadline.
+        // Preserve the same size refusal before computing its temporary frontiers.
+        if merged.update.len() > crate::domain::MAX_UPDATE {
+            return Err(crate::body::BodyError::RecordTooLarge);
+        }
         if merged.ops > 0 {
             source
                 .import(&merged.update)
@@ -7436,6 +7441,60 @@ mod tests {
                 assert_eq!(read["version"], revised["version"], "{name}");
             }
         }
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12
+    #[tokio::test]
+    async fn oversized_prefixed_revision_is_refused_before_import_without_appending() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        revise(
+            &mut session.harness,
+            &document,
+            &read["version"],
+            "Hello from an agent\n",
+        )
+        .await
+        .unwrap();
+        let before = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        let before_appends = appends(&session);
+        let huge = format!("Hello from an agent\n\n{}\n", unique_text(170 * 1024));
+        // Match the existing Host command deadline; this bounds failure, not ordering.
+        let refusal = tokio::time::timeout(
+            Duration::from_secs(8),
+            revise(&mut session.harness, &document, &before["version"], &huge),
+        )
+        .await
+        .expect("an already oversized update is refused before the Host command deadline")
+        .unwrap_err();
+        assert_eq!(refusal.code(), "documents.revision_too_large");
+        assert!(!refusal.outcome_uncertain());
+        assert_eq!(appends(&session), before_appends);
+        assert_eq!(
+            query(
+                &mut session.harness,
+                "document.markdown",
+                json!({"documentId":document})
+            )
+            .await
+            .unwrap(),
+            before
+        );
         session.harness.shutdown().await.unwrap();
     }
 

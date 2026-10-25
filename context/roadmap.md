@@ -70,6 +70,10 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Agent-controlled Package Ports (in progress)
+
+Workstream `agent-port-discovery` implements ADR 0035 in five phases. Phase 1 delivers package-ports 2.0 explicit declared requests and complete bounded metadata with reachable definitions; a real source-built Conversations consumer reconstructs it. Bound-Agent guide-bearing access defaults to denial, including declared Ports. This is an intermediate checkpoint, not a completed 2.0 release. Next: Conversations guidance, durable self-scoped Agent selections and discovery, lifecycle revocation, then generic-client and desktop qualification. Registration replacement remains next-Host-open behavior; packagement is not a prerequisite or integration task. The standalone harness rebuild and Steward's final UI journey remain external qualification. Documents tools and Comments remain follow-ups.
+
 ### Exhibits Package (slice 1 delivered; slice 2 planned)
 
 Slice 1 was implemented on 2026-10-25 on branch `don-smith/link_and_show`, workstream `exhibits-package`. It passed Verify and was integrated into `main` on 2026-10-25. The developer's manual checks are deferred until an Agent can publish Exhibits. An Agent, or any Port Consumer acting for a Person, authors an Exhibit: a multi-page, interactive web experience whose files are all bundled. The bundled Exhibits Package (`dev.teamarness.exhibits`, on-demand activation) stores Drafts in its Package Data Directory and provides the `dev.teamarness.exhibits` 1.0 Port Contract: chunked, content-addressed uploads, atomic Draft updates with revision checks, paged list and read, and a `runtime.guide` query that publishes the enforced limits (`TEAM.SYS.PKG-R18`). Its UI lists Exhibits newest first and shows the selected Draft in a nested frame, replacing it when a newer revision arrives.
@@ -221,11 +225,11 @@ Author signature over the Package artifact, a team endorsement of an exact diges
 
 Start a separate Scope if sustained name-delivery or membership churn becomes an ordinary workload. Two bounded deferred-name replay schedules can starve an eligible name while churn continues; finite backlogs converge. That Scope should also decide whether to use or retire the unused deferred-reference target index. A smaller Core maintenance change can reuse one clock sample for local Agent removal. Clarify the ontology's Agent Identity keypair wording without changing key custody. Diagnose the intermittent `names_converge_without_package_instance_after_restart` test failure before changing a deadline or claiming that a passing retry fixed it. The `agent-invite` final Verify report owns the evidence; these are follow-ups, not unverified passes or blockers to the completed supported flow.
 
-### Agent participation in Package Ports (discuss before Scope)
+### Documents Agent tools and Comments (follow-up)
 
-Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package does not yet have tools that call those Ports. The developer's direction, which is not yet designed, is open question [TEAM-DQ10](open-questions.md):
+Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package does not yet have tools that call those Ports. The generic guidance direction is resolved by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and is in progress above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
 
-- Every Package assumes that Agents will use it, and ships agent-facing guidance with its Port Contract: what is possible, what to do and what not to do, tool descriptions, and possibly skills or a small library. An Agent can discover the guidance from the Package, or a Steward can enable it for an Agent. The aim is loose coupling and high cohesion across Conversations, Documents, Exhibits and later Packages.
+- Documents guidance and generic Agent tools can follow the ordinary `runtime.guide` convention; no Documents-specific Host adapter is planned.
 - Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
 - Agent mentions and Comment Ports for Documents. The Documents Port Contract has no Comment operations today.
 - A developer check once tools exist: an Agent revises a Document that a Member has open, and the change appears live.

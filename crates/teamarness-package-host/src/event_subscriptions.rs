@@ -91,8 +91,8 @@ impl PortBroker {
         input: &Map<String, Value>,
         consumer_generation: u64,
     ) -> Result<EventSubscription, PackageErrorCode> {
-        if input.len() != 4
-            || !["grant", "contract", "port", "kind"]
+        if input.len() != 6
+            || !["grant", "access", "major", "contract", "port", "kind"]
                 .iter()
                 .all(|key| input.contains_key(*key))
         {
@@ -111,6 +111,7 @@ impl PortBroker {
         }
         let (actor, schemas, major, minor) =
             self.resolve(caller, workspace, contract, port, PortKind::Event)?;
+        self.check_declared_access(input, major)?;
         let slot = self
             .event_subscribers
             .clone()

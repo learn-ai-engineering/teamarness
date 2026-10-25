@@ -24,6 +24,21 @@ impl AuthorityPause {
 }
 
 impl PackageHost {
+    /// Holds the next record stream after its empty-page availability read, before another page.
+    pub fn pause_next_record_availability_for_tests(
+        &self,
+        package: PackageIdentity,
+    ) -> Arc<AuthorityPause> {
+        let pause = Arc::new(AuthorityPause::default());
+        *self
+            .inner
+            .port_broker
+            .record_availability_pause
+            .lock()
+            .expect("test pause poisoned") = Some((package, pause.clone()));
+        pause
+    }
+
     /// Holds the next Agent binding write before Core work. Test builds only.
     pub fn pause_next_binding_write_for_tests(
         &self,

@@ -1,0 +1,513 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/package-ports-2.0.schema.json",
+  "title": "Package Ports capability 2.0",
+  "description": "Final wire shapes. Phase 1 qualifies declared metadata and explicit declared invocation/subscriptions only. Agent discovery, enable/disable and dynamic authorization are not yet qualified. The v1 directory names the document collection, not this family major. Byte bounds and digest/offset coherence are semantic checks described in README.md. Describe examples reconstruct the independently pinned package-ports-2.0.golden.json document.",
+  "$defs": {
+    "access": {
+      "enum": [
+        "declared",
+        "agent"
+      ]
+    },
+    "contract": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+    },
+    "major": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "offset": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1048575
+    },
+    "port": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "major",
+        "minor",
+        "description",
+        "available",
+        "enabled",
+        "enabledMajor",
+        "metadataSha256"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "major": {
+          "$ref": "#/$defs/major"
+        },
+        "minor": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "enabledMajor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/major"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadataSha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "availableCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "access"
+      ],
+      "properties": {
+        "method": {
+          "const": "available"
+        },
+        "access": {
+          "$ref": "#/$defs/access"
+        },
+        "cursor": {
+          "$ref": "#/$defs/cursor"
+        }
+      },
+      "examples": [
+        {
+          "method": "available",
+          "access": "declared"
+        }
+      ]
+    },
+    "availableResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contracts"
+      ],
+      "properties": {
+        "contracts": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/summary"
+          }
+        },
+        "nextCursor": {
+          "$ref": "#/$defs/cursor"
+        }
+      },
+      "examples": [
+        {
+          "contracts": [
+            {
+              "contract": "dev.example.metadata",
+              "major": 1,
+              "minor": 2,
+              "description": "Metadata",
+              "available": true,
+              "enabled": false,
+              "enabledMajor": null,
+              "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7"
+            }
+          ]
+        }
+      ]
+    },
+    "describeCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "access",
+        "contract",
+        "metadataSha256",
+        "offset"
+      ],
+      "properties": {
+        "method": {
+          "const": "describe"
+        },
+        "access": {
+          "$ref": "#/$defs/access"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "metadataSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "offset": {
+          "$ref": "#/$defs/offset"
+        }
+      },
+      "examples": [
+        {
+          "method": "describe",
+          "access": "declared",
+          "contract": "dev.example.metadata",
+          "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7",
+          "offset": 0
+        }
+      ]
+    },
+    "describeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metadataSha256",
+        "totalBytes",
+        "offset",
+        "data"
+      ],
+      "properties": {
+        "metadataSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "totalBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "offset": {
+          "$ref": "#/$defs/offset"
+        },
+        "data": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 87384,
+          "contentEncoding": "base64",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        },
+        "nextOffset": {
+          "$ref": "#/$defs/offset"
+        }
+      },
+      "examples": [
+        {
+          "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7",
+          "totalBytes": 267,
+          "offset": 0,
+          "data": "eyJzY2hlbWFWZXJzaW9uIjoxLCIkZGVmcyI6eyJ0ZXh0Ijp7InR5cGUiOiJzdHJpbmcifX0sImNvbnRyYWN0cyI6W3siaWRlbnRpdHkiOiJkZXYuZXhhbXBsZS5tZXRhZGF0YSIsIm1ham9yIjoxLCJtaW5vciI6MiwiZGVzY3JpcHRpb24iOiJNZXRhZGF0YSIsInBvcnRzIjpbeyJuYW1lIjoidmFsdWUucmVhZCIsImtpbmQiOiJxdWVyeSIsImRlc2NyaXB0aW9uIjoiUmVhZCIsInJlcXVlc3QiOnRydWUsInJlc3BvbnNlIjp7IiRyZWYiOiIjLyRkZWZzL3RleHQifX1dfV19"
+        }
+      ]
+    },
+    "enableCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "contract",
+        "major"
+      ],
+      "properties": {
+        "method": {
+          "const": "enable"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "major": {
+          "$ref": "#/$defs/major"
+        }
+      },
+      "examples": [
+        {
+          "method": "enable",
+          "contract": "dev.example.messages",
+          "major": 1
+        }
+      ]
+    },
+    "enableResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "major",
+        "enabled"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "major": {
+          "$ref": "#/$defs/major"
+        },
+        "enabled": {
+          "const": true
+        }
+      },
+      "examples": [
+        {
+          "contract": "dev.example.messages",
+          "major": 1,
+          "enabled": true
+        }
+      ]
+    },
+    "disableCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "contract"
+      ],
+      "properties": {
+        "method": {
+          "const": "disable"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        }
+      },
+      "examples": [
+        {
+          "method": "disable",
+          "contract": "dev.example.messages"
+        }
+      ]
+    },
+    "disableResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "enabled"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "enabled": {
+          "const": false
+        }
+      },
+      "examples": [
+        {
+          "contract": "dev.example.messages",
+          "enabled": false
+        }
+      ]
+    },
+    "invokeCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "access",
+        "contract",
+        "major",
+        "port",
+        "kind",
+        "request"
+      ],
+      "properties": {
+        "method": {
+          "const": "invoke"
+        },
+        "access": {
+          "$ref": "#/$defs/access"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "major": {
+          "$ref": "#/$defs/major"
+        },
+        "port": {
+          "$ref": "#/$defs/port"
+        },
+        "kind": {
+          "enum": [
+            "command",
+            "query"
+          ]
+        },
+        "request": true
+      },
+      "examples": [
+        {
+          "method": "invoke",
+          "access": "declared",
+          "contract": "dev.example.messages",
+          "major": 1,
+          "port": "message.read",
+          "kind": "query",
+          "request": {}
+        }
+      ]
+    },
+    "queryStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grant",
+        "access",
+        "contract",
+        "major",
+        "port",
+        "kind",
+        "request"
+      ],
+      "properties": {
+        "grant": {
+          "type": "string",
+          "minLength": 1
+        },
+        "access": {
+          "$ref": "#/$defs/access"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "major": {
+          "$ref": "#/$defs/major"
+        },
+        "port": {
+          "$ref": "#/$defs/port"
+        },
+        "kind": {
+          "const": "query"
+        },
+        "request": true
+      },
+      "examples": [
+        {
+          "grant": "opaque",
+          "access": "declared",
+          "contract": "dev.example.messages",
+          "major": 1,
+          "port": "message.watch",
+          "kind": "query",
+          "request": {}
+        }
+      ]
+    },
+    "eventStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grant",
+        "access",
+        "contract",
+        "major",
+        "port",
+        "kind"
+      ],
+      "properties": {
+        "grant": {
+          "type": "string",
+          "minLength": 1
+        },
+        "access": {
+          "$ref": "#/$defs/access"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "major": {
+          "$ref": "#/$defs/major"
+        },
+        "port": {
+          "$ref": "#/$defs/port"
+        },
+        "kind": {
+          "const": "event"
+        }
+      },
+      "examples": [
+        {
+          "grant": "opaque",
+          "access": "declared",
+          "contract": "dev.example.messages",
+          "major": 1,
+          "port": "message.changed",
+          "kind": "event"
+        }
+      ]
+    },
+    "errorCodes": {
+      "enum": [
+        "capability_request_invalid",
+        "capability_unavailable",
+        "capability_version_unsupported",
+        "port_catalog_changed",
+        "port_unavailable",
+        "ungranted_port",
+        "port_version_mismatch",
+        "port_not_enabled",
+        "agent_not_bound",
+        "agent_binding_changed",
+        "port_request_invalid",
+        "port_response_invalid",
+        "port_event_invalid",
+        "port_subscriber_overflow",
+        "overloaded",
+        "outcome_unknown",
+        "provider_exited",
+        "provider_error",
+        "event_lagged",
+        "deadline_exceeded",
+        "cancelled"
+      ]
+    }
+  }
+}

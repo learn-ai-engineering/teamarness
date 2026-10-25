@@ -1963,6 +1963,56 @@ fn described(response: &BTreeMap<String, PackageValue>) -> Vec<String> {
     events_of(response).iter().map(describe).collect()
 }
 
+/// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R08
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn record_availability_change_between_state_and_empty_page_is_not_lost() {
+    let requirements = [
+        serde_json::json!({"identity":"teamarness.synchronization.immutable-record-log","major":1,"minMinor":0,"maxMinor":0}),
+    ];
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("fixture", "dev.teamarness.fixture")],
+        &requirements,
+    )
+    .await;
+    let package = "dev.teamarness.fixture";
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    fixture.core.pause_sync_scheduler_for_tests(true);
+    let peer = fixture.core.admit_unreachable_member_for_tests(workspace);
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let mount = mount(&host, 0).await;
+    let pause = host.pause_next_record_availability_for_tests(package.parse().unwrap());
+    fixture_request(
+        &host,
+        &mount,
+        "race-subscribe",
+        "fixture.immutable_subscribe",
+        object([]),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), pause.paused())
+        .await
+        .expect("the final empty-page state read is paused");
+    fixture
+        .core
+        .set_peer_outcome_for_tests(workspace, package, peer, "reachable");
+    pause.resume();
+    let response = poll_immutable(
+        &host,
+        &mount,
+        "Current after the racing health transition",
+        |response| described(response).contains(&"state current 0".to_owned()),
+    )
+    .await;
+    assert_eq!(
+        described(&response),
+        vec!["state catching_up 0", "state current 0"]
+    );
+    assert_eq!(record_events(&response), 0);
+}
+
 /// Verifies: TEAM.SYS.PKG-R10
 #[tokio::test]
 async fn immutable_record_stream_reports_catching_up_then_current() {

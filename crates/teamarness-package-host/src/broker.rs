@@ -8,6 +8,8 @@ use teamarness_package_contract::port_contract::{CompiledPortContracts, PortKind
 use teamarness_package_protocol::{MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 
+#[path = "port_metadata.rs"]
+mod metadata;
 #[path = "event_subscriptions.rs"]
 mod subscriptions;
 
@@ -35,6 +37,10 @@ pub(crate) struct PortBroker {
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) actor_pause: std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) record_availability_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    metadata_revision: [u8; 32],
     graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
     observations: broadcast::Sender<PortObservation>,
     consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
@@ -61,7 +67,12 @@ impl PortBroker {
         consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
         contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
     ) -> Arc<Self> {
+        let mut metadata_revision = [0; 32];
+        getrandom::fill(&mut metadata_revision).expect("Host metadata revision entropy");
         Arc::new(Self {
+            metadata_revision,
+            #[cfg(feature = "test-hooks")]
+            record_availability_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             actor_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -82,6 +93,25 @@ impl PortBroker {
             event_bytes: Arc::new(Semaphore::new(subscriptions::EVENT_BYTES)),
             event_open_locks: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_record_availability_pause(
+        &self,
+        package: &PackageIdentity,
+    ) -> Option<Arc<crate::AuthorityPause>> {
+        let mut pending = self
+            .record_availability_pause
+            .lock()
+            .expect("test pause poisoned");
+        if pending
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == package)
+        {
+            pending.take().map(|(_, pause)| pause)
+        } else {
+            None
+        }
     }
 
     #[cfg(feature = "test-hooks")]
@@ -154,50 +184,6 @@ impl PortBroker {
             .insert(key, Arc::downgrade(actor));
     }
 
-    /// Only declared ports occur in this view; an optional absence has no callable route.
-    pub(crate) async fn availability(
-        &self,
-        caller: &PackageIdentity,
-        workspace: &WorkspaceId,
-    ) -> Value {
-        let mut entries = Vec::new();
-        for consumed in self.consumed.get(caller).into_iter().flatten() {
-            let Some(route) = self.graph.get(caller).and_then(|routes| {
-                routes
-                    .iter()
-                    .find(|entry| entry.contract == consumed.identity)
-            }) else {
-                continue;
-            };
-            let available = if route.unavailable.is_none() {
-                let actor = route.provider.as_ref().and_then(|provider| {
-                    self.instances
-                        .read()
-                        .expect("port registry poisoned")
-                        .get(&PackageInstanceKey::new(
-                            provider.clone(),
-                            workspace.clone(),
-                        ))
-                        .and_then(Weak::upgrade)
-                });
-                match actor {
-                    Some(actor) => matches!(
-                        actor.snapshot().await.lifecycle,
-                        crate::LifecycleState::Admitted | crate::LifecycleState::Active
-                    ),
-                    None => false,
-                }
-            } else {
-                false
-            };
-            entries.push(
-                json!({"contract":consumed.identity,"major":consumed.major,"minor":route.minor,
-                "available":available,"ports":consumed.ports}),
-            );
-        }
-        json!({"contracts":entries})
-    }
-
     fn resolve(
         &self,
         caller: &PackageIdentity,
@@ -255,6 +241,49 @@ impl PortBroker {
             requested.major,
             route.minor.ok_or(PackageErrorCode::PortUnavailable)?,
         ))
+    }
+
+    fn check_declared_access(
+        &self,
+        input: &Map<String, Value>,
+        major: u16,
+    ) -> Result<(), PackageErrorCode> {
+        if input.get("access").and_then(Value::as_str) != Some("declared") {
+            return Err(PackageErrorCode::CapabilityRequestInvalid);
+        }
+        if input.get("major").and_then(Value::as_u64) != Some(u64::from(major)) {
+            return Err(PackageErrorCode::PortVersionMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn deny_disabled_guide(
+        &self,
+        caller: &PackageIdentity,
+        input: &Map<String, Value>,
+        actor: &Value,
+    ) -> Result<(), PackageErrorCode> {
+        if actor.get("kind").and_then(Value::as_str) != Some("agent") {
+            return Ok(());
+        }
+        let contract = input
+            .get("contract")
+            .and_then(Value::as_str)
+            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        let guide = self
+            .graph
+            .get(caller)
+            .into_iter()
+            .flatten()
+            .find(|r| r.contract == contract)
+            .and_then(|r| r.provider.as_ref())
+            .and_then(|p| self.contracts.get(p))
+            .is_some_and(|s| s.has_guide(contract));
+        if guide {
+            Err(PackageErrorCode::PortNotEnabled)
+        } else {
+            Ok(())
+        }
     }
 
     fn permit(&self, request: &Value) -> Result<RoutePermits, PackageErrorCode> {
@@ -366,10 +395,12 @@ impl PortBroker {
         consumer_generation: u64,
         provider_id: Arc<std::sync::Mutex<Option<(String, u64)>>>,
     ) -> Result<Value, WireFailure> {
-        if input.len() != 5
-            || !["method", "contract", "port", "kind", "request"]
-                .iter()
-                .all(|key| input.contains_key(*key))
+        if input.len() != 7
+            || ![
+                "method", "access", "major", "contract", "port", "kind", "request",
+            ]
+            .iter()
+            .all(|key| input.contains_key(*key))
         {
             return Err(WireFailure::new(PackageErrorCode::CapabilityRequestInvalid));
         }
@@ -385,6 +416,8 @@ impl PortBroker {
             .ok_or_else(|| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
         let (provider, schemas, major, minor) = self
             .resolve(caller, workspace, contract, port, kind)
+            .map_err(WireFailure::new)?;
+        self.check_declared_access(input, major)
             .map_err(WireFailure::new)?;
         schemas
             .validate(contract, port, "request", request)
@@ -441,10 +474,12 @@ impl PortBroker {
         actor: &Value,
         input: &Map<String, Value>,
     ) -> Result<PortQueryStream, PackageErrorCode> {
-        if input.len() != 5
-            || !["grant", "contract", "port", "kind", "request"]
-                .iter()
-                .all(|key| input.contains_key(*key))
+        if input.len() != 7
+            || ![
+                "grant", "access", "major", "contract", "port", "kind", "request",
+            ]
+            .iter()
+            .all(|key| input.contains_key(*key))
         {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
@@ -464,6 +499,7 @@ impl PortBroker {
             .ok_or(PackageErrorCode::PortRequestInvalid)?;
         let (provider, schemas, major, minor) =
             self.resolve(caller, workspace, contract, port, PortKind::Query)?;
+        self.check_declared_access(input, major)?;
         let descriptor = schemas
             .contracts
             .iter()

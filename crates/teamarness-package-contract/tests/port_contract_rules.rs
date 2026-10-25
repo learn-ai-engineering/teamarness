@@ -144,3 +144,178 @@ fn unused_definitions_are_validated_even_without_provided_contracts() {
     let empty = json!({"schemaVersion":1,"$defs":{"unused":{"$ref":"https://example.com/remote"}},"contracts":[]});
     assert!(compile_port_contracts(&serde_json::to_vec(&empty).unwrap()).is_err());
 }
+
+#[test]
+fn guide_classification_resolves_local_shapes_and_warns_on_bad_guides() {
+    let mut doc = json!({"schemaVersion":1,"$defs":{
+        "empty":{"type":"object","additionalProperties":false},
+        "markdown":{"type":"string","maxLength":16384},
+        "guide":{"type":"object","properties":{"markdown":{"$ref":"#/$defs/markdown"}},"required":["markdown"],"additionalProperties":false}
+    },"contracts":[{"identity":"dev.example.guide","major":1,"minor":0,"description":"Guide","ports":[
+        {"name":"runtime.guide","kind":"query","description":"Guidance","request":{"$ref":"#/$defs/empty"},"response":{"$ref":"#/$defs/guide"}}
+    ]}]});
+    let compile = |doc: &Value| compile_port_contracts(&serde_json::to_vec(doc).unwrap()).unwrap();
+    assert!(compile(&doc).has_guide("dev.example.guide"));
+    doc["contracts"][0]["ports"][0]["request"] =
+        json!({"type":"object","additionalProperties":false});
+    assert!(compile(&doc).has_guide("dev.example.guide"));
+    let valid = doc.clone();
+    let mut impossible = doc.clone();
+    impossible["contracts"][0]["ports"][0]["request"] =
+        json!({"type":"object","additionalProperties":false,"minProperties":1});
+    assert!(!compile(&impossible).has_guide("dev.example.guide"));
+    for (field, shape) in [
+        ("request", json!({"type":"object"})),
+        (
+            "request",
+            json!({"type":"object","properties":{"input":{"type":"string"}},"additionalProperties":false}),
+        ),
+        (
+            "response",
+            json!({"type":"object","properties":{"markdown":{"type":"string","maxLength":100}},"additionalProperties":false}),
+        ),
+        (
+            "response",
+            json!({"type":"object","properties":{"markdown":{"type":"number"}},"required":["markdown"],"additionalProperties":false}),
+        ),
+    ] {
+        let mut malformed = valid.clone();
+        malformed["contracts"][0]["ports"][0][field] = shape;
+        assert!(!compile(&malformed).has_guide("dev.example.guide"));
+    }
+    let mut literal = valid.clone();
+    literal["contracts"][0]["ports"][0]["response"] = json!({"type":"object","properties":{"markdown":{"type":"string","maxLength":100}},"required":["markdown"],"additionalProperties":false});
+    assert!(compile(&literal).has_guide("dev.example.guide"));
+    doc["$defs"]["markdown"] = json!({"type":"string"});
+    let malformed = compile(&doc);
+    assert!(!malformed.has_guide("dev.example.guide"));
+    assert!(malformed.warnings.iter().any(|w| w.contains("guide_shape")));
+    doc["contracts"][0]["ports"][0]["name"] = json!("other.read");
+    assert!(!compile(&doc).has_guide("dev.example.guide"));
+}
+
+#[test]
+fn metadata_projection_is_complete_filtered_and_deterministic_at_size_bound() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+    let mut doc = json!({"schemaVersion":1,"$defs":{
+        "outer":{"type":"object","properties":{"text":{"$ref":"#/$defs/inner"}},"additionalProperties":false},
+        "inner":{"type":"string"},"unused":{"type":"boolean"}
+    },"contracts":[{"identity":"dev.example.metadata","major":1,"minor":2,"description":"Metadata","ports":[
+        {"name":"value.read","kind":"query","description":"Read","request":true,"response":{"$ref":"#/$defs/outer"}},
+        {"name":"value.watch","kind":"query","description":"Watch","request":true,"event":{"$ref":"#/$defs/inner"}},
+        {"name":"value.changed","kind":"event","description":"Changed","event":{"type":"boolean"}}
+    ]}]});
+    let identity = "dev.example.metadata";
+    let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    let names = BTreeSet::from(["value.read".to_owned()]);
+    let metadata = compiled.project_metadata(identity, Some(&names)).unwrap();
+    let actual: Value = serde_json::from_slice(&metadata.bytes).unwrap();
+    assert_eq!(
+        actual["$defs"],
+        json!({"outer":doc["$defs"]["outer"],"inner":{"type":"string"}})
+    );
+    assert_eq!(
+        actual["contracts"][0]["ports"],
+        json!([doc["contracts"][0]["ports"][0]])
+    );
+    assert_eq!(
+        metadata.sha256,
+        Sha256::digest(&metadata.bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(
+        metadata.bytes,
+        compiled
+            .project_metadata(identity, Some(&names))
+            .unwrap()
+            .bytes
+    );
+    let all = compiled.project_metadata(identity, None).unwrap();
+    let actual: Value = serde_json::from_slice(&all.bytes).unwrap();
+    assert!(
+        actual["contracts"][0]["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "value.watch")
+            .unwrap()
+            .get("response")
+            .is_none()
+    );
+    assert!(
+        actual["contracts"][0]["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "value.changed")
+            .unwrap()
+            .get("request")
+            .is_none()
+    );
+    let size = serde_json::to_vec(&doc).unwrap().len();
+    doc["$defs"]["inner"]["description"] = json!("x".repeat(1024 * 1024 - size - 17));
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    assert_eq!(bytes.len(), 1024 * 1024);
+    let compiled = compile_port_contracts(&bytes).unwrap();
+    assert!(
+        compiled
+            .project_metadata(identity, None)
+            .unwrap()
+            .bytes
+            .len()
+            <= bytes.len()
+    );
+}
+
+#[test]
+fn current_capability_wire_examples_are_closed_and_metadata_fixture_is_complete() {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../contracts/package-capabilities/v1/package-ports-2.0.schema.json"
+    ))
+    .unwrap();
+    for name in [
+        "availableCall",
+        "availableResult",
+        "describeCall",
+        "describeResult",
+        "enableCall",
+        "enableResult",
+        "disableCall",
+        "disableResult",
+        "invokeCall",
+        "queryStream",
+        "eventStream",
+    ] {
+        let validator = jsonschema::validator_for(
+            &json!({"$defs":schema["$defs"],"$ref":format!("#/$defs/{name}")}),
+        )
+        .unwrap();
+        let example = &schema["$defs"][name]["examples"][0];
+        assert!(validator.is_valid(example), "{name}");
+        let mut with_selector = example.clone();
+        with_selector["workspace"] = json!("chosen-by-caller");
+        assert!(!validator.is_valid(&with_selector), "{name} must be closed");
+    }
+    assert_eq!(
+        schema["$defs"]["availableResult"]["properties"]["contracts"]["maxItems"],
+        32
+    );
+    assert_eq!(
+        schema["$defs"]["describeResult"]["properties"]["totalBytes"]["maximum"],
+        1024 * 1024
+    );
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../contracts/package-capabilities/v1/package-ports-2.0.golden.json"
+    ))
+    .unwrap();
+    let document =
+        compile_port_contracts(&serde_json::to_vec(&fixture["document"]).unwrap()).unwrap();
+    assert_eq!(document.contracts[0].identity, "dev.example.metadata");
+    assert_eq!(
+        document.contracts[0].ports[0].response,
+        Some(json!({"$ref":"#/$defs/text"}))
+    );
+}

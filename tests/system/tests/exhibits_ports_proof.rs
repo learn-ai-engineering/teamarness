@@ -1,6 +1,6 @@
 //! The Exhibits Port proof: a real Exhibits Backend and the test-only Exhibits Consumer, both
 //! real processes under a real Package Host and Core Runtime, exercised once with the
-//! Installation Person as the Port actor and once with a bound Workspace Agent.
+//! Installation Person as the Port actor and default-denied for a bound Workspace Agent.
 //!
 //! The Consumer creates a Draft, uploads a file larger than one Port message in parts, resumes
 //! an upload whose response it dropped through `files.missing`, updates the Draft so its revision
@@ -212,6 +212,22 @@ async fn prove(host: &PackageHost, workspace: &str, prefix: &str, expected_autho
         json!({"started": true})
     );
     let report = wait_for_report(&consumer).await;
+    if expected_author.0 == "agent" {
+        // Phase 1's empty settings must govern declared guide-bearing access too.
+        // Enabled Agent authoring is qualified after durable settings are implemented.
+        assert_eq!(report["ok"], false, "{report}");
+        assert_eq!(report["details"]["code"], "port_not_enabled");
+        assert_eq!(report["details"]["uncertain"], false);
+        assert!(
+            host.snapshot()
+                .await
+                .instances
+                .iter()
+                .filter(|i| i.key == key(EXHIBITS, workspace))
+                .all(|i| i.process_generation.is_none())
+        );
+        return;
+    }
     assert_eq!(report["ok"], true, "{report}");
     let result = &report["result"];
     let site = format!("{prefix}-site");
@@ -295,7 +311,7 @@ async fn prove(host: &PackageHost, workspace: &str, prefix: &str, expected_autho
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn person_and_bound_agent_author_drafts_through_the_exhibits_ports() {
+async fn person_authors_exhibits_and_bound_agent_is_default_denied() {
     let root = tempfile::tempdir().unwrap();
     let application = stage_application(root.path());
     let core = open_core(Addressing::Loopback, &root.path().join("core")).await;

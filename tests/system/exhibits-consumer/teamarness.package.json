@@ -33,7 +33,7 @@
   "capabilities": [
     {
       "identity": "teamarness.package-ports",
-      "major": 1,
+      "major": 2,
       "minMinor": 0,
       "maxMinor": 0
     },

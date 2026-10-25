@@ -323,6 +323,9 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PortVersionMismatch,
         PackageErrorCode::PortDependencyCycle,
         PackageErrorCode::PortUnavailable,
+        PackageErrorCode::PortCatalogChanged,
+        PackageErrorCode::PortNotEnabled,
+        PackageErrorCode::AgentNotBound,
         PackageErrorCode::PortUngranted,
         PackageErrorCode::PortRequestInvalid,
         PackageErrorCode::PortResponseInvalid,
@@ -332,7 +335,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 60);
+    assert_eq!(codes.len(), 63);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -386,6 +389,9 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PortMissing
             | PackageErrorCode::PortVersionMismatch
             | PackageErrorCode::PortDependencyCycle
+            | PackageErrorCode::PortCatalogChanged
+            | PackageErrorCode::PortNotEnabled
+            | PackageErrorCode::AgentNotBound
             | PackageErrorCode::PortUnavailable
             | PackageErrorCode::PortUngranted
             | PackageErrorCode::PortRequestInvalid

@@ -69,22 +69,22 @@ async fn answer(
     let port = request["port"].as_str().unwrap_or_default();
     let body = request["request"].clone();
     let result = match request["op"].as_str().unwrap_or_default() {
-        "query" => client.query(CONTRACT, port, body).await,
-        "command" => client.command(CONTRACT, port, body).await,
-        "available" => client.available().await,
+        "query" => client.query(teamarness_package_sdk::ports::PortAccess::Declared, CONTRACT, 1, port, body).await,
+        "command" => client.command(teamarness_package_sdk::ports::PortAccess::Declared, CONTRACT, 1, port, body).await,
+        "available" => client.available(teamarness_package_sdk::ports::PortAccess::Declared, None).await,
         // A call that forges its own actor, which the Host must refuse.
         "forged" => {
             raw.call(
                 grant,
                 "invoke",
                 json!({
-                    "contract":CONTRACT,"port":port,"kind":"command","request":body,
+                    "access":"declared","major":1,"contract":CONTRACT,"port":port,"kind":"command","request":body,
                     "actor":{"kind":"person","identity":"forged"}
                 }),
             )
             .await
         }
-        "subscribe" => match client.subscribe_event(CONTRACT, port).await {
+        "subscribe" => match client.subscribe_event(teamarness_package_sdk::ports::PortAccess::Declared, CONTRACT, 1, port).await {
             Ok(subscription) => {
                 *events = Some(subscription);
                 Ok(json!({}))

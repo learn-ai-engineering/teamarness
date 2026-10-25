@@ -282,7 +282,13 @@ async fn main() -> ExitCode {
 /// The Draft's current revision, or 0 when it does not exist.
 async fn current_revision(ports: &PortClient, id: &str) -> Result<u64, BackendError> {
     match ports
-        .query(CONTRACT, "exhibit.read", json!({"exhibitId": id}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "exhibit.read",
+            json!({"exhibitId": id}),
+        )
         .await
     {
         Ok(read) => Ok(read["revision"].as_u64().unwrap_or_default()),
@@ -294,7 +300,7 @@ async fn current_revision(ports: &PortClient, id: &str) -> Result<u64, BackendEr
 async fn put(ports: &PortClient, bytes: &[u8], index: usize) -> Result<Value, BackendError> {
     ports
         .command(
-            CONTRACT,
+            teamarness_package_sdk::ports::PortAccess::Declared, CONTRACT, 1,
             "file.put",
             json!({
                 "sha256": sha(bytes), "size": bytes.len(), "chunkIndex": index,
@@ -310,7 +316,13 @@ async fn missing(
     hashes: &[String],
 ) -> Result<BTreeMap<String, Option<Vec<usize>>>, BackendError> {
     let answer = ports
-        .query(CONTRACT, "files.missing", json!({"sha256s": hashes}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "files.missing",
+            json!({"sha256s": hashes}),
+        )
         .await
         .map_err(|error| port_failure("files.missing", &error))?;
     Ok(answer["missing"]
@@ -368,7 +380,13 @@ async fn publish(
         request["expectedRevision"] = json!(expected);
     }
     let answer = ports
-        .command(CONTRACT, "draft.update", request)
+        .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "draft.update",
+            request,
+        )
         .await
         .map_err(|error| port_failure("draft.update", &error))?;
     Ok((answer["revision"].as_u64().unwrap_or_default(), sent))
@@ -381,7 +399,9 @@ async fn read_back(ports: &PortClient, sha256: &str) -> Result<Vec<u8>, BackendE
     loop {
         let answer = ports
             .query(
+                teamarness_package_sdk::ports::PortAccess::Declared,
                 CONTRACT,
+                1,
                 "file.read",
                 json!({"sha256": sha256, "chunkIndex": index}),
             )
@@ -402,7 +422,13 @@ async fn read_back(ports: &PortClient, sha256: &str) -> Result<Vec<u8>, BackendE
 /// The system Port proof. Every check is recorded in the report; the test asserts it.
 async fn proof(ports: &PortClient, prefix: &str) -> Result<Value, BackendError> {
     let guide = ports
-        .query(CONTRACT, "runtime.guide", json!({}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "runtime.guide",
+            json!({}),
+        )
         .await
         .map_err(|error| port_failure("runtime.guide", &error))?;
     let site = format!("{prefix}-site");
@@ -455,7 +481,9 @@ async fn proof(ports: &PortClient, prefix: &str) -> Result<Value, BackendError> 
         .map(|error| error.details()["code"].clone());
     let refused = ports
         .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "draft.update",
             json!({"exhibitId": site, "title": "Site", "entry": "index.html",
                 "files": [{"path": "index.html", "sha256": sha(revision_2[0].1)},
@@ -466,11 +494,23 @@ async fn proof(ports: &PortClient, prefix: &str) -> Result<Value, BackendError> 
         .map(|error| provider_code(&error));
 
     let list = ports
-        .query(CONTRACT, "exhibit.list", json!({}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "exhibit.list",
+            json!({}),
+        )
         .await
         .map_err(|error| port_failure("exhibit.list", &error))?;
     let read = ports
-        .query(CONTRACT, "exhibit.read", json!({"exhibitId": site}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "exhibit.read",
+            json!({"exhibitId": site}),
+        )
         .await
         .map_err(|error| port_failure("exhibit.read", &error))?;
     let mut byte_for_byte = true;
@@ -498,14 +538,22 @@ async fn proof(ports: &PortClient, prefix: &str) -> Result<Value, BackendError> 
 
     let deleted = ports
         .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "draft.delete",
             json!({"exhibitId": media, "expectedRevision": media_revision}),
         )
         .await
         .map_err(|error| port_failure("draft.delete", &error))?;
     let after_delete = ports
-        .query(CONTRACT, "exhibit.read", json!({"exhibitId": media}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "exhibit.read",
+            json!({"exhibitId": media}),
+        )
         .await
         .err()
         .map(|error| provider_code(&error));

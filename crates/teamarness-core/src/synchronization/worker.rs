@@ -253,6 +253,9 @@ fn report_health(
         SessionOutcome::Failed | SessionOutcome::RefusedNotAuthorized => {
             (Some(crate::synchronization::PeerOutcome::Failed), None)
         }
+        // Backpressure says nothing new about reachability. Keep a prior
+        // reachable, unknown, or failed observation instead of replacing it.
+        SessionOutcome::Busy => return,
         SessionOutcome::LocalNotAuthorized | SessionOutcome::Cancelled => (None, None),
     };
     health.record_outcome(scope, peer, reported, truncated);
@@ -275,6 +278,7 @@ fn record_outcome(
         LogSessionError::Refused(Refusal::NotAuthorized) => SessionOutcome::RefusedNotAuthorized,
         LogSessionError::LocalNotAuthorized => SessionOutcome::LocalNotAuthorized,
         LogSessionError::Cancelled => SessionOutcome::Cancelled,
+        LogSessionError::PeerBusy => SessionOutcome::Busy,
         // A peer that could not be reached at all is a different thing from one
         // that answered and then failed.
         LogSessionError::Transport(_) => SessionOutcome::Unreachable,
@@ -282,7 +286,7 @@ fn record_outcome(
     };
     if !matches!(
         outcome,
-        SessionOutcome::Cancelled | SessionOutcome::LocalNotAuthorized
+        SessionOutcome::Cancelled | SessionOutcome::LocalNotAuthorized | SessionOutcome::Busy
     ) {
         report_failure(key, &error.to_string());
     }
@@ -1032,6 +1036,25 @@ mod tests {
 
     const PACKAGE: &str = "teamarness.test";
     const DEMAND_PACKAGE: &str = "teamarness.keyless";
+
+    #[test]
+    fn peer_busy_is_not_a_failure_or_a_reachability_claim() {
+        let fixture = Fixture::open("peer-busy-classification");
+        let key = JobKey::Records {
+            workspace: fixture.workspace,
+            package: PACKAGE.to_owned(),
+            scope: crate::synchronization::scope_digest(PACKAGE, fixture.workspace),
+            peer: fixture.peer,
+        };
+        let outcome = record_outcome(&key, Err(LogSessionError::PeerBusy));
+        assert_eq!(
+            outcome,
+            SessionOutcome::Busy,
+            "busy is responding-peer backpressure"
+        );
+        assert_ne!(outcome, SessionOutcome::Unreachable);
+        assert!(!matches!(outcome, SessionOutcome::Completed { .. }));
+    }
 
     /// A scripted runner. Only the session is scripted: the scheduler, the
     /// driver, the durable loads and the real storage under them are real.

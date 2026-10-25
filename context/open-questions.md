@@ -104,21 +104,12 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 ## TEAM-DQ10 - How Packages offer agent-facing guidance for their Ports
 
-**Status:** open (raised 2026-10-25).
+**Status:** guidance resolved by ADR 0035 (2026-10-25); Documents tools and Comments remain follow-ups.
 
-**Blocks:** Agent tools for Documents and later Packages (roadmap: **Agent participation in Package Ports**).
+**Decision:** Packages publish an ordinary bounded `runtime.guide` query, versioned with their Port Contract. Admission classifies its closed empty request and bounded Markdown response without executing a Provider. The generic harness retrieves complete schemas through package-ports 2.0 metadata. The Steward selects contracts in the Agent Package UI; the Host owns self-scoped, default-empty enablement and enforces it even on declared bound-Agent access. No Provider-specific Host adapter or Package-owned Agent-management screen is required.
 
-**Question:** Where does an Agent learn how to use a Package's Ports well: what is possible, what to do, what not to do? Ports give an Agent the capability; each Package also knows best how that capability should be used.
+**Current milestone:** complete declared metadata and explicit current requests are qualified in Phase 1. Agent discovery, durable settings, and revocation follow; no upstream model compatibility or completed Agent UI journey is claimed. Conversations guidance follows in Phase 2; Exhibits already supplies a conforming guide.
 
-**Current state:** Port Contracts (`ports.json`) declare exact shapes, with bounded descriptions of at most 512 characters. The standalone Agent Package is the harness for tools and skills, and it has tools only for Conversations. Documents Port Contract 1.1 accepts a bound Agent on `document.revise` (ADR 0033), but no Agent tool calls it yet. The Exhibits Port Contract 1.0 ships a `runtime.guide` query that publishes its limits and usage rules (`TEAM.SYS.PKG-R18`), one working instance of Package-shipped guidance.
+**Still open:** standalone Agent tools for Documents, Agent mentions, and Comment Ports. Documents 1.1 permits Agent revise, but has no Comment operations. The read-before-revise and live-editor check remain separate follow-ups, not delivered here.
 
-**Options:**
-- Each Package ships agent guidance (skills, tool descriptions, perhaps a small library) beside its Port Contract, and an Agent discovers it from the Package at run time.
-- Packages publish guidance that a Steward imports and enables for an Agent, choosing from the skills available.
-- The Agent Package owns per-Package tools.
-
-The developer prefers loose coupling with high cohesion across the ecosystem, so that Agents engage with every Package naturally.
-
-**Answer looks like:** a design (and an ADR if it adds a contract or capability) that says where guidance lives, how it is versioned with the Port Contract, how an Agent or Steward finds and enables it, and how it is bounded and trusted.
-
-**Owner:** a new Scope, after a developer discussion.
+**Owner:** agent-port-discovery for the generic interface; later Scope for Documents tools and Comments.

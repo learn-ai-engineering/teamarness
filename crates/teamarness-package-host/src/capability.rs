@@ -377,17 +377,43 @@ impl GenerationCapabilities {
                 .ok_or(PackageErrorCode::CapabilityUnavailable)
                 .map_err(CapabilityFailure::certain)?;
             return match method {
-                "available" if object.len() == 1 => Ok(broker
-                    .availability(&self.scope.package_identity, &self.scope.workspace_id)
-                    .await),
+                "available" | "describe" => {
+                    self.check_port_access(object)
+                        .await
+                        .map_err(CapabilityFailure::certain)?;
+                    let result = if method == "available" {
+                        broker
+                            .metadata_page(
+                                &self.scope.package_identity,
+                                &self.scope.workspace_id,
+                                object,
+                            )
+                            .await
+                    } else {
+                        broker
+                            .metadata_chunk(
+                                &self.scope.package_identity,
+                                &self.scope.workspace_id,
+                                object,
+                            )
+                            .await
+                    };
+                    result.map_err(CapabilityFailure::certain)
+                }
                 "invoke" => {
                     #[cfg(feature = "test-hooks")]
                     broker
                         .pause_command_actor(&self.scope.package_identity, object)
                         .await;
+                    self.check_port_access(object)
+                        .await
+                        .map_err(CapabilityFailure::certain)?;
                     let actor = self
                         .port_actor()
                         .await
+                        .map_err(CapabilityFailure::certain)?;
+                    broker
+                        .deny_disabled_guide(&self.scope.package_identity, object, &actor)
                         .map_err(CapabilityFailure::certain)?;
                     broker
                         .call(
@@ -477,6 +503,9 @@ impl GenerationCapabilities {
                 .broker
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
+            self.check_port_access(object).await?;
+            let actor = self.port_actor().await?;
+            broker.deny_disabled_guide(&self.scope.package_identity, object, &actor)?;
             if object.get("kind").and_then(Value::as_str) == Some("event") {
                 let subscription = broker
                     .subscribe_event(
@@ -513,7 +542,6 @@ impl GenerationCapabilities {
                 });
                 return Ok(());
             }
-            let actor = self.port_actor().await?;
             let query = broker
                 .query_stream(
                     &self.scope.package_identity,
@@ -618,6 +646,10 @@ impl GenerationCapabilities {
                     all_streams,
                     self.cancelled.subscribe(),
                     grant.minor,
+                    #[cfg(feature = "test-hooks")]
+                    self.broker.upgrade().and_then(|broker| {
+                        broker.take_record_availability_pause(&self.scope.package_identity)
+                    }),
                 ));
             }
             _ => {
@@ -935,6 +967,22 @@ impl GenerationCapabilities {
                 let view = crate::ContentViewToken::new(string_field(object, "view")?)
                     .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
                 Ok(json!({"closed": self.scope.content_views.close(&owner, &view)}))
+            }
+            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    }
+
+    // Agent-only access never becomes Person composition when the binding is absent.
+    async fn check_port_access(&self, object: &Map<String, Value>) -> Result<(), PackageErrorCode> {
+        match object.get("access").and_then(Value::as_str) {
+            Some("declared") => Ok(()),
+            Some("agent") => {
+                let actor = self.port_actor().await?;
+                if actor.get("kind").and_then(Value::as_str) == Some("agent") {
+                    Err(PackageErrorCode::PortNotEnabled)
+                } else {
+                    Err(PackageErrorCode::AgentNotBound)
+                }
             }
             _ => Err(PackageErrorCode::CapabilityRequestInvalid),
         }
@@ -1277,7 +1325,7 @@ impl Registry {
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.package-ports"),
-            major: 1,
+            major: 2,
             min_minor: 0,
             max_minor: 0,
             kind: CapabilityKind::PackagePorts,
@@ -1781,6 +1829,7 @@ async fn run_record_stream(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
     negotiated_minor: u16,
+    #[cfg(feature = "test-hooks")] mut availability_pause: Option<Arc<crate::AuthorityPause>>,
 ) {
     let subscribe_core = core.clone();
     let subscribe_package = package.clone();
@@ -1816,6 +1865,9 @@ async fn run_record_stream(
             return;
         }
     };
+    // Page and availability reads advance the subscription's read cursor. Keep
+    // notifications independent so a health change between reads cannot be lost.
+    let mut changes = subscription.changes();
     let mut sequence = 0_u64;
     let mut pending_replay: Option<teamarness_core::InitialReplayBoundary> = None;
     let mut tracking = StateTracking::new();
@@ -1901,6 +1953,10 @@ async fn run_record_stream(
                 tracking.since_state = 0;
             }
             need_state = false;
+            #[cfg(feature = "test-hooks")]
+            if refreshed_after_empty && let Some(pause) = availability_pause.take() {
+                pause.wait().await;
+            }
             continue;
         }
         let limit = usize::try_from(credit.min(RECORD_PAGE)).unwrap_or(1);
@@ -1974,7 +2030,7 @@ async fn run_record_stream(
             continue;
         }
         tokio::select! {
-            changed = subscription.changed() => {
+            changed = changes.changed() => {
                 if changed.is_err() {
                     break;
                 }
@@ -2525,6 +2581,25 @@ mod tests {
                 .negotiate(&requirement("example.neutral", 2, 0, 2))
                 .unwrap_err(),
             PackageErrorCode::CapabilityVersionUnsupported
+        );
+    }
+
+    #[test]
+    fn package_ports_only_negotiates_the_current_major() {
+        let registry = Registry::production();
+        assert_eq!(
+            registry
+                .negotiate(&requirement("teamarness.package-ports", 1, 0, 0))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityVersionUnsupported
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement("teamarness.package-ports", 2, 0, 0))
+                .unwrap()
+                .0
+                .major,
+            2
         );
     }
 

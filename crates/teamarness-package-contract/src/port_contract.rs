@@ -3,13 +3,14 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::error::{ContractError, ContractErrorCode};
 use crate::identity::is_valid_package_identity;
 use crate::json::strict_json;
 use crate::ui_contract::{CompiledUiContract, compile_ui_contract, valid_operation_name};
 
-const MAX_BYTES: usize = 1024 * 1024;
+pub const MAX_BYTES: usize = 1024 * 1024;
 const MAX_CONTRACTS: usize = 32;
 const MAX_PORTS: usize = 256;
 
@@ -70,7 +71,94 @@ pub struct CompiledPortContracts {
     validators: Vec<CompiledUiContract>,
 }
 
+/// Exact compact metadata bytes and their lowercase SHA-256 digest.
+#[derive(Debug)]
+pub struct PortMetadata {
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+}
+
 impl CompiledPortContracts {
+    /// Classifies the ordinary runtime guide without executing a Provider.
+    #[must_use]
+    pub fn has_guide(&self, identity: &str) -> bool {
+        self.contracts
+            .iter()
+            .find(|c| c.identity == identity)
+            .and_then(|c| c.ports.iter().find(|p| p.name == "runtime.guide"))
+            .is_some_and(|port| guide_shape(port, &self.definitions))
+            && self
+                .validate(identity, "runtime.guide", "request", &json!({}))
+                .is_ok()
+    }
+
+    /// Projects one contract and all definitions reachable from its visible ports.
+    /// `None` selects every port; a set selects exactly the declared names.
+    /// # Errors
+    /// Refuses unknown contracts, names, or an oversized projection.
+    pub fn project_metadata(
+        &self,
+        identity: &str,
+        names: Option<&BTreeSet<String>>,
+    ) -> Result<PortMetadata, ContractError> {
+        let mut contract = self
+            .contracts
+            .iter()
+            .find(|c| c.identity == identity)
+            .cloned()
+            .ok_or_else(|| violation("port_contract.unknown_port"))?;
+        if let Some(names) = names {
+            if names
+                .iter()
+                .any(|name| !contract.ports.iter().any(|p| &p.name == name))
+            {
+                return Err(violation("port_contract.unknown_port"));
+            }
+            contract.ports.retain(|p| names.contains(&p.name));
+        }
+        contract.ports.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut pending = Vec::new();
+        for port in &contract.ports {
+            for schema in [&port.request, &port.response, &port.event]
+                .into_iter()
+                .flatten()
+            {
+                collect_references(schema, &mut pending);
+            }
+        }
+        let mut definitions = Map::new();
+        while let Some(reference) = pending.pop() {
+            let encoded = reference
+                .strip_prefix("#/$defs/")
+                .ok_or_else(|| violation("port_contract.reference_not_local"))?
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let name = encoded.replace("~1", "/").replace("~0", "~");
+            if definitions.contains_key(&name) {
+                continue;
+            }
+            let schema = self
+                .definitions
+                .get(&name)
+                .ok_or_else(|| violation("port_contract.reference_missing"))?;
+            collect_references(schema, &mut pending);
+            definitions.insert(name, schema.clone());
+        }
+        let bytes = serde_json::to_vec(
+            &json!({"schemaVersion":1,"$defs":definitions,"contracts":[contract]}),
+        )
+        .map_err(|_| violation("port_contract.malformed"))?;
+        if bytes.len() > MAX_BYTES {
+            return Err(violation("port_contract.too_large"));
+        }
+        let sha256 = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(PortMetadata { bytes, sha256 })
+    }
+
     /// Validates one declared request, response or event using the admission-compiled schema.
     /// # Errors
     /// Returns an error when the contract, port or payload is invalid.
@@ -211,6 +299,14 @@ pub fn compile_port_contracts(bytes: &[u8]) -> Result<CompiledPortContracts, Con
                 "ui_contract.reference_cycle" => "port_contract.reference_cycle",
                 _ => "port_contract.schema_invalid",
             }))?;
+        if let Some(port) = contract.ports.iter().find(|p| p.name == "runtime.guide")
+            && (!guide_shape(port, &document.definitions)
+                || compiled
+                    .validate_request("runtime.guide", &json!({}))
+                    .is_err())
+        {
+            warnings.push(format!("port_contract.guide_shape: {}", contract.identity));
+        }
         validators.push(compiled);
     }
     if validators.is_empty() {
@@ -223,6 +319,62 @@ pub fn compile_port_contracts(bytes: &[u8]) -> Result<CompiledPortContracts, Con
         warnings,
         validators,
     })
+}
+
+fn resolved<'a>(schema: &'a Value, definitions: &'a Map<String, Value>) -> Option<&'a Value> {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let pointer = reference.strip_prefix("#/$defs/")?;
+        let (name, rest) = pointer.split_once('/').unwrap_or((pointer, ""));
+        let name = name.replace("~1", "/").replace("~0", "~");
+        let definition = definitions.get(&name)?;
+        let target = if rest.is_empty() {
+            definition
+        } else {
+            definition.pointer(&format!("/{rest}"))?
+        };
+        resolved(target, definitions)
+    } else {
+        Some(schema)
+    }
+}
+
+fn guide_shape(port: &Port, definitions: &Map<String, Value>) -> bool {
+    if port.kind != PortKind::Query || port.event.is_some() {
+        return false;
+    }
+    let Some(request) = port.request.as_ref().and_then(|s| resolved(s, definitions)) else {
+        return false;
+    };
+    let Some(response) = port
+        .response
+        .as_ref()
+        .and_then(|s| resolved(s, definitions))
+    else {
+        return false;
+    };
+    let closed_object = |v: &Value| {
+        v.get("type").and_then(Value::as_str) == Some("object")
+            && v.get("additionalProperties") == Some(&Value::Bool(false))
+    };
+    closed_object(request)
+        && request
+            .get("properties")
+            .is_none_or(|v| v.as_object().is_some_and(Map::is_empty))
+        && request
+            .get("required")
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+        && closed_object(response)
+        && response
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|v| v.iter().any(|v| v == "markdown"))
+        && response
+            .pointer("/properties/markdown")
+            .and_then(|s| resolved(s, definitions))
+            .is_some_and(|s| {
+                s.get("type").and_then(Value::as_str) == Some("string")
+                    && s.get("maxLength").and_then(Value::as_u64).is_some()
+            })
 }
 
 fn description(value: &str) -> Result<(), ContractError> {
