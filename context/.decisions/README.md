@@ -38,6 +38,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0028](0028-qualified-record-replay-and-generation-fence.md) | Qualified immutable-record replay and Package generation append fence | accepted (2026-10-23; renumbered at integration) | – | – | In the ADR | Refines 0018 (additive minor), 0008/0009 (replay), and 0019 (generation retirement); see 0027 for Documents usage |
 | [0029](0029-document-import-failure.md) | A durable body edit may be unapplied on one Installation | accepted (2026-10-23; renumbered at integration) | – | – | In the ADR | Refines 0027/0028; local fail-loud import disposition, last-good incomplete text, no remote ACK or automatic repair |
 | [0030](0030-agent-standing-authority-and-binding.md) | Standing local Agent authority and Package-held Agent binding | accepted (2026-10-24) | 0023 (part), 0026 (part) | – | In the ADR | Refines 0017, 0023 and 0026; caller-independent Agent signing, binding keyed by Package, `teamarness.agent-binding` 1.0, Host-derived Agent actor |
+| [0031](0031-public-releases-and-consent-driven-updates.md) | Public same-repository releases and consent-driven application updates | accepted (2026-10-24) | – | – | In the ADR | Extends 0002 updater intent; preserves 0015 isolation; public repository, signed versions, and Shell-owned stop-first apply |
 
 ### Parallel-branch numbering reconciliation
 

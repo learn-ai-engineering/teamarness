@@ -4,12 +4,18 @@ Teamarness is a local-first, peer-to-peer team workspace. The desktop combines a
 
 ## Prerequisites
 
-- [Rust installed with rustup](https://rustup.rs/), version 1.96 or newer
-- Node.js 24 or newer, with npm
+- [Rust installed with rustup](https://rustup.rs/), using the repository's pinned 1.99.1 toolchain
+- Node.js 24.20.0, with npm
 - A C/C++ build toolchain supported by Rust; SQLite is built from the bundled source
 - On macOS, Xcode Command Line Tools for the current-platform app and DMG bundles
 
-Confirm the tools are available:
+From the repository root, install the pinned toolchain without changing your global default:
+
+```sh
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+```
+
+`rust-toolchain.toml` selects Rust 1.99.1, rustfmt, and clippy for this checkout. The workspace's `rust-version` matches that tested baseline. Confirm the tools are available:
 
 ```sh
 rustc --version
@@ -29,6 +35,12 @@ cargo build --workspace --locked
 ```
 
 Both Cargo and npm lockfiles are committed. Direct third-party dependencies use exact versions.
+
+### Toolchain and dependency upgrades
+
+Prefer current stable tools and dependencies that are compatible with the application. Make upgrades deliberately, pin the tested versions, and keep the workspace baseline, repository-local toolchain, setup guidance, and CI selections aligned. Do not blanket-refresh unrelated dependencies.
+
+Qualify an upgrade with the complete repository checks, locked workspace build, and actual app/DMG build below. Framework changes must also preserve the architecture and trust gates, including the real packaged-app isolation check for Tauri upgrades (ADR 0015). Report specific build or application failures before choosing an older version or a workaround. A successful fixture or compiler check does not replace real application observations.
 
 ## Development
 

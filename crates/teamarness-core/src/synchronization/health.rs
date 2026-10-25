@@ -157,7 +157,7 @@ impl HealthReporter {
     pub(crate) fn applied(&self, count: u64) {
         let charged = self
             .outstanding
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_sub(count))
             })
             .map_or(0, |before| before.min(count));

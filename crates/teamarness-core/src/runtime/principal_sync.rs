@@ -73,10 +73,10 @@ pub(super) fn initialize(
         synchronization::declare_member_key_demand(&state.connection, workspace, SCOPE)?;
     }
     let version = projection.snapshot().version();
-    if !state
+    if state
         .name_replay_scans
         .get(&workspace)
-        .is_some_and(|scan| scan.version == version)
+        .is_none_or(|scan| scan.version != version)
     {
         restart_scan(state, workspace)?;
     }

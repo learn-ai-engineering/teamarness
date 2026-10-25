@@ -70,6 +70,10 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Stable application updates (started)
+
+Started on 2026-10-24 in the `auto-update` workstream on branch `don-smith/auto_update`. ADR 0031 selects public same-repository stable releases, official signed-version verification, and Shell-owned stop-first application after restart consent. The first workstream step qualifies the exact Tauri 2.12 stack and signed-version trust. Release publication and updater runtime behavior are not delivered yet. Native packaged-app isolation, hosted release readiness, and a real installed two-version update remain explicit verification gates. Developer ID signing, notarization, other platforms, per-Package updates, and one-hour adoption remain deferred.
+
 ### Agent Package (complete, verified locally)
 
 Completed and verified on 2026-10-24, including incoming local main `a947a17` merged into the feature branch and constructor/provenance correction `a67f3c4`. The final merged Root checks, all four explicit external-Agent/Host cases, and focused independent review pass. The standalone Agent's verified runtime is `ed3c016`. The developer approved fast-forward integration into local `main`. No source push or publication is authorized.

@@ -56,11 +56,11 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## TEAM-DQ6 — Tauri version and tooling
 
-**Status:** Resolved (2026-09-13, research).
+**Status:** Resolved (2026-10-24, ADR 0031).
 
-**Decision:** Use Tauri 2.11 with exact package pins, vanilla TypeScript, Vite, Vitest, and npm workspaces. Commit the Rust and npm lockfiles. Re-check patch versions if implementation begins after the research date, while preserving Tauri minor-version compatibility.
+**Decision:** Use exact pins for `tauri` 2.12.5, `tauri-build` 2.7.4, `tauri-plugin-updater` 2.14.0, and npm `@tauri-apps/api` and `@tauri-apps/cli` 2.12.4. Keep vanilla TypeScript, Vite, Vitest, npm workspaces, and committed Rust and npm lockfiles. The desktop alone consumes the updater and direct `reqwest` 0.13.5 dependency.
 
-**Rationale:** The official Tauri release index and package registries confirmed compatible current versions and support the repository's Node.js 24 and Rust 1.96 minimums. The shell and reference package do not need a frontend framework. Research on 2026-09-12 found `tauri` 2.11.5, `tauri-build` 2.6.3, `@tauri-apps/api` 2.11.1, and `@tauri-apps/cli` 2.11.4 in the official release index. The Rust crate and the JavaScript API must share the 2.11 minor. Vite 8.3.0, TypeScript 7.0.2, and Vitest 5.0.0 accept Node.js 24. Tauri recommends the vanilla TypeScript template when no framework is needed, and committing lockfiles. No build was run at research time; later phases built and bundled with these pins.
+**Rationale:** [ADR 0031](.decisions/0031-public-releases-and-consent-driven-updates.md) selects the official version-bearing signer and mandatory signed-version verifier instead of custom trust machinery. Updater 2.14.0 requires the Tauri 2.12 stack. The offline `apps/teamarness-desktop/src-tauri/examples/qualify-update.rs` harness uses the pinned plugin's `restore_update` and `Update::verify`, with real signatures and independent expected versions for both macOS target keys. It rejects altered bytes, inflated announcements, unversioned signatures, and changed trusted comments. This upgrade requires renewed native packaged-app and WKWebView isolation qualification under ADR 0015. Successful compilation or fixtures do not replace that manual gate.
 
 ---
 

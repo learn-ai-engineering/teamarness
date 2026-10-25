@@ -9,6 +9,10 @@ license.workspace = true
 name = "teamarness_desktop"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[[example]]
+name = "qualify-update"
+test = true
+
 [build-dependencies]
 tauri-build.workspace = true
 
@@ -18,9 +22,13 @@ teamarness-package-host = { path = "../../../crates/teamarness-package-host" }
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tauri-plugin-updater.workspace = true
+reqwest.workspace = true
+semver.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+tauri = { workspace = true, features = ["test"] }
 sha2.workspace = true
 # Every test Installation binds loopback with no address lookup, so no test
 # here reaches the public internet. `check-core-module-graph.mjs` holds the
