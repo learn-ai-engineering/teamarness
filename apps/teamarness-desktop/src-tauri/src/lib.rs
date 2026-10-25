@@ -8,6 +8,7 @@ mod package_commands;
 mod package_dto;
 mod package_error;
 mod package_protocol;
+mod update;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -57,6 +58,7 @@ pub struct DesktopState {
     packages: Arc<PackageHost>,
     protocol_mounts: Arc<Mutex<BTreeMap<String, ProtocolMountLease>>>,
     lifecycle: Arc<DispatchLifecycle>,
+    updates: Option<update::UpdateService>,
 }
 
 #[derive(Clone)]
@@ -72,6 +74,7 @@ impl DesktopState {
             packages,
             protocol_mounts: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle: Arc::new(DispatchLifecycle::running()),
+            updates: None,
         }
     }
 
@@ -131,6 +134,9 @@ impl DesktopState {
     }
 
     async fn shutdown(&self) {
+        if let Some(updates) = &self.updates {
+            updates.stop();
+        }
         await_shutdown_handoff(
             &self.lifecycle,
             async { self.protocol_mounts.lock().await.clear() },
@@ -219,7 +225,7 @@ pub fn run() {
         commands::COMMAND_NAMES.len() + package_commands::COMMAND_NAMES.len(),
         24
     );
-    let app = tauri::Builder::default()
+    let app = update::configure(tauri::Builder::default())
         .register_asynchronous_uri_scheme_protocol(
             "teamarness-package",
             |context, request, responder| {
@@ -267,7 +273,9 @@ pub fn run() {
                 application_root,
                 application_index,
             ))?;
-            app.manage(DesktopState::new(runtime, packages));
+            let mut state = DesktopState::new(runtime, packages);
+            state.updates = Some(update::UpdateService::start(app.handle()));
+            app.manage(state);
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -281,6 +289,9 @@ pub fn run() {
             }
             api.prevent_exit();
             if state.lifecycle.begin_shutdown() {
+                if let Some(updates) = &state.updates {
+                    updates.stop();
+                }
                 let handle = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     state.shutdown().await;

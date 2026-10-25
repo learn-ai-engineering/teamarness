@@ -29,10 +29,12 @@ serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-updater.workspace = true
 reqwest.workspace = true
+rustls = { version = "=0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
 semver.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tauri = { workspace = true, features = ["test"] }
 sha2.workspace = true
 # Every test Installation binds loopback with no address lookup, so no test
