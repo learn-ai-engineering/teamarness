@@ -127,6 +127,9 @@ impl Lifecycle {
         inner.status.revision += 1;
         self.0.changes.send_replace(inner.status.revision);
     }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.changes.subscribe()
+    }
     pub(crate) fn status(&self) -> Status {
         self.0.inner.lock().unwrap().status.clone()
     }
@@ -186,7 +189,6 @@ impl Lifecycle {
         .await
         .map_err(|_| ())
     }
-    #[allow(dead_code)] // Main-only command adapter is added in the next phase.
     pub(crate) fn apply(
         &self,
         generation: &str,

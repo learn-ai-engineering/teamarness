@@ -23,11 +23,15 @@ use verification::{OfficialVerifier, Verifier};
 pub(crate) fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     // The official plugin requires a key even at initialization. Disabled builds
     // must neither initialize it nor register its denied guest operations.
-    if config::enabled() {
+    if config::enabled() || probe_enabled() {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     } else {
         builder
     }
+}
+
+pub(crate) fn probe_enabled() -> bool {
+    cfg!(feature = "ui-isolation-probe") && !cfg!(debug_assertions)
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -204,6 +208,7 @@ pub(crate) struct UpdateService {
     system: Option<Arc<System>>,
     cancel: Cancellation,
     changed: Arc<Notify>,
+    snapshots: watch::Sender<u64>,
 }
 impl UpdateService {
     fn new(installed: Version, system: Option<System>) -> Self {
@@ -237,9 +242,14 @@ impl UpdateService {
             system: system.map(Arc::new),
             cancel: Cancellation::new(),
             changed: Arc::new(Notify::new()),
+            snapshots: watch::channel(0).0,
         }
     }
     pub(crate) fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Self {
+        #[cfg(feature = "ui-isolation-probe")]
+        if probe_enabled() {
+            return Self::probe(app);
+        }
         let system = if config::enabled() {
             (|| {
                 let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -274,12 +284,59 @@ impl UpdateService {
         }
         service
     }
-    // Native-only interface; the main-only command adapter arrives in phase 5.
-    #[allow(dead_code)]
+
+    #[cfg(feature = "ui-isolation-probe")]
+    pub(crate) fn probe<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Self {
+        // Public disposable Phase 1 fixture only. No transfer, scheduler, or
+        // production key; the terminal adapter below never calls its installer.
+        let raw = serde_json::json!({
+            "version": "1.2.3", "notes": "Disposable isolation probe — not a production update",
+            "platforms": {
+                "darwin-aarch64": { "url": "https://github.com/learn-ai-engineering/teamarness/releases/download/v1.2.3/fixture", "signature": include_str!("../../tests/fixtures/updater/versioned.sig").trim() },
+                "darwin-aarch64-app": { "url": "https://github.com/learn-ai-engineering/teamarness/releases/download/v1.2.3/fixture", "signature": include_str!("../../tests/fixtures/updater/versioned.sig").trim() }
+            }
+        });
+        let installed = app.package_info().version.clone();
+        let metadata = Metadata::parse(&serde_json::to_vec(&raw).unwrap(), &installed)
+            .expect("probe version must be newer");
+        let verifier = OfficialVerifier(
+            app.updater_builder()
+                .target("darwin-aarch64")
+                .build()
+                .expect("probe configuration required"),
+        );
+        let bytes = include_bytes!("../../tests/fixtures/updater/artifact.bin").to_vec();
+        let update = verifier
+            .verify(&metadata, &bytes)
+            .expect("public fixture verifies");
+        let service = Self::new(installed, None);
+        {
+            let mut inner = service.inner.lock().unwrap();
+            inner.snapshot.state = State::Ready;
+            inner.snapshot.candidate_version = Some("1.2.3".into());
+            inner.snapshot.pending_generation = Some("1".into());
+            inner.snapshot.notes = Some(metadata.notes);
+            inner.snapshot.revision = 1;
+            inner.pending = Some(Pending { update, bytes });
+            inner.generation = 1;
+        }
+        eprintln!("application-update-probe ready generation=1");
+        service
+    }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.snapshots.subscribe()
+    }
+    #[cfg(test)]
+    pub(crate) async fn ready_for_commands() -> Self {
+        tests::ready_for_commands().await
+    }
+    #[cfg(test)]
+    pub(crate) fn disabled_for_commands() -> Self {
+        Self::new(Version::new(0, 1, 0), None)
+    }
     pub(crate) fn status(&self) -> Snapshot {
         self.inner.lock().unwrap().snapshot.clone()
     }
-    #[allow(dead_code)]
     pub(crate) fn request_check(&self) -> bool {
         self.begin(true)
     }
@@ -311,6 +368,7 @@ impl UpdateService {
         inner.snapshot.notes = None;
         inner.snapshot.downloaded_bytes = 0;
         inner.snapshot.revision += 1;
+        self.snapshots.send_replace(inner.snapshot.revision);
         drop(inner);
         let service = self.clone();
         tokio::spawn(async move {
@@ -347,6 +405,7 @@ impl UpdateService {
         if !inner.terminal {
             change(&mut inner.snapshot);
             inner.snapshot.revision += 1;
+            self.snapshots.send_replace(inner.snapshot.revision);
             self.changed.notify_one();
         }
     }
@@ -376,6 +435,7 @@ impl UpdateService {
             }
         }
         inner.snapshot.revision += 1;
+        self.snapshots.send_replace(inner.snapshot.revision);
         self.changed.notify_one();
     }
     async fn download_verified(&self) -> Result<Option<Pending>, ErrorCategory> {
@@ -444,6 +504,7 @@ impl UpdateService {
         inner.snapshot.notes = None;
         inner.snapshot.downloaded_bytes = 0;
         inner.snapshot.revision += 1;
+        self.snapshots.send_replace(inner.snapshot.revision);
         self.cancel.cancel();
     }
     // Admission transfers the same verified bytes to one terminal owner. It cannot install.
@@ -478,6 +539,7 @@ impl UpdateService {
         inner.snapshot.state = State::Stopped;
         inner.snapshot.pending_generation = None;
         inner.snapshot.revision += 1;
+        self.snapshots.send_replace(inner.snapshot.revision);
         self.cancel.cancel();
         Ok(pending)
     }

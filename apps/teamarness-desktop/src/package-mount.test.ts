@@ -579,3 +579,33 @@ describe("generic Package UI mount", () => {
     expect(failures).toBe(1);
   });
 });
+
+it("application terminal blocking removes the frame synchronously without awaiting its unmount acknowledgement", async () => {
+  const test = harness(); const controller = test.controller();
+  const { mounted } = await mountThrough(test, controller);
+  await mounted;
+  controller.setBlocked(true);
+  expect(test.calls).toContain("remove-frame");
+  expect(test.themeSubscribers()).toBe(0);
+  await expect(controller.mount(instance, {})).rejects.toThrow("unavailable");
+});
+
+it("late openMount and queued mounts cannot restore frames after application terminal admission", async () => {
+  const test = harness(); const controller = test.controller();
+  let release!: (opened: OpenPackageMount) => void;
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  test.bridge.openMount = () => { entered(); return new Promise((resolve) => { release = resolve; }); };
+  const first = controller.mount(instance, {});
+  const queued = controller.mount(instance, {});
+  await started;
+  controller.setBlocked(true);
+  // Even a rejected stale Restart followed by authoritative Running cannot
+  // make these old in-flight mount requests eligible again.
+  controller.setBlocked(false);
+  release(descriptor(1));
+  await expect(first).rejects.toThrow("unavailable");
+  await expect(queued).rejects.toThrow("unavailable");
+  expect(test.frames).toHaveLength(0);
+  expect(test.calls).toContain("close:mount-1");
+});

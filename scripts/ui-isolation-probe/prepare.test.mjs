@@ -74,3 +74,39 @@ test("registers the probe as trusted native code without overriding an applicati
     assert.equal((await stat(join(dataDirectory, "packages"))).mode & 0o777, 0o700);
   });
 });
+
+// Verifies: TEAM.SYS.SHELL-R05. This fixture qualifies the attempts, not WKWebView isolation.
+test("probe attempts all four commands with missing/fake keys, generation 1 and forged Package bridge messages", async () => {
+  const { runInNewContext } = await import("node:vm");
+  const source = await readFile(new URL("./ui/index.js", import.meta.url), "utf8");
+  const posts = []; const fetches = []; const forged = []; const bridge = []; const text = [];
+  const element = () => ({ textContent: "", append(...items) { text.push(...items); }, remove() {} });
+  const window = {
+    webkit: { messageHandlers: { ipc: { postMessage: (value) => { posts.push(JSON.parse(value)); } } } },
+    parent: { postMessage: (value) => { forged.push(value); } }, top: {},
+  };
+  for (const [target, field] of [[window.parent, "document"], [window.top, "location"], [window, "localStorage"]]) {
+    Object.defineProperty(target, field, { get() { throw new Error("denied"); } });
+  }
+  const mount = runInNewContext(`${source.replace("export async function mount", "async function mount")}\nmount;`, {
+    window, self: { origin: "null" }, document: { createElement: element, documentElement: {} },
+    getComputedStyle: () => ({ getPropertyValue: () => "accent" }),
+    fetch: async (url, options) => { fetches.push({ url, options }); throw new Error("denied"); },
+    setTimeout: () => 1,
+  });
+  await mount({ root: element(), client: { request: async (operation) => { bridge.push(operation); throw { code: "ui_contract_violation" }; } } });
+  for (const command of ["application_update_status", "application_update_check", "application_update_restart", "application_update_quit"]) {
+    const attempts = posts.filter(({ cmd }) => cmd === command);
+    assert.equal(attempts.length, 2, command);
+    assert.deepEqual(attempts.map((entry) => entry.__TAURI_INVOKE_KEY__), [undefined, "probe-fake-key"]);
+    assert.ok(attempts.every(({ payload }) => payload.generation === "1"));
+    assert.equal(fetches.filter(({ url }) => url.endsWith(command)).length, 2);
+    assert.ok(forged.some(({ operation }) => operation === command));
+    assert.ok(bridge.includes(command));
+  }
+  assert.ok(text.some(({ textContent }) => textContent === "Isolation probe PASS"));
+  const smoke = await readFile(new URL("../smoke-packaged-app.mjs", import.meta.url), "utf8");
+  assert.match(smoke, /handlerEntriesBeforeFrame/);
+  assert.match(smoke, /requires the disposable verified Ready probe build, not default Disabled/);
+  assert.match(smoke, /main consent must reach the non-destructive adapter exactly once/);
+});

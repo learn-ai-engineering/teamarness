@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-application-update-status"
+description = "Enables the application_update_status command without any pre-configured scope."
+commands.allow = ["application_update_status"]
+
+[[permission]]
+identifier = "deny-application-update-status"
+description = "Denies the application_update_status command without any pre-configured scope."
+commands.deny = ["application_update_status"]

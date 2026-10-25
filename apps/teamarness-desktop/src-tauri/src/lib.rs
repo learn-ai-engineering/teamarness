@@ -10,6 +10,7 @@ mod package_dto;
 mod package_error;
 mod package_protocol;
 mod update;
+mod update_commands;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -127,30 +128,6 @@ impl DesktopState {
             .await
             .map_err(|()| BridgeError::shutdown())
     }
-
-    #[allow(dead_code)] // Phase 5's main-only command calls this native admission.
-    fn apply(&self, generation: &str, handle: tauri::AppHandle) -> Result<(), ()> {
-        self.lifecycle.apply(
-            generation,
-            || {
-                let pending = self
-                    .updates
-                    .as_ref()
-                    .ok_or(())?
-                    .admit_apply(generation)
-                    .map_err(|category| {
-                        eprintln!(
-                            "teamarness-desktop apply admission rejected category={category:?}"
-                        );
-                    })?;
-                Ok(update::installer(pending))
-            },
-            Arc::new(DesktopTerminal {
-                state: self.clone(),
-                handle,
-            }),
-        )
-    }
 }
 
 struct DesktopTerminal {
@@ -170,9 +147,17 @@ impl lifecycle::TerminalAdapter for DesktopTerminal {
         Box::pin(self.state.cleanup())
     }
     fn install(&self, pending: lifecycle::Install) -> Result<(), lifecycle::InstallFailure> {
+        if update::probe_enabled() {
+            eprintln!("application-update-probe terminal=install-blocked");
+            return Err(lifecycle::InstallFailure { previous_app: None });
+        }
         pending()
     }
     fn restart(&self) {
+        if update::probe_enabled() {
+            eprintln!("application-update-probe terminal=restart-blocked");
+            return;
+        }
         self.handle.restart();
     }
     fn exit(&self) {
@@ -246,8 +231,10 @@ async fn open_runtime_modules(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     debug_assert_eq!(
-        commands::COMMAND_NAMES.len() + package_commands::COMMAND_NAMES.len(),
-        24
+        commands::COMMAND_NAMES.len()
+            + package_commands::COMMAND_NAMES.len()
+            + update_commands::COMMAND_NAMES.len(),
+        28
     );
     let app = update::configure(tauri::Builder::default())
         .register_asynchronous_uri_scheme_protocol(
@@ -287,6 +274,10 @@ pub fn run() {
             package_commands::package_recover,
             package_commands::package_dispose,
             package_commands::package_report_ui_fault,
+            update_commands::application_update_status,
+            update_commands::application_update_check,
+            update_commands::application_update_restart,
+            update_commands::application_update_quit,
         ])
         .setup(|app| {
             let ordinary_directory = app.path().app_data_dir()?;
@@ -303,6 +294,7 @@ pub fn run() {
             let mut state = DesktopState::new(runtime, packages);
             state.updates = Some(update::UpdateService::start(app.handle()));
             app.manage(state);
+            update_commands::start_events(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -354,10 +346,12 @@ mod tests {
         for name in commands::COMMAND_NAMES
             .iter()
             .chain(package_commands::COMMAND_NAMES.iter())
+            .chain(update_commands::COMMAND_NAMES.iter())
         {
             assert!(
                 source.contains(&format!("commands::{name}"))
                     || source.contains(&format!("package_commands::{name}"))
+                    || source.contains(&format!("update_commands::{name}"))
             );
             assert!(build.contains(&format!("\"{name}\"")));
             assert!(capability.contains(&format!("allow-{}", name.replace('_', "-"))));
@@ -383,7 +377,7 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| name.starts_with("allow-")))
                 .count(),
-            24
+            28
         );
     }
 

@@ -1,4 +1,6 @@
 import "./styles.css";
+import { applicationUpdateBridge } from "./application-update-bridge";
+import { ApplicationUpdateController, BrowserApplicationUpdateView } from "./application-update";
 import { bridge } from "./bridge";
 import { packageBridge } from "./package-bridge";
 import { browserFrameDom, browserThemeSource, PackageMountController } from "./package-mount";
@@ -53,3 +55,13 @@ void packageShell.startSnapshotUpdates({
 }).catch(() => undefined);
 void controller.load();
 window.addEventListener("beforeunload", () => controller.dispose(), { once: true });
+
+const updateView = new BrowserApplicationUpdateView(
+  document.getElementById("application-update-notice")!,
+  document.getElementById("application-update-terminal")!,
+  (blocked) => { shell.setApplicationUpdating(blocked); document.getElementById("app")!.hidden = blocked; },
+);
+const updates = new ApplicationUpdateController(applicationUpdateBridge, (view) => { updateView.render(view, updates); });
+void updates.attach();
+window.addEventListener("pageshow", () => { void updates.attach(); });
+window.addEventListener("beforeunload", () => { updates.detach(); }, { once: true });

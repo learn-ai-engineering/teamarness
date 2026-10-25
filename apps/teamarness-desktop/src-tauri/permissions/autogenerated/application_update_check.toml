@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-application-update-check"
+description = "Enables the application_update_check command without any pre-configured scope."
+commands.allow = ["application_update_check"]
+
+[[permission]]
+identifier = "deny-application-update-check"
+description = "Denies the application_update_check command without any pre-configured scope."
+commands.deny = ["application_update_check"]

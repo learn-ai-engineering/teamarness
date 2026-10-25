@@ -25,6 +25,7 @@ export type ShellFrame = Readonly<{
 }>;
 
 type PackageRouter = Readonly<{
+  setBlocked(blocked: boolean): void;
   refresh(): Promise<PackageHostSnapshot>;
   select(instance: PackageInstanceKey): Promise<void>;
   hide(): Promise<void>;
@@ -72,6 +73,7 @@ export class Shell {
   private packageActionTargets: readonly PackageInstanceKey[] = [];
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
+  private applicationUpdating = false;
 
   public constructor(
     private readonly shellFrame: ShellFrame,
@@ -80,12 +82,27 @@ export class Shell {
     this.shellFrame.packageMount.hidden = true;
   }
 
+  public setApplicationUpdating(blocked: boolean): void {
+    if (blocked === this.applicationUpdating) return;
+    this.applicationUpdating = blocked;
+    this.presentationRevision += 1;
+    this.options.packageShell.setBlocked(blocked);
+    if (blocked) {
+      for (const region of Object.values(this.shellFrame)) { region.innerHTML = ""; region.hidden = true; }
+    } else {
+      this.shellFrame.workspaceRail.hidden = false;
+      this.shellFrame.contextualNavigation.hidden = false;
+      void this.navigate(this.selectedRoute);
+    }
+  }
+
   public frame(): ShellFrame { return this.shellFrame; }
 
   public route(): ShellRoute { return this.selectedRoute; }
 
   public async updateWorkspace(model: ShellModel): Promise<void> {
     this.workspaceModel = model;
+    if (this.applicationUpdating) return;
     if (model.workspaces.length === 0) {
       if (this.selectedRoute.kind !== "workspace-chooser") {
         this.deactivatePackage();
@@ -117,6 +134,7 @@ export class Shell {
   }
 
   public async navigate(route: ShellRoute): Promise<void> {
+    if (this.applicationUpdating) return;
     this.setRoute(route);
     if (route.kind === "package-instance") {
       this.shellFrame.shellScreen.hidden = true;
@@ -127,6 +145,7 @@ export class Shell {
     }
 
     await this.options.packageShell.hide();
+    if (this.applicationUpdating) return;
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
     if (await this.preparePresentation()) this.renderAll();
@@ -142,18 +161,20 @@ export class Shell {
     if (!model) return false;
     const revision = ++this.presentationRevision;
     const presentation = await buildShellPresentation(model, routeWorkspaceId(this.selectedRoute));
-    if (revision !== this.presentationRevision) return false;
+    if (this.applicationUpdating || revision !== this.presentationRevision) return false;
     this.workspacePresentation = presentation;
     return true;
   }
 
   private renderAll(): void {
+    if (this.applicationUpdating) return;
     this.renderWorkspaceRail();
     this.renderContextualNavigation();
     this.renderSelectedScreen();
   }
 
   private renderWorkspaceRail(): void {
+    if (this.applicationUpdating) return;
     const model = this.workspaceModel;
     const presentation = this.workspacePresentation;
     if (!model || !presentation) return;
@@ -190,6 +211,7 @@ export class Shell {
   }
 
   private renderContextualNavigation(): void {
+    if (this.applicationUpdating) return;
     const model = this.workspaceModel;
     const presentation = this.workspacePresentation;
     if (!model || !presentation) return;
@@ -249,6 +271,7 @@ export class Shell {
   }
 
   private renderSelectedScreen(): void {
+    if (this.applicationUpdating) return;
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
       ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${renderPackageInstanceSettings(
@@ -358,6 +381,7 @@ export class Shell {
   }
 
   private renderPackageConsumers(): void {
+    if (this.applicationUpdating) return;
     this.renderContextualNavigation();
     if (this.selectedRoute.kind === "workspace-settings") this.renderSelectedScreen();
   }

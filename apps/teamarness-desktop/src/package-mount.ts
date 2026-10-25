@@ -87,6 +87,9 @@ const staticThemeSource: PackageThemeSource = Object.freeze({
 
 export class PackageMountController {
   private current: MountedPackageUi | null = null;
+  private blocked = false;
+  private admission = 0;
+  private interrupt: (() => void) | null = null;
   private transition: Promise<void> = Promise.resolve();
 
   public constructor(
@@ -102,7 +105,8 @@ export class PackageMountController {
     target: unknown,
     onFailure: () => void = () => undefined,
   ): Promise<MountedPackageUi> {
-    const operation = this.transition.then(() => this.mountNow(instance, target, onFailure));
+    const admission = this.admission;
+    const operation = this.transition.then(() => this.mountNow(instance, target, onFailure, admission));
     this.transition = operation.then(() => undefined, () => undefined);
     return operation;
   }
@@ -111,9 +115,17 @@ export class PackageMountController {
     instance: PackageInstanceKey,
     target: unknown,
     onFailure: () => void,
+    admission: number,
   ): Promise<MountedPackageUi> {
+    const denied = (): boolean => this.blocked || admission !== this.admission;
+    if (denied()) throw new Error("Application controls unavailable");
     await this.current?.unmount();
+    if (denied()) throw new Error("Application controls unavailable");
     const opened = await this.bridge.openMount(instance);
+    if (denied()) {
+      void this.bridge.closeMount({ mount: opened.mount }).catch(() => undefined);
+      throw new Error("Application controls unavailable");
+    }
     const loader = opened.loader;
 
     let host: PackagePortHost | null = null;
@@ -138,7 +150,7 @@ export class PackageMountController {
       connectTimer = null;
     };
     const recordFault = async (): Promise<void> => {
-      if (faultReported || hostClosed) return;
+      if (faultReported || hostClosed || denied()) return;
       faultReported = true;
       try {
         await this.bridge.reportUiFault({ mount: opened.mount, code: "ui_exception" });
@@ -250,11 +262,20 @@ export class PackageMountController {
           await this.bridge.closeMount({ mount: opened.mount });
           hostClosed = true;
         });
-        if (hostClosed && this.current === mounted) this.current = null;
+        if (hostClosed && this.current === mounted) { this.current = null; this.interrupt = null; }
         if (firstError !== undefined) throw firstError;
       },
     });
     this.current = mounted;
+    this.interrupt = () => {
+      clearConnectTimer();
+      stopTheme?.(); stopTheme = null; themeStopped = true;
+      stopWatchingLoad(); frame.remove(); frameRemoved = true;
+      hostDisposed = true;
+      void host?.dispose().catch(() => undefined);
+      settleMounted?.(new Error("Application controls unavailable")); settleMounted = null;
+      void mounted.unmount().catch(() => undefined);
+    };
 
     try {
       await mounting;
@@ -290,6 +311,12 @@ export class PackageMountController {
       };
       void host.requestUnmount().then(finish, () => { finish(false); });
     });
+  }
+
+  public setBlocked(blocked: boolean): void {
+    if (blocked === this.blocked) return;
+    this.blocked = blocked;
+    if (blocked) { this.admission += 1; this.interrupt?.(); }
   }
 
   public unmount(): Promise<void> {

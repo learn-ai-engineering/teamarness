@@ -208,6 +208,7 @@ function harness(
   };
   const shell = new Shell(frame, {
     packageShell: {
+      setBlocked: (blocked) => { calls.push(`blocked:${blocked}`); },
       refresh: packageBehavior.refresh ?? (async () => packages),
       select: async (instance) => { calls.push(`mount:${instance.packageIdentity}`); },
       hide: async () => { calls.push("unmount"); },
@@ -639,4 +640,26 @@ describe("Installation Package visibility", () => {
     screen.toggle.click();
     expect(test.frame.contextualNavigation.innerHTML).toContain("<span>One</span>");
   });
+});
+
+// Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R05
+it("application Updating synchronously removes frames and fences late ordinary snapshots and navigation", async () => {
+  const { shell, frame, calls } = harness();
+  await shell.updateWorkspace(model());
+  await shell.navigate({ kind: "package-instance", instance: packageKey });
+  frame.packageMount.innerHTML = "<iframe></iframe>";
+  const pending = shell.updateWorkspace(model());
+  shell.setApplicationUpdating(true);
+  expect(frame.packageMount.innerHTML).toBe("");
+  await pending;
+  shell.updatePackages(packages);
+  await shell.updateWorkspace(model());
+  await shell.navigate({ kind: "package-instance", instance: privatePackageKey });
+  expect(frame.workspaceRail.innerHTML).toBe("");
+  expect(frame.contextualNavigation.hidden).toBe(true);
+  expect(frame.packageMount.hidden).toBe(true);
+  expect(calls).toContain("blocked:true");
+  expect(calls).not.toContain(`mount:${privatePackageKey.packageIdentity}`);
+  shell.setApplicationUpdating(false);
+  expect(calls).toContain("blocked:false");
 });

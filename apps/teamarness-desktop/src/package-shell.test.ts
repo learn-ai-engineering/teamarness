@@ -47,6 +47,7 @@ function snapshotBridge(snapshotRequest: () => Promise<PackageHostSnapshot>): Pa
 
 function mounts() {
   return {
+    setBlocked: () => undefined,
     mount: async () => ({}),
     unmount: async () => undefined,
     suspendBackend: async () => undefined,
@@ -396,6 +397,7 @@ it("targets lifecycle actions at the supplied Package Instance and returns typed
   const calls: string[] = [];
   let snapshotCalls = 0;
   const mounts = {
+    setBlocked: () => undefined,
     mount: async (instance: PackageInstanceKey) => { calls.push(`mount:${instance.packageIdentity}`); return {}; },
     unmount: async () => undefined,
     suspendBackend: async (instance: PackageInstanceKey) => { calls.push(`suspend:${instance.packageIdentity}`); },
@@ -424,6 +426,7 @@ it("targets lifecycle actions at the supplied Package Instance and returns typed
 it("keeps Reload UI separate from Backend lifecycle", async () => {
   const calls: string[] = [];
   const mounts = {
+    setBlocked: () => undefined,
     mount: async (instance: PackageInstanceKey) => { calls.push(`mount:${instance.packageIdentity}`); return {}; },
     unmount: async () => undefined,
     suspendBackend: async () => { calls.push("suspend"); },
@@ -440,6 +443,7 @@ it("keeps Reload UI separate from Backend lifecycle", async () => {
 it("unmounts a hidden Package UI without a Backend lifecycle call", async () => {
   const calls: string[] = [];
   const mounts = {
+    setBlocked: () => undefined,
     mount: async () => ({}),
     unmount: async () => { calls.push("unmount"); },
     suspendBackend: async () => { calls.push("suspend"); },
@@ -457,6 +461,7 @@ it("unmounts a hidden Package UI without a Backend lifecycle call", async () => 
 it("returns an operation failure with the refreshed snapshot without replacing the selected mount", async () => {
   const failures = { value: 0 };
   const mounts = {
+    setBlocked: () => undefined,
     mount: async () => ({}),
     unmount: async () => undefined,
     suspendBackend: async () => { throw new Error("suspend failed"); },
@@ -474,6 +479,7 @@ it("returns refresh and combined lifecycle failures while preserving the last us
   const failures = { value: 0 };
   let operationFails = false;
   const mounts = {
+    setBlocked: () => undefined,
     mount: async () => ({}),
     unmount: async () => undefined,
     suspendBackend: async () => { if (operationFails) throw new Error("suspend failed"); },
@@ -492,6 +498,7 @@ it("shows Shell recovery when the selected mount reports a terminal stream failu
   let failMount: (() => void) | undefined;
   const failures = { value: 0 };
   const mounts = {
+    setBlocked: () => undefined,
     mount: async (_instance: PackageInstanceKey, _target: unknown, onFailure: () => void) => { failMount = onFailure; return {}; },
     unmount: async () => undefined,
     suspendBackend: async () => undefined,

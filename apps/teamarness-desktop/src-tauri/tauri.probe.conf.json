@@ -1,0 +1,11 @@
+{
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNEMDUwNjJBQTRDOTBGRTgKUldUb0Q4bWtLZ1lGUFJpbVVWTmZkWW5iN3UwcEFQd3BJdWhzVm5vV0NvQkJsZnQxZXZrZ2VvMGkK",
+      "requireSignedVersion": true,
+      "endpoints": [
+        "https://github.com/learn-ai-engineering/teamarness/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

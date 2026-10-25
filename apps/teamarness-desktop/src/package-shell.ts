@@ -36,6 +36,7 @@ export type PackageLifecycleResult = Readonly<{
 }>;
 
 interface MountController {
+  setBlocked(blocked: boolean): void;
   mount(instance: PackageInstanceKey, target: unknown, onFailure: () => void): Promise<unknown>;
   unmount(): Promise<void>;
   suspendBackend(instance: PackageInstanceKey): Promise<void>;
@@ -45,6 +46,7 @@ interface MountController {
 
 export class PackageShell {
   private selected: PackageInstanceKey | null = null;
+  private blocked = false;
   private acceptedSnapshot: PackageHostSnapshot | null = null;
   private snapshotObserver: PackageSnapshotObserver | null = null;
   private snapshotStartup: Promise<void> | null = null;
@@ -101,7 +103,13 @@ export class PackageShell {
     return this.acceptedSnapshot;
   }
 
+  public setBlocked(blocked: boolean): void {
+    this.blocked = blocked;
+    this.mounts.setBlocked(blocked);
+  }
+
   public async select(instance: PackageInstanceKey): Promise<void> {
+    if (this.blocked) return;
     this.selected = instance;
     await this.loadSelected();
   }
@@ -216,10 +224,10 @@ export class PackageShell {
   }
 
   private async loadSelected(): Promise<void> {
-    if (!this.selected) return;
+    if (this.blocked || !this.selected) return;
     let failureShown = false;
     const showFailure = (): void => {
-      if (failureShown) return;
+      if (this.blocked || failureShown) return;
       failureShown = true;
       this.view.showFailure(this.recoveryActions());
     };

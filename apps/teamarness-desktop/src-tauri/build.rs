@@ -23,6 +23,10 @@ const COMMANDS: &[&str] = &[
     "package_recover",
     "package_dispose",
     "package_report_ui_fault",
+    "application_update_status",
+    "application_update_check",
+    "application_update_restart",
+    "application_update_quit",
 ];
 
 fn production_release_inputs() {
@@ -35,6 +39,9 @@ fn production_release_inputs() {
     println!("cargo:rustc-env=TEAMARNESS_PRODUCTION_RELEASE={production}");
     if !production {
         return;
+    }
+    if std::env::var_os("CARGO_FEATURE_UI_ISOLATION_PROBE").is_some() {
+        panic!("UI isolation probe instrumentation cannot be selected in a production release");
     }
     // Only reviewed build inputs compile into the client. Never include key/config values in errors.
     fn invalid() -> ! {

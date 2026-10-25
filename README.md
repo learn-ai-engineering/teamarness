@@ -214,3 +214,37 @@ The runtime exclusively owns one private `core.sqlite3`. Uncertain commit outcom
 - `packages/reference-package/`, `packages/tutorial/`, `packages/conversations-package/`, `packages/repo-aware/`, and `packages/documents-package/` are the bundled Packages, and `packages/teamarness-package-ui-sdk/` is the TypeScript UI SDK.
 - `apps/teamarness-desktop/` contains the typed Tauri adapter and Shell.
 - `p2p-local-first-user-management.md` is the supporting P2P membership research baseline.
+
+### Application update consent and frame isolation probe
+
+Production update policy stays native; only the main Shell can check or request
+restart. Later keeps the running application usable and retains an Update ready
+button for this session. Restart now can discard unsaved Package UI edits.
+After shutdown starts, recovery offers Quit and reinstall/open guidance, not an
+installation retry. Ordinary local builds remain update-disabled.
+
+For the maintainer-owned real WKWebView update-command isolation gate, build the
+**disposable, nonproduction** probe (public fixture key only):
+
+```sh
+CI=true npm run tauri build -- --features ui-isolation-probe --config src-tauri/tauri.probe.conf.json --bundles app,dmg
+npm run verify:packaged-app -- --update-probe
+```
+
+Run the smoke from an Accessibility-authorized terminal. It requires a verified
+Ready candidate, checks that missing/fake-key raw IPC and forged Package bridge
+attempts enter none of the four update handlers, then uses main-Shell consent as
+a positive control. The instrumented terminal deliberately fails installation
+without executing the fixture installer or restarting; recovery Quit remains
+real. This instrumentation cannot build with a non-debug production release.
+It does not qualify real replacement, Gatekeeper, hosted access or A→B continuity.
+Record those separately, along with keyboard access, Later/retained affordance,
+and Updating/recovery layout observations. Rebuild the ordinary local app after
+this probe; never distribute the probe as a release:
+
+```sh
+CI=true npm run tauri build -- --bundles app,dmg
+npm run verify:packaged-app
+```
+
+`CI=true` skips only Finder disk-image cosmetics; it supplies no GUI evidence.

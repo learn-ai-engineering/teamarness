@@ -500,3 +500,10 @@ async fn update_apply_rechecks_pending_version_and_lifecycle_quit_cancels_downlo
     assert_eq!(service.status().state, State::Stopped);
     assert!(service.inner.lock().unwrap().pending.is_none());
 }
+
+pub(super) async fn ready_for_commands() -> UpdateService {
+    let (service, _) = fixture(manifest("1.2.3"), BYTES, false, None);
+    service.request_check();
+    wait_state(&service, State::Ready).await;
+    service
+}

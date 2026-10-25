@@ -28,6 +28,10 @@
     "allow-package-suspend",
     "allow-package-recover",
     "allow-package-dispose",
-    "allow-package-report-ui-fault"
+    "allow-package-report-ui-fault",
+    "allow-application-update-status",
+    "allow-application-update-check",
+    "allow-application-update-restart",
+    "allow-application-update-quit"
   ]
 }

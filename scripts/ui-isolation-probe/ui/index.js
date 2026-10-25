@@ -6,6 +6,11 @@
 // real command posts through the WKWebView message handler; the smoke checks
 // afterwards that neither of them created a Workspace.
 
+const UPDATE_COMMANDS = [
+  "application_update_status", "application_update_check",
+  "application_update_restart", "application_update_quit",
+];
+
 const BREACH_FETCH = "ui-isolation-breach-fetch";
 const BREACH_FAKE_KEY = "ui-isolation-breach-fake-key";
 const BREACH_NO_KEY = "ui-isolation-breach-no-key";
@@ -47,6 +52,18 @@ async function blockedFetch() {
   }
 }
 
+async function blockedUpdateFetches() {
+  return (await Promise.all(UPDATE_COMMANDS.flatMap((command) => [false, true].map(async (fakeKey) => {
+    try {
+      const headers = { "Content-Type": "application/json", "Tauri-Callback": "1", "Tauri-Error": "2" };
+      if (fakeKey) headers["Tauri-Invoke-Key"] = "probe-fake-key";
+      const attempt = fetch(`ipc://localhost/${command}`, { method: "POST", headers, body: JSON.stringify({ generation: "1" }) });
+      const outcome = await Promise.race([attempt, new Promise((resolve) => { setTimeout(() => resolve("blocked-by-timeout"), 2_000); })]);
+      return outcome === "blocked-by-timeout";
+    } catch { return true; }
+  })))).every(Boolean);
+}
+
 function attemptMessageHandlerPosts() {
   const handler = window.webkit?.messageHandlers?.ipc?.postMessage;
   if (typeof handler !== "function") return false;
@@ -72,6 +89,13 @@ function attemptMessageHandlerPosts() {
     payload: { name: BREACH_NO_KEY },
     options: {},
   });
+  for (const cmd of UPDATE_COMMANDS) {
+    for (const fakeKey of [false, true]) {
+      post({ cmd, callback: 1, error: 2, payload: { generation: "1" }, options: {},
+        ...(fakeKey ? { __TAURI_INVOKE_KEY__: "probe-fake-key" } : {}),
+      });
+    }
+  }
   return true;
 }
 
@@ -85,6 +109,15 @@ export async function mount(context) {
   checks.push(await runCheck("opaque-origin", () => self.origin === "null"));
   checks.push(await runCheck("storage-blocked", () => throwsWhenRead(() => window.localStorage)));
   checks.push(await runCheck("ipc-fetch-blocked", blockedFetch));
+  checks.push(await runCheck("update-ipc-fetch-blocked", blockedUpdateFetches));
+  checks.push(await runCheck("update-forged-bridge-denied", async () => {
+    for (const operation of UPDATE_COMMANDS) {
+      try { await context.client.request(operation, { generation: "1" }); return false; }
+      catch (error) { if (error?.code !== "ui_contract_violation") return false; }
+      window.parent.postMessage({ kind: "request", id: 1, operation, payload: { generation: "1" } }, "*");
+    }
+    return true;
+  }));
   checks.push(await runCheck("theme-delivered", () =>
     getComputedStyle(document.documentElement).getPropertyValue("--teamarness-color-accent").trim() !== ""));
   checks.push(await runCheck("bridge-error-envelope", async () => {
@@ -97,6 +130,7 @@ export async function mount(context) {
   }));
 
   const messageHandlerPresent = attemptMessageHandlerPosts();
+  checks.push(["update-command-posts", messageHandlerPresent]);
   try {
     window.parent.postMessage({ kind: "request", id: 1, operation: "probe.forged", payload: {} }, "*");
   } catch {

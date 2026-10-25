@@ -23,6 +23,8 @@ const bundledPackages = (await readBundledPackages(repositoryRoot)).map(({ ident
 const version = await checkVersion();
 const dmg = join(repositoryRoot, "target/release/bundle/dmg", assetNames(`v${version}`)[0]);
 const diagnosticOutputLimit = 4_096;
+const updateProbe = process.argv.includes("--update-probe");
+if (process.argv.slice(2).some((argument) => argument !== "--update-probe")) throw new Error("Unknown packaged smoke option");
 
 class SmokeTimeoutError extends Error {}
 
@@ -61,6 +63,7 @@ async function withDesktop(dataDirectory, body) {
     privateValues: [dataDirectory],
     appStdout,
     appStderr,
+    updateProbe: { ready: false, handlers: 0, installBlocked: 0, restartBlocked: 0 },
   };
   const desktop = spawn(executable, ["--data-dir", dataDirectory], {
     cwd: repositoryRoot,
@@ -68,7 +71,18 @@ async function withDesktop(dataDirectory, body) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   desktop.stdout.on("data", appStdout.append);
-  desktop.stderr.on("data", appStderr.append);
+  let pendingLine = "";
+  desktop.stderr.on("data", (chunk) => {
+    appStderr.append(chunk);
+    const lines = `${pendingLine}${chunk.toString("utf8")}`.split("\n");
+    pendingLine = lines.pop().slice(-diagnosticOutputLimit);
+    for (const line of lines) {
+      if (line.includes("application-update-probe ready generation=1")) diagnostics.updateProbe.ready = true;
+      if (line.includes("application-update-probe handler=")) diagnostics.updateProbe.handlers += 1;
+      if (line.includes("application-update-probe terminal=install-blocked")) diagnostics.updateProbe.installBlocked += 1;
+      if (line.includes("application-update-probe terminal=restart-blocked")) diagnostics.updateProbe.restartBlocked += 1;
+    }
+  });
 
   let childPid;
   const backendPids = [];
@@ -239,6 +253,15 @@ async function probeLaunch(dataDirectory) {
       set probePackage to my namedDescendantStartingWith(personalPackages, "${displayName}", "AXButton")
       return name of probePackage
     `), "UI isolation probe navigation");
+    if (updateProbe) {
+      await waitForAccessible(accessibilityScript(childPid, `
+        set restartButton to my namedDescendant(appUi, "Restart now", "AXButton")
+        return name of restartButton
+      `), "instrumented Ready controls");
+      assert.equal(diagnostics.updateProbe.ready, true, "requires the disposable verified Ready probe build, not default Disabled");
+      assert.ok(diagnostics.updateProbe.handlers > 0, "main Shell must enter the native status handler");
+    }
+    const handlerEntriesBeforeFrame = diagnostics.updateProbe.handlers;
     diagnostics.activeStage = "UI isolation probe selection";
     await runAppleScript(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
@@ -266,7 +289,25 @@ async function probeLaunch(dataDirectory) {
       return contents.stdout.includes("Isolation probe PASS");
     }, "UI isolation probe result"));
 
-    await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });
+    if (updateProbe) {
+      assert.equal(diagnostics.updateProbe.handlers, handlerEntriesBeforeFrame, "Package update attempts reached native command handling");
+      assert.equal(diagnostics.updateProbe.installBlocked, 0, "frame entered terminal installation");
+      assert.equal(diagnostics.updateProbe.restartBlocked, 0, "frame entered terminal restart");
+      await runAppleScript(accessibilityScript(childPid, `
+        click my namedDescendant(appUi, "Restart now", "AXButton")
+      `), "main Shell positive restart control");
+      await waitForAccessible(accessibilityScript(childPid, `
+        return name of my namedDescendant(appUi, "Quit", "AXButton")
+      `), "instrumented terminal recovery");
+      assert.equal(diagnostics.updateProbe.installBlocked, 1, "main consent must reach the non-destructive adapter exactly once");
+      assert.equal(diagnostics.updateProbe.restartBlocked, 0);
+      await runAppleScript(accessibilityScript(childPid, `
+        click my namedDescendant(appUi, "Quit", "AXButton")
+      `), "terminal recovery Quit");
+      await atStage("probe recovery exit", () => waitForExit(desktop, "probe recovery exit"));
+    } else {
+      await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });
+    }
   });
 
   const database = await findCoreDatabase(dataDirectory);
