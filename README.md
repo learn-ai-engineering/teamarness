@@ -136,7 +136,7 @@ The default outputs are:
 - `target/release/bundle/macos/Teamarness.app`
 - `target/release/bundle/dmg/Teamarness_<desktop-version>_aarch64.dmg` on Apple silicon
 
-These ordinary artifacts are for local verification, not production update distribution. The stable release/update work is in progress (ADR 0031); hosted publication and real installed updates are not yet qualified. Developer ID signing, notarization, tray and native menus remain deferred.
+These ordinary artifacts are for local verification, not production update distribution. Stable release/update tooling is implemented locally (ADR 0031); hosted publication, final native isolation and real installed updates are not yet qualified. See [Releasing and update recovery](docs/releasing.md) for protected workflow setup, actual release/dry-run commands, key custody and the required A→B gates. Source, binaries and metadata are intended to be public in `learn-ai-engineering/teamarness`; visibility/disclosure changes remain maintainer-owned. Existing binaries require manual DMG bootstrap; ordinary local use remains offline and requires no GitHub login. Developer ID signing, notarization, tray and native menus remain deferred.
 
 ### Local release artifact qualification
 

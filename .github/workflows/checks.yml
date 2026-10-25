@@ -1,0 +1,63 @@
+{
+  "name": "Checks",
+  "on": {
+    "pull_request": {},
+    "push": {
+      "branches": [
+        "main"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "checks": {
+      "runs-on": "macos-15",
+      "permissions": {
+        "contents": "read"
+      },
+      "env": {
+        "CI": "true",
+        "CARGO_INCREMENTAL": "0"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444",
+          "with": {
+            "node-version": "24.20.0"
+          }
+        },
+        {
+          "name": "Install exact Rust",
+          "run": "rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy\nrustup override set 1.99.1"
+        },
+        {
+          "name": "Record native image/tools and inputs",
+          "id": "inputs",
+          "run": "node scripts/release/ci.mjs"
+        },
+        {
+          "run": "npm run check"
+        },
+        {
+          "run": "cargo build --workspace --locked"
+        },
+        {
+          "run": "npm run tauri build -- --bundles app,dmg -- --locked"
+        },
+        {
+          "name": "Disposable signed artifact qualification (no production secrets)",
+          "run": "node scripts/release/build.mjs --disposable --public-key-out \"$RUNNER_TEMP/disposable-public-key.txt\""
+        }
+      ]
+    }
+  }
+}

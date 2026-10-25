@@ -14,7 +14,7 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 | `TEAM.SYS.CONV` | `02-system/04-conversations/` | The Conversations Package: Channels, Messages, Channel participation policy, record validation and projections, local read state, and its UI. Consumes the immutable-record Synchronization Capability |
 | `TEAM.SYS.PKG` | `02-system/05-packages/` | Package Manifests, Sources, Registrations, Admission, Package Host, Process Protocol, lifecycle, Semantic Capabilities, SDKs, local data, trust, Synchronization Capability contracts, and the reference and tutorial example Packages |
 | `TEAM.SYS.REPO` | `02-system/06-repos/` | The Repo-aware Package: repository registration, local read-only Git inspection, and repository views. No repository replication |
-| `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package frame mounting, workspace controls, theming |
+| `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package frame mounting, workspace controls, theming, consent-driven application updates |
 | `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
 | `TEAM.SYS.DOCS` | `02-system/09-documents/` | The Documents Package: Collections, Documents with a collaborative Markdown body, Comments, record validation and projections, and its UI. Consumes the immutable-record Synchronization Capability (ADR 0027) |
 | `TEAM.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
@@ -32,3 +32,5 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 ## Current state
 
 The Context Foundation, Core Runtime, Desktop Shell with Workspace onboarding, Package Foundation, Conversations Package, Repository Integration, Shell and Package UI polish, architecture review, and Workspace Principals workstream are complete. The Agent Package workstream (ADR 0030) is complete and verified locally, including revision-based recovery, standalone Personal distribution, dispatch ownership and Host generation safeguards, and incoming-main integration. Automated checks and focused independent review pass; developer observations cover a limited real-endpoint and restart/offline flow, not the full manual matrix. The developer approved local integration only; remote delivery and publication require separate decisions. Phase 5 Membership Management and Hardening remains next for the core roadmap. See `roadmap.md` for workstream status and `open-questions.md` for unresolved design questions.
+
+Stable application update/release tooling (ADR 0031) is locally implemented. Hosted protections/publication, real WKWebView isolation and installed A→B continuity remain mandatory unobserved gates; this is not complete updater delivery. See `docs/releasing.md` and `TEAM.DEL-R04`–`R06`.

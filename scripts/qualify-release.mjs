@@ -7,7 +7,7 @@ import { assetNames, createManifest, TARGETS, validateManifest } from "./release
 import { checkVersion } from "./release/version.mjs";
 import { checkAssetDirectory, extractArchive, fileDigest, native, qualifyBundle, withMountedDmg } from "./release/artifacts.mjs";
 
-export async function qualifyRelease({ root = repositoryRoot, directory, tag, publicKey, collect = false, notes = "" }) {
+export async function qualifyRelease({ root = repositoryRoot, directory, tag, publicKey, collect = false, notes = "", referenceRecord }) {
   if (process.platform !== "darwin" || process.arch !== "arm64") throw new Error("Release qualification requires native Apple Silicon macOS");
   await checkVersion({ root, tag });
   const names = assetNames(tag);
@@ -19,6 +19,7 @@ export async function qualifyRelease({ root = repositoryRoot, directory, tag, pu
   if (existing.some((name) => ![...names, "qualification.json"].includes(name))) throw new Error("Unexpected release assets in output directory");
   await rm(join(directory, "qualification.json"), { force: true }); // A failed rerun can never retain a passing record.
   const app = join(root, "target/release/bundle/macos/Teamarness.app");
+  if (collect && referenceRecord) throw new Error("Readback qualification cannot collect build outputs");
   if (collect) {
     for (const name of names.slice(0, 3)) {
       const source = join(root, "target/release/bundle", name.endsWith(".dmg") ? "dmg" : "macos", name);
@@ -43,11 +44,14 @@ export async function qualifyRelease({ root = repositoryRoot, directory, tag, pu
   }
   const temporary = await mkdtemp(join(tmpdir(), "teamarness-release-extract-"));
   try {
-    const appDigest = await qualifyBundle({ root, app, tag });
     const extracted = await extractArchive(archive, join(temporary, "archive"));
-    if (await qualifyBundle({ root, app: extracted, tag }) !== appDigest) throw new Error("Updater archive application differs from qualified build");
+    // A publish job rebuilds trusted validators, not the signed app. The same-run
+    // digest record binds this tree to the independently qualified signed build.
+    const stagedRoot = referenceRecord ? join(extracted, "Contents/Resources/packages") : undefined;
+    const appDigest = referenceRecord?.appDigest ?? await qualifyBundle({ root, app, tag });
+    if (await qualifyBundle({ root, app: extracted, tag, stagedRoot }) !== appDigest) throw new Error("Updater archive application differs from qualified build");
     await withMountedDmg(join(directory, names[0]), async (mounted) => {
-      if (await qualifyBundle({ root, app: mounted, tag }) !== appDigest) throw new Error("DMG application differs from qualified build");
+      if (await qualifyBundle({ root, app: mounted, tag, stagedRoot }) !== appDigest) throw new Error("DMG application differs from qualified build");
     });
     const digests = Object.fromEntries(await Promise.all(names.map(async (name) => [name, await fileDigest(join(directory, name))])));
     const record = {

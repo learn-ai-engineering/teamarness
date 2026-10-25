@@ -99,3 +99,8 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 **Note:** the Core Runtime already gates every capability call on current membership, so this is a lifecycle and resource question, not an authorization one. A revoked Installation's Packages cannot read or write Workspace data; they merely keep running.
 
 **Owner:** roadmap Phase 5.
+
+
+## Stable release operations (settled policy; deployment gates pending)
+
+ADR 0031 and `TEAM.DEL-R04`–`R06` settle one public source/Actions/releases repository, stable immutable publication, signed-version trust and explicit restart consent. The [release runbook](../docs/releasing.md) describes actual commands and failure behavior. Repository visibility/disclosure, protected main/tags/environment, production-key backup/custody, hosted permissions/anonymous access and real native A→B/isolation observations remain Don/maintainer-owned gates, not answered by fixtures. Lost/compromised keys can require manual reinstall; no automatic revocation, freeze protection or rollback is promised. This does not resolve other open questions.

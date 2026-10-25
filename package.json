@@ -30,6 +30,7 @@
     "verify:conversations": "node scripts/verify-conversations.mjs",
     "verify:packaged-app": "node scripts/smoke-packaged-app.mjs",
     "verify:release-artifacts": "node scripts/qualify-release.mjs",
-    "tauri": "npm --workspace teamarness-desktop run tauri --"
+    "tauri": "npm --workspace teamarness-desktop run tauri --",
+    "release:publish": "node scripts/release/cli.mjs publish"
   }
 }

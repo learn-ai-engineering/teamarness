@@ -38,7 +38,7 @@ Detailed by: `TEAM.SYS.PKG-R03`, `TEAM.SYS.PKG-R10`, `TEAM.SYS.TRANS-R03`, `TEAM
 
 The Tauri Shell SHALL own Package UI Mounts, Package navigation, Workspace controls, Workspace-level theming, and the desktop window lifecycle. It SHALL NOT own product-domain behavior.
 
-Detailed by: `TEAM.SYS.SHELL-R01`–`R06`.
+Detailed by: `TEAM.SYS.SHELL-R01`–`R07`.
 
 ## TEAM-R09 — Conversations Package
 
@@ -46,7 +46,7 @@ Owned by `TEAM.SYS.CONV-R01`–`R16`. This ID is retained and not reused.
 
 ## TEAM-R10 — Local-First Operation
 
-The system SHALL work offline. Locally authored content SHALL persist and synchronize when peers become reachable via Iroh. No operation SHALL require a central server.
+The system SHALL work offline. Locally authored content SHALL persist and synchronize when peers become reachable via Iroh. Ordinary local application use SHALL NOT require a central server. Optional application update discovery/download MAY use public GitHub HTTPS access; its failure SHALL NOT block local use.
 
 Detailed by: `TEAM.SYS.TRANS-R01`.
 

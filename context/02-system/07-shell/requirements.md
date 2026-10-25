@@ -4,11 +4,11 @@ Prefix: `TEAM.SYS.SHELL`
 
 The Tauri Shell owns Workspace controls, the desktop window lifecycle, Package UI Frame mounting, and Workspace-level theming. It communicates with the Rust runtime through typed, secret-free Tauri commands and events.
 
-Phase 2 delivered the desktop window and Workspace onboarding between two Installations. Phase 3 added Package mounting, Package Process lifecycle coordination, theming, and bounded failure handling for trusted Packages from application-bundled and installation-local Package Sources. Workspace leave, Member removal controls, manager administration, system tray behavior, native menus, and auto-updater behavior are unscheduled.
+Phase 2 delivered the desktop window and Workspace onboarding between two Installations. Phase 3 added Package mounting, Package Process lifecycle coordination, theming, and bounded failure handling for trusted Packages from application-bundled and installation-local Package Sources. Workspace leave, Member removal controls, manager administration, system tray behavior and native menus are unscheduled. Consent-driven stable application updates are implemented under ADR 0031; hosted/native qualification remains pending.
 
 ## TEAM.SYS.SHELL-R01 — Tauri Desktop Host
 
-The system SHALL use Tauri v2 as the desktop shell. The shell SHALL manage the main window. System tray, native menus, and auto-updater are unscheduled; see `roadmap.md` Later (unscheduled). Application behavior SHALL live in the Rust runtime, not in the shell layer.
+The system SHALL use Tauri v2 as the desktop shell. The shell SHALL manage the main window. System tray and native menus are unscheduled; see `roadmap.md` Later (unscheduled). Native application update policy is specified by `TEAM.SYS.SHELL-R07`. Application behavior SHALL live in the Rust runtime, not in the shell layer.
 
 ## TEAM.SYS.SHELL-R02 — Package UI Frame Mounting
 
@@ -31,3 +31,7 @@ The Shell SHALL expose only generic, typed contracts over Tauri invoke and event
 ## TEAM.SYS.SHELL-R06 — Package Error Containment
 
 Beginning in Phase 3, a returned Package Backend error, lifecycle task failure, Package Process exit, missed execution deadline, failed mount, terminal Package UI stream error, or JavaScript exception in a trusted Package SHALL NOT terminate the Shell or Core Runtime. A terminal Package UI stream error owned by Teamarness SHALL cross the generic desktop bridge, close the affected stream, and cause the Shell to present Package UI Mount recovery without stopping or recovering the Package Backend. A stream that the Package Backend completes or closes with a Package-owned error code SHALL be delivered to the subscribing Package UI, with that code, and SHALL NOT by itself cause Package UI Mount recovery. For other failures, the Shell SHALL present the failure and allow Teamarness to recover or dispose the Package Instance according to its lifecycle state. This requirement does not promise safe execution of hostile code, an operating-system sandbox, or recovery from system-wide resource exhaustion.
+
+## TEAM.SYS.SHELL-R07 — Authenticated Consensual Application Updates
+
+Production Apple Silicon installations SHALL discover bounded, strictly newer stable updates from the public repository without credentials or blocking local use. Only official signed-version verification SHALL produce Ready. Development and ordinary local builds SHALL remain Disabled. Main-Shell Restart now SHALL admit only the same verified generation, remove Package frames, drain admitted operations, close mounts, await Host then Core, install then restart once. Later SHALL preserve normal use and bundle bytes. Quit SHALL share terminal cleanup without installation permission. Failure or shutdown uncertainty SHALL leave terminal recovery, never reopen ordinary dispatch or retry installation. Identity, arguments and persisted data SHALL be preserved; unsaved UI-only edits are not promised. Package UI Frames SHALL gain no update authority (ADR 0031).

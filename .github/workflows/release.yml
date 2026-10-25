@@ -1,0 +1,223 @@
+{
+  "name": "Stable release",
+  "on": {
+    "push": {
+      "tags": [
+        "v*"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "checks": {
+      "if": "github.event_name == 'push' && github.repository == 'learn-ai-engineering/teamarness' && startsWith(github.ref, 'refs/tags/v') && github.event.deleted == false",
+      "runs-on": "macos-15",
+      "permissions": {
+        "contents": "read"
+      },
+      "env": {
+        "CI": "true",
+        "CARGO_INCREMENTAL": "0"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444",
+          "with": {
+            "node-version": "24.20.0"
+          }
+        },
+        {
+          "name": "Install exact Rust",
+          "run": "rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy\nrustup override set 1.99.1"
+        },
+        {
+          "name": "Record native image/tools and inputs",
+          "id": "inputs",
+          "run": "node scripts/release/ci.mjs"
+        },
+        {
+          "name": "Validate trusted stable tag before signing inputs",
+          "run": "node scripts/release/cli.mjs preflight --tag \"$TAG\"",
+          "env": {
+            "TAG": "${{ steps.inputs.outputs.tag }}",
+            "GITHUB_TOKEN": "${{ github.token }}"
+          }
+        },
+        {
+          "run": "npm run check"
+        },
+        {
+          "run": "cargo build --workspace --locked"
+        },
+        {
+          "run": "npm run tauri build -- --bundles app,dmg -- --locked"
+        },
+        {
+          "name": "Disposable signed artifact qualification (no production secrets)",
+          "run": "node scripts/release/build.mjs --disposable --public-key-out \"$RUNNER_TEMP/disposable-public-key.txt\""
+        }
+      ]
+    },
+    "signed-build": {
+      "if": "github.event_name == 'push' && github.repository == 'learn-ai-engineering/teamarness' && startsWith(github.ref, 'refs/tags/v') && github.event.deleted == false",
+      "needs": [
+        "checks"
+      ],
+      "runs-on": "macos-15",
+      "environment": "release",
+      "permissions": {
+        "contents": "read"
+      },
+      "env": {
+        "CI": "true",
+        "CARGO_INCREMENTAL": "0"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444",
+          "with": {
+            "node-version": "24.20.0"
+          }
+        },
+        {
+          "name": "Install exact Rust",
+          "run": "rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy\nrustup override set 1.99.1"
+        },
+        {
+          "name": "Record native image/tools and inputs",
+          "id": "inputs",
+          "run": "node scripts/release/ci.mjs",
+          "env": {
+            "TEAMARNESS_UPDATER_PUBLIC_KEY": "${{ vars.TEAMARNESS_UPDATER_PUBLIC_KEY }}"
+          }
+        },
+        {
+          "name": "Validate trusted stable tag before signing inputs",
+          "run": "node scripts/release/cli.mjs preflight --tag \"$TAG\"",
+          "env": {
+            "TAG": "${{ steps.inputs.outputs.tag }}",
+            "GITHUB_TOKEN": "${{ github.token }}"
+          }
+        },
+        {
+          "run": "npm ci"
+        },
+        {
+          "name": "Build and sign only (private inputs confined to this step)",
+          "run": "node scripts/release/build.mjs --production",
+          "env": {
+            "TEAMARNESS_UPDATER_PUBLIC_KEY": "${{ vars.TEAMARNESS_UPDATER_PUBLIC_KEY }}",
+            "TAURI_SIGNING_PRIVATE_KEY": "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}",
+            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD": "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+          }
+        },
+        {
+          "name": "Qualify complete signed build",
+          "run": "npm run verify:release-artifacts -- --directory target/release/distribution --tag \"$TAG\" --public-key \"$RUNNER_TEMP/teamarness-public-key.txt\" --collect",
+          "env": {
+            "TAG": "${{ steps.inputs.outputs.tag }}"
+          }
+        },
+        {
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "qualified-stable-distribution",
+            "path": "${{ steps.inputs.outputs.assets }}",
+            "if-no-files-found": "error",
+            "retention-days": 3
+          }
+        }
+      ]
+    },
+    "publish": {
+      "if": "github.event_name == 'push' && github.repository == 'learn-ai-engineering/teamarness' && startsWith(github.ref, 'refs/tags/v') && github.event.deleted == false",
+      "needs": [
+        "checks",
+        "signed-build"
+      ],
+      "runs-on": "macos-15",
+      "environment": "release",
+      "permissions": {
+        "contents": "write"
+      },
+      "concurrency": {
+        "group": "teamarness-stable-publication",
+        "cancel-in-progress": false
+      },
+      "env": {
+        "CI": "true",
+        "CARGO_INCREMENTAL": "0"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444",
+          "with": {
+            "node-version": "24.20.0"
+          }
+        },
+        {
+          "name": "Install exact Rust",
+          "run": "rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy\nrustup override set 1.99.1"
+        },
+        {
+          "name": "Record native image/tools and inputs",
+          "id": "inputs",
+          "run": "node scripts/release/ci.mjs",
+          "env": {
+            "TEAMARNESS_UPDATER_PUBLIC_KEY": "${{ vars.TEAMARNESS_UPDATER_PUBLIC_KEY }}"
+          }
+        },
+        {
+          "name": "Validate trusted stable tag before signing inputs",
+          "run": "node scripts/release/cli.mjs preflight --tag \"$TAG\"",
+          "env": {
+            "TAG": "${{ steps.inputs.outputs.tag }}",
+            "GITHUB_TOKEN": "${{ github.token }}"
+          }
+        },
+        {
+          "name": "Rebuild pinned native validators from the same trusted revision",
+          "run": "npm ci\nnpm run build\ncargo build --locked -p teamarness-desktop --example qualify-update\ncargo build --locked -p teamarness-package-contract --bin teamarness-package-validate"
+        },
+        {
+          "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+          "with": {
+            "name": "qualified-stable-distribution",
+            "path": "target/release/distribution"
+          }
+        },
+        {
+          "name": "Authenticated readback qualification and final publication",
+          "run": "npm run release:publish -- --tag \"$TAG\" --public-key \"$RUNNER_TEMP/teamarness-public-key.txt\"",
+          "env": {
+            "TAG": "${{ steps.inputs.outputs.tag }}",
+            "GITHUB_TOKEN": "${{ github.token }}"
+          }
+        }
+      ]
+    }
+  }
+}

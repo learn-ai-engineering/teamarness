@@ -118,13 +118,21 @@ Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Pac
 
 **Depends on:** Phase 4. Follow-up: folder mapping, so a mapped folder lets any editor or CLI agent edit documents.
 
+### Stable application releases and updates (implemented locally; qualification pending)
+
+The `auto-update` workstream implements same-public-repository stable release tooling, exact Rust 1.99.1/Node 24.20.0 native Apple Silicon qualification, signed-version bounded acquisition, main-Shell consent, and one stop-first terminal lifecycle (ADR 0031). Publication qualifies complete drafts and serializes strictly increasing stable versions; public releases are immutable by workflow policy. Local checks/builds do not prove hosted permission boundaries or installed continuity.
+
+**Pending, owners Don/maintainer:** public-disclosure/visibility and protected main/tags/environment setup, production-key custody, actual hosted checks/publication/anonymous downloads, final packaged-app/Ready-state WKWebView isolation, ordinary Quit/Backend exits, Gatekeeper/copied writable launch and real installed A→B identity/data/argument/process continuity. These block passing Verify and general distribution. Earlier manual gates and separate Core test-reliability risks remain visible in the workstream. See [releasing runbook](../docs/releasing.md).
+
+Only this stable single-platform application update work moves out of Later. Tray/native menus, Developer ID/notarization, other targets, per-Package updates and one-hour adoption remain deferred. Local-first use does not require GitHub.
+
 ## Later (unscheduled)
 
 Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
 
 - Custom relay server configuration for teams (`TEAM-R11`, `TEAM.SYS.TRANS-R02`).
-- System tray, native menus, and auto-updater (`TEAM.SYS.SHELL-R01`, ADR 0002).
-- CI-published updates that reach every Member within one hour (vision success criterion 6), with code signing, notarization, and CI/CD (`TEAM.DEL`).
+- System tray and native menus (`TEAM.SYS.SHELL-R01`, ADR 0002).
+- One-hour update adoption (vision success criterion 6), Developer ID signing and notarization (`TEAM.DEL`); stable consent-driven update tooling is scheduled below, not an adoption guarantee.
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted Package runs one Backend per Workspace (5 bundled Packages × 3 Workspaces = 15 processes); measure before scheduling.
