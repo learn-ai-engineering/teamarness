@@ -96,7 +96,7 @@ The delivery correction adds Conversations 1.2 `message.changes`, exposing the e
 
 Automated coverage spans Core, Host, SDK, Conversations and Agent tests, a 257-Message two-profile backlog, queued-post actor attribution, and cancelled-binding-waiter ownership against a real test Host. The final merged validation and review are `verify/20261024T092503Z_post-merge-{validation,review}.md` in the `agent-package` workstream. No current Agent or merge findings remain. The developer observed real-endpoint replies, Personal Package discovery, retained configuration after restart, and an offline-addressed reply visible at the first inspection after Alice returned. These observations are not a complete manual matrix, measured latency, or duplicate audit. They were not repeated after integration. Incoming Documents limitations remain separate. The inherited record-log authoring-schema mismatch is tracked in [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). Key custody, streaming, tools, Documents participation, scheduled posts, SDK publication, and stronger Package isolation remain separate Scopes under Later.
 
-### Agent Package tools and guides, slice 1 (verified; closing)
+### Agent Package tools and guides, slice 1 (complete)
 
 This slice was implemented on 2026-10-25 in the standalone Agent Package repository, branch `proper_harness`, workstream `agent-harness`.
 
@@ -118,7 +118,7 @@ The slice removes the Agent's dispatch fence. This supersedes the fail-closed no
 
 **Status**
 
-Verify attempt 3 passed at `b5202d0`. Two corrective phases fixed issues that earlier Verify attempts found:
+Completed on 2026-10-26. Verify attempt 3 passed at `b5202d0`, and the developer approved a fast-forward of the Agent repository's local `main` to `b5202d0`. No remote exists and nothing was published. Two corrective phases fixed issues that earlier Verify attempts found:
 
 - An over-wide message bound broke unchanged no-tool turns.
 - A failed turn lost its activity.
@@ -126,16 +126,16 @@ Verify attempt 3 passed at `b5202d0`. Two corrective phases fixed issues that ea
 - Unsolicited tool calls were acted on.
 - The Packages switch showed the wrong state.
 
-**Remaining before Close**
+**Manual evidence**
 
-- The developer's real-app checks passed on 2026-10-26 for chat with Exhibits, enable and disable, the not-installed case and Channel replies. These were planned with Exhibits installed and then not installed:
-  - the Packages list and "Unavailable" marker;
-  - an Exhibits chat answer that shows its activity line;
-  - exactly one Channel reply;
-  - Chat unchanged after Exhibits is disabled;
-  - activation without Exhibits;
-  - observe only: what the Host does with a tool command while the Agent is unbound.
-- Local integration into the Agent repository's `main`.
+On 2026-10-26 the developer checked the following in the real app:
+
+- With Exhibits not installed, the agent couldn't reach it.
+- With Exhibits installed and enabled, Chat saw it and answered correctly.
+- Switching Exhibits on and off worked.
+- Mentions in Conversations still got replies.
+
+The developer didn't report checking restart persistence of the switch, an exact count of one reply per mention, or a tool command while the Agent is unbound. Automated tests cover the first two.
 
 **Teamarness follow-up**
 
