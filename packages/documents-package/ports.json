@@ -25,8 +25,8 @@
     } }
   },
   "contracts": [{
-    "identity": "dev.teamarness.documents", "major": 1, "minor": 0,
-    "description": "Documents as Canonical Markdown with opaque version tokens: list, read, base-versioned revise with Person authority, and live change invalidation.",
+    "identity": "dev.teamarness.documents", "major": 1, "minor": 1,
+    "description": "Documents as Canonical Markdown with opaque version tokens: list, read, base-versioned revise by the local Installation Person or a locally bound Workspace Agent (1.1), and live change invalidation.",
     "ports": [
       { "name": "document.list", "kind": "query", "description": "List Collections and Documents in Order Key order, at most 64 per page; pass next as after for the following page. With collectionId, only that Collection's Documents. version is present only for an available body. Errors: documents.unknown_collection, documents.invalid_cursor.",
         "request": { "type": "object", "additionalProperties": false, "properties": {
@@ -44,7 +44,7 @@
           "markdown": { "$ref": "#/$defs/markdown" }, "version": { "$ref": "#/$defs/version" }
         } }
       },
-      { "name": "document.revise", "kind": "command", "description": "Merge a Markdown revision of the export at baseVersion as one record signed by the local Installation Person. Only what differs from the base changes; changed false appends nothing. version may include concurrent edits; read again before revising. Errors: documents.base_unavailable, documents.revision_too_large, documents.schema_violation, documents.unknown_document, documents.pending, documents.unavailable, documents.actor_unauthorized. An uncertain command must not be retried automatically.",
+      { "name": "document.revise", "kind": "command", "description": "Merge a Markdown revision of the export at baseVersion as one record signed by the local Installation Person or (1.1) the caller's bound Workspace Agent. Only what differs from the base changes; changed false appends nothing. Errors: documents.base_unavailable, documents.revision_too_large, documents.schema_violation, documents.unknown_document, documents.pending, documents.unavailable, documents.actor_unauthorized, documents.principal_not_bound. An uncertain command must not be retried automatically.",
         "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "baseVersion", "markdown"], "properties": {
           "documentId": { "$ref": "#/$defs/recordId" },
           "baseVersion": { "$ref": "#/$defs/version" },

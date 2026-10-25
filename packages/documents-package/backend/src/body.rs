@@ -415,6 +415,22 @@ impl DocumentBody {
         Ok(true)
     }
 
+    /// Validates a merged revision from `peer` exactly as [`Self::stage_merged`] would, on a
+    /// fork, without staging or adopting it. Returns the update its one record carries, or
+    /// `None` when the revision changes nothing.
+    pub(crate) fn check_merged(
+        &self,
+        peer: u64,
+        request_id: String,
+        merged: &markdown::Merged,
+    ) -> Result<Option<Vec<u8>>, BodyError> {
+        let mut candidate = self.fork();
+        if !candidate.stage_merged(peer, request_id, merged)? {
+            return Ok(None);
+        }
+        Ok(candidate.staged.take())
+    }
+
     /// Merges a Markdown revision made against `base` as one update from a fresh peer, and
     /// stages it: [`Self::merge_source`], [`merge_revision`] and [`Self::stage_merged`] in one.
     #[cfg(test)]

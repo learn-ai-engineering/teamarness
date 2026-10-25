@@ -1,6 +1,7 @@
-//! Documents Port Contract 1.0 through the Host broker: a real SDK consumer Package lists,
-//! reads, revises and observes the real Documents Backend, and every row of the shared merge
-//! scenario table runs through `document.revise`.
+//! Documents Port Contract through the Host broker: a real SDK consumer Package lists, reads,
+//! revises and observes the real Documents Backend, and every row of the shared merge scenario
+//! table runs through `document.revise`. A 1.0 Consumer revises as the Installation Person; a
+//! 1.1 Consumer bound to a Workspace Agent revises as that Agent.
 #![cfg(unix)]
 #[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
 mod support;
@@ -49,7 +50,8 @@ fn documents_stage() -> PackageStage {
     }
 }
 
-fn stage_consumer(application: &Path) {
+/// Stages the consumer Package, declaring Documents `1.min_minor` through 1.1.
+fn stage_consumer(application: &Path, min_minor: u16) {
     let root = application.join(CONSUMER);
     fs::create_dir_all(root.join("backend")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
@@ -69,7 +71,7 @@ fn stage_consumer(application: &Path) {
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],
             "contract":{"path":"ui-contract.json","sha256":digest(contract)}},
         "capabilities":[{"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0}],
-        "consumedPorts":[{"identity":DOCUMENTS,"major":1,"minMinor":0,"maxMinor":0,"ports":[
+        "consumedPorts":[{"identity":DOCUMENTS,"major":1,"minMinor":min_minor,"maxMinor":1,"ports":[
             {"name":"document.list","kind":"query"},{"name":"document.markdown","kind":"query"},
             {"name":"document.revise","kind":"command"},{"name":"documents.changed","kind":"event"}]}]
     });
@@ -299,7 +301,8 @@ fn unique_text(bytes: usize) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let application = harness::StagedApplication::with(&documents_stage());
-    stage_consumer(&application.application_path);
+    // A 1.0 Consumer keeps working against the 1.1 Provider.
+    stage_consumer(&application.application_path, 0);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
     let workspace = core.create_workspace("Documents port proof").unwrap();
@@ -525,6 +528,125 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
             assert_eq!(read["version"], revised["value"]["version"], "{name}");
         }
     }
+
+    consumer
+        .value("close", "documents.changed", json!({}))
+        .await;
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}
+
+/// Verifies: TEAM.SYS.DOCS-R12 — a Consumer bound to a Workspace Agent revises a Document as
+/// that Agent (1.1): the body and Markdown reflect it, `documents.changed` fires, and Core holds
+/// the record signed with the Agent's key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn agent_bound_consumer_revises_a_document_as_the_agent() {
+    let application = harness::StagedApplication::with(&documents_stage());
+    stage_consumer(&application.application_path, 1);
+    let root = application.root.path();
+    let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
+    let workspace = core.create_workspace("Documents agent proof").unwrap();
+    let workspace_id = workspace.id();
+    core.set_own_person_name(workspace_id, "Alice").unwrap();
+    let agent = core.add_agent(workspace_id, "Scribe").unwrap();
+    let agent_key = core.principal(workspace_id, agent).unwrap().unwrap().keys()[0].to_string();
+    assert_ne!(agent_key, core.public_identity().to_string());
+    let private = root.join("alice-host");
+    let host = open_host(&application.application_path, private.clone(), core.clone()).await;
+    assert!(
+        poll_short(|| async { find_file(&private, "port-proof-ready").is_some() }).await,
+        "consumer must activate"
+    );
+    let mut consumer = Consumer {
+        directory: find_file(&private, "port-proof-ready")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned(),
+        next: 0,
+    };
+    let key = PackageInstanceKey::new(
+        PackageIdentity::from_str(DOCUMENTS).unwrap(),
+        WorkspaceId::new(workspace_id.to_string()).unwrap(),
+    );
+    let mount = open_mount(&host, &key).await;
+    let client = ConversationClient {
+        host: &host,
+        mount: &mount,
+    };
+    let collection = ui(
+        &client,
+        "documents.collection.create",
+        json!({"name":"Plans"}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let document = ui(
+        &client,
+        "documents.document.create",
+        json!({"collectionId":collection,"title":"Q4"}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    consumer
+        .value("subscribe", "documents.changed", json!({}))
+        .await;
+    let read = consumer.markdown(&document).await;
+    // Wait for the qualified replay as the Person, before the Consumer is bound.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let answer = consumer.revise(&document, &read["version"], "").await;
+        if answer["ok"] == true {
+            break;
+        }
+        assert_eq!(provider_code(&answer), "documents.pending", "{answer}");
+        assert!(Instant::now() < deadline, "the replay qualifies");
+        // poll-interval: bounded by the deadline above; qualification has no Port event.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The Host reads the binding at each dispatch: from now on the Consumer is the Agent.
+    core.bind_agent_package(workspace_id, agent, CONSUMER)
+        .unwrap();
+    let revised = consumer
+        .revise(&document, &read["version"], "Drafted by the Scribe\n")
+        .await;
+    assert_eq!(revised["ok"], true, "{revised}");
+    assert_eq!(revised["value"]["changed"], true);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let event = consumer
+            .next_event(deadline.saturating_duration_since(Instant::now()))
+            .await
+            .expect("the Agent's revise is observed");
+        if event["documentIds"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!(document)))
+        {
+            break;
+        }
+    }
+    let read = consumer.markdown(&document).await;
+    assert_eq!(read["markdown"], "Drafted by the Scribe\n");
+    assert_eq!(read["version"], revised["value"]["version"]);
+
+    // Core holds exactly one body edit, signed with the Agent's key.
+    let mut records = core
+        .subscribe_records(workspace_id, DOCUMENTS, None)
+        .unwrap();
+    let edits: Vec<String> = records
+        .next_page(256)
+        .unwrap()
+        .events
+        .iter()
+        .filter(|event| event.purpose() == "document.edit")
+        .map(|event| event.author().to_string())
+        .collect();
+    assert_eq!(edits, vec![agent_key], "the revise is the Agent's record");
 
     consumer
         .value("close", "documents.changed", json!({}))

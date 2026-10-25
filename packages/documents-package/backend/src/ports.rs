@@ -1,9 +1,11 @@
-//! Documents Port Contract 1.0 (`dev.teamarness.documents`, `ports.json`): another Package lists
+//! Documents Port Contract 1.1 (`dev.teamarness.documents`, `ports.json`): another Package lists
 //! Documents, reads one as Canonical Markdown with a version token, revises it against a base
-//! version with Person authority, and observes changes. This is the agent surface.
+//! version as the Host-derived actor, and observes changes. This is the agent surface.
 //!
 //! A revise is one Markdown merge from a fresh peer and exactly one `document.edit` record,
-//! through the same validation and write path as an editor session's update.
+//! through the same validation as an editor session's update. The local Installation Person's
+//! revise takes the editor's write path; a bound Agent's (1.1) is appended with its Principal ID
+//! before the body adopts it (ADR 0030, ADR 0033).
 
 use std::collections::BTreeSet;
 
@@ -16,8 +18,9 @@ use teamarness_package_sdk::{BackendError, Context, EventSubscription, event_cha
 use tokio::sync::broadcast;
 
 use super::{
-    BodyEvent, BodyHub, DocumentsActive, LocalWrite, drain_local_writes, error,
-    reopen_unopened_edits, require_collection, require_document, stage_local_write, storage_failed,
+    BodyEvent, BodyHub, DocumentsActive, LocalWrite, append_identified_edit, drain_local_writes,
+    error, reopen_unopened_edits, require_collection, require_document, stage_local_write,
+    storage_failed,
 };
 use crate::markdown;
 
@@ -295,14 +298,36 @@ pub(super) struct ReviseRequest {
     markdown: String,
 }
 
-/// Only the local Installation Person revises; Core signs with the Installation signer.
-pub(super) fn authorize_person(
+/// Who a revise is written as: the signing key its record names as author and, for an Agent,
+/// the Principal ID Core signs for.
+pub(super) struct Signer {
+    identity: String,
+    /// `None` for the Installation Person, whom Core signs for by default.
+    principal: Option<String>,
+}
+
+/// Turns the Host-authored actor into the signer a revise is written as.
+///
+/// A Person must be this Installation. An Agent actor is Host-derived from the calling Package
+/// Instance's Agent Binding (ADR 0030), so it is accepted as given: the record names the Agent's
+/// key, and Core signs with that key or refuses with `principal_not_bound`.
+pub(super) fn authorize_actor(
     context: &Context<DocumentsActive>,
-    actor: &PortActor,
-) -> Result<(), BackendError> {
+    actor: PortActor,
+) -> Result<Signer, BackendError> {
     match actor {
-        PortActor::Person { identity } if *identity == context.state().installation => Ok(()),
-        _ => Err(error("documents.actor_unauthorized", false)),
+        PortActor::Person { identity } if identity == context.state().installation => Ok(Signer {
+            identity,
+            principal: None,
+        }),
+        PortActor::Agent {
+            principal,
+            identity,
+        } => Ok(Signer {
+            identity,
+            principal: Some(principal),
+        }),
+        PortActor::Person { .. } => Err(error("documents.actor_unauthorized", false)),
     }
 }
 
@@ -318,10 +343,12 @@ fn revise_error(cause: BackendError) -> BackendError {
         .with_outcome_uncertain(cause.outcome_uncertain())
 }
 
-/// Merges a Markdown revision made against `baseVersion` as exactly one record, or none when
-/// it changes nothing, and answers once that record has reached the Core record log.
+/// Merges a Markdown revision made against `baseVersion` as exactly one record signed as
+/// `signer`, or none when it changes nothing, and answers once that record has reached the Core
+/// record log.
 pub(super) async fn revise(
     context: &Context<DocumentsActive>,
+    signer: Signer,
     request: ReviseRequest,
 ) -> Result<JsonValue, BackendError> {
     require_available(context, &request.document_id).await?;
@@ -335,27 +362,54 @@ pub(super) async fn revise(
         getrandom::u64().map_err(|_| error("documents.edit_failed", true))?
     );
     let state = context.state();
-    let staged = stage_local_write(
+    let mut staged = stage_local_write(
         &state.log,
         &state.hub,
-        &state.installation,
+        &signer.identity,
         &request.document_id,
         &request_id,
         LocalWrite::Revision {
             base: &base,
             markdown: &request.markdown,
+            append_first: signer.principal.is_some(),
         },
     )
     .await
     .map_err(revise_error)?;
-    if staged.changed {
+    if let Some(edit) = staged.unstaged.take() {
+        // Nothing is staged, so nothing is retried: a refusal leaves the body as it was, and a
+        // failure that may have committed is reported as uncertain. The body adopts the
+        // revision from its appended record, while this Document's append lock is held.
+        append_identified_edit(
+            &state.log,
+            &state.hub,
+            &state.changes,
+            &signer.identity,
+            signer.principal.as_deref(),
+            &request.document_id,
+            &edit.request_id,
+            edit.digest,
+            edit.update,
+        )
+        .await
+        .map_err(|cause| {
+            if cause.code() == "documents.principal_not_bound" {
+                cause
+            } else {
+                revise_error(cause).with_outcome_uncertain(true)
+            }
+        })?;
+        staged.version = state
+            .hub
+            .with_body(&request.document_id, |body| body.frontiers());
+    } else if staged.changed {
         // The staged record is retried until it is appended, so a failure here may still
         // commit: the command's outcome is unknown and must not be replayed automatically.
         drain_local_writes(
             &state.log,
             &state.hub,
             &state.changes,
-            &state.installation,
+            &signer.identity,
             &request.document_id,
         )
         .await

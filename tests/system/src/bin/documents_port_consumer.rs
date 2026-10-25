@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Test-only SDK consumer of Documents Port Contract 1.0: no UI operation and no product
+//! Test-only SDK consumer of Documents Port Contract 1.x: no UI operation and no product
 //! registration. It relays numbered steps the system test writes into its Package Data
 //! Directory (`step-<n>.json`) to the Host broker, and answers each in `answer-<n>.json`.
 use std::path::{Path, PathBuf};

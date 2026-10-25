@@ -1551,8 +1551,8 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
     .port_request(
         ports::CONTRACT, "document.revise", "command",
         |context: Context<DocumentsActive>, actor: PortActor, request: ports::ReviseRequest| async move {
-            ports::authorize_person(&context, &actor)?;
-            ports::revise(&context, request).await
+            let signer = ports::authorize_actor(&context, actor)?;
+            ports::revise(&context, signer, request).await
         },
     )
     .port_event(
@@ -2403,10 +2403,32 @@ async fn append_edit(
             .and_then(|id| body.identity(id).map(|known| (id.to_owned(), known.digest)))
     });
     // Every staged update was accepted under a request identity.
-    let Some((id, digest)) = identity.as_ref() else {
+    let Some((id, digest)) = identity else {
         return Err(error("documents.edit_failed", true));
     };
-    let record = DomainRecord::identified_document_edit(author, document, id, digest, update)
+    append_identified_edit(
+        log, hub, changes, author, None, document, &id, digest, update,
+    )
+    .await
+}
+
+/// Appends one identified `document.edit` record and projects it, signed by this Installation,
+/// or by the bound Agent whose Principal ID `principal` names. The update is either the staged
+/// one ([`append_edit`]) or an Agent's revision that the body adopts only through this
+/// projection.
+#[allow(clippy::too_many_arguments)]
+async fn append_identified_edit(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: &str,
+    principal: Option<&str>,
+    document: &str,
+    id: &str,
+    digest: [u8; 32],
+    update: Vec<u8>,
+) -> Result<(), BackendError> {
+    let record = DomainRecord::identified_document_edit(author, document, id, &digest, update)
         .map_err(domain_error)?;
     if hub
         .store
@@ -2417,18 +2439,25 @@ async fn append_edit(
     }
     let purpose = record.kind();
     let canonical = record.encode();
-    let appended = log.append(purpose, &canonical).await.map_err(|cause| {
-        if cause.retryable() {
-            hub.qualified.store(false, Ordering::Release);
-        }
-        capability_error(purpose, cause)
-    })?;
+    let appended = log
+        .append_with_principal(purpose, &canonical, principal)
+        .await
+        .map_err(|cause| {
+            // Core refuses before committing anything: it does not sign as that Agent now.
+            if cause.code() == "principal_not_bound" {
+                return error("documents.principal_not_bound", false);
+            }
+            if cause.retryable() {
+                hub.qualified.store(false, Ordering::Release);
+            }
+            capability_error(purpose, cause)
+        })?;
     // From the moment Core accepts the bytes until projection commits, recovery must not
     // mistake the local preview for an imported body. A replay may commit while SQLite
     // projection is in flight; only that commit may clear this flag.
-    if let Some((id, digest)) = &identity {
+    {
         let _publication = hub.gate();
-        hub.remember_identity(document, id, author, *digest, true);
+        hub.remember_identity(document, id, author, digest, true);
         hub.with_body(document, |body| body.set_projection_pending(id, true));
     }
     let changes = changes.clone();
@@ -2473,10 +2502,8 @@ async fn append_edit(
             if hub.store.identity_conflicted(document).unwrap_or(true) {
                 return Err(error("documents.identity_conflict", false));
             }
-            if let Some((id, digest)) = &identity {
-                hub.remember_identity(document, id, author, *digest, true);
-                hub.with_body(document, |body| body.set_projection_pending(id, false));
-            }
+            hub.remember_identity(document, id, author, digest, true);
+            hub.with_body(document, |body| body.set_projection_pending(id, false));
             // Ingest installed successful candidates only after the store committed.
         }
         Ok(Err(cause)) => {
@@ -2526,7 +2553,18 @@ enum LocalWrite<'a> {
     Revision {
         base: &'a Frontiers,
         markdown: &'a str,
+        /// Validate the merge but stage nothing: the caller appends it, and the body adopts
+        /// it only from the appended record. An Agent's revision takes this path, so a
+        /// refusal from Core leaves nothing staged for the Installation to sign.
+        append_first: bool,
     },
+}
+
+/// A validated revision that nothing has staged, for the caller to append itself.
+struct Unstaged {
+    request_id: String,
+    digest: [u8; 32],
+    update: Vec<u8>,
 }
 
 /// A local write the body accepted. The Document's append lock is held until it is dropped, so
@@ -2537,6 +2575,9 @@ struct Staged {
     version: Frontiers,
     /// `false` when a revision changed nothing: nothing was staged and no record follows.
     changed: bool,
+    /// An `append_first` revision's update, which the caller appends while it holds this
+    /// Document's append lock.
+    unstaged: Option<Unstaged>,
     _append: tokio::sync::OwnedMutexGuard<()>,
     _identity: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -2582,7 +2623,7 @@ async fn stage_local_write(
     // A revision is merged first, on a blocking thread and holding nothing but this Document's
     // append lock, so a slow merge delays only this write.
     let mut merged = match write {
-        LocalWrite::Revision { base, markdown } => {
+        LocalWrite::Revision { base, markdown, .. } => {
             Some(merge_off_lock(hub, document, base, markdown).await?)
         }
         LocalWrite::Update { .. } => None,
@@ -2627,6 +2668,7 @@ async fn stage_local_write(
     {
         return Err(error("documents.import_failure", false));
     }
+    let mut unstaged = None;
     let (revision, version, staged, changed) = hub.with_body(document, |body| {
         if !body.editable() {
             return Err(error("documents.document_pending", true));
@@ -2643,13 +2685,27 @@ async fn stage_local_write(
                     .map_err(update_error)?;
                 digest
             }
-            (LocalWrite::Revision { .. }, _) => {
+            (LocalWrite::Revision { append_first, .. }, _) => {
                 if body.identity(request_id).is_some() {
                     return Err(invalid_request());
                 }
                 let Some((peer, merged)) = merged.take() else {
                     return Err(error("documents.edit_failed", true));
                 };
+                if append_first {
+                    let Some(update) = body
+                        .check_merged(peer, request_id.to_owned(), &merged)
+                        .map_err(update_error)?
+                    else {
+                        return Ok((body.revision(), body.frontiers(), None, false));
+                    };
+                    unstaged = Some(Unstaged {
+                        request_id: request_id.to_owned(),
+                        digest: Sha256::digest(&update).into(),
+                        update,
+                    });
+                    return Ok((body.revision(), body.frontiers(), None, true));
+                }
                 if !body
                     .stage_merged(peer, request_id.to_owned(), &merged)
                     .map_err(update_error)?
@@ -2668,6 +2724,7 @@ async fn stage_local_write(
         Ok((body.revision(), body.frontiers(), body.staged(), true))
     })?;
     if staged.is_none()
+        && unstaged.is_none()
         && changed
         && hub.with_body(document, |body| {
             body.identity(request_id)
@@ -2690,6 +2747,7 @@ async fn stage_local_write(
         revision,
         version,
         changed,
+        unstaged,
         _append: append_guard,
         _identity: identity_guard,
     })
@@ -3270,6 +3328,10 @@ mod tests {
 
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
     const ALICE: &str = "alice";
+    /// A Workspace Agent's Principal ID and signing key, as the Host derives them.
+    const AGENT_PRINCIPAL: &str =
+        "a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7";
+    const AGENT_KEY: &str = "4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f";
 
     fn hex(length: usize, seed: u64) -> String {
         format!("{seed:0length$x}")
@@ -3368,11 +3430,19 @@ mod tests {
                 }))
             }
             "append" => {
+                // Core signs with the Agent's key when the 1.1 `principal` names a bound Agent.
+                let author = match payload.get("principal").and_then(JsonValue::as_str) {
+                    Some(AGENT_PRINCIPAL) => AGENT_KEY,
+                    Some(_) => {
+                        return Err(BackendError::new("principal_not_bound", false, json!({})));
+                    }
+                    None => ALICE,
+                };
                 let seed = appended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(json!({
                     "recordId": hex(64, seed),
                     "orderKey": hex(82, seed),
-                    "author": ALICE,
+                    "author": author,
                     "signature": "c2ln",
                     "sealedRecord": "c2VhbGVk",
                     "durability": "committed",
@@ -3407,13 +3477,23 @@ mod tests {
     }
 
     async fn start(directory: &std::path::Path, scripted: ScriptedCapability) -> Session {
+        start_as(directory, scripted, ALICE).await
+    }
+
+    /// An activation on the Installation whose Person is `installation`, granted record-log 1.1
+    /// as the manifest requires.
+    async fn start_as(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+        installation: &str,
+    ) -> Session {
         let observer: ActivationObserver = Arc::new(Mutex::new(None));
         let mut harness =
             HarnessBuilder::new(router_observing(Some(observer.clone())).into_backend())
                 .package_identity("dev.teamarness.documents")
-                .installation(ALICE, "Alice")
+                .installation(installation, installation)
                 .data_directory(directory)
-                .capability(RECORD_LOG, scripted.clone())
+                .capability_minor(RECORD_LOG, scripted.clone(), 1)
                 .capability("teamarness.principals", ScriptedCapability::new())
                 .start()
                 .await;
@@ -6869,7 +6949,7 @@ mod tests {
         harness.shutdown().await.unwrap();
     }
 
-    // ------------------------------------------------------------ Port Contract 1.0
+    // ------------------------------------------------------------ Port Contract 1.1
 
     fn port_envelope(port: &str, actor: JsonValue, request: JsonValue) -> JsonValue {
         json!({
@@ -7099,6 +7179,7 @@ mod tests {
                 LocalWrite::Revision {
                     base: &base,
                     markdown: "merged later\n",
+                    append_first: false,
                 },
             )
             .await?;
@@ -7141,7 +7222,7 @@ mod tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, ports::CONTRACT);
-        assert_eq!((provided.major, provided.minor), (1, 0));
+        assert_eq!((provided.major, provided.minor), (1, 1));
         let names: Vec<_> = provided
             .ports
             .iter()
@@ -7175,6 +7256,7 @@ mod tests {
             "documents.pending",
             "documents.unavailable",
             "documents.actor_unauthorized",
+            "documents.principal_not_bound",
         ] {
             assert!(revise.description.contains(code), "{code}");
         }
@@ -7529,6 +7611,255 @@ mod tests {
             .await
             .expect("a rename invalidates the listing");
         events.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.PKG-R12 — 1.1 keeps every 1.0 Port, kind and schema.
+    #[test]
+    fn port_contract_1_1_is_additive_over_the_shipped_1_0_document() {
+        use teamarness_package_contract::port_contract::{
+            check_additive_minor_documents, compile_port_contracts,
+        };
+        let old =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.0.json")).unwrap();
+        let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
+        assert_eq!((old.contracts[0].major, old.contracts[0].minor), (1, 0));
+        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 1));
+        check_additive_minor_documents(&old, &new, ports::CONTRACT).unwrap();
+        assert_eq!(old.contracts[0].ports.len(), new.contracts[0].ports.len());
+        for before in &old.contracts[0].ports {
+            let after = new.contracts[0]
+                .ports
+                .iter()
+                .find(|port| port.name == before.name)
+                .unwrap();
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.request, after.request);
+            assert_eq!(before.response, after.response);
+            assert_eq!(before.event, after.event);
+        }
+    }
+
+    fn agent() -> JsonValue {
+        json!({"kind":"agent","principal":AGENT_PRINCIPAL,"identity":AGENT_KEY})
+    }
+
+    fn append_calls(session: &Session) -> Vec<teamarness_package_sdk::testing::RecordedCall> {
+        session
+            .scripted
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| call.method == "append")
+            .collect()
+    }
+
+    fn appended_record(call: &teamarness_package_sdk::testing::RecordedCall) -> DomainRecord {
+        DomainRecord::decode(
+            &URL_SAFE_NO_PAD
+                .decode(call.payload["canonical"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — an Agent actor revises as itself (1.1): one record that
+    // names the Agent's key, appended with its Principal ID, observed live, and applied on
+    // another Installation as on this one.
+    #[tokio::test]
+    async fn agent_actor_revise_is_signed_as_the_agent_and_converges_elsewhere() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let mut events = session
+            .harness
+            .subscribe(
+                "teamarness.port.event.v1",
+                port_envelope("documents.changed", alice(), json!({})),
+            )
+            .await
+            .unwrap();
+        // Reads accept any Host-derived actor.
+        let read = port_as(
+            &mut session.harness,
+            "query",
+            "document.markdown",
+            agent(),
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        let before = appends(&session);
+        let revised = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            agent(),
+            json!({"documentId":document,"baseVersion":read["version"],"markdown":"Drafted by an agent\n"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(revised["changed"], true);
+        assert_eq!(appends(&session), before + 1, "one revise is one record");
+        let calls = append_calls(&session);
+        let call = calls.last().unwrap();
+        assert_eq!(call.payload["principal"], AGENT_PRINCIPAL);
+        assert_eq!(call.payload["purpose"], DomainRecord::EDIT_KIND);
+        let DomainRecord::IdentifiedDocumentEdit {
+            author,
+            document: target,
+            ..
+        } = appended_record(call)
+        else {
+            panic!("a body edit record");
+        };
+        assert_eq!(author, AGENT_KEY, "the record names the Agent's key");
+        assert_eq!(target, document);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event["$teamarnessPortValue"],
+            json!({"documentIds":[document]})
+        );
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["markdown"], "Drafted by an agent\n");
+        assert_eq!(read["version"], revised["version"]);
+
+        // The Person revises after the Agent, as the Installation signer.
+        let reviewed = revise(
+            &mut session.harness,
+            &document,
+            &read["version"],
+            "Drafted by an agent\n\nReviewed by Alice\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(reviewed["changed"], true);
+        let calls = append_calls(&session);
+        let last = calls.last().unwrap();
+        assert!(last.payload.get("principal").is_none());
+        assert_eq!(appended_record(last).author(), ALICE);
+        events.close().await;
+
+        // Another Installation receives every record, signed as Core signed it, and shows the
+        // same body.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut bob = start_as(elsewhere.path(), scripted_log(), "bob").await;
+        let stream = bob.scripted.stream();
+        tokio::time::timeout(Duration::from_secs(2), stream.opened())
+            .await
+            .unwrap();
+        for (index, call) in calls.iter().enumerate() {
+            let seed = 100 + index as u64;
+            let signer = if call.payload.get("principal").is_some() {
+                AGENT_KEY
+            } else {
+                ALICE
+            };
+            assert!(
+                stream
+                    .send(record_frame(seed, signer, &appended_record(call)))
+                    .await
+            );
+        }
+        let last_cursor = hex(50, 100 + calls.len() as u64 - 1);
+        let store = bob.handles.store.clone();
+        wait_until(
+            || store.cursor().unwrap().as_deref() == Some(last_cursor.as_str()),
+            "every record reaches the other Installation",
+        )
+        .await;
+        let elsewhere_read = query(
+            &mut bob.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            elsewhere_read["markdown"],
+            "Drafted by an agent\n\nReviewed by Alice\n"
+        );
+        assert!(
+            bob.handles
+                .store
+                .import_failure(&document)
+                .unwrap()
+                .is_none()
+        );
+        bob.harness.shutdown().await.unwrap();
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — an Agent that Core will not sign for is refused with
+    // certainty, the body is unchanged, and the Document stays revisable.
+    #[tokio::test]
+    async fn unbound_agent_revise_is_refused_and_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        let before = appends(&session);
+        let stale = json!({"kind":"agent","principal":hex(64, 0x57a1e),"identity":AGENT_KEY});
+        let refused = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            stale,
+            json!({"documentId":document,"baseVersion":read["version"],"markdown":"Not mine\n"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code(), "documents.principal_not_bound");
+        assert!(!refused.retryable());
+        assert!(!refused.outcome_uncertain(), "Core committed nothing");
+        assert_eq!(appends(&session), before + 1, "Core was asked once");
+        assert_eq!(
+            query(
+                &mut session.harness,
+                "document.markdown",
+                json!({"documentId":document}),
+            )
+            .await
+            .unwrap(),
+            read,
+            "the body never showed the refused revision"
+        );
+        // Nothing is left staged: the Person and the bound Agent still revise.
+        let revised = revise(&mut session.harness, &document, &read["version"], "Mine\n")
+            .await
+            .unwrap();
+        assert_eq!(revised["changed"], true);
+        let agent_revised = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            agent(),
+            json!({"documentId":document,"baseVersion":revised["version"],"markdown":"Mine\n\nAnd the agent's\n"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent_revised["changed"], true);
+        tokio::time::sleep(FLUSH_RETRY * 2).await;
+        assert_eq!(
+            appends(&session),
+            before + 3,
+            "no refused write is retried in the background"
+        );
         session.harness.shutdown().await.unwrap();
     }
 
