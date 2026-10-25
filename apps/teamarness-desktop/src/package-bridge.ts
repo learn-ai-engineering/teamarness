@@ -2,7 +2,10 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PackageValue } from "@teamarness/package-ui-sdk";
 import type {
   HostUiEvent,
+  InspectedPackage,
   OpenPackageMount,
+  PackageChange,
+  PackageManagementBridge,
   PackageHostSnapshot,
   PackageHostStateNotification,
   PackageHostTransport,
@@ -67,5 +70,21 @@ const tauriPackageBridge: PackageShellBridge = {
 };
 
 export const packageBridge = Object.freeze(tauriPackageBridge);
+
+/** The Shell's own Package management commands. No Package UI Frame can reach them. */
+export function createTauriPackageManagementBridge(call: typeof invoke = invoke): PackageManagementBridge {
+  const management: PackageManagementBridge = {
+    chooseDirectory: () => call<string | null>("package_choose_directory"),
+    inspectDirectory: (directory: string) => call<InspectedPackage>("package_inspect_directory", { directory }),
+    install: ({ directory, expectedIdentity, acceptedRisks }) =>
+      call<PackageChange>("package_install", { directory, expectedIdentity, acceptedRisks: [...acceptedRisks] }),
+    reload: (identity: string) => call<PackageChange>("package_reload", { identity }),
+    remove: (identity: string) => call<PackageChange>("package_remove", { identity }),
+    writeOverride: ({ directory, expectedIdentity, acceptedRisks }) =>
+      call<PackageChange>("package_write_override", { directory, expectedIdentity, acceptedRisks: [...acceptedRisks] }),
+    restart: async () => { await call("app_restart"); },
+  };
+  return Object.freeze(management);
+}
 
 export type { PackageValue };

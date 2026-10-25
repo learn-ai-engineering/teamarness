@@ -28,6 +28,13 @@
     "allow-package-suspend",
     "allow-package-recover",
     "allow-package-dispose",
-    "allow-package-report-ui-fault"
+    "allow-package-report-ui-fault",
+    "allow-package-choose-directory",
+    "allow-package-inspect-directory",
+    "allow-package-install",
+    "allow-package-reload",
+    "allow-package-remove",
+    "allow-package-write-override",
+    "allow-app-restart"
   ]
 }

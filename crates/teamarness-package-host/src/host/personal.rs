@@ -44,7 +44,7 @@ use crate::values::{
 use crate::{
     AuthoringCatalogEntry, InstallPersonal, PackageErrorCode, PackageErrorEnvelope,
     PackageErrorStage, PackageHost, PackageHostOutcome, PortAvailability, ReloadPersonal,
-    RemovePersonal, instance, supervisor, ui,
+    RemoveOverride, RemovePersonal, WriteOverride, instance, supervisor, ui,
 };
 
 /// The Team tier as the Personal tier sees it: what it may consume, never change.
@@ -350,6 +350,70 @@ impl PackageHost {
         Ok(PackageHostOutcome::PersonalRemoved {
             revision: self.bump_revision().await,
         })
+    }
+
+    /// Writes an override registration for a bundled identity. The running Host
+    /// is unchanged; the override is admitted in the Team tier at the next open.
+    ///
+    /// The write holds the tier lock, so it never interleaves with a live
+    /// Personal write to the same file.
+    pub(crate) async fn write_override(
+        &self,
+        input: WriteOverride,
+    ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
+        let _tier = self.inner.personal.lock().await;
+        self.ensure_running().await?;
+        let identity = input.expected_identity.clone();
+        let request = RegistrationRequest {
+            directory: input.directory,
+            expected_identity: identity.clone(),
+            accepted_risks: input.accepted_risks,
+            override_application: true,
+        };
+        let config = self.inner.config.clone();
+        let proposed = self
+            .inner
+            .store
+            .run(move |store| {
+                if !registrations::application_identities(&config).contains(&identity) {
+                    // Only a bundled Package can be overridden; anything else is Personal.
+                    return Err(refusal(PackageErrorCode::InvalidRegistration, &identity));
+                }
+                let entries = registrations::read_entries(&config)?;
+                let proposed = registrations::propose(&config, &request, entries)?;
+                registrations::preflight(&config, store, &proposed, &identity)?;
+                Ok(proposed)
+            })
+            .await
+            .map_err(|failure| host_error(failure.code, PackageErrorStage::Storage))??;
+        self.write_registrations(proposed).await?;
+        Ok(PackageHostOutcome::OverrideWritten)
+    }
+
+    /// Removes an override registration. The running Host is unchanged; the
+    /// bundled Package returns at the next open. Data is kept.
+    pub(crate) async fn remove_override(
+        &self,
+        input: RemoveOverride,
+    ) -> Result<PackageHostOutcome, PackageErrorEnvelope> {
+        let _tier = self.inner.personal.lock().await;
+        self.ensure_running().await?;
+        let identity = input.identity;
+        let config = self.inner.config.clone();
+        let removing = identity.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut entries = registrations::read_entries(&config)?;
+            if !entries.iter().any(|entry| {
+                entry.expected_identity == removing.as_str() && entry.override_application
+            }) {
+                return Err(refusal(PackageErrorCode::NotRegistered, &removing));
+            }
+            entries.retain(|entry| entry.expected_identity != removing.as_str());
+            registrations::write_entries(&config, &entries)
+        })
+        .await
+        .map_err(|_| unavailable())??;
+        Ok(PackageHostOutcome::OverrideRemoved)
     }
 
     /// Refuses a Personal operation that started while the Host was stopping.
@@ -902,6 +966,83 @@ mod tests {
             );
         }
         drop(data);
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[tokio::test]
+    async fn an_override_write_waits_for_a_live_install_and_keeps_both_entries() {
+        let fixture = host_fixture::Fixture::node(&[("team", "com.example.team")]).await;
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let racer = fixture._root.path().join("sources/racer");
+        host_fixture::write_node_package(&racer, "com.example.racer");
+        let build = fixture._root.path().join("sources/team-build");
+        host_fixture::write_node_package(&build, "com.example.team");
+        let risks = || vec!["filesystem".into(), "network".into(), "process".into()];
+        let pause = Arc::new(Pause::default());
+        *host.inner.personal.instance_pause.lock().unwrap() = Some(pause.clone());
+
+        let installing = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(PackageHostCommand::InstallPersonal(InstallPersonal {
+                    directory: racer,
+                    expected_identity: "com.example.racer".parse().unwrap(),
+                    accepted_risks: risks(),
+                }))
+                .await
+            }
+        });
+        // The install has written its entry and holds the tier lock.
+        pause.reached.notified().await;
+        let mut overriding = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(PackageHostCommand::WriteOverride(WriteOverride {
+                    directory: build,
+                    expected_identity: "com.example.team".parse().unwrap(),
+                    accepted_risks: risks(),
+                }))
+                .await
+            }
+        });
+        // negative-wait: proves the override write does NOT run while the
+        // install holds the tier lock; there is no event for a waiting task.
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut overriding).await;
+        assert!(
+            early.is_err(),
+            "the override write waited for the tier lock"
+        );
+        pause.release.notify_one();
+        installing.await.unwrap().unwrap();
+        assert_eq!(
+            overriding.await.unwrap().unwrap(),
+            PackageHostOutcome::OverrideWritten
+        );
+
+        let entries = registrations::read_entries(&fixture.config).unwrap();
+        let mut identities: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.expected_identity.as_str(), entry.override_application))
+            .collect();
+        identities.sort_unstable();
+        assert_eq!(
+            identities,
+            vec![("com.example.racer", false), ("com.example.team", true)],
+            "neither write lost the other's entry"
+        );
+        // The override is file-only: the Team Package is still the bundled one.
+        let snapshot = host.snapshot().await;
+        let team = snapshot
+            .packages
+            .iter()
+            .find(|package| package.identity.as_str() == "com.example.team")
+            .unwrap();
+        assert_eq!(team.source, crate::PackageSourceKind::Bundled);
         host.execute(PackageHostCommand::Shutdown(ShutdownHost))
             .await
             .unwrap();

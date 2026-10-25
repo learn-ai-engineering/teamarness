@@ -1,6 +1,6 @@
 import type { Channel } from "@tauri-apps/api/core";
 import { describe, expect, it } from "vitest";
-import { createTauriPackageHostTransport } from "./package-bridge";
+import { createTauriPackageHostTransport, createTauriPackageManagementBridge } from "./package-bridge";
 
 describe("desktop Tauri Package transport", () => {
   it("maps a terminal Tauri stream message to termination rather than delivery", async () => {
@@ -66,5 +66,32 @@ describe("desktop Tauri Package transport", () => {
       onEvent: { marker: "channel" },
     });
     expect(calls[5]?.[1]).toEqual({ mount: "mount-1", code: "ui_exception" });
+  });
+});
+
+describe("desktop Tauri Package management bridge", () => {
+  it("calls the Shell-only management commands with their camelCase inputs", async () => {
+    const calls: Array<readonly [string, unknown]> = [];
+    const bridge = createTauriPackageManagementBridge((async (command: string, input: unknown) => {
+      calls.push([command, input]);
+      return null;
+    }) as never);
+    const input = { directory: "/p", expectedIdentity: "com.example.p", acceptedRisks: ["filesystem", "network", "process"] };
+    await bridge.chooseDirectory();
+    await bridge.inspectDirectory("/p");
+    await bridge.install(input);
+    await bridge.reload("com.example.p");
+    await bridge.remove("com.example.p");
+    await bridge.writeOverride(input);
+    await bridge.restart();
+    expect(calls).toEqual([
+      ["package_choose_directory", undefined],
+      ["package_inspect_directory", { directory: "/p" }],
+      ["package_install", input],
+      ["package_reload", { identity: "com.example.p" }],
+      ["package_remove", { identity: "com.example.p" }],
+      ["package_write_override", input],
+      ["app_restart", undefined],
+    ]);
   });
 });

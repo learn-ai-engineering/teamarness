@@ -217,9 +217,10 @@ async fn open_runtime_modules(
 pub fn run() {
     debug_assert_eq!(
         commands::COMMAND_NAMES.len() + package_commands::COMMAND_NAMES.len(),
-        24
+        31
     );
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .register_asynchronous_uri_scheme_protocol(
             "teamarness-package",
             |context, request, responder| {
@@ -254,6 +255,13 @@ pub fn run() {
             package_commands::package_recover,
             package_commands::package_dispose,
             package_commands::package_report_ui_fault,
+            package_commands::package_choose_directory,
+            package_commands::package_inspect_directory,
+            package_commands::package_install,
+            package_commands::package_reload,
+            package_commands::package_remove,
+            package_commands::package_write_override,
+            package_commands::app_restart,
         ])
         .setup(|app| {
             let ordinary_directory = app.path().app_data_dir()?;
@@ -339,8 +347,50 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| name.starts_with("allow-")))
                 .count(),
-            24
+            31
         );
+    }
+
+    /// Verifies: TEAM.SYS.SHELL-R05
+    #[test]
+    fn package_management_permissions_are_granted_only_to_the_main_shell() {
+        let management = [
+            "allow-package-choose-directory",
+            "allow-package-inspect-directory",
+            "allow-package-install",
+            "allow-package-reload",
+            "allow-package-remove",
+            "allow-package-write-override",
+            "allow-app-restart",
+        ];
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut main_shell = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let capability: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            let permissions = capability["permissions"].as_array().unwrap();
+            let granted = management
+                .iter()
+                .filter(|name| permissions.iter().any(|value| value == **name))
+                .count();
+            if capability["identifier"] == "main-shell" {
+                main_shell += 1;
+                assert_eq!(capability["webviews"], serde_json::json!(["main"]));
+                assert_eq!(granted, management.len());
+            } else {
+                assert_eq!(granted, 0, "{}", capability["identifier"]);
+            }
+            // The folder picker runs in Rust; no webview gets the dialog plugin's own commands.
+            assert!(!permissions.iter().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("dialog:"))
+            }));
+        }
+        assert_eq!(main_shell, 1);
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert!(config["app"]["security"].get("capabilities").is_none());
     }
 
     /// Verifies: TEAM.SYS-R01, TEAM.SYS.SHELL-R05

@@ -7,7 +7,8 @@ use teamarness_package_host::{
     PackageErrorCode, PackageErrorEnvelope, PackageErrorStage, PackageHostCommand,
     PackageHostConfig, PackageHostOutcome, PackageHostSnapshot, PackageHostState, PackageIdentity,
     ReadUiResource, ReconcileWorkspaces, RecoverPackage, RecoveryAction, ReloadPersonal,
-    RemovePersonal, ReportUiFault, ShutdownHost, SuspendPackage, UiRequest, UiResourceToken,
+    RemoveOverride, RemovePersonal, ReportUiFault, ShutdownHost, SuspendPackage, UiRequest,
+    UiResourceToken, WriteOverride,
 };
 
 #[test]
@@ -102,9 +103,17 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
         PackageHostCommand::RemovePersonal(RemovePersonal {
             identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
         }),
+        PackageHostCommand::WriteOverride(WriteOverride {
+            directory: PathBuf::from("/packages/tutorial"),
+            expected_identity: PackageIdentity::from_str("dev.teamarness.tutorial").unwrap(),
+            accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+        }),
+        PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity: PackageIdentity::from_str("dev.teamarness.tutorial").unwrap(),
+        }),
         PackageHostCommand::Shutdown(ShutdownHost),
     ];
-    assert_eq!(commands.len(), 17);
+    assert_eq!(commands.len(), 19);
     for command in &commands {
         match command {
             PackageHostCommand::ReconcileWorkspaces(_)
@@ -123,6 +132,8 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostCommand::InstallPersonal(_)
             | PackageHostCommand::ReloadPersonal(_)
             | PackageHostCommand::RemovePersonal(_)
+            | PackageHostCommand::WriteOverride(_)
+            | PackageHostCommand::RemoveOverride(_)
             | PackageHostCommand::Shutdown(_) => {}
         }
     }
@@ -189,9 +200,11 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
         PackageHostOutcome::PersonalRemoved {
             revision: HostRevision::INITIAL,
         },
+        PackageHostOutcome::OverrideWritten,
+        PackageHostOutcome::OverrideRemoved,
         PackageHostOutcome::Shutdown,
     ];
-    assert_eq!(outcomes.len(), 17);
+    assert_eq!(outcomes.len(), 19);
     for outcome in &outcomes {
         match outcome {
             PackageHostOutcome::Reconciled { .. }
@@ -210,6 +223,8 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostOutcome::PersonalInstalled { .. }
             | PackageHostOutcome::PersonalReloaded { .. }
             | PackageHostOutcome::PersonalRemoved { .. }
+            | PackageHostOutcome::OverrideWritten
+            | PackageHostOutcome::OverrideRemoved
             | PackageHostOutcome::Shutdown => {}
         }
     }

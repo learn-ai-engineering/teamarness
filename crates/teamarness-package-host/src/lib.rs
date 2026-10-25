@@ -40,9 +40,9 @@ pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     InstallPersonal, OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome,
-    ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal, RemovePersonal,
-    ReportUiFault, ShutdownHost, SuspendPackage, UiLoaderDescriptor, UiPackageContext, UiRequest,
-    UiWorkspaceContext,
+    ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal, RemoveOverride,
+    RemovePersonal, ReportUiFault, ShutdownHost, SuspendPackage, UiLoaderDescriptor,
+    UiPackageContext, UiRequest, UiWorkspaceContext, WriteOverride,
 };
 pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
@@ -178,6 +178,28 @@ impl PackageHost {
         entries
     }
 
+    /// Reads a Package Directory for a preview, as [`inspect_package_directory`]
+    /// does for this Host's configuration. It runs no Package code and changes
+    /// nothing, so it does not wait for a Personal operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the codes [`inspect_package_directory`] returns.
+    pub async fn inspect_directory(
+        &self,
+        directory: std::path::PathBuf,
+    ) -> Result<InspectedPackage, PackageErrorEnvelope> {
+        let config = self.inner.config.clone();
+        tokio::task::spawn_blocking(move || inspect_package_directory(&config, &directory))
+            .await
+            .map_err(|_| {
+                host_error(
+                    PackageErrorCode::DataDirectoryUnavailable,
+                    PackageErrorStage::Storage,
+                )
+            })?
+    }
+
     /// Opt in to bounded, process-local Port routing observations. A slow receiver reports lag.
     /// Observations are diagnostic only and cannot establish whether a command committed.
     pub fn observe_ports(&self) -> PortObservations {
@@ -251,6 +273,8 @@ impl PackageHost {
             PackageHostCommand::InstallPersonal(input) => self.install_personal(input).await,
             PackageHostCommand::ReloadPersonal(input) => self.reload_personal(input).await,
             PackageHostCommand::RemovePersonal(input) => self.remove_personal(input).await,
+            PackageHostCommand::WriteOverride(input) => self.write_override(input).await,
+            PackageHostCommand::RemoveOverride(input) => self.remove_override(input).await,
             PackageHostCommand::Shutdown(_) => self.shutdown_host().await,
         }
     }

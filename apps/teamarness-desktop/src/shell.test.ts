@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import type { Installation, Membership, PrincipalsSnapshot, Workspace } from "./contracts";
-import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
+import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge } from "./package-contracts";
 import type { PackageLifecycleResult } from "./package-shell";
 import { createInstallationPackageVisibility, type InstallationPackageVisibility } from "./package-visibility";
 import { Shell, type ShellFrame, type ShellRoute } from "./shell";
@@ -183,6 +183,25 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
   };
 }
 
+function unusedPackageManagement(calls: string[] = []): PackageManagementBridge {
+  const change = { revision: 1, restartRequired: false };
+  return {
+    chooseDirectory: async () => { calls.push("choose"); return "/Users/person/Packages/agent"; },
+    inspectDirectory: async (directory) => {
+      calls.push(`inspect:${directory}`);
+      return {
+        directory, identity: "com.example.agent", version: "1.0.0", displayName: "Agent",
+        capabilities: [], provided: [], consumed: [], kind: "new",
+      };
+    },
+    install: async () => { calls.push("install"); return change; },
+    reload: async (identity) => { calls.push(`reload:${identity}`); return change; },
+    remove: async (identity) => { calls.push(`remove:${identity}`); return change; },
+    writeOverride: async () => { calls.push("override"); return { revision: null, restartRequired: true }; },
+    restart: async () => { calls.push("restart"); },
+  };
+}
+
 function harness(
   shellScreen: HTMLElement = new Region() as unknown as HTMLElement,
   packageBehavior: Readonly<{
@@ -193,6 +212,7 @@ function harness(
   contextualNavigation: HTMLElement = new Region() as unknown as HTMLElement,
   agentActions: Readonly<{ addAgent?: (id: string, name: string) => Promise<void>; removeAgent?: (id: string, agentId: string) => Promise<void>; renameAgent?: (id: string, agentId: string, name: string) => Promise<void> }> = {},
   packageVisibility: InstallationPackageVisibility = createInstallationPackageVisibility({ storage: null }),
+  packageManagement: PackageManagementBridge = unusedPackageManagement(),
 ): {
   shell: Shell;
   frame: ShellFrame;
@@ -227,6 +247,7 @@ function harness(
       subscribe: () => () => undefined,
     },
     packageVisibility,
+    packageManagement,
     workspaceActions: {
       selectWorkspace: (workspaceId) => { calls.push(`workspace:${workspaceId}`); },
       createWorkspace: async () => undefined,
@@ -639,5 +660,110 @@ describe("Installation Package visibility", () => {
 
     screen.toggle.click();
     expect(test.frame.contextualNavigation.innerHTML).toContain("<span>One</span>");
+  });
+});
+
+class ManagementRegion extends Region {
+  public focusedSelector: string | null = null;
+  private readonly controls = new Map<string, TestControl>();
+
+  public control(key: string): TestControl {
+    let control = this.controls.get(key);
+    if (!control) {
+      control = new TestControl();
+      this.controls.set(key, control);
+    }
+    return control;
+  }
+
+  public querySelector(selector: string): (TestControl & { focus(): void }) | null {
+    if (selector === "[data-package-install-focus]" || selector === '[data-package-install-action="open"]') {
+      return Object.assign(new TestControl(), { focus: () => { this.focusedSelector = selector; } });
+    }
+    return null;
+  }
+
+  public querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector === "[data-package-install-action]") {
+      return [...this.innerHTML.matchAll(/data-package-install-action="([a-z-]+)"/g)].map(([, action]) => {
+        const control = this.control(`install:${action}`);
+        control.dataset.packageInstallAction = action!;
+        return control;
+      });
+    }
+    if (selector === "[data-package-registration-action]") {
+      return [...this.innerHTML.matchAll(/data-package-registration-action="([a-z-]+)" data-package-registration-index="(\d+)"/g)].map(([, action, index]) => {
+        const control = this.control(`registration:${action}:${index}`);
+        control.dataset.packageRegistrationAction = action!;
+        control.dataset.packageRegistrationIndex = index!;
+        return control;
+      });
+    }
+    return [];
+  }
+}
+
+describe("Add and manage Personal Packages from the Workspace page", () => {
+  const refusedRegistration = {
+    directory: "/Users/person/Packages/broken",
+    expectedIdentity: "com.example.broken",
+    override: false,
+    tier: "personal" as const,
+    status: { kind: "refused" as const, code: "artifact_changed" },
+  };
+
+  it("puts an Add Personal Package button in the Packages section heading", async () => {
+    const test = harness();
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    const html = test.frame.shellScreen.innerHTML;
+    expect(html).toMatch(/<h2 id="package-instances-heading">Package Instances<\/h2>\s*<button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package"/);
+  });
+
+  it("opens the add flow from +, previews, and installs only after Trust and install", async () => {
+    const screen = new ManagementRegion();
+    const calls: string[] = [];
+    const test = harness(screen as unknown as HTMLElement, {}, undefined, undefined, {}, undefined, unusedPackageManagement(calls));
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.control("install:open").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Choose folder"));
+    expect(screen.focusedSelector).toBe("[data-package-install-focus]");
+    screen.control("install:choose").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Preview: Agent"));
+    screen.control("install:continue").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Trust and install"));
+    expect(calls).toEqual(["choose", "inspect:/Users/person/Packages/agent"]);
+
+    screen.control("install:trust").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Installed on this device. It appears in all your Workspaces."));
+    expect(calls.at(-1)).toBe("install");
+  });
+
+  it("lists refused Personal registrations with Reload and Remove, and Remove keeps data", async () => {
+    const screen = new ManagementRegion();
+    const calls: string[] = [];
+    const withRefused = { ...packages, registrations: [refusedRegistration] };
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => withRefused }, undefined, undefined, {}, undefined, unusedPackageManagement(calls));
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(withRefused);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    expect(screen.innerHTML).toContain("com.example.broken");
+    expect(screen.innerHTML).toContain("A file changed after the manifest was written.");
+    expect(screen.innerHTML).toContain('aria-label="Reload com.example.broken"');
+    expect(screen.innerHTML).toContain('aria-label="Remove com.example.broken"');
+
+    screen.control("registration:reload:0").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Reloaded."));
+    expect(calls).toEqual(["reload:com.example.broken"]);
+
+    screen.control("registration:remove:0").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Its data stays on this device"));
+    screen.control("registration:confirm-remove:0").click();
+    await vi.waitFor(() => expect(calls.at(-1)).toBe("remove:com.example.broken"));
   });
 });

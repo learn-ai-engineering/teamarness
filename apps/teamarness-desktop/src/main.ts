@@ -1,6 +1,6 @@
 import "./styles.css";
 import { bridge } from "./bridge";
-import { packageBridge } from "./package-bridge";
+import { createTauriPackageManagementBridge, packageBridge } from "./package-bridge";
 import { browserFrameDom, browserThemeSource, PackageMountController } from "./package-mount";
 import { createPackageShell } from "./package-shell";
 import { createInstallationPackageVisibility } from "./package-visibility";
@@ -27,6 +27,7 @@ const packageShell = createPackageShell(
 
 const shell = new Shell(frame, {
   packageShell,
+  packageManagement: createTauriPackageManagementBridge(),
   theme,
   packageVisibility: createInstallationPackageVisibility(),
   workspaceActions: {

@@ -1,25 +1,28 @@
 #![allow(clippy::result_large_err)]
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
-use tauri::{State, ipc::Channel};
+use tauri::{AppHandle, Manager, State, ipc::Channel};
+use tauri_plugin_dialog::DialogExt;
 use teamarness_package_host::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    HostRevision, OpenUiMount, OpenUiSubscription, PackageErrorCode, PackageErrorStage,
-    PackageHostCommand, PackageHostNotification, PackageHostOutcome,
-    PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey, PackageValue,
-    RecoverPackage, ReportUiFault, SuspendPackage, UiMountId, UiRequest, UiRequestId,
-    UiSubscriptionId, WorkspaceId,
+    HostRevision, InstallPersonal, OpenUiMount, OpenUiSubscription, PackageErrorCode,
+    PackageErrorStage, PackageHost, PackageHostCommand, PackageHostNotification,
+    PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey,
+    PackageValue, RecoverPackage, ReloadPersonal, RemoveOverride, RemovePersonal, ReportUiFault,
+    SuspendPackage, UiMountId, UiRequest, UiRequestId, UiSubscriptionId, WorkspaceId,
+    WriteOverride,
 };
 
 use crate::DesktopState;
 use crate::package_dto::{
-    HostStateNotificationDto, OpenUiMountDto, PackageHostSnapshotDto, PackageInstanceKeyDto,
-    UiStreamMessageDto,
+    HostStateNotificationDto, InspectedPackageDto, OpenUiMountDto, PackageChangeDto,
+    PackageHostSnapshotDto, PackageInstanceKeyDto, UiStreamMessageDto,
 };
 use crate::package_error::{PackageBridgeError, invalid_input};
 
-pub const COMMAND_NAMES: [&str; 13] = [
+pub const COMMAND_NAMES: [&str; 20] = [
     "package_catalog_snapshot",
     "package_subscribe_host_state",
     "package_open_mount",
@@ -33,6 +36,13 @@ pub const COMMAND_NAMES: [&str; 13] = [
     "package_recover",
     "package_dispose",
     "package_report_ui_fault",
+    "package_choose_directory",
+    "package_inspect_directory",
+    "package_install",
+    "package_reload",
+    "package_remove",
+    "package_write_override",
+    "app_restart",
 ];
 
 #[tauri::command]
@@ -307,6 +317,205 @@ pub async fn package_report_ui_fault(
     Ok(())
 }
 
+/// Shows the native folder picker. Returns the chosen absolute path, or `None`
+/// when the person cancels.
+#[tauri::command]
+pub async fn package_choose_directory(
+    app: AppHandle,
+) -> Result<Option<String>, PackageBridgeError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut picker = app.dialog().file().set_title("Choose a Package folder");
+    if let Some(window) = app.get_webview_window("main") {
+        picker = picker.set_parent(&window);
+    }
+    picker.pick_folder(move |chosen| {
+        let _ = sender.send(chosen);
+    });
+    let Some(chosen) = receiver.await.ok().flatten() else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|_| {
+        invalid_input(
+            PackageErrorCode::InvalidRegistration,
+            PackageErrorStage::Discovery,
+        )
+    })?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Reads a Package Directory for the install preview. Runs no Package code.
+#[tauri::command]
+pub async fn package_inspect_directory(
+    directory: String,
+    state: State<'_, DesktopState>,
+) -> Result<InspectedPackageDto, PackageBridgeError> {
+    let host = state.package_host()?;
+    inspect_directory(&host, directory).await
+}
+
+/// Registers and starts a Personal Package after the person accepted its risks.
+#[tauri::command]
+pub async fn package_install(
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let host = state.package_host()?;
+    install(&host, directory, expected_identity, accepted_risks).await
+}
+
+/// Re-admits a Personal Package from its directory after a rebuild.
+#[tauri::command]
+pub async fn package_reload(
+    identity: String,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let host = state.package_host()?;
+    reload(&host, identity).await
+}
+
+/// Removes a Personal Package now, or an override at the next start. Data is kept.
+#[tauri::command]
+pub async fn package_remove(
+    identity: String,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let host = state.package_host()?;
+    remove(&host, identity).await
+}
+
+/// Writes an override of a Team Package. It applies at the next start.
+#[tauri::command]
+pub async fn package_write_override(
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let host = state.package_host()?;
+    write_override(&host, directory, expected_identity, accepted_risks).await
+}
+
+/// Stops the Package Host and Core the way quitting does, then starts Teamarness again.
+#[tauri::command]
+pub async fn app_restart(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), PackageBridgeError> {
+    let state = state.inner().clone();
+    if !state.lifecycle.begin_shutdown() {
+        return Err(invalid_input(
+            PackageErrorCode::ShuttingDown,
+            PackageErrorStage::Shutdown,
+        ));
+    }
+    state.shutdown().await;
+    // The exit handler sees the completed shutdown and lets the restart proceed.
+    app.request_restart();
+    Ok(())
+}
+
+async fn inspect_directory(
+    host: &PackageHost,
+    directory: String,
+) -> Result<InspectedPackageDto, PackageBridgeError> {
+    Ok(host
+        .inspect_directory(PathBuf::from(directory))
+        .await
+        .map_err(PackageBridgeError::from)?
+        .into())
+}
+
+async fn install(
+    host: &PackageHost,
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let outcome = host
+        .execute(PackageHostCommand::InstallPersonal(InstallPersonal {
+            directory: PathBuf::from(directory),
+            expected_identity: parse_identity(expected_identity)?,
+            accepted_risks,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    let PackageHostOutcome::PersonalInstalled { revision } = outcome else {
+        unreachable!("InstallPersonal has one success outcome")
+    };
+    Ok(PackageChangeDto::live(revision))
+}
+
+async fn reload(
+    host: &PackageHost,
+    identity: String,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let outcome = host
+        .execute(PackageHostCommand::ReloadPersonal(ReloadPersonal {
+            identity: parse_identity(identity)?,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    let PackageHostOutcome::PersonalReloaded { revision } = outcome else {
+        unreachable!("ReloadPersonal has one success outcome")
+    };
+    Ok(PackageChangeDto::live(revision))
+}
+
+async fn remove(
+    host: &PackageHost,
+    identity: String,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let identity = parse_identity(identity)?;
+    let removed = host
+        .execute(PackageHostCommand::RemovePersonal(RemovePersonal {
+            identity: identity.clone(),
+        }))
+        .await;
+    match removed {
+        Ok(PackageHostOutcome::PersonalRemoved { revision }) => {
+            Ok(PackageChangeDto::live(revision))
+        }
+        Ok(_) => unreachable!("RemovePersonal has one success outcome"),
+        // A Team identity changes only through its override, which applies at the next start.
+        Err(error) if error.code == PackageErrorCode::OverrideRequired => {
+            host.execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+                identity,
+            }))
+            .await
+            .map_err(PackageBridgeError::from)?;
+            Ok(PackageChangeDto::after_restart())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn write_override(
+    host: &PackageHost,
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    host.execute(PackageHostCommand::WriteOverride(WriteOverride {
+        directory: PathBuf::from(directory),
+        expected_identity: parse_identity(expected_identity)?,
+        accepted_risks,
+    }))
+    .await
+    .map_err(PackageBridgeError::from)?;
+    Ok(PackageChangeDto::after_restart())
+}
+
+fn parse_identity(value: String) -> Result<PackageIdentity, PackageBridgeError> {
+    PackageIdentity::from_str(&value).map_err(|_| {
+        invalid_input(
+            PackageErrorCode::InvalidPackageIdentity,
+            PackageErrorStage::Discovery,
+        )
+    })
+}
+
 async fn forward_ui_events(
     host: std::sync::Arc<teamarness_package_host::PackageHost>,
     mut receiver: teamarness_package_host::PackageHostSubscription,
@@ -378,7 +587,7 @@ mod tests {
 
     #[test]
     fn command_registry_is_generic_and_exact() {
-        assert_eq!(COMMAND_NAMES.len(), 13);
+        assert_eq!(COMMAND_NAMES.len(), 20);
         let names = COMMAND_NAMES.join(" ");
         for forbidden in [
             "reference",
@@ -582,10 +791,44 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let application = root.path().join("application");
         let private = root.path().join("private");
-        let package = application.join("fixture");
+        fs::create_dir_all(&private).unwrap();
+        write_package(&application.join("fixture"), FIXTURE);
+        let index = application.join("application-packages.v1.json");
+        fs::write(
+            &index,
+            br#"{"schemaVersion":1,"packages":[{"directory":"fixture"}]}"#,
+        )
+        .unwrap();
+        let core = Arc::new(
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
+                .await
+                .unwrap(),
+        );
+        core.create_workspace("First Workspace").unwrap();
+        let host = Arc::new(
+            PackageHost::open(
+                PackageHostConfig::new(
+                    application,
+                    index,
+                    private,
+                    InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
+                ),
+                Arc::clone(&core),
+            )
+            .await
+            .unwrap(),
+        );
+        (root, core, host)
+    }
+
+    const FIXTURE: &str = "com.example.desktop-fixture";
+    const PERSONAL: &str = "com.example.desktop-personal";
+    const RISKS: [&str; 3] = ["filesystem", "network", "process"];
+
+    /// Writes a Package Directory with a Node Backend and a small UI contract.
+    fn write_package(package: &Path, identity: &str) {
         fs::create_dir_all(package.join("backend")).unwrap();
         fs::create_dir_all(package.join("ui")).unwrap();
-        fs::create_dir_all(&private).unwrap();
         let backend = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../contracts/package-process/v1/fixtures/node-package-process.mjs"),
@@ -619,7 +862,7 @@ mod tests {
             package.join("teamarness.package.json"),
             serde_json::to_vec(&serde_json::json!({
                 "schemaVersion": 1,
-                "identity": "com.example.desktop-fixture",
+                "identity": identity,
                 "version": "1.0.0",
                 "presentation": {"displayName": "Desktop fixture"},
                 "protocol": {"major": 1, "minMinor": 0, "maxMinor": 0},
@@ -642,32 +885,183 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let index = application.join("application-packages.v1.json");
-        fs::write(
-            &index,
-            br#"{"schemaVersion":1,"packages":[{"directory":"fixture"}]}"#,
-        )
-        .unwrap();
-        let core = Arc::new(
-            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
-                .await
-                .unwrap(),
-        );
-        core.create_workspace("First Workspace").unwrap();
-        let host = Arc::new(
-            PackageHost::open(
-                PackageHostConfig::new(
-                    application,
-                    index,
-                    private,
-                    InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
-                ),
-                Arc::clone(&core),
+    }
+
+    fn registration_file(root: &tempfile::TempDir) -> Option<Vec<u8>> {
+        fs::read(root.path().join("private/packages/registrations.v1.json")).ok()
+    }
+
+    fn code(error: PackageBridgeError) -> String {
+        serde_json::to_value(error).unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn identities(host: &PackageHost) -> Vec<String> {
+        host.snapshot()
+            .await
+            .instances
+            .into_iter()
+            .map(|instance| instance.key.package_identity.to_string())
+            .collect()
+    }
+
+    async fn close(root: tempfile::TempDir, core: Arc<CoreRuntime>, host: Arc<PackageHost>) {
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+        core.shutdown().await.unwrap();
+        drop(root);
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn installing_a_valid_directory_adds_its_instance_and_remove_drops_it() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/personal");
+            write_package(&directory, PERSONAL);
+            let path = directory.to_string_lossy().into_owned();
+
+            let inspected =
+                serde_json::to_value(inspect_directory(&host, path.clone()).await.unwrap())
+                    .unwrap();
+            assert_eq!(inspected["identity"], PERSONAL);
+            assert_eq!(inspected["displayName"], "Desktop fixture");
+            assert_eq!(inspected["kind"], "new");
+            assert!(inspected.get("description").is_none());
+            assert_eq!(
+                inspected["capabilities"][0]["identity"],
+                "teamarness.workspace-context"
+            );
+
+            let installed = install(
+                &host,
+                path,
+                PERSONAL.into(),
+                RISKS.map(str::to_owned).to_vec(),
             )
             .await
-            .unwrap(),
-        );
-        (root, core, host)
+            .unwrap();
+            let installed = serde_json::to_value(installed).unwrap();
+            assert_eq!(installed["restartRequired"], false);
+            let snapshot = host.snapshot().await;
+            assert_eq!(installed["revision"], snapshot.revision.0);
+            assert!(identities(&host).await.contains(&PERSONAL.to_owned()));
+            assert!(registration_file(&root).is_some());
+
+            let removed =
+                serde_json::to_value(remove(&host, PERSONAL.into()).await.unwrap()).unwrap();
+            assert_eq!(removed["restartRequired"], false);
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn an_invalid_directory_leaves_the_snapshot_and_file_unchanged() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let empty = root.path().join("sources/empty");
+            fs::create_dir_all(&empty).unwrap();
+            let tampered = root.path().join("sources/tampered");
+            write_package(&tampered, PERSONAL);
+            fs::write(tampered.join("backend/package.mjs"), b"// changed").unwrap();
+            let before = host.snapshot().await;
+
+            for (directory, expected) in [
+                (empty, "manifest_malformed"),
+                (tampered, "artifact_changed"),
+            ] {
+                let path = directory.to_string_lossy().into_owned();
+                let inspected = inspect_directory(&host, path.clone()).await.unwrap_err();
+                assert_eq!(code(inspected), expected);
+                let refused = install(
+                    &host,
+                    path,
+                    PERSONAL.into(),
+                    RISKS.map(str::to_owned).to_vec(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(code(refused), expected);
+            }
+            let relative = install(
+                &host,
+                "sources/personal".into(),
+                PERSONAL.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code(relative), "invalid_registration");
+            let after = host.snapshot().await;
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            assert_eq!(registration_file(&root), None);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn an_override_is_written_for_a_restart_and_removed_the_same_way() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/team-build");
+            write_package(&directory, FIXTURE);
+            let path = directory.to_string_lossy().into_owned();
+            let inspected =
+                serde_json::to_value(inspect_directory(&host, path.clone()).await.unwrap())
+                    .unwrap();
+            assert_eq!(inspected["kind"], "overrides_team");
+            let refused = install(
+                &host,
+                path.clone(),
+                FIXTURE.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code(refused), "override_required");
+            let before = host.snapshot().await;
+
+            let written = write_override(
+                &host,
+                path,
+                FIXTURE.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(written).unwrap(),
+                serde_json::json!({"revision": null, "restartRequired": true})
+            );
+            let file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            assert_eq!(file["registrations"][0]["overrideApplication"], true);
+            let after = host.snapshot().await;
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(
+                after.instances[0].process_generation,
+                before.instances[0].process_generation
+            );
+
+            // Remove of a Team identity removes its override, also on restart.
+            let removed = remove(&host, FIXTURE.into()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(removed).unwrap()["restartRequired"],
+                true
+            );
+            let file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            assert_eq!(file["registrations"], serde_json::json!([]));
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
     }
 
     fn digest(bytes: &[u8]) -> String {

@@ -261,7 +261,7 @@ fn inspect(
 /// The identities the application index registers, read from each manifest's
 /// `identity` field only. A bundled Package that fails admission still owns its
 /// identity, so an installation registration for it still needs an override.
-fn application_identities(config: &PackageHostConfig) -> BTreeSet<PackageIdentity> {
+pub(crate) fn application_identities(config: &PackageHostConfig) -> BTreeSet<PackageIdentity> {
     catalog::application_registrations(config)
         .unwrap_or_default()
         .into_iter()

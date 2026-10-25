@@ -14,9 +14,9 @@ use std::time::Duration;
 use teamarness_package_host::{
     InstallPersonal, LifecycleState, MountState, OpenUiMount, PackageErrorCode,
     PackageErrorEnvelope, PackageHost, PackageHostCommand, PackageHostOutcome, PackageIdentity,
-    PackageInstanceKey, PackageInstanceSnapshot, PackageTier, PortStage, ReconcileWorkspaces,
-    RegistrationStatus, ReloadPersonal, RemovePersonal, ShutdownHost, UiMountId, UiRequest,
-    UiRequestId,
+    PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTier, PortStage,
+    ReconcileWorkspaces, RegistrationStatus, ReloadPersonal, RemoveOverride, RemovePersonal,
+    ShutdownHost, UiMountId, UiRequest, UiRequestId, WriteOverride,
 };
 
 const TEAM: &str = "com.example.team";
@@ -698,4 +698,119 @@ async fn a_port_call_in_flight_when_its_provider_is_removed_ends_uncertain() {
     assert_active(&instances(&live.host, "com.example.consumer").await, 2);
     live.assert_team_undisturbed().await;
     live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09
+#[tokio::test]
+async fn an_override_is_written_to_the_file_only_and_applies_after_reopen() {
+    let live = Live::open().await;
+    let build = live.package("team-build", TEAM, Ports::None);
+    let revision = live.host.snapshot().await.revision;
+    let write = |risks: Vec<String>, identity: &str, directory: &Path| {
+        PackageHostCommand::WriteOverride(WriteOverride {
+            directory: directory.to_owned(),
+            expected_identity: identity.parse().unwrap(),
+            accepted_risks: risks,
+        })
+    };
+
+    // Refusals leave the file absent.
+    let incomplete = live
+        .host
+        .execute(write(vec!["filesystem".into()], TEAM, &build))
+        .await
+        .unwrap_err();
+    assert_eq!(incomplete.code, PackageErrorCode::TrustEvidenceMissing);
+    let personal = live.package("personal", "com.example.personal", Ports::None);
+    let not_team = live
+        .host
+        .execute(write(
+            RISKS.map(str::to_owned).to_vec(),
+            "com.example.personal",
+            &personal,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(not_team.code, PackageErrorCode::InvalidRegistration);
+    assert_eq!(live.registration_file(), None);
+
+    let outcome = live
+        .host
+        .execute(write(RISKS.map(str::to_owned).to_vec(), TEAM, &build))
+        .await
+        .unwrap();
+    assert_eq!(outcome, PackageHostOutcome::OverrideWritten);
+    let file: serde_json::Value =
+        serde_json::from_slice(&live.registration_file().unwrap()).unwrap();
+    assert_eq!(file["registrations"][0]["expectedIdentity"], TEAM);
+    assert_eq!(file["registrations"][0]["overrideApplication"], true);
+    // The running Host is unchanged: same revision, same Team Package and Instances.
+    let snapshot = live.host.snapshot().await;
+    assert_eq!(snapshot.revision, revision);
+    let source = |snapshot: &teamarness_package_host::PackageHostSnapshot| {
+        snapshot
+            .packages
+            .iter()
+            .find(|package| package.identity.as_str() == TEAM)
+            .map(|package| package.source)
+    };
+    assert_eq!(source(&snapshot), Some(PackageSourceKind::Bundled));
+    live.assert_team_undisturbed().await;
+
+    // A live Personal operation cannot change the override.
+    let reload = live.reload(TEAM).await.unwrap_err();
+    assert_eq!(reload.code, PackageErrorCode::OverrideRequired);
+
+    let config = live.fixture.config.clone();
+    let core = live.fixture.core.clone();
+    live.host
+        .execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+    let reopened = PackageHost::open(config.clone(), core.clone())
+        .await
+        .unwrap();
+    let snapshot = reopened.snapshot().await;
+    assert_eq!(source(&snapshot), Some(PackageSourceKind::Local));
+    let registration = snapshot
+        .registrations
+        .iter()
+        .find(|registration| registration.expected_identity == TEAM)
+        .unwrap();
+    assert_eq!(registration.tier, PackageTier::Team);
+    assert_eq!(registration.status, RegistrationStatus::Admitted);
+
+    // Removing the override is file-only too, and needs an override entry.
+    let missing = reopened
+        .execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity: "com.example.personal".parse().unwrap(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code, PackageErrorCode::NotRegistered);
+    let removed = reopened
+        .execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity: TEAM.parse().unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(removed, PackageHostOutcome::OverrideRemoved);
+    assert_eq!(
+        source(&reopened.snapshot().await),
+        Some(PackageSourceKind::Local)
+    );
+    reopened
+        .execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+    let restored = PackageHost::open(config, core).await.unwrap();
+    assert_eq!(
+        source(&restored.snapshot().await),
+        Some(PackageSourceKind::Bundled)
+    );
+    restored
+        .execute(PackageHostCommand::Shutdown(ShutdownHost))
+        .await
+        .unwrap();
+    drop(live.fixture);
 }

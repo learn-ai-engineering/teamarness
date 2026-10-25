@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-write-override"
+description = "Enables the package_write_override command without any pre-configured scope."
+commands.allow = ["package_write_override"]
+
+[[permission]]
+identifier = "deny-package-write-override"
+description = "Denies the package_write_override command without any pre-configured scope."
+commands.deny = ["package_write_override"]

@@ -42,6 +42,45 @@ export type PackageHostSnapshot = Readonly<{
   registrations: readonly PackageRegistration[];
 }>;
 
+/** A Package Directory read for the install preview. Inspecting runs no Package code. */
+export type InspectedPackage = Readonly<{
+  directory: string;
+  identity: string;
+  version: string;
+  displayName: string;
+  description?: string;
+  author?: string;
+  homepage?: string;
+  capabilities: readonly Readonly<{ identity: string; major: number; minMinor: number; maxMinor: number }>[];
+  provided: readonly Readonly<{ identity: string; major: number; minor: number; description: string }>[];
+  consumed: readonly Readonly<{ identity: string; major: number; minMinor: number; maxMinor: number; required: boolean }>[];
+  kind: "new" | "reload" | "replaces_registration" | "overrides_team";
+}>;
+
+/** The result of an install, reload, remove, or override write. */
+export type PackageChange = Readonly<{
+  /** The Host revision that shows a live change; `null` when the change waits for a restart. */
+  revision: number | null;
+  restartRequired: boolean;
+}>;
+
+export type PackageRegistrationInput = Readonly<{
+  directory: string;
+  expectedIdentity: string;
+  acceptedRisks: readonly string[];
+}>;
+
+/** The Shell-only commands that add and manage Personal Packages on this device. */
+export interface PackageManagementBridge {
+  chooseDirectory(): Promise<string | null>;
+  inspectDirectory(directory: string): Promise<InspectedPackage>;
+  install(input: PackageRegistrationInput): Promise<PackageChange>;
+  reload(identity: string): Promise<PackageChange>;
+  remove(identity: string): Promise<PackageChange>;
+  writeOverride(input: PackageRegistrationInput): Promise<PackageChange>;
+  restart(): Promise<void>;
+}
+
 export type PackageLoader = Readonly<{
   token: string;
   entrypoint: string;

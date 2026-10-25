@@ -321,7 +321,8 @@ export function renderShell(
     <section class="screen-section" aria-labelledby="invitations-heading"><h2 id="invitations-heading">Workspace Invitations</h2><p>Create a one-use Workspace Invitation.</p>
     <button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
     <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section>
-    <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
+    <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><div class="section-heading"><h2 id="package-instances-heading">Package Instances</h2>
+      <button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package" title="Add Personal Package">+</button></div>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
 }
 
 function routeWorkspaceId(route: ShellRoute): string | null {

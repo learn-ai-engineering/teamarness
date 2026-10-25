@@ -23,6 +23,13 @@ const COMMANDS: &[&str] = &[
     "package_recover",
     "package_dispose",
     "package_report_ui_fault",
+    "package_choose_directory",
+    "package_inspect_directory",
+    "package_install",
+    "package_reload",
+    "package_remove",
+    "package_write_override",
+    "app_restart",
 ];
 
 fn main() {

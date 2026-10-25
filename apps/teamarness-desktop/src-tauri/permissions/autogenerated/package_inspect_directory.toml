@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-inspect-directory"
+description = "Enables the package_inspect_directory command without any pre-configured scope."
+commands.allow = ["package_inspect_directory"]
+
+[[permission]]
+identifier = "deny-package-inspect-directory"
+description = "Denies the package_inspect_directory command without any pre-configured scope."
+commands.deny = ["package_inspect_directory"]

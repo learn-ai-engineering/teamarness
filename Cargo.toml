@@ -46,6 +46,7 @@ sha2 = { version = "=0.11.0", default-features = false, features = ["alloc"] }
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 tauri = "=2.11.5"
 tauri-build = "=2.6.3"
+tauri-plugin-dialog = "=2.7.3"
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 uuid = { version = "=1.26.1", default-features = false, features = ["v4"] }

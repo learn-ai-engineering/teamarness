@@ -1,4 +1,5 @@
-import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
+import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge } from "./package-contracts";
+import { PackageManagementController } from "./package-install";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import type { InstallationPackageVisibility } from "./package-visibility";
 import {
@@ -55,6 +56,7 @@ type WorkspaceActions = Readonly<{
 
 type ShellOptions = Readonly<{
   packageShell: PackageRouter;
+  packageManagement: PackageManagementBridge;
   theme: InstallationThemeController;
   packageVisibility: InstallationPackageVisibility;
   workspaceActions: WorkspaceActions;
@@ -72,12 +74,24 @@ export class Shell {
   private packageActionTargets: readonly PackageInstanceKey[] = [];
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
+  private readonly packageManagement: PackageManagementController;
 
   public constructor(
     private readonly shellFrame: ShellFrame,
     private readonly options: ShellOptions,
   ) {
     this.shellFrame.packageMount.hidden = true;
+    this.packageManagement = new PackageManagementController(options.packageManagement, {
+      changed: () => { this.renderPackageConsumers(); },
+      refresh: async () => {
+        try {
+          this.updatePackages(await this.options.packageShell.refresh());
+        } catch (error: unknown) {
+          this.updatePackageSnapshotFailure();
+          throw error;
+        }
+      },
+    });
   }
 
   public frame(): ShellFrame { return this.shellFrame; }
@@ -251,12 +265,12 @@ export class Shell {
   private renderSelectedScreen(): void {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
-      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${renderPackageInstanceSettings(
+      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
         this.packageActionTargets,
         this.packageLifecycleFeedback,
         this.options.packageVisibility,
-      )}`
+      )}${this.packageManagement.renderRegistrations(this.packageSnapshot)}`
       : undefined;
     this.shellFrame.shellScreen.innerHTML = renderShell(
       this.workspacePresentation,
@@ -264,6 +278,41 @@ export class Shell {
       { packageSettings },
     );
     this.bindSelectedScreen();
+    this.focusPackageInstallStep();
+  }
+
+  private focusPackageInstallStep(): void {
+    if (!this.packageManagement.takeFocusRequest() || !hasQueries(this.shellFrame.shellScreen)) return;
+    const selector = this.packageManagement.state().kind === "closed"
+      ? '[data-package-install-action="open"]'
+      : "[data-package-install-focus]";
+    this.shellFrame.shellScreen.querySelector<HTMLElement>(selector)?.focus();
+  }
+
+  private bindPackageManagement(): void {
+    const screen = this.shellFrame.shellScreen;
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-install-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void this.packageManagement.installAction(button.dataset.packageInstallAction);
+      });
+    });
+    screen.querySelector<HTMLFormElement>("#package-install-path-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const path = screen.querySelector<HTMLInputElement>("#package-install-path");
+      if (path) void this.packageManagement.inspectPath(path.value);
+    });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-registration-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const identity = this.packageManagement.registrationIdentity(
+          this.packageSnapshot,
+          Number(button.dataset.packageRegistrationIndex),
+        );
+        if (identity) void this.packageManagement.registrationAction(button.dataset.packageRegistrationAction, identity);
+      });
+    });
+    screen.querySelector<HTMLButtonElement>("[data-package-change-restart]")?.addEventListener("click", () => {
+      void this.packageManagement.restartAfterChange();
+    });
   }
 
   private bindSelectedScreen(): void {
@@ -326,6 +375,7 @@ export class Shell {
       void this.options.workspaceActions.retry();
     });
     this.bindPackageSnapshotRetry(this.shellFrame.shellScreen);
+    this.bindPackageManagement();
     this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-action]").forEach((button) => {
       button.addEventListener("click", () => {
         const index = Number(button.dataset.packageActionIndex);

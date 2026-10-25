@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use teamarness_package_host::{
-    HostStateNotification, InstallationRegistrationSnapshot, PackageCatalogEntry,
-    PackageHostSnapshot, PackageInstanceKey, PackageInstanceSnapshot, PackageValue,
-    RegistrationStatus, UiEventNotification, UiLoaderDescriptor, UiStreamCompletedNotification,
+    HostRevision, HostStateNotification, InspectedPackage, InstallationRegistrationSnapshot,
+    PackageCatalogEntry, PackageHostSnapshot, PackageInstanceKey, PackageInstanceSnapshot,
+    PackageValue, RegistrationStatus, UiEventNotification, UiLoaderDescriptor,
+    UiStreamCompletedNotification,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +185,130 @@ impl From<UiLoaderDescriptor> for UiLoaderDto {
                 id: value.workspace.id.into(),
                 name: value.workspace.name,
             },
+        }
+    }
+}
+
+/// A Package Directory read for the install preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedPackageDto {
+    directory: String,
+    identity: String,
+    version: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    homepage: Option<String>,
+    capabilities: Vec<InspectedCapabilityDto>,
+    provided: Vec<ProvidedPortContractDto>,
+    consumed: Vec<ConsumedPortContractDto>,
+    /// `new`, `reload`, `replaces_registration`, or `overrides_team`.
+    kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedCapabilityDto {
+    identity: String,
+    major: u16,
+    min_minor: u16,
+    max_minor: u16,
+}
+
+/// A Port contract the Package provides, without its Port schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvidedPortContractDto {
+    identity: String,
+    major: u16,
+    minor: u16,
+    description: String,
+}
+
+/// A Port contract the Package consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedPortContractDto {
+    identity: String,
+    major: u16,
+    min_minor: u16,
+    max_minor: u16,
+    required: bool,
+}
+
+impl From<InspectedPackage> for InspectedPackageDto {
+    fn from(value: InspectedPackage) -> Self {
+        Self {
+            directory: value.directory.to_string_lossy().into_owned(),
+            identity: value.identity.into(),
+            version: value.version,
+            display_name: value.presentation.display_name,
+            description: value.presentation.description,
+            author: value.presentation.author,
+            homepage: value.presentation.homepage,
+            capabilities: value
+                .capabilities
+                .into_iter()
+                .map(|capability| InspectedCapabilityDto {
+                    identity: capability.identity,
+                    major: capability.major,
+                    min_minor: capability.min_minor,
+                    max_minor: capability.max_minor,
+                })
+                .collect(),
+            provided: value
+                .provided
+                .into_iter()
+                .map(|contract| ProvidedPortContractDto {
+                    identity: contract.identity,
+                    major: contract.major,
+                    minor: contract.minor,
+                    description: contract.description,
+                })
+                .collect(),
+            consumed: value
+                .consumed
+                .into_iter()
+                .map(|contract| ConsumedPortContractDto {
+                    identity: contract.identity,
+                    major: contract.major,
+                    min_minor: contract.min_minor,
+                    max_minor: contract.max_minor,
+                    required: contract.required,
+                })
+                .collect(),
+            kind: wire_name(value.kind),
+        }
+    }
+}
+
+/// The result of an install, reload, remove, or override write.
+///
+/// A live change carries the Host revision that shows it. A change to an
+/// override has no revision: it applies only after Teamarness restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageChangeDto {
+    revision: Option<u64>,
+    restart_required: bool,
+}
+
+impl PackageChangeDto {
+    pub fn live(revision: HostRevision) -> Self {
+        Self {
+            revision: Some(revision.0),
+            restart_required: false,
+        }
+    }
+
+    pub fn after_restart() -> Self {
+        Self {
+            revision: None,
+            restart_required: true,
         }
     }
 }

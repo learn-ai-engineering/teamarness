@@ -281,6 +281,53 @@ h1, h2, p { margin-top: 0; }
 .package-lifecycle-feedback p { margin-bottom: 0.65rem; }
 .package-snapshot-failure button,
 .package-lifecycle-feedback button { width: 100%; }
+.package-add {
+  display: grid;
+  flex: none;
+  width: 2.25rem;
+  height: 2.25rem;
+  place-items: center;
+  padding: 0;
+  font-size: 1.25rem;
+  line-height: 1;
+}
+.package-install,
+.package-registrations { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
+.package-install {
+  padding: 1rem;
+  background: var(--teamarness-color-background);
+  border: 1px solid var(--teamarness-color-border);
+  border-radius: var(--teamarness-radius-control);
+}
+.package-registrations { margin: 1.25rem 0 0; padding-top: 1rem; border-top: 1px solid var(--teamarness-color-border); }
+.package-install h3,
+.package-registrations h3 { margin: 0; font-size: 1rem; }
+.package-registrations h4 { margin: 0 0 0.25rem; font-size: 0.95rem; overflow-wrap: anywhere; }
+.package-install h3:focus { outline: none; }
+.package-install h3:focus-visible { outline: 3px solid var(--teamarness-color-focus); outline-offset: 2px; }
+.package-install p,
+.package-registrations p { margin: 0; overflow-wrap: anywhere; }
+.package-install-note { color: var(--teamarness-color-accent); font-weight: 700; }
+.package-preview { display: grid; gap: 0.5rem; margin: 0; }
+.package-preview div { display: grid; grid-template-columns: minmax(7rem, 0.35fr) 1fr; gap: 1rem; }
+.package-preview dt { color: var(--teamarness-color-text-muted); font-weight: 700; }
+.package-preview dd { margin: 0; overflow-wrap: anywhere; }
+.package-risks { display: grid; gap: 0.35rem; margin: 0; padding-left: 1.2rem; }
+.package-remove-confirmation { display: grid; gap: 0.65rem; }
+.package-action-feedback {
+  padding: 0.75rem;
+  background: var(--teamarness-color-background);
+  border: 1px solid var(--teamarness-color-border);
+  border-radius: var(--teamarness-radius-control);
+}
+.package-action-feedback p { margin-bottom: 0.65rem; }
+.package-action-feedback p:last-child { margin-bottom: 0; }
+button.secondary {
+  color: var(--teamarness-color-text);
+  background: transparent;
+  border: 1px solid var(--teamarness-color-border);
+}
+button.secondary:hover { background: var(--teamarness-color-panel); }
 .shell-status:empty,
 .shell-alert:empty { display: none; }
 .shell-alert:not(:empty) { margin-bottom: 1rem; padding: 1rem; background: var(--teamarness-color-panel); border: 1px solid var(--teamarness-color-danger); border-radius: var(--teamarness-radius-panel); }
