@@ -7,7 +7,11 @@
 //!
 //! - `fixture.publish {fixture, exhibitId?, title?}` uploads one fixture the way an Agent should
 //!   (`files.missing`, then only the missing chunks, then `draft.update` with the revision it
-//!   read) and returns `{exhibitId, revision, chunksSent}`.
+//!   read) and returns `{exhibitId, revision, chunksSent}`. With `delayMs` (at most 60,000) it
+//!   returns `{exhibitId, scheduledInMs}` at once and publishes in the background after the
+//!   delay, so a check can switch to the Exhibits UI and watch an open Draft change: UI
+//!   requests time out long before a person could switch, and the Shell unmounts this UI when
+//!   another Package is shown.
 //! - `agent.bind` binds this Instance to the first Workspace Agent this Installation stewards;
 //!   `agent.unbind` clears it. The Host then derives the Port actor from the binding.
 //! - `proof.start {prefix}` runs the system Port proof in the background, and `proof.result`
@@ -58,7 +62,12 @@ struct PublishRequest {
     exhibit_id: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    delay_ms: Option<u64>,
 }
+
+/// The longest `fixture.publish` delay, matching `ui-contract.json`.
+const MAX_DELAY_MS: u64 = 60_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,6 +144,37 @@ async fn main() -> ExitCode {
             let title = request
                 .title
                 .unwrap_or_else(|| exhibit_fixtures::title(&request.fixture).to_owned());
+            let delay = request.delay_ms.unwrap_or_default();
+            if delay > MAX_DELAY_MS {
+                return Err(failure(
+                    "fixture.delay_too_long",
+                    json!({"maxMs": MAX_DELAY_MS}),
+                ));
+            }
+            if delay > 0 {
+                let state = context.state().clone();
+                let scheduled = id.clone();
+                tokio::spawn(async move {
+                    let ports = &state.ports;
+                    // simulated-delay: the delay is the operation's purpose, so a person or the
+                    // packaged smoke can show the Exhibits UI before the update lands.
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    let outcome = match current_revision(ports, &scheduled).await {
+                        Ok(current) => {
+                            publish(ports, &scheduled, &title, &files, Some(current)).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = outcome {
+                        eprintln!(
+                            "Delayed fixture publish of {scheduled} failed: {} {}",
+                            error.code(),
+                            error.details()
+                        );
+                    }
+                });
+                return Ok(json!({"exhibitId": id, "scheduledInMs": delay}));
+            }
             let ports = &context.state().ports;
             let current = current_revision(ports, &id).await?;
             let (revision, sent) = publish(ports, &id, &title, &files, Some(current)).await?;

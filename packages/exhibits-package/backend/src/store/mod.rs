@@ -273,12 +273,26 @@ impl ExhibitStore {
                 _ => return Ok(false),
             }
         }
-        let promoted = self.assemble(&connection, sha256, size, count, now);
-        remove_tree(&directory)?;
+        self.finish_partial(&connection, sha256, size, count, now)
+            .map(|()| true)
+    }
+
+    /// Assembles a partial upload whose chunks are all present, then removes the partial
+    /// whatever the outcome.
+    fn finish_partial(
+        &self,
+        connection: &Connection,
+        sha256: &str,
+        size: u64,
+        count: u64,
+        now: i64,
+    ) -> Result<(), ExhibitsError> {
+        let promoted = self.assemble(connection, sha256, size, count, now);
+        remove_tree(&self.partial_directory(sha256))?;
         connection
             .execute("DELETE FROM partials WHERE sha256 = ?1", [sha256])
             .map_err(fault("finish_partial"))?;
-        promoted.map(|()| true)
+        promoted
     }
 
     /// Concatenates the chunks into `content/tmp`, verifies the result and renames it into the
@@ -337,6 +351,10 @@ impl ExhibitStore {
     /// For each hash, whether the store is missing all of the file, some chunks, or nothing.
     /// Hashes the store holds completely are left out; duplicates are reported once.
     ///
+    /// A partial upload whose chunks are all present but which was never assembled (the
+    /// process ended during assembly) is assembled here: it is left out when it verifies, and
+    /// reported as missing all of the file when it does not.
+    ///
     /// # Errors
     /// `exhibits.invalid_request` for a malformed hash or more than 256 hashes, or
     /// `exhibits.storage_failed`.
@@ -370,7 +388,18 @@ impl ExhibitStore {
                         .is_ok_and(|metadata| metadata.len() == chunk_length(to_u64(size), *chunk))
                 })
                 .collect();
-            missing.push((sha256.clone(), Missing::Chunks(chunks)));
+            if !chunks.is_empty() {
+                missing.push((sha256.clone(), Missing::Chunks(chunks)));
+                continue;
+            }
+            let now = (self.clock)();
+            match self.finish_partial(&connection, sha256, to_u64(size), to_u64(count), now) {
+                Ok(()) => {}
+                Err(ExhibitsError::ContentMismatch) => {
+                    missing.push((sha256.clone(), Missing::All));
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(missing)
     }

@@ -689,3 +689,90 @@ async fn the_ui_lists_opens_a_view_and_hears_changes() {
     changes.close().await;
     session.harness.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn exhibits_changed_carries_one_event_per_update_and_delete() {
+    let mut session = start().await;
+    let mut changes = session
+        .harness
+        .subscribe("exhibits.changed", json!({}))
+        .await
+        .unwrap();
+    let page = session.upload(&agent(), b"<h1>one</h1>").await;
+    let update = |id: &str, expected: Option<u64>| {
+        let mut request = json!({"exhibitId":id,"title":"T","entry":"index.html",
+            "files":[{"path":"index.html","sha256":page}]});
+        if let Some(expected) = expected {
+            request["expectedRevision"] = json!(expected);
+        }
+        request
+    };
+    session
+        .port("draft.update", &agent(), update("a", Some(0)))
+        .await
+        .unwrap();
+    session
+        .port("draft.update", &person(), update("a", Some(1)))
+        .await
+        .unwrap();
+    // Refusals change nothing and publish nothing.
+    assert_eq!(
+        code(
+            session
+                .port("draft.update", &agent(), update("a", Some(1)))
+                .await
+        ),
+        "exhibits.revision_conflict"
+    );
+    assert_eq!(
+        code(
+            session
+                .port(
+                    "draft.delete",
+                    &agent(),
+                    json!({"exhibitId":"a","expectedRevision":1})
+                )
+                .await
+        ),
+        "exhibits.revision_conflict"
+    );
+    session
+        .port(
+            "draft.delete",
+            &agent(),
+            json!({"exhibitId":"a","expectedRevision":2}),
+        )
+        .await
+        .unwrap();
+    // Deleting a Draft that no longer exists is idempotent and publishes nothing.
+    session
+        .port("draft.delete", &agent(), json!({"exhibitId":"a"}))
+        .await
+        .unwrap();
+    // A last update marks the end, so any extra event would arrive before it.
+    session
+        .port("draft.update", &agent(), update("b", None))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        events.push(
+            tokio::time::timeout(Duration::from_secs(5), changes.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        events,
+        vec![
+            json!({"exhibitId":"a","revision":1,"deleted":false}),
+            json!({"exhibitId":"a","revision":2,"deleted":false}),
+            json!({"exhibitId":"a","revision":0,"deleted":true}),
+            json!({"exhibitId":"b","revision":1,"deleted":false}),
+        ]
+    );
+    changes.close().await;
+    session.harness.shutdown().await.unwrap();
+}

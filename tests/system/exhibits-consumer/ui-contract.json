@@ -13,17 +13,19 @@
         "properties": {
           "fixture": { "$ref": "#/$defs/fixture" },
           "exhibitId": { "$ref": "#/$defs/exhibitId" },
-          "title": { "type": "string", "minLength": 1, "maxLength": 120 }
+          "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "delayMs": { "type": "integer", "minimum": 0, "maximum": 60000 }
         }
       },
       "response": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["exhibitId", "revision", "chunksSent"],
+        "required": ["exhibitId"],
         "properties": {
           "exhibitId": { "$ref": "#/$defs/exhibitId" },
           "revision": { "type": "integer", "minimum": 1 },
-          "chunksSent": { "type": "integer", "minimum": 0 }
+          "chunksSent": { "type": "integer", "minimum": 0 },
+          "scheduledInMs": { "type": "integer", "minimum": 1, "maximum": 60000 }
         }
       }
     },

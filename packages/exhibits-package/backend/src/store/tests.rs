@@ -290,6 +290,68 @@ fn files_missing_reports_all_or_chunks_and_bounds_the_query() {
 }
 
 #[test]
+fn files_missing_assembles_a_partial_whose_chunks_are_all_present() {
+    let fixture = fixture();
+    // Every chunk is on disk but assembly never ran, as after a crash during assembly: the
+    // last chunk is placed by hand where `file.put` would have put it.
+    let stage = |bytes: &[u8]| {
+        let sha256 = sha(bytes);
+        let size = bytes.len() as u64;
+        assert!(
+            !fixture
+                .store
+                .put_chunk(&sha256, size, 0, 2, chunk(bytes, 0))
+                .unwrap()
+        );
+        let directory = fixture.root.join("content/partial").join(&sha256);
+        fs::write(directory.join("1"), chunk(bytes, 1)).unwrap();
+        sha256
+    };
+    let good = pattern(CHUNK_BYTES + 3, 11);
+    let good_sha = stage(&good);
+    // A partial whose chunks are complete but whose bytes do not match the declared hash.
+    let mut wrong = pattern(CHUNK_BYTES + 3, 12);
+    let wrong_sha = sha(&wrong);
+    assert!(
+        !fixture
+            .store
+            .put_chunk(&wrong_sha, wrong.len() as u64, 0, 2, chunk(&wrong, 0))
+            .unwrap()
+    );
+    wrong[CHUNK_BYTES] ^= 0xff;
+    fs::write(
+        fixture
+            .root
+            .join("content/partial")
+            .join(&wrong_sha)
+            .join("1"),
+        chunk(&wrong, 1),
+    )
+    .unwrap();
+
+    let missing = fixture
+        .store
+        .missing(&[good_sha.clone(), wrong_sha.clone()])
+        .unwrap();
+    assert_eq!(missing, vec![(wrong_sha.clone(), Missing::All)]);
+    assert!(fixture.complete(&good_sha));
+    assert!(!fixture.partial(&good_sha));
+    assert!(!fixture.complete(&wrong_sha));
+    assert!(!fixture.partial(&wrong_sha));
+    assert_eq!(
+        fixture.store.read_chunk(&good_sha, 1).unwrap().0,
+        chunk(&good, 1)
+    );
+    assert_eq!(
+        fixture
+            .store
+            .missing(std::slice::from_ref(&wrong_sha))
+            .unwrap(),
+        vec![(wrong_sha, Missing::All)]
+    );
+}
+
+#[test]
 fn file_read_returns_each_chunk_byte_for_byte() {
     let fixture = fixture();
     let bytes = pattern(CHUNK_BYTES * 2 + 1, 5);

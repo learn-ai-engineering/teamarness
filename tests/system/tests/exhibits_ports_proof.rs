@@ -23,8 +23,9 @@ use support::harness::{
     Addressing, ConversationClient, open_core, open_host, shutdown, workspace_root,
 };
 use teamarness_package_host::{
-    ContentViewToken, OpenUiMount, PackageHost, PackageHostCommand, PackageHostOutcome,
-    PackageIdentity, PackageInstanceKey, PackageValue, ReadContent, UiMountId, WorkspaceId,
+    ContentViewToken, OpenUiMount, OpenUiSubscription, PackageHost, PackageHostCommand,
+    PackageHostNotification, PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity,
+    PackageInstanceKey, PackageValue, ReadContent, UiMountId, UiSubscriptionId, WorkspaceId,
 };
 use teamarness_system_tests::exhibit_fixtures;
 
@@ -373,6 +374,71 @@ async fn person_and_bound_agent_author_drafts_through_the_exhibits_ports() {
     .await;
     assert_eq!(probe["exhibitId"], "fixture-isolation-probe");
     assert_eq!(probe["revision"], 1);
+
+    // The delayed publish that manual check M1 and the packaged smoke use to change an open
+    // Draft: the request returns at once, and the update reaches the Exhibits UI's
+    // `exhibits.changed` stream as exactly one event.
+    let (exhibits_mount, _) = mount(&host, &key(EXHIBITS, &person_workspace.to_string())).await;
+    let changes = UiSubscriptionId::new("exhibits-changed").unwrap();
+    host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+        mount: exhibits_mount.clone(),
+        subscription: changes.clone(),
+        operation: "exhibits.changed".into(),
+        payload: object(json!({})),
+    }))
+    .await
+    .unwrap();
+    let mut events = host
+        .subscribe(PackageHostSubscriptionSelector::UiEvents {
+            mount: exhibits_mount.clone(),
+            subscription: changes,
+        })
+        .await
+        .unwrap();
+    let scheduled = ui(
+        &consumer,
+        "fixture.publish",
+        json!({"fixture": "revision-1", "exhibitId": "fixture-revision-1", "delayMs": 200}),
+    )
+    .await;
+    assert_eq!(
+        scheduled,
+        json!({"exhibitId": "fixture-revision-1", "scheduledInMs": 200})
+    );
+    let exhibits = ConversationClient {
+        host: &host,
+        mount: &exhibits_mount,
+    };
+    let event = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let PackageHostNotification::UiEvent(event) = events.changed().await.unwrap() {
+                break json_of(&event.payload);
+            }
+        }
+    })
+    .await
+    .expect("the delayed publish reaches the Exhibits change stream");
+    assert_eq!(
+        event,
+        json!({"exhibitId": "fixture-revision-1", "revision": 3, "deleted": false})
+    );
+    let opened = ui(
+        &exhibits,
+        "exhibit.open",
+        json!({"exhibitId": "fixture-revision-1"}),
+    )
+    .await;
+    assert_eq!(opened["revision"], 3);
+    assert!(
+        consumer
+            .request_fails(
+                "fixture-publish",
+                "fixture.publish",
+                object(json!({"fixture": "revision-1", "delayMs": 60_001})),
+            )
+            .await,
+        "a delay beyond the contract's bound is refused"
+    );
 
     // The Consumer's own content view of the probe, which the packaged smoke frames without a
     // `sandbox` attribute.

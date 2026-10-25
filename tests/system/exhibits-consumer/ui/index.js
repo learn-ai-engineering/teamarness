@@ -3,6 +3,10 @@
 // checks in a dev profile: each button publishes one fixture through the real Exhibits Ports,
 // and the outcome is shown as visible text that Accessibility can read.
 //
+// "Publish revision 2 in 30 s" returns at once and publishes in the Backend after the delay, so
+// there is time to show Exhibits with revision 1 open and watch it change without reselecting.
+// The Shell unmounts this UI when Exhibits is shown; the Backend keeps running.
+//
 // "Open unsandboxed frame probe" frames this Package's own content view of the isolation probe
 // in an iframe created WITHOUT a `sandbox` attribute. This UI may nest content only because the
 // Consumer declares `teamarness.content-views`; the probe must still report an opaque origin,
@@ -12,6 +16,7 @@
 const PUBLISH = [
   ["Publish revision 1", { fixture: "revision-1" }],
   ["Publish revision 2", { fixture: "revision-2", exhibitId: "fixture-revision-1" }],
+  ["Publish revision 2 in 30 s", { fixture: "revision-2", exhibitId: "fixture-revision-1", delayMs: 30000 }],
   ["Publish media", { fixture: "media" }],
   ["Publish second Exhibit", { fixture: "revision-1", exhibitId: "fixture-second", title: "Second Exhibit fixture" }],
   ["Publish isolation probe", { fixture: "isolation-probe" }],
@@ -57,7 +62,11 @@ export async function mount(context) {
   for (const [label, request] of PUBLISH) {
     button(label, async () => {
       const published = await context.client.request("fixture.publish", request);
-      record(`Published ${published.exhibitId} revision ${published.revision} (${published.chunksSent} chunks)`);
+      if (published.scheduledInMs !== undefined) {
+        record(`Scheduled ${published.exhibitId} in ${published.scheduledInMs} ms`);
+      } else {
+        record(`Published ${published.exhibitId} revision ${published.revision} (${published.chunksSent} chunks)`);
+      }
     });
   }
   button("Open unsandboxed frame probe", async () => {

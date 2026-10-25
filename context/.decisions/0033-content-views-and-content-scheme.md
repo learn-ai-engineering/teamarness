@@ -46,7 +46,7 @@ The handler answers a single `bytes=a-b`, `bytes=a-` or `bytes=-n` range with `2
 - **The Shell reads a Package's storage layout directly.** The Shell would learn Package storage, which breaks the generic Shell rule.
 - **`srcdoc`, `blob:` URLs or a reserved path on `teamarness-package:`.** `srcdoc` and `blob:` break relative navigation. A reserved path would widen `frame-src` for every Package and share the Package frame's policy.
 - **A scheme named after one Package.** The Shell and Host would name one Package, and a second user would need a rename.
-- **`frame-src teamarness-content:` for every Package.** Nesting changes the isolation surface, so it is opted into by declaration. This differs from ADR 0030 for `'wasm-unsafe-eval'` in Package UI Frames, which changes no boundary.
+- **`frame-src teamarness-content:` for every Package.** Nesting changes the isolation surface, so it is opted into by declaration. This differs from the rendered-document-editing decision that allows `'wasm-unsafe-eval'` in Package UI Frames (its ADR number is assigned when that workstream is integrated), which changes no boundary.
 - **Relying on the embedding frame's `sandbox` attribute.** A Package UI could omit it. The CSP `sandbox` directive comes from the Shell on every response.
 
 ## Consequences
@@ -55,7 +55,7 @@ The handler answers a single `bytes=a-b`, `bytes=a-` or `bytes=-n` range with `2
 - A Package that declares `teamarness.content-views` can show content it did not write, isolated from its own frame, without serving bytes itself.
 - Content can run inline script and inline style, and compile WebAssembly. It cannot use `eval` or `new Function`, workers, plugins, forms or nested frames.
 - A file that changes after a view is opened fails Host verification and is a `404`. Showing new content needs a new view.
-- The packaged-app isolation probe gains a content-frame check when the first Package uses the scheme. It is re-run on every Tauri upgrade, together with ADR 0015's probe.
+- The packaged-app smoke's Exhibits stage checks content frames with the isolation probe, in the Exhibits viewer and in a Package frame created without a `sandbox` attribute. It is re-run on every Tauri upgrade, together with ADR 0015's probe.
 - A Windows or Linux port re-verifies this policy, because custom schemes there resolve as `http://<scheme>.localhost`.
 - Network denial for content frames stays open until navigation and WebRTC are controlled.
 
@@ -68,7 +68,7 @@ The handler answers a single `bytes=a-b`, `bytes=a-` or `bytes=-n` range with `2
 - `crates/teamarness-package-contract/src/media_types.rs` holds the shared extension allowlist and content path rules.
 - `contracts/package-capabilities/v1/content-views.schema.json` is the capability schema.
 
-**Known weaknesses.** The unit tests check the response headers and the policy text, not WebKit's enforcement of them. A throwaway packaged-app spike showed that a nested opaque-origin frame on a custom scheme renders, loads relative assets, runs module and dynamic imports and WebAssembly, and navigates between its own pages, while it cannot read parent or top, has no Tauri globals, cannot use storage or `ipc://` fetch, and its message-handler posts created no Workspace. The spike used a different scheme name and allowed nesting for every Package, and it did not check network access. The packaged-app smoke becomes the authoritative check when the first Package uses the scheme.
+**Known weaknesses.** The unit tests check the response headers and the policy text, not WebKit's enforcement of them. A throwaway packaged-app spike showed that a nested opaque-origin frame on a custom scheme renders, loads relative assets, runs module and dynamic imports and WebAssembly, and navigates between its own pages, while it cannot read parent or top, has no Tauri globals, cannot use storage or `ipc://` fetch, and its message-handler posts created no Workspace. The spike used a different scheme name and allowed nesting for every Package, and it did not check network access. The packaged-app smoke's Exhibits stage is the authoritative check of WebKit's enforcement. Its frame without a `sandbox` attribute is nested in a Package UI Frame, which the Shell sandboxes, and a child frame inherits its parent's `sandbox` flags. So the smoke proves the end-to-end result, content that stays opaque-origin without the attribute, but it cannot attribute that result to the CSP `sandbox` directive alone. The `content_protocol.rs` tests prove the directive at header level.
 
 ### Provenance (non-versioned)
 

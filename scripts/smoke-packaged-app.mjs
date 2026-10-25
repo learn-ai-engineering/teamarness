@@ -61,7 +61,9 @@ try {
   console.log(
     "Packaged app smoke passed twice with admitted UI, protocol traffic, and clean process reaping, "
     + "the WKWebView UI isolation probe reached neither Tauri nor the Shell, "
-    + "and Exhibits rendered a Draft whose content, sandboxed or not, reached neither.",
+    + "and Exhibits rendered a Draft, swapped the open Draft to its next revision, and kept its content "
+    + "from reaching either (in its viewer, and in a frame without a sandbox attribute, which inherits "
+    + "the Package frame's sandbox; the CSP sandbox header is proven by the content scheme's tests).",
   );
 } finally {
   await chmod(dataDirectory, 0o700).catch(() => {});
@@ -316,8 +318,9 @@ async function probeLaunch(dataDirectory) {
  * The Exhibits stage. The test-only fixture consumer publishes the content isolation probe and
  * fixture revision 1 through the real Exhibits Ports, and frames its own content view of the
  * probe without a `sandbox` attribute. Exhibits then lists both Drafts and opens each in its
- * sandboxed viewer frame. Every verdict is read through Accessibility, and the Core database
- * must hold no Workspace a content frame tried to create.
+ * sandboxed viewer frame. With revision 1 open, a delayed publish of revision 2 must change the
+ * open view without reselecting it. Every verdict is read through Accessibility, and the Core
+ * database must hold no Workspace a content frame tried to create.
  */
 async function exhibitsLaunch(dataDirectory) {
   const backend = buildExhibitsFixtureConsumer();
@@ -407,6 +410,20 @@ async function exhibitsLaunch(dataDirectory) {
     await clickInPackage("Exhibit fixture (revision 1)", "Exhibits revision 1 Draft");
     await waitForText("Exhibit fixture revision 1", "Exhibits revision 1 entry page");
     await waitForVerdict("PASS navigated-to-page-2-and-back", EXHIBIT_RENDERING_CHECKS, "Exhibits revision 1 rendering");
+
+    // Live update (AC3). The consumer schedules revision 2 of the same Draft 30 s ahead, and
+    // Exhibits is shown with revision 1 open before it lands. The open view must then change to
+    // revision 2 with no further click: the viewer swapped its frame on `exhibits.changed`.
+    await selectPackage("Personal Packages", displayName, "Exhibits fixture consumer before the live update");
+    await clickInPackage("Publish revision 2 in 30 s", "delayed revision 2 publication");
+    await waitForText("Scheduled fixture-revision-1 in 30000 ms", "delayed revision 2 scheduling");
+    await selectPackage("Team Packages", exhibitsPackage.displayName, "Exhibits for the live update");
+    await clickInPackage("Exhibit fixture (revision 1)", "Exhibits revision 1 Draft before the live update");
+    await waitForText("Exhibit fixture revision 1", "Exhibits revision 1 open before the live update");
+    await atStage("Exhibits live update to revision 2", () => waitFor(() => {
+      const visible = contents();
+      return visible?.includes("Exhibit fixture revision 2") && !visible.includes("Exhibit fixture revision 1");
+    }, "Exhibits live update to revision 2", 45_000));
 
     await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });
   });

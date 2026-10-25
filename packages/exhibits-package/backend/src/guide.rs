@@ -86,6 +86,10 @@ someone else's update (`exhibits.revision_conflict` carries the current revision
 5. If `draft.update` fails with `exhibits.missing_files`, upload the files it names \
 (at most 32 are listed; `missingCount` says how many) and call it again.
 
+Over a Port, every refusal arrives as `provider_error`: the `exhibits.*` code is in \
+`details.provider.code`, and its details (such as `missing` and `missingCount`) are in \
+`details.provider.details`.
+
 Exhibit IDs match `{ID_PATTERN}`, at most {MAX_ID_CHARS} characters. Titles are at most \
 {MAX_TITLE_CHARS} characters.
 
@@ -174,6 +178,9 @@ mod tests {
             "at most 4 `file.put` calls",
             "files.missing",
             "outcome_unknown",
+            "arrives as `provider_error`",
+            "`details.provider.code`",
+            "`details.provider.details`",
             "Web Workers, nested frames",
             "`.html`",
             "`.wasm`",

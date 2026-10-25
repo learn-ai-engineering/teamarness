@@ -14,6 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read as _;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -71,8 +73,42 @@ struct ListedFile {
     sha256: String,
     size: u64,
     media_type: &'static str,
-    /// The cached verification verdict, set by the first read.
-    verified: Option<bool>,
+    /// The cached verification verdict, set by the first read and made sticky by a failure.
+    verdict: Verdict,
+}
+
+/// What a view knows about one listed file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Not read yet: the next read checks the SHA-256.
+    Unverified,
+    /// The SHA-256 matched for the file with this fingerprint. A later read whose open file
+    /// has another fingerprint is refused, so a rewrite of the same size is never served.
+    Verified(Fingerprint),
+    /// A read failed verification. The file stays refused in this view.
+    Failed,
+}
+
+/// The identity and change stamps of an open file, taken from its handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Fingerprint {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 struct View {
@@ -126,7 +162,7 @@ impl ContentViews {
                         sha256: file.sha256,
                         size: file.size,
                         media_type: file.media_type,
-                        verified: None,
+                        verdict: Verdict::Unverified,
                     },
                 )
             })
@@ -215,7 +251,9 @@ impl ContentViews {
         })
     }
 
-    fn record_verdict(&self, token: &ContentViewToken, path: &str, verdict: bool) {
+    /// Records a read's verdict. A failure always sticks; a verification only replaces
+    /// `Unverified`, so a concurrent read cannot revive a failed file.
+    fn record_verdict(&self, token: &ContentViewToken, path: &str, verdict: Verdict) {
         if let Some(file) = self
             .table
             .lock()
@@ -223,8 +261,9 @@ impl ContentViews {
             .views
             .get_mut(token)
             .and_then(|view| view.files.get_mut(path))
+            && (verdict == Verdict::Failed || file.verdict == Verdict::Unverified)
         {
-            file.verified = Some(verdict);
+            file.verdict = verdict;
         }
     }
 
@@ -241,25 +280,42 @@ impl ContentViews {
 }
 
 impl ReadTarget {
-    /// Reads the file, checking its type and size on every read and its SHA-256 on the first.
+    /// Reads the file, checking its type, size and fingerprint on every read and its SHA-256
+    /// on the first.
     ///
-    /// Blocking. `None` is every failure: the caller answers not-found without detail.
-    fn read(&self) -> Option<Vec<u8>> {
-        if self.file.verified == Some(false) {
+    /// The metadata comes from the opened handle, before and after the read, so the checks and
+    /// the bytes refer to the same file and a change during the read is refused. Blocking.
+    /// `None` is every failure: the caller answers not-found without detail.
+    fn read(&self) -> Option<(Vec<u8>, Fingerprint)> {
+        if self.file.verdict == Verdict::Failed {
             return None;
         }
         let path = resolve_source(&self.root, &self.file.source).ok()?;
-        if fs::symlink_metadata(&path).ok()?.len() != self.file.size {
+        let mut handle = fs::File::open(&path).ok()?;
+        let metadata = handle.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() != self.file.size {
             return None;
         }
-        let bytes = fs::read(&path).ok()?;
-        if bytes.len() as u64 != self.file.size {
+        let fingerprint = Fingerprint::of(&metadata);
+        if let Verdict::Verified(known) = self.file.verdict
+            && known != fingerprint
+        {
             return None;
         }
-        if self.file.verified.is_none() && sha256(&bytes) != self.file.sha256 {
+        let mut bytes = Vec::with_capacity(usize::try_from(self.file.size).ok()?);
+        (&mut handle)
+            .take(self.file.size + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 != self.file.size
+            || Fingerprint::of(&handle.metadata().ok()?) != fingerprint
+        {
             return None;
         }
-        Some(bytes)
+        if self.file.verdict == Verdict::Unverified && sha256(&bytes) != self.file.sha256 {
+            return None;
+        }
+        Some((bytes, fingerprint))
     }
 }
 
@@ -442,16 +498,21 @@ impl PackageHost {
             return Err(not_found());
         }
         let media_type = target.file.media_type;
-        let first_read = target.file.verified.is_none();
+        let first_read = target.file.verdict == Verdict::Unverified;
         // Reading and hashing a content file is blocking file work.
-        let bytes = tokio::task::spawn_blocking(move || target.read())
+        let read = tokio::task::spawn_blocking(move || target.read())
             .await
             .map_err(|_| not_found())?;
-        if first_read || bytes.is_none() {
-            views.record_verdict(&input.token, &input.path, bytes.is_some());
+        match &read {
+            None => views.record_verdict(&input.token, &input.path, Verdict::Failed),
+            Some((_, fingerprint)) if first_read => {
+                views.record_verdict(&input.token, &input.path, Verdict::Verified(*fingerprint))
+            }
+            Some(_) => {}
         }
+        let (bytes, _) = read.ok_or_else(not_found)?;
         Ok(PackageHostOutcome::Content {
-            bytes: bytes.ok_or_else(not_found)?,
+            bytes,
             media_type: media_type.to_owned(),
         })
     }

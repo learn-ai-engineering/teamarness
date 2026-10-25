@@ -293,6 +293,44 @@ async fn a_file_modified_after_open_is_refused() {
 }
 
 #[tokio::test]
+async fn a_same_size_rewrite_after_a_verified_read_is_refused() {
+    let opened = Opened::new().await;
+    let files = vec![opened.write("index.html", "content/index", b"original")];
+    let (view, _) = opened.open("index.html", files).await.unwrap();
+    assert_eq!(
+        opened.read(&view, "index.html").await.unwrap().0,
+        b"original"
+    );
+    // Rewrite in place with the same byte count, and move the modification time explicitly so
+    // the change is visible however coarse the file system's clock is.
+    let path = opened.data.join("content/index");
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, b"replaced").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before + std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        opened.read(&view, "index.html").await.unwrap_err(),
+        PackageErrorCode::ContentNotFound
+    );
+    // The refusal is cached: restoring the bytes and the time does not revive the file.
+    fs::write(&path, b"original").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+    assert_eq!(
+        opened.read(&view, "index.html").await.unwrap_err(),
+        PackageErrorCode::ContentNotFound
+    );
+}
+
+#[tokio::test]
 async fn symlinks_non_regular_files_and_escapes_are_refused_at_open() {
     let opened = Opened::new().await;
     let outside = opened.fixture._root.path().join("outside.html");
