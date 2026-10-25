@@ -118,7 +118,13 @@ The slice removes the Agent's dispatch fence. This supersedes the fail-closed no
 
 **Status**
 
-Verify attempt 2 passed at `55a016c`. A corrective phase for three behaviour P2s, requested by the developer, is in progress.
+Verify attempt 3 passed at `b5202d0`. Two corrective phases fixed issues that earlier Verify attempts found:
+
+- An over-wide message bound broke unchanged no-tool turns.
+- A failed turn lost its activity.
+- A tool batch from the last model call still ran.
+- Unsolicited tool calls were acted on.
+- The Packages switch showed the wrong state.
 
 **Remaining before Close**
 
@@ -129,7 +135,6 @@ Verify attempt 2 passed at `55a016c`. A corrective phase for three behaviour P2s
   - Chat unchanged after Exhibits is disabled;
   - activation without Exhibits;
   - observe only: what the Host does with a tool command while the Agent is unbound.
-- A fresh Verify after the corrective phase.
 - Local integration into the Agent repository's `main`.
 
 **Teamarness follow-up**
@@ -141,6 +146,9 @@ The system test `agent_reply_flow.rs::enqueued_reply_keeps_old_actor_during_rebi
 These are recorded in the `agent-harness` Verify reports:
 
 - a command in flight at the deadline is missing from the failed-turn activity;
+- an interrupted chat turn drops the activity of tool calls that already finished;
+- the final model call is still offered tools it can't use;
+- keyboard focus is lost on each Packages toggle;
 - a running turn keeps its tools after a Package is disabled;
 - Channel content can steer commands on reply turns, a prompt-injection surface;
 - documentation and comment cleanups.
