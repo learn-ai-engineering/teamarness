@@ -1,4 +1,4 @@
-//! Native acquisition only. No installer/restart operation is reachable from this module.
+//! Native acquisition and a private installer transferred only to the terminal owner.
 mod config;
 mod transport;
 mod verification;
@@ -179,8 +179,7 @@ impl Metadata {
     }
 }
 
-// Consumed only by the terminal lifecycle owner in the next implementation phase.
-#[allow(dead_code)]
+// Consumed only by the terminal lifecycle owner.
 pub(crate) struct Pending {
     pub update: Update,
     pub bytes: Vec<u8>,
@@ -448,7 +447,6 @@ impl UpdateService {
         self.cancel.cancel();
     }
     // Admission transfers the same verified bytes to one terminal owner. It cannot install.
-    #[allow(dead_code)]
     pub(crate) fn admit_apply(&self, generation: &str) -> Result<Pending, ErrorCategory> {
         let mut inner = self.inner.lock().unwrap();
         if inner.terminal
@@ -464,6 +462,17 @@ impl UpdateService {
         {
             return Err(ErrorCategory::StaleCandidate);
         }
+        let pending_version = &inner
+            .pending
+            .as_ref()
+            .ok_or(ErrorCategory::StaleCandidate)?
+            .update
+            .version;
+        if inner.snapshot.candidate_version.as_deref() != Some(pending_version.as_str())
+            || stable(pending_version)? <= stable(&inner.snapshot.installed_version)?
+        {
+            return Err(ErrorCategory::StaleCandidate);
+        }
         let pending = inner.pending.take().ok_or(ErrorCategory::StaleCandidate)?;
         inner.terminal = true;
         inner.snapshot.state = State::Stopped;
@@ -476,3 +485,15 @@ impl UpdateService {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn installer(pending: Pending) -> crate::lifecycle::Install {
+    Box::new(move || {
+        pending.update.install(pending.bytes).map_err(|error| {
+            let previous_app = match error {
+                tauri_plugin_updater::Error::PreviousAppNotRestored(path) => Some(path),
+                _ => None,
+            };
+            crate::lifecycle::InstallFailure { previous_app }
+        })
+    })
+}

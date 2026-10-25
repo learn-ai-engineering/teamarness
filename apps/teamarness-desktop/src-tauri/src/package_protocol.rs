@@ -53,7 +53,30 @@ struct ResourceRequest {
     head: bool,
 }
 
-pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+// Hold admission through the actual Tauri responder, including reserved resources.
+pub async fn respond(
+    state: DesktopState,
+    request: Request<Vec<u8>>,
+    responder: impl FnOnce(Response<Vec<u8>>) + Send + 'static,
+) {
+    let dispatch = state.clone();
+    // The responder must also be used on rejected admission; acquire explicitly.
+    let Ok(lease) = dispatch.lifecycle.admit() else {
+        responder(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain; charset=utf-8",
+            Vec::new(),
+        ));
+        return;
+    };
+    let _ = tokio::spawn(async move {
+        let _lease = lease;
+        responder(serve(state, request).await);
+    })
+    .await;
+}
+
+async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let parsed = match parse_request(request.method(), request.uri()) {
         Ok(value) => value,
         Err(status) => return response(status, "text/plain; charset=utf-8", Vec::new()),
@@ -93,16 +116,7 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
             );
         }
     };
-    let host = match state.package_host() {
-        Ok(host) => host,
-        Err(_) => {
-            return response(
-                StatusCode::NOT_FOUND,
-                "text/plain; charset=utf-8",
-                Vec::new(),
-            );
-        }
-    };
+    let host = state.package_host();
     let outcome = host
         .execute(PackageHostCommand::ReadUiResource(ReadUiResource {
             mount,

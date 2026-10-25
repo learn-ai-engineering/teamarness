@@ -31,36 +31,52 @@ where
     T: Send + 'static,
     F: FnOnce(Arc<teamarness_core::CoreRuntime>) -> Result<T, BridgeError> + Send + 'static,
 {
-    let runtime = state.runtime()?;
-    tauri::async_runtime::spawn_blocking(move || operation(runtime))
-        .await
-        .map_err(|_| BridgeError::shutdown())?
+    let runtime = state.runtime();
+    let lease = state.lifecycle.blocking_work();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        operation(runtime)
+    })
+    .await
+    .map_err(|_| BridgeError::shutdown())?
 }
 
 #[tauri::command]
 pub async fn installation_details(
     state: State<'_, DesktopState>,
 ) -> Result<InstallationDto, BridgeError> {
-    blocking(&state, |runtime| {
-        Ok(InstallationDto {
-            identity: runtime.public_identity().to_string(),
-            display_name: runtime.display_name(),
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            blocking(&state, |runtime| {
+                Ok(InstallationDto {
+                    identity: runtime.public_identity().to_string(),
+                    display_name: runtime.display_name(),
+                })
+            })
+            .await
         })
-    })
-    .await
+        .await?
 }
 
 #[tauri::command]
 pub async fn list_workspaces(
     state: State<'_, DesktopState>,
 ) -> Result<Vec<WorkspaceDto>, BridgeError> {
-    blocking(&state, |runtime| {
-        runtime
-            .list_workspaces()
-            .map(|values| values.into_iter().map(WorkspaceDto::from).collect())
-            .map_err(BridgeError::from)
-    })
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            blocking(&state, |runtime| {
+                runtime
+                    .list_workspaces()
+                    .map(|values| values.into_iter().map(WorkspaceDto::from).collect())
+                    .map_err(BridgeError::from)
+            })
+            .await
+        })
+        .await?
 }
 
 #[tauri::command]
@@ -69,19 +85,25 @@ pub async fn create_workspace(
     person_name: String,
     state: State<'_, DesktopState>,
 ) -> Result<WorkspaceStateDto, BridgeError> {
-    let created = blocking(&state, move |runtime| {
-        let workspace = runtime
-            .create_workspace_with_person_name(&name, &person_name)
-            .map_err(BridgeError::from)?;
-        let membership = roster(&runtime, workspace.id())?;
-        Ok(WorkspaceStateDto {
-            workspace: workspace.into(),
-            membership,
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let created = blocking(&state, move |runtime| {
+                let workspace = runtime
+                    .create_workspace_with_person_name(&name, &person_name)
+                    .map_err(BridgeError::from)?;
+                let membership = roster(&runtime, workspace.id())?;
+                Ok(WorkspaceStateDto {
+                    workspace: workspace.into(),
+                    membership,
+                })
+            })
+            .await?;
+            reconcile_packages(&state).await?;
+            Ok(created)
         })
-    })
-    .await?;
-    reconcile_packages(&state).await?;
-    Ok(created)
+        .await?
 }
 
 #[tauri::command]
@@ -89,17 +111,23 @@ pub async fn create_workspace_invitation(
     workspace_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<InvitationDto, BridgeError> {
-    let workspace_id =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    let runtime = state.runtime()?;
-    let invitation = runtime
-        .create_workspace_invitation(workspace_id)
-        .await
-        .map_err(BridgeError::from)?;
-    Ok(InvitationDto {
-        value: invitation.to_string(),
-        sensitivity: InvitationSensitivity::BearerAdmission,
-    })
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace_id =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            let runtime = state.runtime();
+            let invitation = runtime
+                .create_workspace_invitation(workspace_id)
+                .await
+                .map_err(BridgeError::from)?;
+            Ok(InvitationDto {
+                value: invitation.to_string(),
+                sensitivity: InvitationSensitivity::BearerAdmission,
+            })
+        })
+        .await?
 }
 
 #[tauri::command]
@@ -108,18 +136,24 @@ pub async fn join_workspace(
     person_name: String,
     state: State<'_, DesktopState>,
 ) -> Result<WorkspaceStateDto, BridgeError> {
-    let invitation =
-        WorkspaceInvitation::from_str(&invitation).map_err(|_| BridgeError::invalid_input())?;
-    let runtime = state.runtime()?;
-    let (workspace, _) = runtime
-        .join_workspace_with_person_name(&invitation, &person_name)
-        .await
-        .map_err(BridgeError::from)?;
-    reconcile_packages(&state).await?;
-    Ok(WorkspaceStateDto {
-        membership: roster(&runtime, workspace.id())?,
-        workspace: workspace.into(),
-    })
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let invitation = WorkspaceInvitation::from_str(&invitation)
+                .map_err(|_| BridgeError::invalid_input())?;
+            let runtime = state.runtime();
+            let (workspace, _) = runtime
+                .join_workspace_with_person_name(&invitation, &person_name)
+                .await
+                .map_err(BridgeError::from)?;
+            reconcile_packages(&state).await?;
+            Ok(WorkspaceStateDto {
+                membership: roster(&runtime, workspace.id())?,
+                workspace: workspace.into(),
+            })
+        })
+        .await?
 }
 
 #[tauri::command]
@@ -127,9 +161,15 @@ pub async fn current_membership(
     workspace_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<MembershipDto, BridgeError> {
-    let workspace_id =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    blocking(&state, move |runtime| roster(&runtime, workspace_id)).await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace_id =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| roster(&runtime, workspace_id)).await
+        })
+        .await?
 }
 
 fn roster(
@@ -162,15 +202,21 @@ pub async fn principals_snapshot(
     workspace_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<PrincipalsSnapshotDto, BridgeError> {
-    let workspace =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    blocking(&state, move |runtime| {
-        runtime
-            .principals_snapshot(workspace)
-            .map(|snapshot| snapshot_dto(workspace, snapshot))
-            .map_err(BridgeError::from)
-    })
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| {
+                runtime
+                    .principals_snapshot(workspace)
+                    .map(|snapshot| snapshot_dto(workspace, snapshot))
+                    .map_err(BridgeError::from)
+            })
+            .await
+        })
+        .await?
 }
 
 #[tauri::command]
@@ -180,16 +226,22 @@ pub async fn rename_workspace_principal(
     name: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), BridgeError> {
-    let workspace =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    let principal =
-        PrincipalId::from_str(&principal_id).map_err(|_| BridgeError::invalid_input())?;
-    blocking(&state, move |runtime| {
-        runtime
-            .rename_principal(workspace, principal, &name)
-            .map_err(BridgeError::from)
-    })
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            let principal =
+                PrincipalId::from_str(&principal_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| {
+                runtime
+                    .rename_principal(workspace, principal, &name)
+                    .map_err(BridgeError::from)
+            })
+            .await
+        })
+        .await?
 }
 
 #[tauri::command]
@@ -198,12 +250,18 @@ pub async fn add_workspace_agent(
     name: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), BridgeError> {
-    let workspace =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    blocking(&state, move |runtime| {
-        add_agent_mutation(&runtime, workspace, &name)
-    })
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| {
+                add_agent_mutation(&runtime, workspace, &name)
+            })
+            .await
+        })
+        .await?
 }
 
 fn add_agent_mutation(
@@ -223,13 +281,20 @@ pub async fn remove_workspace_agent(
     agent_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), BridgeError> {
-    let workspace =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    let agent = PrincipalId::from_str(&agent_id).map_err(|_| BridgeError::invalid_input())?;
-    blocking(&state, move |runtime| {
-        remove_agent_mutation(&runtime, workspace, agent)
-    })
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            let agent =
+                PrincipalId::from_str(&agent_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| {
+                remove_agent_mutation(&runtime, workspace, agent)
+            })
+            .await
+        })
+        .await?
 }
 
 fn remove_agent_mutation(
@@ -249,45 +314,60 @@ pub async fn subscribe_principals(
     on_event: Channel<PrincipalsStreamEvent>,
     state: State<'_, DesktopState>,
 ) -> Result<(), BridgeError> {
-    let workspace =
-        WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
-    let after: u64 = after_cursor
-        .parse()
-        .map_err(|_| BridgeError::invalid_input())?;
-    if after.to_string() != after_cursor {
-        return Err(BridgeError::invalid_input());
-    }
-    let runtime = state.runtime()?;
-    let watch_runtime = Arc::clone(&runtime);
-    let mut changes =
-        tauri::async_runtime::spawn_blocking(move || watch_runtime.subscribe_principals(workspace))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            let after: u64 = after_cursor
+                .parse()
+                .map_err(|_| BridgeError::invalid_input())?;
+            if after.to_string() != after_cursor {
+                return Err(BridgeError::invalid_input());
+            }
+            let runtime = state.runtime();
+            let watch_runtime = Arc::clone(&runtime);
+            let lease = state.lifecycle.blocking_work();
+            let mut changes = tauri::async_runtime::spawn_blocking(move || {
+                let _lease = lease;
+                watch_runtime.subscribe_principals(workspace)
+            })
             .await
             .map_err(|_| BridgeError::shutdown())?
             .map_err(BridgeError::from)?;
-    if *changes.borrow() < after {
-        return Err(BridgeError::invalid_input());
-    }
-    tauri::async_runtime::spawn(async move {
-        forward_principals(
-            &mut changes,
-            after,
-            || {
-                let runtime = Arc::clone(&runtime);
-                async move {
-                    tauri::async_runtime::spawn_blocking(move || {
-                        runtime.principals_snapshot(workspace)
-                    })
-                    .await
-                    .ok()?
-                    .ok()
-                    .map(|snapshot| snapshot_dto(workspace, snapshot))
-                }
-            },
-            |event| on_event.send(event).is_ok(),
-        )
-        .await;
-    });
-    Ok(())
+            if *changes.borrow() < after {
+                return Err(BridgeError::invalid_input());
+            }
+            let lifecycle = state.lifecycle.clone();
+            let forwarder = lifecycle.forwarder();
+            tauri::async_runtime::spawn(async move {
+                let _forwarder = forwarder;
+                forward_principals(
+                    &lifecycle,
+                    &mut changes,
+                    after,
+                    || {
+                        let runtime = Arc::clone(&runtime);
+                        let lease = lifecycle.blocking_work();
+                        async move {
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let _lease = lease;
+                                runtime.principals_snapshot(workspace)
+                            })
+                            .await
+                            .ok()?
+                            .ok()
+                            .map(|snapshot| snapshot_dto(workspace, snapshot))
+                        }
+                    },
+                    |event| on_event.send(event).is_ok(),
+                )
+                .await;
+            });
+            Ok(())
+        })
+        .await?
 }
 
 #[derive(serde::Serialize)]
@@ -298,6 +378,7 @@ pub enum PrincipalsStreamEvent {
 }
 
 async fn forward_principals<F, Read, Send>(
+    lifecycle: &crate::lifecycle::Lifecycle,
     changes: &mut tokio::sync::watch::Receiver<u64>,
     after: u64,
     mut read: F,
@@ -309,6 +390,9 @@ async fn forward_principals<F, Read, Send>(
 {
     let mut cursor = after;
     loop {
+        if lifecycle.status().phase != crate::lifecycle::Phase::Running {
+            break;
+        }
         let generation = *changes.borrow_and_update();
         if generation < cursor {
             break;
@@ -328,8 +412,9 @@ async fn forward_principals<F, Read, Send>(
             }
             continue;
         }
-        if changes.changed().await.is_err() {
-            break;
+        tokio::select! { biased;
+            _ = lifecycle.cancelled() => break,
+            result = changes.changed() => if result.is_err() { break; },
         }
     }
     let _ = send(PrincipalsStreamEvent::Terminated);
@@ -338,7 +423,6 @@ async fn forward_principals<F, Read, Send>(
 async fn reconcile_packages(state: &DesktopState) -> Result<(), BridgeError> {
     state
         .package_host()
-        .map_err(|_| BridgeError::shutdown())?
         .execute(PackageHostCommand::ReconcileWorkspaces(
             ReconcileWorkspaces {},
         ))
@@ -436,6 +520,7 @@ mod tests {
         let mut reads = 0;
         let mut events = Vec::new();
         forward_principals(
+            &crate::lifecycle::Lifecycle::new(),
             &mut changes,
             0,
             || {
@@ -498,5 +583,96 @@ mod tests {
         ] {
             assert!(!registry.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    async fn blocking_dispatch_retains_lease_after_waiter_drop_through_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let application = root.path().join("application");
+        std::fs::create_dir(&application).unwrap();
+        let index = application.join("index.json");
+        std::fs::write(&index, br#"{"schemaVersion":1,"packages":[]}"#).unwrap();
+        let runtime = Arc::new(
+            teamarness_core::CoreRuntime::open_loopback_for_tests(
+                teamarness_core::CoreRuntimeConfig::new(root.path().join("core")),
+            )
+            .await
+            .unwrap(),
+        );
+        let host = Arc::new(
+            teamarness_package_host::PackageHost::open(
+                teamarness_package_host::PackageHostConfig::new(
+                    application,
+                    index,
+                    root.path().join("private"),
+                    teamarness_package_host::InstallationPublicIdentity::new(
+                        runtime.public_identity().to_string(),
+                    )
+                    .unwrap(),
+                ),
+                runtime.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = DesktopState::new(runtime.clone(), host);
+        let (entered, received) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let work = state.clone();
+        let dispatch = state.clone();
+        let waiter = tokio::spawn(async move {
+            dispatch
+                .dispatch(async move {
+                    blocking(&work, move |runtime| {
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                        runtime.create_workspace("Admitted").unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                    reconcile_packages(&work).await.unwrap();
+                })
+                .await
+        });
+        received.await.unwrap();
+        waiter.abort();
+        // First intent closes admission while the actual blocking adapter owns its lease.
+        struct Cleanup(DesktopState);
+        impl crate::lifecycle::TerminalAdapter for Cleanup {
+            fn stop_updates(&self) {}
+            fn cleanup(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::lifecycle::ShutdownErrors> + Send + '_>,
+            > {
+                Box::pin(async {
+                    assert_eq!(self.0.packages.snapshot().await.instances.len(), 0);
+                    assert_eq!(self.0.runtime.list_workspaces().unwrap().len(), 1);
+                    self.0.cleanup().await
+                })
+            }
+            fn install(
+                &self,
+                _: crate::lifecycle::Install,
+            ) -> Result<(), crate::lifecycle::InstallFailure> {
+                panic!("Quit never installs")
+            }
+            fn restart(&self) {
+                panic!("Quit never restarts")
+            }
+            fn exit(&self) {}
+        }
+        state.lifecycle.quit(Arc::new(Cleanup(state.clone())));
+        assert_eq!(
+            state.lifecycle.status().phase,
+            crate::lifecycle::Phase::Stopping
+        );
+        release.send(()).unwrap();
+        state.lifecycle.finished().await;
+        assert_eq!(
+            state.lifecycle.status().phase,
+            crate::lifecycle::Phase::Stopped
+        );
     }
 }

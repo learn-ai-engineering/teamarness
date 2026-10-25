@@ -4,6 +4,7 @@ mod commands;
 mod data_dir;
 mod dto;
 mod error;
+mod lifecycle;
 mod package_commands;
 mod package_dto;
 mod package_error;
@@ -11,10 +12,8 @@ mod package_protocol;
 mod update;
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{Manager, RunEvent};
 use teamarness_core::{CoreError, CoreRuntime, CoreRuntimeConfig, StorageError};
@@ -26,38 +25,12 @@ use tokio::sync::Mutex;
 
 use crate::error::BridgeError;
 
-#[derive(Default)]
-struct DispatchLifecycle {
-    accepting: AtomicBool,
-    shutdown_started: AtomicBool,
-    shutdown_complete: AtomicBool,
-}
-
-impl DispatchLifecycle {
-    fn running() -> Self {
-        Self {
-            accepting: AtomicBool::new(true),
-            shutdown_started: AtomicBool::new(false),
-            shutdown_complete: AtomicBool::new(false),
-        }
-    }
-
-    fn begin_shutdown(&self) -> bool {
-        self.accepting.store(false, Ordering::SeqCst);
-        !self.shutdown_started.swap(true, Ordering::SeqCst)
-    }
-
-    fn complete_shutdown(&self) {
-        self.shutdown_complete.store(true, Ordering::SeqCst);
-    }
-}
-
 #[derive(Clone)]
 pub struct DesktopState {
     runtime: Arc<CoreRuntime>,
     packages: Arc<PackageHost>,
     protocol_mounts: Arc<Mutex<BTreeMap<String, ProtocolMountLease>>>,
-    lifecycle: Arc<DispatchLifecycle>,
+    lifecycle: lifecycle::Lifecycle,
     updates: Option<update::UpdateService>,
 }
 
@@ -73,27 +46,18 @@ impl DesktopState {
             runtime,
             packages,
             protocol_mounts: Arc::new(Mutex::new(BTreeMap::new())),
-            lifecycle: Arc::new(DispatchLifecycle::running()),
+            lifecycle: lifecycle::Lifecycle::new(),
             updates: None,
         }
     }
 
-    fn runtime(&self) -> Result<Arc<CoreRuntime>, BridgeError> {
-        if !self.lifecycle.accepting.load(Ordering::SeqCst) {
-            return Err(BridgeError::shutdown());
-        }
-        Ok(Arc::clone(&self.runtime))
+    // Module accessors are private to admitted dispatch/resource work; cloning
+    // these Arcs is not admission and must never stand in for an operation lease.
+    fn runtime(&self) -> Arc<CoreRuntime> {
+        Arc::clone(&self.runtime)
     }
-
-    #[allow(clippy::result_large_err)]
-    fn package_host(&self) -> Result<Arc<PackageHost>, package_error::PackageBridgeError> {
-        if !self.lifecycle.accepting.load(Ordering::SeqCst) {
-            return Err(package_error::invalid_input(
-                teamarness_package_host::PackageErrorCode::ShuttingDown,
-                teamarness_package_host::PackageErrorStage::Shutdown,
-            ));
-        }
-        Ok(Arc::clone(&self.packages))
+    fn package_host(&self) -> Arc<PackageHost> {
+        Arc::clone(&self.packages)
     }
 
     async fn register_protocol_mount(
@@ -133,42 +97,102 @@ impl DesktopState {
             .retain(|_, lease| lease.instance != *instance);
     }
 
-    async fn shutdown(&self) {
-        if let Some(updates) = &self.updates {
-            updates.stop();
-        }
-        await_shutdown_handoff(
-            &self.lifecycle,
-            async { self.protocol_mounts.lock().await.clear() },
+    async fn cleanup(&self) -> lifecycle::ShutdownErrors {
+        shutdown_handoff(
             async {
-                let _ = self
+                self.protocol_mounts.lock().await.clear();
+            },
+            async {
+                let result = self
                     .packages
                     .execute(PackageHostCommand::Shutdown(ShutdownHost))
                     .await;
+                let uncertain = result.as_ref().is_err_and(|error| {
+                    error.code == teamarness_package_host::PackageErrorCode::OutcomeUncertain
+                });
+                (result.is_err(), uncertain)
             },
-            async {
-                let _ = self.runtime.shutdown().await;
-            },
+            async { self.runtime.shutdown().await.is_err() },
         )
-        .await;
+        .await
+    }
+
+    async fn dispatch<F, T>(&self, operation: F) -> Result<T, BridgeError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.lifecycle
+            .dispatch(operation)
+            .await
+            .map_err(|()| BridgeError::shutdown())
+    }
+
+    #[allow(dead_code)] // Phase 5's main-only command calls this native admission.
+    fn apply(&self, generation: &str, handle: tauri::AppHandle) -> Result<(), ()> {
+        self.lifecycle.apply(
+            generation,
+            || {
+                let pending = self
+                    .updates
+                    .as_ref()
+                    .ok_or(())?
+                    .admit_apply(generation)
+                    .map_err(|category| {
+                        eprintln!(
+                            "teamarness-desktop apply admission rejected category={category:?}"
+                        );
+                    })?;
+                Ok(update::installer(pending))
+            },
+            Arc::new(DesktopTerminal {
+                state: self.clone(),
+                handle,
+            }),
+        )
     }
 }
 
-async fn await_shutdown_handoff<M, P, C>(
-    lifecycle: &DispatchLifecycle,
-    close_mounts: M,
-    shutdown_packages: P,
-    shutdown_core: C,
-) where
-    M: Future<Output = ()>,
-    P: Future<Output = ()>,
-    C: Future<Output = ()>,
-{
-    lifecycle.begin_shutdown();
-    close_mounts.await;
-    shutdown_packages.await;
-    shutdown_core.await;
-    lifecycle.complete_shutdown();
+struct DesktopTerminal {
+    state: DesktopState,
+    handle: tauri::AppHandle,
+}
+impl lifecycle::TerminalAdapter for DesktopTerminal {
+    fn stop_updates(&self) {
+        if let Some(updates) = &self.state.updates {
+            updates.stop();
+        }
+    }
+    fn cleanup(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lifecycle::ShutdownErrors> + Send + '_>>
+    {
+        Box::pin(self.state.cleanup())
+    }
+    fn install(&self, pending: lifecycle::Install) -> Result<(), lifecycle::InstallFailure> {
+        pending()
+    }
+    fn restart(&self) {
+        self.handle.restart();
+    }
+    fn exit(&self) {
+        self.handle.exit(0);
+    }
+}
+
+async fn shutdown_handoff(
+    mounts: impl std::future::Future<Output = ()>,
+    host: impl std::future::Future<Output = (bool, bool)>,
+    core: impl std::future::Future<Output = bool>,
+) -> lifecycle::ShutdownErrors {
+    mounts.await;
+    let (host, uncertain) = host.await;
+    let core = core.await;
+    lifecycle::ShutdownErrors {
+        host,
+        core,
+        uncertain,
+    }
 }
 
 async fn open_runtime_modules(
@@ -231,7 +255,10 @@ pub fn run() {
             |context, request, responder| {
                 let state = context.app_handle().state::<DesktopState>().inner().clone();
                 tauri::async_runtime::spawn(async move {
-                    responder.respond(package_protocol::serve(state, request).await);
+                    package_protocol::respond(state, request, move |response| {
+                        responder.respond(response)
+                    })
+                    .await;
                 });
             },
         )
@@ -282,23 +309,29 @@ pub fn run() {
         .expect("failed to build Teamarness desktop application");
 
     app.run(|handle, event| {
-        if let RunEvent::ExitRequested { api, .. } = event {
-            let state = handle.state::<DesktopState>().inner().clone();
-            if state.lifecycle.shutdown_complete.load(Ordering::SeqCst) {
-                return;
-            }
-            api.prevent_exit();
-            if state.lifecycle.begin_shutdown() {
-                if let Some(updates) = &state.updates {
-                    updates.stop();
+        let state = handle.state::<DesktopState>().inner().clone();
+        match event {
+            RunEvent::ExitRequested { api, .. } => {
+                if state.lifecycle.exit_allowed() {
+                    return;
                 }
-                let handle = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    state.shutdown().await;
-                    handle.exit(0);
-                });
+                api.prevent_exit();
             }
+            RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                if state.lifecycle.exit_allowed() {
+                    return;
+                }
+                api.prevent_close();
+            }
+            _ => return,
         }
+        state.lifecycle.quit(Arc::new(DesktopTerminal {
+            state: state.clone(),
+            handle: handle.clone(),
+        }));
     });
 }
 
@@ -466,22 +499,5 @@ mod tests {
             serde_json::Value::Array(expected_index),
             "run `npm run build:application-packages`"
         );
-    }
-
-    #[test]
-    fn exit_handoff_closes_dispatch_then_mounts_host_and_core() {
-        let lifecycle = DispatchLifecycle::running();
-        let order = std::sync::Mutex::new(Vec::new());
-        tauri::async_runtime::block_on(await_shutdown_handoff(
-            &lifecycle,
-            async {
-                assert!(!lifecycle.accepting.load(Ordering::SeqCst));
-                order.lock().unwrap().push("mounts");
-            },
-            async { order.lock().unwrap().push("host") },
-            async { order.lock().unwrap().push("core") },
-        ));
-        assert_eq!(*order.lock().unwrap(), ["mounts", "host", "core"]);
-        assert!(lifecycle.shutdown_complete.load(Ordering::SeqCst));
     }
 }

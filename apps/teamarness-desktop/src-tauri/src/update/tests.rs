@@ -455,3 +455,48 @@ fn update_default_application_initializes_without_updater_configuration() {
     assert_eq!(service.status().state, State::Disabled);
     assert!(!service.request_check());
 }
+
+#[tokio::test]
+async fn update_apply_rechecks_pending_version_and_lifecycle_quit_cancels_download() {
+    let (service, _) = fixture(manifest("1.2.3"), BYTES, false, None);
+    service.request_check();
+    wait_state(&service, State::Ready).await;
+    let generation = service.status().pending_generation.unwrap();
+    service.inner.lock().unwrap().snapshot.installed_version = "1.2.3".into();
+    assert!(service.admit_apply(&generation).is_err());
+    assert_eq!(service.status().state, State::Ready);
+    service.stop();
+
+    let gate = Arc::new(Notify::new());
+    let (service, transfer) = fixture(manifest("1.2.3"), BYTES, false, Some(gate.clone()));
+    service.request_check();
+    while transfer.calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    gate.notify_one();
+    wait_state(&service, State::Downloading).await;
+    struct Quit(UpdateService);
+    impl crate::lifecycle::TerminalAdapter for Quit {
+        fn stop_updates(&self) {
+            self.0.stop();
+        }
+        fn cleanup(&self) -> BoxFuture<'_, crate::lifecycle::ShutdownErrors> {
+            Box::pin(async { Default::default() })
+        }
+        fn install(
+            &self,
+            _: crate::lifecycle::Install,
+        ) -> Result<(), crate::lifecycle::InstallFailure> {
+            panic!("Quit cannot install")
+        }
+        fn restart(&self) {
+            panic!("Quit cannot restart")
+        }
+        fn exit(&self) {}
+    }
+    let lifecycle = crate::lifecycle::Lifecycle::new();
+    lifecycle.quit(Arc::new(Quit(service.clone())));
+    lifecycle.finished().await;
+    assert_eq!(service.status().state, State::Stopped);
+    assert!(service.inner.lock().unwrap().pending.is_none());
+}

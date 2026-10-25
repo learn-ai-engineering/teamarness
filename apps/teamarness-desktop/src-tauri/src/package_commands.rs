@@ -39,7 +39,17 @@ pub const COMMAND_NAMES: [&str; 13] = [
 pub async fn package_catalog_snapshot(
     state: State<'_, DesktopState>,
 ) -> Result<PackageHostSnapshotDto, PackageBridgeError> {
-    Ok(state.package_host()?.snapshot().await.into())
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move { Ok(state.package_host().snapshot().await.into()) })
+        .await
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -48,21 +58,32 @@ pub async fn package_subscribe_host_state(
     on_event: Channel<HostStateNotificationDto>,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let host = state.package_host()?;
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch.dispatch(async move {
+    let host = state.package_host();
     let mut subscription = host
         .subscribe(PackageHostSubscriptionSelector::HostState {
             after_revision: HostRevision(after_revision),
         })
         .await
         .map_err(PackageBridgeError::from)?;
+    let lifecycle = state.lifecycle.clone();
+    let forwarder = lifecycle.forwarder();
     tauri::async_runtime::spawn(async move {
-        while let Ok(PackageHostNotification::HostState(value)) = subscription.changed().await {
-            if on_event.send(value.into()).is_err() {
-                break;
+        let _forwarder = forwarder;
+        loop {
+            tokio::select! { biased;
+                _ = lifecycle.cancelled() => break,
+                value = subscription.changed() => match value {
+                    Ok(PackageHostNotification::HostState(value)) => if on_event.send(value.into()).is_err() { break; },
+                    _ => break,
+                }
             }
         }
     });
     Ok(())
+    }).await.map_err(|_| crate::package_error::invalid_input(PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown))?
 }
 
 #[tauri::command]
@@ -70,25 +91,37 @@ pub async fn package_open_mount(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<OpenUiMountDto, PackageBridgeError> {
-    let instance = parse_instance(instance)?;
-    state.remove_instance_tokens(&instance).await;
-    let outcome = state
-        .package_host()?
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: instance.clone(),
-        }))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let instance = parse_instance(instance)?;
+            state.remove_instance_tokens(&instance).await;
+            let outcome = state
+                .package_host()
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
+                    instance: instance.clone(),
+                }))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            let PackageHostOutcome::UiMountOpened { mount, loader, .. } = outcome else {
+                unreachable!("OpenUiMount has one success outcome")
+            };
+            state
+                .register_protocol_mount(loader.token.as_str(), &mount, &instance)
+                .await;
+            Ok(OpenUiMountDto {
+                mount: mount.into(),
+                loader: loader.into(),
+            })
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    let PackageHostOutcome::UiMountOpened { mount, loader, .. } = outcome else {
-        unreachable!("OpenUiMount has one success outcome")
-    };
-    state
-        .register_protocol_mount(loader.token.as_str(), &mount, &instance)
-        .await;
-    Ok(OpenUiMountDto {
-        mount: mount.into(),
-        loader: loader.into(),
-    })
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -96,14 +129,26 @@ pub async fn package_close_mount(
     mount: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let mount = parse_mount(mount)?;
-    state.remove_mount_token(&mount).await;
-    state
-        .package_host()?
-        .execute(PackageHostCommand::CloseUiMount(CloseUiMount { mount }))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let mount = parse_mount(mount)?;
+            state.remove_mount_token(&mount).await;
+            state
+                .package_host()
+                .execute(PackageHostCommand::CloseUiMount(CloseUiMount { mount }))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            Ok(())
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -114,20 +159,32 @@ pub async fn package_request(
     payload: PackageValue,
     state: State<'_, DesktopState>,
 ) -> Result<PackageValue, PackageBridgeError> {
-    let outcome = state
-        .package_host()?
-        .execute(PackageHostCommand::UiRequest(UiRequest {
-            mount: parse_mount(mount)?,
-            request: UiRequestId::new(request).map_err(|_| ui_input_error())?,
-            operation,
-            payload,
-        }))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let outcome = state
+                .package_host()
+                .execute(PackageHostCommand::UiRequest(UiRequest {
+                    mount: parse_mount(mount)?,
+                    request: UiRequestId::new(request).map_err(|_| ui_input_error())?,
+                    operation,
+                    payload,
+                }))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            let PackageHostOutcome::UiResponse { payload } = outcome else {
+                unreachable!("UiRequest has one success outcome")
+            };
+            Ok(payload)
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    let PackageHostOutcome::UiResponse { payload } = outcome else {
-        unreachable!("UiRequest has one success outcome")
-    };
-    Ok(payload)
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -136,15 +193,27 @@ pub async fn package_cancel_request(
     request: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    state
-        .package_host()?
-        .execute(PackageHostCommand::CancelUiRequest(CancelUiRequest {
-            mount: parse_mount(mount)?,
-            request: UiRequestId::new(request).map_err(|_| ui_input_error())?,
-        }))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            state
+                .package_host()
+                .execute(PackageHostCommand::CancelUiRequest(CancelUiRequest {
+                    mount: parse_mount(mount)?,
+                    request: UiRequestId::new(request).map_err(|_| ui_input_error())?,
+                }))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            Ok(())
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -156,32 +225,43 @@ pub async fn package_open_stream(
     on_event: Channel<UiStreamMessageDto>,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let mount = parse_mount(mount)?;
-    let subscription = UiSubscriptionId::new(subscription).map_err(|_| ui_input_error())?;
-    let host = state.package_host()?;
-    host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
-        mount: mount.clone(),
-        subscription: subscription.clone(),
-        operation,
-        payload,
-    }))
-    .await
-    .map_err(PackageBridgeError::from)?;
-    let receiver = host
-        .subscribe(PackageHostSubscriptionSelector::UiEvents {
-            mount: mount.clone(),
-            subscription: subscription.clone(),
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let mount = parse_mount(mount)?;
+            let subscription = UiSubscriptionId::new(subscription).map_err(|_| ui_input_error())?;
+            let host = state.package_host();
+            host.execute(PackageHostCommand::OpenUiSubscription(OpenUiSubscription {
+                mount: mount.clone(),
+                subscription: subscription.clone(),
+                operation,
+                payload,
+            }))
+            .await
+            .map_err(PackageBridgeError::from)?;
+            let receiver = host
+                .subscribe(PackageHostSubscriptionSelector::UiEvents {
+                    mount: mount.clone(),
+                    subscription: subscription.clone(),
+                })
+                .await
+                .map_err(PackageBridgeError::from)?;
+            let lifecycle = state.lifecycle.clone();
+            let forwarder = lifecycle.forwarder();
+            tauri::async_runtime::spawn(async move {
+                let _forwarder = forwarder;
+                forward_ui_events(&lifecycle, host, receiver, mount, subscription, on_event).await;
+            });
+            Ok(())
         })
         .await
-        .map_err(PackageBridgeError::from)?;
-    tauri::async_runtime::spawn(forward_ui_events(
-        host,
-        receiver,
-        mount,
-        subscription,
-        on_event,
-    ));
-    Ok(())
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -191,19 +271,32 @@ pub async fn package_acknowledge_events(
     through_sequence: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    let through_sequence = through_sequence.parse().map_err(|_| ui_input_error())?;
-    state
-        .package_host()?
-        .execute(PackageHostCommand::AcknowledgeUiEvents(
-            AcknowledgeUiEvents {
-                mount: parse_mount(mount)?,
-                subscription: UiSubscriptionId::new(subscription).map_err(|_| ui_input_error())?,
-                through_sequence,
-            },
-        ))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let through_sequence = through_sequence.parse().map_err(|_| ui_input_error())?;
+            state
+                .package_host()
+                .execute(PackageHostCommand::AcknowledgeUiEvents(
+                    AcknowledgeUiEvents {
+                        mount: parse_mount(mount)?,
+                        subscription: UiSubscriptionId::new(subscription)
+                            .map_err(|_| ui_input_error())?,
+                        through_sequence,
+                    },
+                ))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            Ok(())
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -212,28 +305,41 @@ pub async fn package_close_stream(
     subscription: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    state
-        .package_host()?
-        .execute(PackageHostCommand::CloseUiSubscription(
-            CloseUiSubscription {
-                mount: parse_mount(mount)?,
-                subscription: UiSubscriptionId::new(subscription).map_err(|_| ui_input_error())?,
-            },
-        ))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            state
+                .package_host()
+                .execute(PackageHostCommand::CloseUiSubscription(
+                    CloseUiSubscription {
+                        mount: parse_mount(mount)?,
+                        subscription: UiSubscriptionId::new(subscription)
+                            .map_err(|_| ui_input_error())?,
+                    },
+                ))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            Ok(())
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 async fn run_package_lifecycle(
     instance: PackageInstanceKeyDto,
-    state: State<'_, DesktopState>,
+    state: &DesktopState,
     command: fn(PackageInstanceKey) -> PackageHostCommand,
     remove_tokens: bool,
 ) -> Result<(), PackageBridgeError> {
     let instance = parse_instance(instance)?;
     state
-        .package_host()?
+        .package_host()
         .execute(command(instance.clone()))
         .await
         .map_err(PackageBridgeError::from)?;
@@ -248,13 +354,25 @@ pub async fn package_suspend(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    run_package_lifecycle(
-        instance,
-        state,
-        |instance| PackageHostCommand::Suspend(SuspendPackage { instance }),
-        false,
-    )
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            run_package_lifecycle(
+                instance,
+                &state,
+                |instance| PackageHostCommand::Suspend(SuspendPackage { instance }),
+                false,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -262,13 +380,25 @@ pub async fn package_recover(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    run_package_lifecycle(
-        instance,
-        state,
-        |instance| PackageHostCommand::Recover(RecoverPackage { instance }),
-        false,
-    )
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            run_package_lifecycle(
+                instance,
+                &state,
+                |instance| PackageHostCommand::Recover(RecoverPackage { instance }),
+                false,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -276,13 +406,25 @@ pub async fn package_dispose(
     instance: PackageInstanceKeyDto,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    run_package_lifecycle(
-        instance,
-        state,
-        |instance| PackageHostCommand::Dispose(DisposePackage { instance }),
-        true,
-    )
-    .await
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            run_package_lifecycle(
+                instance,
+                &state,
+                |instance| PackageHostCommand::Dispose(DisposePackage { instance }),
+                true,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -291,23 +433,36 @@ pub async fn package_report_ui_fault(
     code: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), PackageBridgeError> {
-    if code != "ui_exception" {
-        return Err(ui_input_error());
-    }
-    let mount = parse_mount(mount)?;
-    state.remove_mount_token(&mount).await;
-    state
-        .package_host()?
-        .execute(PackageHostCommand::ReportUiFault(ReportUiFault {
-            mount,
-            code,
-        }))
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            if code != "ui_exception" {
+                return Err(ui_input_error());
+            }
+            let mount = parse_mount(mount)?;
+            state.remove_mount_token(&mount).await;
+            state
+                .package_host()
+                .execute(PackageHostCommand::ReportUiFault(ReportUiFault {
+                    mount,
+                    code,
+                }))
+                .await
+                .map_err(PackageBridgeError::from)?;
+            Ok(())
+        })
         .await
-        .map_err(PackageBridgeError::from)?;
-    Ok(())
+        .map_err(|_| {
+            crate::package_error::invalid_input(
+                PackageErrorCode::ShuttingDown,
+                PackageErrorStage::Shutdown,
+            )
+        })?
 }
 
 async fn forward_ui_events(
+    lifecycle: &crate::lifecycle::Lifecycle,
     host: std::sync::Arc<teamarness_package_host::PackageHost>,
     mut receiver: teamarness_package_host::PackageHostSubscription,
     mount: UiMountId,
@@ -315,7 +470,11 @@ async fn forward_ui_events(
     on_event: Channel<UiStreamMessageDto>,
 ) {
     loop {
-        let message = match receiver.changed().await {
+        let received = tokio::select! { biased;
+            _ = lifecycle.cancelled() => return,
+            result = receiver.changed() => result,
+        };
+        let message = match received {
             Ok(PackageHostNotification::UiEvent(value)) => UiStreamMessageDto::Event(value.into()),
             // The Package ended the stream; the Shell reports it and stops, without a fault.
             Ok(PackageHostNotification::UiStreamCompleted(value)) => {
@@ -431,6 +590,7 @@ mod tests {
                 .unwrap();
             let failed_channel = Channel::new(|_| Err(tauri::Error::FailedToReceiveMessage));
             forward_ui_events(
+                &crate::lifecycle::Lifecycle::new(),
                 Arc::clone(&host),
                 receiver,
                 mount.clone(),
@@ -507,6 +667,7 @@ mod tests {
             });
 
             forward_ui_events(
+                &crate::lifecycle::Lifecycle::new(),
                 Arc::clone(&host),
                 receiver,
                 mount.clone(),
@@ -579,6 +740,12 @@ mod tests {
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<CoreRuntime>, Arc<PackageHost>) {
+        fixture_processes(false).await
+    }
+
+    async fn fixture_processes(
+        process_tree: bool,
+    ) -> (tempfile::TempDir, Arc<CoreRuntime>, Arc<PackageHost>) {
         let root = tempfile::tempdir().unwrap();
         let application = root.path().join("application");
         let private = root.path().join("private");
@@ -586,11 +753,27 @@ mod tests {
         fs::create_dir_all(package.join("backend")).unwrap();
         fs::create_dir_all(package.join("ui")).unwrap();
         fs::create_dir_all(&private).unwrap();
-        let backend = fs::read(
+        let mut backend = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../contracts/package-process/v1/fixtures/node-package-process.mjs"),
         )
         .unwrap();
+        if process_tree {
+            let source = String::from_utf8(backend).unwrap();
+            let injected = format!(
+                "import {{ spawn as fixtureSpawn }} from 'node:child_process';\nimport {{ writeFileSync as fixtureWrite, existsSync as fixtureExists, readFileSync as fixtureRead }} from 'node:fs';\nconst fixturePidFile = {};\n",
+                serde_json::to_string(&root.path().join("processes.json")).unwrap()
+            );
+            backend = source.replace("import { pathToFileURL }", &(injected + "import { pathToFileURL }"))
+                .replace("packageIdentity = frame.package.identity;", r#"
+                    packageIdentity = frame.package.identity;
+                    const child = fixtureSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+                    fixtureWrite(fixturePidFile, JSON.stringify([process.pid, child.pid]));
+                    const marker = frame.dataDirectory.path + '/lifecycle-marker';
+                    const previous = fixtureExists(marker) ? Number(fixtureRead(marker, 'utf8')) : 0;
+                    fixtureWrite(marker, String(previous + 1));
+                "#).into_bytes();
+        }
         let backend_path = package.join("backend/package.mjs");
         fs::write(&backend_path, &backend).unwrap();
         fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -669,6 +852,8 @@ mod tests {
         );
         (root, core, host)
     }
+
+    mod lifecycle_integration;
 
     fn digest(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
