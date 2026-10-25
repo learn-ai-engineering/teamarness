@@ -96,6 +96,61 @@ The delivery correction adds Conversations 1.2 `message.changes`, exposing the e
 
 Automated coverage spans Core, Host, SDK, Conversations and Agent tests, a 257-Message two-profile backlog, queued-post actor attribution, and cancelled-binding-waiter ownership against a real test Host. The final merged validation and review are `verify/20261024T092503Z_post-merge-{validation,review}.md` in the `agent-package` workstream. No current Agent or merge findings remain. The developer observed real-endpoint replies, Personal Package discovery, retained configuration after restart, and an offline-addressed reply visible at the first inspection after Alice returned. These observations are not a complete manual matrix, measured latency, or duplicate audit. They were not repeated after integration. Incoming Documents limitations remain separate. The inherited record-log authoring-schema mismatch is tracked in [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). Key custody, streaming, tools, Documents participation, scheduled posts, SDK publication, and stronger Package isolation remain separate Scopes under Later.
 
+### Agent Package tools and guides, slice 1 (verified; closing)
+
+This slice was implemented on 2026-10-25 in the standalone Agent Package repository, branch `proper_harness`, workstream `agent-harness`.
+
+**What it delivers**
+
+- The Agent offers each enabled agent-facing Package to the model as tools that the generic Port client builds. A contract is agent-facing when it has a `runtime.guide`.
+- The model first sees one line per Package. It loads the Package guide, and the Agent's own compiled-in skill, only when it asks for them.
+- Arguments are validated against the Port schema before any dispatch.
+- A Provider error reaches the model with its stable code.
+- A command is never re-sent, and an unknown outcome is reported to the model as unknown.
+- Each turn is bounded by a model-call budget, a tool-call budget, a cap on each result, a cap on how much the turn's own tool exchange can grow its messages, and a deadline.
+- Chat shows which Package operations an answer used.
+- Channel replies can use tools, and the harness still posts exactly one reply.
+- With nothing enabled, requests are unchanged.
+
+**Change to the earlier Agent Package**
+
+The slice removes the Agent's dispatch fence. This supersedes the fail-closed note under **Agent Package** above: a failed or uncertain post no longer stops replies until restart. An in-flight post is now not fenced against a concurrent rebind. The developer judged that race not credible and accepted it.
+
+**Status**
+
+Verify attempt 2 passed at `55a016c`. A corrective phase for three behaviour P2s, requested by the developer, is in progress.
+
+**Remaining before Close**
+
+- The developer's real-app checks, with Exhibits installed and then not installed:
+  - the Packages list and "Unavailable" marker;
+  - an Exhibits chat answer that shows its activity line;
+  - exactly one Channel reply;
+  - Chat unchanged after Exhibits is disabled;
+  - activation without Exhibits;
+  - observe only: what the Host does with a tool command while the Agent is unbound.
+- A fresh Verify after the corrective phase.
+- Local integration into the Agent repository's `main`.
+
+**Teamarness follow-up**
+
+The system test `agent_reply_flow.rs::enqueued_reply_keeps_old_actor_during_rebind` asserts the removed fence. It fails by design against this Agent, so update or drop it.
+
+**Retained P2 follow-ups**
+
+These are recorded in the `agent-harness` Verify reports:
+
+- a command in flight at the deadline is missing from the failed-turn activity;
+- a running turn keeps its tools after a Package is disabled;
+- Channel content can steer commands on reply turns, a prompt-injection surface;
+- documentation and comment cleanups.
+
+**Not how it should stay**
+
+The slice uses a bundled catalog, manifest-declared optional contracts, Agent-local enablement and package-ports 1.x. See [DELTA-016](.delta/DELTA-016-agent-harness-bundled-catalog.md).
+
+The developer's goal is that a newly installed agent-capable Package appears, can be switched on, and works with no Agent rebuild. The next Agent slice moves to ADR 0035 Host discovery and Host-owned enablement once **Agent-controlled Package Ports** integrates. That slice also runs the deferred Documents chat check and lists Conversations once their guides ship.
+
 ### Workspace Principals (complete)
 
 Verified on 2026-10-23 on branch `don-smith/agent_invite`, workstream `agent-invite`. ADR 0023 (accepted 2026-10-21) defines Workspace Principals: a Workspace Person is a key group nested in the Workspace group, a Workspace Agent is a Principal whose key the Steward's Installation custodies, and attribution is the signer key resolved to its Principal. The workstream replaces the names capability of ADR 0022 with `teamarness.principals` 1.0, adds the optional `principal` selector to `teamarness.synchronization.immutable-record-log` 1.1, lets any Member add an Agent by name from the Shell without a Manager, lists Agents with their Steward, and shows Agent authors in Conversations. The agent runtime Package, cross-Package reads, and Shell-driven Package binding are the next workstream.
@@ -159,6 +214,7 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
 - Agent Package: streaming replies, tool use beyond declared Ports, and unprompted or scheduled posts (non-goals of the `agent-package` workstream). Documents participation is tracked under **Agent participation in Package Ports**.
+- Agent Package runtime discovery: replace the Agent's bundled catalog and local enablement with ADR 0035 Host discovery and Host-owned enablement, so new agent-capable Packages work without an Agent rebuild ([DELTA-016](.delta/DELTA-016-agent-harness-bundled-catalog.md)).
 - Network denial for Exhibit content frames: a navigation handler and WebRTC denial beside the content policy's `connect-src` ([DELTA-015](.delta/DELTA-015-exhibit-content-network-access.md), ADR 0034).
 - Package platform authoring contracts: align the immutable-record-log 1.1 JSON request schema with the optional `principal` selector already supported by Host and SDK. See [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). This inherited mismatch is not resolved by the Agent integration.
 
