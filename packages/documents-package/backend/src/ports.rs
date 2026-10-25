@@ -399,9 +399,6 @@ pub(super) async fn revise(
                 revise_error(cause).with_outcome_uncertain(true)
             }
         })?;
-        staged.version = state
-            .hub
-            .with_body(&request.document_id, |body| body.frontiers());
     } else if staged.changed {
         // The staged record is retried until it is appended, so a failure here may still
         // commit: the command's outcome is unknown and must not be replayed automatically.

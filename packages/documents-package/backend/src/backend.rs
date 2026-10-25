@@ -2571,7 +2571,8 @@ struct Unstaged {
 /// the caller drains exactly this write before any other local write is staged.
 struct Staged {
     revision: u64,
-    /// The body's version once the write was staged; it includes the write.
+    /// The Document's version as this write left it. For a revision that changed something, it
+    /// is the merge's own result, so it holds no edit adopted after the merge forked the body.
     version: Frontiers,
     /// `false` when a revision changed nothing: nothing was staged and no record follows.
     changed: bool,
@@ -2673,7 +2674,7 @@ async fn stage_local_write(
         if !body.editable() {
             return Err(error("documents.document_pending", true));
         }
-        let digest = match (write, digest) {
+        let (digest, version) = match (write, digest) {
             (LocalWrite::Update { peer, bytes }, Some(digest)) => {
                 if let Some(known) = body.identity(request_id) {
                     if known.author != author || known.digest != digest {
@@ -2683,13 +2684,13 @@ async fn stage_local_write(
                 }
                 body.accept_local_update(peer, request_id.to_owned(), bytes)
                     .map_err(update_error)?;
-                digest
+                (digest, None)
             }
             (LocalWrite::Revision { append_first, .. }, _) => {
                 if body.identity(request_id).is_some() {
                     return Err(invalid_request());
                 }
-                let Some((peer, merged)) = merged.take() else {
+                let Some((peer, merged, merged_version)) = merged.take() else {
                     return Err(error("documents.edit_failed", true));
                 };
                 if append_first {
@@ -2704,7 +2705,7 @@ async fn stage_local_write(
                         digest: Sha256::digest(&update).into(),
                         update,
                     });
-                    return Ok((body.revision(), body.frontiers(), None, true));
+                    return Ok((body.revision(), merged_version, None, true));
                 }
                 if !body
                     .stage_merged(peer, request_id.to_owned(), &merged)
@@ -2715,13 +2716,14 @@ async fn stage_local_write(
                 let update = body
                     .staged()
                     .ok_or_else(|| error("documents.edit_failed", true))?;
-                Sha256::digest(update).into()
+                (Sha256::digest(update).into(), Some(merged_version))
             }
             (LocalWrite::Update { .. }, None) => return Err(invalid_request()),
         };
         body.remember_identity(request_id.to_owned(), author.to_owned(), digest, false)
             .map_err(|_| invalid_request())?;
-        Ok((body.revision(), body.frontiers(), body.staged(), true))
+        let version = version.unwrap_or_else(|| body.frontiers());
+        Ok((body.revision(), version, body.staged(), true))
     })?;
     if staged.is_none()
         && unstaged.is_none()
@@ -2755,13 +2757,14 @@ async fn stage_local_write(
 
 /// Merges a Markdown revision of `base` into a fork of the body of `document`, as a fresh peer,
 /// on a blocking thread. The bodies lock is held only to fork; the merge holds no lock, so other
-/// Documents keep reading, writing and publishing while it runs. Returns the peer and the merge.
+/// Documents keep reading, writing and publishing while it runs. Returns the peer, the merge and
+/// the fork's version with the merge applied: the version the revision leaves the Document at.
 async fn merge_off_lock(
     hub: &BodyHub,
     document: &str,
     base: &Frontiers,
     markdown: &str,
-) -> Result<(u64, crate::markdown::Merged), BackendError> {
+) -> Result<(u64, crate::markdown::Merged, Frontiers), BackendError> {
     let (source, peer) = hub
         .with_body(document, |body| body.merge_source())
         .map_err(update_error)?;
@@ -2775,12 +2778,18 @@ async fn merge_off_lock(
             let _ = started.send(());
             let _ = release.recv();
         }
-        crate::body::merge_revision(&source, &base, &markdown, peer)
+        let merged = crate::body::merge_revision(&source, &base, &markdown, peer)?;
+        if merged.ops > 0 {
+            source
+                .import(&merged.update)
+                .map_err(|_| crate::body::BodyError::Loro)?;
+        }
+        Ok((merged, source.oplog_frontiers()))
     })
     .await
     .map_err(|_| error("documents.edit_failed", true))?
     .map_err(update_error)?;
-    Ok((peer, merged))
+    Ok((peer, merged.0, merged.1))
 }
 
 /// Waits until every staged update of `document` has reached the Core record log.
@@ -3416,6 +3425,21 @@ mod tests {
 
     /// A capability that opens nothing, appends deterministically, and refuses the rest.
     fn scripted_log() -> ScriptedCapability {
+        scripted_log_pausing(AppendPause::default())
+    }
+
+    /// A pause the scripted record log takes inside the next Agent append, before it answers:
+    /// it signals the sender, then waits on the receiver.
+    type AppendPause = Arc<
+        Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    >;
+
+    fn scripted_log_pausing(pause: AppendPause) -> ScriptedCapability {
         let appended = Arc::new(std::sync::atomic::AtomicU64::new(100));
         ScriptedCapability::new().calls(move |method, payload| match method {
             "open" => {
@@ -3432,7 +3456,14 @@ mod tests {
             "append" => {
                 // Core signs with the Agent's key when the 1.1 `principal` names a bound Agent.
                 let author = match payload.get("principal").and_then(JsonValue::as_str) {
-                    Some(AGENT_PRINCIPAL) => AGENT_KEY,
+                    Some(AGENT_PRINCIPAL) => {
+                        let paused = recover(&pause).take();
+                        if let Some((started, release)) = paused {
+                            let _ = started.send(());
+                            let _ = release.recv();
+                        }
+                        AGENT_KEY
+                    }
                     Some(_) => {
                         return Err(BackendError::new("principal_not_bound", false, json!({})));
                     }
@@ -7408,7 +7439,7 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: TEAM.SYS.DOCS-R12 — list, read, revise and observe, with Person authority and the
+    // Verifies: TEAM.SYS.DOCS-R12 — list, read, revise and observe, with actor authority and the
     // typed refusals, each refusal appending nothing.
     #[tokio::test]
     async fn ports_list_read_revise_observe_and_refuse() {
@@ -7494,7 +7525,8 @@ mod tests {
             );
         }
 
-        // Person authority: only the local Installation Person revises.
+        // Authority: a Person actor revises only as the local Installation Person, and an Agent
+        // actor only with the Principal ID the Host derived for it.
         let before = appends(&session);
         let stranger = port_as(
             &mut session.harness,
@@ -7797,6 +7829,60 @@ mod tests {
         );
         bob.harness.shutdown().await.unwrap();
         session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — a revise returns the version its own revision left the
+    // Document at: a remote edit adopted while the Agent's record is being appended is not in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_revise_version_excludes_an_edit_adopted_during_its_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let pause = AppendPause::default();
+        let mut session = start(directory.path(), scripted_log_pausing(pause.clone())).await;
+        let (_, document) = ported_document(&mut session).await;
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        let (started, on_start) = std::sync::mpsc::sync_channel(1);
+        let (release, on_release) = std::sync::mpsc::sync_channel(1);
+        *recover(&pause) = Some((started, on_release));
+        let mut harness = session.harness;
+        let request = json!({"documentId":document,"baseVersion":read["version"],"markdown":"Drafted by an agent\n"});
+        let revising = tokio::spawn(async move {
+            let revised =
+                port_as(&mut harness, "command", "document.revise", agent(), request).await;
+            (harness, revised)
+        });
+        tokio::task::spawn_blocking(move || on_start.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Another Installation's edit is adopted while Core appends the Agent's record.
+        let remote = Writer::of(&session.handles, &document).write("Written elsewhere\n");
+        session
+            .handles
+            .hub
+            .apply_edits(&[(document.clone(), remote)]);
+        let adopted = session.handles.bodies.lock().unwrap()[&document].frontiers();
+        release.send(()).unwrap();
+        let (harness, revised) = revising.await.unwrap();
+        let revised = revised.unwrap();
+        assert_eq!(revised["changed"], true);
+        let version = ports::decode_version(revised["version"].as_str().unwrap()).unwrap();
+        let current = session.handles.bodies.lock().unwrap()[&document].frontiers();
+        assert!(
+            version.iter().all(|id| current.contains(&id)),
+            "the Agent's revision is in the body"
+        );
+        assert!(
+            adopted.iter().all(|id| !version.contains(&id)),
+            "the returned version does not include the remote edit"
+        );
+        assert_ne!(version, current);
+        harness.shutdown().await.unwrap();
     }
 
     // Verifies: TEAM.SYS.DOCS-R12 — an Agent that Core will not sign for is refused with

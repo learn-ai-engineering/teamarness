@@ -50,8 +50,8 @@ fn documents_stage() -> PackageStage {
     }
 }
 
-/// Stages the consumer Package, declaring Documents `1.min_minor` through 1.1.
-fn stage_consumer(application: &Path, min_minor: u16) {
+/// Stages the consumer Package, declaring Documents `1.min_minor` through `1.max_minor`.
+fn stage_consumer(application: &Path, min_minor: u16, max_minor: u16) {
     let root = application.join(CONSUMER);
     fs::create_dir_all(root.join("backend")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
@@ -71,7 +71,7 @@ fn stage_consumer(application: &Path, min_minor: u16) {
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],
             "contract":{"path":"ui-contract.json","sha256":digest(contract)}},
         "capabilities":[{"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0}],
-        "consumedPorts":[{"identity":DOCUMENTS,"major":1,"minMinor":min_minor,"maxMinor":1,"ports":[
+        "consumedPorts":[{"identity":DOCUMENTS,"major":1,"minMinor":min_minor,"maxMinor":max_minor,"ports":[
             {"name":"document.list","kind":"query"},{"name":"document.markdown","kind":"query"},
             {"name":"document.revise","kind":"command"},{"name":"documents.changed","kind":"event"}]}]
     });
@@ -302,7 +302,7 @@ fn unique_text(bytes: usize) -> String {
 async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let application = harness::StagedApplication::with(&documents_stage());
     // A 1.0 Consumer keeps working against the 1.1 Provider.
-    stage_consumer(&application.application_path, 0);
+    stage_consumer(&application.application_path, 0, 0);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
     let workspace = core.create_workspace("Documents port proof").unwrap();
@@ -461,7 +461,7 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let too_large = consumer.revise(&document, &read["version"], &huge).await;
     assert_eq!(provider_code(&too_large), "documents.revision_too_large");
     assert_eq!(too_large["uncertain"], false);
-    // Person authority is Host-derived: a Consumer cannot name its own actor.
+    // The actor is Host-derived: a Consumer cannot name its own.
     let forged = consumer
         .call(
             "forged",
@@ -542,7 +542,7 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn agent_bound_consumer_revises_a_document_as_the_agent() {
     let application = harness::StagedApplication::with(&documents_stage());
-    stage_consumer(&application.application_path, 1);
+    stage_consumer(&application.application_path, 1, 1);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
     let workspace = core.create_workspace("Documents agent proof").unwrap();

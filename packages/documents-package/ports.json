@@ -44,7 +44,7 @@
           "markdown": { "$ref": "#/$defs/markdown" }, "version": { "$ref": "#/$defs/version" }
         } }
       },
-      { "name": "document.revise", "kind": "command", "description": "Merge a Markdown revision of the export at baseVersion as one record signed by the local Installation Person or (1.1) the caller's bound Workspace Agent. Only what differs from the base changes; changed false appends nothing. Errors: documents.base_unavailable, documents.revision_too_large, documents.schema_violation, documents.unknown_document, documents.pending, documents.unavailable, documents.actor_unauthorized, documents.principal_not_bound. An uncertain command must not be retried automatically.",
+      { "name": "document.revise", "kind": "command", "description": "Merge Markdown revised from the baseVersion export as one record signed by the local Person or (1.1) the caller's bound Agent; changed false appends nothing. Errors: documents.base_unavailable, documents.revision_too_large, documents.schema_violation, documents.unknown_document, documents.pending, documents.unavailable, documents.actor_unauthorized, documents.principal_not_bound. version may include concurrent edits; read again before revising. An uncertain command must not be retried automatically.",
         "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "baseVersion", "markdown"], "properties": {
           "documentId": { "$ref": "#/$defs/recordId" },
           "baseVersion": { "$ref": "#/$defs/version" },
