@@ -70,6 +70,22 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Packagement (implemented, not yet verified)
+
+Implemented on 2026-10-25 on branch `don-smith/packagement`, workstream `packagement`. ADR 0031 (accepted 2026-10-25) splits Package Admission into a Team tier, fixed at Host open, and a Personal tier that changes while the Host runs. A Team Package never routes to a Personal Provider.
+
+- The Host's registration store inspects a Package Directory without running it and writes the existing `registrations.v1.json` atomically, after an admission preflight that records nothing. Hand-written files keep working.
+- The Host installs, reloads, restarts, and removes one Personal Package at a time without restarting Team Packages. A live claim on a Port Contract that a running Package provides is refused with `port_provider_conflict`.
+- The Shell adds **+** (**Add Personal Package**) on the Workspace page: folder picker or pasted path, preview, native-code consent, and install. A Team Package override needs a second confirmation and applies after **Restart Teamarness**. Refused registrations appear under **Needs attention on this device**.
+- Every Package has a Package page with its metadata, trust, capabilities, and Ports. Personal Packages get Reload, Restart, Pause, Resume, Start, and Remove; Remove keeps the Package Data Directory.
+- The manifest gains optional `presentation.description`, `author`, and `homepage`, and an optional `ui.views` settings view (`TEAM.SYS.PKG-R16`). `uiHostVersion` is 2 (ADR 0032).
+
+Automated checks pass for every implementation step. The manual checks of install, reload, remove, override, the Package page, and the settings view, and the workstream Verify, are outstanding. Integration into `main` needs the developer's approval; `main` already uses ADR numbers 0031 to 0034, so this branch's ADRs 0031 and 0032 need renumbering at integration.
+
+**Outcome:** A person installs, rebuilds, and removes a Personal Package from the Shell without touching files or restarting Teamarness, and Team Packages keep running.
+
+**Next:** the `package-builder` workstream, which builds Personal Packages inside the Shell on top of this live tier.
+
 ### Agent Package (complete, verified locally)
 
 Completed and verified on 2026-10-24, including incoming local main `a947a17` merged into the feature branch and constructor/provenance correction `a67f3c4`. The final merged Root checks, all four explicit external-Agent/Host cases, and focused independent review pass. The standalone Agent's verified runtime is `ed3c016`. The developer approved fast-forward integration into local `main`. No source push or publication is authorized.
@@ -185,7 +201,7 @@ Re-evaluate ADR 0006's deferral. Its blocking reason, Package-owned Tokio and Ir
 
 #### Package distribution and per-Instance restart
 
-Author signature over the Package artifact, a team endorsement of an exact digest and capability set recorded in the membership log, a Host-owned update feed per Package (The Update Framework's threat list as the checklist, Packages never fetch their own updates), a consolidated installed-Packages view with permission diffs, and restarting one Package Instance without restarting the application. Depends on the code-signing work under Later.
+Author signature over the Package artifact, a team endorsement of an exact digest and capability set recorded in the membership log, a Host-owned update feed per Package (The Update Framework's threat list as the checklist, Packages never fetch their own updates), a consolidated installed-Packages view with permission diffs, and restarting one Package Instance without restarting the application. Depends on the code-signing work under Later. The Packagement workstream (see **Current work**) delivers live install, reload, and per-Instance restart for Personal Packages only; Team Package changes still apply at the next start.
 
 ### Workspace Principal maintenance (unscheduled)
 

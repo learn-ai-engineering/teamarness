@@ -84,13 +84,13 @@ Keep these three paths separate:
 
 Tutorial arrived with the Teamarness application. Emojart will be a local Package, so it follows a different deployment path.
 
-Teamarness does not build a local Package as part of its own build. Each local Package lives in a separate project directory, can have its own Git repository, and produces its own Package Directory. An Installation-level registration file points Teamarness to that built directory. Teamarness reads the registration at startup, validates the Package manifest and its declared files, then makes the Package available in the Shell.
+Teamarness does not build a local Package as part of its own build. Each local Package lives in a separate project directory, can have its own Git repository, and produces its own Package Directory. An Installation-level registration file points Teamarness to that built directory. When you install the Package from the Shell, Teamarness validates the Package manifest and its declared files, writes the registration, and makes the Package available in the Shell.
 
 ```mermaid
 flowchart LR
   Project[Emojart project\nsource, tests, lockfiles] -->|npm run build compiles and assembles| Directory[Package Directory\ndist/dev.teamarness.emojart]
   Directory -->|absolute path is recorded in| Registration[registrations.v1.json\nowned by one Installation]
-  Registration -->|Teamarness reads it at startup| Runtime[Teamarness runtime]
+  Registration -->|Teamarness admits it at install and at startup| Runtime[Teamarness runtime]
   Runtime -->|validates identity, contract, sizes, and digests| Directory
   Runtime -->|makes the admitted Package available in| Shell[Teamarness Shell]
 ```
@@ -283,7 +283,7 @@ At this point the product split should be visible in the code. TypeScript presen
 
 Source code is not what Teamarness runs. Teamarness admits a Package Directory containing a self-contained Backend executable, one ESM UI entrypoint, the UI contract, and a manifest that identifies those exact bytes.
 
-The generated build script already knows how to assemble that directory. It calculates sizes and lowercase SHA-256 digests after the final files exist. If any admitted byte changes later, Teamarness rejects it until you rebuild and restart.
+The generated build script already knows how to assemble that directory. It calculates sizes and lowercase SHA-256 digests after the final files exist. If any admitted byte changes later, Teamarness rejects it until you rebuild and reload it.
 
 ### Agent brief 4
 
@@ -317,43 +317,24 @@ Review the code before registering it. The [Source and trust](#source-and-trust)
 
 ### Agent brief 5
 
-> Review the completed Emojart project as code that will run with the current user's authority. Confirm that its manifest, contract, Backend operations, UI requests, dependencies, and built bytes match this guide. Prepare the exact `registrations.v1.json` entry for `dist/dev.teamarness.emojart/` with expected identity `dev.teamarness.emojart` and trust kind `trusted_native_code_v1`. Do not edit Teamarness application metadata, add `overrideApplication`, or claim Workspace enablement, synchronization, sharing, networking, or collaboration. Wait for me to approve the registration.
+> Review the completed Emojart project as code that will run with the current user's authority. Confirm that its manifest, contract, Backend operations, UI requests, dependencies, and built bytes match this guide. Give me the absolute path of `dist/dev.teamarness.emojart/` and confirm that its manifest identity is `dev.teamarness.emojart`. Do not edit Teamarness application metadata or the Teamarness registration file, and do not claim Workspace enablement, synchronization, sharing, networking, or collaboration. Wait for me to install it.
 
 ### Human checkpoint 5
 
-After you approve the code, register it in the same `first-package` development profile you used earlier. Replace both example paths below with canonical absolute paths:
+After you approve the code, install it in the same `first-package` development profile you used earlier:
 
 ```sh
-TEAMARNESS_ROOT=/absolute/path/to/teamarness
-EMOJART_PROJECT="$HOME/Projects/teamarness/local-packages/emojart"
-
-mkdir -p "$TEAMARNESS_ROOT/.teamarness-dev/first-package/packages"
-chmod 700 \
-  "$TEAMARNESS_ROOT/.teamarness-dev/first-package" \
-  "$TEAMARNESS_ROOT/.teamarness-dev/first-package/packages"
-
-cat > "$TEAMARNESS_ROOT/.teamarness-dev/first-package/packages/registrations.v1.json" <<EOF
-{
-  "schemaVersion": 1,
-  "registrations": [
-    {
-      "directory": "$EMOJART_PROJECT/dist/dev.teamarness.emojart",
-      "expectedIdentity": "dev.teamarness.emojart",
-      "trust": {
-        "kind": "trusted_native_code_v1",
-        "acceptedRisks": ["filesystem", "network", "process"]
-      }
-    }
-  ]
-}
-EOF
-
-chmod 600 "$TEAMARNESS_ROOT/.teamarness-dev/first-package/packages/registrations.v1.json"
-cd "$TEAMARNESS_ROOT"
+cd /absolute/path/to/teamarness
 npm run dev -- first-package
 ```
 
-Teamarness reads `registrations.v1.json` only at startup. There is no hot reload.
+1. Open the Workspace page: select **Workspace settings** beside the Workspace name.
+2. In **Package Instances**, select **+** (**Add Personal Package**).
+3. Select **Choose folder** and pick `dist/dev.teamarness.emojart` inside your Emojart project. You can also select **Paste a path** and enter its absolute path.
+4. Check the preview: the identity is `dev.teamarness.emojart`. Select **Continue**.
+5. Read the native-code risks and select **Trust and install**. The Shell records `trusted_native_code_v1` trust evidence for the filesystem, network, and process risks.
+
+Emojart starts at once, without a restart. The Shell writes the registration for this Installation into `.teamarness-dev/first-package/packages/registrations.v1.json`. [Local Package registration](local-package-registration.md) describes that file if you want to write it by hand.
 
 Confirm the Shell presents bundled Tutorial as `Team` and registered local Emojart as `Personal`; the [Source and trust](#source-and-trust) callout says what those aliases do and do not mean. If either is missing, record the badge observation as unresolved instead of marking it complete.
 
@@ -375,8 +356,10 @@ For each change to Emojart:
 
 1. edit and test in the Emojart project;
 2. run `npm run build` to replace the Package Directory;
-3. quit Teamarness if it is running; and
-4. restart the `first-package` profile.
+3. open the Emojart Package page, for example with **About** beside Emojart in the sidebar; and
+4. select **Reload**.
+
+Reload admits the new build in every Workspace and keeps Emojart's saved pieces. Teamarness keeps running. There is no hot reload: Teamarness does not watch the Package Directory, so a rebuild takes effect only when you select **Reload** or restart Teamarness.
 
 Do not edit files inside `dist/dev.teamarness.emojart/` by hand. The manifest describes exact final bytes. Rebuild the directory instead.
 
@@ -386,8 +369,8 @@ Emojart is still installation-local. A later guide can cover application distrib
 
 ## Troubleshooting
 
-- **Emojart does not appear.** Check the absolute `directory`, `expectedIdentity`, trust record, file permissions, and restart. The registration path for this guide is `.teamarness-dev/first-package/packages/registrations.v1.json` under the Teamarness checkout.
-- **Digest mismatch or `artifact_changed`.** Quit Teamarness, run `npm run build` in the Emojart project, and restart. Do not modify assembled files after the build.
+- **Emojart is refused at install.** The Shell names the failed rule, and nothing is registered. Run `npm run validate:dist` in the Emojart project for the same verdict, fix the cause, rebuild, and install again.
+- **Emojart appears under Needs attention on this device, or reports `artifact_changed`.** Run `npm run build` in the Emojart project, then select **Reload** on its Package page. Do not modify assembled files after the build.
 - **Invalid UI contract.** Run `npm run validate`: it applies the same rules Package Admission does and names the rule and the JSON pointer that failed. Keep request names and payloads aligned across `ui-contract.json`, the Backend, `ui/src/contract.generated.ts`, and the UI. Preserve an empty `subscriptions` object.
 - **Unsupported target.** This guide supports `aarch64-apple-darwin` only.
 - **Saved art is missing in another Workspace.** That is expected. Package data is scoped to one Installation, Workspace, and Package identity.

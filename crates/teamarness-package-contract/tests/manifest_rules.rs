@@ -287,7 +287,7 @@ fn assert_refused(patch: Value, rule: &str, pointer: &str) {
     assert_eq!(error.pointer.as_deref(), Some(pointer));
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn presentation_metadata_is_optional() {
     let document = accept(json!({}));
@@ -311,7 +311,7 @@ fn presentation_metadata_is_optional() {
     );
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn an_unknown_presentation_key_is_still_refused() {
     let error = reject(presentation(json!({"tagline": "Unknown"})));
@@ -319,7 +319,7 @@ fn an_unknown_presentation_key_is_still_refused() {
     assert_eq!(error.rule, "manifest.malformed");
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn a_description_is_bounded_trimmed_and_allows_only_newline_controls() {
     let longest = "é".repeat(1024);
@@ -355,7 +355,7 @@ fn a_description_is_bounded_trimmed_and_allows_only_newline_controls() {
     }
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn an_author_is_bounded_and_has_no_control_characters() {
     let longest = "é".repeat(128);
@@ -381,7 +381,7 @@ fn an_author_is_bounded_and_has_no_control_characters() {
     }
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn a_homepage_is_an_absolute_bounded_https_url() {
     let prefix = "https://example.com/";
@@ -421,7 +421,7 @@ fn a_homepage_is_an_absolute_bounded_https_url() {
 
 /// The published schema agrees with the semantic rules on every case it can express.
 /// Trimming is a semantic check only, as it is for `displayName`.
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn the_schema_publishes_the_presentation_metadata_bounds() {
     let schema: Value = serde_json::from_slice(
@@ -473,7 +473,7 @@ fn ui_views(views: Value) -> Value {
     }})
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn ui_views_are_optional_and_settings_is_the_only_declarable_view() {
     use teamarness_package_contract::manifest::UiView;
@@ -506,7 +506,7 @@ fn ui_views_are_optional_and_settings_is_the_only_declarable_view() {
 }
 
 /// The published schema and the semantic rule agree on `ui.views`.
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn the_schema_publishes_the_ui_views_rule() {
     let schema: Value = serde_json::from_slice(
@@ -538,7 +538,7 @@ fn the_schema_publishes_the_ui_views_rule() {
 }
 
 /// A loaded Package Directory carries its declared views.
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[test]
 fn a_loaded_package_directory_carries_its_declared_views() {
     use teamarness_package_contract::manifest::UiView;

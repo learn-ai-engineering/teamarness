@@ -35,7 +35,7 @@ Use the semantic purpose rather than assuming a particular light or dark value:
 
 ## Views
 
-`context.view` is the view the mount shows: `"main"`, or `"settings"` for a Package whose manifest declares `"views": ["settings"]` in its `ui` object. A UI that declares no views can ignore it. `PACKAGE_UI_VIEWS` lists both values, and `PACKAGE_UI_HOST_VERSION` is the mount contract version this SDK describes, 2. In tests, `createTestMountContext` takes an optional `view`, which defaults to `"main"`.
+`context.view` is the view the mount shows: `"main"`, or `"settings"` for a Package whose manifest declares `"views": ["settings"]` in its `ui` object. A UI that declares no views can ignore it. `PACKAGE_UI_VIEWS` lists both values, and `PACKAGE_UI_HOST_VERSION` is the mount contract version this SDK describes, 2. Version 2 adds `context.view`, and a UI written for version 1 keeps working (ADR 0032). In tests, `createTestMountContext` takes an optional `view`, which defaults to `"main"`.
 
 ## Optional CSS kit
 

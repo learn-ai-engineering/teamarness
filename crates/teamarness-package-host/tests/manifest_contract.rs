@@ -663,7 +663,7 @@ async fn open_catalog(
     packages
 }
 
-// Verifies: TEAM.SYS.PKG-R01
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
 #[tokio::test]
 async fn catalog_entry_carries_optional_presentation_metadata() {
     let packages = open_catalog(serde_json::json!({

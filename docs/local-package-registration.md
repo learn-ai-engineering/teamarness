@@ -1,16 +1,121 @@
 # Local Package registration
 
-Installation-local registration is an operator action outside the Teamarness UI. It trusts native code at one canonical absolute directory. Teamarness reads the file only at application startup.
+A local registration makes one built Package Directory on this device available to Teamarness. It trusts the native code at one canonical absolute directory. Install a Personal Package from the Shell. The Shell writes the registration for you, and the Package starts without an application restart. A hand-written registration file still works; see [Write the registration file by hand](#advanced-write-the-registration-file-by-hand).
 
 ## Prepare the Package Directory
 
-Build and inspect the directory by following the [Package author guide](package-author-guide.md). Keep it outside the application bundle. The manifest identity must match the identity you intend to register.
+Build and inspect the directory by following the [Package author guide](package-author-guide.md). Keep it outside the application bundle. Install the built Package Directory, not the project root. For a generated project, that is `dist/<identity>/`.
 
-A registration trusts future rebuilt bytes at that same canonical directory. Teamarness still verifies the current manifest, Backend, UI, asset, and contract digests during every admission. If any admitted Backend byte changes while Teamarness is running, spawn fails with `artifact_changed`. Restart the application to admit a deliberate rebuild. There is no hot reload.
+A registration trusts future rebuilt bytes at that same canonical directory. Teamarness still verifies the current manifest, Backend, UI, asset, and contract digests during every admission. If an admitted Backend byte changes while Teamarness is running, spawn fails with `artifact_changed`. To admit a deliberate rebuild, select **Reload** on the Package page.
 
-## Find the installation file
+## Install a Personal Package
 
-Create this file under the selected application data directory:
+1. Open the Workspace page: select **Workspace settings** beside the Workspace name.
+2. In the **Package Instances** section, select **+** (**Add Personal Package**).
+3. Select **Choose folder** and pick the Package Directory in the folder picker. To type the location instead, select **Paste a path** and enter the absolute path of the Package Directory.
+4. Check the preview. It shows the name, Package Identity, version, folder, declared capabilities, and provided and consumed Ports. It also shows the description, author, and homepage when the manifest declares them. Select **Continue**.
+5. Read the native-code risks: filesystem, network, and process. Select **Trust and install** only for code you have reviewed.
+
+The Shell shows "Installed on this device. It appears in all your Workspaces." The Package runs at once under **Personal Packages**, in every Workspace on this Installation. Team Packages keep running, and their open UIs stay mounted.
+
+If you install a folder that is already registered, the preview says so. Installing it again restarts the Package with the current build. If the Package Identity is already registered from another folder, installing replaces that registration.
+
+If Teamarness refuses the folder, nothing is registered. The Shell names the failed rule, for example a folder without a valid `teamarness.package.json`, or a file that changed after the manifest was written. `teamarness-package-validate` gives the same verdict without the application: run `npm run validate:dist` in a generated project, or `cargo run -p teamarness-package-contract --bin teamarness-package-validate -- directory <path> --smoke` from a Teamarness checkout.
+
+## Manage a Package from its Package page
+
+Every Package has a Package page. To open it, do one of these:
+
+- Select the Package name in the **Package Instances** section of the Workspace page.
+- Select **About** (the information button) beside the Package in the sidebar. The sidebar Package button itself still opens the Package UI.
+- Select the Package name in **Needs attention on this device**.
+
+The page shows the name, Package Identity, version, description, author, homepage, source, trust, declared capabilities, provided Ports, and consumed Ports with their availability. A Personal Package page also shows the Package folder and the Instance state in this Workspace.
+
+A Personal Package page has these controls:
+
+| Control | What it does |
+|---|---|
+| **Reload** | Admits the current bytes of the Package folder in every Workspace. Use it after each rebuild. The process generation continues, and the Package Data Directory and settings are kept. |
+| **Restart** | Starts a new Backend process for this Workspace's Instance only. |
+| **Pause** and **Resume** | Pause sends the Backend a suspend request. The process keeps running, and Resume continues it. |
+| **Start** | Starts an Instance that has not started yet, for example an on-demand Package. |
+| **Remove** | Stops the Package in every Workspace and removes its registration. Its data stays on this device, so installing it again resumes where it left off. |
+
+A Team Package page shows the same information but no Personal controls. It offers **Recover Backend** and **Dispose** only when the Instance needs recovery.
+
+If the Package declares a settings view, the page shows **Open settings**. It opens the settings view of the Package in the current Workspace. A bar above the Package UI names the view. To return to the main view, select the **Back to** button, for example **Back to Reference Package**. A Package without an Instance in the current Workspace shows no **Open settings**.
+
+## Fix a refused registration
+
+A registration that Teamarness could not admit is listed under **Needs attention on this device** on the Workspace page, with a readable reason. Its Package page shows the same reason and the Package diagnostics.
+
+1. Correct the Package Directory, for example by rebuilding it.
+2. Select **Reload**.
+
+To stop using it, select **Remove**. Do not weaken file permissions or change the expected identity merely to silence a mismatch.
+
+## Understand the two tiers
+
+Admission has two tiers (ADR 0031). The tier decides when a change takes effect. It is not a trust verdict: both tiers grant `trusted_native_code_v1`.
+
+- The **Team tier** holds the Packages bundled with Teamarness and any override of one of them. It is admitted when Teamarness starts and does not change while it runs.
+- The **Personal tier** holds every other local registration. You install, reload, and remove Personal Packages while Teamarness runs.
+
+Port routing follows the tiers:
+
+- A Team Package never uses a Port that a Personal Package provides. If only a Personal Package provides a contract, a Team consumer sees that Port as unavailable.
+- A Personal Package can use Ports from Team and Personal Packages.
+- A Personal Package that provides a Port contract a Team Package already provides is refused with `port_provider_conflict`.
+- A live install or reload that provides a Port contract a running Personal Package already provides is also refused with `port_provider_conflict`. Remove the running provider first.
+- When a live change adds or removes a provider, Teamarness restarts only the Personal consumers whose route changed.
+
+The Shell presents Package Source `bundled` as `Team` and Package Source `local` as `Personal`. Package Source remains separate from trust, registration scope, Workspace enablement, synchronization, sharing, networking, and collaboration.
+
+## Override a Team Package
+
+A local Package with the Package Identity of a bundled Package replaces it only after two confirmations, and only after Teamarness restarts.
+
+1. Select **+** and choose the folder of the local build. The preview says that the Package replaces a Team Package.
+2. Read the native-code risks and select **Trust and continue**.
+3. Read the second confirmation and select the replace button. It names the Team Package, for example **Replace Tutorial after restart**.
+4. Select **Restart Teamarness**, or select **Later** to apply the override at the next start.
+
+After the restart, the override runs in the Team tier. Its Package page labels its source as "Team, replaced on this device by an override", and the sidebar lists it under **Personal Packages**. It has no Personal controls.
+
+To return to the bundled Package, select **Remove override** on the Package page or under **Needs attention on this device**. Then select **Restart Teamarness**.
+
+No source wins by file order or Package version. If a declared override is invalid, that Package Identity stays unavailable. Teamarness does not silently fall back to bundled code. Unrelated valid Packages and the Core Runtime continue.
+
+## Data continuity
+
+The Package Data Directory is keyed by Installation, Workspace, and Package Identity. Source path and Package version do not select it. A bundled Package, its local override, a removed and reinstalled Personal Package, and a later bundled version therefore use the same durable directory for the same identity tuple.
+
+To test continuity without inspecting private database contents:
+
+1. Start on bundled code and make one visible Package state change.
+2. Override the Package with a local build of the same identity, then select **Restart Teamarness**.
+3. Confirm the Package page says "Team, replaced on this device by an override", confirm its trust, and inspect the visible state.
+4. Select **Remove override**, then select **Restart Teamarness**.
+5. Confirm the Package page says `Team` and inspect the same visible state.
+
+For a Personal Package, make a visible change, select **Remove**, and install the same folder again. The state returns.
+
+Removing or disposing of a Package does not delete its Package Data Directory. Teamarness has no Package-data deletion, backup, or migration service.
+
+## Promote or remove
+
+To promote a Package, give its complete tested Package Directory to the application build as described in [Promotion to application distribution](package-author-guide.md#promotion-to-application-distribution). Compare all declared bytes and digests before bundling.
+
+To stop using a Personal Package, select **Remove** on its Package page. Remote Package fetching, signing and notarization, Gatekeeper remediation, and automatic source updates are not provided.
+
+## Advanced: write the registration file by hand
+
+The Shell and a hand-written file use the same file and the same format. Teamarness reads a hand-written change only when it starts. After that start, you can reload or remove a hand-registered Personal Package from its Package page like any other.
+
+### Find the installation file
+
+The file lives under the selected application data directory:
 
 ```text
 <app-data>/packages/registrations.v1.json
@@ -20,7 +125,7 @@ Named development profiles use `.teamarness-dev/<profile>` as `<app-data>`. An e
 
 Start Teamarness once with that data directory before writing the file. The Core Runtime refuses a data directory that holds unrelated files (`TEAM.SYS.ID-R07`, ADR 0017), so it must be one Teamarness has already created.
 
-The registration file must be a regular, non-symlink file owned by the current user. On macOS, make its parent private and the file owner-only:
+The registration file must be a regular, non-symlink file owned by the current user. Its parent must be private and the file owner-only. On macOS:
 
 ```sh
 mkdir -p '<app-data>/packages'
@@ -30,7 +135,7 @@ chmod 600 '<app-data>/packages/registrations.v1.json'
 
 Replace `<app-data>` and the Package Directory below with absolute paths. Do not paste an invitation, token, key, or database content into this file.
 
-## Register one local Package
+### Register one local Package
 
 ```json
 {
@@ -52,9 +157,9 @@ Replace `<app-data>` and the Package Directory below with absolute paths. Do not
 
 The Package UI runs in its own sandboxed frame inside the Shell webview. It cannot reach the Shell's DOM, browser storage, the network, or any Tauri command, and it talks to Teamarness only through its mount-scoped bridge. Frame isolation does not contain a UI that blocks its thread, and it does not limit what the Backend can do. Register only code you trust.
 
-## Override a bundled Package
+### Override a bundled Package by hand
 
-A local Package with the same Package Identity as an application Package needs an explicit override:
+Add `"overrideApplication": true` to an entry whose `expectedIdentity` is the identity of a bundled Package:
 
 ```json
 {
@@ -73,35 +178,18 @@ A local Package with the same Package Identity as an application Package needs a
 }
 ```
 
-No source wins by file order or Package version. Teamarness accepts a replacement only when the directory is canonical and readable, the manifest identity equals `expectedIdentity`, trust evidence is complete, and `overrideApplication` is true. If a declared override is invalid, that Package Identity stays unavailable. Teamarness does not silently fall back to bundled code. Unrelated valid Packages and the Core Runtime continue.
+Teamarness accepts a replacement only when the directory is canonical and readable, the manifest identity equals `expectedIdentity`, trust evidence is complete, and `overrideApplication` is true. An entry with a bundled identity and without `overrideApplication` is refused with `override_required`, and the bundled Package with that identity also stays unavailable until you correct the entry.
 
-Restart Teamarness after creating, changing, or removing the registration. The Shell presents Package Source `local` as `Personal`; its trust remains `trusted_native_code_v1`. Bundled Tutorial is admitted from application resources without this file, and the Shell presents Package Source `bundled` as `Team`. Confirm both UI aliases before testing the local build. Package Source remains separate from trust, registration scope, Workspace enablement, synchronization, sharing, networking, and collaboration.
+### What the Shell writes
 
-## Data continuity
+The Shell writes the same version 1 document. Each entry it writes has the canonical directory, the expected identity, the three accepted risks, and `"overrideApplication"` set to `true` or `false`. A write keeps every other entry and replaces the entry with the same identity. It is atomic: a `0600` temporary file in the `0700` `packages/` directory, synced and renamed into place.
 
-The Package Data Directory is keyed by Installation, Workspace, and Package Identity. Source path and Package version do not select it. A bundled Package, its explicit local override, and a later bundled version therefore use the same durable directory for the same identity tuple.
+The Shell never rewrites a file that is already invalid, for example one with group or world permissions, a symlink, an unknown field, or malformed JSON. It refuses with `registration_file_invalid` and leaves the file unchanged. Fix or delete the file, then install again.
 
-To test continuity without inspecting private database contents:
+If you edit the file by hand while Teamarness runs, your entry stays in the file when the Shell next writes it, but it takes effect only at the next start. Two writers at the same moment are not coordinated: the last write wins.
 
-1. Start on bundled code and make one visible Package state change.
-2. Stop Teamarness cleanly.
-3. Add the explicit local override and restart.
-4. Confirm the local Package Source is presented as `Personal`, confirm its trust, and inspect the visible state.
-5. Stop Teamarness, remove the registration, and restart.
-6. Confirm the bundled Package Source is presented as `Team` and inspect the same visible state.
+### Diagnose a rejected hand-written registration
 
-Disposal stops Package-owned resources but does not delete the Package Data Directory. Teamarness has no Package-data deletion, backup, or migration service in this phase.
+Check **Needs attention on this device** and the Package page. Common failures include a relative or symlink path, group or world permissions on the registration file, missing trust evidence, identity mismatch, an omitted bundled override, duplicate local registrations, unsupported target, missing file, digest mismatch, malformed manifest, or invalid UI contract.
 
-## Diagnose a rejected registration
-
-Check the Shell's stable Package diagnostic and recovery action. Common failures include a relative or symlink path, group or world permissions on the registration file, missing trust evidence, identity mismatch, an omitted bundled override, duplicate local registrations, unsupported target, missing file, digest mismatch, malformed manifest, or invalid UI contract.
-
-For everything about the Package Directory itself, `teamarness-package-validate` gives the same verdict without the application, and names the rule that failed: run `npm run validate:dist` in a generated project, or `cargo run -p teamarness-package-contract --bin teamarness-package-validate -- directory <path> --smoke` from a Teamarness checkout.
-
-Correct the source or registration, then restart. Do not weaken file permissions or change `expectedIdentity` merely to silence a mismatch. Keep the expected identity tied to the Package you reviewed.
-
-## Promote or remove
-
-To promote a Package, give its complete tested Package Directory to the application build as described in [Promotion to application distribution](package-author-guide.md#promotion-to-application-distribution). Compare all declared bytes and digests before bundling.
-
-To stop using a local source, remove its registration entry or the owner-only registration file and restart. Removing a registration does not remove Package-owned data. Remote Package fetching, install and update UI, signing and notarization, Gatekeeper remediation, and automatic source updates are not provided.
+Correct the source or the registration, then restart Teamarness. For a Personal registration whose file entry is correct, select **Reload** instead. Keep the expected identity tied to the Package you reviewed.

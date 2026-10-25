@@ -1,6 +1,6 @@
 # Package author guide
 
-A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as an installation-local Package, then give the same declared bytes to the Teamarness application build. For a supported starter project, run `npm run create:package -- --output <directory> --identity <reverse-dns-id> --display-name <name>` from a Teamarness checkout. The generator creates a foundation outside the Teamarness workspaces and vendors the current Rust and TypeScript SDK source with exact lockfiles. Generated SDK copies have no supported in-place upgrade yet.
+A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as a Personal Package installed from the Shell, then give the same declared bytes to the Teamarness application build. For a supported starter project, run `npm run create:package -- --output <directory> --identity <reverse-dns-id> --display-name <name>` from a Teamarness checkout. The generator creates a foundation outside the Teamarness workspaces and vendors the current Rust and TypeScript SDK source with exact lockfiles. Generated SDK copies have no supported in-place upgrade yet.
 
 Teamarness supports `aarch64-apple-darwin`, and ships a Rust Backend SDK and a TypeScript UI SDK. The Package Process Protocol is language-neutral, but no other production Backend SDK exists yet.
 
@@ -20,7 +20,7 @@ ui/
 
 You own executable packaging. Ship a self-contained executable for every declared target. Teamarness does not install Node, Python, shared libraries, language runtimes, or Package dependencies. It starts the exact admitted Backend path without a command shell and uses the Package Data Directory as its working directory.
 
-Do not use symlinks. Every manifest path must be normalized relative UTF-8 with no empty, `.`, `..`, absolute, or backslash segment. Compute each declared byte size and lowercase SHA-256 digest after the final build. Any later byte change invalidates admission until Teamarness restarts and admits the directory again.
+Do not use symlinks. Every manifest path must be normalized relative UTF-8 with no empty, `.`, `..`, absolute, or backslash segment. Compute each declared byte size and lowercase SHA-256 digest after the final build. Any later byte change invalidates admission until Teamarness admits the directory again: select **Reload** on the Package page, or restart Teamarness.
 
 ## Package Manifest
 
@@ -248,7 +248,7 @@ A capability is negotiated at activation: you declare a family and the versions 
 
 A capability family the Host does not provide is an unavailable capability, not a version error. A **new** family — document-oriented synchronization, say — is added beside the existing ones. It changes no existing family, no lifecycle operation, no protocol version, and no UI contract, so a Package that does not declare it is unaffected.
 
-When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. No such window exists yet, because nothing has broken yet. See ADR 0018, Package seam versioning.
+When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. No such window exists yet, because nothing has broken yet. An additive mount-contract change, such as `context.view` in version 2, raises `uiHostVersion` without a window, and this table says what each version adds. See ADR 0018, Package seam versioning, and ADR 0032.
 
 ## Trust limits
 
@@ -258,19 +258,19 @@ A Package UI runs in a sandboxed frame with an opaque origin, so it reaches neit
 
 ## Bundled and local Package Source kinds
 
-`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local and is admitted through the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
+`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local: you install it from the Shell, which writes the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
 
 ## Local development loop
 
 1. Run `npm run validate` after every contract or manifest change.
 2. Build the final Backend executable, ESM entrypoint, declared assets, and UI contract in the Package repository.
 3. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`. `npm run build` does both and validates the result.
-4. Follow [Local Package registration](local-package-registration.md). Use the manifest identity as `expectedIdentity`, accept the native-code risks, and restart Teamarness.
-5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. Workspace settings offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
-6. Rebuild in place when needed, then restart. There is no source watch or hot reload for Backend bytes.
+4. Install the Package Directory from the Shell: on the Workspace page, select **+** (**Add Personal Package**), choose the folder, check the preview, and select **Trust and install**. It starts without a restart. [Local Package registration](local-package-registration.md) describes the flow, the Package page, and the hand-written registration file.
+5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. The Package page offers **Restart**, **Pause**, and **Resume**, and **Open settings** when you declare a settings view. The Workspace page offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
+6. Rebuild in place when needed, then select **Reload** on the Package page. Reload admits the new bytes in every Workspace and keeps the Package Data Directory. There is no source watch: Teamarness admits new bytes only when you reload or restart it.
 
 ## Promotion to application distribution
 
-Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds one reviewed entry (source directory and Cargo Backend package) to `packages/bundled-packages.json`, the single list of bundled Packages, and runs `node scripts/bundled-packages.mjs --write` to regenerate the matching Tauri resource and external-binary configuration; `npm test` fails if they diverge. The builder remains the only writer of `packages/application-packages.v1.json`; it stages and verifies every declared byte, size, and digest. Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages`, then remove the installation override and restart to confirm the bundled source uses the same Package Data Directory.
+Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds one reviewed entry (source directory and Cargo Backend package) to `packages/bundled-packages.json`, the single list of bundled Packages, and runs `node scripts/bundled-packages.mjs --write` to regenerate the matching Tauri resource and external-binary configuration; `npm test` fails if they diverge. The builder remains the only writer of `packages/application-packages.v1.json`; it stages and verifies every declared byte, size, and digest. Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages`, then remove the local registration (**Remove** or **Remove override** on the Package page) and restart Teamarness to confirm the bundled source uses the same Package Data Directory.
 
-Signing and notarization, Gatekeeper remediation, other operating systems, remote Package fetching, Package updates, hot reload, enablement policy, and synchronization engines remain outside the current delivery claims.
+Signing and notarization, Gatekeeper remediation, other operating systems, remote Package fetching, Package updates, source watching, enablement policy, and synchronization engines remain outside the current delivery claims.

@@ -490,7 +490,7 @@ mod tests {
         }
     }
 
-    // Verifies: TEAM.SYS.PKG-R01
+    // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
     #[test]
     fn catalog_dto_carries_optional_presentation_metadata_in_camel_case() {
         let entry = |description: Option<&str>, author: Option<&str>, homepage: Option<&str>| {
@@ -524,7 +524,7 @@ mod tests {
         }
     }
 
-    // Verifies: TEAM.SYS.PKG-R01
+    // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
     #[test]
     fn catalog_dto_lists_declared_views_and_omits_none() {
         let entry = |views| {
