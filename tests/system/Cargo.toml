@@ -45,6 +45,11 @@ path = "src/bin/documents_port_consumer.rs"
 name = "generic-port-consumer-under-test"
 path = "src/bin/generic_port_consumer.rs"
 
+# Source-built only for external Agent qualification; never an application resource.
+[[bin]]
+name = "agent-qualification-provider-under-test"
+path = "src/bin/agent_qualification_provider.rs"
+
 # The optional standalone Agent is qualified through an explicitly supplied Package Directory;
 # it is not a source dependency or prerequisite of the default Teamarness suite.
 

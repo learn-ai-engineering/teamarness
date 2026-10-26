@@ -55,6 +55,21 @@ impl PackageHost {
             .expect("test pause poisoned") = Some((package, pause.clone()));
         pause
     }
+    /// Holds only a command after authorization and before Provider dispatch.
+    pub fn pause_next_command_authorized_for_tests(
+        &self,
+        package: PackageIdentity,
+    ) -> Arc<AuthorityPause> {
+        let pause = Arc::new(AuthorityPause::default());
+        *self
+            .inner
+            .port_broker
+            .command_authorized_pause
+            .lock()
+            .expect("test pause poisoned") = Some((package, pause.clone()));
+        pause
+    }
+
     /// Holds one already accepted event before forwarding it to the Consumer writer.
     pub fn pause_next_port_delivery_for_tests(
         &self,

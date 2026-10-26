@@ -426,6 +426,10 @@ impl GenerationCapabilities {
                     broker
                         .pause_port_work(&self.scope.package_identity, false)
                         .await;
+                    #[cfg(feature = "test-hooks")]
+                    broker
+                        .pause_command_authorized(&self.scope.package_identity, object)
+                        .await;
                     broker
                         .call(
                             &self.scope.package_identity,

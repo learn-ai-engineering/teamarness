@@ -1107,3 +1107,51 @@ async fn saturated_routes_refuse_before_dispatch_and_release_without_command_rep
         .unwrap();
     }
 }
+
+/// The command-only postauthorization acknowledgement cannot be stolen by query traffic.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn queries_cannot_consume_command_authorized_pause() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+        &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    ).await;
+    declare(&fixture, "provider", true);
+    declare(&fixture, "consumer", false);
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = host
+        .snapshot()
+        .await
+        .instances
+        .into_iter()
+        .find(|slot| slot.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key;
+    let mount = mount(&host, consumer).await;
+    let pause =
+        host.pause_next_command_authorized_for_tests("com.example.consumer".parse().unwrap());
+    let _release = pause.resume_on_drop();
+    let query = request(&host, &mount, "query-before-command", "fixture.capability", serde_json::json!({
+        "capability":"teamarness.package-ports","method":"invoke",
+        "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.list","kind":"query","request":{}}
+    })).await;
+    assert_eq!(query["result"]["accepted"], true);
+    assert_eq!(
+        live_actor(&host, &mount, "live-before-command").await["kind"],
+        "person"
+    );
+    let command_host = host.clone();
+    let command_mount = mount.clone();
+    let command = tokio::spawn(async move {
+        request(&command_host, &command_mount, "held-command", "fixture.capability", serde_json::json!({
+            "capability":"teamarness.package-ports","method":"invoke",
+            "arguments":{"access":"declared","major":1,"contract":"com.example.messages","port":"message.post","kind":"command","request":{"text":"once"}}
+        })).await
+    });
+    pause.paused().await;
+    assert!(!command.is_finished());
+    pause.resume();
+    assert_eq!(command.await.unwrap()["result"]["accepted"], true);
+}

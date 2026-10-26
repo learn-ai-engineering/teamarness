@@ -34,6 +34,9 @@ pub(crate) struct PortBroker {
     pub(crate) authorized_pause:
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     #[cfg(feature = "test-hooks")]
+    pub(crate) command_authorized_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
     pub(crate) delivery_pause:
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     #[cfg(feature = "test-hooks")]
@@ -85,6 +88,8 @@ impl PortBroker {
         Arc::new(Self {
             #[cfg(feature = "test-hooks")]
             authorized_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            command_authorized_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             delivery_pause: std::sync::Mutex::new(None),
             access,
@@ -166,6 +171,32 @@ impl PortBroker {
     ) {
         let pause = {
             let mut pending = self.actor_pause.lock().expect("test pause poisoned");
+            if object.get("kind").and_then(Value::as_str) == Some("command")
+                && pending
+                    .as_ref()
+                    .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_command_authorized(
+        &self,
+        package: &PackageIdentity,
+        object: &Map<String, Value>,
+    ) {
+        let pause = {
+            let mut pending = self
+                .command_authorized_pause
+                .lock()
+                .expect("test pause poisoned");
             if object.get("kind").and_then(Value::as_str) == Some("command")
                 && pending
                     .as_ref()
