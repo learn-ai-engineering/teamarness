@@ -163,6 +163,40 @@ async fn finite_type_intersection_guide_is_discovered_and_default_denied_until_e
     .await;
 }
 
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn numeric_alternatives_narrowed_to_string_and_object_remain_guides() {
+    assert_numeric_narrowing_guide(false).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn reversed_numeric_alternatives_narrowed_to_string_and_object_remain_guides() {
+    assert_numeric_narrowing_guide(true).await;
+}
+
+async fn assert_numeric_narrowing_guide(reverse: bool) {
+    assert_guide_discovery_and_access(|doc| {
+        let (direct, referenced) = if reverse {
+            ("integer", "number")
+        } else {
+            ("number", "integer")
+        };
+        doc["$defs"]["text"]["type"] = json!([referenced, "string"]);
+        doc["$defs"]["nested"]["type"] = json!("string");
+        doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"]["type"] =
+            json!([direct, "string"]);
+        doc["$defs"]["objectTypes"] =
+            json!({"$ref":"#/$defs/objectOnly","type":[referenced,"object"]});
+        doc["$defs"]["objectOnly"] = json!({"type":["object"]});
+        for direction in ["request", "response"] {
+            doc["contracts"][0]["ports"][0][direction]["$ref"] = json!("#/$defs/objectTypes");
+            doc["contracts"][0]["ports"][0][direction]["type"] = json!([direct, "object"]);
+        }
+    })
+    .await;
+}
+
 async fn assert_guide_discovery_and_access(update: impl FnOnce(&mut Value)) {
     let fixture = fixture().await;
     let root = fixture.config.application_root();
@@ -315,13 +349,59 @@ async fn disjoint_array_guide_is_not_advertised_and_keeps_ordinary_composition()
     .await;
 }
 
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn numeric_overlap_is_not_advertised_and_keeps_empty_selection_declared_composition() {
+    assert_numeric_overlap_composition(false).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn reversed_numeric_overlap_is_not_advertised_and_keeps_empty_selection_declared_composition()
+{
+    assert_numeric_overlap_composition(true).await;
+}
+
+async fn assert_numeric_overlap_composition(reverse: bool) {
+    for marker in ["markdown", "request", "response"] {
+        assert_nonconforming_guide_document(|doc| {
+            let (direct, referenced) = if reverse {
+                ("integer", "number")
+            } else {
+                ("number", "integer")
+            };
+            let expected = if marker == "markdown" {
+                "string"
+            } else {
+                "object"
+            };
+            doc["$defs"]["alternative"] = json!({"type":[referenced,expected]});
+            let schema = if marker == "markdown" {
+                &mut doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"]
+            } else {
+                &mut doc["contracts"][0]["ports"][0][marker]
+            };
+            schema["$ref"] = json!("#/$defs/alternative");
+            schema["type"] = json!([direct, expected]);
+        })
+        .await;
+    }
+}
+
 async fn assert_nonconforming_guide_composition(markdown: Value) {
+    assert_nonconforming_guide_document(|doc| {
+        doc["$defs"] = json!({"text":{"type":"string","maxLength":100}});
+        doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] = markdown;
+    })
+    .await;
+}
+
+async fn assert_nonconforming_guide_document(update: impl FnOnce(&mut Value)) {
     let fixture = fixture().await;
     let root = fixture.config.application_root();
     let path = root.join("provider/ports.json");
     let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    doc["$defs"] = json!({"text":{"type":"string","maxLength":100}});
-    doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] = markdown;
+    update(&mut doc);
     let bytes = serde_json::to_vec(&doc).unwrap();
     fs::write(path, &bytes).unwrap();
     let path = root.join("provider/teamarness.package.json");
@@ -358,6 +438,17 @@ async fn assert_nonconforming_guide_composition(markdown: Value) {
             .iter()
             .filter(|i| i.key.package_identity.as_str() == "com.example.provider")
             .all(|i| i.process_generation.is_none())
+    );
+    let connection =
+        rusqlite::Connection::open(fixture._private.join("packages/package-host.sqlite3")).unwrap();
+    let selections: i64 = connection
+        .query_row("SELECT COUNT(*) FROM agent_port_selections", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        selections, 0,
+        "ordinary declared composition needs no selection"
     );
     let posted = call(
         &host,

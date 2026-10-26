@@ -253,6 +253,38 @@ fn guide_finite_type_sets_preserve_exact_markers_and_runtime_schemas() {
         }
         cases.push(("finite array intersections through references", doc));
     }
+    for (direct, referenced) in [
+        (json!("string"), json!(["number", "string"])),
+        (json!(["integer", "string"]), json!(["number", "string"])),
+    ] {
+        for reverse in [false, true] {
+            let mut doc = reference_sibling_guide(
+                json!({"$ref":"#/$defs/nested","type":direct,"maxLength":100}),
+            );
+            doc["$defs"]["text"]["type"] = referenced.clone();
+            // This intermediate restriction genuinely removes every numeric alternative.
+            doc["$defs"]["nested"]["type"] = json!(["string", "null"]);
+            for name in ["empty", "response"] {
+                doc["$defs"][format!("{name}Types")] = json!({"type":["number","object"]});
+                doc["$defs"][name]["$ref"] = json!(format!("#/$defs/{name}Types"));
+                doc["$defs"][name]["type"] = json!(["integer", "object"]);
+                doc["$defs"][format!("{name}Types")]["$ref"] = json!("#/$defs/objectOnly");
+            }
+            doc["$defs"]["objectOnly"] = json!({"type":"object"});
+            if reverse {
+                doc["$defs"]["text"]["type"] = direct.clone();
+                doc["$defs"]["response"]["properties"]["markdown"]["type"] = referenced.clone();
+                for name in ["empty", "response"] {
+                    doc["$defs"][name]["type"] = json!(["number", "object"]);
+                    doc["$defs"][format!("{name}Types")]["type"] = json!(["integer", "object"]);
+                }
+            }
+            cases.push((
+                "genuine string and object narrowing through reordered reference chains",
+                doc,
+            ));
+        }
+    }
     for (name, doc) in cases {
         let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
         assert!(compiled.has_guide("dev.example.guide"), "{name}");
@@ -303,6 +335,157 @@ fn guide_finite_type_sets_preserve_exact_markers_and_runtime_schemas() {
         let again = rebuilt.project_metadata("dev.example.guide", None).unwrap();
         assert_eq!(projection.bytes, again.bytes, "{name}");
         assert_eq!(projection.sha256, again.sha256, "{name}");
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_numeric_overlap_preserves_integer_alternatives_at_every_marker() {
+    for (definition, marker, direction) in [
+        ("markdown", "string", "response"),
+        ("empty", "object", "request"),
+        ("response", "object", "response"),
+    ] {
+        for (direct, referenced) in [("number", "integer"), ("integer", "number")] {
+            let mut doc = reference_sibling_guide(json!({"$ref":"#/$defs/markdown"}));
+            doc["$defs"]["markdown"] = json!({"type":"string","maxLength":100});
+            doc["$defs"]["alternative"] = json!({"type":[referenced,marker]});
+            doc["$defs"][definition]["$ref"] = json!("#/$defs/alternative");
+            doc["$defs"][definition]["type"] = json!([direct, marker]);
+            let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            let value = |v: Value| {
+                if definition == "markdown" {
+                    json!({"markdown":v})
+                } else {
+                    v
+                }
+            };
+            for v in [json!(7), json!("ok"), json!(1.5)] {
+                let expected = v == json!(7) || (definition == "markdown" && v == json!("ok"));
+                assert_eq!(
+                    compiled
+                        .validate(
+                            "dev.example.guide",
+                            "runtime.guide",
+                            direction,
+                            &value(v.clone())
+                        )
+                        .is_ok(),
+                    expected,
+                    "{definition}/{direct}: {v}"
+                );
+            }
+            let valid_marker = if direction == "request" {
+                json!({})
+            } else {
+                json!({"markdown":"ok"})
+            };
+            assert!(
+                compiled
+                    .validate(
+                        "dev.example.guide",
+                        "runtime.guide",
+                        direction,
+                        &valid_marker
+                    )
+                    .is_ok()
+            );
+            assert!(
+                !compiled.has_guide("dev.example.guide"),
+                "{definition}/{direct}"
+            );
+            assert!(compiled.warnings.iter().any(|w| w.contains("guide_shape")));
+            let projection = compiled
+                .project_metadata("dev.example.guide", None)
+                .unwrap();
+            let projected: Value = serde_json::from_slice(&projection.bytes).unwrap();
+            for (name, schema) in projected["$defs"].as_object().unwrap() {
+                assert_eq!(schema, &doc["$defs"][name]);
+            }
+            assert_eq!(projected["contracts"], doc["contracts"]);
+            let rebuilt = compile_port_contracts(&projection.bytes).unwrap();
+            assert!(!rebuilt.has_guide("dev.example.guide"));
+            let again = rebuilt.project_metadata("dev.example.guide", None).unwrap();
+            assert_eq!(projection.bytes, again.bytes);
+            assert_eq!(projection.sha256, again.sha256);
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_primitive_intersections_agree_with_actual_validator_witnesses() {
+    // Explicit witnesses cover all seven primitive names and the sole subtype relation.
+    // Each clause also admits string. No expected result computes an intersection.
+    let samples = [
+        json!(null),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(7),
+        json!(1.5),
+    ];
+    for (left, right, accepted) in [
+        ("number", "integer", vec![json!(7)]),
+        ("number", "number", vec![json!(7), json!(1.5)]),
+        ("integer", "integer", vec![json!(7)]),
+        ("null", "null", vec![json!(null)]),
+        ("boolean", "boolean", vec![json!(true)]),
+        ("array", "array", vec![json!([])]),
+        ("object", "object", vec![json!({})]),
+        ("string", "number", vec![]),
+        ("number", "boolean", vec![]),
+        ("integer", "null", vec![]),
+        ("array", "object", vec![]),
+    ] {
+        for (direct, referenced) in [(left, right), (right, left)] {
+            let mut doc = reference_sibling_guide(
+                json!({"$ref":"#/$defs/nested","type":[direct,"string"],"maxLength":100}),
+            );
+            doc["$defs"]["text"]["type"] = if referenced == "string" {
+                json!("string")
+            } else {
+                json!([referenced, "string"])
+            };
+            // Avoid a duplicate string type in the direct clause.
+            if direct == "string" {
+                doc["$defs"]["response"]["properties"]["markdown"]["type"] = json!("string");
+            }
+            let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            for sample in &samples {
+                assert_eq!(
+                    compiled
+                        .validate(
+                            "dev.example.guide",
+                            "runtime.guide",
+                            "response",
+                            &json!({"markdown":sample})
+                        )
+                        .is_ok(),
+                    accepted.contains(sample),
+                    "{direct}/{referenced}: {sample}"
+                );
+            }
+            assert!(
+                compiled
+                    .validate(
+                        "dev.example.guide",
+                        "runtime.guide",
+                        "response",
+                        &json!({"markdown":"ok"})
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                compiled.has_guide("dev.example.guide"),
+                accepted.is_empty(),
+                "{direct}/{referenced}"
+            );
+            assert_eq!(
+                compiled.warnings.iter().any(|w| w.contains("guide_shape")),
+                !accepted.is_empty()
+            );
+        }
     }
 }
 

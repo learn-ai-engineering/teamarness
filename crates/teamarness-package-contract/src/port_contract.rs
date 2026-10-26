@@ -357,11 +357,17 @@ impl<'a> GuideSchema<'a> {
         if self.clauses.contains(&&Value::Bool(false)) {
             return false;
         }
-        // Guide markers only ask for object or string, not numeric subtype relations.
-        let mut restrictions = self.values("type").map(|value| match value {
-            Value::String(name) => BTreeSet::from([name.as_str()]),
-            Value::Array(types) => types.iter().filter_map(Value::as_str).collect(),
-            _ => BTreeSet::new(),
+        // Integers satisfy number too; retain that overlap before intersecting clauses.
+        let mut restrictions = self.values("type").map(|value| {
+            let mut types = match value {
+                Value::String(name) => BTreeSet::from([name.as_str()]),
+                Value::Array(types) => types.iter().filter_map(Value::as_str).collect(),
+                _ => BTreeSet::new(),
+            };
+            if types.contains("number") {
+                types.insert("integer");
+            }
+            types
         });
         let Some(mut effective) = restrictions.next() else {
             return false;
