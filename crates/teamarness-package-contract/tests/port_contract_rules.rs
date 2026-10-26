@@ -194,6 +194,199 @@ fn guide_classification_resolves_local_shapes_and_warns_on_bad_guides() {
     assert!(!compile(&doc).has_guide("dev.example.guide"));
 }
 
+fn reference_sibling_guide(markdown: Value) -> Value {
+    json!({"schemaVersion":1,"$defs":{
+        "empty":{"type":"object","additionalProperties":false},
+        "text":{"type":"string"},
+        "literalBounded":{"type":"string","maxLength":100},
+        "bounded":{"$ref":"#/$defs/text","maxLength":100},
+        "nested":{"$ref":"#/$defs/bounded","minLength":2},
+        "response":{"type":"object","properties":{"markdown":markdown},"required":["markdown"],"additionalProperties":false}
+    },"contracts":[{"identity":"dev.example.guide","major":1,"minor":0,"description":"Guide","ports":[
+        {"name":"runtime.guide","kind":"query","description":"Guide","request":{"$ref":"#/$defs/empty"},"response":{"$ref":"#/$defs/response"}}
+    ]}]})
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_reference_siblings_preserve_bounds_and_runtime_validation() {
+    for markdown in [
+        json!({"type":"string","maxLength":100}),
+        json!({"$ref":"#/$defs/literalBounded"}),
+        json!({"$ref":"#/$defs/bounded"}),
+        json!({"$ref":"#/$defs/text","maxLength":100}),
+        json!({"$ref":"#/$defs/nested","maxLength":3}),
+    ] {
+        let doc = reference_sibling_guide(markdown.clone());
+        let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(compiled.has_guide("dev.example.guide"), "{markdown}");
+        assert!(!compiled.warnings.iter().any(|w| w.contains("guide_shape")));
+        assert!(
+            compiled
+                .validate(
+                    "dev.example.guide",
+                    "runtime.guide",
+                    "response",
+                    &json!({"markdown":"ok"})
+                )
+                .is_ok()
+        );
+        for value in [json!({"markdown":"x".repeat(101)}), json!({"markdown":7})] {
+            assert!(
+                compiled
+                    .validate("dev.example.guide", "runtime.guide", "response", &value)
+                    .is_err()
+            );
+        }
+        let projected = compiled
+            .project_metadata("dev.example.guide", None)
+            .unwrap();
+        let rebuilt = compile_port_contracts(&projected.bytes).unwrap();
+        assert!(rebuilt.has_guide("dev.example.guide"));
+        assert_eq!(
+            projected.bytes,
+            rebuilt
+                .project_metadata("dev.example.guide", None)
+                .unwrap()
+                .bytes
+        );
+        assert_eq!(
+            projected.sha256,
+            rebuilt
+                .project_metadata("dev.example.guide", None)
+                .unwrap()
+                .sha256
+        );
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_reference_siblings_reject_type_boolean_and_length_contradictions() {
+    for markdown in [
+        json!({"$ref":"#/$defs/literalBounded","type":"integer"}),
+        json!({"$ref":"#/$defs/nested","maxLength":1}),
+        json!({"$ref":"#/$defs/never","type":"string","maxLength":100}),
+    ] {
+        let mut doc = reference_sibling_guide(markdown.clone());
+        doc["$defs"]["never"] = json!(false);
+        let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(!compiled.has_guide("dev.example.guide"), "{markdown}");
+        assert!(compiled.warnings.iter().any(|w| w.contains("guide_shape")));
+        assert!(
+            compiled
+                .validate(
+                    "dev.example.guide",
+                    "runtime.guide",
+                    "response",
+                    &json!({"markdown":"ok"})
+                )
+                .is_err()
+        );
+    }
+    for direction in ["request", "response"] {
+        let mut doc = reference_sibling_guide(json!({"$ref":"#/$defs/bounded"}));
+        let definition = if direction == "request" {
+            "empty"
+        } else {
+            "response"
+        };
+        doc["contracts"][0]["ports"][0][direction] =
+            json!({"$ref":format!("#/$defs/{definition}"),"type":"string"});
+        let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(!compiled.has_guide("dev.example.guide"), "{direction}");
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_reference_siblings_conjoin_object_properties_required_and_closure() {
+    let mut doc = reference_sibling_guide(json!({"$ref":"#/$defs/bounded"}));
+    doc["$defs"]["response"]
+        .as_object_mut()
+        .unwrap()
+        .remove("required");
+    doc["$defs"]["response"]
+        .as_object_mut()
+        .unwrap()
+        .remove("additionalProperties");
+    doc["contracts"][0]["ports"][0]["response"] = json!({"$ref":"#/$defs/response","required":["markdown"],"additionalProperties":false,"properties":{"markdown":{"minLength":2}}});
+    // Closure belongs to each schema location: the sibling must declare markdown too.
+    let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    assert!(compiled.has_guide("dev.example.guide"));
+    assert!(
+        compiled
+            .validate(
+                "dev.example.guide",
+                "runtime.guide",
+                "response",
+                &json!({"markdown":"ok"})
+            )
+            .is_ok()
+    );
+    assert!(
+        compiled
+            .validate(
+                "dev.example.guide",
+                "runtime.guide",
+                "response",
+                &json!({"markdown":"x"})
+            )
+            .is_err()
+    );
+    doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"]["type"] =
+        json!("integer");
+    assert!(
+        !compile_port_contracts(&serde_json::to_vec(&doc).unwrap())
+            .unwrap()
+            .has_guide("dev.example.guide")
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_reference_sibling_pattern_properties_does_not_demote_valid_marker() {
+    let mut doc = reference_sibling_guide(json!({"$ref":"#/$defs/bounded"}));
+    doc["contracts"][0]["ports"][0]["response"] = json!({"$ref":"#/$defs/response","additionalProperties":false,"patternProperties":{"^markdown$":true}});
+    let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    assert!(
+        compiled
+            .validate(
+                "dev.example.guide",
+                "runtime.guide",
+                "response",
+                &json!({"markdown":"ok"})
+            )
+            .is_ok()
+    );
+    assert!(compiled.has_guide("dev.example.guide"));
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_reference_siblings_preserve_effectively_empty_request() {
+    let mut doc = reference_sibling_guide(json!({"$ref":"#/$defs/bounded"}));
+    doc["contracts"][0]["ports"][0]["request"] =
+        json!({"$ref":"#/$defs/empty","properties":{"input":{"type":"string"}}});
+    let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    assert!(
+        compiled
+            .validate("dev.example.guide", "runtime.guide", "request", &json!({}))
+            .is_ok()
+    );
+    assert!(
+        compiled
+            .validate(
+                "dev.example.guide",
+                "runtime.guide",
+                "request",
+                &json!({"input":"not accepted"})
+            )
+            .is_err()
+    );
+    assert!(compiled.has_guide("dev.example.guide"));
+}
+
 #[test]
 fn metadata_projection_is_complete_filtered_and_deterministic_at_size_bound() {
     use sha2::{Digest, Sha256};
@@ -318,4 +511,35 @@ fn current_capability_wire_examples_are_closed_and_metadata_fixture_is_complete(
         document.contracts[0].ports[0].response,
         Some(json!({"$ref":"#/$defs/text"}))
     );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn capability_wire_port_names_match_compiler_ascii_grammar_and_length() {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../contracts/package-capabilities/v1/package-ports-2.0.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema["$defs"]["port"]).unwrap();
+    for (name, expected) in [
+        ("message.read-all".to_owned(), true),
+        ("a".to_owned(), true),
+        (format!("a{}", "-".repeat(127)), true),
+        (format!("a{}", "_".repeat(128)), false),
+        ("".to_owned(), false),
+        ("message..read".to_owned(), false),
+        ("message.Read".to_owned(), false),
+        ("message.0read".to_owned(), false),
+        ("message.-read".to_owned(), false),
+        ("message.read.".to_owned(), false),
+        ("message.réad".to_owned(), false),
+        ("message.read\n".to_owned(), false),
+    ] {
+        assert_eq!(
+            teamarness_package_contract::ui_contract::valid_operation_name(&name),
+            expected,
+            "compiler {name:?}"
+        );
+        assert_eq!(validator.is_valid(&json!(name)), expected, "wire {name:?}");
+    }
 }

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teamarness.dev/contracts/package-capabilities/v1/package-ports-2.0.schema.json",
   "title": "Package Ports capability 2.0",
-  "description": "Final wire shapes. Phase 1 qualifies declared metadata and explicit declared invocation/subscriptions only. Agent discovery, enable/disable and dynamic authorization are not yet qualified. The v1 directory names the document collection, not this family major. Byte bounds and digest/offset coherence are semantic checks described in README.md. Describe examples reconstruct the independently pinned package-ports-2.0.golden.json document.",
+  "description": "Current wire shapes. Declared metadata, Agent discovery, durable enable/disable, both access views and lifecycle revocation are implemented and covered by scripted repository tests. Independent Verify and external harness/UI/model qualification remain separate. The v1 directory names the document collection, not this family major. Byte bounds and digest/offset coherence are semantic checks described in README.md. Describe examples reconstruct the independently pinned package-ports-2.0.golden.json document.",
   "$defs": {
     "access": {
       "enum": [
@@ -37,7 +37,8 @@
     },
     "port": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
     },
     "summary": {
       "type": "object",

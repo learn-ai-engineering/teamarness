@@ -15,7 +15,7 @@ Conversations owns Channels, immutable Markdown Messages, and their durable loca
 
 The runtime guide is generated from enforced Backend constants. It explains subscribe-before-read, acknowledged prefixes, pending and unavailable content, changed-epoch reconstruction, Host-derived authorship, Provider errors, and read repeatability. Port reads do not mark Channels read. A post can take effect even when its result is uncertain. Never retry an uncertain post automatically.
 
-The [Port declaration reference](../../contracts/package-ports/v1/README.md) and [Package author guide](../../docs/package-author-guide.md#consume-a-package-port) describe generic consumption. A declared consumer can retrieve guide metadata without a binding. Bound-Agent access now defaults to `port_not_enabled`, including declared Ports, because the contract has a conforming guide. Durable enablement and generic Agent discovery are later qualification milestones, not functionality supplied by this Package change.
+The [Port declaration reference](../../contracts/package-ports/v1/README.md) and [Package author guide](../../docs/package-author-guide.md#consume-a-package-port) describe generic consumption. A declared consumer can retrieve guide metadata without a binding. Bound-Agent access now defaults to `port_not_enabled`, including declared Ports, because the contract has a conforming guide. The Host implements durable enablement, generic Agent discovery and lifecycle revocation, with scripted repository coverage including Conversations. Independent Verify and external harness provenance, UI observations and model quality remain separate qualification.
 
 ## Build and validation
 

@@ -1,5 +1,16 @@
 //! Test-only, payload-free scheduling gates; never the nonblocking observer.
 use std::sync::Arc;
+use std::time::Duration;
+
+struct PauseRelease<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for PauseRelease<F> {
+    fn drop(&mut self) {
+        if let Some(resume) = self.0.take() {
+            resume();
+        }
+    }
+}
 
 use crate::{PackageHost, PackageIdentity};
 
@@ -12,7 +23,13 @@ pub struct AuthorityPause {
 
 impl AuthorityPause {
     pub async fn paused(&self) {
-        self.reached.notified().await;
+        tokio::time::timeout(Duration::from_secs(8), self.reached.notified())
+            .await
+            .expect("test pause was not reached within 8 seconds");
+    }
+    pub fn resume_on_drop(self: &Arc<Self>) -> impl Drop + use<> {
+        let pause = Arc::clone(self);
+        PauseRelease(Some(move || pause.resume()))
     }
     pub fn resume(&self) {
         self.release.notify_one();
@@ -109,7 +126,13 @@ pub struct PortSelectionPause {
 
 impl PortSelectionPause {
     pub async fn paused(&self) {
-        self.reached.notified().await;
+        tokio::time::timeout(Duration::from_secs(8), self.reached.notified())
+            .await
+            .expect("test pause was not reached within 8 seconds");
+    }
+    pub fn resume_on_drop(self: &Arc<Self>) -> impl Drop + use<> {
+        let pause = Arc::clone(self);
+        PauseRelease(Some(move || pause.resume()))
     }
     pub fn resume(&self) {
         self.finish(false);
@@ -119,7 +142,10 @@ impl PortSelectionPause {
         self.finish(true);
     }
     fn finish(&self, failed: bool) {
-        *self.outcome.lock().expect("selection pause poisoned") = Some(failed);
+        self.outcome
+            .lock()
+            .expect("selection pause poisoned")
+            .get_or_insert(failed);
         self.release.notify_one();
     }
     pub(crate) fn wait(&self) -> bool {
@@ -148,5 +174,22 @@ impl PackageHost {
             .lock()
             .expect("selection pause poisoned") = Some((package, pause.clone()));
         pause
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_pause_cleanup_retains_chosen_completion_failure() {
+        let pause = Arc::new(PortSelectionPause::default());
+        let cleanup = pause.resume_on_drop();
+        pause.fail_completion();
+        drop(cleanup);
+        assert!(
+            pause.wait(),
+            "cleanup must not overwrite the simulated failure"
+        );
     }
 }

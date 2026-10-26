@@ -1984,6 +1984,7 @@ async fn record_availability_change_between_state_and_empty_page_is_not_lost() {
         .unwrap();
     let mount = mount(&host, 0).await;
     let pause = host.pause_next_record_availability_for_tests(package.parse().unwrap());
+    let _release = pause.resume_on_drop();
     fixture_request(
         &host,
         &mount,

@@ -1,5 +1,5 @@
 {
-  "description": "Declared metadata fixture; exact compact UTF-8 bytes are represented by describeResult.data. Agent operations are wire examples, not qualified handlers.",
+  "description": "Declared metadata fixture; exact compact UTF-8 bytes are represented by describeResult.data. Agent handlers are implemented and covered by scripted repository tests. Independent Verify and external harness/UI/model qualification remain separate.",
   "document": {
     "schemaVersion": 1,
     "$defs": {

@@ -104,6 +104,188 @@ async fn shutdown(host: &PackageHost) {
 
 // Verifies: TEAM.SYS.PKG-R13
 #[tokio::test]
+async fn reference_sibling_guide_is_discovered_without_wake_and_declared_agent_is_default_denied() {
+    let fixture = fixture().await;
+    let root = fixture.config.application_root();
+    let path = root.join("provider/ports.json");
+    let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    doc["$defs"] = json!({"text":{"type":"string"},"nested":{"$ref":"#/$defs/text","minLength":1}});
+    doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] =
+        json!({"$ref":"#/$defs/nested","maxLength":100});
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    fs::write(path, &bytes).unwrap();
+    let path = root.join("provider/teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["portContract"]["sha256"] = json!(common::digest(&bytes));
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let agent = fixture
+        .core
+        .add_agent(workspace, "Sibling Guide Agent")
+        .unwrap();
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "com.example.consumer")
+        .unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    // Assert the authority boundary before discovery: the old classifier dispatched this command.
+    for access in ["declared", "agent"] {
+        let denied = call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke(access, "message.post", "command", json!({"text":"denied"})),
+        )
+        .await;
+        assert_eq!(denied["error"], "port_not_enabled", "{access}: {denied}");
+    }
+    let available = call(&host, &consumer, "available", json!({"access":"agent"})).await;
+    let rows = available["result"]["contracts"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{available}");
+    assert_eq!(rows[0]["contract"], CONTRACT);
+    assert_eq!(rows[0]["enabled"], false);
+    let metadata = call(&host, &consumer, "describe", json!({"access":"agent","contract":CONTRACT,"metadataSha256":rows[0]["metadataSha256"],"offset":0})).await;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(metadata["result"]["data"].as_str().unwrap())
+        .unwrap();
+    let described: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(described["$defs"], doc["$defs"]);
+    let guide = described["contracts"][0]["ports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "runtime.guide")
+        .unwrap();
+    assert_eq!(
+        guide["response"],
+        doc["contracts"][0]["ports"][0]["response"]
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "enable",
+            json!({"contract":CONTRACT,"major":1})
+        )
+        .await["result"]["enabled"],
+        true
+    );
+    assert!(
+        host.snapshot()
+            .await
+            .instances
+            .iter()
+            .filter(|i| i.key.package_identity.as_str() == "com.example.provider")
+            .all(|i| i.process_generation.is_none()),
+        "neither refused dispatch, discovery nor enable may start the Provider"
+    );
+    for access in ["declared", "agent"] {
+        let posted = call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke(access, "message.post", "command", json!({"text":"enabled"})),
+        )
+        .await;
+        assert_eq!(posted["result"]["accepted"], true, "{posted}");
+    }
+    shutdown(&host).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    assert_eq!(
+        call(&host, &consumer, "available", json!({"access":"agent"})).await["result"]["contracts"]
+            [0]["enabledMajor"],
+        1
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke(
+                "declared",
+                "message.post",
+                "command",
+                json!({"text":"retained"})
+            )
+        )
+        .await["result"]["accepted"],
+        true
+    );
+    shutdown(&host).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn conflicting_reference_sibling_guide_is_not_advertised_and_keeps_ordinary_composition() {
+    let fixture = fixture().await;
+    let root = fixture.config.application_root();
+    let path = root.join("provider/ports.json");
+    let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    doc["$defs"] = json!({"text":{"type":"string","maxLength":100}});
+    doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] =
+        json!({"$ref":"#/$defs/text","type":"integer"});
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    fs::write(path, &bytes).unwrap();
+    let path = root.join("provider/teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["portContract"]["sha256"] = json!(common::digest(&bytes));
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let agent = fixture.core.add_agent(workspace, "No Guide Agent").unwrap();
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "com.example.consumer")
+        .unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    let available = call(&host, &consumer, "available", json!({"access":"agent"})).await;
+    assert_eq!(available["result"]["contracts"], json!([]), "{available}");
+    assert!(
+        call(
+            &host,
+            &consumer,
+            "enable",
+            json!({"contract":CONTRACT,"major":1})
+        )
+        .await
+        .get("error")
+        .is_some()
+    );
+    assert!(
+        host.snapshot()
+            .await
+            .instances
+            .iter()
+            .filter(|i| i.key.package_identity.as_str() == "com.example.provider")
+            .all(|i| i.process_generation.is_none())
+    );
+    let posted = call(
+        &host,
+        &consumer,
+        "invoke",
+        invoke(
+            "declared",
+            "message.post",
+            "command",
+            json!({"text":"ordinary"}),
+        ),
+    )
+    .await;
+    assert_eq!(posted["result"]["accepted"], true, "{posted}");
+    shutdown(&host).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
 async fn bound_harness_discovers_and_enables_only_its_own_contracts_without_starting_provider() {
     let fixture = fixture().await;
     let workspace = fixture.core.list_workspaces().unwrap()[0].id();
@@ -766,6 +948,7 @@ async fn failed_storage_never_claims_success_and_lost_completion_is_reread() {
     #[cfg(feature = "test-hooks")]
     {
         let pause = host.pause_next_port_selection_for_tests("com.example.other".parse().unwrap());
+        let _release = pause.resume_on_drop();
         let running_host = host.clone();
         let running_target = target.clone();
         let running = tokio::spawn(async move {
@@ -836,6 +1019,7 @@ async fn cancelled_storage_waiter_retains_gate_and_generation_until_actual_work_
     .await["grant"]
         .clone();
     let pause = host.pause_next_port_selection_for_tests(key.package_identity.clone());
+    let _release = pause.resume_on_drop();
     let running_host = host.clone();
     let running_target = target.clone();
     let running = tokio::spawn(async move {
@@ -881,6 +1065,7 @@ async fn cancelled_storage_waiter_retains_gate_and_generation_until_actual_work_
     );
     // A second timed-out write fences replacement of the crashed harness generation.
     let pause = host.pause_next_port_selection_for_tests(key.package_identity.clone());
+    let _release = pause.resume_on_drop();
     let running_host = host.clone();
     let running_target = target.clone();
     let running = tokio::spawn(async move {
@@ -1520,6 +1705,7 @@ async fn authorization_races_keep_original_command_actor_and_revoke_late_stream_
         .await;
         let pause =
             host.pause_next_port_authorized_for_tests("com.example.consumer".parse().unwrap());
+        let _release = pause.resume_on_drop();
         let h = host.clone();
         let t = target.clone();
         let command = tokio::spawn(async move {
@@ -1576,6 +1762,7 @@ async fn authorization_races_keep_original_command_actor_and_revoke_late_stream_
         // A command already authorized still uses the common uncertainty classifier, without retry.
         let pause =
             host.pause_next_port_authorized_for_tests("com.example.consumer".parse().unwrap());
+        let _release = pause.resume_on_drop();
         let h = host.clone();
         let t = target.clone();
         let command = tokio::spawn(async move {
@@ -1622,6 +1809,7 @@ async fn authorization_races_keep_original_command_actor_and_revoke_late_stream_
                 .await;
                 let pause = host
                     .pause_next_port_authorized_for_tests("com.example.consumer".parse().unwrap());
+                let _release = pause.resume_on_drop();
                 request(&host,&target,open,json!({"access":access,"port":if open == "fixture.port_open" {"message.idle_watch"} else {"message.created"}})).await;
                 pause.paused().await;
                 match transition {
@@ -1668,6 +1856,7 @@ async fn accepted_event_drains_before_terminal_but_post_disable_events_do_not_en
     .await;
     open_idle_streams(&host, &target, &provider, "agent").await;
     let pause = host.pause_next_port_delivery_for_tests("com.example.other".parse().unwrap());
+    let _release = pause.resume_on_drop();
     request(
         &host,
         &provider,
@@ -1779,6 +1968,7 @@ async fn retired_harness_open_cannot_replace_or_close_a_new_generation_subscript
     )
     .await;
     let pause = host.pause_next_port_authorized_for_tests("com.example.other".parse().unwrap());
+    let _release = pause.resume_on_drop();
     request(
         &host,
         &target,
@@ -1892,6 +2082,7 @@ async fn provider_replacement_revokes_previously_authorized_stream_work() {
             .unwrap();
         let pause =
             host.pause_next_port_authorized_for_tests("com.example.consumer".parse().unwrap());
+        let _release = pause.resume_on_drop();
         request(&host,&target,open,json!({"access":access,"port":if open == "fixture.port_open" {"message.idle_watch"} else {"message.created"}})).await;
         pause.paused().await;
         let _ = host
@@ -1945,4 +2136,85 @@ async fn provider_replacement_revokes_previously_authorized_stream_work() {
     )
     .await;
     shutdown(&host).await;
+}
+
+#[cfg(feature = "test-hooks")]
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn selection_pause_unwind_reports_original_failure_promptly() {
+    const PROBE: &str = "TEAMARNESS_SELECTION_PAUSE_UNWIND_PROBE";
+    if std::env::var_os(PROBE).is_some() {
+        let fixture = fixture().await;
+        let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+        let agent = fixture.core.add_agent(workspace, "Unwind Agent").unwrap();
+        fixture
+            .core
+            .bind_agent_package(workspace, agent, "com.example.other")
+            .unwrap();
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let target = mount(&host, "com.example.other", &workspace.to_string()).await;
+        let pause = host.pause_next_port_selection_for_tests("com.example.other".parse().unwrap());
+        let _release = pause.resume_on_drop();
+        tokio::spawn(async move {
+            call(
+                &host,
+                &target,
+                "enable",
+                json!({"contract":CONTRACT,"major":1}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(8), pause.paused())
+            .await
+            .expect("selection pause entered");
+        panic!("intentional selection pause assertion failure");
+    }
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "selection_pause_unwind_reports_original_failure_promptly",
+            "--nocapture",
+        ])
+        .env(PROBE, "1")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    let child = command.spawn().unwrap();
+    let pid = child.id().unwrap();
+    let output = match tokio::time::timeout(Duration::from_secs(8), child.wait_with_output()).await
+    {
+        Ok(output) => output.unwrap(),
+        Err(error) => {
+            #[cfg(unix)]
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+            panic!("paused storage stranded original failure: {error}");
+        }
+    };
+    assert!(
+        !output.status.success(),
+        "intentional failure must remain a failure"
+    );
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.contains("intentional selection pause assertion failure"),
+        "{output}"
+    );
+    assert!(
+        output.contains("test result: FAILED"),
+        "original test failure must reach harness output: {output}"
+    );
 }

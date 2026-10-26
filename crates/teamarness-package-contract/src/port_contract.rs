@@ -321,20 +321,87 @@ pub fn compile_port_contracts(bytes: &[u8]) -> Result<CompiledPortContracts, Con
     })
 }
 
-fn resolved<'a>(schema: &'a Value, definitions: &'a Map<String, Value>) -> Option<&'a Value> {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        let pointer = reference.strip_prefix("#/$defs/")?;
-        let (name, rest) = pointer.split_once('/').unwrap_or((pointer, ""));
-        let name = name.replace("~1", "/").replace("~0", "~");
-        let definition = definitions.get(&name)?;
-        let target = if rest.is_empty() {
-            definition
-        } else {
-            definition.pointer(&format!("/{rest}"))?
+/// Structural guide markers conjoin every local-reference sibling. This is not
+/// a satisfiability solver for arbitrary JSON Schema response constraints.
+struct GuideSchema<'a> {
+    clauses: Vec<&'a Value>,
+}
+
+impl<'a> GuideSchema<'a> {
+    fn new(schema: &'a Value, definitions: &'a Map<String, Value>) -> Option<Self> {
+        let mut result = Self {
+            clauses: Vec::new(),
         };
-        resolved(target, definitions)
-    } else {
-        Some(schema)
+        result.append(schema, definitions)?;
+        Some(result)
+    }
+
+    fn append(&mut self, schema: &'a Value, definitions: &'a Map<String, Value>) -> Option<()> {
+        self.clauses.push(schema);
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let pointer = reference.strip_prefix("#/$defs/")?;
+            let name = pointer.replace("~1", "/").replace("~0", "~");
+            // Admission has already rejected nonlocal, missing and cyclic references.
+            self.append(definitions.get(&name)?, definitions)?;
+        }
+        Some(())
+    }
+
+    fn values(&self, key: &'static str) -> impl Iterator<Item = &'a Value> + '_ {
+        self.clauses
+            .iter()
+            .filter_map(move |schema| schema.get(key))
+    }
+
+    fn typed(&self, expected: &str) -> bool {
+        !self.clauses.contains(&&Value::Bool(false))
+            && self.values("type").any(|value| value == expected)
+            && self.values("type").all(|value| {
+                value == expected
+                    || value
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|t| t == expected))
+            })
+    }
+
+    fn bounds(&self, minimum: &'static str, maximum: &'static str) -> (u64, Option<u64>) {
+        (
+            self.values(minimum)
+                .filter_map(Value::as_u64)
+                .max()
+                .unwrap_or(0),
+            self.values(maximum).filter_map(Value::as_u64).min(),
+        )
+    }
+
+    fn closed_object(&self) -> bool {
+        if !self.typed("object")
+            || !self
+                .values("additionalProperties")
+                .any(|value| value == &Value::Bool(false))
+        {
+            return false;
+        }
+        let required: BTreeSet<_> = self
+            .values("required")
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let (minimum, maximum) = self.bounds("minProperties", "maxProperties");
+        maximum.is_none_or(|max| max >= minimum && max >= required.len() as u64)
+    }
+
+    fn property(&self, name: &str, definitions: &'a Map<String, Value>) -> Option<Self> {
+        let mut result = Self {
+            clauses: Vec::new(),
+        };
+        for properties in self.values("properties") {
+            if let Some(schema) = properties.get(name) {
+                result.append(schema, definitions)?;
+            }
+        }
+        Some(result)
     }
 }
 
@@ -342,39 +409,44 @@ fn guide_shape(port: &Port, definitions: &Map<String, Value>) -> bool {
     if port.kind != PortKind::Query || port.event.is_some() {
         return false;
     }
-    let Some(request) = port.request.as_ref().and_then(|s| resolved(s, definitions)) else {
+    let Some(request) = port
+        .request
+        .as_ref()
+        .and_then(|s| GuideSchema::new(s, definitions))
+    else {
         return false;
     };
     let Some(response) = port
         .response
         .as_ref()
-        .and_then(|s| resolved(s, definitions))
+        .and_then(|s| GuideSchema::new(s, definitions))
     else {
         return false;
     };
-    let closed_object = |v: &Value| {
-        v.get("type").and_then(Value::as_str) == Some("object")
-            && v.get("additionalProperties") == Some(&Value::Bool(false))
+    let Some(markdown) = response.property("markdown", definitions) else {
+        return false;
     };
-    closed_object(request)
+    let (minimum, maximum) = markdown.bounds("minLength", "maxLength");
+    request.closed_object()
+        && request.clauses.iter().any(|schema| {
+            schema.get("additionalProperties") == Some(&Value::Bool(false))
+                && ["properties", "patternProperties"].iter().all(|key| {
+                    schema
+                        .get(key)
+                        .is_none_or(|v| v.as_object().is_some_and(Map::is_empty))
+                })
+        })
         && request
-            .get("properties")
-            .is_none_or(|v| v.as_object().is_some_and(Map::is_empty))
-        && request
-            .get("required")
-            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
-        && closed_object(response)
+            .values("required")
+            .all(|v| v.as_array().is_some_and(Vec::is_empty))
+        && response.closed_object()
         && response
-            .get("required")
-            .and_then(Value::as_array)
-            .is_some_and(|v| v.iter().any(|v| v == "markdown"))
-        && response
-            .pointer("/properties/markdown")
-            .and_then(|s| resolved(s, definitions))
-            .is_some_and(|s| {
-                s.get("type").and_then(Value::as_str) == Some("string")
-                    && s.get("maxLength").and_then(Value::as_u64).is_some()
-            })
+            .values("required")
+            .filter_map(Value::as_array)
+            .flatten()
+            .any(|v| v == "markdown")
+        && markdown.typed("string")
+        && maximum.is_some_and(|max| max >= minimum)
 }
 
 fn description(value: &str) -> Result<(), ContractError> {

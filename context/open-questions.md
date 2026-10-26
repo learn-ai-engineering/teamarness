@@ -108,7 +108,7 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 **Decision:** Packages publish an ordinary bounded `runtime.guide` query, versioned with their Port Contract. Admission classifies its closed empty request and bounded Markdown response without executing a Provider. The generic harness retrieves complete schemas through package-ports 2.0 metadata. The Steward selects contracts in the Agent Package UI; the Host owns self-scoped, default-empty enablement and enforces it even on declared bound-Agent access. No Provider-specific Host adapter or Package-owned Agent-management screen is required.
 
-**Current milestone:** complete declared metadata and explicit current requests are qualified in Phase 1. Agent discovery, durable settings, and revocation follow; no upstream model compatibility or completed Agent UI journey is claimed. Conversations guidance follows in Phase 2; Exhibits already supplies a conforming guide.
+**Current milestone:** complete declared metadata, Agent discovery, durable settings, both access views, lifecycle revocation and Conversations guidance are implemented and covered by scripted repository tests. Independent Verify remains separate from that evidence. Current external harness revision, rebuild and vendor provenance, UI observations and model quality remain unprovided; no completed Agent UI journey is claimed. Exhibits already supplies a conforming guide.
 
 **Still open:** standalone Agent tools for Documents, Agent mentions, and Comment Ports. Documents 1.1 permits Agent revise, but has no Comment operations. The read-before-revise and live-editor check remain separate follow-ups, not delivered here.
 
