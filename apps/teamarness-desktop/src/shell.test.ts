@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
+import { ApplicationUpdateController, BrowserApplicationUpdateView } from "./application-update";
+import type { ApplicationUpdateBridge, ApplicationUpdateSnapshot } from "./application-update-contracts";
 import type { Installation, Membership, PrincipalsSnapshot, Workspace } from "./contracts";
 import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
 import type { PackageLifecycleResult } from "./package-shell";
@@ -640,6 +642,79 @@ describe("Installation Package visibility", () => {
     screen.toggle.click();
     expect(test.frame.contextualNavigation.innerHTML).toContain("<span>One</span>");
   });
+});
+
+// Verifies: TEAM.SYS.SHELL-R07
+it("restores Workspace controls and the selected Package after rejected Restart", async () => {
+  const { shell, frame, calls } = harness();
+  await shell.updateWorkspace(model());
+  shell.updatePackages(packages);
+  const route: ShellRoute = { kind: "package-instance", instance: packageKey };
+  await shell.navigate(route);
+  const rail = frame.workspaceRail.innerHTML;
+  const navigation = frame.contextualNavigation.innerHTML;
+  frame.packageMount.innerHTML = "<iframe></iframe>";
+
+  const ready: ApplicationUpdateSnapshot = {
+    revision: 1,
+    update: { revision: 1, state: "ready", installedVersion: "0.1.0", candidateVersion: "1.2.3", downloadedBytes: 20, archiveLimit: 100, error: null, pendingGeneration: "opaque-1", notes: null },
+    lifecycle: { revision: 1, shutdown: { host: false, core: false, uncertain: false }, phase: "running", failure: null, previousApp: null, guidance: null },
+  };
+  const running: ApplicationUpdateSnapshot = {
+    ...ready,
+    revision: 2,
+    update: { ...ready.update, revision: 2, state: "idle", pendingGeneration: null },
+  };
+  const bridge: ApplicationUpdateBridge = {
+    subscribe: vi.fn(async () => () => undefined),
+    status: vi.fn().mockResolvedValueOnce(ready).mockResolvedValue(running),
+    check: vi.fn(async () => running),
+    restart: vi.fn().mockRejectedValue({ code: "stale_candidate" }),
+    quit: vi.fn(async () => undefined),
+  };
+  const notice = Object.assign(new Region(), { querySelectorAll: () => [] });
+  const terminal = Object.assign(new Region(), { querySelectorAll: () => [], focus: vi.fn() });
+  const view = new BrowserApplicationUpdateView(
+    notice as unknown as HTMLElement,
+    terminal as unknown as HTMLElement,
+    (blocked) => { shell.setApplicationUpdating(blocked); },
+  );
+  const updates = new ApplicationUpdateController(bridge, (state) => { view.render(state, updates); });
+  await updates.attach();
+
+  const restarting = updates.restart();
+  for (const region of Object.values(frame)) {
+    expect(region.innerHTML).toBe("");
+    expect(region.hidden).toBe(true);
+  }
+  expect(terminal.hidden).toBe(false);
+  shell.updatePackages({ ...packages, revision: packages.revision + 1 });
+  await shell.navigate({ kind: "package-instance", instance: privatePackageKey });
+  expect(frame.contextualNavigation.innerHTML).toBe("");
+  expect(frame.packageMount.hidden).toBe(true);
+  expect(calls).not.toContain(`mount:${privatePackageKey.packageIdentity}`);
+
+  await restarting;
+  expect(bridge.restart).toHaveBeenCalledExactlyOnceWith("opaque-1");
+  expect(bridge.status).toHaveBeenCalledTimes(2);
+  // No Workspace-model update follows the initial setup: recovery must restore the cleared rail itself.
+  expect(frame.workspaceRail.innerHTML).toContain(`aria-label="Switch to ${workspace.name}"`);
+  expect(frame.workspaceRail.innerHTML).toContain('aria-label="Switch to Other"');
+  expect(frame.workspaceRail.innerHTML).toContain('aria-label="Add or join a Workspace"');
+  for (const label of ["System theme", "Light theme", "Dark theme"]) {
+    expect(frame.workspaceRail.innerHTML).toContain(`aria-label="${label}"`);
+  }
+  expect(frame.workspaceRail.innerHTML).toBe(rail);
+  expect(frame.contextualNavigation.innerHTML).toBe(navigation);
+  expect(frame.contextualNavigation.innerHTML).toContain('data-package-index="0" aria-current="page"');
+  expect(shell.route()).toEqual(route);
+  expect(frame.workspaceRail.hidden).toBe(false);
+  expect(frame.contextualNavigation.hidden).toBe(false);
+  expect(frame.packageMount.hidden).toBe(false);
+  expect(frame.shellScreen.hidden).toBe(true);
+  expect(terminal.hidden).toBe(true);
+  expect(calls).toEqual([`mount:${packageKey.packageIdentity}`, "blocked:true", "blocked:false", `mount:${packageKey.packageIdentity}`]);
+  updates.detach();
 });
 
 // Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R05

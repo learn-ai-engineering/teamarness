@@ -92,6 +92,7 @@ export class Shell {
     } else {
       this.shellFrame.workspaceRail.hidden = false;
       this.shellFrame.contextualNavigation.hidden = false;
+      this.renderWorkspaceRail();
       void this.navigate(this.selectedRoute);
     }
   }
