@@ -85,7 +85,9 @@ export class PackageManagementController {
     const step = this.step;
     switch (action) {
       case "open":
-        if (step.kind === "closed") this.go({ kind: "choose", pasting: false, refusal: null });
+        if (step.kind !== "closed") return;
+        this.feedback.clear();
+        this.go({ kind: "choose", pasting: false, refusal: null });
         return;
       case "paste":
         if (step.kind === "choose") this.go({ ...step, pasting: true });
@@ -243,6 +245,15 @@ export class PackageManagementController {
     if (this.workingRegistration) return;
     this.feedback.clear();
     this.confirmingRemoval = null;
+  }
+
+  /**
+   * Clears the shown message because another action started, without
+   * cancelling a pending Remove confirmation. The caller renders again.
+   */
+  public clearMessage(): void {
+    if (this.workingRegistration) return;
+    this.feedback.clear();
   }
 
   /** Dismisses the shown message, for the person's dismiss control. */

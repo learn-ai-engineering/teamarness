@@ -241,6 +241,7 @@ function harness(
   shellScreen: HTMLElement = new Region() as unknown as HTMLElement,
   packageBehavior: Readonly<{
     refresh?: () => Promise<PackageHostSnapshot>;
+    hide?: () => Promise<void>;
     lifecycle?: (action: "suspend" | "recover" | "dispose", instance: PackageInstanceKey) => Promise<PackageLifecycleResult>;
   }> = {},
   workspaceRail: HTMLElement = new Region() as unknown as HTMLElement,
@@ -270,7 +271,10 @@ function harness(
       select: async (instance, view = "main") => {
         calls.push(view === "main" ? `mount:${instance.packageIdentity}` : `mount:${instance.packageIdentity}:${view}`);
       },
-      hide: async () => { calls.push("unmount"); },
+      hide: () => {
+        calls.push("unmount");
+        return packageBehavior.hide?.() ?? Promise.resolve();
+      },
       suspendBackend: async (instance) => {
         calls.push(`suspend:${instance.packageIdentity}`);
         return packageBehavior.lifecycle?.("suspend", instance) ?? { snapshot: packages, failure: null };
@@ -1005,6 +1009,52 @@ describe("Package page Configuration tab", () => {
     await vi.waitFor(() => expect(test.calls.filter((call) => call === "mount:com.example.one:settings")).toHaveLength(2));
   });
 
+  it("keeps the settings view when About is selected and Configuration again before the unmount finishes", async () => {
+    let finishUnmount: () => void = () => undefined;
+    let deferring = false;
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      refresh: async () => declaring,
+      hide: () => deferring ? new Promise<void>((resolve) => { finishUnmount = resolve; }) : Promise.resolve(),
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate(configuration);
+    expect(test.frame.packageMount.hidden).toBe(false);
+
+    deferring = true;
+    const about = test.shell.navigate(page);
+    deferring = false;
+    await test.shell.navigate(configuration);
+    finishUnmount();
+    await about;
+
+    expect(test.shell.route()).toEqual(configuration);
+    expect(test.frame.packageMount.hidden).toBe(false);
+    expect(test.frame.shellScreen.hidden).toBe(false);
+    expect(mountAttributes(test).get("data-placement")).toBe("package-page");
+  });
+
+  it("leaves Configuration for About when the unmount fails", async () => {
+    let failing = false;
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      refresh: async () => declaring,
+      hide: async () => { if (failing) throw new Error("unmount was not acknowledged"); },
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate(configuration);
+
+    failing = true;
+    await expect(test.shell.navigate(page)).resolves.toBeUndefined();
+    expect(test.shell.route()).toEqual(page);
+    expect(test.frame.packageMount.hidden).toBe(true);
+    expect(test.frame.shellScreen.hidden).toBe(false);
+    expect(mountAttributes(test).get("data-placement")).toBeUndefined();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain(">Details</h2>"));
+  });
+
   it("moves between tabs with the arrow keys", async () => {
     const screen = new AttributeRegion();
     const test = harness(screen as unknown as HTMLElement, { refresh: async () => declaring });
@@ -1073,7 +1123,7 @@ describe("Package page Configuration tab", () => {
     });
     await vi.waitFor(() => expect(test.shell.route()).toEqual(page));
     expect(test.calls.at(-1)).toBe("unmount");
-    expect(test.frame.packageMount.hidden).toBe(true);
+    await vi.waitFor(() => expect(test.frame.packageMount.hidden).toBe(true));
   });
 });
 

@@ -186,6 +186,7 @@ export class PackagePageController {
         return;
       }
       case "restart-app":
+        this.feedback.clear();
         await this.management.registrationAction("restart", identity, snapshot);
         return;
       case "restart":
@@ -256,6 +257,7 @@ export class PackagePageController {
   ): Promise<void> {
     this.working = action;
     this.feedback.clear();
+    this.management.clearMessage();
     if (showWorking) this.hooks.changed();
     let feedback: PageFeedback;
     try {

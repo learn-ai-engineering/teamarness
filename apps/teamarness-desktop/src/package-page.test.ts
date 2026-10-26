@@ -112,7 +112,7 @@ const catalog: readonly PackageAuthoringEntry[] = [
   { identity: BARE, capabilities: [], provided: [], consumed: [] },
 ];
 
-type Behavior = Partial<Pick<PackageManagementBridge, "authoringCatalog" | "restartPackage" | "remove" | "reload">>;
+type Behavior = Partial<Pick<PackageManagementBridge, "authoringCatalog" | "restartPackage" | "remove" | "reload" | "restart">>;
 
 /** A clock the test advances by hand, so message timing needs no waiting. */
 function manualTimers(): StatusMessageTimers & { advance(ms: number): void } {
@@ -149,7 +149,7 @@ function harness(current: PackageHostSnapshot = snapshot(), behavior: Behavior =
     reload: behavior.reload ?? (async (identity) => { calls.push(`reload:${identity}`); return { revision: 8, restartRequired: false }; }),
     remove: behavior.remove ?? (async (identity) => { calls.push(`remove:${identity}`); return { revision: 8, restartRequired: false }; }),
     writeOverride: async () => { throw new Error("unused"); },
-    restart: async () => { calls.push("app-restart"); },
+    restart: behavior.restart ?? (async () => { calls.push("app-restart"); }),
     restartPackage: behavior.restartPackage ?? (async (key) => { calls.push(`restart:${key.packageIdentity}:${key.workspaceId}`); }),
     authoringCatalog: behavior.authoringCatalog ?? (async () => { calls.push("catalog"); return catalog; }),
   };
@@ -326,6 +326,48 @@ describe("Package page messages", () => {
     await test.act("reload");
     expect(test.html()).not.toContain("A file changed");
     expect(test.html()).toContain("<p>Reloaded.</p>");
+  });
+
+  it("clears a Reload error when a later action starts, so it does not come back after that result hides", async () => {
+    const test = harness(snapshot(), {
+      reload: async () => { throw { code: "artifact_changed" }; },
+    });
+    await test.open(AGENT);
+    await test.act("reload");
+    expect(test.html()).toContain("A file changed after the manifest was written.");
+
+    await test.act("pause");
+    expect(test.html()).toContain("<p>Paused Agent.</p>");
+    expect(test.html()).not.toContain("A file changed");
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS);
+    expect(test.html()).not.toContain("Paused Agent.");
+    expect(test.html()).not.toContain("A file changed");
+    expect(test.html()).toContain('<div class="status-message" role="status" aria-live="polite"></div>');
+  });
+
+  it("keeps an open Remove confirmation when another action clears the message", async () => {
+    const test = harness();
+    await test.open(AGENT);
+    await test.act("remove");
+    expect(actions(test.html())).toContain("confirm-remove");
+    await test.act("pause");
+    expect(actions(test.html())).toContain("confirm-remove");
+    expect(test.management.registrationState(AGENT).confirming).toBe(true);
+  });
+
+  it("shows a Restart Teamarness failure in place of an earlier page error", async () => {
+    const test = harness(snapshot(), {
+      restartPackage: async () => { throw { code: "invalid_lifecycle_state" }; },
+      restart: async () => { throw { code: "restart_failed" }; },
+    });
+    await test.open(AGENT);
+    await test.act("restart");
+    expect(test.html()).toContain("This Package cannot do that in its current state.");
+
+    await test.act("restart-app");
+    const html = test.html();
+    expect(html).not.toContain("This Package cannot do that");
+    expect(between(html, "status-message-slot", "role=\"tabpanel\"")).toContain('role="alert" aria-live="assertive"><p>');
   });
 });
 

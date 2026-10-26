@@ -567,4 +567,14 @@ describe("the Packages section message area", () => {
     expect(replaced).not.toContain("A file the manifest lists is missing.");
     expect(replaced).toContain("Reloaded.");
   });
+
+  it("clears an error when the add flow opens", async () => {
+    const test = harness({ reload: async () => { throw { code: "artifact_missing" }; } });
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    expect(test.controller.renderMessage(snapshot([refused]))).toContain("A file the manifest lists is missing.");
+
+    await test.controller.installAction("open");
+    expect(test.controller.state().kind).toBe("choose");
+    expect(test.controller.renderMessage(snapshot([refused]))).not.toContain("A file the manifest lists is missing.");
+  });
 });

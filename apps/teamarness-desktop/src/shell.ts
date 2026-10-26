@@ -88,6 +88,8 @@ export class Shell {
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
   private packagePageTabFocus = false;
+  /** Counts navigations, so one that finishes unmounting after a newer one started leaves the newer one's mount alone. */
+  private navigation = 0;
   private readonly packageManagement: PackageManagementController;
   private readonly packagePage: PackagePageController;
 
@@ -164,6 +166,7 @@ export class Shell {
   }
 
   public async navigate(requested: ShellRoute): Promise<void> {
+    const navigation = ++this.navigation;
     const route = this.availableRoute(requested);
     this.setRoute(route);
     if (route.kind === "package-instance") {
@@ -190,7 +193,9 @@ export class Shell {
       return;
     }
 
-    await this.options.packageShell.hide();
+    // A failed unmount still leaves the Shell screen; the Package Shell already reported it.
+    await this.options.packageShell.hide().catch(() => undefined);
+    if (navigation !== this.navigation) return;
     placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
