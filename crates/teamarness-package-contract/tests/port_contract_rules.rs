@@ -209,6 +209,170 @@ fn reference_sibling_guide(markdown: Value) -> Value {
 
 // Verifies: TEAM.SYS.PKG-R13
 #[test]
+fn guide_finite_type_sets_preserve_exact_markers_and_runtime_schemas() {
+    let scalar = reference_sibling_guide(json!({"type":"string","maxLength":100}));
+    let mut cases = vec![("scalar", scalar.clone())];
+    for (name, pointer) in [
+        ("singleton request", "/$defs/empty/type"),
+        ("singleton response", "/$defs/response/type"),
+        (
+            "singleton markdown",
+            "/$defs/response/properties/markdown/type",
+        ),
+    ] {
+        let mut doc = scalar.clone();
+        let ty = doc.pointer_mut(pointer).unwrap();
+        *ty = json!([ty.clone()]);
+        cases.push((name, doc));
+    }
+    let mut all = scalar.clone();
+    all["$defs"]["empty"]["type"] = json!(["object"]);
+    all["$defs"]["response"]["type"] = json!(["object"]);
+    all["$defs"]["response"]["properties"]["markdown"]["type"] = json!(["string"]);
+    cases.push(("all singleton", all));
+    let mut singleton_ref =
+        reference_sibling_guide(json!({"$ref":"#/$defs/nested","maxLength":100}));
+    singleton_ref["$defs"]["text"]["type"] = json!(["string"]);
+    cases.push((
+        "singleton reference chain with sibling bound",
+        singleton_ref,
+    ));
+    for types in [
+        json!(["string", "null"]),
+        json!(["null", "string", "boolean", "array"]),
+    ] {
+        let mut doc = reference_sibling_guide(
+            json!({"$ref":"#/$defs/nested","type":["integer","string"],"maxLength":100}),
+        );
+        doc["$defs"]["text"]["type"] = types;
+        doc["$defs"]["nested"]["type"] = json!(["number", "string", "null"]);
+        doc["$defs"]["objectTypes"] = json!({"type":["null","object","array"]});
+        for name in ["empty", "response"] {
+            doc["$defs"][name]["$ref"] = json!("#/$defs/objectTypes");
+            doc["$defs"][name]["type"] = json!(["boolean", "object"]);
+        }
+        cases.push(("finite array intersections through references", doc));
+    }
+    for (name, doc) in cases {
+        let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(compiled.has_guide("dev.example.guide"), "{name}");
+        assert!(
+            !compiled.warnings.iter().any(|w| w.contains("guide_shape")),
+            "{name}"
+        );
+        for (direction, value) in [
+            ("request", json!({})),
+            ("response", json!({"markdown":"ok"})),
+        ] {
+            assert!(
+                compiled
+                    .validate("dev.example.guide", "runtime.guide", direction, &value)
+                    .is_ok(),
+                "{name}: {value}"
+            );
+        }
+        for (direction, value) in [
+            ("request", json!({"extra":true})),
+            ("request", json!(null)),
+            ("request", json!([])),
+            ("response", json!(null)),
+            ("response", json!([])),
+            ("response", json!({})),
+            ("response", json!({"markdown":"ok","extra":true})),
+            ("response", json!({"markdown":"x".repeat(101)})),
+            ("response", json!({"markdown":null})),
+            ("response", json!({"markdown":1})),
+        ] {
+            assert!(
+                compiled
+                    .validate("dev.example.guide", "runtime.guide", direction, &value)
+                    .is_err(),
+                "{name}: {value}"
+            );
+        }
+        let projection = compiled
+            .project_metadata("dev.example.guide", None)
+            .unwrap();
+        let projected: Value = serde_json::from_slice(&projection.bytes).unwrap();
+        for (definition, schema) in projected["$defs"].as_object().unwrap() {
+            assert_eq!(schema, &doc["$defs"][definition], "{name}: {definition}");
+        }
+        assert_eq!(projected["contracts"], doc["contracts"], "{name}");
+        let rebuilt = compile_port_contracts(&projection.bytes).unwrap();
+        assert!(rebuilt.has_guide("dev.example.guide"), "{name}");
+        let again = rebuilt.project_metadata("dev.example.guide", None).unwrap();
+        assert_eq!(projection.bytes, again.bytes, "{name}");
+        assert_eq!(projection.sha256, again.sha256, "{name}");
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
+fn guide_finite_type_sets_reject_nullable_multiple_disjoint_and_false_markers() {
+    for markdown in [
+        json!({"type":["string","null"],"maxLength":100}),
+        json!({"type":["boolean","string"],"maxLength":100}),
+        json!({"$ref":"#/$defs/nullable","type":["null","string"],"maxLength":100}),
+        json!({"$ref":"#/$defs/nullable","type":["integer","boolean"],"maxLength":100}),
+        json!({"type":["number","integer"],"maxLength":100}),
+        json!({"$ref":"#/$defs/never","type":["string"],"maxLength":100}),
+        json!({"maxLength":100}),
+    ] {
+        let mut doc = reference_sibling_guide(markdown.clone());
+        doc["$defs"]["nullable"] = json!({"type":["string","null"]});
+        doc["$defs"]["never"] = json!(false);
+        let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(!compiled.has_guide("dev.example.guide"), "{markdown}");
+        assert!(
+            compiled.warnings.iter().any(|w| w.contains("guide_shape")),
+            "{markdown}"
+        );
+    }
+    for name in ["empty", "response"] {
+        for types in [
+            json!(["null", "object"]),
+            json!(["array", "object"]),
+            json!(["string", "boolean"]),
+        ] {
+            let mut doc = reference_sibling_guide(json!({"type":["string"],"maxLength":100}));
+            doc["$defs"][name]["type"] = types;
+            let compiled = compile_port_contracts(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert!(!compiled.has_guide("dev.example.guide"), "{name}");
+            assert!(compiled.warnings.iter().any(|w| w.contains("guide_shape")));
+        }
+    }
+    let mut extra = reference_sibling_guide(json!({"type":["string"],"maxLength":100}));
+    extra["$defs"]["empty"]["type"] = json!(["object"]);
+    extra["$defs"]["empty"]["properties"] = json!({"extra":{"type":"string"}});
+    let compiled = compile_port_contracts(&serde_json::to_vec(&extra).unwrap()).unwrap();
+    assert!(!compiled.has_guide("dev.example.guide"));
+    assert!(
+        compiled
+            .validate(
+                "dev.example.guide",
+                "runtime.guide",
+                "request",
+                &json!({"extra":"accepted"})
+            )
+            .is_ok()
+    );
+    // Exact finite markers do not replace the actual compiled empty-request check.
+    extra["$defs"]["empty"]
+        .as_object_mut()
+        .unwrap()
+        .remove("properties");
+    extra["$defs"]["empty"]["minProperties"] = json!(1);
+    let compiled = compile_port_contracts(&serde_json::to_vec(&extra).unwrap()).unwrap();
+    assert!(!compiled.has_guide("dev.example.guide"));
+    assert!(
+        compiled
+            .validate("dev.example.guide", "runtime.guide", "request", &json!({}))
+            .is_err()
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[test]
 fn guide_reference_siblings_preserve_bounds_and_runtime_validation() {
     for markdown in [
         json!({"type":"string","maxLength":100}),

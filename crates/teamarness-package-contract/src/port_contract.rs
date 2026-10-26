@@ -354,14 +354,22 @@ impl<'a> GuideSchema<'a> {
     }
 
     fn typed(&self, expected: &str) -> bool {
-        !self.clauses.contains(&&Value::Bool(false))
-            && self.values("type").any(|value| value == expected)
-            && self.values("type").all(|value| {
-                value == expected
-                    || value
-                        .as_array()
-                        .is_some_and(|types| types.iter().any(|t| t == expected))
-            })
+        if self.clauses.contains(&&Value::Bool(false)) {
+            return false;
+        }
+        // Guide markers only ask for object or string, not numeric subtype relations.
+        let mut restrictions = self.values("type").map(|value| match value {
+            Value::String(name) => BTreeSet::from([name.as_str()]),
+            Value::Array(types) => types.iter().filter_map(Value::as_str).collect(),
+            _ => BTreeSet::new(),
+        });
+        let Some(mut effective) = restrictions.next() else {
+            return false;
+        };
+        for types in restrictions {
+            effective.retain(|name| types.contains(name));
+        }
+        effective == BTreeSet::from([expected])
     }
 
     fn bounds(&self, minimum: &'static str, maximum: &'static str) -> (u64, Option<u64>) {

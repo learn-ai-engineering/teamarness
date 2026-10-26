@@ -105,6 +105,65 @@ async fn shutdown(host: &PackageHost) {
 // Verifies: TEAM.SYS.PKG-R13
 #[tokio::test]
 async fn reference_sibling_guide_is_discovered_without_wake_and_declared_agent_is_default_denied() {
+    assert_guide_discovery_and_access(|_| {}).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn singleton_request_guide_is_discovered_and_default_denied_until_enabled() {
+    assert_guide_discovery_and_access(|doc| {
+        doc["contracts"][0]["ports"][0]["request"]["type"] = json!(["object"]);
+    })
+    .await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn singleton_response_guide_is_discovered_and_default_denied_until_enabled() {
+    assert_guide_discovery_and_access(|doc| {
+        doc["contracts"][0]["ports"][0]["response"]["type"] = json!(["object"]);
+    })
+    .await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn singleton_markdown_guide_is_discovered_and_default_denied_until_enabled() {
+    assert_guide_discovery_and_access(|doc| {
+        doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] =
+            json!({"type":["string"],"maxLength":100});
+        doc["$defs"] = json!({});
+    })
+    .await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn all_singleton_guide_types_are_discovered_and_default_denied_until_enabled() {
+    assert_guide_discovery_and_access(|doc| {
+        doc["contracts"][0]["ports"][0]["request"]["type"] = json!(["object"]);
+        doc["contracts"][0]["ports"][0]["response"]["type"] = json!(["object"]);
+        doc["$defs"]["text"]["type"] = json!(["string"]);
+    })
+    .await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn finite_type_intersection_guide_is_discovered_and_default_denied_until_enabled() {
+    assert_guide_discovery_and_access(|doc| {
+        doc["$defs"]["text"]["type"] = json!(["null", "string", "boolean"]);
+        doc["$defs"]["nested"]["type"] = json!(["integer", "string"]);
+        doc["$defs"]["objectTypes"] = json!({"type":["null","object","array"]});
+        for direction in ["request", "response"] {
+            doc["contracts"][0]["ports"][0][direction]["$ref"] = json!("#/$defs/objectTypes");
+            doc["contracts"][0]["ports"][0][direction]["type"] = json!(["boolean", "object"]);
+        }
+    })
+    .await;
+}
+
+async fn assert_guide_discovery_and_access(update: impl FnOnce(&mut Value)) {
     let fixture = fixture().await;
     let root = fixture.config.application_root();
     let path = root.join("provider/ports.json");
@@ -112,6 +171,7 @@ async fn reference_sibling_guide_is_discovered_without_wake_and_declared_agent_i
     doc["$defs"] = json!({"text":{"type":"string"},"nested":{"$ref":"#/$defs/text","minLength":1}});
     doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] =
         json!({"$ref":"#/$defs/nested","maxLength":100});
+    update(&mut doc);
     let bytes = serde_json::to_vec(&doc).unwrap();
     fs::write(path, &bytes).unwrap();
     let path = root.join("provider/teamarness.package.json");
@@ -153,13 +213,26 @@ async fn reference_sibling_guide_is_discovered_without_wake_and_declared_agent_i
         .decode(metadata["result"]["data"].as_str().unwrap())
         .unwrap();
     let described: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(metadata["result"]["totalBytes"], bytes.len());
     assert_eq!(described["$defs"], doc["$defs"]);
+    let described_ports = described["contracts"][0]["ports"].as_array().unwrap();
+    let original_ports = doc["contracts"][0]["ports"].as_array().unwrap();
+    assert_eq!(described_ports.len(), original_ports.len());
+    for original in original_ports {
+        assert_eq!(
+            described_ports
+                .iter()
+                .find(|port| port["name"] == original["name"]),
+            Some(original)
+        );
+    }
     let guide = described["contracts"][0]["ports"]
         .as_array()
         .unwrap()
         .iter()
         .find(|p| p["name"] == "runtime.guide")
         .unwrap();
+    assert_eq!(guide["request"], doc["contracts"][0]["ports"][0]["request"]);
     assert_eq!(
         guide["response"],
         doc["contracts"][0]["ports"][0]["response"]
@@ -224,13 +297,31 @@ async fn reference_sibling_guide_is_discovered_without_wake_and_declared_agent_i
 // Verifies: TEAM.SYS.PKG-R13
 #[tokio::test]
 async fn conflicting_reference_sibling_guide_is_not_advertised_and_keeps_ordinary_composition() {
+    assert_nonconforming_guide_composition(json!({"$ref":"#/$defs/text","type":"integer"})).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn nullable_array_guide_is_not_advertised_and_keeps_ordinary_composition() {
+    assert_nonconforming_guide_composition(json!({"type":["string","null"],"maxLength":100})).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn disjoint_array_guide_is_not_advertised_and_keeps_ordinary_composition() {
+    assert_nonconforming_guide_composition(
+        json!({"$ref":"#/$defs/text","type":["integer","boolean"]}),
+    )
+    .await;
+}
+
+async fn assert_nonconforming_guide_composition(markdown: Value) {
     let fixture = fixture().await;
     let root = fixture.config.application_root();
     let path = root.join("provider/ports.json");
     let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     doc["$defs"] = json!({"text":{"type":"string","maxLength":100}});
-    doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] =
-        json!({"$ref":"#/$defs/text","type":"integer"});
+    doc["contracts"][0]["ports"][0]["response"]["properties"]["markdown"] = markdown;
     let bytes = serde_json::to_vec(&doc).unwrap();
     fs::write(path, &bytes).unwrap();
     let path = root.join("provider/teamarness.package.json");
