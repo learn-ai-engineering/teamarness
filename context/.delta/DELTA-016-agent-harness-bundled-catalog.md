@@ -1,8 +1,18 @@
 # DELTA-016 — The Agent harness uses a bundled catalog and its own enablement
 
-**Status:** open (2026-10-26). Owner: the next standalone Agent Package slice, after workstream `agent-port-discovery` lands ADR 0035. Accepted by the developer as a v1 step for the `agent-harness` workstream.
+**Status:** resolved (2026-10-30) by workstream `agent-port-discovery`, Host `6073dd0` and paired standalone Agent `7cf7358`. Don approved local Host-first integration; no push or release is authorized. The original divergence below is retained as history.
 
-## Divergence
+## Resolution
+
+The Agent uses package-ports 2.0 runtime summaries and complete metadata, with Host-owned durable selections. Its built-in Conversations participation and generic model tools use the same enforced access. Canonical SDK vendor provenance, final Agent build and all nine real Agent/Host integration cases pass independent review and audit. A source-built major-3 Provider absent from the Agent's catalog and consumed declarations supplies a guide, exact schemas and successful query/command calls without an Agent rebuild.
+
+Don confirms the rebuilt Agent, Conversations guide retrieval, enable/disable, rebinding/unbinding and retained choices after app restart. He accepts automated evidence for Provider stop/recover because the desktop UI has no such control. This is not qualification of per-Agent restart with unresolved commands.
+
+Documents still has no guide. Its future chat/revise check and Comment Ports remain under **Documents Agent tools and Comments** in the [roadmap](../roadmap.md), not an unresolved runtime-catalog divergence. Exhibits file tooling also remains separate.
+
+Evidence: workstream `agent-port-discovery`, `verify/20261027T012416Z_{review,validation}.md` and `verify/20261030T234629Z_validation.md` in the resolver-selected MyFlow store.
+
+## Original divergence
 
 [ADR 0035](../.decisions/0035-agent-controlled-port-discovery.md) puts runtime discovery and enablement in the Host:
 
@@ -19,22 +29,22 @@ The standalone Agent Package's first tools slice (workstream `agent-harness`, re
 
 Only Exhibits has a `runtime.guide` at `d25a42d`, so Exhibits is the only Package the Agent offers today.
 
-## Impact
+## Original impact
 
 - A Steward can't use a newly installed agent-capable Package without a new Agent build. This is the opposite of the developer's goal: an agent-capable Package should appear, be switched on, and work at once from the metadata the Host provides.
 - Enablement is a harness-side policy, not a Host guarantee.
 - After ADR 0035 integrates, the current Agent build no longer negotiates Ports until it is migrated.
 
-## Follow-up
+## Original follow-up
 
-The next Agent slice, after `agent-port-discovery` integrates:
+The original proposed Agent slice was:
 
 - Replace `BundledCatalog` with Host discovery behind the Agent's existing `Catalog` seam, using package-ports 2.0 summary and detail reads.
 - Move enablement to the Host-owned selections. Retire `packages.json`, the bundled `backend/catalog/`, `refresh-catalog.mjs` and the optional `consumedPorts` entries.
 - Show only the contracts that discovery returns, plus retained unavailable selections, as ADR 0035 defines.
 - Run the Documents chat check that `agent-harness` deferred, once Documents publishes a guide, and list Conversations once its guide ships.
 
-Close this delta when the Agent discovers and enables a guide-bearing Package that it was not built with, with no rebuild.
+The closure criterion was discovering and enabling a guide-bearing Package that the Agent was not built with, without a rebuild. The real unknown-Provider integration case now satisfies it.
 
 ## Tracking
 

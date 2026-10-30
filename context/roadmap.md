@@ -70,11 +70,17 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-### Agent-controlled Package Ports (in progress)
+### Agent-controlled Package Ports (complete, verified locally)
 
-Workstream `agent-port-discovery` implements ADR 0035 in five phases. Complete bounded metadata, current package-ports 2.0 requests, durable self-scoped Agent selections and lifecycle revocation are implemented. Conversations 1.3 publishes bounded runtime guidance without changing its five earlier operations. Phase 5 adds a source-built generic client with no consumed-Port declarations: its real Conversations proof covers discovery without activation, explicit enablement, schema validation, guide loading, Agent-attributed posts, subscribe-before-read, revision recovery, disable, rebind, unbind and restart retention. Shared broker safety examples exercise both access views. Final automated checks and desktop bundle evidence are recorded in the workstream's `implement/phase-5-completion.md`; independent Verify is still required.
+Completed on 2026-10-30 in workstream `agent-port-discovery`, with the paired standalone Agent migration. ADR 0035 supplies complete bounded metadata, package-ports 2.0, durable Host-owned per-harness selections and lifecycle revocation. Conversations 1.3 adds bounded runtime guidance without changing its five earlier operations. Declared composition and dynamic Agent access share broker validation, authorization-time actors, generation safety and uncertainty handling. Old 1.x consumers must be rebuilt; there is no compatibility dispatcher.
 
-Registration replacement remains next-Host-open behavior; packagement is not a prerequisite or integration task. The current standalone harness revision, rebuilt 2.0 declaration and SDK vendor provenance have not been supplied. Optional external Agent tests and Don's Steward UI/model observations are not qualified by default workspace tests or the scripted proof. The complete user journey and a completed release are not claimed. Documents guidance/tools and Comments remain follow-ups.
+The qualified Host implementation is `6073dd0`, paired with standalone Agent `7cf7358` on `agent-package-ports-2`. The Agent discovers unknown guide-bearing contracts, uses their complete schemas and configures Host-owned selections without a Provider-specific adapter. Its bounded schema preparation refuses excessive work before model or Port effects. Agent-owned unresolved commands prevent unsafe identity changes, survive cancelled waiters and are never replayed. Ordinary Provider refusals release ownership; uncertain outcomes do not silently clear it.
+
+All required implementation checks, the nine-case real Agent/Host integration target, cumulative independent source reviews and provenance audits pass. Final source evidence is in `verify/20261027T012416Z_{review,validation}.md`; manual acceptance is in `verify/20261030T234629Z_validation.md`. Don confirms the rebuilt Agent, real-model Conversations guidance, enable/disable, A/B binding and unbind, and retained binding/selections after an app restart. Provider stop/recover has no current desktop control; Don accepts the existing automated evidence instead of a manual observation. Catch-up variation is accepted, not a requested behavior change.
+
+Don approved local integration: reconcile main's documentation into alignment, land the Host first, then fast-forward standalone Agent main. No push or release is authorized. Registration replacement still takes effect on the next Host open. Packagement remains separate and must preserve ports 2.0 when integrating; its per-Package controls must qualify restarting/reloading the Agent while commands remain unresolved. Existing full-Host retirement tests do not prove that case or that detached Provider work is quiescent.
+
+Follow-ups remain separate: Documents guidance/tools and Comments; Agent Chat versus the Host-owned Configuration view in Packagement; Exhibits file tooling; and the nonblocking published contract-identity grammar mismatch (`SM-003`, `contracts/package-capabilities/v1/package-ports-2.0.schema.json`). Historical Documents `StaleMount`, Core async-boundary stall and name-convergence timeout remain unexplained; passing checks do not establish their cause or repair.
 
 ### Exhibits Package (slice 1 delivered; slice 2 planned)
 
@@ -120,7 +126,7 @@ This slice was implemented on 2026-10-25 in the standalone Agent Package reposit
 
 **Change to the earlier Agent Package**
 
-The slice removes the Agent's dispatch fence. This supersedes the fail-closed note under **Agent Package** above: a failed or uncertain post no longer stops replies until restart. An in-flight post is now not fenced against a concurrent rebind. The developer judged that race not credible and accepted it.
+At `b5202d0`, this slice removed the earlier dispatch fence. The later **Agent-controlled Package Ports** workstream reproduced a real preauthorization attribution race and superseded that decision with Agent-owned command tracking. Binding changes now refuse while commands remain unresolved; ordinary certain refusals release ownership, while uncertainty retains the identity-change guard. Already-authorized commands keep their original Host-derived actor. The original Agent Package's broad fail-closed dispatch rule is not the current policy.
 
 **Status**
 
@@ -145,7 +151,7 @@ The developer didn't report checking restart persistence of the switch, an exact
 
 **Teamarness follow-up**
 
-The system test `agent_reply_flow.rs::enqueued_reply_keeps_old_actor_during_rebind` asserts the removed fence. It fails by design against this Agent, so update or drop it.
+The later **Agent-controlled Package Ports** workstream replaced the obsolete full-dispatch-fence expectation with precise preauthorization and already-authorized actor checks. All nine external `agent_reply_flow` cases pass against Agent `7cf7358` and Host `6073dd0`; no attribution or no-replay assertion was waived.
 
 **Retained P2 follow-ups**
 
@@ -162,9 +168,7 @@ These are recorded in the `agent-harness` Verify reports:
 
 **Not how it should stay**
 
-The slice uses a bundled catalog, manifest-declared optional contracts, Agent-local enablement and package-ports 1.x. See [DELTA-016](.delta/DELTA-016-agent-harness-bundled-catalog.md).
-
-The developer's goal is that a newly installed agent-capable Package appears, can be switched on, and works with no Agent rebuild. The next Agent slice moves to ADR 0035 Host discovery and Host-owned enablement once **Agent-controlled Package Ports** integrates. That slice also runs the deferred Documents chat check and lists Conversations once their guides ship.
+The original slice used a bundled catalog, manifest-declared optional contracts, Agent-local enablement and package-ports 1.x. The paired **Agent-controlled Package Ports** migration replaces these with runtime metadata and Host-owned selections, resolving [DELTA-016](.delta/DELTA-016-agent-harness-bundled-catalog.md). A real unknown major-3 Provider works without an Agent rebuild, and Conversations guidance is qualified. Documents still needs a guide before its deferred Agent chat/revise check can run.
 
 ### Workspace Principals (complete)
 
@@ -228,8 +232,7 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
 - A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
 - Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
-- Agent Package: streaming replies, tool use beyond declared Ports, and unprompted or scheduled posts (non-goals of the `agent-package` workstream). Documents participation is tracked under **Agent participation in Package Ports**.
-- Agent Package runtime discovery: replace the Agent's bundled catalog and local enablement with ADR 0035 Host discovery and Host-owned enablement, so new agent-capable Packages work without an Agent rebuild ([DELTA-016](.delta/DELTA-016-agent-harness-bundled-catalog.md)).
+- Agent Package: streaming replies and unprompted or scheduled posts. Generic tool use beyond declared Ports and runtime discovery are delivered by **Agent-controlled Package Ports**. Documents participation remains under **Documents Agent tools and Comments**.
 - Network denial for Exhibit content frames: a navigation handler and WebRTC denial beside the content policy's `connect-src` ([DELTA-015](.delta/DELTA-015-exhibit-content-network-access.md), ADR 0034).
 - Package platform authoring contracts: align the immutable-record-log 1.1 JSON request schema with the optional `principal` selector already supported by Host and SDK. See [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). This inherited mismatch is not resolved by the Agent integration.
 
@@ -294,7 +297,7 @@ Start a separate Scope if sustained name-delivery or membership churn becomes an
 
 ### Documents Agent tools and Comments (follow-up)
 
-Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package does not yet have tools that call those Ports. The generic guidance direction is resolved by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and is in progress above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
+Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package now supports generic tools, but Documents has no `runtime.guide` and is not yet eligible for Agent discovery. The generic guidance direction is delivered by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and the completed alignment workstream above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
 
 - Documents guidance and generic Agent tools can follow the ordinary `runtime.guide` convention; no Documents-specific Host adapter is planned.
 - Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
