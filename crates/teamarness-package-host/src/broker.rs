@@ -8,6 +8,8 @@ use teamarness_package_contract::port_contract::{CompiledPortContracts, PortKind
 use teamarness_package_protocol::{MAX_FRAME_BYTES, MAX_IN_FLIGHT_EACH_DIRECTION};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 
+#[path = "port_metadata.rs"]
+mod metadata;
 #[path = "event_subscriptions.rs"]
 mod subscriptions;
 
@@ -28,6 +30,18 @@ const _: () = {
 };
 
 pub(crate) struct PortBroker {
+    #[cfg(feature = "test-hooks")]
+    pub(crate) authorized_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) command_authorized_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) delivery_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) selection_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::PortSelectionPause>)>>,
     authority_generations:
         std::sync::Mutex<BTreeMap<PackageInstanceKey, crate::authority::AuthorityGeneration>>,
     #[cfg(feature = "test-hooks")]
@@ -35,14 +49,21 @@ pub(crate) struct PortBroker {
         std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) actor_pause: std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) record_availability_pause:
+        std::sync::Mutex<Option<(PackageIdentity, Arc<crate::AuthorityPause>)>>,
+    pub(crate) subscription_leases:
+        std::sync::Mutex<Vec<Weak<crate::port_access::SubscriptionLease>>>,
+    pub(crate) access: crate::port_access::PortAccess,
+    metadata_revision: [u8; 32],
     /// Callers whose entries were inserted at construction and are never changed:
-    /// the Team tier (ADR 0031).
+    /// the Team tier (ADR 0036).
     fixed: BTreeSet<PackageIdentity>,
     graph: RwLock<BTreeMap<PackageIdentity, Vec<PortAvailability>>>,
     observations: broadcast::Sender<PortObservation>,
     consumed: RwLock<BTreeMap<PackageIdentity, Vec<ConsumedContract>>>,
     contracts: RwLock<BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>>,
-    instances: RwLock<BTreeMap<PackageInstanceKey, Weak<InstanceActor>>>,
+    pub(crate) instances: RwLock<BTreeMap<PackageInstanceKey, Weak<InstanceActor>>>,
     routes: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     events: Arc<tokio::sync::Mutex<subscriptions::EventRegistry>>,
@@ -66,8 +87,24 @@ impl PortBroker {
         consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
         contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
         fixed: BTreeSet<PackageIdentity>,
+        access: crate::port_access::PortAccess,
     ) -> Arc<Self> {
+        let mut metadata_revision = [0; 32];
+        getrandom::fill(&mut metadata_revision).expect("Host metadata revision entropy");
         Arc::new(Self {
+            #[cfg(feature = "test-hooks")]
+            authorized_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            command_authorized_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            delivery_pause: std::sync::Mutex::new(None),
+            access,
+            subscription_leases: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            selection_pause: std::sync::Mutex::new(None),
+            metadata_revision,
+            #[cfg(feature = "test-hooks")]
+            record_availability_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             actor_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -92,6 +129,48 @@ impl PortBroker {
     }
 
     #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_port_work(&self, package: &PackageIdentity, delivery: bool) {
+        let pending = if delivery {
+            &self.delivery_pause
+        } else {
+            &self.authorized_pause
+        };
+        let pause = {
+            let mut pending = pending.lock().expect("test pause poisoned");
+            if pending
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_record_availability_pause(
+        &self,
+        package: &PackageIdentity,
+    ) -> Option<Arc<crate::AuthorityPause>> {
+        let mut pending = self
+            .record_availability_pause
+            .lock()
+            .expect("test pause poisoned");
+        if pending
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == package)
+        {
+            pending.take().map(|(_, pause)| pause)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
     pub(crate) async fn pause_command_actor(
         &self,
         package: &PackageIdentity,
@@ -99,6 +178,32 @@ impl PortBroker {
     ) {
         let pause = {
             let mut pending = self.actor_pause.lock().expect("test pause poisoned");
+            if object.get("kind").and_then(Value::as_str) == Some("command")
+                && pending
+                    .as_ref()
+                    .is_some_and(|(expected, _)| expected == package)
+            {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_command_authorized(
+        &self,
+        package: &PackageIdentity,
+        object: &Map<String, Value>,
+    ) {
+        let pause = {
+            let mut pending = self
+                .command_authorized_pause
+                .lock()
+                .expect("test pause poisoned");
             if object.get("kind").and_then(Value::as_str) == Some("command")
                 && pending
                     .as_ref()
@@ -130,6 +235,33 @@ impl PortBroker {
         if let Some(pause) = pause {
             pause.wait().await;
         }
+    }
+
+    pub(crate) fn record_call_refusal(
+        &self,
+        caller: &PackageIdentity,
+        consumer_id: &str,
+        generation: u64,
+        input: &Map<String, Value>,
+        code: PackageErrorCode,
+    ) {
+        self.record(PortObservation {
+            kind: if input.get("kind").and_then(Value::as_str) == Some("command") {
+                "command"
+            } else {
+                "query"
+            },
+            contract: None,
+            port: None,
+            consumer_id: consumer_id.to_owned(),
+            consumer_package: caller.as_str().to_owned(),
+            consumer_generation: generation,
+            provider_id: None,
+            provider_generation: None,
+            stage: PortStage::Rejected,
+            code: Some(capability_code(code)),
+            outcome_uncertain: false,
+        });
     }
 
     pub(crate) fn observe(&self) -> PortObservations {
@@ -234,6 +366,43 @@ impl PortBroker {
             .remove(caller);
     }
 
+    /// Whether `caller` is in the Team tier, whose entries never change.
+    pub(crate) fn is_team(&self, caller: &PackageIdentity) -> bool {
+        self.fixed.contains(caller)
+    }
+
+    /// One caller's consumed Port declarations, read under the lock.
+    fn consumed_of(&self, caller: &PackageIdentity) -> Vec<ConsumedContract> {
+        self.consumed
+            .read()
+            .expect("port graph poisoned")
+            .get(caller)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// One caller's selected route for `contract`, read under the lock.
+    fn route_of(&self, caller: &PackageIdentity, contract: &str) -> Option<PortAvailability> {
+        self.graph
+            .read()
+            .expect("port graph poisoned")
+            .get(caller)
+            .and_then(|routes| routes.iter().find(|route| route.contract == contract))
+            .cloned()
+    }
+
+    /// The contracts one Provider declares, read under the lock.
+    pub(crate) fn provided_contracts(
+        &self,
+        provider: &PackageIdentity,
+    ) -> Option<Arc<CompiledPortContracts>> {
+        self.contracts
+            .read()
+            .expect("port graph poisoned")
+            .get(provider)
+            .cloned()
+    }
+
     /// One caller's consumed Ports with each selected route, read under the lock.
     fn declared_routes(
         &self,
@@ -258,44 +427,7 @@ impl PortBroker {
             .collect()
     }
 
-    /// Only declared ports occur in this view; an optional absence has no callable route.
-    pub(crate) async fn availability(
-        &self,
-        caller: &PackageIdentity,
-        workspace: &WorkspaceId,
-    ) -> Value {
-        let mut entries = Vec::new();
-        for (consumed, route) in self.declared_routes(caller) {
-            let available = if route.unavailable.is_none() {
-                let actor = route.provider.as_ref().and_then(|provider| {
-                    self.instances
-                        .read()
-                        .expect("port registry poisoned")
-                        .get(&PackageInstanceKey::new(
-                            provider.clone(),
-                            workspace.clone(),
-                        ))
-                        .and_then(Weak::upgrade)
-                });
-                match actor {
-                    Some(actor) => matches!(
-                        actor.snapshot().await.lifecycle,
-                        crate::LifecycleState::Admitted | crate::LifecycleState::Active
-                    ),
-                    None => false,
-                }
-            } else {
-                false
-            };
-            entries.push(
-                json!({"contract":consumed.identity,"major":consumed.major,"minor":route.minor,
-                "available":available,"ports":consumed.ports}),
-            );
-        }
-        json!({"contracts":entries})
-    }
-
-    fn resolve(
+    pub(crate) fn resolve(
         &self,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
@@ -377,8 +509,7 @@ impl PortBroker {
     pub(crate) async fn call(
         &self,
         caller: &PackageIdentity,
-        workspace: &WorkspaceId,
-        actor: &Value,
+        route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         consumer_id: &str,
@@ -388,8 +519,7 @@ impl PortBroker {
         let result = self
             .call_inner(
                 caller,
-                workspace,
-                actor,
+                route,
                 input,
                 dispatched,
                 consumer_id,
@@ -448,18 +578,19 @@ impl PortBroker {
     async fn call_inner(
         &self,
         caller: &PackageIdentity,
-        workspace: &WorkspaceId,
-        actor: &Value,
+        route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
         dispatched: Arc<std::sync::atomic::AtomicBool>,
         consumer_id: &str,
         consumer_generation: u64,
         provider_id: Arc<std::sync::Mutex<Option<(String, u64)>>>,
     ) -> Result<Value, WireFailure> {
-        if input.len() != 5
-            || !["method", "contract", "port", "kind", "request"]
-                .iter()
-                .all(|key| input.contains_key(*key))
+        if input.len() != 7
+            || ![
+                "method", "access", "major", "contract", "port", "kind", "request",
+            ]
+            .iter()
+            .all(|key| input.contains_key(*key))
         {
             return Err(WireFailure::new(PackageErrorCode::CapabilityRequestInvalid));
         }
@@ -473,9 +604,14 @@ impl PortBroker {
         let request = input
             .get("request")
             .ok_or_else(|| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
-        let (provider, schemas, major, minor) = self
-            .resolve(caller, workspace, contract, port, kind)
-            .map_err(WireFailure::new)?;
+        let crate::port_access::ResolvedPort {
+            provider,
+            schemas,
+            major,
+            minor,
+            actor,
+            lease: _,
+        } = route;
         schemas
             .validate(contract, port, "request", request)
             .map_err(|_| WireFailure::new(PackageErrorCode::PortRequestInvalid))?;
@@ -526,15 +662,15 @@ impl PortBroker {
 
     pub(crate) async fn query_stream(
         &self,
-        caller: &PackageIdentity,
-        workspace: &WorkspaceId,
-        actor: &Value,
+        route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
     ) -> Result<PortQueryStream, PackageErrorCode> {
-        if input.len() != 5
-            || !["grant", "contract", "port", "kind", "request"]
-                .iter()
-                .all(|key| input.contains_key(*key))
+        if input.len() != 7
+            || ![
+                "grant", "access", "major", "contract", "port", "kind", "request",
+            ]
+            .iter()
+            .all(|key| input.contains_key(*key))
         {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
@@ -552,8 +688,17 @@ impl PortBroker {
         let request = input
             .get("request")
             .ok_or(PackageErrorCode::PortRequestInvalid)?;
-        let (provider, schemas, major, minor) =
-            self.resolve(caller, workspace, contract, port, PortKind::Query)?;
+        let crate::port_access::ResolvedPort {
+            provider,
+            schemas,
+            major,
+            minor,
+            actor,
+            lease,
+        } = route;
+        if let Some(lease) = &lease {
+            lease.enqueue(|| ())?;
+        }
         let descriptor = schemas
             .contracts
             .iter()
@@ -579,6 +724,7 @@ impl PortBroker {
                 contract.to_owned(),
                 port.to_owned(),
                 permits,
+                lease,
             )
             .await
             .map_err(|error| error.code)
@@ -595,17 +741,27 @@ fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, WireFa
 }
 
 #[cfg(test)]
+pub(crate) async fn empty_broker() -> Arc<PortBroker> {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::host_store::HostStoreHandle::open(directory.path().to_owned())
+        .await
+        .unwrap();
+    PortBroker::new(
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeSet::new(),
+        crate::port_access::PortAccess::new(store, BTreeMap::new(), BTreeMap::new()),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn optional_observer_lag_does_not_consume_route_capacity_or_copy_payload() {
-        let broker = PortBroker::new(
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
+    #[tokio::test]
+    async fn optional_observer_lag_does_not_consume_route_capacity_or_copy_payload() {
+        let broker = empty_broker().await;
         let mut slow = broker.observe();
         let observation = PortObservation {
             kind: "command",
@@ -632,14 +788,9 @@ mod tests {
     }
 
     // Verifies: TEAM.SYS.PKG-R14
-    #[test]
-    fn maximum_frame_and_aggregate_bytes_bound_routes_before_dispatch() {
-        let broker = PortBroker::new(
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
+    #[tokio::test]
+    async fn maximum_frame_and_aggregate_bytes_bound_routes_before_dispatch() {
+        let broker = empty_broker().await;
         assert!(matches!(
             broker.permit(&json!({"value":"x".repeat(MAX_FRAME_BYTES)})),
             Err(PackageErrorCode::PortRequestInvalid)

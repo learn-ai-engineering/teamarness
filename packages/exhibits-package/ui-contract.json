@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "exhibitId": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "updatedAt", "kind", "revision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/exhibitId" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "updatedAt": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "kind": { "type": "string", "enum": ["draft"] },
+        "revision": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exhibits"],
+      "properties": {
+        "exhibits": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/summary" } },
+        "nextBefore": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "opened": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "revision"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "revision": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exhibitId", "revision", "deleted"],
+      "properties": {
+        "exhibitId": { "$ref": "#/$defs/exhibitId" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "deleted": { "type": "boolean" }
+      }
+    }
+  },
+  "requests": {
+    "exhibit.list": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "before": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+        }
+      },
+      "response": { "$ref": "#/$defs/page" }
+    },
+    "exhibit.open": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["exhibitId"],
+        "properties": { "exhibitId": { "$ref": "#/$defs/exhibitId" } }
+      },
+      "response": { "$ref": "#/$defs/opened" }
+    }
+  },
+  "subscriptions": {
+    "exhibits.changed": {
+      "request": { "type": "object", "additionalProperties": false },
+      "event": { "$ref": "#/$defs/change" }
+    }
+  }
+}

@@ -157,7 +157,7 @@ fn declare_views(fixture: &common::Fixture, directory: &str, views: serde_json::
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
 
-// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R19
 #[tokio::test]
 async fn a_mount_shows_only_a_declared_view() {
     use teamarness_package_host::{PackageErrorStage, PackageUiView};

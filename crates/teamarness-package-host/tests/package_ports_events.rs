@@ -115,13 +115,19 @@ async fn wait_subscribed(
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
+    for access in ["declared", "agent"] {
+        two_consumers_share_one_upstream_and_keep_order_without_replay_for_access(access).await;
+    }
+}
+
+async fn two_consumers_share_one_upstream_and_keep_order_without_replay_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[
             ("provider", "com.example.provider"),
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -138,6 +144,10 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
     let mut dormant: Value = serde_json::from_slice(&fs::read(&dormant_manifest).unwrap()).unwrap();
     dormant["activation"] = "on_demand".into();
     fs::write(dormant_manifest, serde_json::to_vec(&dormant).unwrap()).unwrap();
+    common::prepare_agent_ports(
+        &fixture,
+        &["com.example.consumer-a", "com.example.consumer-b"],
+    );
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -161,9 +171,17 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
             .clone()
     };
     let a = mount(&host, key("com.example.consumer-a")).await;
+    common::enable_agent_ports(&host, &a, 1).await;
     let mut observations = host.observe_ports();
     assert_eq!(
-        request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await["opened"],
+        request(
+            &host,
+            &a,
+            "open-a",
+            "fixture.port_event_open",
+            json!({"access":access})
+        )
+        .await["opened"],
         true
     );
     common::eventually(
@@ -223,9 +241,17 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
         "an event never wakes a dormant Consumer"
     );
     let b = mount(&host, key("com.example.consumer-b")).await;
+    common::enable_agent_ports(&host, &b, 1).await;
     let mut readiness = host.observe_ports();
     assert_eq!(
-        request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await["opened"],
+        request(
+            &host,
+            &b,
+            "open-b",
+            "fixture.port_event_open",
+            json!({"access":access})
+        )
+        .await["opened"],
         true
     );
     wait_subscribed(&mut readiness, "com.example.consumer-b").await;
@@ -318,7 +344,14 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
         |event| event.stage == teamarness_package_host::PortStage::Closed
             && event.provider_id == subscribers[0].provider_id
     ));
-    request(&host, &a, "open-late", "fixture.port_event_open", json!({})).await;
+    request(
+        &host,
+        &a,
+        "open-late",
+        "fixture.port_event_open",
+        json!({"access":access}),
+    )
+    .await;
     common::eventually(
         Duration::from_secs(4),
         "new upstream after reconnect",
@@ -337,7 +370,7 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
             "health",
             "fixture.capability",
             json!({
-                "capability":"teamarness.package-ports","method":"available","arguments":{}
+                "capability":"teamarness.package-ports","method":"available","arguments":{"access":access}
             })
         )
         .await["result"]["contracts"][0]["available"],
@@ -348,13 +381,19 @@ async fn two_consumers_share_one_upstream_and_keep_order_without_replay() {
 // Verifies: TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
+    for access in ["declared", "agent"] {
+        invalid_event_ends_only_subscriptions_and_sessions_stay_usable_for_access(access).await;
+    }
+}
+
+async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[
             ("provider", "com.example.provider"),
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -364,6 +403,10 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
     ] {
         declare(&fixture, directory, provider);
     }
+    common::prepare_agent_ports(
+        &fixture,
+        &["com.example.consumer-a", "com.example.consumer-b"],
+    );
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -378,10 +421,26 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
             .clone()
     };
     let a = mount(&host, key("com.example.consumer-a")).await;
+    common::enable_agent_ports(&host, &a, 1).await;
     let b = mount(&host, key("com.example.consumer-b")).await;
-    request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await;
+    common::enable_agent_ports(&host, &b, 1).await;
+    request(
+        &host,
+        &a,
+        "open-a",
+        "fixture.port_event_open",
+        json!({"access":access}),
+    )
+    .await;
     let mut readiness = host.observe_ports();
-    request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await;
+    request(
+        &host,
+        &b,
+        "open-b",
+        "fixture.port_event_open",
+        json!({"access":access}),
+    )
+    .await;
     wait_subscribed(&mut readiness, "com.example.consumer-b").await;
     common::eventually(Duration::from_secs(4), "Provider active", || {
         let host = &host;
@@ -455,7 +514,7 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
             &b,
             "health",
             "fixture.capability",
-            json!({"capability":"teamarness.package-ports","method":"available","arguments":{}})
+            json!({"capability":"teamarness.package-ports","method":"available","arguments":{"access":access}})
         )
         .await["result"]["contracts"][0]["available"],
         true
@@ -465,13 +524,24 @@ async fn invalid_event_ends_only_subscriptions_and_sessions_stay_usable() {
 // Verifies: TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progressing() {
+    for access in ["declared", "agent"] {
+        slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progressing_for_access(
+            access,
+        )
+        .await;
+    }
+}
+
+async fn slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progressing_for_access(
+    access: &str,
+) {
     let fixture = common::Fixture::node_with_capabilities(
         &[
             ("provider", "com.example.provider"),
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -481,6 +551,10 @@ async fn slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progre
     ] {
         declare(&fixture, directory, provider);
     }
+    common::prepare_agent_ports(
+        &fixture,
+        &["com.example.consumer-a", "com.example.consumer-b"],
+    );
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -495,10 +569,26 @@ async fn slow_subscriber_overflows_after_accepted_events_while_peer_keeps_progre
             .clone()
     };
     let a = mount(&host, key("com.example.consumer-a")).await;
+    common::enable_agent_ports(&host, &a, 1).await;
     let b = mount(&host, key("com.example.consumer-b")).await;
-    request(&host, &a, "open-a", "fixture.port_event_open", json!({})).await;
+    common::enable_agent_ports(&host, &b, 1).await;
+    request(
+        &host,
+        &a,
+        "open-a",
+        "fixture.port_event_open",
+        json!({"access":access}),
+    )
+    .await;
     let mut readiness = host.observe_ports();
-    request(&host, &b, "open-b", "fixture.port_event_open", json!({})).await;
+    request(
+        &host,
+        &b,
+        "open-b",
+        "fixture.port_event_open",
+        json!({"access":access}),
+    )
+    .await;
     wait_subscribed(&mut readiness, "com.example.consumer-b").await;
     common::eventually(Duration::from_secs(4), "Provider active", || {
         let host = &host;
@@ -595,7 +685,7 @@ async fn invalid_event_grant_and_churn_do_not_start_or_strand_upstreams() {
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -724,7 +814,7 @@ async fn replacing_provider_generation_revokes_streams_without_replay() {
             ("consumer-a", "com.example.consumer-a"),
             ("consumer-b", "com.example.consumer-b"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     for (directory, provider) in [
@@ -862,16 +952,26 @@ async fn replacing_provider_generation_revokes_streams_without_replay() {
 // Verifies: TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn largest_schema_accepted_event_fits_bounded_process_and_fanout_queues() {
+    for access in ["declared", "agent"] {
+        largest_schema_accepted_event_fits_bounded_process_and_fanout_queues_for_access(access)
+            .await;
+    }
+}
+
+async fn largest_schema_accepted_event_fits_bounded_process_and_fanout_queues_for_access(
+    access: &str,
+) {
     let fixture = common::Fixture::node_with_capabilities(
         &[
             ("provider", "com.example.provider"),
             ("consumer", "com.example.consumer"),
         ],
-        &[json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0})],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
     )
     .await;
     declare(&fixture, "provider", true);
     declare(&fixture, "consumer", false);
+    common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -886,12 +986,13 @@ async fn largest_schema_accepted_event_fits_bounded_process_and_fanout_queues() 
             .clone()
     };
     let consumer = mount(&host, key("com.example.consumer")).await;
+    common::enable_agent_ports(&host, &consumer, 1).await;
     request(
         &host,
         &consumer,
         "open",
         "fixture.port_event_open",
-        json!({}),
+        json!({"access":access}),
     )
     .await;
     common::eventually(Duration::from_secs(4), "Provider active", || {

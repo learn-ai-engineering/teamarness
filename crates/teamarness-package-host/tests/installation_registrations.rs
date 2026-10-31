@@ -1,5 +1,5 @@
 //! The installation registration store: inspect, write, and remove entries of
-//! `registrations.v1.json` without hand-editing the file (ADR 0031).
+//! `registrations.v1.json` without hand-editing the file (ADR 0036).
 
 #![cfg(unix)]
 #![allow(dead_code)]

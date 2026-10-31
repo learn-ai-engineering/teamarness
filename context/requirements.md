@@ -26,19 +26,19 @@ Revoking a member SHALL end their current membership interval. Every committed m
 
 All product-domain capability SHALL live in Packages. Host-level Workspace controls SHALL remain in the Shell. A Package SHALL own its domain model, records, schemas, projections, policy, UI, and Package-specific membership.
 
-Detailed by: `TEAM.SYS-R01`, `TEAM.SYS.PKG-R01`–`R11`.
+Detailed by: `TEAM.SYS-R01`, `TEAM.SYS.PKG-R01`–`R11`, `TEAM.SYS.PKG-R18`.
 
 ## TEAM-R07 — Semantic Capabilities
 
 Teamarness SHALL fulfill capabilities for Teamarness-owned authority and generic behavior through typed, secret-free, versioned Semantic Capabilities. The Shell SHALL NOT hard-code product-specific capability branches.
 
-Detailed by: `TEAM.SYS.PKG-R03`, `TEAM.SYS.PKG-R10`, `TEAM.SYS.TRANS-R03`, `TEAM.SYS.SHELL-R05`.
+Detailed by: `TEAM.SYS.PKG-R03`, `TEAM.SYS.PKG-R10`, `TEAM.SYS.PKG-R16`, `TEAM.SYS.PKG-R17`, `TEAM.SYS.TRANS-R03`, `TEAM.SYS.SHELL-R05`.
 
 ## TEAM-R08 — Shell
 
 The Tauri Shell SHALL own Package UI Mounts, Package navigation, Workspace controls, Workspace-level theming, and the desktop window lifecycle. It SHALL NOT own product-domain behavior.
 
-Detailed by: `TEAM.SYS.SHELL-R01`–`R06`.
+Detailed by: `TEAM.SYS.SHELL-R01`–`R06`, `TEAM.SYS.PKG-R17`.
 
 ## TEAM-R09 — Conversations Package
 

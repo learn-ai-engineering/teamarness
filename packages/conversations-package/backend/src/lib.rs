@@ -5,6 +5,7 @@
 
 mod backend;
 pub(crate) mod domain;
+mod guide;
 pub(crate) mod store;
 
 pub use backend::{ConversationsActive, router};

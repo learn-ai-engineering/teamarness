@@ -663,7 +663,7 @@ async fn open_catalog(
     packages
 }
 
-// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
+// Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R19
 #[tokio::test]
 async fn catalog_entry_carries_optional_presentation_metadata() {
     let packages = open_catalog(serde_json::json!({
@@ -701,4 +701,21 @@ async fn catalog_entry_carries_optional_presentation_metadata() {
     for key in ["description", "author", "homepage"] {
         assert!(json.get(key).is_none(), "{key} is omitted when absent");
     }
+}
+
+#[test]
+fn a_manifest_may_declare_the_content_views_family() {
+    let temp = valid_package();
+    write_manifest(
+        &temp,
+        serde_json::json!({"capabilities": [{
+            "identity": "teamarness.content-views",
+            "major": 1,
+            "minMinor": 0,
+            "maxMinor": 0
+        }]}),
+    );
+    let loaded = manifest::load(temp.path(), "aarch64-apple-darwin").unwrap();
+    assert_eq!(loaded.capabilities.len(), 1);
+    assert_eq!(loaded.capabilities[0].family, "teamarness.content-views");
 }

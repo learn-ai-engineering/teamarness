@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use tauri::http::{
     Method, Request, Response, StatusCode, Uri,
     header::{
@@ -44,27 +46,58 @@ const FRAME_RUNTIME: &[u8] = include_bytes!(concat!(
 
 /// Carried on every Package resource response, so a Package UI Frame can load
 /// only Shell-owned and Package-declared resources and can reach no network.
-const FRAME_DOCUMENT_CSP: &str = "default-src 'none'; script-src teamarness-package:; style-src teamarness-package:; img-src teamarness-package: data:; font-src teamarness-package:; media-src teamarness-package:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+/// `'wasm-unsafe-eval'` lets it compile WebAssembly from bytes it already holds
+/// (ADR 0031); `eval` and `new Function` stay refused.
+const FRAME_DOCUMENT_CSP: &str = "default-src 'none'; script-src teamarness-package: 'wasm-unsafe-eval'; style-src teamarness-package:; img-src teamarness-package: data:; font-src teamarness-package:; media-src teamarness-package:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+
+/// The one directive a mount's frame policy varies on.
+const DENIED_FRAME_SRC: &str = "frame-src 'none'";
+
+/// A mount whose Package declares `teamarness.content-views` may nest
+/// Shell-served content frames, and nothing else (ADR 0034).
+const NESTED_CONTENT_FRAME_SRC: &str = "frame-src teamarness-content:";
+
+static NESTED_CONTENT_FRAME_DOCUMENT_CSP: LazyLock<String> =
+    LazyLock::new(|| FRAME_DOCUMENT_CSP.replacen(DENIED_FRAME_SRC, NESTED_CONTENT_FRAME_SRC, 1));
+
+/// The frame document policy for one mount: the base policy, with
+/// `frame-src teamarness-content:` only when the mount reports nested content.
+pub(crate) fn frame_document_policy(nested_content: bool) -> &'static str {
+    if nested_content {
+        NESTED_CONTENT_FRAME_DOCUMENT_CSP.as_str()
+    } else {
+        FRAME_DOCUMENT_CSP
+    }
+}
 
 #[derive(Debug)]
-struct ResourceRequest {
-    token: String,
-    relative_path: String,
-    head: bool,
+pub(crate) struct ResourceRequest {
+    pub(crate) token: String,
+    pub(crate) relative_path: String,
+    pub(crate) head: bool,
 }
 
 pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let parsed = match parse_request(request.method(), request.uri()) {
         Ok(value) => value,
-        Err(status) => return response(status, "text/plain; charset=utf-8", Vec::new()),
+        Err(status) => {
+            return response(
+                status,
+                "text/plain; charset=utf-8",
+                Vec::new(),
+                frame_document_policy(false),
+            );
+        }
     };
-    let Some(mount) = state.mount_for_token(&parsed.token).await else {
+    let Some((mount, nested_content)) = state.mount_for_token(&parsed.token).await else {
         return response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
             Vec::new(),
+            frame_document_policy(false),
         );
     };
+    let policy = frame_document_policy(nested_content);
     if parsed.relative_path.starts_with(FRAME_PREFIX) {
         return match reserved_frame_resource(&parsed.relative_path) {
             Some((bytes, media_type)) => response(
@@ -75,11 +108,13 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
                 } else {
                     bytes.to_vec()
                 },
+                policy,
             ),
             None => response(
                 StatusCode::NOT_FOUND,
                 "text/plain; charset=utf-8",
                 Vec::new(),
+                policy,
             ),
         };
     }
@@ -90,6 +125,7 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
                 StatusCode::NOT_FOUND,
                 "text/plain; charset=utf-8",
                 Vec::new(),
+                policy,
             );
         }
     };
@@ -100,6 +136,7 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
                 StatusCode::NOT_FOUND,
                 "text/plain; charset=utf-8",
                 Vec::new(),
+                policy,
             );
         }
     };
@@ -115,11 +152,13 @@ pub async fn serve(state: DesktopState, request: Request<Vec<u8>>) -> Response<V
             StatusCode::OK,
             &media_type,
             if parsed.head { Vec::new() } else { bytes },
+            policy,
         ),
         _ => response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
             Vec::new(),
+            policy,
         ),
     }
 }
@@ -134,6 +173,21 @@ fn reserved_frame_resource(relative_path: &str) -> Option<(&'static [u8], &'stat
 }
 
 fn parse_request(method: &Method, uri: &Uri) -> Result<ResourceRequest, StatusCode> {
+    let parsed = parse_resource_request(method, uri)?;
+    if !parsed.token.is_ascii() || !parsed.relative_path.is_ascii() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(parsed)
+}
+
+/// The rules every Shell-owned scheme shares: GET or HEAD only, host
+/// `localhost`, no query, a token segment and a normalized relative path.
+/// Percent-encoded UTF-8 is decoded; an encoded separator, backslash, NUL or
+/// percent sign is refused.
+pub(crate) fn parse_resource_request(
+    method: &Method,
+    uri: &Uri,
+) -> Result<ResourceRequest, StatusCode> {
     let head = match *method {
         Method::GET => false,
         Method::HEAD => true,
@@ -187,18 +241,22 @@ fn decode_path(value: &str) -> Option<String> {
             index += 1;
         }
     }
-    let decoded = String::from_utf8(output).ok()?;
-    decoded.is_ascii().then_some(decoded)
+    String::from_utf8(output).ok()
 }
 
-fn response(status: StatusCode, media_type: &str, body: Vec<u8>) -> Response<Vec<u8>> {
+fn response(
+    status: StatusCode,
+    media_type: &str,
+    body: Vec<u8>,
+    policy: &'static str,
+) -> Response<Vec<u8>> {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, media_type)
         .header(NOSNIFF, "nosniff")
         .header(CACHE_CONTROL, "no-store")
         .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(CONTENT_SECURITY_POLICY, FRAME_DOCUMENT_CSP)
+        .header(CONTENT_SECURITY_POLICY, policy)
         .body(body)
         .expect("static protocol response is valid")
 }
@@ -247,7 +305,12 @@ mod tests {
 
     #[test]
     fn every_response_carries_the_frame_document_policy() {
-        let response = response(StatusCode::OK, "text/javascript", b"export {}".to_vec());
+        let response = response(
+            StatusCode::OK,
+            "text/javascript",
+            b"export {}".to_vec(),
+            frame_document_policy(false),
+        );
         assert_eq!(response.headers()[CONTENT_TYPE], "text/javascript");
         assert_eq!(response.headers()[NOSNIFF], "nosniff");
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
@@ -255,6 +318,65 @@ mod tests {
         assert_eq!(
             response.headers()[CONTENT_SECURITY_POLICY],
             FRAME_DOCUMENT_CSP
+        );
+    }
+
+    #[test]
+    fn a_mount_without_nested_content_denies_every_nested_frame() {
+        assert_eq!(frame_document_policy(false), FRAME_DOCUMENT_CSP);
+        assert!(frame_document_policy(false).contains("frame-src 'none'"));
+        assert!(!frame_document_policy(false).contains("teamarness-content:"));
+    }
+
+    #[test]
+    fn a_mount_with_nested_content_may_frame_only_content_views() {
+        let directives = |policy: &'static str| -> Vec<(&'static str, Vec<&'static str>)> {
+            policy
+                .split(';')
+                .map(|directive| {
+                    let mut parts = directive.split_whitespace();
+                    (parts.next().unwrap(), parts.collect())
+                })
+                .collect()
+        };
+        let base = directives(frame_document_policy(false));
+        let nested = directives(frame_document_policy(true));
+        assert_eq!(base.len(), nested.len());
+        for ((base_name, base_sources), (name, sources)) in base.iter().zip(&nested) {
+            assert_eq!(base_name, name);
+            if *name == "frame-src" {
+                assert_eq!(base_sources, &vec!["'none'"]);
+                assert_eq!(sources, &vec!["teamarness-content:"]);
+            } else {
+                assert_eq!(base_sources, sources, "{name}");
+            }
+        }
+        let response = response(
+            StatusCode::OK,
+            "text/html; charset=utf-8",
+            Vec::new(),
+            frame_document_policy(true),
+        );
+        assert_eq!(
+            response.headers()[CONTENT_SECURITY_POLICY],
+            frame_document_policy(true)
+        );
+    }
+
+    #[test]
+    fn package_resources_stay_ascii_while_shared_rules_decode_utf8() {
+        let uri: Uri = format!("teamarness-package://localhost/{TOKEN}/ui/caf%C3%A9.js")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            parse_request(&Method::GET, &uri).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            parse_resource_request(&Method::GET, &uri)
+                .unwrap()
+                .relative_path,
+            "ui/café.js"
         );
     }
 
@@ -317,6 +439,36 @@ mod tests {
         ] {
             assert!(!FRAME_DOCUMENT_CSP.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn frame_document_policy_is_exactly_the_reviewed_directive_set() {
+        let directives: Vec<(&str, Vec<&str>)> = FRAME_DOCUMENT_CSP
+            .split(';')
+            .map(|directive| {
+                let mut parts = directive.split_whitespace();
+                let name = parts.next().expect("a directive has a name");
+                (name, parts.collect())
+            })
+            .collect();
+        let expected: Vec<(&str, Vec<&str>)> = vec![
+            ("default-src", vec!["'none'"]),
+            (
+                "script-src",
+                vec!["teamarness-package:", "'wasm-unsafe-eval'"],
+            ),
+            ("style-src", vec!["teamarness-package:"]),
+            ("img-src", vec!["teamarness-package:", "data:"]),
+            ("font-src", vec!["teamarness-package:"]),
+            ("media-src", vec!["teamarness-package:"]),
+            ("connect-src", vec!["'none'"]),
+            ("frame-src", vec!["'none'"]),
+            ("worker-src", vec!["'none'"]),
+            ("object-src", vec!["'none'"]),
+            ("base-uri", vec!["'none'"]),
+            ("form-action", vec!["'none'"]),
+        ];
+        assert_eq!(directives, expected);
     }
 
     #[test]

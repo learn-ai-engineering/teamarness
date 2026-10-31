@@ -1,5 +1,5 @@
 //! The live Personal tier: a running Host installs, reloads, and removes a
-//! Personal Package without disturbing any Team Package (ADR 0031).
+//! Personal Package without disturbing any Team Package (ADR 0036).
 
 #![cfg(unix)]
 // Host commands return the full, payload-free error envelope.
@@ -36,7 +36,7 @@ struct Live {
 fn capabilities() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"identity":"teamarness.workspace-context","major":1,"minMinor":0,"maxMinor":0}),
-        serde_json::json!({"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0}),
+        serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0}),
     ]
 }
 
@@ -226,7 +226,7 @@ async fn post(
             operation: "fixture.capability".into(),
             payload: serde_json::from_value(serde_json::json!({
                 "capability":"teamarness.package-ports","method":"invoke",
-                "arguments":{"contract":CONTRACT,"port":"message.post","kind":"command","request":{"text":text}}
+                "arguments":{"access":"declared","major":1,"contract":CONTRACT,"port":"message.post","kind":"command","request":{"text":text}}
             }))
             .unwrap(),
         }))

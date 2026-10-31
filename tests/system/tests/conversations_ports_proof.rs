@@ -43,7 +43,7 @@ fn stage_consumer(application: &Path) {
         "backends":[{"target":"aarch64-apple-darwin","path":backend,"size":binary.len(),"sha256":digest(&binary)}],
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],
             "contract":{"path":"ui-contract.json","sha256":digest(contract)}},
-        "capabilities":[{"identity":"teamarness.package-ports","major":1,"minMinor":0,"maxMinor":0}],
+        "capabilities":[{"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0}],
         "consumedPorts":[{"identity":PACKAGE_ID,"major":1,"minMinor":0,"maxMinor":0,"ports":[
             {"name":"message.post","kind":"command"},{"name":"message.page","kind":"query"},
             {"name":"messages.changed","kind":"event"}]}]
@@ -149,9 +149,10 @@ async fn real_sdk_consumer_posts_invalidates_recovers_and_converges() {
         .expect("real Conversations appears in the authoring catalog");
     let provided = serde_json::to_value(&provider.provided).unwrap();
     assert_eq!(provided[0]["identity"], PACKAGE_ID);
-    assert_eq!(provided[0]["minor"], 2);
-    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 5);
+    assert_eq!(provided[0]["minor"], 3);
+    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 6);
     for (name, kind) in [
+        ("runtime.guide", "query"),
         ("message.post", "command"),
         ("message.page", "query"),
         ("message.changes", "query"),
@@ -179,6 +180,12 @@ async fn real_sdk_consumer_posts_invalidates_recovers_and_converges() {
         &fs::read(find_file(&alice_private, "port-proof.json").unwrap()).unwrap(),
     )
     .unwrap();
+    assert_eq!(proof["result"]["metadata"]["identity"], PACKAGE_ID);
+    assert_eq!(proof["result"]["metadata"]["ports"], 3);
+    assert_eq!(
+        proof["result"]["metadata"]["definitions"],
+        json!(["channelId", "message", "page", "pendingRow"])
+    );
     let trace: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok()).collect();
     let post = trace
         .iter()

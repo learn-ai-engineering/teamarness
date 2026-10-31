@@ -68,7 +68,7 @@ To stop using it, select **Remove**. Do not weaken file permissions or change th
 
 ## Understand the two tiers
 
-Admission has two tiers (ADR 0031). The tier decides when a change takes effect. It is not a trust verdict: both tiers grant `trusted_native_code_v1`.
+Admission has two tiers (ADR 0036). The tier decides when a change takes effect. It is not a trust verdict: both tiers grant `trusted_native_code_v1`.
 
 - The **Team tier** holds the Packages bundled with Teamarness and any override of one of them. It is admitted when Teamarness starts and does not change while it runs.
 - The **Personal tier** holds every other local registration. You install, reload, and remove Personal Packages while Teamarness runs.

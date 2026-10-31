@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as BlockingMutex};
@@ -230,6 +231,7 @@ enum CapabilityKind {
     Signing,
     ImmutableRecordLog,
     PackagePorts,
+    ContentViews,
     #[cfg(test)]
     Neutral,
 }
@@ -249,6 +251,9 @@ pub(crate) struct CapabilityScope {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) workspace_name: String,
     pub(crate) installation: InstallationPublicIdentity,
+    /// The Package Data Directory content views resolve their sources under.
+    pub(crate) data_directory: PathBuf,
+    pub(crate) content_views: Arc<crate::content_views::ContentViews>,
 }
 
 #[derive(Clone)]
@@ -372,23 +377,63 @@ impl GenerationCapabilities {
                 .ok_or(PackageErrorCode::CapabilityUnavailable)
                 .map_err(CapabilityFailure::certain)?;
             return match method {
-                "available" if object.len() == 1 => Ok(broker
-                    .availability(&self.scope.package_identity, &self.scope.workspace_id)
-                    .await),
+                "available" | "describe" => {
+                    let state = self
+                        .port_access_state(&broker, object)
+                        .await
+                        .map_err(CapabilityFailure::certain)?;
+                    let result = if method == "available" {
+                        broker
+                            .metadata_page(
+                                &self.scope.package_identity,
+                                &self.scope.workspace_id,
+                                object,
+                                &state,
+                            )
+                            .await
+                    } else {
+                        broker
+                            .metadata_chunk(
+                                &self.scope.package_identity,
+                                &self.scope.workspace_id,
+                                object,
+                                &state,
+                            )
+                            .await
+                    };
+                    result.map_err(CapabilityFailure::certain)
+                }
+                "enable" | "disable" => self
+                    .port_selection(&broker, method, object)
+                    .await
+                    .map_err(CapabilityFailure::certain),
                 "invoke" => {
                     #[cfg(feature = "test-hooks")]
                     broker
                         .pause_command_actor(&self.scope.package_identity, object)
                         .await;
-                    let actor = self
-                        .port_actor()
-                        .await
-                        .map_err(CapabilityFailure::certain)?;
+                    let route = self.authorize_port(&broker, object).await.map_err(|code| {
+                        broker.record_call_refusal(
+                            &self.scope.package_identity,
+                            consumer_id,
+                            self.generation,
+                            object,
+                            code,
+                        );
+                        CapabilityFailure::certain(code)
+                    })?;
+                    #[cfg(feature = "test-hooks")]
+                    broker
+                        .pause_port_work(&self.scope.package_identity, false)
+                        .await;
+                    #[cfg(feature = "test-hooks")]
+                    broker
+                        .pause_command_authorized(&self.scope.package_identity, object)
+                        .await;
                     broker
                         .call(
                             &self.scope.package_identity,
-                            &self.scope.workspace_id,
-                            &actor,
+                            route,
                             object,
                             started,
                             consumer_id,
@@ -446,6 +491,7 @@ impl GenerationCapabilities {
                     .await
             }
             CapabilityKind::PackagePorts => Err(PackageErrorCode::CapabilityRequestInvalid),
+            CapabilityKind::ContentViews => self.content_views(method, object).await,
             #[cfg(test)]
             CapabilityKind::Neutral => Ok(json!({"neutral":true})),
         }
@@ -471,12 +517,18 @@ impl GenerationCapabilities {
                 .broker
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
+            let route = self.authorize_port(&broker, object).await?;
+            #[cfg(feature = "test-hooks")]
+            broker
+                .pause_port_work(&self.scope.package_identity, false)
+                .await;
             if object.get("kind").and_then(Value::as_str) == Some("event") {
                 let subscription = broker
                     .subscribe_event(
                         &self.scope.package_identity,
                         &self.scope.workspace_id,
                         &self.core.public_identity().to_string(),
+                        route,
                         object,
                         self.generation,
                     )
@@ -507,15 +559,7 @@ impl GenerationCapabilities {
                 });
                 return Ok(());
             }
-            let actor = self.port_actor().await?;
-            let query = broker
-                .query_stream(
-                    &self.scope.package_identity,
-                    &self.scope.workspace_id,
-                    &actor,
-                    object,
-                )
-                .await?;
+            let query = broker.query_stream(route, object).await?;
             let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
             let mut streams = self.streams.lock().await;
             if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
@@ -612,6 +656,10 @@ impl GenerationCapabilities {
                     all_streams,
                     self.cancelled.subscribe(),
                     grant.minor,
+                    #[cfg(feature = "test-hooks")]
+                    self.broker.upgrade().and_then(|broker| {
+                        broker.take_record_availability_pause(&self.scope.package_identity)
+                    }),
                 ));
             }
             _ => {
@@ -820,6 +868,8 @@ impl GenerationCapabilities {
             .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
         let package = self.scope.package_identity.as_str().to_owned();
         let core = Arc::clone(&self.core);
+        let broker = self.broker.clone();
+        let key = self.instance_key();
         #[cfg(feature = "test-hooks")]
         if matches!(method, "bind" | "unbind")
             && let Some(broker) = self.broker.upgrade()
@@ -881,6 +931,10 @@ impl GenerationCapabilities {
                     .run(&self.limiter, started, move || {
                         core.bind_agent_package(workspace, id, &package)
                             .map_err(binding_error)?;
+                        if let Some(broker) = broker.upgrade() {
+                            broker
+                                .reconcile_binding(&key, &crate::port_access::actor(&core, &key)?);
+                        }
                         current_binding(&core, workspace, &package)
                     })
                     .await?
@@ -891,6 +945,10 @@ impl GenerationCapabilities {
                     .run(&self.limiter, started, move || {
                         core.unbind_agent_package(workspace, &package)
                             .map_err(binding_error)?;
+                        if let Some(broker) = broker.upgrade() {
+                            broker
+                                .reconcile_binding(&key, &crate::port_access::actor(&core, &key)?);
+                        }
                         Ok(json!({"agent":Value::Null}))
                     })
                     .await?
@@ -899,37 +957,226 @@ impl GenerationCapabilities {
         }
     }
 
+    /// `teamarness.content-views` 1.0: open and close views over files in this Package's own
+    /// Data Directory. The grant fixes the Package, Workspace and generation, so a view is this
+    /// generation's and no request names a Package or a directory.
+    async fn content_views(
+        &self,
+        method: &str,
+        object: &Map<String, Value>,
+    ) -> Result<Value, PackageErrorCode> {
+        let owner = crate::content_views::ViewOwner {
+            instance: crate::PackageInstanceKey::new(
+                self.scope.package_identity.clone(),
+                self.scope.workspace_id.clone(),
+            ),
+            generation: self.generation,
+        };
+        match method {
+            "open" => {
+                let request = crate::content_views::parse_open(object)?;
+                let views = Arc::clone(&self.scope.content_views);
+                let root = self.scope.data_directory.clone();
+                // Resolving every source is blocking file work.
+                tokio::task::spawn_blocking(move || views.open(owner, &root, request))
+                    .await
+                    .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
+            }
+            "close" => {
+                exact_fields(object, &["method", "view"])?;
+                let view = crate::ContentViewToken::new(string_field(object, "view")?)
+                    .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                Ok(json!({"closed": self.scope.content_views.close(&owner, &view)}))
+            }
+            _ => Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    }
+
+    fn instance_key(&self) -> crate::PackageInstanceKey {
+        crate::PackageInstanceKey::new(
+            self.scope.package_identity.clone(),
+            self.scope.workspace_id.clone(),
+        )
+    }
+
+    async fn port_access_state(
+        &self,
+        broker: &Arc<crate::broker::PortBroker>,
+        object: &Map<String, Value>,
+    ) -> Result<crate::port_access::AccessState, PackageErrorCode> {
+        let agent = match object.get("access").and_then(Value::as_str) {
+            Some("agent") => true,
+            Some("declared") => false,
+            _ => return Err(PackageErrorCode::CapabilityRequestInvalid),
+        };
+        broker
+            .access_work(
+                self.core.clone(),
+                self.instance_key(),
+                &self.authority,
+                move |_, _, state| {
+                    if agent && state.actor["kind"] != "agent" {
+                        return Err(PackageErrorCode::AgentNotBound);
+                    }
+                    Ok(state)
+                },
+            )
+            .await
+    }
+
+    async fn authorize_port(
+        &self,
+        broker: &Arc<crate::broker::PortBroker>,
+        object: &Map<String, Value>,
+    ) -> Result<crate::port_access::ResolvedPort, PackageErrorCode> {
+        let key = self.instance_key();
+        // Subscribe before reading authority, so accepted membership loss cannot be missed
+        // between issuing a lease and starting its idle-stream watcher.
+        let changes = if object.contains_key("method") {
+            None
+        } else {
+            let core = self.core.clone();
+            let workspace = teamarness_core::WorkspaceId::from_str(key.workspace_id.as_str())
+                .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+            Some(
+                tokio::task::spawn_blocking(move || core.subscribe_principals(workspace))
+                    .await
+                    .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
+                    .map_err(binding_error)?,
+            )
+        };
+        let input = object.clone();
+        let resolved_key = key.clone();
+        let generation = self.generation;
+        let authority_revision = self.authority.revision();
+        let route = broker
+            .access_work(
+                self.core.clone(),
+                key.clone(),
+                &self.authority,
+                move |broker, _, state| {
+                    broker.reconcile_binding(&resolved_key, &state.actor);
+                    let mut route = broker.resolve_access(
+                        &resolved_key.package_identity,
+                        &resolved_key.workspace_id,
+                        &input,
+                        &state,
+                    )?;
+                    if !input.contains_key("method") {
+                        route.lease = Some(broker.subscription_lease(
+                            resolved_key,
+                            &input,
+                            &route,
+                            generation,
+                            authority_revision,
+                        ));
+                    }
+                    Ok(route)
+                },
+            )
+            .await?;
+        if !matches!(
+            route.provider.snapshot().await.lifecycle,
+            crate::LifecycleState::Admitted
+                | crate::LifecycleState::Active
+                | crate::LifecycleState::Activating
+                | crate::LifecycleState::Recovering
+        ) {
+            return Err(PackageErrorCode::PortUnavailable);
+        }
+        if let (Some(mut changes), Some(lease)) = (changes, &route.lease) {
+            let mut ended = lease.watch();
+            let weak = Arc::downgrade(lease);
+            let broker = Arc::downgrade(broker);
+            let core = self.core.clone();
+            let authority = self.authority.clone();
+            let limiter = self.limiter.clone();
+            let mut cancelled = self.cancelled.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    if ended.borrow().is_some() || *cancelled.borrow() {
+                        break;
+                    }
+                    tokio::select! {
+                        change = changes.changed() => if change.is_err() { break; },
+                        _ = ended.changed() => break,
+                        _ = cancelled.changed() => break,
+                    }
+                    let Some(broker) = broker.upgrade() else {
+                        break;
+                    };
+                    if weak.strong_count() == 0 {
+                        break;
+                    }
+                    let core = core.clone();
+                    let key = key.clone();
+                    let _ = authority
+                        .run(&limiter, Arc::new(AtomicBool::new(false)), move || {
+                            if let Ok(actor) = crate::port_access::actor(&core, &key) {
+                                broker.reconcile_binding(&key, &actor);
+                            }
+                        })
+                        .await;
+                }
+            });
+        }
+        Ok(route)
+    }
+
+    async fn port_selection(
+        &self,
+        broker: &Arc<crate::broker::PortBroker>,
+        method: &str,
+        object: &Map<String, Value>,
+    ) -> Result<Value, PackageErrorCode> {
+        let enable = method == "enable";
+        exact_fields(
+            object,
+            if enable {
+                &["method", "contract", "major"]
+            } else {
+                &["method", "contract"]
+            },
+        )?;
+        let contract = string_field(object, "contract")?.to_owned();
+        if !teamarness_package_contract::identity::is_valid_package_identity(&contract) {
+            return Err(PackageErrorCode::CapabilityRequestInvalid);
+        }
+        let major = if enable {
+            Some(
+                object
+                    .get("major")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u16::try_from(v).ok())
+                    .filter(|v| *v != 0)
+                    .ok_or(PackageErrorCode::CapabilityRequestInvalid)?,
+            )
+        } else {
+            None
+        };
+        broker
+            .select_contract(
+                self.core.clone(),
+                self.instance_key(),
+                &self.authority,
+                contract,
+                major,
+            )
+            .await
+    }
+
     /// The Host-authored actor for a Port dispatch by this generation: the
     /// Workspace Agent the calling Package is bound to, otherwise the
     /// Installation Person (ADR 0030). Read once per dispatch; the lookup
     /// never marks the command as started, because nothing has reached the
     /// Provider yet.
+    #[cfg(test)]
     async fn port_actor(&self) -> Result<Value, PackageErrorCode> {
-        let workspace = teamarness_core::WorkspaceId::from_str(self.scope.workspace_id.as_str())
-            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
-        let package = self.scope.package_identity.as_str().to_owned();
-        let core = Arc::clone(&self.core);
+        let key = self.instance_key();
+        let core = self.core.clone();
         self.authority
             .run(&self.limiter, Arc::new(AtomicBool::new(false)), move || {
-                let person = json!({"kind":"person","identity":core.public_identity().to_string()});
-                let Some(agent) = core
-                    .bound_agent(workspace, &package)
-                    .map_err(binding_error)?
-                else {
-                    return Ok(person);
-                };
-                let Some(principal) = core.principal(workspace, agent).map_err(binding_error)?
-                else {
-                    return Ok(person);
-                };
-                let Some(identity) = principal.keys().first() else {
-                    return Ok(person);
-                };
-                Ok(json!({
-                    "kind":"agent",
-                    "principal":agent.to_string(),
-                    "identity":identity.to_string(),
-                }))
+                crate::port_access::actor(&core, &key)
             })
             .await?
     }
@@ -1132,6 +1379,13 @@ impl GenerationCapabilities {
 impl Drop for GenerationCapabilities {
     fn drop(&mut self) {
         self.cancelled.send_replace(true);
+        if let Some(broker) = self.broker.upgrade() {
+            broker.revoke_consumer(
+                &self.instance_key(),
+                self.generation,
+                self.authority.revision(),
+            );
+        }
     }
 }
 
@@ -1236,10 +1490,17 @@ impl Registry {
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.package-ports"),
-            major: 1,
+            major: 2,
             min_minor: 0,
             max_minor: 0,
             kind: CapabilityKind::PackagePorts,
+        });
+        registry.register(Descriptor {
+            family: CapabilityFamily::new(crate::content_views::FAMILY),
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::ContentViews,
         });
         registry.register(Descriptor {
             family: CapabilityFamily::new("teamarness.synchronization.immutable-record-log"),
@@ -1384,7 +1645,7 @@ fn current_binding(
 }
 
 /// Core's binding and registry errors in the capability's own vocabulary.
-fn binding_error(error: teamarness_core::PersonNameError) -> PackageErrorCode {
+pub(crate) fn binding_error(error: teamarness_core::PersonNameError) -> PackageErrorCode {
     match error {
         teamarness_core::PersonNameError::NotOwnPerson => PackageErrorCode::AgentNotStewarded,
         teamarness_core::PersonNameError::AgentNotFound => PackageErrorCode::AgentNotFound,
@@ -1408,23 +1669,39 @@ async fn run_port_query(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let mut revocation = query.receiver.revocation();
+    let mut terminal = query.receiver.terminal();
     let mut credit = MAX_STREAM_CREDIT;
     let mut sequence = 0;
     let reason = loop {
-        if *cancelled.borrow()
-            || !drain_commands(&mut commands, &mut credit).await
-            || !await_credit(&mut commands, &mut credit, &mut cancelled).await
-        {
+        if *cancelled.borrow() || !drain_commands(&mut commands, &mut credit).await {
             break "closed";
+        }
+        if credit == 0 {
+            if let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
+                break crate::protocol::capability_code(code);
+            }
+            if let Some(end) = terminal.borrow().clone() {
+                break match end {
+                    StreamEnd::Completed => "completed",
+                    StreamEnd::Host(code) => crate::protocol::capability_code(code),
+                    _ => "provider_exited",
+                };
+            }
         }
         tokio::select! {
             biased;
+            _ = async {
+                if let Some(watch) = &mut revocation { let _ = watch.changed().await; }
+                else { std::future::pending::<()>().await; }
+            }, if credit == 0 => {},
+            _ = terminal.changed(), if credit == 0 => {},
             change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => credit += amount,
                 Some(StreamCommand::Close) | None => break "closed",
             },
-            event = query.receiver.changed() => match event {
+            event = query.receiver.changed(), if credit > 0 => match event {
                 Ok(event) => {
                     sequence += 1;
                     credit -= 1;
@@ -1438,6 +1715,9 @@ async fn run_port_query(
                 Err(StreamEnd::Completed) => break "completed",
                 Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
                 Err(StreamEnd::Host(PackageErrorCode::Overloaded)) => break "overloaded",
+                Err(StreamEnd::Host(PackageErrorCode::PortNotEnabled)) => break "port_not_enabled",
+                Err(StreamEnd::Host(PackageErrorCode::AgentNotBound)) => break "agent_not_bound",
+                Err(StreamEnd::Host(PackageErrorCode::AgentBindingChanged)) => break "agent_binding_changed",
                 Err(_) => break "provider_exited",
             },
         }
@@ -1733,6 +2013,7 @@ async fn run_record_stream(
     streams: Arc<Mutex<BTreeMap<String, mpsc::Sender<StreamCommand>>>>,
     mut cancelled: watch::Receiver<bool>,
     negotiated_minor: u16,
+    #[cfg(feature = "test-hooks")] mut availability_pause: Option<Arc<crate::AuthorityPause>>,
 ) {
     let subscribe_core = core.clone();
     let subscribe_package = package.clone();
@@ -1768,6 +2049,9 @@ async fn run_record_stream(
             return;
         }
     };
+    // Page and availability reads advance the subscription's read cursor. Keep
+    // notifications independent so a health change between reads cannot be lost.
+    let mut changes = subscription.changes();
     let mut sequence = 0_u64;
     let mut pending_replay: Option<teamarness_core::InitialReplayBoundary> = None;
     let mut tracking = StateTracking::new();
@@ -1853,6 +2137,10 @@ async fn run_record_stream(
                 tracking.since_state = 0;
             }
             need_state = false;
+            #[cfg(feature = "test-hooks")]
+            if refreshed_after_empty && let Some(pause) = availability_pause.take() {
+                pause.wait().await;
+            }
             continue;
         }
         let limit = usize::try_from(credit.min(RECORD_PAGE)).unwrap_or(1);
@@ -1926,7 +2214,7 @@ async fn run_record_stream(
             continue;
         }
         tokio::select! {
-            changed = subscription.changed() => {
+            changed = changes.changed() => {
                 if changed.is_err() {
                     break;
                 }
@@ -2094,6 +2382,8 @@ mod tests {
                 workspace_name: workspace.name().to_owned(),
                 installation: InstallationPublicIdentity::new(core.public_identity().to_string())
                     .unwrap(),
+                data_directory: PathBuf::new(),
+                content_views: Arc::default(),
             },
             &[CapabilityRequirement {
                 family: "teamarness.synchronization.immutable-record-log".into(),
@@ -2136,18 +2426,15 @@ mod tests {
             package.clone(),
             WorkspaceId::new(workspace.id().to_string()).unwrap(),
         );
-        let broker = crate::broker::PortBroker::new(
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            std::collections::BTreeSet::new(),
-        );
+        let broker = crate::broker::empty_broker().await;
         let scope = CapabilityScope {
             package_identity: package.clone(),
             workspace_id: key.workspace_id.clone(),
             workspace_name: "test".into(),
             installation: InstallationPublicIdentity::new(core.public_identity().to_string())
                 .unwrap(),
+            data_directory: PathBuf::new(),
+            content_views: Arc::default(),
         };
         let old = GenerationCapabilities::bind(
             core.clone(),
@@ -2481,6 +2768,25 @@ mod tests {
     }
 
     #[test]
+    fn package_ports_only_negotiates_the_current_major() {
+        let registry = Registry::production();
+        assert_eq!(
+            registry
+                .negotiate(&requirement("teamarness.package-ports", 1, 0, 0))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityVersionUnsupported
+        );
+        assert_eq!(
+            registry
+                .negotiate(&requirement("teamarness.package-ports", 2, 0, 0))
+                .unwrap()
+                .0
+                .major,
+            2
+        );
+    }
+
+    #[test]
     fn unknown_capability_family_is_not_a_version_error() {
         // A family the Host does not provide, asked for with versions the Host would otherwise
         // accept: the answer names the missing capability, not the versions.
@@ -2641,6 +2947,67 @@ mod tests {
                 .as_u64()
                 .unwrap() as usize,
             MAX_AGENT_CANDIDATES
+        );
+    }
+
+    #[test]
+    fn content_view_limits_and_allowlist_match_the_contract_schema() {
+        use teamarness_package_contract::media_types as content;
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/content-views.schema.json"
+        ))
+        .unwrap();
+        let defs = &schema["$defs"];
+        let limits = &defs["limits"]["properties"];
+        let number = |value: &Value| value.as_u64().unwrap();
+        assert_eq!(
+            number(&limits["maxFiles"]["const"]) as usize,
+            content::MAX_CONTENT_FILES
+        );
+        assert_eq!(
+            number(&defs["openCall"]["properties"]["files"]["maxItems"]) as usize,
+            content::MAX_CONTENT_FILES
+        );
+        assert_eq!(
+            number(&limits["maxTotalBytes"]["const"]),
+            content::MAX_CONTENT_TOTAL_BYTES
+        );
+        assert_eq!(
+            number(&limits["maxFileBytes"]["const"]),
+            content::MAX_CONTENT_FILE_BYTES
+        );
+        assert_eq!(
+            number(&defs["file"]["properties"]["size"]["maximum"]),
+            content::MAX_CONTENT_FILE_BYTES
+        );
+        assert_eq!(
+            number(&limits["maxPathBytes"]["const"]) as usize,
+            content::MAX_CONTENT_PATH_BYTES
+        );
+        assert_eq!(
+            number(&defs["contentPath"]["maxLength"]) as usize,
+            content::MAX_CONTENT_PATH_BYTES
+        );
+        assert_eq!(
+            number(&defs["sourcePath"]["maxLength"]) as usize,
+            crate::content_views::MAX_SOURCE_PATH_BYTES
+        );
+        assert_eq!(
+            number(&limits["maxViewsPerGeneration"]["const"]) as usize,
+            crate::content_views::MAX_VIEWS_PER_GENERATION
+        );
+        let published = defs["mediaTypes"]["const"].as_object().unwrap();
+        assert_eq!(published.len(), content::MEDIA_TYPES.len());
+        for (extension, media_type) in content::MEDIA_TYPES {
+            assert_eq!(published[*extension], *media_type, "{extension}");
+        }
+        assert_eq!(
+            Registry::production()
+                .negotiate(&requirement(crate::content_views::FAMILY, 1, 0, 0))
+                .unwrap()
+                .0
+                .kind,
+            CapabilityKind::ContentViews
         );
     }
 }

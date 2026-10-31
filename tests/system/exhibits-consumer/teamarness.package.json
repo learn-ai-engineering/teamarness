@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "identity": "dev.teamarness.exhibits-fixture-consumer",
+  "version": "1.0.0",
+  "presentation": {
+    "displayName": "Exhibits fixture consumer"
+  },
+  "protocol": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "backends": [
+    {
+      "target": "aarch64-apple-darwin",
+      "path": "backend/exhibits-port-consumer-under-test",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "ui": {
+    "entrypoint": {
+      "path": "ui/index.js",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "assets": [],
+    "contract": {
+      "path": "ui-contract.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "capabilities": [
+    {
+      "identity": "teamarness.package-ports",
+      "major": 2,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.agent-binding",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.content-views",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    }
+  ],
+  "consumedPorts": [
+    {
+      "identity": "dev.teamarness.exhibits",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0,
+      "ports": [
+        { "name": "runtime.guide", "kind": "query" },
+        { "name": "file.put", "kind": "command" },
+        { "name": "files.missing", "kind": "query" },
+        { "name": "draft.update", "kind": "command" },
+        { "name": "exhibit.list", "kind": "query" },
+        { "name": "exhibit.read", "kind": "query" },
+        { "name": "file.read", "kind": "query" },
+        { "name": "draft.delete", "kind": "command" }
+      ]
+    }
+  ]
+}

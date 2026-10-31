@@ -154,6 +154,7 @@ pub struct UiLoaderDto {
     pub package: UiPackageContextDto,
     pub workspace: UiWorkspaceContextDto,
     pub view: String,
+    pub nested_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -196,6 +197,7 @@ impl From<UiLoaderDescriptor> for UiLoaderDto {
                 name: value.workspace.name,
             },
             view: wire_name(value.view),
+            nested_content: value.nested_content,
         }
     }
 }
@@ -496,7 +498,7 @@ mod tests {
         }
     }
 
-    // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
+    // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R19
     #[test]
     fn catalog_dto_carries_optional_presentation_metadata_in_camel_case() {
         let entry = |description: Option<&str>, author: Option<&str>, homepage: Option<&str>| {
@@ -530,7 +532,7 @@ mod tests {
         }
     }
 
-    // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R16
+    // Verifies: TEAM.SYS.PKG-R01, TEAM.SYS.PKG-R19
     #[test]
     fn catalog_dto_lists_declared_views_and_omits_none() {
         let entry = |views| {
@@ -640,10 +642,19 @@ mod tests {
                 name: "Fixture Workspace".into(),
             },
             view: teamarness_package_host::PackageUiView::Settings,
+            nested_content: false,
         };
         assert_eq!(
-            serde_json::to_value(UiLoaderDto::from(descriptor)).unwrap(),
+            serde_json::to_value(UiLoaderDto::from(descriptor.clone())).unwrap(),
             fixture["loader"]
+        );
+        let nested = teamarness_package_host::UiLoaderDescriptor {
+            nested_content: true,
+            ..descriptor
+        };
+        assert_eq!(
+            serde_json::to_value(UiLoaderDto::from(nested)).unwrap()["nestedContent"],
+            serde_json::Value::Bool(true)
         );
     }
 

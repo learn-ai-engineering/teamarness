@@ -414,7 +414,36 @@ impl std::fmt::Debug for RecordSubscription {
     }
 }
 
+/// An independent scope-change cursor, unaffected by record or availability reads.
+/// It carries notifications only, not records or health state.
+#[derive(Debug)]
+pub struct RecordSubscriptionChanges {
+    head: watch::Receiver<HeadState>,
+}
+
+impl RecordSubscriptionChanges {
+    /// Waits for a change since creation or the previous completed wait.
+    /// Changes that arrive before waiting remain observable. Cancellation is safe.
+    /// # Errors
+    /// Returns `RuntimeUnavailable` when the scope notifier closes.
+    pub async fn changed(&mut self) -> Result<(), SynchronizationError> {
+        self.head
+            .changed()
+            .await
+            .map_err(|_| SynchronizationError::RuntimeUnavailable)
+    }
+}
+
 impl RecordSubscription {
+    /// Creates a notification cursor that page and availability reads cannot advance.
+    /// Establish it before sampling state to avoid losing a change between reads and waiting.
+    #[must_use]
+    pub fn changes(&self) -> RecordSubscriptionChanges {
+        RecordSubscriptionChanges {
+            head: self.scope_head.subscribe(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: Weak<Mutex<RuntimeState>>,

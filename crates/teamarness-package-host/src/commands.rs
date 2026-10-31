@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::values::{
-    HostRevision, LifecycleState, PackageIdentity, PackageInstanceKey, PackageSourceKind,
-    PackageTrustKind, PackageUiView, PackageValue, UiMountId, UiRequestId, UiResourceToken,
-    UiSubscriptionId, WorkspaceId,
+    ContentViewToken, HostRevision, LifecycleState, PackageIdentity, PackageInstanceKey,
+    PackageSourceKind, PackageTrustKind, PackageUiView, PackageValue, UiMountId, UiRequestId,
+    UiResourceToken, UiSubscriptionId, WorkspaceId,
 };
 
 /// Activates every admitted Package for every Workspace Core lists. Never disposes
@@ -80,6 +80,9 @@ pub struct UiLoaderDescriptor {
     pub workspace: UiWorkspaceContext,
     /// The view this mount shows.
     pub view: PackageUiView,
+    /// True when the Package declares `teamarness.content-views`: its frames may nest
+    /// `teamarness-content:` frames. Every other Package's frames may nest none.
+    pub nested_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,10 +130,20 @@ pub struct ReadUiResource {
     pub token: UiResourceToken,
     pub relative_path: String,
 }
+/// Reads one listed file of an open content view, as `teamarness-content://localhost/<token>/<path>`
+/// names it. `path` is the decoded content path.
+///
+/// An unknown or ended view, a path the view does not list, and a file that fails verification
+/// are all `content_not_found`, with no further detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadContent {
+    pub token: ContentViewToken,
+    pub path: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownHost;
 
-/// Registers and admits a Personal Package while the Host runs (ADR 0031).
+/// Registers and admits a Personal Package while the Host runs (ADR 0036).
 ///
 /// The directory must inspect as `expected_identity`, the risks must be exactly
 /// the `trusted_native_code_v1` set, and the identity must not belong to the
@@ -157,7 +170,7 @@ pub struct RemovePersonal {
 }
 
 /// Replaces the running process of one Personal Package Instance with a new
-/// process generation (ADR 0031). Team Instances are refused with
+/// process generation (ADR 0036). Team Instances are refused with
 /// `override_required`; an Instance that is not running or failed is refused
 /// with `invalid_lifecycle_state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +179,7 @@ pub struct RestartPersonal {
 }
 
 /// Writes an override registration that replaces a Team Package at the next
-/// application start (ADR 0031). No Instance, route, or mount changes in the
+/// application start (ADR 0036). No Instance, route, or mount changes in the
 /// running Host; its snapshot shows the registration as
 /// [`RegistrationStatus::PendingRestart`](crate::RegistrationStatus::PendingRestart)
 /// at a new revision.
@@ -218,6 +231,7 @@ pub enum PackageHostCommand {
     RestartPersonal(RestartPersonal),
     WriteOverride(WriteOverride),
     RemoveOverride(RemoveOverride),
+    ReadContent(ReadContent),
     Shutdown(ShutdownHost),
 }
 
@@ -275,5 +289,10 @@ pub enum PackageHostOutcome {
     OverrideWritten,
     /// The override is gone from the registration file; the bundled Package returns at the next start.
     OverrideRemoved,
+    /// The verified bytes of one content-view file and its allowlisted media type.
+    Content {
+        bytes: Vec<u8>,
+        media_type: String,
+    },
     Shutdown,
 }

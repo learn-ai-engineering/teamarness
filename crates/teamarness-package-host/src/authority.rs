@@ -8,7 +8,7 @@ use crate::PackageErrorCode;
 use crate::capability::CoreCallLimiter;
 
 #[derive(Clone, Default)]
-pub(crate) struct AuthorityGeneration(Arc<RwLock<u64>>);
+pub(crate) struct AuthorityGeneration(Arc<RwLock<u64>>, Arc<tokio::sync::Mutex<()>>);
 
 #[derive(Clone)]
 pub(crate) struct GenerationAuthority {
@@ -32,21 +32,39 @@ impl AuthorityGeneration {
 }
 
 impl GenerationAuthority {
+    pub(crate) fn revision(&self) -> u64 {
+        self.expected
+    }
+
+    pub(crate) async fn leases(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::OwnedRwLockReadGuard<u64>,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        PackageErrorCode,
+    > {
+        let lease = self.generation.0.clone().read_owned().await;
+        if *lease != self.expected {
+            return Err(PackageErrorCode::Cancelled);
+        }
+        let operation = self.generation.1.clone().lock_owned().await;
+        Ok((lease, operation))
+    }
+
     pub(crate) async fn run<T: Send + 'static>(
         &self,
         limiter: &CoreCallLimiter,
         started: Arc<AtomicBool>,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, PackageErrorCode> {
-        let lease = self.generation.0.clone().read_owned().await;
-        if *lease != self.expected {
-            return Err(PackageErrorCode::Cancelled);
-        }
+        let (lease, operation) = self.leases().await?;
         limiter
             .run(started, move || {
                 // Like the limiter permit, this lease belongs to actual Core work, not its
                 // async waiter. Dropping/aborting that waiter cannot admit a replacement early.
-                let _lease = lease;
+                let _lease = (lease, operation);
                 work()
             })
             .await

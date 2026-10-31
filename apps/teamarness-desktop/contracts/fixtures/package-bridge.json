@@ -40,7 +40,8 @@
       "id": "00112233445566778899aabbccddeeff",
       "name": "Fixture Workspace"
     },
-    "view": "settings"
+    "view": "settings",
+    "nestedContent": false
   },
   "event": {
     "mount": "mount-1",

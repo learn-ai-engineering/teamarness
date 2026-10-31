@@ -93,6 +93,11 @@ impl PackageHost {
             consumed,
             port_contracts.clone(),
             team_identities.clone(),
+            crate::port_access::PortAccess::new(
+                store.clone(),
+                report.team_providers.clone(),
+                report.personal_providers.clone(),
+            ),
         );
         let tiers = Self::split_tiers(&config, &mut report, &team_identities)?;
         let templates: Vec<_> = tiers
@@ -101,13 +106,14 @@ impl PackageHost {
             .chain(tiers.personal.iter().map(|package| &package.template))
             .cloned()
             .collect();
-        // One permit pool and one set of protocol bounds for every Package in
-        // this Host.
+        // One permit pool, one set of protocol bounds and one content view
+        // table for every Package in this Host.
         let calls = supervisor::CallEnvironment {
             limiter: capability::CoreCallLimiter::new(),
             limits: protocol::ProtocolLimits {
                 capability_call: config.capability_call_timeout,
             },
+            content_views: Arc::default(),
         };
         let instances = Self::activate_initial_instances(
             &config,

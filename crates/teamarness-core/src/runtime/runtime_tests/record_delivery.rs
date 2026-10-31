@@ -624,3 +624,44 @@ async fn commits_from_every_path_wake_a_waiting_subscriber() {
 fn drain(subscription: &mut crate::RecordSubscription) {
     while !subscription.next_page(32).unwrap().events.is_empty() {}
 }
+
+/// Verifies: TEAM.SYS.PKG-R10, TEAM.SYS.TRANS-R08
+#[tokio::test]
+async fn independent_changes_survive_intervening_page_and_availability_reads() {
+    let cluster = SyncCluster::start("independent-record-changes", &["a"]).await;
+    let workspace = cluster
+        .node("a")
+        .create_workspace("Independent notifications")
+        .unwrap()
+        .id();
+    let mut records = cluster
+        .node("a")
+        .subscribe_records(workspace, PACKAGE, None)
+        .unwrap();
+    let mut changes = records.changes();
+    cluster
+        .node("a")
+        .health
+        .scope_changed(scope_digest(PACKAGE, workspace));
+    assert!(records.next_page(32).unwrap().events.is_empty());
+    assert_eq!(
+        records.availability().unwrap().availability,
+        crate::SyncAvailability::Current
+    );
+    tokio::time::timeout(WAKE_DEADLINE, changes.changed())
+        .await
+        .expect("page and availability reads cannot acknowledge the independent notification")
+        .unwrap();
+    // A notification that arrives after sampling but before waiting must also survive.
+    records.availability().unwrap();
+    cluster
+        .node("a")
+        .health
+        .scope_changed(scope_digest(PACKAGE, workspace));
+    records.next_page(32).unwrap();
+    tokio::time::timeout(WAKE_DEADLINE, changes.changed())
+        .await
+        .expect("the independent watcher observes changes before waiting")
+        .unwrap();
+    cluster.finish().await;
+}

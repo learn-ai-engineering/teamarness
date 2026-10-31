@@ -189,6 +189,55 @@ impl From<UiResourceToken> for String {
     }
 }
 
+/// The opaque token of one content view: 128 random bits as lowercase hexadecimal.
+///
+/// It is the `<view>` segment of `teamarness-content://localhost/<view>/<path>`, and holding it
+/// is what lets the Shell read the view's files, so its `Debug` form is redacted.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ContentViewToken(String);
+
+impl ContentViewToken {
+    /// Validates exactly 32 lowercase hexadecimal characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueParseError> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ValueParseError::new("content view token"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the opaque token text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ContentViewToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentViewToken([redacted])")
+    }
+}
+
+impl TryFrom<String> for ContentViewToken {
+    type Error = ValueParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ContentViewToken> for String {
+    fn from(value: ContentViewToken) -> Self {
+        value.0
+    }
+}
+
 /// One Package Identity and Workspace pair inside the opened Installation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -456,7 +505,7 @@ pub struct PackageHostSnapshot {
     pub registrations: Vec<InstallationRegistrationSnapshot>,
 }
 
-/// The admission tier a Package belongs to (ADR 0031).
+/// The admission tier a Package belongs to (ADR 0036).
 ///
 /// The Team tier is the bundled Packages plus installation registrations with
 /// `overrideApplication`. It is fixed when the Host opens. The Personal tier is

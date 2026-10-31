@@ -98,6 +98,7 @@ impl PackageHost {
                 name: actor.workspace_name().to_owned(),
             },
             view: input.view,
+            nested_content: actor.declares_capability(crate::content_views::FAMILY),
         };
         self.inner.data.lock().await.mounts.insert(
             mount.clone(),

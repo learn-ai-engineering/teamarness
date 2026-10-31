@@ -105,7 +105,7 @@ const catalog: readonly PackageAuthoringEntry[] = [
   },
   {
     identity: TEAM,
-    capabilities: [{ identity: "teamarness.package-ports", major: 1, minMinor: 0, maxMinor: 0 }],
+    capabilities: [{ identity: "teamarness.package-ports", major: 2, minMinor: 0, maxMinor: 0 }],
     provided: [{ identity: "dev.teamarness.conversations", major: 1, minor: 1, description: "Conversations" }],
     consumed: [],
   },
@@ -385,7 +385,7 @@ describe("Package page", () => {
     expect(html).toContain("<dt>Source</dt><dd>Team</dd>");
     expect(html).toContain("<dt>Trust</dt><dd>Bundled with Teamarness</dd>");
     expect(html).not.toContain("Package folder");
-    expect(html).toContain("teamarness.package-ports 1.0");
+    expect(html).toContain("teamarness.package-ports 2.0");
     expect(html).toContain("dev.teamarness.conversations 1.1 — Conversations");
     expect(html).toContain("<dt>Availability</dt><dd>Available</dd>");
     expect(html).toContain('<p class="package-page-kind">Team Package</p>');

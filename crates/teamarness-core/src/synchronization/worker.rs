@@ -253,6 +253,9 @@ fn report_health(
         SessionOutcome::Failed | SessionOutcome::RefusedNotAuthorized => {
             (Some(crate::synchronization::PeerOutcome::Failed), None)
         }
+        // Backpressure says nothing new about reachability. Keep a prior
+        // reachable, unknown, or failed observation instead of replacing it.
+        SessionOutcome::Busy => return,
         SessionOutcome::LocalNotAuthorized | SessionOutcome::Cancelled => (None, None),
     };
     health.record_outcome(scope, peer, reported, truncated);
@@ -275,6 +278,7 @@ fn record_outcome(
         LogSessionError::Refused(Refusal::NotAuthorized) => SessionOutcome::RefusedNotAuthorized,
         LogSessionError::LocalNotAuthorized => SessionOutcome::LocalNotAuthorized,
         LogSessionError::Cancelled => SessionOutcome::Cancelled,
+        LogSessionError::PeerBusy => SessionOutcome::Busy,
         // A peer that could not be reached at all is a different thing from one
         // that answered and then failed.
         LogSessionError::Transport(_) => SessionOutcome::Unreachable,
@@ -282,7 +286,7 @@ fn record_outcome(
     };
     if !matches!(
         outcome,
-        SessionOutcome::Cancelled | SessionOutcome::LocalNotAuthorized
+        SessionOutcome::Cancelled | SessionOutcome::LocalNotAuthorized | SessionOutcome::Busy
     ) {
         report_failure(key, &error.to_string());
     }
@@ -326,6 +330,8 @@ pub(crate) struct SyncWorker {
     #[cfg(test)]
     loads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
+    completed_loads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     snapshot: Arc<Mutex<Vec<crate::synchronization::scheduler::PeerSnapshot>>>,
 }
 
@@ -359,6 +365,8 @@ impl SyncWorker {
             #[cfg(test)]
             loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            completed_loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
             snapshot: Arc::new(Mutex::new(Vec::new())),
         });
         let driver = Driver {
@@ -375,6 +383,8 @@ impl SyncWorker {
             sweep: Arc::clone(&worker.sweep),
             #[cfg(test)]
             loads: Arc::clone(&worker.loads),
+            #[cfg(test)]
+            completed_loads: Arc::clone(&worker.completed_loads),
             #[cfg(test)]
             snapshot: Arc::clone(&worker.snapshot),
         };
@@ -478,6 +488,8 @@ struct Driver {
     #[cfg(test)]
     loads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
+    completed_loads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     snapshot: Arc<Mutex<Vec<crate::synchronization::scheduler::PeerSnapshot>>>,
 }
 
@@ -546,15 +558,15 @@ impl Driver {
                     Err(_) => return,
                 }
             }
-            if self.paused.load(Ordering::Acquire) {
-                continue;
-            }
             #[cfg(test)]
             {
                 *self
                     .snapshot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = core.snapshot();
+            }
+            if self.paused.load(Ordering::Acquire) {
+                continue;
             }
             let now = Instant::now();
             while let Some(job) = core.next_dispatch(now) {
@@ -613,11 +625,13 @@ impl Driver {
         let now = Instant::now();
         let forced = self.demand.take_ready(|_| true);
         let selection = Arc::clone(&self.selection);
+        #[cfg(test)]
+        let completed_loads = Arc::clone(&self.completed_loads);
         crate::blocking::run_with_state(&self.state, move |state| {
             let mut cursor = selection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            load_due_jobs(
+            let due = load_due_jobs(
                 state,
                 local,
                 kind,
@@ -626,7 +640,11 @@ impl Driver {
                 now,
                 &forced,
                 &mut cursor,
-            )
+            );
+            // Publish actual successful work while the runtime guard still excludes a test holder.
+            #[cfg(test)]
+            completed_loads.fetch_add(1, Ordering::Relaxed);
+            due
         })
         .await
     }
@@ -1033,6 +1051,25 @@ mod tests {
     const PACKAGE: &str = "teamarness.test";
     const DEMAND_PACKAGE: &str = "teamarness.keyless";
 
+    #[test]
+    fn peer_busy_is_not_a_failure_or_a_reachability_claim() {
+        let fixture = Fixture::open("peer-busy-classification");
+        let key = JobKey::Records {
+            workspace: fixture.workspace,
+            package: PACKAGE.to_owned(),
+            scope: crate::synchronization::scope_digest(PACKAGE, fixture.workspace),
+            peer: fixture.peer,
+        };
+        let outcome = record_outcome(&key, Err(LogSessionError::PeerBusy));
+        assert_eq!(
+            outcome,
+            SessionOutcome::Busy,
+            "busy is responding-peer backpressure"
+        );
+        assert_ne!(outcome, SessionOutcome::Unreachable);
+        assert!(!matches!(outcome, SessionOutcome::Completed { .. }));
+    }
+
     /// A scripted runner. Only the session is scripted: the scheduler, the
     /// driver, the durable loads and the real storage under them are real.
     struct FakeRunner {
@@ -1286,6 +1323,37 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("timed out waiting until {what}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_scheduler_snapshot_observes_in_flight_completion() {
+        let fixture = Fixture::open("paused-completion-snapshot");
+        let runner = FakeRunner::new(SessionOutcome::Failed);
+        runner.hold.store(true, Ordering::Release);
+        let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
+        until("held session starts", || !runner.dispatches().is_empty()).await;
+        worker.wake.notify_one();
+        until("snapshot observes in-flight session", || {
+            worker.snapshot_for_test().iter().any(|peer| peer.in_flight)
+        })
+        .await;
+        worker.pause_for_test(true);
+        runner.release.notify_waiters();
+        until("paused snapshot observes completion", || {
+            worker
+                .snapshot_for_test()
+                .iter()
+                .all(|peer| !peer.in_flight)
+        })
+        .await;
+        assert_eq!(
+            runner.dispatches().len(),
+            1,
+            "pause does not dispatch another job"
+        );
+        worker.shutdown().await;
+        drop(worker);
+        fixture.finish();
     }
 
     // Verifies: TEAM.SYS.TRANS-R08
@@ -1939,6 +2007,113 @@ mod tests {
         fixture.finish();
     }
 
+    // Call only after the intended thread acknowledges acquisition of the runtime
+    // lock. No blocking load can then finish; wait for earlier driver publication.
+    async fn settled_load_baseline(loads: &AtomicUsize, completed_loads: &AtomicUsize) -> usize {
+        let completed = completed_loads.load(Ordering::Relaxed);
+        until("prior completed loads are published by the driver", || {
+            loads.load(Ordering::Relaxed) == completed
+        })
+        .await;
+        loads.load(Ordering::Relaxed)
+    }
+
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn busy_lock_baseline_waits_for_intended_holder_and_prior_load_publication() {
+        let fixture = Fixture::open("busy-lock-publication");
+        let loads = Arc::new(AtomicUsize::new(0));
+        let completed_loads = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
+        let (stop, stop_rx) = watch::channel(false);
+        let driver = Driver {
+            state: Arc::downgrade(&fixture.state),
+            local: fixture.local,
+            runner: FakeRunner::new(SessionOutcome::Completed { truncated: false }),
+            demand: MembershipDemand::new(),
+            limits: SchedulerLimits::CURRENT,
+            wake: Arc::clone(&wake),
+            paused: Arc::new(AtomicBool::new(false)),
+            selection: Arc::new(Mutex::new(SelectionCursor::default())),
+            stop: stop_rx,
+            sweep: Arc::new(AtomicBool::new(false)),
+            loads: Arc::clone(&loads),
+            completed_loads: Arc::clone(&completed_loads),
+            snapshot: Arc::new(Mutex::new(Vec::new())),
+        };
+        // Keep the real driver's load pending at its blocking boundary, then leave
+        // its completion unpolled until the intended state holder has acquired.
+        let transient = fixture.state.lock().unwrap();
+        let mut driver = Box::pin(driver.run(no_jitter));
+        assert!(
+            driver
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        let (begin, begin_rx) = std::sync::mpsc::channel::<()>();
+        let (acquired, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(&fixture.state);
+        let holding = std::thread::spawn(move || {
+            let _ = begin_rx.recv();
+            let _guard = held.lock().unwrap();
+            let _ = acquired.send(());
+            let _ = released.recv();
+        });
+        assert!(
+            fixture.state.try_lock().is_err(),
+            "an unrelated holder satisfies the old probe"
+        );
+        assert!(
+            matches!(
+                acquired_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "only the intended holder can acknowledge"
+        );
+        drop(transient);
+        until("blocking load completes without async publication", || {
+            completed_loads.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            0,
+            "real driver completion is deliberately unpolled"
+        );
+        begin.send(()).unwrap();
+        until("the intended thread holds the runtime lock", || {
+            acquired_rx.try_recv().is_ok()
+        })
+        .await;
+        let running = tokio::spawn(driver);
+        let before = settled_load_baseline(&loads, &completed_loads).await;
+        assert_eq!(
+            before,
+            completed_loads.load(Ordering::Relaxed),
+            "prior async publication has settled"
+        );
+        wake.notify_one();
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            before,
+            "a busy lock delays the load instead of skipping it"
+        );
+        release.send(()).unwrap();
+        holding.join().unwrap();
+        until("the delayed wake is loaded", || {
+            loads.load(Ordering::Relaxed) > before
+        })
+        .await;
+        stop.send_replace(true);
+        running.await.unwrap();
+        fixture.finish();
+    }
+
     /// Verifies: TEAM.SYS.TRANS-R07
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn busy_runtime_lock_delays_but_does_not_drop_a_wake() {
@@ -1946,20 +2121,21 @@ mod tests {
         let runner = FakeRunner::new(SessionOutcome::Completed { truncated: false });
         let worker = start(&fixture, Arc::clone(&runner), SchedulerLimits::CURRENT);
         until("the first pass has run", || worker.loads_for_test() >= 1).await;
-        let before = worker.loads_for_test();
-
+        let (acquired, mut acquired_rx) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let held = Arc::clone(&fixture.state);
         let holding = std::thread::spawn(move || {
             let _guard = held
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = acquired.send(());
             let _ = released.recv();
         });
-        // Let the holding thread take the lock before the wake lands.
-        while fixture.state.try_lock().is_ok() {
-            std::thread::yield_now();
-        }
+        until("the intended thread holds the runtime lock", || {
+            acquired_rx.try_recv().is_ok()
+        })
+        .await;
+        let before = settled_load_baseline(&worker.loads, &worker.completed_loads).await;
 
         worker.wake();
         for _ in 0..200 {

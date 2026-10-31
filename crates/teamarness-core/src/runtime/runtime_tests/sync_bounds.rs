@@ -760,3 +760,130 @@ async fn shutdown_is_prompt_with_pending_backoff_and_an_inbound_session() {
     drop(held);
     cluster.finish().await;
 }
+
+/// Verifies: TEAM.SYS.TRANS-R07, TEAM.SYS.PKG-R10
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_saturation_preserves_reachable_unknown_and_failed_health() {
+    use crate::synchronization::PeerOutcome;
+    for (name, prior, expected) in [
+        (
+            "busy-reachable",
+            Some(PeerOutcome::Reachable),
+            crate::SyncAvailability::Current,
+        ),
+        ("busy-unknown", None, crate::SyncAvailability::CatchingUp),
+        (
+            "busy-failed",
+            Some(PeerOutcome::Failed),
+            crate::SyncAvailability::Offline,
+        ),
+    ] {
+        let cluster = SyncCluster::start(name, &["a", "b"]).await;
+        let workspace = cluster
+            .node("a")
+            .create_workspace("Busy peer")
+            .unwrap()
+            .id();
+        cluster.admit("a", "b", workspace).await;
+        cluster
+            .wait_until("both nodes have the roster", DEFAULT_DEADLINE, |c| {
+                c.members("b", workspace).len() == 2
+            })
+            .await;
+        pause_scheduling(&cluster, &["a", "b"]);
+        cluster
+            .wait_until("outbound sessions are idle", DEFAULT_DEADLINE, |c| {
+                ["a", "b"].iter().all(|name| {
+                    c.node(name)
+                        .scheduler_snapshot_for_test()
+                        .iter()
+                        .all(|peer| !peer.in_flight)
+                })
+            })
+            .await;
+        let _origin = cluster
+            .node("a")
+            .subscribe_records(workspace, PACKAGE, None)
+            .unwrap();
+        let mut subscription = cluster
+            .node("b")
+            .subscribe_records(workspace, PACKAGE, None)
+            .unwrap();
+        cluster
+            .node("b")
+            .replicate_records_to_address_for_test(
+                workspace,
+                PACKAGE,
+                cluster.address("a"),
+                cluster.identity("a"),
+            )
+            .await
+            .unwrap();
+        cluster
+            .node("b")
+            .append_record(workspace, PACKAGE, "message.post", b"due work")
+            .unwrap();
+        let initial = subscription.next_page(32).unwrap();
+        let live = subscription.next_page(32).unwrap();
+        assert_eq!(
+            initial.events.len() + live.events.len(),
+            1,
+            "drain the captured empty prefix and the later local record"
+        );
+        cluster.node("b").health.record_outcome(
+            crate::synchronization::scope_digest(PACKAGE, workspace),
+            cluster.identity("a"),
+            prior,
+            None,
+        );
+        assert_eq!(subscription.availability().unwrap().availability, expected);
+        // Reading the application acknowledgement completes the initiator before
+        // the responder's send.stopped() necessarily releases its inbound slot.
+        cluster
+            .wait_until(
+                "setup responder slots are released",
+                DEFAULT_DEADLINE,
+                |c| {
+                    c.node("a").inbound_package_sessions_for_test() == 0
+                        && c.node("b").inbound_package_sessions_for_test() == 0
+                },
+            )
+            .await;
+        // Hold the real responder's two per-peer slots before Hello. The third
+        // connection is refused as busy while the peer stays alive and reachable.
+        let first = cluster
+            .node("b")
+            .hold_package_sync_before_hello_for_test(cluster.address("a"))
+            .await;
+        let second = cluster
+            .node("b")
+            .hold_package_sync_before_hello_for_test(cluster.address("a"))
+            .await;
+        cluster
+            .wait_until("both inbound slots are held", DEFAULT_DEADLINE, |c| {
+                c.node("a").inbound_package_sessions_for_test() == 2
+            })
+            .await;
+        cluster.node("b").pause_sync_scheduler_for_test(false);
+        cluster.node("b").sync_now_for_test();
+        cluster
+            .wait_until(
+                "the busy session enters bounded retry backoff",
+                DEFAULT_DEADLINE,
+                |c| {
+                    c.node("b")
+                        .scheduler_snapshot_for_test()
+                        .iter()
+                        .any(|p| p.peer == c.identity("a") && p.failures > 0 && !p.in_flight)
+                },
+            )
+            .await;
+        assert_eq!(
+            subscription.availability().unwrap().availability,
+            expected,
+            "busy must preserve {name}"
+        );
+        drop((first, second));
+        cluster.finish().await;
+    }
+}

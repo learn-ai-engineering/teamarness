@@ -50,6 +50,7 @@ function descriptor(number: number, view: PackageUiView = "main"): OpenPackageMo
         processGeneration: 1,
       },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
+      nestedContent: false,
     },
   };
 }

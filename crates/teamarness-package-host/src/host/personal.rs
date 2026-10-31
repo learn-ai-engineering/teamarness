@@ -1,5 +1,5 @@
 //! The live Personal tier: install, reload, and remove one Personal Package
-//! while the Host runs (ADR 0031).
+//! while the Host runs (ADR 0036).
 //!
 //! The Team tier is admitted at open and never changes. The Personal tier is
 //! every installation registration without `overrideApplication`. This module
@@ -614,6 +614,10 @@ impl PackageHost {
         let running = {
             let mut entries = self.inner.personal.write();
             entries.providers.retain(|_, provider| provider != identity);
+            self.inner
+                .port_broker
+                .access
+                .set_personal_providers(entries.providers.clone());
             entries.catalog.remove(identity);
             entries.packages.remove(identity).is_some()
         };
@@ -658,6 +662,10 @@ impl PackageHost {
         {
             let mut entries = self.inner.personal.write();
             entries.providers.extend(providers);
+            self.inner
+                .port_broker
+                .access
+                .set_personal_providers(entries.providers.clone());
             if let Some(catalog) = catalog {
                 entries.catalog.insert(identity.clone(), catalog);
             }

@@ -1,7 +1,8 @@
-import { describePackageError, isAbortError } from "@teamarness/package-ui-sdk";
+import { describePackageError, isAbortError, packageErrorCode } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
-import type { Collection, Comment, Document, DocumentsContract, Names, Snapshot, TextEvent } from "./contract.generated";
-import { DocumentEditor } from "./editor";
+import type { Collection, Comment, Document, DocumentsContract, Names, Snapshot } from "./contract.generated";
+import { EditorSession, clientBridge } from "./editor/session";
+import type { LostNotice, SessionState } from "./editor/session";
 import { authorLabel } from "./markdown";
 
 export type ControllerState = Readonly<{
@@ -12,8 +13,6 @@ export type ControllerState = Readonly<{
   commentsCursor: string | null;
   commentsLoading: boolean;
   names: Names;
-  /** Document body shown as rendered Markdown instead of the editor. */
-  preview: boolean;
   showArchived: boolean;
   busy: boolean;
   error: string | null;
@@ -36,7 +35,6 @@ export class DocumentsController {
     commentsCursor: null,
     commentsLoading: false,
     names: { available: false, cursor: "0", persons: [] },
-    preview: false,
     showArchived: false,
     busy: false,
     error: null,
@@ -44,9 +42,8 @@ export class DocumentsController {
   private disposed = false;
   /** A Collection this Installation just created, selected once its record is listed. */
   private pendingSelectionId: string | null = null;
-  /** The editor for the open Document and its text subscription. */
-  private editor: DocumentEditor | null = null;
-  private textSubscription: { close(): Promise<void> } | null = null;
+  /** The editor session of the open Document. */
+  private session: EditorSession | null = null;
   private openSequence = 0;
   private commentsSequence = 0;
   private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
@@ -60,8 +57,26 @@ export class DocumentsController {
     return this._state;
   }
 
-  get openEditor(): DocumentEditor | null {
-    return this.editor;
+  /** The open Document's editor session state, once its session has started. */
+  get openSession(): SessionState | null {
+    return this.session?.state ?? null;
+  }
+
+  /** The open Document's editor session: its Loro document, export cadence and size. */
+  get editorSession(): EditorSession | null {
+    return this.session;
+  }
+
+  /** The open Document as Canonical Markdown, read from the Backend in chunks. */
+  async documentMarkdown(): Promise<string> {
+    const documentId = this._state.openDocumentId;
+    if (documentId === null) throw new Error("No Document is open.");
+    try {
+      return await readChunkedMarkdown((chunkIndex) =>
+        this.client.request("documents.document.markdown", { documentId, chunkIndex }));
+    } catch (error) {
+      throw new Error(describeError(error), { cause: error });
+    }
   }
 
   get openDocument(): Document | null {
@@ -95,10 +110,10 @@ export class DocumentsController {
     if (this.disposed) return;
     // Any committed record may be a Comment on the open Document; refresh its thread.
     void this.refreshComments();
-    if (this._state.openDocumentId !== null && this.editor !== null
-      && !this.editor.current.editable && !this.editor.assembling
-      && this.editor.current.reason !== "identity_conflict"
-      && this.editor.current.reason !== "import_failure") {
+    // A body still waiting for history may open now; its session reloads once it can.
+    const session = this.session?.state;
+    if (this._state.openDocumentId !== null && session !== undefined && session.phase === "ready"
+      && !session.editable && session.reason === undefined) {
       void this.retryOpen(this._state.openDocumentId, this.openSequence);
     }
     const visible = snapshot.collections.filter((c) => this._state.showArchived || !c.archived);
@@ -120,40 +135,31 @@ export class DocumentsController {
     }
   }
 
-  /** Opens a Document for editing: fetches its text, then follows its text events. */
+  /** Opens a Document: starts its editor session, which loads the body from a snapshot. */
   async openDocumentById(documentId: string): Promise<void> {
     if (this.disposed || this._state.openDocumentId === documentId) return;
+    // Cleared before the close, so the notice of changes the closing session lost stays shown.
+    this.update({ error: null });
     await this.closeDocument();
     const sequence = ++this.openSequence;
-    this.update({ openDocumentId: documentId, comments: [], commentsCursor: null, commentsLoading: false, error: null });
+    this.update({ openDocumentId: documentId, comments: [], commentsCursor: null, commentsLoading: false });
     void this.refreshComments();
-    try {
-      const subscription = await this.client.subscribe("documents.document.text", { documentId }, (event) => {
-        if (this.disposed || sequence !== this.openSequence) return;
-        this.onTextEvent(event);
-      });
-      if (this.disposed || sequence !== this.openSequence) {
-        await subscription.close();
-        return;
-      }
-      this.textSubscription = subscription;
-      await this.retryOpen(documentId, sequence);
-    } catch (error) {
-      if (sequence !== this.openSequence || this.disposed) return;
-      this.update({ openDocumentId: null, error: describeError(error) });
-    }
+    const session = new EditorSession({
+      bridge: clientBridge(this.client),
+      documentId,
+      onChange: () => { if (!this.disposed && sequence === this.openSequence) this.announce(); },
+      // A session closed with unacknowledged changes reports them too, after its Document closed.
+      onLost: (notice) => {
+        if (!this.disposed) this.update({ error: sequence === this.openSequence ? lostMessage(notice) : CLOSED_LOST_MESSAGE });
+      },
+    });
+    this.session = session;
+    await session.start();
   }
 
   private async retryOpen(documentId: string, sequence: number): Promise<void> {
     try {
-      const outstanding = this.editor?.current.documentId === documentId ? this.editor.outstandingIds : [];
-      if (outstanding.length > 0) {
-        const transferId = globalThis.crypto.randomUUID().replaceAll("-", "");
-        this.editor?.beginRecovery(transferId);
-        await this.client.request("documents.document.recover", { documentId, transferId, requestIds: outstanding });
-      } else {
-        await this.client.request("documents.document.open", { documentId });
-      }
+      await this.client.request("documents.document.open", { documentId });
     } catch (error) {
       if (!this.disposed && sequence === this.openSequence && !isAbortError(error)) {
         this.update({ error: describeError(error) });
@@ -164,11 +170,10 @@ export class DocumentsController {
   async closeDocument(): Promise<void> {
     this.openSequence += 1;
     this.commentsSequence += 1;
-    const subscription = this.textSubscription;
-    this.textSubscription = null;
-    this.editor = null;
+    const session = this.session;
+    this.session = null;
     if (this._state.openDocumentId !== null) this.update({ openDocumentId: null, comments: [], commentsCursor: null, commentsLoading: false });
-    if (subscription) await subscription.close();
+    await session?.dispose();
   }
 
   async refreshComments(): Promise<void> {
@@ -234,40 +239,6 @@ export class DocumentsController {
     const ok = (await this.perform(() => this.client.request("documents.comment.reopen", { commentId }))) !== null;
     if (ok) await this.refreshComments();
     return ok;
-  }
-
-  /** Called by the view with the caret so a remote change can move it. */
-  receiveText(event: TextEvent, caret: { start: number; end: number } | null): { start: number; end: number } | null {
-    if (event.documentId !== this._state.openDocumentId) return caret;
-    if (this.editor === null || this.editor.current.documentId !== event.documentId) {
-      if (event.text === undefined && event.transfer !== "begin") {
-        void this.retryOpen(event.documentId, this.openSequence);
-        return caret;
-      }
-      this.editor = new DocumentEditor(
-        event.transfer === "begin" ? { documentId: event.documentId, revision: "0", editable: false, text: "" } : event,
-        async (documentId, baseRevision, ops, requestId) => {
-          const { revision } = await this.client.request("documents.document.edit", { documentId, requestId, baseRevision, ops });
-          return { revision };
-        },
-        this.announce,
-        () => { void this.retryOpen(event.documentId, this.openSequence); },
-      );
-      this.announce();
-      return event.transfer === "begin" ? this.editor.receive(event, caret) : caret;
-    }
-    return this.editor.receive(event, caret);
-  }
-
-  private onTextEvent(event: TextEvent): void {
-    this.textListener?.(event);
-  }
-
-  /** The view installs this to supply the caret when an event arrives. */
-  textListener: ((event: TextEvent) => void) | null = null;
-
-  togglePreview(): void {
-    this.update({ preview: !this._state.preview });
   }
 
   /** The current Workspace Person Name for an author identity, with duplicate detection. */
@@ -372,8 +343,50 @@ export class DocumentsController {
   }
 }
 
+type MarkdownChunk = DocumentsContract["requests"]["documents.document.markdown"]["response"];
+
+/** How many times a Markdown read starts over when the Document changes while it is read. */
+export const MARKDOWN_READ_ATTEMPTS = 3;
+
+/**
+ * Reads a chunked Markdown export. Every chunk must carry the first chunk's digest and count;
+ * when one does not, the Document changed meanwhile and the read starts over from chunk 0. When
+ * the frame can hash, the reassembled text is checked against the digest too.
+ */
+export async function readChunkedMarkdown(read: (chunkIndex: number) => Promise<MarkdownChunk>): Promise<string> {
+  for (let attempt = 0; attempt < MARKDOWN_READ_ATTEMPTS; attempt += 1) {
+    const first = await read(0);
+    const parts = [first.chunk];
+    let consistent = first.chunkIndex === 0;
+    for (let index = 1; consistent && index < first.chunks; index += 1) {
+      const next = await read(index);
+      consistent = next.digest === first.digest && next.chunks === first.chunks && next.chunkIndex === index;
+      parts.push(next.chunk);
+    }
+    if (!consistent) continue;
+    const text = parts.join("");
+    if (await digestMatches(text, first.digest)) return text;
+  }
+  throw new Error("The Document kept changing while it was read; try again.");
+}
+
+async function digestMatches(text: string, digest: string): Promise<boolean> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) return true;
+  const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("") === digest;
+}
+
+const CLOSED_LOST_MESSAGE = "Your last changes to the Document you closed could not be confirmed as saved.";
+
+function lostMessage(notice: LostNotice): string {
+  return notice.requests > 0
+    ? "The Document was reloaded; your most recent changes could not be saved."
+    : "The Document was reloaded; changes not yet sent were discarded.";
+}
+
 function describeError(error: unknown): string {
-  const code = (error as { code?: unknown } | null)?.code;
+  const code = packageErrorCode(error) ?? (error as { code?: unknown } | null)?.code;
   switch (code) {
     case "documents.invalid_name":
       return "Collection names are 1 to 128 characters with no leading or trailing spaces.";
@@ -391,6 +404,10 @@ function describeError(error: unknown): string {
       return "A quote is at most 2 KiB.";
     case "documents.deferred":
       return "Saved locally; it will apply once its Collection arrives.";
+    case "documents.document_pending":
+      return "This Document is still waiting for its history.";
+    case "documents.unavailable":
+      return "This Document is unavailable.";
     default:
       return describePackageError(error);
   }

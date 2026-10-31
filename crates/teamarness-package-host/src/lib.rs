@@ -10,13 +10,15 @@ mod authority;
 #[cfg(feature = "test-hooks")]
 mod test_hooks;
 #[cfg(feature = "test-hooks")]
-pub use test_hooks::AuthorityPause;
+pub use test_hooks::{AuthorityPause, PortSelectionPause};
 mod broker;
+mod port_access;
 mod port_observation;
 pub use port_observation::{PortObservation, PortObservations, PortStage};
 mod capability;
 mod catalog;
 mod commands;
+mod content_views;
 mod data_directory;
 mod diag;
 mod errors;
@@ -40,8 +42,8 @@ pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
     InstallPersonal, OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome,
-    ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal, RemoveOverride,
-    RemovePersonal, ReportUiFault, RestartPersonal, ShutdownHost, SuspendPackage,
+    ReadContent, ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal,
+    RemoveOverride, RemovePersonal, ReportUiFault, RestartPersonal, ShutdownHost, SuspendPackage,
     UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext, WriteOverride,
 };
 pub use crate::errors::{
@@ -57,13 +59,13 @@ pub use crate::subscriptions::{
 };
 pub use crate::ui::MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 pub use crate::values::{
-    DiagnosticId, HostRevision, InspectedCapability, InspectedPackage, InspectedPackageKind,
-    InspectedPresentation, InstallationPublicIdentity, InstallationRegistrationSnapshot,
-    LifecycleState, MountState, PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot,
-    PackageHostState, PackageIdentity, PackageInstanceKey, PackageInstanceSnapshot,
-    PackageSourceKind, PackageTier, PackageTrustKind, PackageUiView, PackageValue,
-    PendingRegistrationChange, RegistrationRequest, RegistrationStatus, UiMountId, UiRequestId,
-    UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
+    ContentViewToken, DiagnosticId, HostRevision, InspectedCapability, InspectedPackage,
+    InspectedPackageKind, InspectedPresentation, InstallationPublicIdentity,
+    InstallationRegistrationSnapshot, LifecycleState, MountState, PackageCatalogEntry,
+    PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity, PackageInstanceKey,
+    PackageInstanceSnapshot, PackageSourceKind, PackageTier, PackageTrustKind, PackageUiView,
+    PackageValue, PendingRegistrationChange, RegistrationRequest, RegistrationStatus, UiMountId,
+    UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
 };
 
 use crate::errors::host_error;
@@ -98,7 +100,7 @@ struct PackageHostInner {
     revisions: watch::Sender<HostRevision>,
     config: PackageHostConfig,
     core: Arc<teamarness_core::CoreRuntime>,
-    // The Team tier, fixed at open and never changed while the Host runs (ADR 0031).
+    // The Team tier, fixed at open and never changed while the Host runs (ADR 0036).
     team: host::personal::TeamTier,
     templates: Vec<supervisor::ProcessTemplate>,
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
@@ -278,6 +280,7 @@ impl PackageHost {
             PackageHostCommand::RestartPersonal(input) => self.restart_personal(input).await,
             PackageHostCommand::WriteOverride(input) => self.write_override(input).await,
             PackageHostCommand::RemoveOverride(input) => self.remove_override(input).await,
+            PackageHostCommand::ReadContent(input) => self.read_content(input).await,
             PackageHostCommand::Shutdown(_) => self.shutdown_host().await,
         }
     }

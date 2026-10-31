@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
-use teamarness_package_host::{InstallationPublicIdentity, PackageHostConfig};
+use teamarness_package_host::{
+    InstallationPublicIdentity, PackageHost, PackageHostCommand, PackageHostConfig,
+};
 use tempfile::TempDir;
 
 pub struct Fixture {
@@ -106,7 +108,7 @@ pub fn write_node_package_with_capabilities(
     fs::write(&backend_path, &backend).unwrap();
     fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
     let entrypoint = b"export function mount() { return async () => {}; }";
-    let contract = serde_json::to_vec(&serde_json::json!({
+    let mut contract = serde_json::json!({
         "schemaVersion": 1,
         "$defs": {},
         "requests": {
@@ -155,8 +157,15 @@ pub fn write_node_package_with_capabilities(
             "fixture.rejected_stream": {"request": {}, "event": {}},
             "fixture.saturation": {"request": {}, "event": {}}
         }
-    }))
-    .unwrap();
+    });
+    contract["requests"]["fixture.port_release"] = serde_json::json!({"request":{},"response":{}});
+    contract["requests"]["fixture.port_query_stats"] =
+        serde_json::json!({"request":{},"response":{}});
+    contract["requests"]["fixture.port_query_emit"] =
+        serde_json::json!({"request":{},"response":{}});
+    contract["requests"]["fixture.port_last_actor"] =
+        serde_json::json!({"request":{},"response":{}});
+    let contract = serde_json::to_vec(&contract).unwrap();
     fs::write(root.join("ui/index.js"), entrypoint).unwrap();
     fs::write(root.join("ui/icon.svg"), b"<svg/>").unwrap();
     fs::write(root.join("ui/contract.json"), &contract).unwrap();
@@ -245,4 +254,71 @@ where
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Give broker safety examples a real guide-bearing contract and bound Agent callers.
+pub fn prepare_agent_ports(fixture: &Fixture, consumers: &[&str]) -> serde_json::Value {
+    let root = fixture.config.application_root().join("provider");
+    let ports = root.join("ports.json");
+    if ports.exists() {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ports).unwrap()).unwrap();
+        document["contracts"][0]["ports"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":"runtime.guide","kind":"query","description":"Fixture guidance",
+            "request":{"type":"object","additionalProperties":false},
+            "response":{"type":"object","additionalProperties":false,"required":["markdown"],"properties":{"markdown":{"type":"string","maxLength":100}}}
+        }));
+        let bytes = serde_json::to_vec(&document).unwrap();
+        fs::write(ports, &bytes).unwrap();
+        let path = root.join("teamarness.package.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["portContract"]["sha256"] = digest(&bytes).into();
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    let mut actors = serde_json::Map::new();
+    for workspace in fixture.core.list_workspaces().unwrap() {
+        let agent = fixture
+            .core
+            .add_agent(workspace.id(), "Broker safety Agent")
+            .unwrap();
+        let identity = fixture
+            .core
+            .principal(workspace.id(), agent)
+            .unwrap()
+            .unwrap()
+            .keys()[0]
+            .to_string();
+        for consumer in consumers {
+            fixture
+                .core
+                .bind_agent_package(workspace.id(), agent, consumer)
+                .unwrap();
+        }
+        actors.insert(
+            workspace.id().to_string(),
+            serde_json::json!({"kind":"agent","principal":agent.to_string(),"identity":identity}),
+        );
+    }
+    serde_json::Value::Object(actors)
+}
+
+pub async fn enable_agent_ports(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    major: u16,
+) {
+    let outcome = host.execute(PackageHostCommand::UiRequest(teamarness_package_host::UiRequest {
+        mount: mount.clone(),
+        request: teamarness_package_host::UiRequestId::new("enable-safety-contract").unwrap(),
+        operation: "fixture.capability".into(),
+        payload: serde_json::from_value(serde_json::json!({"capability":"teamarness.package-ports","method":"enable","arguments":{"contract":"com.example.messages","major":major}})).unwrap(),
+    })).await.unwrap();
+    let teamarness_package_host::PackageHostOutcome::UiResponse { payload } = outcome else {
+        panic!("enable response")
+    };
+    assert_eq!(
+        serde_json::to_value(payload).unwrap()["result"]["enabled"],
+        true
+    );
 }

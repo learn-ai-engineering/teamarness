@@ -11,6 +11,7 @@ members = [
     "packages/conversations-package/backend",
     "packages/repo-aware/backend",
     "packages/documents-package/backend",
+    "packages/exhibits-package/backend",
     "tests/system",
 ]
 resolver = "3"
@@ -50,6 +51,8 @@ tauri-plugin-dialog = "=2.7.3"
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 uuid = { version = "=1.26.1", default-features = false, features = ["v4"] }
+comrak = { version = "=0.57.0", default-features = false }
+proptest = "=1.12.0"
 chrono = { version = "=0.4.45", default-features = false, features = ["now", "serde"] }
 curve25519-dalek = { version = "=5.0.0", default-features = false }
 hpke-rs = "=0.7.0"

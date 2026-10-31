@@ -40,6 +40,10 @@
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
   },
+  "portContract": {
+    "path": "ports.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
   "capabilities": [
     {
       "identity": "teamarness.workspace-context",
@@ -81,7 +85,8 @@
         "ui.entrypoint.sha256",
         "ui.assets.0.size",
         "ui.assets.0.sha256",
-        "ui.contract.sha256"
+        "ui.contract.sha256",
+        "portContract.sha256"
       ]
     }
   }

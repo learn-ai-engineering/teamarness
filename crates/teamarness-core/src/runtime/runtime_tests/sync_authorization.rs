@@ -2312,6 +2312,68 @@ async fn forged_scope_record_is_rejected_without_ending_the_session() {
         )
     };
 
+    // This test injects one raw session, not a scheduler job with Busy backoff.
+    // Establish ownership of the responder slots before testing record handling.
+    for name in ["a", "m", "b"] {
+        cluster.node(name).pause_sync_scheduler_for_test(true);
+    }
+    cluster
+        .wait_until(
+            "raw injection has no competing sessions",
+            DEFAULT_DEADLINE,
+            |c| {
+                ["a", "m", "b"].iter().all(|name| {
+                    c.node(name)
+                        .scheduler_snapshot_for_test()
+                        .iter()
+                        .all(|peer| !peer.in_flight)
+                        && c.node(name).inbound_package_sessions_for_test() == 0
+                })
+            },
+        )
+        .await;
+    // Deterministically distinguish pre-Hello Busy from a record-handling refusal.
+    let first = cluster
+        .node("m")
+        .hold_package_sync_before_hello_for_test(cluster.address("b"))
+        .await;
+    let second = cluster
+        .node("m")
+        .hold_package_sync_before_hello_for_test(cluster.address("b"))
+        .await;
+    cluster
+        .wait_until(
+            "test owns both raw injection responder slots",
+            DEFAULT_DEADLINE,
+            |c| c.node("b").inbound_package_sessions_for_test() == 2,
+        )
+        .await;
+    let refused = cluster
+        .node("m")
+        .deliver_operations_for_test(
+            cluster.address("b"),
+            id,
+            PACKAGE,
+            cluster.identity("b"),
+            vec![forged.clone()],
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::synchronization::LogSessionError::PeerBusy)
+        ),
+        "full responder slots refuse before record handling: {refused:?}"
+    );
+    drop((first, second));
+    cluster
+        .wait_until(
+            "raw injection responder slots are released",
+            DEFAULT_DEADLINE,
+            |c| c.node("b").inbound_package_sessions_for_test() == 0,
+        )
+        .await;
+
     let applied = cluster
         .node("m")
         .deliver_operations_for_test(

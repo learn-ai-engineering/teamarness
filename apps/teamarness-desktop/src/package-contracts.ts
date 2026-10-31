@@ -29,7 +29,7 @@ export type PackageInstance = Readonly<{
   mountState: "opening" | "mounted" | "failed" | "closing" | "closed" | null;
 }>;
 
-/** One installation registration, with its admission tier and result (ADR 0031). */
+/** One installation registration, with its admission tier and result (ADR 0036). */
 export type PackageRegistration = Readonly<{
   directory: string;
   expectedIdentity: string;
@@ -130,6 +130,7 @@ export type PackageLoader = Readonly<{
   }>;
   workspace: Readonly<{ id: string; name: string }>;
   view: PackageUiView;
+  nestedContent: boolean;
 }>;
 
 export type OpenPackageMount = Readonly<{ mount: string; loader: PackageLoader }>;

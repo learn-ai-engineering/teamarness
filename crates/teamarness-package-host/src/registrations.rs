@@ -1,5 +1,5 @@
 //! The installation registration store: inspect a Package Directory, then add or
-//! remove its entry in `registrations.v1.json` (ADR 0031).
+//! remove its entry in `registrations.v1.json` (ADR 0036).
 //!
 //! The store shares one definition of a valid file with the reader in
 //! [`crate::catalog`]. It refuses to rewrite a file that breaks the file policy

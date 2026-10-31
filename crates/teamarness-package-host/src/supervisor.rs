@@ -54,6 +54,8 @@ pub(crate) struct ProcessTemplate {
 pub(crate) struct CallEnvironment {
     pub(crate) limiter: crate::capability::CoreCallLimiter,
     pub(crate) limits: crate::protocol::ProtocolLimits,
+    /// The Host-wide content view table: Packages open views into it, the Shell reads them.
+    pub(crate) content_views: Arc<crate::content_views::ContentViews>,
 }
 
 #[derive(Clone)]
@@ -97,6 +99,8 @@ pub(crate) async fn spawn(
             workspace_id: spec.workspace_id.clone(),
             workspace_name: spec.workspace_name.clone(),
             installation: spec.installation.clone(),
+            data_directory: spec.data_directory.clone(),
+            content_views: Arc::clone(&spec.calls.content_views),
         },
         &spec.template.capabilities,
         generation,
@@ -460,6 +464,7 @@ mod tests {
             calls: CallEnvironment {
                 limiter: crate::capability::CoreCallLimiter::new(),
                 limits: crate::protocol::ProtocolLimits::CURRENT,
+                content_views: Arc::default(),
             },
             store: HostStoreHandle::open(private.clone()).await.unwrap(),
             broker: std::sync::Weak::new(),

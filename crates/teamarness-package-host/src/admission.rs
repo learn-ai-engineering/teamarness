@@ -97,7 +97,7 @@ pub(crate) struct FixedGraph<'a> {
 
 impl<'a> FixedGraph<'a> {
     /// The Team tier as the Personal tier sees it: every Team Provider is fixed and
-    /// every contract the Team tier provides is reserved (ADR 0031).
+    /// every contract the Team tier provides is reserved (ADR 0036).
     pub(crate) fn team(team: &'a TierOutcome) -> Self {
         Self {
             admitted: team
@@ -148,7 +148,7 @@ pub(crate) fn admit(
 /// Identity collisions are resolved across every registration first. The Team
 /// tier (bundled Packages and override registrations) is then admitted over Team
 /// Providers only. The Personal tier (every other installation registration) is
-/// admitted next against the fixed Team graph (ADR 0031).
+/// admitted next against the fixed Team graph (ADR 0036).
 pub(crate) fn admit_installation(
     config: &PackageHostConfig,
     store: &HostStore,
@@ -393,7 +393,7 @@ pub(crate) struct LiveVerdict {
     pub(crate) diagnostics: Vec<PackageErrorEnvelope>,
 }
 
-/// Admits one Personal registration against the running Host (ADR 0031).
+/// Admits one Personal registration against the running Host (ADR 0036).
 ///
 /// `running` holds every admitted Package except the candidate's own identity:
 /// the Team tier and the other running Personal Packages, with `providers`

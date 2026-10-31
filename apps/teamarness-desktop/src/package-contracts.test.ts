@@ -8,3 +8,7 @@ it("keeps wide event sequences as decimal strings and bridge fixtures path-free"
     expect(encoded).not.toContain(forbidden);
   }
 });
+
+it("reports whether a mount may nest content frames", () => {
+  expect(fixture.loader.nestedContent).toBe(false);
+});
