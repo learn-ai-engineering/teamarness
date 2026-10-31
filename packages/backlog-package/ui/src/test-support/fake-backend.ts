@@ -35,6 +35,8 @@ export function createFakeBacklog(seed: { epics?: FakeEpic[]; tickets?: Partial<
   const tickets = new Map<string, FakeTicket>();
   let clock = 1000;
   let remembered: RememberedState | null = null;
+  /** Set by a test to refuse stale saves without the body, as the Backend does for large Tickets. */
+  let omitStaleBody = false;
   const LOCAL = "local-identity";
   const next = () => ++clock;
 
@@ -79,6 +81,11 @@ export function createFakeBacklog(seed: { epics?: FakeEpic[]; tickets?: Partial<
     const ticket = tickets.get(String(payload.ticketId));
     if (!ticket) throw failure("backlog.not_found", { id: String(payload.ticketId) });
     if (payload.baseVersion !== ticket.version) {
+      if (omitStaleBody) {
+        const { body: _body, ...rest } = full(ticket);
+        void _body;
+        throw failure("backlog.stale_version", { ticket: rest as unknown as PackageValue, bodyOmitted: true });
+      }
       throw failure("backlog.stale_version", { ticket: full(ticket) as unknown as PackageValue });
     }
     change(ticket);
@@ -168,7 +175,10 @@ export function createFakeBacklog(seed: { epics?: FakeEpic[]; tickets?: Partial<
     publish: () => publish(),
     /** The mutating requests the UI made, in order. */
     requests: () => fake.calls.filter((call) => call.operation.startsWith("backlog.") && call.operation !== "backlog.changes"
-      && call.operation !== "backlog.names"),
+      && call.operation !== "backlog.names" && call.operation !== "backlog.ticket.get" && call.operation !== "backlog.draft.get"),
+    /** The `backlog.ticket.get` reads the UI made, by Ticket ID. */
+    reads: () => fake.calls.filter((call) => call.operation === "backlog.ticket.get")
+      .map((call) => (call.payload as { ticketId: string }).ticketId),
     /** Changes a Ticket as another Installation would, without the UI asking. */
     remoteChange(ticketId: string, change: Partial<FakeTicket>): void {
       const ticket = tickets.get(ticketId);
@@ -182,6 +192,8 @@ export function createFakeBacklog(seed: { epics?: FakeEpic[]; tickets?: Partial<
       return release;
     },
     get remembered() { return remembered; },
+    get omitStaleBody() { return omitStaleBody; },
+    set omitStaleBody(value: boolean) { omitStaleBody = value; },
   };
 }
 

@@ -12,7 +12,7 @@ describe("Backlog mount", () => {
     const backlog = createFakeBacklog({ epics: [{ epicId: recordId(1), title: "Launch", archived: false, createdOrder: order(1) }] });
     const root = host.attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ root, client: backlog.client, displayName: "Backlog" }));
-    expect(backlog.fake.calls.map((call) => call.operation)).toEqual(["backlog.changes"]);
+    expect(backlog.fake.calls.map((call) => call.operation)).toEqual(["backlog.changes", "backlog.names"]);
     expect(root.querySelector("h1")?.textContent).toBe("Backlog");
     expect(root.querySelector(".backlog-empty")?.textContent).toBe("Loading…");
     expect(root.querySelector("[role=status]")?.textContent).toBe("Catching up");

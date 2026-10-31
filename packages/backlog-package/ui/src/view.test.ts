@@ -291,12 +291,14 @@ describe("Backlog actions", () => {
     expect(q(".ticket-actions")).not.toBeNull();
   });
 
-  it("selects a Ticket and shows it in the detail placeholder", async () => {
+  it("selects a Ticket and shows it in the detail pane", async () => {
     const { root, q } = await mounted();
-    expect(q(".ticket-detail-title").textContent).toBe("Choose a Ticket");
+    expect(q(".ticket-detail-placeholder").hidden).toBe(false);
+    expect(q(".ticket-detail-content").hidden).toBe(true);
     const title = [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((b) => b.textContent?.startsWith("High done"))!;
     title.click();
     expect(q('.ticket-title[aria-current="true"]').textContent).toContain("High done");
+    expect(q(".ticket-detail-placeholder").hidden).toBe(true);
     expect(q(".ticket-detail-title").textContent).toBe("High done");
   });
 

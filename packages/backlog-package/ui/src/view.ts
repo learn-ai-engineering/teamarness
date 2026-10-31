@@ -1,6 +1,7 @@
 import type { Epic, Priority, Status, TicketSummary } from "./contract.generated";
-import { PRIORITIES, PRIORITY_LABEL, STATUSES, STATUS_LABEL } from "./controller";
-import type { BacklogController } from "./controller";
+import { MAX_TITLE, PRIORITIES, PRIORITY_LABEL, STATUSES, STATUS_LABEL } from "./controller";
+import type { BacklogController, ControllerState } from "./controller";
+import { TicketDetailView } from "./detail";
 import { Listbox } from "./listbox";
 
 const KIT = {
@@ -18,9 +19,6 @@ const AVAILABILITY_LABEL = {
   offline: "Offline",
   waiting_for_history_access: "Waiting for history access",
 } as const;
-
-/** Titles are at most 256 characters (Backend `MAX_TITLE`). */
-const MAX_TITLE = 256;
 
 function button(label: string, className: string, onClick: () => void): HTMLButtonElement {
   const element = document.createElement("button");
@@ -138,8 +136,9 @@ export class BacklogView {
   private readonly statusFilter: Listbox<FilterValue<Status>>;
   private readonly clearPriority: HTMLButtonElement;
   private readonly clearStatus: HTMLButtonElement;
-  private readonly detailTitle: HTMLElement;
-  private readonly detailPlaceholder: HTMLElement;
+  private readonly detail: TicketDetailView;
+  /** The state the tree was last built from; typing in the detail pane leaves the tree alone. */
+  private treeInputs: readonly unknown[] = [];
   private readonly controller: BacklogController;
   /** `"epic"` while the New Epic form shows, an Epic ID while its Add Ticket form shows. */
   private createTarget: string | null = null;
@@ -200,7 +199,7 @@ export class BacklogView {
     const addEpic = icon("plus", "New Epic", () => {
       this.createGeneration++;
       this.createTarget = "epic";
-      this.render();
+      this.refresh();
       this.epicForm.input.focus();
     });
     addEpic.classList.add("epic-add");
@@ -251,7 +250,7 @@ export class BacklogView {
         const ok = await controller.createEpic(value);
         if (ok && generation === this.createGeneration && this.createTarget === "epic") {
           this.createTarget = null;
-          this.render();
+          this.refresh();
         }
         return ok;
       },
@@ -266,27 +265,23 @@ export class BacklogView {
         const ok = await controller.createTicket(target, value);
         if (ok && generation === this.createGeneration && this.createTarget === target) {
           this.createTarget = null;
-          this.render();
+          this.refresh();
         }
         return ok;
       },
     });
     this.epicForm.input.addEventListener("input", () => { this.createGeneration++; });
     this.ticketForm.input.addEventListener("input", () => { this.createGeneration++; });
-    const cancelCreate = () => { this.createGeneration++; this.createTarget = null; this.render(); };
+    const cancelCreate = () => { this.createGeneration++; this.createTarget = null; this.refresh(); };
     this.epicForm.form.append(icon("x", "Cancel", cancelCreate));
     this.ticketForm.form.append(icon("x", "Cancel", cancelCreate));
     rail.append(railHeader, filters, this.epicList);
 
-    // --- detail pane (Ticket detail arrives in a later slice) ---
+    // --- detail pane ---
     const detail = document.createElement("section");
     detail.className = "ticket-detail";
     detail.setAttribute("aria-label", "Ticket");
-    this.detailTitle = document.createElement("h2");
-    this.detailTitle.className = "ticket-detail-title";
-    this.detailPlaceholder = document.createElement("p");
-    this.detailPlaceholder.className = "ticket-detail-placeholder";
-    detail.append(this.detailTitle, this.detailPlaceholder);
+    this.detail = new TicketDetailView(detail, controller);
 
     shell.append(rail, detail);
     this.page.append(header, this.warnings, this.error, shell);
@@ -321,26 +316,34 @@ export class BacklogView {
       this.ticketForm.input.value = "";
     }
     this.ticketForm.submit.disabled = busy;
-    this.renderTree(loaded);
-    this.renderDetail();
+    if (this.treeChanged(this.controller.state)) this.renderTree(loaded);
+    this.detail.render();
+  }
+
+  /** Whether the tree's inputs changed since it was last built. View-local changes clear the memo. */
+  private treeChanged(state: ControllerState): boolean {
+    const inputs = [state.snapshot, state.loaded, state.showArchived, state.filters, state.expandedEpicIds,
+      state.selectedTicketId, state.busy];
+    const same = inputs.length === this.treeInputs.length && inputs.every((value, index) => value === this.treeInputs[index]);
+    this.treeInputs = inputs;
+    return !same;
+  }
+
+  /** Re-renders after a change only the view knows about (an inline form opened or closed). */
+  private refresh(): void {
+    this.treeInputs = [];
+    this.render();
   }
 
   dispose(): void {
     this.dismissMenu();
     this.priorityFilter.dispose();
     this.statusFilter.dispose();
+    this.detail.dispose();
     this.page.getRootNode().removeEventListener("click", this.onOutsideClick);
     this.page.getRootNode().removeEventListener("keydown", this.onEscape);
     document.removeEventListener("click", this.onOutsideClick);
     this.page.remove();
-  }
-
-  private renderDetail(): void {
-    const ticket = this.controller.selectedTicket;
-    this.detailTitle.textContent = ticket?.title ?? "Choose a Ticket";
-    this.detailPlaceholder.textContent = ticket === null
-      ? "Select a Ticket in the tree to see it here."
-      : `${PRIORITY_LABEL[ticket.priority]} priority · ${STATUS_LABEL[ticket.status]}`;
   }
 
   private dismissMenu(): void {
@@ -375,7 +378,7 @@ export class BacklogView {
       onSubmit: async (value) => {
         const ok = await this.controller.renameEpic(epic.epicId, value);
         if (ok) { this.renameTarget = null; this.renameForm = null; }
-        this.render();
+        this.refresh();
         return ok;
       },
     });
@@ -383,10 +386,10 @@ export class BacklogView {
     rename.form.append(icon("x", "Cancel", () => {
       this.renameTarget = null;
       this.renameForm = null;
-      this.render();
+      this.refresh();
     }));
     this.renameForm = rename;
-    this.render();
+    this.refresh();
     rename.input.focus();
   }
 
@@ -462,7 +465,7 @@ export class BacklogView {
         this.controller.expandEpic(epic.epicId);
         this.createGeneration++;
         this.createTarget = epic.epicId;
-        this.render();
+        this.refresh();
         this.ticketForm.input.focus();
       });
       add.dataset.treeFocus = `epic:add:${epic.epicId}`;
