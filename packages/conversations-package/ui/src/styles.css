@@ -43,6 +43,9 @@ button, input, textarea { font: inherit; }
 .message-markdown pre { max-width: 100%; overflow: auto; padding: .6rem; background: var(--teamarness-color-panel); }
 .message-markdown code { font-family: ui-monospace, monospace; }
 .message-markdown a { color: var(--teamarness-color-accent); }
+.message-markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: .3rem 0 .5rem; }
+.message-markdown th, .message-markdown td { border: 1px solid var(--teamarness-color-border); padding: .25rem .5rem; text-align: left; vertical-align: top; }
+.message-markdown th { background: var(--teamarness-color-panel); font-weight: 600; }
 .history-status { flex: none; padding: 0 clamp(1rem, 4vw, 3rem); color: var(--teamarness-color-text-muted); font-size: .8rem; }
 .history-status:empty { display: none; }
 .retry-older { flex: none; align-self: flex-start; margin: .25rem clamp(1rem, 4vw, 3rem) .65rem; }
