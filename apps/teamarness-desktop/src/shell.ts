@@ -781,6 +781,7 @@ function packageLifecycleMessage(feedback: PackageLifecycleFeedback): Registrati
       ? `${past}, but Package information could not be refreshed.`
       : `${past}.`;
   return {
+    source: "lifecycle",
     identity: feedback.instance.packageIdentity,
     name: feedback.name,
     message,

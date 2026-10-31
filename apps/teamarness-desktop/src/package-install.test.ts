@@ -572,6 +572,34 @@ describe("the Packages section message area", () => {
     expect(replaced).toContain("Reloaded.");
   });
 
+  it("keeps a Workspace page Recover or Dispose result out of the Package page's registration state", async () => {
+    const test = harness();
+    const lifecycle = {
+      source: "lifecycle" as const,
+      identity: refused.expectedIdentity,
+      name: "Broken",
+      message: "Could not dispose.",
+      failed: true,
+      restart: false,
+      retry: "dispose" as const,
+    };
+    test.controller.showMessage(lifecycle);
+    expect(test.controller.registrationState(refused.expectedIdentity).feedback).toBeNull();
+
+    // A Package page opening, acting, dismissing or closing leaves the Workspace page's result.
+    test.controller.dismissFeedback();
+    test.controller.clearRegistrationMessage();
+    test.controller.dismissRegistrationMessage();
+    expect(test.controller.currentMessage()).toBe(lifecycle);
+    expect(test.controller.renderMessage(snapshot([refused]))).toContain("Broken: Could not dispose.");
+
+    // A registration result for the same Package replaces it and is the Package page's.
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    expect(test.controller.registrationState(refused.expectedIdentity).feedback?.message).toBe("Reloaded.");
+    test.controller.dismissRegistrationMessage();
+    expect(test.controller.currentMessage()).toBeNull();
+  });
+
   it("clears an error when the add flow opens", async () => {
     const test = harness({ reload: async () => { throw { code: "artifact_missing" }; } });
     await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));

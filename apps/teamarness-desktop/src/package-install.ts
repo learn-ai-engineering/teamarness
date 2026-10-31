@@ -23,15 +23,24 @@ export type PackageInstallStep =
   | Readonly<{ kind: "installed"; name: string }>
   | Readonly<{ kind: "restart"; message: string; refusal: string | null }>;
 
-/** What the person did last to one registration row, and how it went. */
+/**
+ * The last result in the Workspace page's message area, and how it went: a
+ * registration action (Install, Reload, Remove, Restart Teamarness) or a
+ * Workspace page Recover or Dispose.
+ */
 export type RegistrationFeedback = Readonly<{
+  /**
+   * Where the result came from. Only a `registration` result belongs to a
+   * Package page; a `lifecycle` result is the Workspace page's alone.
+   */
+  source: "registration" | "lifecycle";
   identity: string;
   /** The Package's name when the action ran, because a removed Package leaves the snapshot. */
   name: string;
   message: string;
   failed: boolean;
   restart: boolean;
-  /** A Workspace page Recover or Dispose that failed and can run again from the message. */
+  /** A `lifecycle` Recover or Dispose that failed and can run again from the message. */
   retry?: "recover" | "dispose";
 }>;
 
@@ -39,6 +48,7 @@ export type RegistrationFeedback = Readonly<{
 export type RegistrationState = Readonly<{
   confirming: boolean;
   working: boolean;
+  /** The last registration result for this identity; never a Workspace page Recover or Dispose result. */
   feedback: RegistrationFeedback | null;
 }>;
 
@@ -188,7 +198,7 @@ export class PackageManagementController {
     try {
       await this.bridge.restart();
     } catch (error: unknown) {
-      this.feedback.set({ identity, name, message: refusalMessage(error), failed: true, restart: true });
+      this.feedback.set({ source: "registration", identity, name, message: refusalMessage(error), failed: true, restart: true });
       this.hooks.changed();
     }
   }
@@ -200,7 +210,8 @@ export class PackageManagementController {
 
   /**
    * The message area at the top of the Workspace page's Packages section. It
-   * shows the last registration result, named, and keeps its space when empty.
+   * shows the last registration or Recover/Dispose result, named, and keeps
+   * its space when empty.
    */
   public renderMessage(snapshot: PackageHostSnapshot | null): string {
     const feedback = this.feedback.current();
@@ -235,25 +246,51 @@ export class PackageManagementController {
     return `<section class="package-registrations" aria-labelledby="package-registrations-heading"><h3 id="package-registrations-heading">Needs attention on this device</h3><div class="package-instance-list">${items}</div></section>`;
   }
 
-  /** Whether Remove waits for confirmation, an action runs, and how the last one went, for one identity. */
+  /** Whether Remove waits for confirmation, an action runs, and how the last registration action went, for one identity. */
   public registrationState(identity: string): RegistrationState {
+    const feedback = this.registrationFeedback();
     return {
       confirming: this.confirmingRemoval === identity,
       working: this.workingRegistration === identity,
-      feedback: this.feedback.current()?.identity === identity ? this.feedback.current() : null,
+      feedback: feedback?.identity === identity ? feedback : null,
     };
   }
 
-  /** Forgets the last registration result and any pending Remove confirmation. */
+  /**
+   * Forgets the last registration result and any pending Remove confirmation.
+   * A Workspace page Recover or Dispose result stays.
+   */
   public dismissFeedback(): void {
     if (this.workingRegistration) return;
-    this.feedback.clear();
+    if (this.registrationFeedback()) this.feedback.clear();
     this.confirmingRemoval = null;
   }
 
   /**
-   * Clears the shown message because another action started, without
-   * cancelling a pending Remove confirmation. The caller renders again.
+   * Clears a shown registration result because a Package page action started.
+   * A Workspace page Recover or Dispose result stays. The caller renders again.
+   */
+  public clearRegistrationMessage(): void {
+    if (this.workingRegistration || !this.registrationFeedback()) return;
+    this.feedback.clear();
+  }
+
+  /** Dismisses a shown registration result, for a Package page's dismiss control. */
+  public dismissRegistrationMessage(): void {
+    if (!this.registrationFeedback()) return;
+    this.feedback.clear();
+    this.hooks.changed();
+  }
+
+  private registrationFeedback(): RegistrationFeedback | null {
+    const feedback = this.feedback.current();
+    return feedback?.source === "registration" ? feedback : null;
+  }
+
+  /**
+   * Clears the shown message, of either source, because another Workspace
+   * page action started, without cancelling a pending Remove confirmation.
+   * The caller renders again.
    */
   public clearMessage(): void {
     if (this.workingRegistration) return;
@@ -266,15 +303,15 @@ export class PackageManagementController {
   }
 
   /**
-   * Shows another Workspace page result, such as Recover or Dispose, in the
-   * same message area. The caller renders again.
+   * Shows a Workspace page Recover or Dispose result (`source: "lifecycle"`)
+   * in the same message area. The caller renders again.
    */
   public showMessage(feedback: RegistrationFeedback): void {
     if (this.workingRegistration) return;
     this.feedback.set(feedback);
   }
 
-  /** Dismisses the shown message, for the person's dismiss control. */
+  /** Dismisses the shown message, of either source, for the Workspace page's dismiss control. */
   public dismissMessage(): void {
     if (!this.feedback.current()) return;
     this.feedback.clear();
@@ -367,9 +404,9 @@ export class PackageManagementController {
     let feedback: RegistrationFeedback;
     try {
       const change = await operation();
-      feedback = { identity, name, message: success(change), failed: false, restart: change.restartRequired };
+      feedback = { source: "registration", identity, name, message: success(change), failed: false, restart: change.restartRequired };
     } catch (error: unknown) {
-      feedback = { identity, name, message: refusalMessage(error), failed: true, restart: false };
+      feedback = { source: "registration", identity, name, message: refusalMessage(error), failed: true, restart: false };
     }
     // After a refusal the Host may have changed the registration's status, so read it again either way.
     await this.refreshQuietly();

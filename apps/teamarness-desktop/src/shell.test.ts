@@ -510,8 +510,32 @@ describe("persistent Shell frame", () => {
     expect(screen.innerHTML).not.toContain("data-package-failure-action");
     expect(screen.innerHTML).toContain('<div class="status-message status-message--success" role="status" aria-live="polite"><p>Private One: Recovered.</p></div>');
 
-    test.timers.advance(5_000);
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS);
     expect(screen.innerHTML).not.toContain("Private One: Recovered.");
+  });
+
+  it("keeps a Workspace page Dispose failure off that Package's page, which cannot dismiss it", async () => {
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      lifecycle: async () => ({ snapshot: packages, failure: "operation" }),
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.control("data-package-action", "dispose").dataset.packageActionIndex = "1";
+    screen.control("data-package-action", "dispose").click();
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("<p>Private One: Could not dispose.</p>"));
+
+    await test.shell.navigate({ kind: "package-page", workspaceId: workspace.id, packageIdentity: privatePackageKey.packageIdentity });
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("data-package-page-focus>Private One</h1>"));
+    expect(screen.innerHTML).not.toContain("Could not dispose");
+    expect(screen.innerHTML).not.toContain("Retry Dispose");
+
+    // Opening and leaving the Package page does not clear the Workspace page's result.
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(screen.innerHTML).toContain("<p>Private One: Could not dispose.</p>");
+    expect(screen.innerHTML).toContain(">Retry Dispose</button>");
   });
 
   it("replaces a refresh failure message with the result once Package information refreshes", async () => {

@@ -160,7 +160,7 @@ export class PackagePageController {
         return;
       case "dismiss-message":
         this.feedback.clear();
-        this.management.dismissMessage();
+        this.management.dismissRegistrationMessage();
         this.hooks.changed();
         return;
       case "copy-homepage":
@@ -260,7 +260,7 @@ export class PackagePageController {
   ): Promise<void> {
     this.working = action;
     this.feedback.clear();
-    this.management.clearMessage();
+    this.management.clearRegistrationMessage();
     if (showWorking) this.hooks.changed();
     let feedback: PageFeedback;
     try {
