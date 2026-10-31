@@ -2450,18 +2450,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The `file.put` arguments for a file small enough to be one chunk.
-fn put_whole(bytes: &[u8]) -> Value {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    json!({
-        "sha256": sha256_hex(bytes), "size": bytes.len(), "chunkIndex": 0, "chunkCount": 1,
-        "data": STANDARD.encode(bytes),
-    })
+/// The `file.write` answer for `text`: the Provider computes the hash a model cannot.
+fn written(text: &str) -> Value {
+    json!({"sha256": sha256_hex(text.as_bytes()), "size": text.len()})
 }
 
 /// Verifies AC5–AC6 end to end: a bound Agent, scripted only at the model, enables Exhibits,
-/// uploads two linked pages, creates a Draft, finds it by title, revises it, and reads a stored
-/// page back.
+/// writes two linked pages as plain text with `file.write` (Exhibits 1.1), creates a Draft from
+/// the returned hashes, finds it by title, revises it, and reads a stored page back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
 async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
@@ -2497,23 +2493,23 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         .await;
     enable_package(&agent, EXHIBITS).await;
 
-    let index = b"<!doctype html><title>Plan</title><h1>Plan</h1><a href=\"page2.html\">Next</a>\n";
+    let index = "<!doctype html><title>Plan</title><h1>Plan</h1><a href=\"page2.html\">Next</a>\n";
     let page2 =
-        b"<!doctype html><title>Details</title><h1>Details</h1><a href=\"index.html\">Back</a>\n";
+        "<!doctype html><title>Details</title><h1>Details</h1><a href=\"index.html\">Back</a>\n";
     let index_v2 =
-        b"<!doctype html><title>Plan</title><h1>Plan, revised</h1><a href=\"page2.html\">Next</a>\n";
-    let files = |entry: &[u8]| {
+        "<!doctype html><title>Plan</title><h1>Plan, revised</h1><a href=\"page2.html\">Next</a>\n";
+    let files = |entry: &str| {
         json!([
-            {"path":"index.html","sha256":sha256_hex(entry)},
-            {"path":"page2.html","sha256":sha256_hex(page2)},
+            {"path":"index.html","sha256":written(entry)["sha256"]},
+            {"path":"page2.html","sha256":written(page2)["sha256"]},
         ])
     };
     let results = scripted_turn(
         &agent,
         &mut requests,
         &[
-            ("exhibits__file_put", put_whole(index)),
-            ("exhibits__file_put", put_whole(page2)),
+            ("exhibits__file_write", json!({"text":index})),
+            ("exhibits__file_write", json!({"text":page2})),
             (
                 "exhibits__draft_update",
                 json!({"exhibitId":"plan","title":"Launch plan","entry":"index.html",
@@ -2524,8 +2520,8 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         "published",
     )
     .await;
-    assert_eq!(results[0], json!({"complete":true}));
-    assert_eq!(results[1], json!({"complete":true}));
+    assert_eq!(results[0], written(index));
+    assert_eq!(results[1], written(page2));
     assert_eq!(results[2], json!({"revision":1}));
     let listed = results[3]["exhibits"].as_array().unwrap();
     let plan = listed
@@ -2540,7 +2536,7 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         &agent,
         &mut requests,
         &[
-            ("exhibits__file_put", put_whole(index_v2)),
+            ("exhibits__file_write", json!({"text":index_v2})),
             (
                 "exhibits__draft_update",
                 json!({"exhibitId":"plan","title":"Launch plan","entry":"index.html",
@@ -2549,13 +2545,13 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
             ("exhibits__exhibit_list", json!({})),
             (
                 "exhibits__file_read",
-                json!({"sha256":sha256_hex(page2),"chunkIndex":0}),
+                json!({"sha256":written(page2)["sha256"],"chunkIndex":0}),
             ),
         ],
         "revised",
     )
     .await;
-    assert_eq!(results[0], json!({"complete":true}));
+    assert_eq!(results[0], written(index_v2));
     assert_eq!(results[1], json!({"revision":2}));
     assert!(
         results[2]["exhibits"]
@@ -2571,7 +2567,7 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         STANDARD
             .decode(results[3]["data"].as_str().unwrap())
             .unwrap(),
-        page2
+        page2.as_bytes()
     );
 
     // The Exhibits UI sees the Agent's Draft at its new revision.
@@ -2610,7 +2606,7 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         "{activity}"
     );
     println!(
-        "agent exhibits timeline: enable -> put x2 -> draft r1 -> list by title -> put -> draft r2 -> read back"
+        "agent exhibits timeline: enable -> write x2 -> draft r1 -> list by title -> write -> draft r2 -> read back"
     );
     shutdown(host).await;
     core.shutdown().await.unwrap();

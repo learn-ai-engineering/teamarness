@@ -14,7 +14,7 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::broadcast;
 
-use crate::domain::{ExhibitsError, LIST_PAGE, rfc3339, validate_chunk_header};
+use crate::domain::{ExhibitsError, LIST_PAGE, MAX_WRITE_BYTES, rfc3339, validate_chunk_header};
 use crate::guide;
 use crate::store::{
     Author, Clock, DraftUpdate, ExhibitStore, Missing, content_source_path, system_clock,
@@ -55,6 +55,12 @@ struct PutRequest {
     chunk_index: u64,
     chunk_count: u64,
     data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteRequest {
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +174,7 @@ pub fn router_with_clock(clock: Clock) -> Router<ExhibitsActive> {
         },
     )
     .port_request(CONTRACT, "file.put", "command", file_put)
+    .port_request(CONTRACT, "file.write", "command", file_write)
     .port_request(CONTRACT, "files.missing", "query", files_missing)
     .port_request(CONTRACT, "draft.update", "command", draft_update)
     .port_request(
@@ -314,6 +321,25 @@ async fn file_put(
     })
     .await?;
     Ok(json!({ "complete": complete }))
+}
+
+/// Stores a whole text file for a caller that cannot hash or encode: the Provider computes the
+/// SHA-256 and stores the UTF-8 bytes as a completed `file.put` would.
+async fn file_write(
+    context: Context<ExhibitsActive>,
+    actor: PortActor,
+    request: WriteRequest,
+) -> Result<JsonValue, BackendError> {
+    authorize(&context, &actor)?;
+    if request.text.len() > MAX_WRITE_BYTES {
+        return Err(ExhibitsError::TooLarge { limit: "text" }.into());
+    }
+    let size = request.text.len();
+    let sha256 = on_store(&context, move |store| {
+        store.write_whole(request.text.as_bytes())
+    })
+    .await?;
+    Ok(json!({ "sha256": sha256, "size": size }))
 }
 
 async fn files_missing(

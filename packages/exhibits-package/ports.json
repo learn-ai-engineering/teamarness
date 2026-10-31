@@ -38,8 +38,8 @@
       } }
   },
   "contracts": [{
-    "identity": "dev.teamarness.exhibits", "major": 1, "minor": 0,
-    "description": "Author Exhibits: static multi-page websites (HTML, CSS, JavaScript, images, media, WebAssembly) that a Person views inside Teamarness. Upload files in chunks by SHA-256, then create or replace a Draft that names them. Call runtime.guide first.",
+    "identity": "dev.teamarness.exhibits", "major": 1, "minor": 1,
+    "description": "Author Exhibits: static multi-page websites (HTML, CSS, JavaScript, images, media, WebAssembly) that a Person views inside Teamarness. Store each file (file.write for text, file.put for binary), then create or replace a Draft that names them. Call runtime.guide first.",
     "ports": [
       { "name": "runtime.guide", "kind": "query", "description": "Read this first. Returns how to author an Exhibit as Markdown, plus the enforced limits, the allowed extensions with their media types (lowercase extensions only) and the Exhibit ID pattern. Exhibits bundle every file: no CDN or network, relative links only, one entry page, no workers or nested frames.",
         "request": { "type": "object", "additionalProperties": false },
@@ -57,6 +57,14 @@
           "data": { "type": "string", "maxLength": 174764 }
         } },
         "response": { "type": "object", "additionalProperties": false, "required": ["complete"], "properties": { "complete": { "type": "boolean" } } }
+      },
+      { "name": "file.write", "kind": "command", "description": "Store one whole text file (HTML, CSS, JavaScript, SVG, JSON, Markdown) by sending its content as text, at most 98304 bytes of UTF-8 (exhibits.too_large otherwise; split larger files). Returns its sha256 and size: pass that sha256 with the file's path to draft.update. Never compute hashes or base64 yourself. Repeating the same text is safe and returns the same sha256. Use file.put only for binary files or when a program computes the hash.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["text"], "properties": {
+          "text": { "type": "string", "maxLength": 98304 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["sha256", "size"], "properties": {
+          "sha256": { "$ref": "#/$defs/sha256" }, "size": { "type": "integer", "minimum": 0, "maximum": 98304 }
+        } }
       },
       { "name": "files.missing", "kind": "query", "description": "Report which of up to 256 files are not yet stored completely: chunks is \"all\" when nothing was received, or the chunk indices to send. Files already stored are left out, so an empty list means every file is present. Use it before uploading, to skip files another Exhibit already stored, and to resume after an uncertain file.put.",
         "request": { "type": "object", "additionalProperties": false, "required": ["sha256s"], "properties": {

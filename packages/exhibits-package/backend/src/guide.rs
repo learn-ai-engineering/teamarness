@@ -6,7 +6,8 @@ use teamarness_package_contract::media_types::MEDIA_TYPES;
 
 use crate::domain::{
     CHUNK_BYTES, ID_PATTERN, LIST_PAGE, MAX_CONCURRENT_PUTS, MAX_FILE_BYTES, MAX_FILES,
-    MAX_ID_CHARS, MAX_MISSING_QUERY, MAX_PATH_BYTES, MAX_TITLE_CHARS, MAX_TOTAL_BYTES, READ_PAGE,
+    MAX_ID_CHARS, MAX_MISSING_QUERY, MAX_PATH_BYTES, MAX_TITLE_CHARS, MAX_TOTAL_BYTES,
+    MAX_WRITE_BYTES, READ_PAGE,
 };
 
 /// The enforced limits, as `runtime.guide` publishes them.
@@ -70,21 +71,31 @@ segment and no `\\`, `%`, `?`, `#` or `\"`.
 - Keep library files (frameworks, fonts) byte-for-byte identical between revisions and \
 Exhibits: content is stored by SHA-256, so an unchanged file is never uploaded twice.
 
-## Uploading
+## Storing files
 
-1. For each file, compute its SHA-256 (lowercase hex) and size.
-2. Call `files.missing` with up to {MAX_MISSING_QUERY} hashes. Upload only what it reports.
-3. Upload a file with `file.put` in chunks of exactly {CHUNK_BYTES} raw bytes \
-(standard padded base64 in `data`); only the last chunk may be shorter. `chunkCount` is \
-`ceil(size / {CHUNK_BYTES})`, and 1 for an empty file. Chunks may arrive in any order and \
-may be repeated. The file is verified when its last missing chunk arrives, and `complete` \
-becomes true. Keep at most {MAX_CONCURRENT_PUTS} `file.put` calls in flight.
-4. Call `draft.update` with the Exhibit ID, a title, the entry path and every file as \
-`{{path, sha256}}`. It creates the Draft or replaces it completely, and returns the new \
-`revision`. Pass the revision you last saw as `expectedRevision` to avoid overwriting \
-someone else's update (`exhibits.revision_conflict` carries the current revision).
-5. If `draft.update` fails with `exhibits.missing_files`, upload the files it names \
-(at most 32 are listed; `missingCount` says how many) and call it again.
+Write text files with `file.write`. Send binary files with `file.put`.
+
+- **Text files** (HTML, CSS, JavaScript, SVG, JSON, Markdown, plain text): call `file.write` \
+with the whole file as `text`. It returns the file's `sha256` and `size`; use that `sha256` \
+in `draft.update`. If you are a model, always use `file.write` for text: never compute a \
+SHA-256 or base64 yourself. `text` is at most {MAX_WRITE_BYTES} bytes of UTF-8 \
+(`exhibits.too_large` otherwise), so split larger code or data into several files. Writing \
+the same text again is safe and returns the same `sha256`.
+- **Binary files** (images, fonts, media, WebAssembly), or any file a program uploads:
+   1. Compute its SHA-256 (lowercase hex) and size.
+   2. Call `files.missing` with up to {MAX_MISSING_QUERY} hashes. Upload only what it reports.
+   3. Upload it with `file.put` in chunks of exactly {CHUNK_BYTES} raw bytes (standard \
+padded base64 in `data`); only the last chunk may be shorter. `chunkCount` is \
+`ceil(size / {CHUNK_BYTES})`, and 1 for an empty file. Chunks may arrive in any order and may \
+be repeated. The file is verified when its last missing chunk arrives, and `complete` becomes \
+true. Keep at most {MAX_CONCURRENT_PUTS} `file.put` calls in flight.
+
+Then call `draft.update` with the Exhibit ID, a title, the entry path and every file as \
+`{{path, sha256}}`. The media type comes from the path's extension. It creates the Draft or \
+replaces it completely, and returns the new `revision`. Pass the revision you last saw as \
+`expectedRevision` to avoid overwriting someone else's update (`exhibits.revision_conflict` \
+carries the current revision). If `draft.update` fails with `exhibits.missing_files`, store \
+the files it names (at most 32 are listed; `missingCount` says how many) and call it again.
 
 Over a Port, every refusal arrives as `provider_error`: the `exhibits.*` code is in \
 `details.provider.code`, and its details (such as `missing` and `missingCount`) are in \
@@ -99,6 +110,7 @@ A command may fail with `outcome_unknown`: it may or may not have taken effect. 
 either. After an uncertain `file.put`, call `files.missing` and send only the chunks it \
 reports. If a re-sent chunk fails with `exhibits.content_mismatch`, the chunks received did \
 not form the file and were discarded: upload the whole file again. After an uncertain \
+`file.write`, call it again with the same text. After an uncertain \
 `draft.update`, call `exhibit.read` and compare the revision and files before trying again.
 
 ## Reading back
@@ -176,6 +188,10 @@ mod tests {
             "16 MiB per file",
             "64 MiB in total",
             "131072 raw bytes",
+            "always use `file.write` for text",
+            "never compute a SHA-256 or base64 yourself",
+            "at most 98304 bytes of UTF-8",
+            "Binary files",
             "at most 4 `file.put` calls",
             "files.missing",
             "outcome_unknown",

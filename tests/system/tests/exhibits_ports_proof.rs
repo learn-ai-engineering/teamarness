@@ -301,7 +301,7 @@ async fn person_authors_exhibits_and_bound_agent_is_default_denied() {
         .expect("the real Exhibits Package appears in the authoring catalog");
     let provided = serde_json::to_value(&provider.provided).unwrap();
     assert_eq!(provided[0]["identity"], EXHIBITS);
-    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 8);
+    assert_eq!(provided[0]["ports"].as_array().unwrap().len(), 9);
 
     prove(
         &host,

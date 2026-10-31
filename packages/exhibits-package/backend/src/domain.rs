@@ -35,6 +35,10 @@ pub const LIST_PAGE: usize = 64;
 /// The most files one `exhibit.read` page returns. A full page at the path bound stays well
 /// under the 256 KiB Port payload bound.
 pub const READ_PAGE: usize = 500;
+/// The largest `file.write` text, in UTF-8 bytes (96 KiB). Even when every character is a quote
+/// or backslash that doubles when written as JSON, the request stays under the 256 KiB Port
+/// payload bound. It is below [`CHUNK_BYTES`], so a written file is always one chunk.
+pub const MAX_WRITE_BYTES: usize = 98_304;
 /// The most `file.put` calls a Consumer should have in flight at once.
 pub const MAX_CONCURRENT_PUTS: usize = 4;
 /// How long a partial upload, or a complete file no Draft references, is kept (24 hours).
@@ -374,6 +378,7 @@ mod tests {
         assert_eq!(chunk_length(CHUNK_BYTES as u64 + 1, 1), 1);
         assert_eq!(chunk_count(MAX_FILE_BYTES), MAX_CHUNKS);
         assert_eq!(MAX_CHUNKS, 128);
+        const { assert!(MAX_WRITE_BYTES <= CHUNK_BYTES) };
         let sha = "a".repeat(64);
         assert!(validate_chunk_header(&sha, 10, 0, 1).is_ok());
         assert_eq!(
