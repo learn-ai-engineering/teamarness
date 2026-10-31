@@ -23,6 +23,39 @@ test("malformed, truncated, overlong and unversioned signatures are rejected", (
   assert.throws(() => createManifest({ ...input, tag: "v9.9.9" }));
 });
 
+// Verifies: TEAM.DEL-R05, TEAM.SYS.SHELL-R07.
+for (const codePoint of [0x0080, 0x0085, 0x009f]) {
+  const label = `U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+  const notes = `Release${String.fromCodePoint(codePoint)}notes`;
+  test(`createManifest rejects ${label} in notes`, () => {
+    assert.throws(() => createManifest({ ...input, notes }), /Notes must be bounded plain text/);
+  });
+  test(`validateManifest rejects ${label} in notes`, () => {
+    const manifest = createManifest(input);
+    manifest.notes = notes;
+    assert.throws(() => validateManifest(manifest, input), /Notes must be bounded plain text/);
+  });
+}
+
+// Verifies: TEAM.DEL-R05, TEAM.SYS.SHELL-R07.
+test("createManifest and validateManifest preserve whitespace, Unicode and the UTF-8 byte boundary", () => {
+  for (const notes of ["", "Release\tindent\r\nNext line", "Café — 更新 🙂 ~\u00a0", "a".repeat(4096), "é".repeat(2048), "🙂".repeat(1024)]) {
+    const manifest = createManifest({ ...input, notes });
+    assert.equal(manifest.notes, notes);
+    assert.equal(validateManifest(manifest, input).notes, notes);
+  }
+});
+
+// Verifies: TEAM.DEL-R05, TEAM.SYS.SHELL-R07.
+test("createManifest and validateManifest reject C0, DEL, angles and excess UTF-8 bytes", () => {
+  for (const notes of ["<", ">", "\u0000", "\u0008", "\u000b", "\u000c", "\u000e", "\u001f", "\u007f", "a".repeat(4097), "é".repeat(2048) + "a", "🙂".repeat(1024) + "a", 4]) {
+    assert.throws(() => createManifest({ ...input, notes }), /Notes must be bounded plain text/);
+    const manifest = createManifest(input);
+    manifest.notes = notes;
+    assert.throws(() => validateManifest(manifest, input), /Notes must be bounded plain text/);
+  }
+});
+
 test("notes are bounded plain text and feed targets/URLs are closed", () => {
   for (const notes of ["<script>x</script>", "hello\u0000", "a".repeat(4097), 4]) assert.throws(() => createManifest({ ...input, notes }));
   for (const url of ["http://github.com/learn-ai-engineering/teamarness/releases/download/v1.2.3/Teamarness.app.tar.gz", "https://github.com.evil/x", "https://user@github.com/learn-ai-engineering/teamarness/releases/download/v1.2.3/Teamarness.app.tar.gz", "https://github.com/learn-ai-engineering/teamarness/releases/latest/download/Teamarness.app.tar.gz", "https://github.com/learn-ai-engineering/teamarness/releases/download/v1.2.3/Teamarness.app.tar.gz#fragment"]) {

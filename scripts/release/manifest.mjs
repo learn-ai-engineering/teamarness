@@ -35,7 +35,7 @@ export function validateSignature(signature, version) {
 export function createManifest({ tag, signature, notes = "" }) {
   const version = tagVersion(tag);
   validateSignature(signature, version);
-  if (typeof notes !== "string" || Buffer.byteLength(notes) > 4096 || /[<>\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(notes)) throw new Error("Notes must be bounded plain text");
+  if (typeof notes !== "string" || Buffer.byteLength(notes) > 4096 || /[<>\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(notes)) throw new Error("Notes must be bounded plain text");
   const [, archive] = assetNames(tag);
   const platform = { url: `https://github.com/learn-ai-engineering/teamarness/releases/download/${tag}/${archive}`, signature };
   const manifest = { version, notes, platforms: Object.fromEntries(TARGETS.map((target) => [target, { ...platform }])) };
