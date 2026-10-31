@@ -40,6 +40,11 @@ export interface ControllerState {
 }
 
 export const PAGE_SIZE = 32;
+/**
+ * How long a draft waits for more typing before it is saved. The Frame has no unmount hook to
+ * save on, so each change is saved soon after it settles.
+ */
+export const DRAFT_SAVE_DELAY_MS = 150;
 const MAX_HISTORY_PAGES = 32;
 
 interface HistoryRebuild {
@@ -183,8 +188,17 @@ export class ConversationsController {
   private readonly client: ConversationsClient;
   private readonly onChange: () => void;
 
-  /** Sticky draft value that survives re-renders. */
+  /** Sticky draft value of the selected Channel that survives re-renders. Change it with editDraft. */
   draft = "";
+  /** The Channel `draft` belongs to. */
+  private draftChannelId: string | null = null;
+  /** Counts each time the controller, not the Member, replaces `draft`; the view copies it then. */
+  private _draftVersion = 0;
+  /** Counts the Member's edits, so a late draft read never overwrites typing. */
+  private draftEdits = 0;
+  private draftTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The text last saved or read for each Channel this mount, to skip identical saves. */
+  private readonly savedDrafts = new Map<string, string>();
 
   constructor(client: ConversationsClient, onChange: () => void) {
     this.client = client;
@@ -218,6 +232,84 @@ export class ConversationsController {
   /** Returns an immutable snapshot of the current state. */
   get state(): ControllerState {
     return this._state;
+  }
+
+  /** Changes whenever the controller replaces `draft`; the view then shows the new draft. */
+  get draftVersion(): number {
+    return this._draftVersion;
+  }
+
+  // ------------------------------------------------------------------
+  // drafts
+  // ------------------------------------------------------------------
+
+  /** Records the Member's draft for the selected Channel, saved soon after it settles. */
+  editDraft(text: string): void {
+    this.draft = text;
+    ++this.draftEdits;
+    if (this.disposed || this.draftChannelId === null) return;
+    if (this.draftTimer !== undefined) clearTimeout(this.draftTimer);
+    this.draftTimer = setTimeout(() => this.flushDraft(), DRAFT_SAVE_DELAY_MS);
+  }
+
+  /** Empties the selected Channel's draft at once, as after its Message was posted. */
+  clearDraft(): void {
+    this.draft = "";
+    ++this.draftEdits;
+    this.flushDraft();
+  }
+
+  /** Saves a draft still waiting for its delay. */
+  private flushDraft(): void {
+    if (this.draftTimer !== undefined) clearTimeout(this.draftTimer);
+    this.draftTimer = undefined;
+    if (this.draftChannelId !== null) this.saveDraft(this.draftChannelId, this.draft);
+  }
+
+  /** Saves a Channel's draft in the Backend's memory, unless it is already saved. */
+  private saveDraft(channelId: string, text: string): void {
+    if (this.savedDrafts.has(channelId) ? this.savedDrafts.get(channelId) === text : text === "") return;
+    this.savedDrafts.set(channelId, text);
+    // Remembering is a convenience: a refused save changes nothing the Member can see.
+    Promise.resolve()
+      .then(() => this.client.request("conversations.draft.set", { channelId, text }))
+      .catch(() => {
+        if (this.savedDrafts.get(channelId) === text) this.savedDrafts.delete(channelId);
+      });
+  }
+
+  /** Moves the sticky draft to `channelId`: saves the old Channel's draft and reads the new one's. */
+  private switchDraft(channelId: string | null): void {
+    if (channelId === this.draftChannelId) return;
+    this.flushDraft();
+    this.draftChannelId = channelId;
+    this.draft = "";
+    ++this._draftVersion;
+    if (channelId !== null) void this.loadDraft(channelId);
+  }
+
+  private async loadDraft(channelId: string): Promise<void> {
+    const edits = this.draftEdits;
+    let text = "";
+    try {
+      const response = await this.client.request("conversations.draft.get", { channelId });
+      if (typeof response?.text === "string") text = response.text;
+    } catch {
+      // A draft that cannot be read is treated as none.
+    }
+    if (this.disposed || this.draftChannelId !== channelId || this.draftEdits !== edits) return;
+    this.savedDrafts.set(channelId, text);
+    if (text === this.draft) return;
+    this.draft = text;
+    ++this._draftVersion;
+    this.notify();
+  }
+
+  /** A post was acknowledged: forget its draft if the Member left that Channel unchanged. */
+  private clearPostedDraft(channelId: string, markdown: string): void {
+    // The selected Channel's composer decides for itself whether the Member kept typing.
+    if (channelId === this.draftChannelId) return;
+    if (this.savedDrafts.get(channelId) === markdown) this.saveDraft(channelId, "");
   }
 
   /** A profile cursor invalidates presentation, never Message authorship or history. */
@@ -258,6 +350,7 @@ export class ConversationsController {
       const snapshot = await this.client.request("conversations.snapshot", {});
       if (this.disposed) return;
       this.applySnapshotSync(snapshot);
+      this.switchDraft(this._state.selectedChannelId);
     } catch {
       if (this.disposed) return;
       this._state = {
@@ -322,6 +415,7 @@ export class ConversationsController {
 
   /** Dispose all pending work. Safe to call multiple times. */
   dispose(): void {
+    if (this.draftTimer !== undefined) this.flushDraft();
     this.disposed = true;
     this.feed = null;
     this.removedDuringOlder = null;
@@ -367,6 +461,7 @@ export class ConversationsController {
       warning: null,
       confirmingHide: false,
     };
+    this.switchDraft(channelId);
     this.notify();
 
     try {
@@ -603,6 +698,7 @@ export class ConversationsController {
 
     try {
       await this.client.request("conversations.message.post", { channelId, markdown });
+      if (!this.disposed) this.clearPostedDraft(channelId, markdown);
       if (this.disposed || this.generation !== gen) return false;
       // A committed post does not wait for change replay or resume a failed history request.
       this._state = { ...this._state, posting: false };
@@ -653,6 +749,7 @@ export class ConversationsController {
       this.historyRebuilding = false;
       this.headFailed = false;
       this.feed = null;
+      this.switchDraft(null);
       this._state = { ...this._state, selectedChannelId: null, messages: [], hasMore: false,
         nextBefore: null, loading: false, loadingOlder: false, posting: false, retryingHead: false, olderError: false,
         feedError: false, resolveError: false, pendingHistory: 0, unavailableHistory: 0 };

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -17,6 +18,8 @@ use crate::store::{ConversationStore, IngestResult, MessageRow};
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
+/// How many Channels' unsent drafts the Backend remembers; saving one more forgets the oldest.
+const MAX_DRAFTS: usize = 64;
 
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, json!({}))
@@ -76,6 +79,35 @@ pub struct ConversationsActive {
     /// The Installation this Package Instance belongs to, which decides who may hide a Channel.
     installation: String,
     session: Mutex<Option<Session>>,
+    /// The UI's unsent drafts: held in memory only, so they last while the Backend runs.
+    drafts: Mutex<Drafts>,
+}
+
+/// Unsent drafts by Channel, oldest saved first, bounded to [`MAX_DRAFTS`] Channels.
+///
+/// They survive a Package switch but never a Backend restart.
+#[derive(Debug, Default)]
+struct Drafts(VecDeque<(String, String)>);
+
+impl Drafts {
+    fn get(&self, channel_id: &str) -> &str {
+        self.0
+            .iter()
+            .find(|(id, _)| id == channel_id)
+            .map_or("", |(_, text)| text.as_str())
+    }
+
+    /// Saves `text` as the newest draft, or forgets the Channel's draft when `text` is empty.
+    fn set(&mut self, channel_id: String, text: String) {
+        self.0.retain(|(id, _)| *id != channel_id);
+        if text.is_empty() {
+            return;
+        }
+        self.0.push_back((channel_id, text));
+        while self.0.len() > MAX_DRAFTS {
+            self.0.pop_front();
+        }
+    }
 }
 
 /// What one activation built, for a test that must look inside.
@@ -128,6 +160,26 @@ struct ChangesRequest {
     after: String,
     #[serde(default)]
     limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DraftGetRequest {
+    channel_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DraftSetRequest {
+    channel_id: String,
+    text: String,
+}
+
+/// A Channel ID as the UI contract writes it: 32 lowercase hex characters.
+fn draft_channel(channel_id: &str) -> Result<(), BackendError> {
+    decode_id(channel_id)
+        .map(|_| ())
+        .ok_or_else(|| error("conversations.invalid_request", false))
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +239,7 @@ pub(crate) fn router_observing(
                 changes,
                 installation: initialization.installation().identity.clone(),
                 session: Mutex::new(Some(session)),
+                drafts: Mutex::new(Drafts::default()),
             })
         }
     })
@@ -273,6 +326,34 @@ pub(crate) fn router_observing(
         "conversations.channel.changes",
         |context: Context<ConversationsActive>, request: ChangesRequest| async move {
             changes(&context, request).await
+        },
+    )
+    .request(
+        "conversations.draft.get",
+        |context: Context<ConversationsActive>, request: DraftGetRequest| async move {
+            draft_channel(&request.channel_id)?;
+            let drafts = context
+                .state()
+                .drafts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(json!({ "text": drafts.get(&request.channel_id) }))
+        },
+    )
+    .request(
+        "conversations.draft.set",
+        |context: Context<ConversationsActive>, request: DraftSetRequest| async move {
+            draft_channel(&request.channel_id)?;
+            if request.text.len() > crate::domain::MAX_MARKDOWN {
+                return Err(error("conversations.invalid_request", false));
+            }
+            context
+                .state()
+                .drafts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set(request.channel_id, request.text);
+            Ok(json!({}))
         },
     )
     .request(
@@ -3435,6 +3516,172 @@ mod session_tests {
         .await
         .unwrap();
         harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: AC13 (better-doc-agent) — a Channel's draft round-trips through the Backend's
+    // memory, an empty draft forgets it, at most 64 Channels are kept, and nothing survives a
+    // Backend restart.
+    #[tokio::test]
+    async fn channel_drafts_round_trip_in_bounded_memory_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let contract = teamarness_package_contract::ui_contract::compile_ui_contract(
+            include_bytes!("../../ui-contract.json"),
+        )
+        .unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let channel = |seed: u64| hex(32, seed);
+        let get = |id: String| json!({ "channelId": id });
+        let empty = session
+            .harness
+            .request("conversations.draft.get", get(channel(1)))
+            .await
+            .unwrap();
+        contract
+            .validate_response("conversations.draft.get", &empty)
+            .unwrap();
+        assert_eq!(empty, json!({ "text": "" }));
+
+        let set = session
+            .harness
+            .request(
+                "conversations.draft.set",
+                json!({ "channelId": channel(1), "text": "half a *thought*" }),
+            )
+            .await
+            .unwrap();
+        contract
+            .validate_response("conversations.draft.set", &set)
+            .unwrap();
+        session
+            .harness
+            .request(
+                "conversations.draft.set",
+                json!({ "channelId": channel(2), "text": "another" }),
+            )
+            .await
+            .unwrap();
+        let read = session
+            .harness
+            .request("conversations.draft.get", get(channel(1)))
+            .await
+            .unwrap();
+        contract
+            .validate_response("conversations.draft.get", &read)
+            .unwrap();
+        assert_eq!(read, json!({ "text": "half a *thought*" }));
+        assert_eq!(
+            session
+                .harness
+                .request("conversations.draft.get", get(channel(2)))
+                .await
+                .unwrap(),
+            json!({ "text": "another" })
+        );
+
+        // An empty draft forgets the Channel's entry.
+        session
+            .harness
+            .request(
+                "conversations.draft.set",
+                json!({ "channelId": channel(1), "text": "" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .harness
+                .request("conversations.draft.get", get(channel(1)))
+                .await
+                .unwrap(),
+            json!({ "text": "" })
+        );
+
+        // A draft over 32 KiB is refused.
+        let refused = session
+            .harness
+            .request(
+                "conversations.draft.set",
+                json!({ "channelId": channel(3), "text": "é".repeat(16 * 1024 + 1) }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "conversations.invalid_request");
+
+        // Channel 2 is the oldest; 64 more Channels push it out, and the newest 64 stay.
+        for seed in 100..164 {
+            session
+                .harness
+                .request(
+                    "conversations.draft.set",
+                    json!({ "channelId": channel(seed), "text": format!("draft {seed}") }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session
+                .harness
+                .request("conversations.draft.get", get(channel(2)))
+                .await
+                .unwrap(),
+            json!({ "text": "" })
+        );
+        for seed in [100, 163] {
+            assert_eq!(
+                session
+                    .harness
+                    .request("conversations.draft.get", get(channel(seed)))
+                    .await
+                    .unwrap(),
+                json!({ "text": format!("draft {seed}") })
+            );
+        }
+        // Saving again makes a Channel the newest, so the next new Channel drops the next oldest.
+        session
+            .harness
+            .request(
+                "conversations.draft.set",
+                json!({ "channelId": channel(100), "text": "draft 100 again" }),
+            )
+            .await
+            .unwrap();
+        session
+            .harness
+            .request(
+                "conversations.draft.set",
+                json!({ "channelId": channel(200), "text": "newest" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .harness
+                .request("conversations.draft.get", get(channel(100)))
+                .await
+                .unwrap(),
+            json!({ "text": "draft 100 again" })
+        );
+        assert_eq!(
+            session
+                .harness
+                .request("conversations.draft.get", get(channel(101)))
+                .await
+                .unwrap(),
+            json!({ "text": "" })
+        );
+        session.harness.shutdown().await.unwrap();
+
+        // A new Backend start remembers nothing.
+        let mut restarted = start(directory.path(), scripted_log()).await;
+        assert_eq!(
+            restarted
+                .harness
+                .request("conversations.draft.get", get(channel(200)))
+                .await
+                .unwrap(),
+            json!({ "text": "" })
+        );
+        restarted.harness.shutdown().await.unwrap();
     }
 
     #[test]
