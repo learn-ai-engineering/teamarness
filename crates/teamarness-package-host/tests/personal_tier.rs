@@ -1319,7 +1319,7 @@ async fn in_flight_call_keeps_provider_resolved_before_swap() {
     pause.resume();
     match held.await.unwrap() {
         Ok(answer) => assert!(answer["error"].is_string(), "{answer}"),
-        Err(error) => panic!("the consumer was not restarted: {error:?}"),
+        Err(error) => panic!("the held call failed instead of answering with an error: {error:?}"),
     }
     let provider_after = instances(&live.host, "com.example.provider")
         .await
@@ -1953,9 +1953,15 @@ async fn removed_personal_provider_selection_is_unavailable_then_returns() {
 }
 
 /// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R14
+///
+/// The Host does not report "uncertain" to the reloaded harness: the caller that held the
+/// command has exited, so the uncertainty belongs to that exited caller and to the Agent's own
+/// record of its unresolved command. The Host's guarantee is at-most-once dispatch: the command
+/// reaches its Provider once, nothing replays it to the new harness generation, and the binding
+/// and selection survive the reload.
 #[cfg(feature = "test-hooks")]
 #[tokio::test]
-async fn personal_agent_reload_with_uncertain_command_reports_uncertain_without_retry() {
+async fn personal_agent_reload_with_unresolved_command_dispatches_once_without_replay() {
     let live = Live::open().await;
     let (key, agent) = install_messages_tier(&live).await;
     let harness = mount(
@@ -1972,6 +1978,11 @@ async fn personal_agent_reload_with_uncertain_command_reports_uncertain_without_
     .await;
     assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
     let harness_before = instances(&live.host, "com.example.harness").await;
+    let generation_before = harness_before
+        .iter()
+        .find(|instance| instance.key.workspace_id == key.workspace_id)
+        .and_then(|instance| instance.process_generation)
+        .expect("the mounted harness is running before the reload");
     let mut observations = live.host.observe_ports();
 
     // Hold one authorized Agent command before dispatch, then reload its harness.
@@ -2006,24 +2017,15 @@ async fn personal_agent_reload_with_uncertain_command_reports_uncertain_without_
             .await
         }
     });
-    // The harness process ends under the held command: its request neither succeeds nor
-    // reports a certain refusal.
+    // The harness process ends under the held command, so its request ends with the
+    // process.
     let ended = tokio::time::timeout(Duration::from_secs(20), held)
         .await
         .expect("the held request ends with its process")
         .unwrap();
     match ended {
         Ok(answer) => panic!("the held command reported an outcome: {answer:?}"),
-        Err(error) => assert!(
-            matches!(
-                error.code,
-                PackageErrorCode::ProcessExited
-                    | PackageErrorCode::OutcomeUncertain
-                    | PackageErrorCode::StaleMount
-                    | PackageErrorCode::Cancelled
-            ),
-            "{error:?}"
-        ),
+        Err(error) => assert_eq!(error.code, PackageErrorCode::ProcessExited, "{error:?}"),
     }
     pause.resume();
     reload.await.unwrap().unwrap();
@@ -2042,7 +2044,10 @@ async fn personal_agent_reload_with_uncertain_command_reports_uncertain_without_
             if observation.consumer_package != "com.example.harness" {
                 continue;
             }
-            assert_eq!(observation.consumer_generation, 1, "{observation:?}");
+            assert_eq!(
+                observation.consumer_generation, generation_before,
+                "{observation:?}"
+            );
             match observation.stage {
                 PortStage::Dispatched => dispatched.push(observation),
                 PortStage::Completed | PortStage::Failed => return (dispatched, observation),
@@ -2053,6 +2058,19 @@ async fn personal_agent_reload_with_uncertain_command_reports_uncertain_without_
     .await
     .expect("the held command ends");
     assert_eq!(terminal.0.len(), 1, "dispatched once: {:?}", terminal.0);
+    // The Provider finishes the command it received; the Port observation for it is certain,
+    // even though its exited caller never learns the outcome.
+    let terminal_observation = &terminal.1;
+    assert_eq!(
+        terminal_observation.stage,
+        PortStage::Completed,
+        "{terminal_observation:?}"
+    );
+    assert_eq!(terminal_observation.code, None, "{terminal_observation:?}");
+    assert!(
+        !terminal_observation.outcome_uncertain,
+        "{terminal_observation:?}"
+    );
     let provider = mount(
         &live.host,
         sibling(&live.host, "com.example.provider", &key).await,

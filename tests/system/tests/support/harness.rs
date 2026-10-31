@@ -656,13 +656,6 @@ pub const QUALIFICATION: &str = "dev.teamarness.qualification";
 /// contract digests.
 #[allow(dead_code)] // Only the Agent qualification targets use it.
 pub fn write_qualification_provider(root: &Path) -> (String, String) {
-    use sha2::{Digest, Sha256};
-    let digest = |bytes: &[u8]| -> String {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    };
     fs::create_dir_all(root.join("backend")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
     let binary = fs::read(env!(
