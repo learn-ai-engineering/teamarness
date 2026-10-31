@@ -680,6 +680,148 @@ mod tests {
         assert_eq!(serde_json::to_value(state).unwrap(), fixture["hostState"]);
     }
 
+    fn bridge_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../contracts/fixtures/package-bridge.json")).unwrap()
+    }
+
+    // Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn snapshot_with_registrations_round_trips_the_shared_fixture() {
+        let fixture = bridge_fixture();
+        let snapshot: PackageHostSnapshot =
+            serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+        assert_eq!(snapshot.registrations.len(), 4);
+        assert_eq!(
+            serde_json::to_value(PackageHostSnapshotDto::from(snapshot)).unwrap(),
+            fixture["snapshot"]
+        );
+    }
+
+    #[test]
+    fn open_mount_for_the_main_view_with_nested_content_matches_the_fixture() {
+        let fixture = bridge_fixture();
+        let open = &fixture["openMount"];
+        let descriptor: UiLoaderDescriptor =
+            serde_json::from_value(open["loader"].clone()).unwrap();
+        assert_eq!(
+            descriptor.view,
+            teamarness_package_host::PackageUiView::Main
+        );
+        assert!(descriptor.nested_content);
+        let dto = OpenUiMountDto {
+            mount: open["mount"].as_str().unwrap().to_owned(),
+            loader: descriptor.into(),
+        };
+        assert_eq!(serde_json::to_value(dto).unwrap(), *open);
+
+        let settings: UiLoaderDescriptor =
+            serde_json::from_value(fixture["loader"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(UiLoaderDto::from(settings)).unwrap(),
+            fixture["loader"]
+        );
+    }
+
+    #[test]
+    fn inspected_package_matches_the_shared_fixture() {
+        let fixture = bridge_fixture();
+        let sample = &fixture["inspectedPackage"];
+        let without_ports = |value: &serde_json::Value| {
+            let mut value = value.clone();
+            value["ports"] = serde_json::json!([]);
+            value
+        };
+        let inspected = InspectedPackage {
+            directory: sample["directory"].as_str().unwrap().into(),
+            identity: sample["identity"].as_str().unwrap().parse().unwrap(),
+            version: sample["version"].as_str().unwrap().into(),
+            presentation: serde_json::from_value(sample.clone()).unwrap(),
+            capabilities: serde_json::from_value(sample["capabilities"].clone()).unwrap(),
+            provided: sample["provided"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|contract| serde_json::from_value(without_ports(contract)).unwrap())
+                .collect(),
+            consumed: sample["consumed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|contract| serde_json::from_value(without_ports(contract)).unwrap())
+                .collect(),
+            kind: serde_json::from_value(sample["kind"].clone()).unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(InspectedPackageDto::from(inspected)).unwrap(),
+            *sample
+        );
+    }
+
+    #[test]
+    fn authoring_catalog_entry_matches_the_shared_fixture() {
+        let fixture = bridge_fixture();
+        let sample = &fixture["authoringCatalog"][0];
+        let contract_fields = |contract: &serde_json::Value| {
+            serde_json::json!({
+                "identity": contract["identity"],
+                "major": contract["major"],
+                "minMinor": contract["minMinor"],
+                "maxMinor": contract["maxMinor"],
+                "required": contract["required"],
+                "ports": [],
+            })
+        };
+        let consumed = sample["consumed"].as_array().unwrap();
+        let entry = AuthoringCatalogEntry {
+            package: PackageCatalogEntry {
+                identity: sample["identity"].as_str().unwrap().parse().unwrap(),
+                version: "0.2.0".into(),
+                display_name: "Notes".into(),
+                description: None,
+                author: None,
+                homepage: None,
+                source: teamarness_package_host::PackageSourceKind::Local,
+                trust: teamarness_package_host::PackageTrustKind::TrustedNativeCodeV1,
+                ui_contract_digest: "a".repeat(64),
+                views: vec![],
+            },
+            capabilities: serde_json::from_value(sample["capabilities"].clone()).unwrap(),
+            provided: sample["provided"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|contract| {
+                    let mut contract = contract.clone();
+                    contract["ports"] = serde_json::json!([]);
+                    serde_json::from_value(contract).unwrap()
+                })
+                .collect(),
+            definitions: serde_json::Map::new(),
+            consumed: consumed
+                .iter()
+                .map(|contract| serde_json::from_value(contract_fields(contract)).unwrap())
+                .collect(),
+            availability: consumed
+                .iter()
+                .map(|contract| teamarness_package_host::PortAvailability {
+                    contract: contract["identity"].as_str().unwrap().into(),
+                    provider: contract["provider"]
+                        .as_str()
+                        .map(|provider| provider.parse().unwrap()),
+                    minor: contract["minor"]
+                        .as_u64()
+                        .map(|minor| u16::try_from(minor).unwrap()),
+                    unavailable: serde_json::from_value(contract["unavailable"].clone()).unwrap(),
+                })
+                .collect(),
+            diagnostics: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(PackageAuthoringEntryDto::from(entry)).unwrap(),
+            *sample
+        );
+    }
+
     #[test]
     fn stream_completed_matches_the_fixture() {
         let fixture: serde_json::Value =

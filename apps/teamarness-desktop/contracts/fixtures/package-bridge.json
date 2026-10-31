@@ -20,7 +20,112 @@
       "mountState": null
     }],
     "diagnostics": [],
-    "registrations": []
+    "registrations": [
+      {
+        "directory": "/Users/person/Packages/notes",
+        "expectedIdentity": "com.example.notes",
+        "override": false,
+        "tier": "personal",
+        "status": { "kind": "admitted" }
+      },
+      {
+        "directory": "/Users/person/Packages/clash",
+        "expectedIdentity": "com.example.clash",
+        "override": false,
+        "tier": "personal",
+        "status": { "kind": "refused", "code": "port_provider_conflict" }
+      },
+      {
+        "directory": "/Users/person/Packages/fixture",
+        "expectedIdentity": "com.example.fixture",
+        "override": true,
+        "tier": "team",
+        "status": { "kind": "pending_restart", "change": "written" }
+      },
+      {
+        "directory": "/Users/person/Packages/legacy",
+        "expectedIdentity": "com.example.legacy",
+        "override": true,
+        "tier": "team",
+        "status": { "kind": "pending_restart", "change": "removed" }
+      }
+    ]
+  },
+  "inspectedPackage": {
+    "directory": "/Users/person/Packages/notes",
+    "identity": "com.example.notes",
+    "version": "0.2.0",
+    "displayName": "Notes",
+    "description": "Keeps short notes for a Workspace.",
+    "author": "Example Author",
+    "homepage": "https://example.com/notes",
+    "capabilities": [
+      { "identity": "teamarness.workspace-context", "major": 1, "minMinor": 0, "maxMinor": 0 }
+    ],
+    "provided": [
+      { "identity": "com.example.notes", "major": 1, "minor": 2, "description": "Read and write Workspace notes." }
+    ],
+    "consumed": [
+      { "identity": "dev.teamarness.exhibits", "major": 1, "minMinor": 0, "maxMinor": 1, "required": false }
+    ],
+    "kind": "new"
+  },
+  "authoringCatalog": [
+    {
+      "identity": "com.example.notes",
+      "capabilities": [
+        { "identity": "teamarness.workspace-context", "major": 1, "minMinor": 0, "maxMinor": 0 }
+      ],
+      "provided": [
+        { "identity": "com.example.notes", "major": 1, "minor": 2, "description": "Read and write Workspace notes." }
+      ],
+      "consumed": [
+        {
+          "identity": "dev.teamarness.exhibits",
+          "major": 1,
+          "minMinor": 0,
+          "maxMinor": 1,
+          "required": false,
+          "provider": "dev.teamarness.exhibits",
+          "minor": 0,
+          "unavailable": null
+        },
+        {
+          "identity": "com.example.calendar",
+          "major": 2,
+          "minMinor": 1,
+          "maxMinor": 3,
+          "required": true,
+          "provider": null,
+          "minor": null,
+          "unavailable": "port_unavailable"
+        }
+      ]
+    }
+  ],
+  "openMount": {
+    "mount": "mount-2",
+    "loader": {
+      "token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "entrypoint": "ui/index.js",
+      "uiHostVersion": 2,
+      "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "package": {
+        "identity": "com.example.fixture",
+        "version": "1.0.0",
+        "displayName": "Fixture",
+        "source": "local",
+        "trust": "trusted_native_code_v1",
+        "lifecycle": "active",
+        "processGeneration": 4
+      },
+      "workspace": {
+        "id": "00112233445566778899aabbccddeeff",
+        "name": "Fixture Workspace"
+      },
+      "view": "main",
+      "nestedContent": true
+    }
   },
   "loader": {
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
