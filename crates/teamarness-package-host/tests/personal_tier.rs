@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use teamarness_package_host::{
-    InstallPersonal, LifecycleState, MountState, OpenUiMount, PackageErrorCode,
+    ContentViewToken, InstallPersonal, LifecycleState, MountState, OpenUiMount, PackageErrorCode,
     PackageErrorEnvelope, PackageHost, PackageHostCommand, PackageHostOutcome, PackageIdentity,
     PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTier,
-    PendingRegistrationChange, PortStage, ReconcileWorkspaces, RegistrationStatus, ReloadPersonal,
-    RemoveOverride, RemovePersonal, RestartPersonal, ShutdownHost, SuspendPackage, UiMountId,
-    UiRequest, UiRequestId, WriteOverride,
+    PendingRegistrationChange, PortStage, ReadContent, ReconcileWorkspaces, RegistrationStatus,
+    ReloadPersonal, RemoveOverride, RemovePersonal, RestartPersonal, ShutdownHost, SuspendPackage,
+    UiMountId, UiRequest, UiRequestId, WriteOverride,
 };
 
 const TEAM: &str = "com.example.team";
@@ -1340,6 +1340,7 @@ async fn in_flight_call_keeps_provider_resolved_before_swap() {
 }
 
 const UPSTREAM: &str = "com.example.upstream";
+const AGENT_BINDING: &str = "teamarness.agent-binding";
 
 /// Rewrites one Package Directory's manifest in place.
 fn edit_manifest(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
@@ -1363,6 +1364,209 @@ fn provide(path: &Path, contract: &str, ports: serde_json::Value) {
         manifest["portContract"] =
             serde_json::json!({"path":"ports.json","sha256":common::digest(&bytes)});
     });
+}
+
+/// The messages contract: a guide, a command, and an event.
+fn message_ports() -> serde_json::Value {
+    serde_json::json!([
+        {"name":"runtime.guide","kind":"query","description":"Guide",
+            "request":{"type":"object","additionalProperties":false},
+            "response":{"type":"object","properties":{"markdown":{"type":"string","maxLength":100}},"required":["markdown"],"additionalProperties":false}},
+        {"name":"message.post","kind":"command","description":"Post a message",
+            "request":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},
+            "response":{"type":"object","properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"additionalProperties":false}},
+        {"name":"message.created","kind":"event","description":"Message was created",
+            "event":{"type":"object","properties":{"order":{"type":"integer"}},"required":["order"],"additionalProperties":false}}
+    ])
+}
+
+/// Declares the messages contract as consumed, optionally or required.
+fn consume_messages(manifest: &mut serde_json::Value, required: bool) {
+    manifest["consumedPorts"] = serde_json::json!([{
+        "identity":CONTRACT,"major":1,"minMinor":0,"maxMinor":0,"required":required,
+        "ports":[{"name":"message.post","kind":"command"},{"name":"message.created","kind":"event"}]
+    }]);
+}
+
+fn declare_agent_binding(manifest: &mut serde_json::Value) {
+    manifest["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"identity":AGENT_BINDING,"major":1,"minMinor":0,"maxMinor":0}));
+}
+
+/// Binds one new Agent to each `packages` in the Workspace of `key`; returns its Principal id.
+fn bind_agent(live: &Live, key: &PackageInstanceKey, packages: &[&str]) -> String {
+    let workspace = live
+        .fixture
+        .core
+        .list_workspaces()
+        .unwrap()
+        .into_iter()
+        .find(|workspace| workspace.id().to_string() == key.workspace_id.as_str())
+        .unwrap();
+    let agent = live
+        .fixture
+        .core
+        .add_agent(workspace.id(), "Personal tier Agent")
+        .unwrap();
+    for package in packages {
+        live.fixture
+            .core
+            .bind_agent_package(workspace.id(), agent, package)
+            .unwrap();
+    }
+    agent.to_string()
+}
+
+fn invoke_post(access: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({"access":access,"contract":CONTRACT,"major":1,"port":"message.post",
+        "kind":"command","request":{"text":text}})
+}
+
+/// The Instance of `identity` in the Workspace of `key`.
+async fn sibling(
+    host: &PackageHost,
+    identity: &str,
+    key: &PackageInstanceKey,
+) -> PackageInstanceKey {
+    instances(host, identity)
+        .await
+        .into_iter()
+        .find(|instance| instance.key.workspace_id == key.workspace_id)
+        .unwrap()
+        .key
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn team_caller_cannot_call_or_discover_personal_provider() {
+    // The Team Package declares the contract that only a Personal Package provides, and is a
+    // bound Agent harness, so every access view is tried.
+    let live = Live::open_with(|manifest| {
+        consume_messages(manifest, false);
+        declare_agent_binding(manifest);
+    })
+    .await;
+    let provider = live.package("provider", "com.example.provider", Ports::None);
+    provide(&provider, CONTRACT, message_ports());
+    let harness = live.package("harness", "com.example.harness", Ports::None);
+    edit_manifest(&harness, |manifest| {
+        consume_messages(manifest, false);
+        declare_agent_binding(manifest);
+    });
+    live.install(&provider, "com.example.provider")
+        .await
+        .unwrap();
+    live.install(&harness, "com.example.harness").await.unwrap();
+    let team_key = live.team_before[0].key.clone();
+    bind_agent(&live, &team_key, &[TEAM, "com.example.harness"]);
+    let team = &live.team_mount;
+    let refused = |answer: &serde_json::Value, code: &str, what: &str| {
+        assert_eq!(answer["error"], code, "{what}: {answer}");
+    };
+
+    // Declared route and declared metadata.
+    refused(
+        &capability(&live.host, team, "invoke", invoke_post("declared", "team")).await,
+        "port_unavailable",
+        "declared call",
+    );
+    let declared = capability(
+        &live.host,
+        team,
+        "available",
+        serde_json::json!({"access":"declared"}),
+    )
+    .await;
+    assert_eq!(
+        declared["result"]["contracts"],
+        serde_json::json!([{"contract":CONTRACT,"major":1,"minor":null,"description":null,
+            "available":false,"enabled":false,"enabledMajor":null,"metadataSha256":null}]),
+        "the declared row shows no Provider: {declared}"
+    );
+    // Agent metadata, selection, and a dynamic Agent call.
+    let agent = capability(
+        &live.host,
+        team,
+        "available",
+        serde_json::json!({"access":"agent"}),
+    )
+    .await;
+    assert_eq!(
+        agent["result"]["contracts"],
+        serde_json::json!([]),
+        "the guide is not discovered: {agent}"
+    );
+    refused(
+        &capability(
+            &live.host,
+            team,
+            "describe",
+            serde_json::json!({"access":"agent","contract":CONTRACT,"metadataSha256":"0".repeat(64),"offset":0}),
+        )
+        .await,
+        "port_unavailable",
+        "Agent metadata",
+    );
+    refused(
+        &capability(
+            &live.host,
+            team,
+            "enable",
+            serde_json::json!({"contract":CONTRACT,"major":1}),
+        )
+        .await,
+        "port_unavailable",
+        "selection",
+    );
+    refused(
+        &capability(&live.host, team, "invoke", invoke_post("agent", "team")).await,
+        "port_not_enabled",
+        "dynamic Agent call",
+    );
+    let provider_key = sibling(&live.host, "com.example.provider", &team_key).await;
+    let provider_mount = mount(&live.host, provider_key).await;
+    let last = fixture_request(&live.host, &provider_mount, "fixture.port_last_actor").await;
+    assert_eq!(
+        last["commands"], 0,
+        "no Team call reached the Provider: {last}"
+    );
+
+    // A Personal caller discovers, selects, and calls the same Provider in both views.
+    let harness_key = sibling(&live.host, "com.example.harness", &team_key).await;
+    let personal = mount(&live.host, harness_key).await;
+    let agent = capability(
+        &live.host,
+        &personal,
+        "available",
+        serde_json::json!({"access":"agent"}),
+    )
+    .await;
+    assert_eq!(
+        agent["result"]["contracts"][0]["contract"], CONTRACT,
+        "{agent}"
+    );
+    assert_eq!(
+        agent["result"]["contracts"][0]["available"], true,
+        "{agent}"
+    );
+    let selected = capability(
+        &live.host,
+        &personal,
+        "enable",
+        serde_json::json!({"contract":CONTRACT,"major":1}),
+    )
+    .await;
+    assert_eq!(selected["result"]["enabled"], true, "{selected}");
+    for access in ["declared", "agent"] {
+        let answer = capability(&live.host, &personal, "invoke", invoke_post(access, "p")).await;
+        assert_eq!(answer["result"]["accepted"], true, "{access}: {answer}");
+    }
+    let last = fixture_request(&live.host, &provider_mount, "fixture.port_last_actor").await;
+    assert_eq!(last["commands"], 2, "{last}");
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
 }
 
 /// The consumed-Port routes the authoring catalog shows for `identity`.
@@ -1445,6 +1649,524 @@ async fn provider_losing_required_dependency_is_unavailable_to_existing_and_new_
     assert_eq!(posted["result"]["accepted"], true, "{posted}");
     live.install(&late, "com.example.late").await.unwrap();
     assert_active(&instances(&live.host, "com.example.late").await, 2);
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Sends one fixture request with `payload` to a mount and returns its payload.
+async fn fixture_call(
+    host: &PackageHost,
+    mount: &UiMountId,
+    operation: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let outcome = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new(format!("call-{}", rand_suffix())).unwrap(),
+            operation: operation.into(),
+            payload: serde_json::from_value(payload).unwrap(),
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("{operation}: {error:?}"));
+    let PackageHostOutcome::UiResponse { payload } = outcome else {
+        panic!("{outcome:?}")
+    };
+    serde_json::to_value(payload).unwrap()
+}
+
+/// Waits until the Host has registered a subscription for `consumer`.
+async fn wait_subscribed(
+    observations: &mut teamarness_package_host::PortObservations,
+    consumer: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let event = observations.recv().await.expect("Port observation");
+            if event.stage == PortStage::Subscribed && event.consumer_package == consumer {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the consumer's subscription was registered");
+}
+
+/// A Personal Provider of the messages contract, a declared Personal consumer, and a bound
+/// Personal Agent harness, all installed; returns the Workspace key the mounts use.
+async fn install_messages_tier(live: &Live) -> (PackageInstanceKey, String) {
+    let provider = live.package("provider", "com.example.provider", Ports::None);
+    provide(&provider, CONTRACT, message_ports());
+    let consumer = live.package("consumer", "com.example.consumer", Ports::None);
+    edit_manifest(&consumer, |manifest| consume_messages(manifest, false));
+    let harness = live.package("harness", "com.example.harness", Ports::None);
+    edit_manifest(&harness, declare_agent_binding);
+    for (path, identity) in [
+        (&provider, "com.example.provider"),
+        (&consumer, "com.example.consumer"),
+        (&harness, "com.example.harness"),
+    ] {
+        live.install(path, identity).await.unwrap();
+    }
+    let key = live.team_before[0].key.clone();
+    let agent = bind_agent(live, &key, &["com.example.harness"]);
+    (key, agent)
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn personal_provider_reload_ends_subscriptions_with_provider_exited() {
+    let live = Live::open().await;
+    let (key, _) = install_messages_tier(&live).await;
+    let consumer = mount(
+        &live.host,
+        sibling(&live.host, "com.example.consumer", &key).await,
+    )
+    .await;
+    let harness = mount(
+        &live.host,
+        sibling(&live.host, "com.example.harness", &key).await,
+    )
+    .await;
+    let enabled = capability(
+        &live.host,
+        &harness,
+        "enable",
+        serde_json::json!({"contract":CONTRACT,"major":1}),
+    )
+    .await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    let mut observations = live.host.observe_ports();
+    fixture_call(
+        &live.host,
+        &consumer,
+        "fixture.port_event_open",
+        serde_json::json!({}),
+    )
+    .await;
+    wait_subscribed(&mut observations, "com.example.consumer").await;
+    fixture_call(
+        &live.host,
+        &harness,
+        "fixture.port_event_open",
+        serde_json::json!({"access":"agent"}),
+    )
+    .await;
+    wait_subscribed(&mut observations, "com.example.harness").await;
+    let provider = mount(
+        &live.host,
+        sibling(&live.host, "com.example.provider", &key).await,
+    )
+    .await;
+    // Both subscriptions share one upstream to the Provider.
+    common::eventually(Duration::from_secs(8), "the shared upstream opens", || {
+        let host = &live.host;
+        let provider = provider.clone();
+        async move {
+            fixture_call(
+                host,
+                &provider,
+                "fixture.port_event_stats",
+                serde_json::json!({}),
+            )
+            .await["active"]
+                == 1
+        }
+    })
+    .await;
+    fixture_call(
+        &live.host,
+        &provider,
+        "fixture.port_event_emit",
+        serde_json::json!({"order":1}),
+    )
+    .await;
+    let events = |mount: UiMountId| {
+        let host = live.host.clone();
+        async move {
+            fixture_call(
+                &host,
+                &mount,
+                "fixture.port_event_events",
+                serde_json::json!({}),
+            )
+            .await
+        }
+    };
+    common::eventually(Duration::from_secs(8), "the first event", || {
+        let (consumer, harness) = (consumer.clone(), harness.clone());
+        async move {
+            events(consumer).await["events"] == serde_json::json!([{"order":1}])
+                && events(harness).await["events"] == serde_json::json!([{"order":1}])
+        }
+    })
+    .await;
+    let consumers_before = generations(&instances(&live.host, "com.example.consumer").await);
+    let harness_before = generations(&instances(&live.host, "com.example.harness").await);
+
+    live.reload("com.example.provider").await.unwrap();
+
+    common::eventually(Duration::from_secs(8), "both streams end", || {
+        let (consumer, harness) = (consumer.clone(), harness.clone());
+        async move {
+            events(consumer).await["closeCode"] == "provider_exited"
+                && events(harness).await["closeCode"] == "provider_exited"
+        }
+    })
+    .await;
+    // The consumers kept running; only their streams ended.
+    assert_eq!(
+        generations(&instances(&live.host, "com.example.consumer").await),
+        consumers_before
+    );
+    assert_eq!(
+        generations(&instances(&live.host, "com.example.harness").await),
+        harness_before
+    );
+    // A new subscription reaches the new generation and nothing is replayed.
+    fixture_call(
+        &live.host,
+        &consumer,
+        "fixture.port_event_open",
+        serde_json::json!({}),
+    )
+    .await;
+    wait_subscribed(&mut observations, "com.example.consumer").await;
+    let provider = mount(
+        &live.host,
+        sibling(&live.host, "com.example.provider", &key).await,
+    )
+    .await;
+    common::eventually(Duration::from_secs(8), "new upstream", || {
+        let host = &live.host;
+        let provider = provider.clone();
+        async move {
+            fixture_call(
+                host,
+                &provider,
+                "fixture.port_event_stats",
+                serde_json::json!({}),
+            )
+            .await["active"]
+                == 1
+        }
+    })
+    .await;
+    assert_eq!(
+        events(consumer.clone()).await["events"],
+        serde_json::json!([])
+    );
+    fixture_call(
+        &live.host,
+        &provider,
+        "fixture.port_event_emit",
+        serde_json::json!({"order":2}),
+    )
+    .await;
+    common::eventually(
+        Duration::from_secs(8),
+        "the new event without replay",
+        || {
+            let consumer = consumer.clone();
+            async move { events(consumer).await["events"] == serde_json::json!([{"order":2}]) }
+        },
+    )
+    .await;
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn removed_personal_provider_selection_is_unavailable_then_returns() {
+    let live = Live::open().await;
+    let (key, _) = install_messages_tier(&live).await;
+    let harness = mount(
+        &live.host,
+        sibling(&live.host, "com.example.harness", &key).await,
+    )
+    .await;
+    let enabled = capability(
+        &live.host,
+        &harness,
+        "enable",
+        serde_json::json!({"contract":CONTRACT,"major":1}),
+    )
+    .await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    let posted = capability(
+        &live.host,
+        &harness,
+        "invoke",
+        invoke_post("agent", "before"),
+    )
+    .await;
+    assert_eq!(posted["result"]["accepted"], true, "{posted}");
+    let provider = live.fixture._root.path().join("sources/provider");
+
+    live.remove("com.example.provider").await.unwrap();
+
+    let missing = capability(
+        &live.host,
+        &harness,
+        "available",
+        serde_json::json!({"access":"agent"}),
+    )
+    .await;
+    assert_eq!(
+        missing["result"]["contracts"],
+        serde_json::json!([{"contract":CONTRACT,"major":1,"minor":null,"description":null,
+            "available":false,"enabled":true,"enabledMajor":1,"metadataSha256":null}]),
+        "the selection is kept and shown unavailable: {missing}"
+    );
+    let refused = capability(&live.host, &harness, "invoke", invoke_post("agent", "gone")).await;
+    assert_eq!(refused["error"], "port_unavailable", "{refused}");
+
+    live.install(&provider, "com.example.provider")
+        .await
+        .unwrap();
+
+    let returned = capability(
+        &live.host,
+        &harness,
+        "available",
+        serde_json::json!({"access":"agent"}),
+    )
+    .await;
+    let row = &returned["result"]["contracts"][0];
+    assert_eq!(row["available"], true, "{returned}");
+    assert_eq!(row["enabled"], true, "{returned}");
+    assert_eq!(row["enabledMajor"], 1, "{returned}");
+    let posted = capability(
+        &live.host,
+        &harness,
+        "invoke",
+        invoke_post("agent", "after"),
+    )
+    .await;
+    assert_eq!(
+        posted["result"]["accepted"], true,
+        "the selection applies again: {posted}"
+    );
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R14
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn personal_agent_reload_with_uncertain_command_reports_uncertain_without_retry() {
+    let live = Live::open().await;
+    let (key, agent) = install_messages_tier(&live).await;
+    let harness = mount(
+        &live.host,
+        sibling(&live.host, "com.example.harness", &key).await,
+    )
+    .await;
+    let enabled = capability(
+        &live.host,
+        &harness,
+        "enable",
+        serde_json::json!({"contract":CONTRACT,"major":1}),
+    )
+    .await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    let harness_before = instances(&live.host, "com.example.harness").await;
+    let mut observations = live.host.observe_ports();
+
+    // Hold one authorized Agent command before dispatch, then reload its harness.
+    let pause = live
+        .host
+        .pause_next_command_authorized_for_tests("com.example.harness".parse().unwrap());
+    let _resume = pause.resume_on_drop();
+    let held = tokio::spawn({
+        let host = live.host.clone();
+        let mount = harness.clone();
+        async move {
+            host.execute(PackageHostCommand::UiRequest(UiRequest {
+                mount,
+                request: UiRequestId::new("held-command").unwrap(),
+                operation: "fixture.capability".into(),
+                payload: serde_json::from_value(serde_json::json!({
+                    "capability":"teamarness.package-ports","method":"invoke",
+                    "arguments":invoke_post("agent", "held")
+                }))
+                .unwrap(),
+            }))
+            .await
+        }
+    });
+    pause.paused().await;
+    let reload = tokio::spawn({
+        let host = live.host.clone();
+        async move {
+            host.execute(PackageHostCommand::ReloadPersonal(ReloadPersonal {
+                identity: "com.example.harness".parse().unwrap(),
+            }))
+            .await
+        }
+    });
+    // The harness process ends under the held command: its request neither succeeds nor
+    // reports a certain refusal.
+    let ended = tokio::time::timeout(Duration::from_secs(20), held)
+        .await
+        .expect("the held request ends with its process")
+        .unwrap();
+    match ended {
+        Ok(answer) => panic!("the held command reported an outcome: {answer:?}"),
+        Err(error) => assert!(
+            matches!(
+                error.code,
+                PackageErrorCode::ProcessExited
+                    | PackageErrorCode::OutcomeUncertain
+                    | PackageErrorCode::StaleMount
+                    | PackageErrorCode::Cancelled
+            ),
+            "{error:?}"
+        ),
+    }
+    pause.resume();
+    reload.await.unwrap().unwrap();
+    let harness_after = instances(&live.host, "com.example.harness").await;
+    assert_active(&harness_after, 2);
+    for (old, new) in harness_before.iter().zip(&harness_after) {
+        assert!(new.process_generation > old.process_generation);
+    }
+
+    // The authorized command runs at most once, as the actor it was authorized for, and
+    // nothing replays it to the new harness generation.
+    let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut dispatched = Vec::new();
+        loop {
+            let observation = observations.recv().await.unwrap();
+            if observation.consumer_package != "com.example.harness" {
+                continue;
+            }
+            assert_eq!(observation.consumer_generation, 1, "{observation:?}");
+            match observation.stage {
+                PortStage::Dispatched => dispatched.push(observation),
+                PortStage::Completed | PortStage::Failed => return (dispatched, observation),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the held command ends");
+    assert_eq!(terminal.0.len(), 1, "dispatched once: {:?}", terminal.0);
+    let provider = mount(
+        &live.host,
+        sibling(&live.host, "com.example.provider", &key).await,
+    )
+    .await;
+    let last = fixture_request(&live.host, &provider, "fixture.port_last_actor").await;
+    assert_eq!(last["commands"], 1, "no retry: {last}");
+    assert_eq!(last["actor"]["principal"], agent.as_str(), "{last}");
+
+    // The reloaded harness rereads its binding and selection; only a new call reaches the
+    // Provider.
+    let harness = mount(
+        &live.host,
+        sibling(&live.host, "com.example.harness", &key).await,
+    )
+    .await;
+    let available = capability(
+        &live.host,
+        &harness,
+        "available",
+        serde_json::json!({"access":"agent"}),
+    )
+    .await;
+    let row = &available["result"]["contracts"][0];
+    assert_eq!(row["enabled"], true, "{available}");
+    assert_eq!(row["enabledMajor"], 1, "{available}");
+    assert_eq!(
+        fixture_request(&live.host, &provider, "fixture.port_last_actor").await["commands"],
+        1
+    );
+    let posted = capability(
+        &live.host,
+        &harness,
+        "invoke",
+        invoke_post("agent", "after"),
+    )
+    .await;
+    assert_eq!(posted["result"]["accepted"], true, "{posted}");
+    let last = fixture_request(&live.host, &provider, "fixture.port_last_actor").await;
+    assert_eq!(last["commands"], 2, "{last}");
+    assert_eq!(
+        last["actor"]["principal"],
+        agent.as_str(),
+        "the binding survived: {last}"
+    );
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R16, TEAM.SYS.PKG-R17
+#[tokio::test]
+async fn personal_package_declaring_content_views_serves_content() {
+    let live = Live::open().await;
+    let path = live.package("viewer", "com.example.viewer", Ports::None);
+    edit_manifest(&path, |manifest| {
+        manifest["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "identity":"teamarness.content-views","major":1,"minMinor":0,"maxMinor":0
+            }));
+    });
+    live.install(&path, "com.example.viewer").await.unwrap();
+    let key = instances(&live.host, "com.example.viewer").await[0]
+        .key
+        .clone();
+    let (viewer, nested) = match live
+        .host
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+            key.clone(),
+        )))
+        .await
+        .unwrap()
+    {
+        PackageHostOutcome::UiMountOpened { mount, loader, .. } => (mount, loader.nested_content),
+        other => panic!("{other:?}"),
+    };
+    assert!(nested, "the Personal mount reports nested content");
+    let bytes = b"<h1>Personal exhibit</h1>";
+    let source = live.data_directory(&key).join("content/index");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, bytes).unwrap();
+    let opened = fixture_call(
+        &live.host,
+        &viewer,
+        "fixture.capability",
+        serde_json::json!({"capability":"teamarness.content-views","method":"open","arguments":{
+            "entry":"index.html","files":[{"path":"index.html","sha256":common::digest(bytes),
+                "size":bytes.len(),"source":{"kind":"file","path":"content/index"}}]
+        }}),
+    )
+    .await;
+    let token = opened["result"]["view"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the view opens: {opened}"));
+    let served = live
+        .host
+        .execute(PackageHostCommand::ReadContent(ReadContent {
+            token: ContentViewToken::new(token.to_owned()).unwrap(),
+            path: "index.html".into(),
+        }))
+        .await
+        .unwrap();
+    let PackageHostOutcome::Content {
+        bytes: served,
+        media_type,
+    } = served
+    else {
+        panic!("{served:?}")
+    };
+    assert_eq!(served, bytes);
+    assert_eq!(media_type, "text/html; charset=utf-8");
+
+    // The open Team mount and its Instances are unchanged.
     live.assert_team_undisturbed().await;
     live.shutdown().await;
 }

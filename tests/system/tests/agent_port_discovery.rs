@@ -7,11 +7,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use support::harness::{
-    self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, object, open_core, open_host,
-    open_mount, shutdown,
+    self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, QUALIFICATION, object, open_core,
+    open_host, open_mount, shutdown, write_qualification_provider,
 };
 use teamarness_package_host::{
-    PackageHost, PackageInstanceKey, PortObservations, PortStage, UiMountId, WorkspaceId,
+    InstallPersonal, PackageHost, PackageHostCommand, PackageHostOutcome, PackageInstanceKey,
+    PackageTier, PortObservations, PortStage, UiMountId, WorkspaceId,
 };
 
 const CLIENT: &str = "dev.teamarness.generic-port-proof";
@@ -24,7 +25,27 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn stage_client(application: &Path) {
-    let root = application.join(CLIENT);
+    write_client(&application.join(CLIENT));
+    let registration = application.join("application-packages.v1.json");
+    let mut registered: Value = serde_json::from_slice(&fs::read(&registration).unwrap()).unwrap();
+    registered["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"directory":CLIENT}));
+    fs::write(registration, serde_json::to_vec(&registered).unwrap()).unwrap();
+    on_demand_conversations(application);
+}
+
+/// Exercise real Conversations with opt-in lazy activation, not a replacement Provider.
+fn on_demand_conversations(application: &Path) {
+    let path = application.join(PACKAGE_ID).join("teamarness.package.json");
+    let mut provider: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    provider["activation"] = json!("on_demand");
+    fs::write(path, serde_json::to_vec(&provider).unwrap()).unwrap();
+}
+
+/// Writes the generic Agent client's Package Directory at `root`.
+fn write_client(root: &Path) {
     fs::create_dir_all(root.join("backend")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
     let binary = fs::read(env!("CARGO_BIN_EXE_generic-port-consumer-under-test")).unwrap();
@@ -56,18 +77,6 @@ fn stage_client(application: &Path) {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
-    let registration = application.join("application-packages.v1.json");
-    let mut registered: Value = serde_json::from_slice(&fs::read(&registration).unwrap()).unwrap();
-    registered["packages"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"directory":CLIENT}));
-    fs::write(registration, serde_json::to_vec(&registered).unwrap()).unwrap();
-    // Exercise real Conversations with opt-in lazy activation, not a replacement Provider.
-    let path = application.join(PACKAGE_ID).join("teamarness.package.json");
-    let mut provider: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    provider["activation"] = json!("on_demand");
-    fs::write(path, serde_json::to_vec(&provider).unwrap()).unwrap();
 }
 
 async fn execute(host: &PackageHost, mount: &UiMountId, input: Value) -> Value {
@@ -400,6 +409,122 @@ async fn generic_client_discovers_guidance_posts_as_agent_and_reconciles_after_r
     assert_eq!(parity["messages"], recovered["messages"]);
     ui.request("status", "conversations.snapshot", object([]))
         .await;
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}
+
+/// Installs one Personal Package from `directory` into a running Host.
+async fn install_personal(host: &PackageHost, directory: &Path, identity: &str) {
+    let outcome = host
+        .execute(PackageHostCommand::InstallPersonal(InstallPersonal {
+            directory: directory.to_owned(),
+            expected_identity: identity.parse().unwrap(),
+            accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("install {identity}: {error:?}"));
+    assert!(
+        matches!(outcome, PackageHostOutcome::PersonalInstalled { .. }),
+        "{outcome:?}"
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn personal_agent_harness_discovers_and_enables_team_and_personal_guides() {
+    // Conversations is a Team guide Provider; the qualification Provider and the generic
+    // Agent harness are Personal, installed live into the running Host.
+    let app = harness::StagedApplication::new();
+    on_demand_conversations(&app.application_path);
+    let root = app.root.path();
+    let personal = root.join("personal");
+    write_client(&personal.join(CLIENT));
+    write_qualification_provider(&personal.join(QUALIFICATION));
+    let core = open_core(Addressing::Loopback, &root.join("core")).await;
+    let workspace = core.create_workspace("Personal Agent harness").unwrap();
+    let agent = core.add_agent(workspace.id(), "Personal").unwrap();
+    let agent_key = core
+        .principal(workspace.id(), agent)
+        .unwrap()
+        .unwrap()
+        .keys()[0]
+        .to_string();
+    let key = |id: &str| {
+        PackageInstanceKey::new(
+            id.parse().unwrap(),
+            WorkspaceId::new(workspace.id().to_string()).unwrap(),
+        )
+    };
+    let host = open_host(&app.application_path, root.join("host"), core.clone()).await;
+    install_personal(&host, &personal.join(QUALIFICATION), QUALIFICATION).await;
+    install_personal(&host, &personal.join(CLIENT), CLIENT).await;
+    let snapshot = host.snapshot().await;
+    for identity in [CLIENT, QUALIFICATION] {
+        let registration = snapshot
+            .registrations
+            .iter()
+            .find(|registration| registration.expected_identity == identity)
+            .unwrap();
+        assert_eq!(registration.tier, PackageTier::Personal, "{identity}");
+    }
+    let mount = open_mount(&host, &key(CLIENT)).await;
+    success(
+        &host,
+        &mount,
+        json!({"action":"bind","principalId":agent.to_string()}),
+    )
+    .await;
+
+    let catalog = success(&host, &mount, json!({"action":"discover"})).await;
+    let mut contracts: Vec<_> = catalog
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            assert_eq!(row["summary"]["available"], true, "{row}");
+            assert_eq!(row["summary"]["enabled"], false, "{row}");
+            row["summary"]["contract"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    contracts.sort();
+    assert_eq!(
+        contracts,
+        [PACKAGE_ID, QUALIFICATION],
+        "both tiers: {catalog}"
+    );
+    for contract in [PACKAGE_ID, QUALIFICATION] {
+        let invoke =
+            json!({"action":"invoke","contract":contract,"port":"runtime.guide","request":{}});
+        let denied = execute(&host, &mount, invoke.clone()).await;
+        assert_eq!(denied["error"], "port_not_enabled", "{contract}: {denied}");
+        success(
+            &host,
+            &mount,
+            json!({"action":"enable","contract":contract}),
+        )
+        .await;
+        let guide = success(&host, &mount, invoke).await;
+        assert!(
+            guide["markdown"]
+                .as_str()
+                .is_some_and(|markdown| !markdown.is_empty()),
+            "{contract}: {guide}"
+        );
+    }
+    let written = success(
+        &host,
+        &mount,
+        json!({"action":"invoke","contract":QUALIFICATION,"port":"sample.write","request":{"value":"personal"}}),
+    )
+    .await;
+    assert_eq!(written["actor"]["identity"], agent_key, "{written}");
+    let channels = success(
+        &host,
+        &mount,
+        json!({"action":"invoke","contract":PACKAGE_ID,"port":"channel.list","request":{}}),
+    )
+    .await;
+    assert_eq!(channels["channels"][0]["id"], GENERAL_ID);
     shutdown(host).await;
     core.shutdown().await.unwrap();
 }

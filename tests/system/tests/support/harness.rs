@@ -647,3 +647,62 @@ fn digest(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[allow(dead_code)] // Only the Agent qualification targets use it.
+pub const QUALIFICATION: &str = "dev.teamarness.qualification";
+
+/// Writes the test-only qualification Provider Package Directory at `root`, a guide-bearing
+/// contract with an identity absent from every bundled catalog. Returns the Backend and Port
+/// contract digests.
+#[allow(dead_code)] // Only the Agent qualification targets use it.
+pub fn write_qualification_provider(root: &Path) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let digest = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    fs::create_dir_all(root.join("backend")).unwrap();
+    fs::create_dir_all(root.join("ui")).unwrap();
+    let binary = fs::read(env!(
+        "CARGO_BIN_EXE_agent-qualification-provider-under-test"
+    ))
+    .unwrap();
+    let ui = b"export function mount() { return () => {}; }";
+    let ui_contract = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"$defs":{},"requests":{
+        "proof.rows":{"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}
+    },"subscriptions":{}})).unwrap();
+    let ports = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"$defs":{
+        "offset":{"type":"integer","minimum":7,"maximum":7},
+        "value":{"type":"string","minLength":1,"maxLength":64}
+    },"contracts":[{"identity":QUALIFICATION,"major":3,"minor":0,
+        "description":"Test-only independent sample query and actor-observed writes.","ports":[
+        {"name":"runtime.guide","kind":"query","description":"Read ordinary operational instructions, never schemas.",
+            "request":{"type":"object","additionalProperties":false},"response":{"type":"object","required":["markdown"],"properties":{"markdown":{"type":"string","maxLength":32768}},"additionalProperties":false}},
+        {"name":"sample.read","kind":"query","description":"Add thirty-five to the supplied offset.",
+            "request":{"type":"object","required":["offset"],"properties":{"offset":{"$ref":"#/$defs/offset"}},"additionalProperties":false},"response":{"type":"object"}},
+        {"name":"sample.write","kind":"command","description":"Append a value once with the actual Host-authored actor.",
+            "request":{"type":"object","required":["value"],"properties":{"value":{"$ref":"#/$defs/value"}},"additionalProperties":false},"response":{"type":"object"}}
+    ]}]})).unwrap();
+    fs::write(root.join("backend/provider"), &binary).unwrap();
+    fs::set_permissions(
+        root.join("backend/provider"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(root.join("ui/index.js"), ui).unwrap();
+    fs::write(root.join("ui-contract.json"), &ui_contract).unwrap();
+    fs::write(root.join("ports.json"), &ports).unwrap();
+    let manifest = serde_json::json!({"schemaVersion":1,"identity":QUALIFICATION,"version":"1.0.0",
+        "presentation":{"displayName":"Qualification"},"protocol":{"major":1,"minMinor":0,"maxMinor":0},
+        "backends":[{"target":"aarch64-apple-darwin","path":"backend/provider","size":binary.len(),"sha256":digest(&binary)}],
+        "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],"contract":{"path":"ui-contract.json","sha256":digest(&ui_contract)}},
+        "portContract":{"path":"ports.json","sha256":digest(&ports)},"capabilities":[]});
+    fs::write(
+        root.join("teamarness.package.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    (digest(&binary), digest(&ports))
+}

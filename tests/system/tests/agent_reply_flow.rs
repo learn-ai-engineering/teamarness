@@ -19,12 +19,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::harness::{
-    self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, create_invitation, introduce,
-    object, open_core, open_host, open_mount, poll_until, shutdown,
+    self, Addressing, ConversationClient, GENERAL_ID, PACKAGE_ID, QUALIFICATION, create_invitation,
+    introduce, object, open_core, open_host, open_mount, poll_until, shutdown,
 };
 use teamarness_package_host::{
-    PackageHostCommand, PackageIdentity, PackageInstanceKey, PackageSourceKind, PackageTrustKind,
-    PackageValue, UiRequest, UiRequestId, WorkspaceId,
+    InstallPersonal, PackageHostCommand, PackageHostOutcome, PackageIdentity, PackageInstanceKey,
+    PackageSourceKind, PackageTier, PackageTrustKind, PackageValue, RegistrationStatus, UiRequest,
+    UiRequestId, WorkspaceId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -37,10 +38,7 @@ static NEXT_BINDING_REQUEST: AtomicU64 = AtomicU64::new(1);
 /// Explicit external qualification: build the standalone project immediately before running.
 /// Never silently skip, substitute a fixture, or claim this proves an unbuilt source revision.
 fn register_agent(private: &Path) {
-    let directory = fs::canonicalize(std::env::var_os("TEAMARNESS_AGENT_PACKAGE_DIR").expect(
-        "build the standalone Agent, then set TEAMARNESS_AGENT_PACKAGE_DIR to its dist directory",
-    ))
-    .expect("the external Agent Package Directory exists");
+    let directory = agent_directory();
     let packages = private.join("packages");
     fs::create_dir_all(&packages).unwrap();
     fs::set_permissions(&packages, fs::Permissions::from_mode(0o700)).unwrap();
@@ -320,6 +318,34 @@ async fn local_agent_package_loads_from_registration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
 async fn the_agent_replies_once_when_addressed_across_two_profiles() {
+    replies_across_two_profiles(AgentInstall::AtOpen).await;
+}
+
+/// Verifies: AC9 — the same flow with the Agent installed live into the running Host as a
+/// Personal Package, instead of registered before the Host opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn the_live_installed_agent_replies_once_when_addressed_across_two_profiles() {
+    replies_across_two_profiles(AgentInstall::Live).await;
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AgentInstall {
+    /// Registered in the file before the Host opens.
+    AtOpen,
+    /// Installed through `InstallPersonal` while the Host runs.
+    Live,
+}
+
+/// The external Agent Package Directory the qualification run supplies.
+fn agent_directory() -> std::path::PathBuf {
+    fs::canonicalize(std::env::var_os("TEAMARNESS_AGENT_PACKAGE_DIR").expect(
+        "build the standalone Agent, then set TEAMARNESS_AGENT_PACKAGE_DIR to its dist directory",
+    ))
+    .expect("the external Agent Package Directory exists")
+}
+
+async fn replies_across_two_profiles(install: AgentInstall) {
     let (endpoint, requests) = stub_endpoint().await;
     let alice_app = harness::StagedApplication::new();
     let root = alice_app.root.path();
@@ -340,13 +366,38 @@ async fn the_agent_replies_once_when_addressed_across_two_profiles() {
         .to_string();
     assert_ne!(agent_key, alice_core.public_identity().to_string());
     let alice_private = root.join("alice-host");
-    register_agent(&alice_private);
+    if install == AgentInstall::AtOpen {
+        register_agent(&alice_private);
+    }
     let alice_host = open_host(
         &alice_app.application_path,
         alice_private.clone(),
         alice_core.clone(),
     )
     .await;
+    if install == AgentInstall::Live {
+        let outcome = alice_host
+            .execute(PackageHostCommand::InstallPersonal(InstallPersonal {
+                directory: agent_directory(),
+                expected_identity: AGENT_PACKAGE_ID.parse().unwrap(),
+                accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+            }))
+            .await
+            .expect("the Agent installs into the running Host");
+        assert!(
+            matches!(outcome, PackageHostOutcome::PersonalInstalled { .. }),
+            "{outcome:?}"
+        );
+    }
+    let registration = alice_host
+        .snapshot()
+        .await
+        .registrations
+        .into_iter()
+        .find(|registration| registration.expected_identity == AGENT_PACKAGE_ID)
+        .expect("the Agent is registered");
+    assert_eq!(registration.tier, PackageTier::Personal);
+    assert_eq!(registration.status, RegistrationStatus::Admitted);
     let conversations_key = PackageInstanceKey::new(
         PackageIdentity::from_str(PACKAGE_ID).unwrap(),
         WorkspaceId::new(workspace_id.to_string()).unwrap(),
@@ -1305,59 +1356,9 @@ async fn public_host_state(host: &teamarness_package_host::PackageHost, label: &
     );
 }
 
-const QUALIFICATION: &str = "dev.teamarness.qualification";
-
 /// This contract is assembled only inside a disposable test application.
 fn stage_qualification_provider(application: &Path) {
-    use sha2::{Digest, Sha256};
-    let digest = |bytes: &[u8]| -> String {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    };
-    let root = application.join(QUALIFICATION);
-    fs::create_dir_all(root.join("backend")).unwrap();
-    fs::create_dir_all(root.join("ui")).unwrap();
-    let binary = fs::read(env!(
-        "CARGO_BIN_EXE_agent-qualification-provider-under-test"
-    ))
-    .unwrap();
-    let ui = b"export function mount() { return () => {}; }";
-    let ui_contract = serde_json::to_vec(&json!({"schemaVersion":1,"$defs":{},"requests":{
-        "proof.rows":{"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}
-    },"subscriptions":{}})).unwrap();
-    let ports = serde_json::to_vec(&json!({"schemaVersion":1,"$defs":{
-        "offset":{"type":"integer","minimum":7,"maximum":7},
-        "value":{"type":"string","minLength":1,"maxLength":64}
-    },"contracts":[{"identity":QUALIFICATION,"major":3,"minor":0,
-        "description":"Test-only independent sample query and actor-observed writes.","ports":[
-        {"name":"runtime.guide","kind":"query","description":"Read ordinary operational instructions, never schemas.",
-            "request":{"type":"object","additionalProperties":false},"response":{"type":"object","required":["markdown"],"properties":{"markdown":{"type":"string","maxLength":32768}},"additionalProperties":false}},
-        {"name":"sample.read","kind":"query","description":"Add thirty-five to the supplied offset.",
-            "request":{"type":"object","required":["offset"],"properties":{"offset":{"$ref":"#/$defs/offset"}},"additionalProperties":false},"response":{"type":"object"}},
-        {"name":"sample.write","kind":"command","description":"Append a value once with the actual Host-authored actor.",
-            "request":{"type":"object","required":["value"],"properties":{"value":{"$ref":"#/$defs/value"}},"additionalProperties":false},"response":{"type":"object"}}
-    ]}]})).unwrap();
-    fs::write(root.join("backend/provider"), &binary).unwrap();
-    fs::set_permissions(
-        root.join("backend/provider"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-    fs::write(root.join("ui/index.js"), ui).unwrap();
-    fs::write(root.join("ui-contract.json"), &ui_contract).unwrap();
-    fs::write(root.join("ports.json"), &ports).unwrap();
-    let manifest = json!({"schemaVersion":1,"identity":QUALIFICATION,"version":"1.0.0",
-        "presentation":{"displayName":"Qualification"},"protocol":{"major":1,"minMinor":0,"maxMinor":0},
-        "backends":[{"target":"aarch64-apple-darwin","path":"backend/provider","size":binary.len(),"sha256":digest(&binary)}],
-        "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],"contract":{"path":"ui-contract.json","sha256":digest(&ui_contract)}},
-        "portContract":{"path":"ports.json","sha256":digest(&ports)},"capabilities":[]});
-    fs::write(
-        root.join("teamarness.package.json"),
-        serde_json::to_vec(&manifest).unwrap(),
-    )
-    .unwrap();
+    let (backend, ports) = harness::write_qualification_provider(&application.join(QUALIFICATION));
     let path = application.join("application-packages.v1.json");
     let mut registrations: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     registrations["packages"]
@@ -1366,9 +1367,7 @@ fn stage_qualification_provider(application: &Path) {
         .push(json!({"directory":QUALIFICATION}));
     fs::write(path, serde_json::to_vec(&registrations).unwrap()).unwrap();
     println!(
-        "fixture: source-built qualification provider backend sha256={} ports sha256={}",
-        digest(&binary),
-        digest(&ports)
+        "fixture: source-built qualification provider backend sha256={backend} ports sha256={ports}"
     );
 }
 
