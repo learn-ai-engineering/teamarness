@@ -6,9 +6,10 @@
 //! or does not parse, so an entry a person wrote by hand is never lost. A write
 //! is committed only after a preflight admission, which writes no Host state,
 //! shows that the candidate would be admitted. The public functions change the
-//! file only, and a running Host admits that change when it next opens. The
-//! Host's live Personal commands use the same store under the Personal tier
-//! lock (`crate::host::personal`).
+//! file only, and a running Host admits that change when it next opens. They
+//! do not take the Personal tier lock, so they must not race a running Host's
+//! management writes. The Host's live Personal commands use the same store
+//! under that lock (`crate::host::personal`).
 
 // Every Host operation returns the full, payload-free error envelope, as the Host facade does.
 #![allow(clippy::result_large_err)]
@@ -68,6 +69,15 @@ pub fn inspect_package_directory(
 /// rewrite, any inspect error, `identity_mismatch`, `trust_evidence_missing`,
 /// `override_required`, the candidate's admission code, or
 /// `data_directory_unavailable` when the file cannot be written.
+///
+/// # Concurrency
+///
+/// This function changes the file only. It does not take the Personal tier
+/// lock that a running Host's live Personal commands hold
+/// (`crate::host::personal`), so it must not run while a Host is open on the
+/// same data directory: a concurrent live install, reload, or remove can
+/// overwrite this write, or this write can overwrite theirs. A running Host
+/// admits the file change only when it next opens.
 pub fn write_registration(
     config: &PackageHostConfig,
     request: RegistrationRequest,
@@ -89,6 +99,15 @@ pub fn write_registration(
 /// Returns `registration_file_invalid` for an existing file it will not
 /// rewrite, `not_registered` when no entry has the identity, or
 /// `data_directory_unavailable` when the file cannot be written.
+///
+/// # Concurrency
+///
+/// This function changes the file only. It does not take the Personal tier
+/// lock that a running Host's live Personal commands hold
+/// (`crate::host::personal`), so it must not run while a Host is open on the
+/// same data directory: a concurrent live install, reload, or remove can
+/// overwrite this write, or this write can overwrite theirs. A running Host
+/// admits the file change only when it next opens.
 pub fn remove_registration(
     config: &PackageHostConfig,
     identity: &PackageIdentity,

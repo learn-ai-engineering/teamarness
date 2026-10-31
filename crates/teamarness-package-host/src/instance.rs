@@ -24,7 +24,10 @@ use crate::{
 pub(crate) enum RestartOutcome {
     /// A new process generation started.
     Restarted,
-    /// The Instance was not running or failed, so nothing changed.
+    /// The Instance was not in a restartable state, so nothing changed. Active,
+    /// Failed, and crash-looping Instances restart; an Instance that never
+    /// started, is suspended, has ended, or is shutting down reports this
+    /// outcome.
     NotRunning,
 }
 

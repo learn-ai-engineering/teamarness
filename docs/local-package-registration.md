@@ -16,7 +16,7 @@ A registration trusts future rebuilt bytes at that same canonical directory. Tea
 4. Check the preview. It shows the name, Package Identity, version, folder, declared capabilities, and provided and consumed Ports. It also shows the description, author, and homepage when the manifest declares them. Select **Continue**.
 5. Read the native-code risks: filesystem, network, and process. Select **Trust and install** only for code you have reviewed.
 
-The Shell shows "Installed on this device. It appears in all your Workspaces." The Package runs at once under **Personal Packages**, in every Workspace on this Installation. Team Packages keep running, and their open UIs stay mounted.
+The Shell shows "Installed on this device. It appears in all your Workspaces." The Package runs at once under **Personal Packages**, in every Workspace on this Installation. Team Packages keep running, and their Backend processes are not restarted. A Package UI closes while you use the Workspace page and opens again when you return to it.
 
 If you install a folder that is already registered, the preview says so. Installing it again restarts the Package with the current build. If the Package Identity is already registered from another folder, installing replaces that registration.
 
@@ -41,7 +41,7 @@ The **About** tab has these groups:
 - **Diagnostics:** shown only when the Package Host reported a diagnostic for the Package.
 - **Manage:** the controls this Package allows.
 
-Results of these controls appear in a message area at the top of the page, below the tabs. A success message hides after 5 seconds. An error stays until you select **Dismiss** or take the next action. The **Package Instances** section of the Workspace page shows the results of **Reload** and **Remove** in the same way.
+Results of these controls appear in a message area below the tabs. A success message hides after 5 seconds. An error stays until you select **Dismiss** or take the next action. The **Package Instances** section of the Workspace page shows the results of **Reload**, **Remove**, **Recover Backend**, and **Dispose** in a message area at the top of the section, in the same way.
 
 A Personal Package page has these controls:
 
@@ -76,10 +76,12 @@ Admission has two tiers (ADR 0036). The tier decides when a change takes effect.
 Port routing follows the tiers:
 
 - A Team Package never uses a Port that a Personal Package provides. If only a Personal Package provides a contract, a Team consumer sees that Port as unavailable.
+- Personal Providers are invisible to Team callers. This includes a Team Package that acts as a Workspace Agent: Agent discovery does not list a Personal Provider's contract, and an Agent call to it is refused. A Personal Agent harness sees Team and Personal Providers.
 - A Personal Package can use Ports from Team and Personal Packages.
 - A Personal Package that provides a Port contract a Team Package already provides is refused with `port_provider_conflict`.
 - A live install or reload that provides a Port contract a running Personal Package already provides is also refused with `port_provider_conflict`. Remove the running provider first.
 - When a live change adds or removes a provider, Teamarness restarts only the Personal consumers whose route changed.
+- A Personal Provider that loses a required Port of its own keeps running, but Teamarness does not serve it: no consumer is routed to it, and Agent discovery does not offer it. Its routes return when the dependency returns.
 
 The Shell presents Package Source `bundled` as `Team` and Package Source `local` as `Personal`. Package Source remains separate from trust, registration scope, Workspace enablement, synchronization, sharing, networking, and collaboration.
 
@@ -92,7 +94,7 @@ A local Package with the Package Identity of a bundled Package replaces it only 
 3. Read the second confirmation and select the replace button. It names the Team Package, for example **Replace Tutorial after restart**.
 4. Select **Restart Teamarness**, or select **Later** to apply the override at the next start.
 
-Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The bundled Package keeps running, and its Package page still labels its source as "Team". To change your mind before the restart, select **Cancel override**. The bundled Package keeps running and no restart is needed.
+Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The Team Package keeps running, and its Package page still labels its source as "Team". To change your mind before the restart, select **Cancel override**, then confirm with **Cancel override** again. No restart is needed.
 
 After the restart, the override runs in the Team tier, so the sidebar lists it under **Team Packages**, because the sidebar groups Packages by tier. In the **Package Instances** section of the Workspace page, its source label follows Package Source, so it reads `Personal`. Its Package page is labelled "Team Package", and the source in **Details** reads "Team, replaced on this device by an override". It has no Personal controls.
 

@@ -70,7 +70,7 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-### Packagement (implemented, not yet verified)
+### Packagement (implemented and integrated with Ports 2.0, not yet verified)
 
 Implemented on 2026-10-25 on branch `don-smith/packagement`, workstream `packagement`. ADR 0036 (accepted 2026-10-25) splits Package Admission into a Team tier, fixed at Host open, and a Personal tier that changes while the Host runs. A Team Package never routes to a Personal Provider.
 
@@ -80,7 +80,9 @@ Implemented on 2026-10-25 on branch `don-smith/packagement`, workstream `package
 - Every Package has a Package page with its metadata, trust, capabilities, and Ports. Personal Packages get Reload, Restart, Pause, Resume, Start, and Remove; Remove keeps the Package Data Directory.
 - The manifest gains optional `presentation.description`, `author`, and `homepage`, and an optional `ui.views` settings view (`TEAM.SYS.PKG-R19`). `uiHostVersion` is 2 (ADR 0037).
 
-Automated checks pass for every implementation step. The manual checks of install, reload, remove, override, the Package page, and the settings view, and the workstream Verify, are outstanding. Integration into `main` needs the developer's approval. This branch's ADRs, accepted as 0031 and 0032, were renumbered to 0036 and 0037 when `main` was merged in, because `main` already uses 0031 to 0035.
+On 2026-10-31 the branch was integrated with Package Ports 2.0 (plan `ports-2-integration`). `main` was merged in. The broker now resolves each operation against one swappable, immutable Port snapshot, and every Personal change publishes a new snapshot that invalidates open metadata cursors. Team callers, including a Team Package acting as an Agent, see Team Providers only. Personal callers, including the standalone Agent harness, see both tiers. A Personal Provider that loses a required Port is no longer routed to or offered to Agents. Host integration tests cover Provider exit, retained Agent selections, and Agent reload with an uncertain command. The external cross-profile Agent reply case also fails on unchanged `main`, so it is tracked separately.
+
+Automated checks pass for every implementation step. The manual checks and the workstream Verify are outstanding. Integration into `main` needs the developer's approval. This branch's ADRs, accepted as 0031 and 0032, were renumbered to 0036 and 0037 when `main` was merged in, because `main` already uses 0031 to 0035.
 
 **Outcome:** A person installs, rebuilds, and removes a Personal Package from the Shell without touching files or restarting Teamarness, and Team Packages keep running.
 
