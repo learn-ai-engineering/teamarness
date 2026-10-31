@@ -79,6 +79,41 @@ pub struct CommentView {
     pub quote: Option<String>,
 }
 
+/// One projected Comment change, in revision order: `add`, `resolve` or `reopen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentChange {
+    pub revision: u64,
+    pub kind: String,
+    pub comment_id: String,
+    /// The Comment as it is now; its Markdown is `None` until its add record is opened.
+    pub comment: Option<CommentView>,
+}
+
+/// A bounded run of Comment changes after a cursor, sampled with the epoch and head under one
+/// store lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentChanges {
+    /// The current epoch, which a Consumer saves with its cursor.
+    pub epoch: String,
+    pub changes: Vec<CommentChange>,
+    /// The head revision when the batch was sampled.
+    pub high_water: u64,
+    /// The cursor through this batch: the last change's revision, or the head when none follow.
+    pub continuation: u64,
+    /// The asked epoch is not the current one, or the cursor is past the head. The batch is
+    /// empty, and `continuation` is the current head to resume from after resynchronizing.
+    pub resync_required: bool,
+}
+
+/// One Comment thread: its root first, then every nested reply in creation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentThread {
+    pub document_id: String,
+    /// `None` until the Document's create or latest rename record has been opened.
+    pub title: Option<String>,
+    pub comments: Vec<CommentView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestResult {
     Applied,
@@ -1018,40 +1053,126 @@ impl DocumentStore {
     /// The Comments of one Document in creation order, threads included.
     pub fn comments(&self, document: &str) -> Result<Vec<CommentView>, StoreError> {
         let inner = lock(&self.inner)?;
+        comment_rows(&inner, "document_id=?1", document)
+    }
+
+    /// The Comment history's current epoch and head revision.
+    pub fn comment_head(&self) -> Result<(String, u64), StoreError> {
+        let inner = lock(&self.inner)?;
+        comment_head(&inner)
+    }
+
+    /// At most `limit` (clamped to 1..=32) Comment changes after revision `after` in `epoch`.
+    /// The epoch, head and changes are sampled under the same store lock.
+    pub fn comment_changes(
+        &self,
+        epoch: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<CommentChanges, StoreError> {
+        let inner = lock(&self.inner)?;
+        let (current, head) = comment_head(&inner)?;
+        if current != epoch || after > head {
+            return Ok(CommentChanges {
+                epoch: current,
+                changes: Vec::new(),
+                high_water: head,
+                continuation: head,
+                resync_required: true,
+            });
+        }
+        let limit = limit.clamp(1, 32);
         let mut statement = inner
             .conn
-            .prepare("SELECT comment_id,parent_id,author,create_order,resolved,created_at FROM comments WHERE document_id=?1 ORDER BY create_order,comment_id")
+            .prepare(
+                "SELECT revision,comment_id,kind FROM comment_history_changes \
+                 WHERE revision>?1 AND revision<=?2 ORDER BY revision LIMIT ?3",
+            )
             .map_err(rerr)?;
         let rows = statement
-            .query_map([document], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, bool>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            })
+            .query_map(
+                params![after as i64, head as i64, (limit + 1) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(rerr)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(rerr)?;
-        rows.map(|row| {
-            row.map(|(id, parent_id, author, order_key, resolved, created_at)| {
-                let text = inner.comments.get(&id);
-                CommentView {
-                    markdown: text.map(|(markdown, _)| markdown.clone()),
-                    quote: text.and_then(|(_, quote)| quote.clone()),
-                    id,
-                    document_id: document.to_owned(),
-                    parent_id,
-                    author,
-                    order_key,
-                    resolved,
-                    created_at,
-                }
-            })
-            .map_err(rerr)
+        drop(statement);
+        let more = rows.len() > limit;
+        let mut changes = Vec::with_capacity(limit);
+        for (revision, comment_id, kind) in rows.into_iter().take(limit) {
+            let comment = comment_rows(&inner, "comment_id=?1", &comment_id)?
+                .into_iter()
+                .next();
+            changes.push(CommentChange {
+                revision,
+                kind,
+                comment_id,
+                comment,
+            });
+        }
+        let continuation = match changes.last() {
+            Some(last) if more => last.revision,
+            _ => head,
+        };
+        Ok(CommentChanges {
+            epoch: current,
+            changes,
+            high_water: head,
+            continuation,
+            resync_required: false,
         })
-        .collect()
+    }
+
+    /// The whole thread holding `comment_id`, or `None` for an unknown Comment.
+    pub fn comment_thread(&self, comment_id: &str) -> Result<Option<CommentThread>, StoreError> {
+        let inner = lock(&self.inner)?;
+        let Some(found) = comment_rows(&inner, "comment_id=?1", comment_id)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let all = comment_rows(&inner, "document_id=?1", &found.document_id)?;
+        let parents: HashMap<&str, Option<&str>> = all
+            .iter()
+            .map(|comment| (comment.id.as_str(), comment.parent_id.as_deref()))
+            .collect();
+        // A parent is always on the same Document (projection quarantines any other), so the
+        // walk stays inside `all`; the step bound guards against a cycle in a damaged store.
+        let root_of = |start: &str| {
+            let mut id = start.to_owned();
+            for _ in 0..=all.len() {
+                match parents.get(id.as_str()).copied().flatten() {
+                    Some(parent) if parents.contains_key(parent) => id = parent.to_owned(),
+                    _ => break,
+                }
+            }
+            id
+        };
+        let root = root_of(&found.id);
+        let mut comments: Vec<CommentView> = all
+            .iter()
+            .filter(|comment| root_of(&comment.id) == root)
+            .cloned()
+            .collect();
+        // The root first, then its replies in creation order.
+        comments.sort_by_key(|comment| comment.id != root);
+        let title = inner
+            .texts
+            .get(&found.document_id)
+            .map(|(_, title)| title.clone());
+        Ok(Some(CommentThread {
+            document_id: found.document_id,
+            title,
+            comments,
+        }))
     }
 
     pub fn collection_exists(&self, id: &str) -> Result<bool, StoreError> {
@@ -1144,6 +1265,58 @@ impl DocumentStore {
 
 /// Insert only a provenance-consistent identity. Both duplicate and conflicting record IDs
 /// are decided in the same transaction that projects the sealed record and cursor.
+fn comment_head(inner: &StoreInner) -> Result<(String, u64), StoreError> {
+    inner
+        .conn
+        .query_row(
+            "SELECT epoch,revision FROM comment_history_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+        )
+        .map_err(rerr)
+}
+
+/// The Comments matching `filter` (one `?1` parameter) in creation order, with their
+/// remembered Markdown and quote.
+fn comment_rows(
+    inner: &StoreInner,
+    filter: &str,
+    param: &str,
+) -> Result<Vec<CommentView>, StoreError> {
+    let mut statement = inner
+        .conn
+        .prepare(&format!(
+            "SELECT comment_id,document_id,parent_id,author,create_order,resolved,created_at FROM comments WHERE {filter} ORDER BY create_order,comment_id"
+        ))
+        .map_err(rerr)?;
+    let rows = statement
+        .query_map([param], |row| {
+            Ok(CommentView {
+                id: row.get(0)?,
+                document_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                author: row.get(3)?,
+                order_key: row.get(4)?,
+                resolved: row.get(5)?,
+                created_at: row.get(6)?,
+                markdown: None,
+                quote: None,
+            })
+        })
+        .map_err(rerr)?;
+    rows.map(|row| {
+        row.map(|mut comment| {
+            if let Some((markdown, quote)) = inner.comments.get(&comment.id) {
+                comment.markdown = Some(markdown.clone());
+                comment.quote.clone_from(quote);
+            }
+            comment
+        })
+        .map_err(rerr)
+    })
+    .collect()
+}
+
 fn index_identity(
     tx: &rusqlite::Transaction<'_>,
     id: &str,

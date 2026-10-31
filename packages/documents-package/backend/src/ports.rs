@@ -1,4 +1,4 @@
-//! Documents Port Contract 1.2 (`dev.teamarness.documents`, `ports.json`): another Package lists
+//! Documents Port Contract 1.3 (`dev.teamarness.documents`, `ports.json`): another Package lists
 //! Documents, reads one as Canonical Markdown with a version token, creates one (1.2) and
 //! revises it against a base version as the Host-derived actor, observes changes, and reads the
 //! `runtime.guide` (1.2). This is the agent surface.
@@ -26,6 +26,7 @@ use super::{
 };
 use crate::domain::DomainRecord;
 use crate::markdown;
+use crate::store::{CommentChanges, CommentView};
 
 pub(super) const CONTRACT: &str = "dev.teamarness.documents";
 
@@ -480,6 +481,291 @@ pub(super) async fn create(
             }
         })?;
     Ok(json!({ "documentId": created["id"], "version": version }))
+}
+
+// ---------------------------------------------------------------- Comments (1.3)
+
+/// The most changes one `comment.changes` batch holds.
+pub(crate) const MAX_COMMENT_CHANGES: usize = 32;
+/// The most Comments one `comment.thread` response holds: the root and its newest replies.
+pub(crate) const MAX_THREAD_COMMENTS: usize = 256;
+
+/// A Comment as the Comment Ports show it, or `None` while its text is not open.
+fn comment_value(comment: &CommentView) -> Option<JsonValue> {
+    let markdown = comment.markdown.as_ref()?;
+    let mut value = json!({
+        "id": comment.id,
+        "documentId": comment.document_id,
+        "author": comment.author,
+        "markdown": markdown,
+        "resolved": comment.resolved,
+    });
+    if let Some(parent) = &comment.parent_id {
+        value["parentId"] = json!(parent);
+    }
+    if let Some(quote) = &comment.quote {
+        value["quote"] = json!(quote);
+    }
+    if let Some(time) = &comment.created_at {
+        value["createdAt"] = json!(time);
+    }
+    Some(value)
+}
+
+fn fits(value: &JsonValue) -> bool {
+    value.to_string().len() <= PORT_PAYLOAD_BYTES
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CommentChangesRequest {
+    #[serde(default)]
+    epoch: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Workspace-wide Comment changes after a cursor, or the head as a baseline without one.
+pub(super) async fn comment_changes(
+    context: &Context<DocumentsActive>,
+    request: CommentChangesRequest,
+) -> Result<JsonValue, BackendError> {
+    let cursor = match (request.epoch, request.after) {
+        (None, None) => None,
+        (Some(epoch), Some(after)) => Some((
+            epoch,
+            after
+                .parse::<u64>()
+                .map_err(|_| error("documents.invalid_cursor", false))?,
+        )),
+        _ => return Err(error("documents.invalid_cursor", false)),
+    };
+    let limit = request
+        .limit
+        .unwrap_or(MAX_COMMENT_CHANGES)
+        .clamp(1, MAX_COMMENT_CHANGES);
+    let state = context.state().clone();
+    let batch = context
+        .blocking(move |_| {
+            let store = &state.store;
+            match cursor {
+                Some((epoch, after)) => store.comment_changes(&epoch, after, limit),
+                None => store.comment_head().map(|(epoch, head)| CommentChanges {
+                    epoch,
+                    changes: Vec::new(),
+                    high_water: head,
+                    continuation: head,
+                    resync_required: false,
+                }),
+            }
+            .map_err(|_| storage_failed())
+        })
+        .await?;
+    let mut value = json!({
+        "epoch": batch.epoch,
+        "events": [],
+        "continuation": batch.continuation.to_string(),
+        "highWater": batch.high_water.to_string(),
+    });
+    if batch.resync_required {
+        value["resyncRequired"] = json!(true);
+        return Ok(value);
+    }
+    let mut events = Vec::with_capacity(batch.changes.len());
+    for change in batch.changes {
+        let mut event = json!({
+            "revision": change.revision.to_string(),
+            "id": change.comment_id,
+            "kind": change.kind,
+            "status": "pending",
+        });
+        if let Some(comment) = change.comment.as_ref().and_then(comment_value) {
+            event["status"] = json!("ready");
+            event["comment"] = comment;
+        }
+        events.push(event);
+        value["events"] = json!(events);
+        value["continuation"] = json!(change.revision.to_string());
+        // A batch ends early rather than exceed the Port value bound; one change always fits,
+        // since a Comment is at most 32 KiB of Markdown and a 2 KiB quote.
+        if !fits(&value) {
+            events.pop();
+            let last = events
+                .last()
+                .and_then(|event| event["revision"].as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| error("documents.too_large", false))?;
+            value["events"] = json!(events);
+            value["continuation"] = json!(last);
+            return Ok(value);
+        }
+    }
+    value["continuation"] = json!(batch.continuation.to_string());
+    Ok(value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CommentThreadRequest {
+    comment_id: String,
+}
+
+/// The thread holding a Comment, root first, with its oldest replies dropped to fit.
+pub(super) async fn comment_thread(
+    context: &Context<DocumentsActive>,
+    request: CommentThreadRequest,
+) -> Result<JsonValue, BackendError> {
+    let state = context.state().clone();
+    let thread = context
+        .blocking(move |_| {
+            state
+                .store
+                .comment_thread(&request.comment_id)
+                .map_err(|_| storage_failed())
+        })
+        .await?
+        .ok_or_else(|| error("documents.unknown_comment", false))?;
+    let comments: Vec<JsonValue> = thread.comments.iter().filter_map(comment_value).collect();
+    let (root, replies) = match comments.split_first() {
+        Some((root, replies)) => (vec![root.clone()], replies),
+        None => (Vec::new(), &[][..]),
+    };
+    let mut kept = replies
+        .len()
+        .min(MAX_THREAD_COMMENTS.saturating_sub(root.len()));
+    loop {
+        let shown: Vec<&JsonValue> = root
+            .iter()
+            .chain(&replies[replies.len() - kept..])
+            .collect();
+        let value = json!({
+            "documentId": thread.document_id,
+            "title": thread.title.clone().unwrap_or_else(|| "Untitled".into()),
+            "comments": shown,
+            "truncated": kept < replies.len(),
+        });
+        if kept == 0 || fits(&value) {
+            return Ok(value);
+        }
+        kept -= 1;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CommentAddRequest {
+    document_id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    quote: Option<String>,
+    markdown: String,
+}
+
+/// Adds a Comment as exactly one `comment.add` record signed as `signer`.
+///
+/// Refusals before the append are certain, and so is Core's `principal_not_bound`; any other
+/// failure once the append is requested may have added the Comment, so it is uncertain.
+pub(super) async fn comment_add(
+    context: &Context<DocumentsActive>,
+    signer: Signer,
+    request: CommentAddRequest,
+) -> Result<JsonValue, BackendError> {
+    let state = context.state().clone();
+    let document = request.document_id.clone();
+    let parent = request.parent_id.clone();
+    context
+        .blocking(move |_| {
+            if !state
+                .store
+                .document_exists(&document)
+                .map_err(|_| storage_failed())?
+            {
+                return Err(error("documents.unknown_document", false));
+            }
+            if let Some(parent) = parent {
+                // A parent must be a Comment on the same Document.
+                let on_document = state
+                    .store
+                    .comment_thread(&parent)
+                    .map_err(|_| storage_failed())?
+                    .is_some_and(|thread| thread.document_id == document);
+                if !on_document {
+                    return Err(error("documents.unknown_comment", false));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| error("documents.invalid_timestamp", false))?
+        .as_millis()
+        .to_string();
+    let record = DomainRecord::comment_add_at(
+        &signer.identity,
+        &request.document_id,
+        request.parent_id.as_deref(),
+        request.quote.as_deref(),
+        &request.markdown,
+        Some(&created_at),
+    )
+    .map_err(domain_error)?;
+    let added = append_as(context, record, signer.principal.as_deref())
+        .await
+        .map_err(|cause| {
+            if cause.code() == "documents.principal_not_bound" {
+                cause
+            } else {
+                cause.with_outcome_uncertain(true)
+            }
+        })?;
+    Ok(json!({ "commentId": added["id"] }))
+}
+
+async fn comment_head(context: &Context<DocumentsActive>) -> Result<(String, u64), BackendError> {
+    let state = context.state().clone();
+    context
+        .blocking(move |_| state.store.comment_head().map_err(|_| storage_failed()))
+        .await
+}
+
+/// Live-only and coalescing: a payload-free event whenever the Comment history's head moves.
+pub(super) fn comments_changed(
+    context: &Context<DocumentsActive>,
+) -> Result<EventSubscription, BackendError> {
+    let (sender, subscription) = event_channel(1);
+    let mut metadata = context.state().changes.subscribe();
+    let context = context.clone();
+    tokio::spawn(async move {
+        let Ok(mut seen) = comment_head(&context).await else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                () = sender.closed() => return,
+                result = metadata.changed() => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
+            metadata.borrow_and_update();
+            let Ok(now) = comment_head(&context).await else {
+                return;
+            };
+            if now == seen {
+                continue;
+            }
+            seen = now;
+            if sender.send(json!({})).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(subscription)
 }
 
 // ---------------------------------------------------------------- documents.changed

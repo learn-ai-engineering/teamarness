@@ -301,7 +301,7 @@ fn unique_text(bytes: usize) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let application = harness::StagedApplication::with(&PackageStage::documents());
-    // A 1.0 Consumer keeps working against the 1.2 Provider.
+    // A 1.0 Consumer keeps working against the 1.3 Provider.
     stage_consumer(&application.application_path, 0, 0);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
@@ -320,7 +320,7 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let provided = serde_json::to_value(&provider.provided).unwrap();
     assert_eq!(provided[0]["identity"], DOCUMENTS);
     let ports = provided[0]["ports"].as_array().unwrap();
-    assert_eq!(ports.len(), 6);
+    assert_eq!(ports.len(), 10);
     for (name, kind) in [
         ("runtime.guide", "query"),
         ("document.create", "command"),
@@ -328,6 +328,10 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
         ("document.markdown", "query"),
         ("document.revise", "command"),
         ("documents.changed", "event"),
+        ("comments.changed", "event"),
+        ("comment.changes", "query"),
+        ("comment.thread", "query"),
+        ("comment.add", "command"),
     ] {
         assert!(
             ports

@@ -146,7 +146,7 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -351,7 +351,7 @@ mod store_tests {
                 ).unwrap();
             }
             let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;").unwrap();
+            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
             drop(connection);
             let store = DocumentStore::open(&path).unwrap();
             let mut rows = store.identity_candidates().unwrap();
@@ -410,7 +410,7 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -1181,5 +1181,304 @@ mod store_tests {
                 .iter()
                 .any(|r| r.purpose == "comment.add")
         );
+    }
+
+    fn kinds(changes: &store::CommentChanges) -> Vec<(u64, String, String)> {
+        changes
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    change.revision,
+                    change.kind.clone(),
+                    change.comment_id.clone(),
+                )
+            })
+            .collect()
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07 — every projected Comment add, resolve or reopen appends
+    // exactly one revision, including a reply that waited for its parent; duplicates, stale
+    // state records and quarantined records append none. Changes page under one epoch.
+    #[test]
+    fn comment_history_counts_each_projected_change_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let root = hex(64, 3);
+        let reply_id = hex(64, 4);
+        let add =
+            DomainRecord::comment_add(ALICE, &document, None, Some("Q"), "@Scout look").unwrap();
+        let reply = DomainRecord::comment_add(BOB, &document, Some(&root), None, "Reply").unwrap();
+        let epoch;
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            let (head_epoch, head) = store.comment_head().unwrap();
+            assert_eq!(head, 0, "a new history starts at revision 0");
+            assert_eq!(head_epoch.len(), 32);
+            assert!(head_epoch.bytes().all(|b| b.is_ascii_hexdigit()));
+            epoch = head_epoch;
+            ingest(
+                &store,
+                1,
+                ALICE,
+                &DomainRecord::collection_create(ALICE, "C").unwrap(),
+            );
+            ingest(
+                &store,
+                2,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &collection, "D", genesis()).unwrap(),
+            );
+            assert!(matches!(
+                ingest(&store, 4, BOB, &reply),
+                IngestResult::Deferred(_)
+            ));
+            assert_eq!(store.comment_head().unwrap().1, 0, "a deferred reply waits");
+            assert_eq!(ingest(&store, 3, ALICE, &add), IngestResult::Applied);
+            assert_eq!(
+                store.comment_head().unwrap().1,
+                2,
+                "the root, then the reply it unblocked"
+            );
+            assert_eq!(ingest(&store, 3, ALICE, &add), IngestResult::Duplicate);
+            ingest(
+                &store,
+                6,
+                BOB,
+                &DomainRecord::comment_resolve(BOB, &root).unwrap(),
+            );
+            // An earlier-sorting reopen changes nothing, so it records nothing.
+            ingest(
+                &store,
+                5,
+                ALICE,
+                &DomainRecord::comment_reopen(ALICE, &root).unwrap(),
+            );
+            ingest(
+                &store,
+                7,
+                ALICE,
+                &DomainRecord::comment_reopen(ALICE, &root).unwrap(),
+            );
+            ingest(
+                &store,
+                9,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &collection, "Other", genesis()).unwrap(),
+            );
+            let cross =
+                DomainRecord::comment_add(ALICE, &hex(64, 9), Some(&root), None, "x").unwrap();
+            assert!(matches!(
+                ingest(&store, 10, ALICE, &cross),
+                IngestResult::Quarantined(_)
+            ));
+            let all = store.comment_changes(&epoch, 0, 32).unwrap();
+            assert!(!all.resync_required);
+            assert_eq!(all.epoch, epoch);
+            assert_eq!(
+                kinds(&all),
+                [
+                    (1, "add".to_owned(), root.clone()),
+                    (2, "add".to_owned(), reply_id.clone()),
+                    (3, "resolve".to_owned(), root.clone()),
+                    (4, "reopen".to_owned(), root.clone()),
+                ]
+            );
+            assert_eq!((all.continuation, all.high_water), (4, 4));
+            let first = all.changes[0].comment.as_ref().unwrap();
+            assert_eq!(first.document_id, document);
+            assert_eq!(first.author, ALICE);
+            assert_eq!(first.markdown.as_deref(), Some("@Scout look"));
+            assert_eq!(first.quote.as_deref(), Some("Q"));
+            let second = all.changes[1].comment.as_ref().unwrap();
+            assert_eq!(second.parent_id.as_deref(), Some(root.as_str()));
+
+            // Paging: a limit stops at a revision, and the next page continues from it.
+            let page = store.comment_changes(&epoch, 0, 2).unwrap();
+            assert_eq!(page.changes.len(), 2);
+            assert_eq!((page.continuation, page.high_water), (2, 4));
+            let rest = store.comment_changes(&epoch, 2, 2).unwrap();
+            assert_eq!(kinds(&rest)[0].0, 3);
+            assert_eq!((rest.continuation, rest.high_water), (4, 4));
+            let none = store.comment_changes(&epoch, 4, 32).unwrap();
+            assert!(none.changes.is_empty());
+            assert_eq!((none.continuation, none.high_water), (4, 4));
+            assert_eq!(
+                store
+                    .comment_changes(&epoch, 0, 1000)
+                    .unwrap()
+                    .changes
+                    .len(),
+                4,
+                "the limit is clamped, not refused"
+            );
+
+            // A foreign epoch or a cursor past the head asks for a resync from the head.
+            for (asked, after) in [(hex(32, 0xe), 0), (epoch.clone(), 5)] {
+                let resync = store.comment_changes(&asked, after, 32).unwrap();
+                assert!(resync.resync_required);
+                assert!(resync.changes.is_empty());
+                assert_eq!(resync.epoch, epoch);
+                assert_eq!((resync.continuation, resync.high_water), (4, 4));
+            }
+        }
+        // The history survives restart; texts are pending until their records are reopened.
+        let store = DocumentStore::open(&path).unwrap();
+        assert_eq!(store.comment_head().unwrap(), (epoch.clone(), 4));
+        let after_restart = store.comment_changes(&epoch, 0, 1).unwrap();
+        assert_eq!(
+            after_restart.changes[0].comment.as_ref().unwrap().markdown,
+            None
+        );
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07 — a reply deferred before restart is counted when it is
+    // actually projected after restart, once.
+    #[test]
+    fn comment_history_counts_a_reply_rehydrated_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let root = hex(64, 3);
+        let reply = DomainRecord::comment_add(BOB, &document, Some(&root), None, "Reply").unwrap();
+        {
+            let store = DocumentStore::open(&path).unwrap();
+            ingest(
+                &store,
+                1,
+                ALICE,
+                &DomainRecord::collection_create(ALICE, "C").unwrap(),
+            );
+            ingest(
+                &store,
+                2,
+                ALICE,
+                &DomainRecord::document_create(ALICE, &collection, "D", genesis()).unwrap(),
+            );
+            assert!(matches!(
+                ingest(&store, 4, BOB, &reply),
+                IngestResult::Deferred(_)
+            ));
+        }
+        let store = DocumentStore::open(&path).unwrap();
+        let (epoch, _) = store.comment_head().unwrap();
+        ingest(
+            &store,
+            3,
+            ALICE,
+            &DomainRecord::comment_add(ALICE, &document, None, None, "Root").unwrap(),
+        );
+        assert_eq!(store.comment_head().unwrap().1, 1);
+        for _ in 0..2 {
+            store.retry_deferred(&hex(64, 4), &reply.encode()).unwrap();
+        }
+        let changes = store.comment_changes(&epoch, 0, 32).unwrap();
+        assert_eq!(
+            kinds(&changes),
+            [
+                (1, "add".to_owned(), root),
+                (2, "add".to_owned(), hex(64, 4)),
+            ]
+        );
+        assert_eq!(
+            changes.changes[1]
+                .comment
+                .as_ref()
+                .unwrap()
+                .markdown
+                .as_deref(),
+            Some("Reply")
+        );
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07 — a v7 database gains an empty Comment history with a fresh
+    // epoch.
+    #[test]
+    fn comment_history_migrates_v7_with_a_fresh_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(concat!(
+                    include_str!("../migrations/0001_documents.sql"),
+                    include_str!("../migrations/0002_edit_targets.sql"),
+                    include_str!("../migrations/0003_comments.sql"),
+                    include_str!("../migrations/0004_comment_time.sql"),
+                    include_str!("../migrations/0005_edit_identity_index.sql"),
+                    include_str!("../migrations/0006_import_failure.sql"),
+                    include_str!("../migrations/0007_schema_violation.sql"),
+                ))
+                .unwrap();
+            connection.pragma_update(None, "user_version", 7).unwrap();
+        }
+        let first = DocumentStore::open(&path).unwrap().comment_head().unwrap();
+        assert_eq!(first.1, 0);
+        let other = tempfile::tempdir().unwrap();
+        let second = DocumentStore::open(other.path().join("documents.sqlite3"))
+            .unwrap()
+            .comment_head()
+            .unwrap();
+        assert_ne!(first.0, second.0, "each history has its own epoch");
+        assert_eq!(
+            DocumentStore::open(&path).unwrap().comment_head().unwrap(),
+            first,
+            "reopening keeps the epoch"
+        );
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07 — a thread is its root and every nested reply in creation
+    // order, with its Document's ID and title, from any Comment in it.
+    #[test]
+    fn comment_thread_is_the_root_and_nested_replies() {
+        let f = fixture();
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "C").unwrap(),
+        );
+        ingest(
+            &f.store,
+            2,
+            ALICE,
+            &DomainRecord::document_create(ALICE, &collection, "Plan", genesis()).unwrap(),
+        );
+        let comment = |parent: Option<u64>, text: &str| {
+            DomainRecord::comment_add(
+                ALICE,
+                &document,
+                parent.map(|p| hex(64, p)).as_deref(),
+                None,
+                text,
+            )
+            .unwrap()
+        };
+        ingest(&f.store, 3, ALICE, &comment(None, "Root"));
+        ingest(&f.store, 4, ALICE, &comment(None, "Other thread"));
+        ingest(&f.store, 5, ALICE, &comment(Some(3), "First reply"));
+        ingest(&f.store, 6, ALICE, &comment(Some(5), "Nested reply"));
+        ingest(&f.store, 7, ALICE, &comment(Some(4), "Other reply"));
+        ingest(&f.store, 8, ALICE, &comment(Some(3), "Second reply"));
+        for from in [3, 5, 6, 8] {
+            let thread = f.store.comment_thread(&hex(64, from)).unwrap().unwrap();
+            assert_eq!(thread.document_id, document);
+            assert_eq!(thread.title.as_deref(), Some("Plan"));
+            let texts: Vec<_> = thread
+                .comments
+                .iter()
+                .map(|c| c.markdown.as_deref().unwrap())
+                .collect();
+            assert_eq!(
+                texts,
+                ["Root", "First reply", "Nested reply", "Second reply"]
+            );
+        }
+        assert!(f.store.comment_thread(&hex(64, 0xdead)).unwrap().is_none());
     }
 }

@@ -79,6 +79,24 @@ fn comment_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, rusq
     .optional()
     .map(|found| found.is_some())
 }
+/// Journals one projected Comment change in the caller's transaction, so the revision log
+/// commits or rolls back with the projection it describes.
+fn record_comment_change(
+    tx: &rusqlite::Transaction<'_>,
+    comment_id: &str,
+    document_id: &str,
+    kind: &str,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE comment_history_state SET revision=revision+1 WHERE singleton=1",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO comment_history_changes(revision,comment_id,document_id,kind) VALUES((SELECT revision FROM comment_history_state WHERE singleton=1),?1,?2,?3)",
+        params![comment_id, document_id, kind],
+    )?;
+    Ok(())
+}
 fn clear(tx: &rusqlite::Transaction<'_>, record_id: &str) -> Result<(), rusqlite::Error> {
     tx.execute(
         "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
@@ -277,10 +295,13 @@ pub(crate) fn project_domain(
                     );
                 }
             }
-            tx.execute(
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO comments(comment_id,document_id,parent_id,author,create_order,state_order,resolved,created_at) VALUES(?1,?2,?3,?4,?5,?5,0,?6)",
                 params![record_id, document, parent, author, order_key, created_at],
             )?;
+            if inserted > 0 {
+                record_comment_change(tx, record_id, document, "add")?;
+            }
             clear(tx, record_id)?;
             Ok(ProjectionOutcome {
                 comment: Some((record_id.into(), markdown.clone(), quote.clone())),
@@ -294,10 +315,20 @@ pub(crate) fn project_domain(
                 return ProjectionOutcome::deferred(tx, record_id, domain);
             }
             let resolved = matches!(domain, DomainRecord::CommentResolve { .. });
-            tx.execute(
+            let updated = tx.execute(
                 "UPDATE comments SET resolved=?2,state_order=?3 WHERE comment_id=?1 AND state_order<?3",
                 params![comment, resolved, order_key],
             )?;
+            // A record older than the state it would change projects nothing new.
+            if updated > 0 {
+                let document: String = tx.query_row(
+                    "SELECT document_id FROM comments WHERE comment_id=?1",
+                    [comment],
+                    |row| row.get(0),
+                )?;
+                let kind = if resolved { "resolve" } else { "reopen" };
+                record_comment_change(tx, comment, &document, kind)?;
+            }
             clear(tx, record_id)?;
             Ok(ProjectionOutcome::applied())
         }

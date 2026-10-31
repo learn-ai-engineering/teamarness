@@ -1576,6 +1576,31 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             ports::changed(&context)
         },
     )
+    .port_event(
+        ports::CONTRACT, "comments.changed",
+        |context: Context<DocumentsActive>, _actor: PortActor| async move {
+            ports::comments_changed(&context)
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "comment.changes", "query",
+        |context: Context<DocumentsActive>, _actor: PortActor, request: ports::CommentChangesRequest| async move {
+            ports::comment_changes(&context, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "comment.thread", "query",
+        |context: Context<DocumentsActive>, _actor: PortActor, request: ports::CommentThreadRequest| async move {
+            ports::comment_thread(&context, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "comment.add", "command",
+        |context: Context<DocumentsActive>, actor: PortActor, request: ports::CommentAddRequest| async move {
+            let signer = ports::authorize_actor(&context, actor)?;
+            ports::comment_add(&context, signer, request).await
+        },
+    )
 }
 
 async fn require_collection(
@@ -4325,10 +4350,10 @@ mod tests {
             drop(store);
             let connection = rusqlite::Connection::open(&path).unwrap();
             if old_version == 4 {
-                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;").unwrap();
+                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
             } else {
                 connection
-                    .execute_batch("DROP TABLE document_import_failures; PRAGMA user_version=5;")
+                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=5;")
                     .unwrap();
             }
             drop(connection);
@@ -4547,7 +4572,7 @@ mod tests {
             ).unwrap();
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -4694,7 +4719,7 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
@@ -7289,7 +7314,7 @@ mod tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, ports::CONTRACT);
-        assert_eq!((provided.major, provided.minor), (1, 2));
+        assert_eq!((provided.major, provided.minor), (1, 3));
         let names: Vec<_> = provided
             .ports
             .iter()
@@ -7304,6 +7329,10 @@ mod tests {
                 ("document.create", json!("command")),
                 ("document.revise", json!("command")),
                 ("documents.changed", json!("event")),
+                ("comments.changed", json!("event")),
+                ("comment.changes", json!("query")),
+                ("comment.thread", json!("query")),
+                ("comment.add", json!("command")),
             ]
         );
         assert!(contract.has_guide(ports::CONTRACT));
@@ -7429,6 +7458,110 @@ mod tests {
             "event",
             json!({"markdown":"secret"})
         ));
+
+        // Comment Ports (1.3).
+        let add = provided
+            .ports
+            .iter()
+            .find(|port| port.name == "comment.add")
+            .unwrap();
+        assert!(
+            add.description
+                .contains("must not be retried automatically")
+        );
+        for code in [
+            "documents.unknown_document",
+            "documents.unknown_comment",
+            "documents.actor_unauthorized",
+            "documents.principal_not_bound",
+        ] {
+            assert!(add.description.contains(code), "{code}");
+        }
+        let epoch = "0123456789abcdef0123456789abcdef";
+        assert!(valid("comments.changed", "event", json!({})));
+        assert!(!valid(
+            "comments.changed",
+            "event",
+            json!({"commentIds":[id]})
+        ));
+        assert!(valid("comment.changes", "request", json!({})));
+        assert!(valid(
+            "comment.changes",
+            "request",
+            json!({"epoch":epoch,"after":"0","limit":32})
+        ));
+        for invalid in [
+            json!({"epoch":epoch,"after":"0","limit":33}),
+            json!({"epoch":epoch,"after":"01"}),
+            json!({"epoch":"E".repeat(32),"after":"0"}),
+            json!({"epoch":epoch,"after":"0","documentId":id}),
+        ] {
+            assert!(!valid("comment.changes", "request", invalid));
+        }
+        let comment = json!({"id":id,"documentId":id,"author":ALICE,"markdown":"@Scout hi",
+            "resolved":false,"quote":"Q","parentId":hex(64, 2),"createdAt":"1730000000000"});
+        assert!(valid(
+            "comment.changes",
+            "response",
+            json!({"epoch":epoch,"events":[{"revision":"1","id":id,"kind":"add","status":"ready","comment":comment}],
+                "continuation":"1","highWater":"1"})
+        ));
+        assert!(valid(
+            "comment.changes",
+            "response",
+            json!({"epoch":epoch,"events":[{"revision":"2","id":id,"kind":"resolve","status":"pending"}],
+                "continuation":"2","highWater":"2"})
+        ));
+        assert!(valid(
+            "comment.changes",
+            "response",
+            json!({"epoch":epoch,"events":[],"continuation":"2","highWater":"2","resyncRequired":true})
+        ));
+        assert!(!valid(
+            "comment.changes",
+            "response",
+            json!({"epoch":epoch,"events":[{"revision":"1","id":id,"kind":"insert","status":"ready"}],
+                "continuation":"1","highWater":"1"})
+        ));
+        assert!(!valid(
+            "comment.changes",
+            "response",
+            json!({"events":[],"continuation":"0","highWater":"0"})
+        ));
+        assert!(valid("comment.thread", "request", json!({"commentId":id})));
+        assert!(!valid("comment.thread", "request", json!({})));
+        assert!(!valid(
+            "comment.thread",
+            "request",
+            json!({"commentId":"x"})
+        ));
+        assert!(valid(
+            "comment.thread",
+            "response",
+            json!({"documentId":id,"title":"Q4","comments":[comment],"truncated":false})
+        ));
+        assert!(!valid(
+            "comment.thread",
+            "response",
+            json!({"documentId":id,"title":"Q4","comments":[comment]})
+        ));
+        assert!(valid(
+            "comment.add",
+            "request",
+            json!({"documentId":id,"parentId":id,"quote":"Q","markdown":"x"})
+        ));
+        for invalid in [
+            json!({"documentId":id}),
+            json!({"documentId":id,"markdown":""}),
+            json!({"documentId":id,"markdown":"x".repeat(32 * 1024 + 1)}),
+            json!({"documentId":id,"markdown":"x","quote":""}),
+            json!({"documentId":id,"markdown":"x","quote":"q".repeat(2049)}),
+            json!({"documentId":id,"markdown":"x","author":ALICE}),
+        ] {
+            assert!(!valid("comment.add", "request", invalid));
+        }
+        assert!(valid("comment.add", "response", json!({"commentId":id})));
+        assert!(!valid("comment.add", "response", json!({"ok":true})));
     }
 
     // Verifies: TEAM.SYS.DOCS-R12 — every shared merge scenario holds through the provider, with
@@ -7823,13 +7956,20 @@ mod tests {
         }
     }
 
-    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.PKG-R12 — 1.2 keeps every 1.1 Port, kind and schema,
-    // and adds runtime.guide and document.create; 1.1 still keeps every 1.0 Port.
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.PKG-R12 — 1.3 keeps every 1.2 Port, kind and schema,
+    // and adds the four Comment Ports; 1.2 kept every 1.1 Port and added runtime.guide and
+    // document.create; 1.1 still keeps every 1.0 Port.
     #[test]
-    fn port_contract_1_2_is_additive_over_1_1_and_1_1_over_1_0() {
+    fn port_contract_minors_are_additive() {
+        assert_additive(
+            include_bytes!("../tests/fixtures/ports-1.2.json"),
+            include_bytes!("../../ports.json"),
+            (2, 3),
+            4,
+        );
         assert_additive(
             include_bytes!("../tests/fixtures/ports-1.1.json"),
-            include_bytes!("../../ports.json"),
+            include_bytes!("../tests/fixtures/ports-1.2.json"),
             (1, 2),
             2,
         );
@@ -8383,6 +8523,7 @@ mod tests {
             "## Create",
             "## Revise against a version",
             "## Host-derived authorship",
+            "## Comments",
             "## Errors and repeatability",
         ] {
             assert!(markdown.contains(heading), "missing section: {heading}");
@@ -8404,6 +8545,11 @@ mod tests {
             "Never automatically retry an uncertain command".into(),
             "a retry duplicates it".into(),
             "List and reconcile first".into(),
+            "comments.changed".into(),
+            "resyncRequired".into(),
+            "comment.thread".into(),
+            "Never automatically retry an uncertain comment.add".into(),
+            format!("at most {} changes", ports::MAX_COMMENT_CHANGES),
         ] {
             assert!(markdown.contains(&advice), "missing guidance: {advice}");
         }
@@ -8704,5 +8850,402 @@ mod tests {
         }
         text.truncate(bytes);
         text.trim_end().to_owned()
+    }
+
+    // ------------------------------------------------------------ Comment Ports 1.3
+
+    fn comment_contract() -> teamarness_package_contract::port_contract::CompiledPortContracts {
+        teamarness_package_contract::port_contract::compile_port_contracts(include_bytes!(
+            "../../ports.json"
+        ))
+        .unwrap()
+    }
+
+    /// Asserts that `value` is a valid `direction` value of `port` under the contract.
+    fn assert_port_value(port: &str, direction: &str, value: &JsonValue) {
+        let contract = comment_contract();
+        if let Err(error) = contract.validate(ports::CONTRACT, port, direction, value) {
+            panic!("{port} {direction} is invalid: {error:?}\n{value}");
+        }
+    }
+
+    async fn comment_changes(harness: &mut Harness, request: JsonValue) -> JsonValue {
+        let value = port_as(harness, "query", "comment.changes", agent(), request)
+            .await
+            .unwrap();
+        assert_port_value("comment.changes", "response", &value);
+        value
+    }
+
+    async fn agent_comment(
+        harness: &mut Harness,
+        actor: JsonValue,
+        request: JsonValue,
+    ) -> Result<JsonValue, BackendError> {
+        port_as(harness, "command", "comment.add", actor, request).await
+    }
+
+    async fn next_comment_event(events: &mut teamarness_package_sdk::testing::HarnessSubscription) {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next_event())
+            .await
+            .expect("comments.changed in time")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["$teamarnessPortValue"], json!({}));
+        assert_port_value("comments.changed", "event", &event["$teamarnessPortValue"]);
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07, TEAM.SYS.DOCS-R12 — a bound Agent baselines the Workspace
+    // Comment feed, is woken by comments.changed, reads each new Comment once in revision
+    // order, reads its thread with the Document, and replies as itself.
+    #[tokio::test]
+    async fn agent_reads_comment_changes_and_threads_and_replies_as_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let mut events = session
+            .harness
+            .subscribe(
+                "teamarness.port.event.v1",
+                port_envelope("comments.changed", agent(), json!({})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.next_event())
+                .await
+                .is_err(),
+            "the event is live-only: no initial event"
+        );
+        // Without a cursor, the feed answers its head: the Consumer starts from there.
+        let baseline = comment_changes(&mut session.harness, json!({})).await;
+        assert_eq!(baseline["events"], json!([]));
+        assert_eq!(baseline["continuation"], "0");
+        assert_eq!(baseline["highWater"], "0");
+        assert!(baseline.get("resyncRequired").is_none());
+        let epoch = baseline["epoch"].as_str().unwrap().to_owned();
+
+        // A Person mentions the Agent in a Comment on a quote.
+        let root = session
+            .harness
+            .request(
+                "documents.comment.add",
+                json!({"documentId":document,"quote":"Ship in Q4","markdown":"@Scout add dates"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        next_comment_event(&mut events).await;
+        let changes = comment_changes(
+            &mut session.harness,
+            json!({"epoch":epoch,"after":"0","limit":32}),
+        )
+        .await;
+        assert_eq!(changes["epoch"], epoch);
+        assert_eq!(changes["continuation"], "1");
+        assert_eq!(changes["highWater"], "1");
+        let change = &changes["events"][0];
+        assert_eq!(change["revision"], "1");
+        assert_eq!(change["id"], root);
+        assert_eq!(change["kind"], "add");
+        assert_eq!(change["status"], "ready");
+        assert_eq!(change["comment"]["id"], root);
+        assert_eq!(change["comment"]["documentId"], document);
+        assert_eq!(change["comment"]["author"], ALICE);
+        assert_eq!(change["comment"]["markdown"], "@Scout add dates");
+        assert_eq!(change["comment"]["quote"], "Ship in Q4");
+        assert_eq!(change["comment"]["resolved"], false);
+        assert!(change["comment"].get("parentId").is_none());
+        assert!(change["comment"]["createdAt"].as_str().is_some());
+
+        // The Agent replies under the triggering Comment: one record, signed as the Agent.
+        let before = appends(&session);
+        let reply = agent_comment(
+            &mut session.harness,
+            agent(),
+            json!({"documentId":document,"parentId":root,"markdown":"Added the dates."}),
+        )
+        .await
+        .unwrap();
+        assert_port_value("comment.add", "response", &reply);
+        assert_eq!(appends(&session), before + 1);
+        let calls = append_calls(&session);
+        let call = calls.last().unwrap();
+        assert_eq!(call.payload["principal"], AGENT_PRINCIPAL);
+        assert_eq!(call.payload["purpose"], "comment.add");
+        let DomainRecord::CommentAdd {
+            author,
+            document: target,
+            parent,
+            quote,
+            markdown,
+            created_at,
+        } = appended_record(call)
+        else {
+            panic!("a comment.add record");
+        };
+        assert_eq!(author, AGENT_KEY, "the record names the Agent's key");
+        assert_eq!(target, document);
+        assert_eq!(parent.as_deref(), Some(root.as_str()));
+        assert_eq!(quote, None);
+        assert_eq!(markdown, "Added the dates.");
+        assert!(created_at.is_some());
+        let reply_id = reply["commentId"].as_str().unwrap().to_owned();
+        next_comment_event(&mut events).await;
+        let changes =
+            comment_changes(&mut session.harness, json!({"epoch":epoch,"after":"1"})).await;
+        assert_eq!(changes["events"].as_array().unwrap().len(), 1);
+        assert_eq!(changes["events"][0]["id"], reply_id);
+        assert_eq!(changes["events"][0]["comment"]["author"], AGENT_KEY);
+        assert_eq!(changes["events"][0]["comment"]["parentId"], root);
+
+        // The thread, from either Comment, is the root then its replies, with the Document.
+        for from in [&root, &reply_id] {
+            let thread = port_as(
+                &mut session.harness,
+                "query",
+                "comment.thread",
+                agent(),
+                json!({"commentId":from}),
+            )
+            .await
+            .unwrap();
+            assert_port_value("comment.thread", "response", &thread);
+            assert_eq!(thread["documentId"], document);
+            assert_eq!(thread["title"], "Q4");
+            assert_eq!(thread["truncated"], false);
+            let ids: Vec<_> = thread["comments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|comment| comment["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, [root.as_str(), reply_id.as_str()]);
+        }
+
+        // Resolve and reopen are changes too, and the Person's own Port add is the Person's.
+        session
+            .harness
+            .request("documents.comment.resolve", json!({"commentId":root}))
+            .await
+            .unwrap();
+        next_comment_event(&mut events).await;
+        port_as(
+            &mut session.harness,
+            "command",
+            "comment.add",
+            alice(),
+            json!({"documentId":document,"markdown":"Thanks"}),
+        )
+        .await
+        .unwrap();
+        let calls = append_calls(&session);
+        assert!(calls.last().unwrap().payload.get("principal").is_none());
+        assert_eq!(appended_record(calls.last().unwrap()).author(), ALICE);
+        let changes = comment_changes(
+            &mut session.harness,
+            json!({"epoch":epoch,"after":"2","limit":1}),
+        )
+        .await;
+        assert_eq!(changes["events"][0]["kind"], "resolve");
+        assert_eq!(changes["events"][0]["comment"]["resolved"], true);
+        assert_eq!(changes["continuation"], "3");
+        assert_eq!(changes["highWater"], "4");
+
+        // A foreign epoch, or a cursor past the head, asks for a resync from the head.
+        for request in [
+            json!({"epoch":"0".repeat(32),"after":"0"}),
+            json!({"epoch":epoch,"after":"5"}),
+        ] {
+            let resync = comment_changes(&mut session.harness, request).await;
+            assert_eq!(resync["resyncRequired"], true);
+            assert_eq!(resync["events"], json!([]));
+            assert_eq!(resync["epoch"], epoch);
+            assert_eq!(resync["continuation"], "4");
+            assert_eq!(resync["highWater"], "4");
+        }
+        events.close().await;
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07, TEAM.SYS.DOCS-R12 — comment.add and the Comment queries
+    // refuse with the existing typed errors, and no refused add appends a record.
+    #[tokio::test]
+    async fn comment_ports_refuse_with_typed_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, document) = ported_document(&mut session).await;
+        let other = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"Other"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let root = agent_comment(
+            &mut session.harness,
+            agent(),
+            json!({"documentId":document,"markdown":"Root"}),
+        )
+        .await
+        .unwrap()["commentId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let before = appends(&session);
+        let stranger = json!({"kind":"person","identity":"stranger"});
+        for (actor, request, code) in [
+            (
+                stranger,
+                json!({"documentId":document,"markdown":"x"}),
+                "documents.actor_unauthorized",
+            ),
+            (
+                agent(),
+                json!({"documentId":hex(64, 0xdead),"markdown":"x"}),
+                "documents.unknown_document",
+            ),
+            (
+                agent(),
+                json!({"documentId":document,"parentId":hex(64, 0xdead),"markdown":"x"}),
+                "documents.unknown_comment",
+            ),
+            (
+                agent(),
+                json!({"documentId":other,"parentId":root,"markdown":"x"}),
+                "documents.unknown_comment",
+            ),
+        ] {
+            let refused = agent_comment(&mut session.harness, actor, request)
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), code);
+            assert!(!refused.retryable(), "{code}");
+            assert!(!refused.outcome_uncertain(), "{code}");
+        }
+        assert_eq!(appends(&session), before, "no refused add is appended");
+        let stale = json!({"kind":"agent","principal":hex(64, 0x57a1e),"identity":AGENT_KEY});
+        let refused = agent_comment(
+            &mut session.harness,
+            stale,
+            json!({"documentId":document,"markdown":"x"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code(), "documents.principal_not_bound");
+        assert!(!refused.outcome_uncertain(), "Core committed nothing");
+
+        let unknown = port_as(
+            &mut session.harness,
+            "query",
+            "comment.thread",
+            agent(),
+            json!({"commentId":hex(64, 0xdead)}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown.code(), "documents.unknown_comment");
+        // A cursor is an epoch and a revision together.
+        let (epoch, _) = session.handles.store.comment_head().unwrap();
+        for request in [json!({"epoch":epoch}), json!({"after":"0"})] {
+            let refused = port_as(
+                &mut session.harness,
+                "query",
+                "comment.changes",
+                agent(),
+                request,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_cursor");
+        }
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R07, TEAM.SYS.DOCS-R12 — a thread and a change batch stay within
+    // the Port value bound: the thread drops its oldest replies after the root first, and a
+    // batch ends early with a continuation inside it.
+    #[tokio::test]
+    async fn comment_thread_and_changes_fit_the_port_value_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (_, document) = ported_document(&mut session).await;
+        let (epoch, _) = session.handles.store.comment_head().unwrap();
+        // Quotes and newlines escape to the largest JSON for their bytes.
+        let large = |seed: u8| format!("{seed}{}", "\"\n".repeat(16 * 1024 - 1));
+        let root = agent_comment(
+            &mut session.harness,
+            alice(),
+            json!({"documentId":document,"quote":"\"".repeat(2048),"markdown":large(0)}),
+        )
+        .await
+        .unwrap()["commentId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut replies = Vec::new();
+        for seed in 1..=8 {
+            replies.push(
+                agent_comment(
+                    &mut session.harness,
+                    alice(),
+                    json!({"documentId":document,"parentId":root,"markdown":large(seed)}),
+                )
+                .await
+                .unwrap()["commentId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        let thread = port_as(
+            &mut session.harness,
+            "query",
+            "comment.thread",
+            agent(),
+            json!({"commentId":replies[0]}),
+        )
+        .await
+        .unwrap();
+        assert_port_value("comment.thread", "response", &thread);
+        assert!(serde_json::to_vec(&thread).unwrap().len() <= ports::PORT_PAYLOAD_BYTES);
+        assert_eq!(thread["truncated"], true);
+        let comments = thread["comments"].as_array().unwrap();
+        assert_eq!(comments[0]["id"], root, "the root is kept");
+        assert_eq!(
+            comments.last().unwrap()["id"],
+            *replies.last().unwrap(),
+            "the newest reply is kept"
+        );
+        assert!(comments.len() < 9);
+        assert_eq!(
+            comments[1]["id"],
+            replies[9 - comments.len()],
+            "the oldest replies are dropped first"
+        );
+
+        let mut after = "0".to_owned();
+        let mut seen = 0;
+        loop {
+            let batch =
+                comment_changes(&mut session.harness, json!({"epoch":epoch,"after":after})).await;
+            assert!(serde_json::to_vec(&batch).unwrap().len() <= ports::PORT_PAYLOAD_BYTES);
+            let count = batch["events"].as_array().unwrap().len();
+            assert!(count > 0 || batch["continuation"] == batch["highWater"]);
+            seen += count;
+            after = batch["continuation"].as_str().unwrap().to_owned();
+            if after == batch["highWater"] {
+                break;
+            }
+            assert!(count < 9, "a full batch would exceed the bound");
+        }
+        assert_eq!(seen, 9, "every change is reachable");
+        session.harness.shutdown().await.unwrap();
     }
 }

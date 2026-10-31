@@ -1,11 +1,13 @@
-//! Runtime advice for the public Documents Ports (1.2). Numeric limits come from their
+//! Runtime advice for the public Documents Ports (1.3). Numeric limits come from their
 //! enforcement.
 
 use serde_json::{Value as JsonValue, json};
 
-use super::ports::{MAX_PAGE, MAX_VERSION_IDS, PORT_PAYLOAD_BYTES};
+use super::ports::{
+    MAX_COMMENT_CHANGES, MAX_PAGE, MAX_THREAD_COMMENTS, MAX_VERSION_IDS, PORT_PAYLOAD_BYTES,
+};
 use crate::body::MAX_TEXT_BYTES;
-use crate::domain::{MAX_TITLE, MAX_UPDATE};
+use crate::domain::{MAX_MARKDOWN, MAX_QUOTE, MAX_TITLE, MAX_UPDATE};
 
 pub(super) fn response() -> JsonValue {
     let markdown = format!(
@@ -35,7 +37,19 @@ One revise is one record of at most {update_kib} KiB of changes. A larger change
 
 ## Host-derived authorship
 
-document.create and document.revise act as the Host-derived actor: this Installation Person, or the Workspace Agent the calling Package Instance is bound to. Never supply an actor, author, signer or Principal in a request. An Agent's record names the Agent's signing key as its author, and Core signs it with that key or refuses. A Person from another Installation is refused with documents.actor_unauthorized. Queries and the event accept any Host-derived actor.
+document.create, document.revise and comment.add act as the Host-derived actor: this Installation Person, or the Workspace Agent the calling Package Instance is bound to. Never supply an actor, author, signer or Principal in a request. An Agent's record names the Agent's signing key as its author, and Core signs it with that key or refuses. A Person from another Installation is refused with documents.actor_unauthorized. Queries and events accept any Host-derived actor.
+
+## Comments
+
+A Comment is Markdown on a Document, with an optional quoted excerpt and an optional parent Comment on the same Document; a reply to a reply makes a nested thread. A mention such as @Name is plain text in the Markdown: read it from there.
+
+comments.changed is a payload-free wake whenever a Comment anywhere in the Workspace is added, resolved or reopened. It may coalesce and has no initial event or replay, so read comment.changes on receipt and after reconnecting.
+
+comment.changes returns at most {MAX_COMMENT_CHANGES} changes in revision order. Call it first with {{}} for a baseline: the current epoch and head with no events. Save epoch and continuation, then pass them as epoch and after; pass both or neither. Each event has revision, id, kind (add, resolve or reopen) and status. A ready event carries the Comment: id, documentId, parentId, author, markdown, quote, resolved and createdAt. A pending event's text is not open yet: keep the cursor before it and read again from there. A batch can stop before highWater to fit the {payload_kib} KiB Port value bound; continue from continuation until it reaches highWater. Save only a cursor whose Comments you have handled, and skip revisions and Comment IDs you have already handled. resyncRequired true means the epoch changed or after is past the head: do not act on Comments from before it; save the returned epoch and continuation as the new baseline.
+
+comment.thread takes commentId and returns the Document's documentId and title, and the whole thread holding that Comment: the root first, then every nested reply in creation order, at most {MAX_THREAD_COMMENTS} Comments. A thread too large for the Port value bound drops its oldest replies after the root and sets truncated. Read the Document itself with document.markdown when you need it.
+
+comment.add takes documentId, markdown (1 byte to {markdown_kib} KiB), and optionally quote (at most {quote_kib} KiB) and parentId, and adds the Comment as the Host-derived actor. To answer a Comment, reply with its ID as parentId. documents.unknown_comment means the parent is unknown or on another Document. The response is commentId. Every accepted add makes a new Comment. Never automatically retry an uncertain comment.add: read the thread and look for your Comment first.
 
 ## Errors and repeatability
 
@@ -43,11 +57,13 @@ The Host validates closed schemas and its own authority before dispatch. A Provi
 
 document.create refuses an unknown Collection with documents.unknown_collection, an archived Collection with documents.collection_archived, and an invalid title with documents.invalid_title. documents.principal_not_bound means Core does not sign for this Agent now; nothing was written. These refusals are certain. documents.capability_unavailable carries causeCode in Provider details. documents.storage_failed, documents.deferred and documents.rejected can follow a committed record, so treat them as uncertain when outcomeUncertain is set.
 
-runtime.guide, document.list and document.markdown are read-only and repeatable, but their results can change. Treat document.revise as not repeatable: after an uncertain revise, read the Document and decide from what it holds. document.create is not repeatable: every accepted create makes a new Document, so a retry duplicates it. Never automatically retry an uncertain command, including outcome_unknown after a timeout, Provider exit or an invalid response. List and reconcile first: look for the Document by Collection and title before you create it again, and read it before you revise it again.
+runtime.guide, document.list, document.markdown, comment.changes and comment.thread are read-only and repeatable, but their results can change. Treat document.revise as not repeatable: after an uncertain revise, read the Document and decide from what it holds. document.create is not repeatable: every accepted create makes a new Document, so a retry duplicates it. Never automatically retry an uncertain command, including outcome_unknown after a timeout, Provider exit or an invalid response. List and reconcile first: look for the Document by Collection and title before you create it again, and read it before you revise it again.
 "#,
         payload_kib = PORT_PAYLOAD_BYTES / 1024,
         update_kib = MAX_UPDATE / 1024,
         text_kib = MAX_TEXT_BYTES / 1024,
+        markdown_kib = MAX_MARKDOWN / 1024,
+        quote_kib = MAX_QUOTE / 1024,
     );
     json!({ "markdown": markdown })
 }
