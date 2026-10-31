@@ -70,6 +70,24 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Backlog Package (implemented on branch, Verify pending)
+
+Implemented on 2026-11-01 on branch `don-smith/add_backlog_package`, workstream `backlog-package`. It is not integrated into `main`. Verify, including the developer's manual checks, has not run yet. The new bundled Team Package `dev.teamarness.backlog` holds Epics and Tickets for the Workspace (`TEAM.SYS.BACKLOG-R01` to `R10`).
+
+- ADR 0039 (accepted 2026-11-01) settles Ticket field updates. A Ticket changes field by field, and each field keeps the change that is last in log order. A Ticket's version is the highest applied OrderKey. A save on an older version than this Installation has seen is refused with `backlog.stale_version`, and the refusal returns the current Ticket. Saves on Installations that had not seen each other are not refused; they converge per field.
+- Records go on the immutable record log with a Package-owned codec. Titles, bodies and drafts are never stored as plaintext in SQLite (ADR 0027).
+- A Person creates, renames, archives and restores Epics, and creates, moves, archives and restores Tickets. Nothing is deleted. Show archived reveals archived items.
+- The left pane shows collapsible Epics in alphabetical order. Tickets are ordered by priority, then status, then creation time. A Priority filter and a Status filter combine, and each clears in one action. Every dropdown is a Package-local WAI-ARIA listbox, not a native `<select>`.
+- The detail pane shows the title, the rendered Markdown body (tables and read-only task lists), status, priority, assignee, and who created and last changed the Ticket. Edit shows the raw Markdown; Save sends only the changed fields. The assignee is a current Workspace Person or nobody. A former assignee shows as **Former member** with a short identity.
+- Drafts, the selected Ticket, edit mode, filters, Show archived and Epic expansion survive a Package switch on the same Installation. They are held in Backend memory only, so they do not survive an application restart.
+- Port Contract `dev.teamarness.backlog` 1.0 offers `runtime.guide`, `ticket.list`, `ticket.get`, `ticket.create`, `ticket.update` and the `backlog.changed` event. A bound Agent creates Tickets in an existing, open Epic and changes their title, body, status and priority, signed with its own key. It cannot create Epics, assign, move, archive or restore.
+
+Automated evidence: Backend unit tests, Backlog UI tests, and the system tests `backlog_two_installation_flow` (replication, offline catch-up, per-field convergence) and `backlog_ports_proof` (guide, list, get, create, update, stale refusal, Agent attribution, live UI update).
+
+**Outcome:** A Workspace plans its work as Epics and Tickets, and its Agents read and update Tickets beside the Members.
+
+**Follow-ups:** a former assignee's name needs `teamarness.principals` 1.1; conflict detection across Installations (deferred by ADR 0039); chunking the `backlog.changes` snapshot; remembering the new-Ticket draft.
+
 ### Agent Doc Exhibit (complete, verified locally)
 
 Started on 2026-10-31 on branch `don-smith/agent_doc_exhibit` in the Host and the standalone Agent Package, workstream `agent-doc-exhibit`. A Steward's Agent works with Documents and Exhibits in chat, and the Agent's Configuration moves to its Package page.
