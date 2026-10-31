@@ -34,6 +34,20 @@ Publish uses one cross-version concurrency group, `teamarness-stable-publication
 
 Use exact **Rust 1.99.1**, **Node 24.20.0**, committed lockfiles and native `aarch64-apple-darwin`. Prefer latest compatible tooling deliberately, with actual checks; discuss concrete breakage rather than silently retreat or blanket-refresh dependencies.
 
+Before changing versions or starting another build, inspect `target/release/distribution`. Qualification intentionally rejects a prior version's DMG as an unexpected asset. Preserve the previous version's outputs in a new private archive directory **outside** the distribution directory. For a completed `v0.1.0` qualification, archive only these explicitly named files:
+
+```sh
+mkdir -m 700 /private/path/teamarness-v0.1.0-distribution &&
+  mv -i target/release/distribution/Teamarness_0.1.0_aarch64.dmg \
+    target/release/distribution/Teamarness.app.tar.gz \
+    target/release/distribution/Teamarness.app.tar.gz.sig \
+    target/release/distribution/latest.json \
+    target/release/distribution/qualification.json \
+    /private/path/teamarness-v0.1.0-distribution/
+```
+
+Use the actual prior version and a new archive path; if an earlier attempt was incomplete, explicitly name only the known files present. Stop and investigate any other entries rather than deleting them or bypassing the qualifier's allowlist. Confirm the named files are preserved in the archive and distribution is ready for the new version before proceeding. Do not use wildcards, recursive cleanup, or place signing material in either asset directory.
+
 ```sh
 node scripts/release/version.mjs set 0.1.1
 node scripts/release/version.mjs check --tag v0.1.1

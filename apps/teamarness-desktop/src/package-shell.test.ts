@@ -576,3 +576,31 @@ it("contains mount failure in the selected target and keeps Reload UI separate f
   target.children[2]?.click();
   expect(calls).toEqual(["reload", "recover"]);
 });
+
+// Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R06
+it.each(["select", "hide"] as const)("ignores an established mount's obsolete failure callback after %s", async (next) => {
+  const failures = { value: 0 };
+  let oldFailure!: () => void;
+  let currentFailure!: () => void;
+  let opening = 0;
+  const controller = {
+    ...mounts(),
+    mount: async (_instance: PackageInstanceKey, _target: unknown, onFailure: () => void) => {
+      opening += 1;
+      if (opening === 1) { oldFailure = onFailure; return {}; }
+      currentFailure = onFailure;
+      return {};
+    },
+  };
+  const shell = new PackageShell(snapshotBridge(async () => snapshot), controller, view(failures));
+  await shell.select(first);
+  if (next === "select") await shell.select(second);
+  else await shell.hide();
+  oldFailure();
+  expect(failures.value).toBe(0);
+  if (next === "select") {
+    currentFailure();
+    currentFailure();
+    expect(failures.value).toBe(1);
+  }
+});

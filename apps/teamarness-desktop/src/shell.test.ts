@@ -2,13 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/fixtures/bridge-contract.json";
 import { ApplicationUpdateController, BrowserApplicationUpdateView } from "./application-update";
 import type { ApplicationUpdateBridge, ApplicationUpdateSnapshot } from "./application-update-contracts";
-import type { Installation, Membership, PrincipalsSnapshot, Workspace } from "./contracts";
+import type { TeamarnessBridge } from "./bridge";
+import type { Installation, Invitation, Membership, PrincipalsSnapshot, Workspace, WorkspaceState } from "./contracts";
 import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge } from "./package-contracts";
 import type { PackageLifecycleResult } from "./package-shell";
 import { createInstallationPackageVisibility, type InstallationPackageVisibility } from "./package-visibility";
 import { Shell, type ShellFrame, type ShellRoute } from "./shell";
 import { STATUS_MESSAGE_HIDE_MS, type StatusMessageTimers } from "./status-message";
-import type { ShellModel } from "./view";
+import { ShellController, type ShellModel } from "./view";
 
 const installation = fixture.installation as Installation;
 const workspace = fixture.workspace as Workspace;
@@ -805,7 +806,7 @@ it("restores Workspace controls and the selected Package after rejected Restart"
   const running: ApplicationUpdateSnapshot = {
     ...ready,
     revision: 2,
-    update: { ...ready.update, revision: 2, state: "idle", pendingGeneration: null },
+    update: { ...ready.update, revision: 2 },
   };
   const bridge: ApplicationUpdateBridge = {
     subscribe: vi.fn(async () => () => undefined),
@@ -837,6 +838,7 @@ it("restores Workspace controls and the selected Package after rejected Restart"
   expect(calls).not.toContain(`mount:${privatePackageKey.packageIdentity}`);
 
   await restarting;
+  await vi.waitFor(() => { expect(calls.filter((call) => call === `mount:${packageKey.packageIdentity}`)).toHaveLength(2); });
   expect(bridge.restart).toHaveBeenCalledExactlyOnceWith("opaque-1");
   expect(bridge.status).toHaveBeenCalledTimes(2);
   // No Workspace-model update follows the initial setup: recovery must restore the cleared rail itself.
@@ -857,6 +859,201 @@ it("restores Workspace controls and the selected Package after rejected Restart"
   expect(terminal.hidden).toBe(true);
   expect(calls).toEqual([`mount:${packageKey.packageIdentity}`, "blocked:true", "blocked:false", `mount:${packageKey.packageIdentity}`]);
   updates.detach();
+});
+
+// Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R07
+it.each(["publication", "navigation", "active-workspace", "terminal"] as const)(
+  "retains recovery ownership through a newer presentation without overriding %s",
+  async (next) => {
+    const { shell, frame, calls } = harness();
+    await shell.updateWorkspace(model());
+    shell.updatePackages(packages);
+    await shell.navigate({ kind: "package-instance", instance: packageKey });
+    shell.setApplicationUpdating(true);
+    shell.setApplicationUpdating(false);
+    // This real publication supersedes recovery's in-progress presentation.
+    const publication = shell.updateWorkspace({ ...model(), notice: "Current model" });
+    if (next === "navigation") await shell.navigate({ kind: "package-instance", instance: privatePackageKey });
+    if (next === "active-workspace") await shell.updateWorkspace(model(otherWorkspace.id));
+    if (next === "terminal") shell.setApplicationUpdating(true);
+    await publication;
+
+    if (next === "publication") {
+      await vi.waitFor(() => { expect(calls.filter((call) => call === `mount:${packageKey.packageIdentity}`)).toHaveLength(2); });
+      expect(shell.route()).toEqual({ kind: "package-instance", instance: packageKey });
+      expect(frame.packageMount.hidden).toBe(false);
+      expect(frame.workspaceRail.innerHTML).toContain('aria-label="Switch to Other"');
+    } else {
+      expect(calls.filter((call) => call === `mount:${packageKey.packageIdentity}`)).toHaveLength(1);
+      if (next === "navigation") {
+        expect(calls.filter((call) => call === `mount:${privatePackageKey.packageIdentity}`)).toHaveLength(1);
+        expect(shell.route()).toEqual({ kind: "package-instance", instance: privatePackageKey });
+        expect(frame.packageMount.hidden).toBe(false);
+      } else if (next === "active-workspace") {
+        expect(shell.route()).toEqual({ kind: "workspace-settings", workspaceId: otherWorkspace.id });
+        expect(frame.contextualNavigation.innerHTML).toContain("<h1>Other</h1>");
+        expect(frame.packageMount.hidden).toBe(true);
+      } else {
+        for (const region of Object.values(frame)) {
+          expect(region.hidden).toBe(true);
+          expect(region.innerHTML).toBe("");
+        }
+      }
+    }
+  },
+);
+
+class RecoveryRailRegion extends ThemeRailRegion {
+  public readonly choices = [new TestControl(), new TestControl()];
+  public readonly add = new TestControl();
+
+  public override querySelector(selector: string): (TestControl & { focus(): void }) | null {
+    if (selector === "#choose-workspace") return Object.assign(this.add, { focus: () => undefined });
+    return super.querySelector(selector);
+  }
+
+  public override querySelectorAll(selector: string): readonly TestControl[] {
+    if (selector !== "[data-workspace-index]") return super.querySelectorAll(selector);
+    return this.choices.filter((control, index) => {
+      control.dataset.workspaceIndex = String(index);
+      return this.innerHTML.includes(`data-workspace-index="${index}"`);
+    });
+  }
+}
+
+// Verifies: TEAM.SYS.SHELL-R04, TEAM.SYS.SHELL-R07
+it.each(["create", "join"] as const)("reconciles a completed %s while rejected Restart awaits Running status", async (operation) => {
+  let completeWorkspace!: (state: WorkspaceState) => void;
+  const pendingWorkspace = new Promise<WorkspaceState>((resolve) => { completeWorkspace = resolve; });
+  const native: TeamarnessBridge = {
+    installationDetails: async () => installation,
+    listWorkspaces: async () => [workspace],
+    currentMembership: async () => membership,
+    createWorkspace: async () => pendingWorkspace,
+    joinWorkspace: async () => pendingWorkspace,
+    createWorkspaceInvitation: async () => fixture.invitation as Invitation,
+    principalsSnapshot: async (workspaceId) => ({ workspaceId, cursor: "0", principals: [] }),
+    subscribePrincipals: async () => undefined,
+    renameWorkspacePrincipal: async () => undefined,
+    addWorkspaceAgent: async () => undefined,
+    removeWorkspaceAgent: async () => undefined,
+  };
+  const rail = new RecoveryRailRegion();
+  const nav = new NavRegion();
+  const screen = new SettingsRegion();
+  const frame: ShellFrame = {
+    workspaceRail: rail as unknown as HTMLElement,
+    contextualNavigation: nav as unknown as HTMLElement,
+    shellScreen: screen as unknown as HTMLElement,
+    packageMount: new Region() as unknown as HTMLElement,
+  };
+  const calls: string[] = [];
+  const publications: Promise<void>[] = [];
+  const controller = new ShellController(native, (model) => { publications.push(shell.updateWorkspace(model)); });
+  const shell = new Shell(frame, {
+    packageShell: {
+      setBlocked: (blocked) => { calls.push(`blocked:${blocked}`); },
+      select: async () => { calls.push("mount"); },
+      hide: async () => { calls.push("hide"); },
+      refresh: async () => packages,
+      suspendBackend: async () => ({ snapshot: packages, failure: null }),
+      recoverBackend: async () => ({ snapshot: packages, failure: null }),
+      disposeBackend: async () => ({ snapshot: packages, failure: null }),
+    },
+    packageManagement: unusedPackageManagement(),
+    packageVisibility: createInstallationPackageVisibility({ storage: null }),
+    theme: { getPreference: () => "system", selectPreference: (value) => { calls.push(`theme:${value}`); }, subscribe: () => () => undefined },
+    workspaceActions: {
+      selectWorkspace: (id) => { controller.selectWorkspace(id); },
+      createWorkspace: (name, person) => controller.createWorkspace(name, person),
+      joinWorkspace: (invitation, person) => controller.joinWorkspace(invitation, person),
+      rename: (id, name) => controller.rename(id, name),
+      addAgent: (id, name) => controller.addAgent(id, name),
+      removeAgent: (id, agent) => controller.removeAgent(id, agent),
+      renameAgent: (id, agent, name) => controller.renameAgent(id, agent, name),
+      copyInvitation: (id) => controller.copyInvitation(id),
+      refreshMembership: (id) => controller.refreshMembership(id),
+      retry: () => controller.load(),
+    },
+  });
+  const ready: ApplicationUpdateSnapshot = {
+    revision: 1,
+    update: { revision: 1, state: "ready", installedVersion: "0.1.0", candidateVersion: "1.2.3", downloadedBytes: 20, archiveLimit: 100, error: null, pendingGeneration: "opaque-1", notes: null },
+    lifecycle: { revision: 1, shutdown: { host: false, core: false, uncertain: false }, phase: "running", failure: null, previousApp: null, guidance: null },
+  };
+  let rejectRestart!: (error: Error) => void;
+  const pendingRestart = new Promise<ApplicationUpdateSnapshot>((_resolve, reject) => { rejectRestart = reject; });
+  let returnStatus!: (snapshot: ApplicationUpdateSnapshot) => void;
+  const pendingStatus = new Promise<ApplicationUpdateSnapshot>((resolve) => { returnStatus = resolve; });
+  let statusEntered!: () => void;
+  const readingStatus = new Promise<void>((resolve) => { statusEntered = resolve; });
+  const updateBridge: ApplicationUpdateBridge = {
+    subscribe: async () => () => undefined,
+    status: vi.fn().mockResolvedValueOnce(ready).mockImplementation(() => { statusEntered(); return pendingStatus; }),
+    restart: async () => pendingRestart,
+    check: async () => ready,
+    quit: async () => undefined,
+  };
+  const notice = Object.assign(new Region(), { querySelectorAll: () => [] });
+  const terminal = Object.assign(new Region(), { querySelectorAll: () => [], focus: () => undefined });
+  const view = new BrowserApplicationUpdateView(notice as unknown as HTMLElement, terminal as unknown as HTMLElement, (blocked) => { shell.setApplicationUpdating(blocked); });
+  const updates = new ApplicationUpdateController(updateBridge, (state) => { view.render(state, updates); });
+  try {
+    await controller.load();
+    await Promise.all(publications);
+    shell.updatePackages(packages);
+    await shell.navigate({ kind: "workspace-chooser" });
+    const completing = operation === "create"
+      ? controller.createWorkspace("Other", "Person")
+      : controller.joinWorkspace("fixture invitation", "Person");
+    expect(controller.snapshot().loading).toBe(true);
+    // Package navigation remains available while this already-started operation is pending.
+    await shell.navigate({ kind: "package-instance", instance: packageKey });
+    await updates.attach();
+    const restarting = updates.restart();
+    expect(rail.innerHTML).toBe("");
+    expect(frame.packageMount.hidden).toBe(true);
+    rejectRestart(new Error("admission rejected"));
+    await readingStatus;
+    completeWorkspace({ workspace: otherWorkspace, membership: { ...membership, workspaceId: otherWorkspace.id } });
+    await completing;
+    await Promise.all(publications);
+    expect(controller.snapshot().activeWorkspaceId).toBe(otherWorkspace.id);
+    expect(controller.snapshot().loading).toBe(false);
+    expect(rail.innerHTML).toBe("");
+    const completedPublications = publications.length;
+    // Ready can remain Ready: only rejected admission plus authoritative Running restores use.
+    returnStatus({ ...ready, revision: 2 });
+    await restarting;
+    await vi.waitFor(() => { expect(rail.innerHTML).toContain('aria-label="Switch to Other"'); });
+    expect(publications).toHaveLength(completedPublications);
+    expect(rail.innerHTML).toContain('data-workspace-index="1" aria-current="page"');
+    expect(nav.innerHTML).toContain("<h1>Other</h1>");
+    expect(shell.route()).toEqual({ kind: "workspace-settings", workspaceId: otherWorkspace.id });
+    expect(screen.innerHTML).toContain(operation === "create" ? "Created Other" : "Joined Other");
+    expect(frame.packageMount.hidden).toBe(true);
+    expect(frame.shellScreen.hidden).toBe(false);
+    expect(calls.filter((call) => call === "mount")).toHaveLength(1);
+
+    // Restored controls address the current model, not the pre-block presentation.
+    rail.dark.click();
+    expect(calls).toContain("theme:dark");
+    rail.choices[0]!.click();
+    await Promise.all(publications);
+    expect(controller.snapshot().activeWorkspaceId).toBe(workspace.id);
+    expect(shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id });
+    rail.choices[1]!.click();
+    await Promise.all(publications);
+    nav.settings.click();
+    await vi.waitFor(() => { expect(nav.innerHTML).toContain("<h1>Other</h1>"); });
+    expect(shell.route()).toEqual({ kind: "workspace-settings", workspaceId: otherWorkspace.id });
+    rail.add.click();
+    await vi.waitFor(() => { expect(screen.innerHTML).toContain('id="create-workspace"'); });
+    expect(shell.route()).toEqual({ kind: "workspace-chooser" });
+  } finally {
+    controller.dispose();
+    updates.detach();
+  }
 });
 
 // Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R05

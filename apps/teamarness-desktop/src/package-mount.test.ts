@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TEAMARNESS_THEME_TOKENS } from "@teamarness/package-ui-sdk";
 import type { OpenPackageMount, PackageHostTransport, PackageInstanceKey, PackageUiView } from "./package-contracts";
 import { CONNECT_KIND, FRAME_BRIDGE_PROTOCOL, type ThemeSnapshot } from "./package-frame/protocol";
+import { PackageShell, type PackageShellActions } from "./package-shell";
 import {
   browserFrameDom,
   FRAME_CONNECT_TIMEOUT_MS,
@@ -635,4 +636,127 @@ it("late openMount and queued mounts cannot restore frames after application ter
   await expect(queued).rejects.toThrow("unavailable");
   expect(test.frames).toHaveLength(0);
   expect(test.calls).toContain("close:mount-1");
+});
+
+// Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R06, TEAM.SYS.SHELL-R07
+it("keeps the recovered Package frame when an established old frame's fault report finishes", async () => {
+  const test = harness();
+  let finishOldReport!: () => void;
+  const oldReport = new Promise<void>((resolve) => { finishOldReport = resolve; });
+  let reportEntered!: () => void;
+  const reporting = new Promise<void>((resolve) => { reportEntered = resolve; });
+  test.bridge.reportUiFault = async ({ mount }) => {
+    test.calls.push(`fault:${mount}`);
+    if (mount === "mount-1") { reportEntered(); await oldReport; }
+  };
+  // Model the two real writers to the same target: frame creation and failure presentation.
+  const target: { content: unknown } = { content: null };
+  const dom: PackageFrameDom = {
+    create: (mountTarget, source) => {
+      expect(mountTarget).toBe(target);
+      const lease = test.dom.create(mountTarget, source);
+      target.content = lease;
+      return {
+        ...lease,
+        remove: () => {
+          lease.remove();
+          if (target.content === lease) target.content = null;
+        },
+      };
+    },
+  };
+  const controller = new PackageMountController(test.bridge, dom, test.theme, test.timers.timers, () => {
+    const channel = new MessageChannel();
+    openPorts.push(channel.port1, channel.port2);
+    return channel;
+  });
+  const failures: PackageShellActions[] = [];
+  const shell = new PackageShell({
+    snapshot: async () => ({ revision: 1, state: "running", packages: [], instances: [], diagnostics: [], registrations: [] }),
+    subscribeHostState: async () => undefined,
+  }, controller, {
+    mountTarget: target,
+    showFailure: (actions) => { failures.push(actions); target.content = "failure"; },
+  });
+  const finishMount = async (selecting: Promise<void>, index: number): Promise<ScriptedFrame> => {
+    await settle();
+    const frame = test.frames[index];
+    if (!frame) throw new Error(`no frame for mount ${index + 1}`);
+    frame.load();
+    const scripted = scriptFrame(frame);
+    scripted.send({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
+    await settle();
+    scripted.send({ kind: "mounted" });
+    await selecting;
+    return scripted;
+  };
+  const oldFrame = await finishMount(shell.select(instance), 0);
+  oldFrame.send({ kind: "fault", source: "error" });
+  await reporting;
+  expect(failures).toHaveLength(0);
+  shell.setBlocked(true);
+  expect(target.content).toBeNull();
+  shell.setBlocked(false);
+  const recovered = await finishMount(shell.select(instance), 1);
+  const workingFrame = test.frames[1]!.lease;
+  expect(target.content).toBe(workingFrame);
+  expect(test.calls).toContain("close:mount-1");
+  finishOldReport();
+  await oldReport;
+  await settle();
+  expect(target.content).toBe(workingFrame);
+  expect(failures).toHaveLength(0);
+
+  // A fault from the current frame still presents ordinary recovery.
+  recovered.send({ kind: "fault", source: "error" });
+  await settle();
+  expect(target.content).toBe("failure");
+  expect(failures).toHaveLength(1);
+  expect(test.calls).toContain("fault:mount-2");
+  await shell.hide();
+});
+
+// Verifies: TEAM.SYS.SHELL-R02, TEAM.SYS.SHELL-R07
+it("ignores a cancelled old opening before the serialized recovery mount creates its frame", async () => {
+  const test = harness();
+  let rejectOpening!: (error: Error) => void;
+  const oldOpening = new Promise<OpenPackageMount>((_resolve, reject) => { rejectOpening = reject; });
+  let enterOpening!: () => void;
+  const opening = new Promise<void>((resolve) => { enterOpening = resolve; });
+  let opens = 0;
+  test.bridge.openMount = async () => {
+    opens += 1;
+    if (opens === 1) { enterOpening(); return oldOpening; }
+    return descriptor(opens);
+  };
+  let failures = 0;
+  const shell = new PackageShell({
+    snapshot: async () => ({ revision: 1, state: "running", packages: [], instances: [], diagnostics: [], registrations: [] }),
+    subscribeHostState: async () => undefined,
+  }, test.controller(), { mountTarget: {}, showFailure: () => { failures += 1; } });
+  const selecting = shell.select(instance);
+  await opening;
+  shell.setBlocked(true);
+  shell.setBlocked(false);
+  const recovering = shell.select(instance);
+  expect(opens).toBe(1);
+  expect(test.frames).toHaveLength(0);
+  rejectOpening(new Error("old opening rejected"));
+  await selecting;
+  expect(failures).toBe(0);
+  await settle();
+  expect(opens).toBe(2);
+  expect(test.frames).toHaveLength(1);
+  const recovered = test.frames[0]!;
+  recovered.load();
+  const scripted = scriptFrame(recovered);
+  scripted.send({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
+  await settle();
+  scripted.send({ kind: "mounted" });
+  await recovering;
+  expect(failures).toBe(0);
+  const hiding = shell.hide();
+  await settle();
+  scripted.send({ kind: "unmounted", ok: true });
+  await hiding;
 });

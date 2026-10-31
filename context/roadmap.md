@@ -218,13 +218,6 @@ Started on 2026-10-18 on the `workspace-documents` workstream. The Documents Pac
 
 **Depends on:** Phase 4. Follow-up: folder mapping, so a mapped folder lets any editor or CLI agent edit documents.
 
-### Stable application releases and updates (implemented locally; qualification pending)
-
-Started on 2026-10-24 in the `auto-update` workstream on branch `don-smith/auto_update`. The workstream implements same-public-repository stable release tooling, exact Rust 1.99.1/Node 24.20.0 native Apple Silicon qualification, signed-version bounded acquisition, main-Shell consent, and one stop-first terminal lifecycle (ADR 0038). Publication qualifies complete drafts and serializes strictly increasing stable versions; public releases are immutable by workflow policy. Local checks/builds do not prove hosted permission boundaries or installed continuity.
-
-**Pending, owners Don/maintainer:** public-disclosure/visibility and protected main/tags/environment setup, production-key custody, actual hosted checks/publication/anonymous downloads, final packaged-app/Ready-state WKWebView isolation, ordinary Quit/Backend exits, Gatekeeper/copied writable launch and real installed A→B identity/data/argument/process continuity. These block passing Verify and general distribution. Earlier manual gates and separate Core test-reliability risks remain visible in the workstream. See [releasing runbook](../docs/releasing.md).
-
-Only this stable single-platform application update work moves out of Later. Tray/native menus, Developer ID/notarization, other targets, per-Package updates and one-hour adoption remain deferred. Local-first use does not require GitHub.
 #### Documents rendered editing (verified and integrated 2026-10-25)
 
 Implemented on branch `don-smith/rendered_doc_editing`, workstream `rendered-document-editing`, from `e6b2afc`; it passed Verify and was integrated into `main` on 2026-10-25. ADR 0032 replaces the plain-text body: a Document body is a structured Loro tree that a Member edits in rendered form, and the Package UI is a Loro peer through `loro-prosemirror`. ADR 0031 lets Package UI frames run WebAssembly by adding only `'wasm-unsafe-eval'`. The workstream delivers:
@@ -241,13 +234,21 @@ The record format changed incompatibly, so development data directories that hol
 
 **Depends on:** Phase 7 (Documents Package), Package interface (ADR 0026).
 
+### Stable application releases and updates (implemented locally; qualification pending)
+
+Started on 2026-10-24 in the `auto-update` workstream on branch `don-smith/auto_update`. The workstream implements same-public-repository stable release tooling, exact Rust 1.99.1/Node 24.20.0 native Apple Silicon qualification, signed-version bounded acquisition, main-Shell consent, and one stop-first terminal lifecycle (ADR 0038). Publication qualifies complete drafts and serializes strictly increasing stable versions; public releases are immutable by workflow policy. Local checks/builds do not prove hosted permission boundaries or installed continuity.
+
+**Pending, owners Don/maintainer:** public-disclosure/visibility and protected main/tags/environment setup, production-key custody, actual hosted checks/publication/anonymous downloads, final packaged-app/Ready-state WKWebView isolation, ordinary Quit/Backend exits, Gatekeeper/copied writable launch and real installed A→B identity/data/argument/process continuity. These block passing Verify and general distribution. Earlier manual gates and separate Core test-reliability risks remain visible in the workstream. See [releasing runbook](../docs/releasing.md).
+
+Only this stable single-platform application update work moves out of Later. Tray/native menus, Developer ID/notarization, other targets, per-Package updates and one-hour adoption remain deferred. Local-first use does not require GitHub.
+
 ## Later (unscheduled)
 
 Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
 
 - Custom relay server configuration for teams (`TEAM-R11`, `TEAM.SYS.TRANS-R02`).
 - System tray and native menus (`TEAM.SYS.SHELL-R01`, ADR 0002).
-- One-hour update adoption (vision success criterion 6), Developer ID signing and notarization (`TEAM.DEL`); stable consent-driven update tooling is scheduled below, not an adoption guarantee.
+- One-hour update adoption (vision success criterion 6), Developer ID signing and notarization (`TEAM.DEL`); see **Stable application releases and updates** for the consent-driven tooling, not an adoption guarantee.
 - Builds for platforms other than macOS on Apple silicon.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted eager Package runs one Backend per Workspace (5 eager bundled Packages × 3 Workspaces = 15 processes); the on-demand Exhibits Package starts only on first use. Measure before scheduling.

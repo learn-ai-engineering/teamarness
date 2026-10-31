@@ -97,6 +97,8 @@ export class Shell {
   private packagePageTabFocus = false;
   /** Counts navigations, so one that finishes unmounting after a newer one started leaves the newer one's mount alone. */
   private navigation = 0;
+  /** A newer presentation may finish recovery, but a newer navigation or block revokes it. */
+  private recoveryNavigation: number | null = null;
   private readonly packageManagement: PackageManagementController;
   private readonly packagePage: PackagePageController;
 
@@ -138,6 +140,7 @@ export class Shell {
   public setApplicationUpdating(blocked: boolean): void {
     if (blocked === this.applicationUpdating) return;
     this.applicationUpdating = blocked;
+    this.recoveryNavigation = blocked ? null : this.navigation;
     this.presentationRevision += 1;
     this.options.packageShell.setBlocked(blocked);
     if (blocked) {
@@ -145,8 +148,7 @@ export class Shell {
     } else {
       this.shellFrame.workspaceRail.hidden = false;
       this.shellFrame.contextualNavigation.hidden = false;
-      this.renderWorkspaceRail();
-      void this.navigate(this.selectedRoute);
+      if (this.workspaceModel) void this.updateWorkspace(this.workspaceModel);
     }
   }
 
@@ -168,7 +170,13 @@ export class Shell {
       this.deactivatePackage();
       this.setRoute({ kind: "workspace-settings", workspaceId: model.activeWorkspaceId });
     }
-    if (await this.preparePresentation()) this.renderAll();
+    if (await this.preparePresentation()) {
+      this.renderAll();
+      if (this.recoveryNavigation === this.navigation) {
+        this.recoveryNavigation = null;
+        void this.navigate(this.selectedRoute);
+      }
+    }
   }
 
   public updatePackages(snapshot: PackageHostSnapshot): void {
@@ -192,6 +200,7 @@ export class Shell {
 
   public async navigate(requested: ShellRoute): Promise<void> {
     if (this.applicationUpdating) return;
+    this.recoveryNavigation = null;
     const navigation = ++this.navigation;
     const route = this.availableRoute(requested);
     this.setRoute(route);

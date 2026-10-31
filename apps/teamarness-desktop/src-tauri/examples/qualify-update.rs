@@ -159,7 +159,7 @@ mod tests {
         }})
     }
 
-    // Verifies: TEAM.CONTRIB-R02. ADR 0031 requires official signed-version verification.
+    // Verifies: TEAM.CONTRIB-R02. ADR 0038 requires official signed-version verification.
     #[test]
     fn genuine_signed_bytes_verify_for_both_macos_targets() {
         for target in TARGETS {

@@ -48,6 +48,7 @@ interface MountController {
 export class PackageShell {
   private selected: PackageInstanceKey | null = null;
   private blocked = false;
+  private presentationGeneration = 0;
   private selectedView: PackageUiView = "main";
   private acceptedSnapshot: PackageHostSnapshot | null = null;
   private snapshotObserver: PackageSnapshotObserver | null = null;
@@ -106,6 +107,7 @@ export class PackageShell {
   }
 
   public setBlocked(blocked: boolean): void {
+    if (blocked && !this.blocked) this.presentationGeneration += 1;
     this.blocked = blocked;
     this.mounts.setBlocked(blocked);
   }
@@ -118,6 +120,7 @@ export class PackageShell {
   }
 
   public async hide(): Promise<void> {
+    this.presentationGeneration += 1;
     await this.mounts.unmount();
   }
 
@@ -228,9 +231,10 @@ export class PackageShell {
 
   private async loadSelected(): Promise<void> {
     if (this.blocked || !this.selected) return;
+    const generation = ++this.presentationGeneration;
     let failureShown = false;
     const showFailure = (): void => {
-      if (this.blocked || failureShown) return;
+      if (this.blocked || generation !== this.presentationGeneration || failureShown) return;
       failureShown = true;
       this.view.showFailure(this.recoveryActions());
     };
