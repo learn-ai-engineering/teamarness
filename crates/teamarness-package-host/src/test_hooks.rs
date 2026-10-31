@@ -192,6 +192,32 @@ impl PackageHost {
     }
 }
 
+/// A payload-free view of the broker's current Port snapshot. Test builds only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSnapshotProbe {
+    pub revision: [u8; 32],
+    /// Every Team caller's entries, by identity.
+    pub team: std::collections::BTreeMap<PackageIdentity, TeamPortEntry>,
+    pub team_providers: std::collections::BTreeMap<String, PackageIdentity>,
+    pub personal_providers: std::collections::BTreeMap<String, PackageIdentity>,
+}
+
+/// One Team caller's snapshot entries. `contracts` is the address of its
+/// compiled contracts, so equal entries share the same allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamPortEntry {
+    pub routes: Vec<crate::PortAvailability>,
+    pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+    pub contracts: Option<usize>,
+}
+
+impl PackageHost {
+    /// The broker's current Port snapshot, without payloads.
+    pub fn port_snapshot_for_tests(&self) -> PortSnapshotProbe {
+        self.inner.port_broker.snapshot().probe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

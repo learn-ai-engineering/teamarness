@@ -10,7 +10,7 @@ mod authority;
 #[cfg(feature = "test-hooks")]
 mod test_hooks;
 #[cfg(feature = "test-hooks")]
-pub use test_hooks::{AuthorityPause, PortSelectionPause};
+pub use test_hooks::{AuthorityPause, PortSelectionPause, PortSnapshotProbe, TeamPortEntry};
 mod broker;
 mod port_access;
 mod port_observation;

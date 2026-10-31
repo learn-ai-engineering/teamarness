@@ -1,5 +1,5 @@
 //! Installation-scoped, generation-limited routing for exact consumed Ports.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, Weak};
 
 use serde_json::{Map, Value, json};
@@ -17,7 +17,9 @@ use crate::admission::PortAvailability;
 use crate::instance::InstanceActor;
 use crate::port_observation::{PortObservation, PortObservations, PortStage};
 use crate::protocol::{PortQueryStream, WireFailure, capability_code};
-use crate::{PackageErrorCode, PackageIdentity, PackageInstanceKey, PackageValue, WorkspaceId};
+use crate::{
+    PackageErrorCode, PackageIdentity, PackageInstanceKey, PackageTier, PackageValue, WorkspaceId,
+};
 
 // Four maximum request/response pairs fit this Host-wide byte budget; the per-generation
 // limit leaves at least 24 of the protocol's 32 request slots to UI/lifecycle traffic.
@@ -55,14 +57,10 @@ pub(crate) struct PortBroker {
     pub(crate) subscription_leases:
         std::sync::Mutex<Vec<Weak<crate::port_access::SubscriptionLease>>>,
     pub(crate) access: crate::port_access::PortAccess,
-    metadata_revision: [u8; 32],
-    /// Callers whose entries were inserted at construction and are never changed:
-    /// the Team tier (ADR 0036).
-    fixed: BTreeSet<PackageIdentity>,
-    graph: RwLock<BTreeMap<PackageIdentity, Vec<PortAvailability>>>,
+    /// The admission-derived routing every operation reads. Replaced whole by
+    /// [`PortBroker::publish`], never changed in place (ADR 0035, ADR 0036).
+    snapshot: RwLock<Arc<PortSnapshot>>,
     observations: broadcast::Sender<PortObservation>,
-    consumed: RwLock<BTreeMap<PackageIdentity, Vec<ConsumedContract>>>,
-    contracts: RwLock<BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>>,
     pub(crate) instances: RwLock<BTreeMap<PackageInstanceKey, Weak<InstanceActor>>>,
     routes: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
@@ -79,18 +77,207 @@ pub(crate) struct RoutePermits {
     _bytes: OwnedSemaphorePermit,
 }
 
-impl PortBroker {
-    /// Builds the broker over every admitted Package. The entries of `fixed`
-    /// callers are never replaced or removed; every other caller's are.
+/// One caller's admission-derived Port entries.
+pub(crate) struct CallerPorts {
+    pub(crate) routes: Vec<PortAvailability>,
+    pub(crate) consumed: Vec<ConsumedContract>,
+    pub(crate) contracts: Option<Arc<CompiledPortContracts>>,
+}
+
+/// One immutable view of the admission-derived Port graph.
+///
+/// Every resolve, metadata page or chunk, and access check clones the current
+/// snapshot once and reads only it (ADR 0035). A Personal change builds the
+/// next snapshot, which copies every Team entry unchanged, and publishes it in
+/// one swap with a fresh `revision` (ADR 0036). Metadata cursors hash the
+/// revision, so a cursor from an earlier snapshot is refused.
+pub(crate) struct PortSnapshot {
+    revision: [u8; 32],
+    graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
+    consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
+    contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
+    tiers: BTreeMap<PackageIdentity, PackageTier>,
+    team_providers: BTreeMap<String, PackageIdentity>,
+    personal_providers: BTreeMap<String, PackageIdentity>,
+}
+
+impl PortSnapshot {
+    /// The snapshot at Host open, over every admitted Package of both tiers.
     pub(crate) fn new(
         graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
         consumed: BTreeMap<PackageIdentity, Vec<ConsumedContract>>,
         contracts: BTreeMap<PackageIdentity, Arc<CompiledPortContracts>>,
-        fixed: BTreeSet<PackageIdentity>,
-        access: crate::port_access::PortAccess,
-    ) -> Arc<Self> {
-        let mut metadata_revision = [0; 32];
-        getrandom::fill(&mut metadata_revision).expect("Host metadata revision entropy");
+        tiers: BTreeMap<PackageIdentity, PackageTier>,
+        team_providers: BTreeMap<String, PackageIdentity>,
+        personal_providers: BTreeMap<String, PackageIdentity>,
+    ) -> Self {
+        Self {
+            revision: fresh_revision(),
+            graph,
+            consumed,
+            contracts,
+            tiers,
+            team_providers,
+            personal_providers,
+        }
+    }
+
+    /// The next snapshot: this one's Team entries unchanged, the Personal tier
+    /// replaced by `personal` and `personal_providers`, and a fresh revision.
+    pub(crate) fn with_personal(
+        &self,
+        personal: BTreeMap<PackageIdentity, CallerPorts>,
+        personal_providers: BTreeMap<String, PackageIdentity>,
+    ) -> Self {
+        let team =
+            |identity: &PackageIdentity| self.tiers.get(identity) == Some(&PackageTier::Team);
+        let mut next = Self {
+            revision: fresh_revision(),
+            graph: keep(&self.graph, team),
+            consumed: keep(&self.consumed, team),
+            contracts: keep(&self.contracts, team),
+            tiers: keep(&self.tiers, team),
+            team_providers: self.team_providers.clone(),
+            personal_providers,
+        };
+        for (identity, ports) in personal {
+            debug_assert!(!team(&identity), "a Team caller's entries never change");
+            next.graph.insert(identity.clone(), ports.routes);
+            next.consumed.insert(identity.clone(), ports.consumed);
+            if let Some(contracts) = ports.contracts {
+                next.contracts.insert(identity.clone(), contracts);
+            }
+            next.tiers.insert(identity, PackageTier::Personal);
+        }
+        next
+    }
+
+    pub(crate) fn revision(&self) -> &[u8; 32] {
+        &self.revision
+    }
+
+    /// The tier of `caller`. A caller this snapshot does not know gets the Team
+    /// tier's narrower view.
+    pub(crate) fn tier_of(&self, caller: &PackageIdentity) -> PackageTier {
+        self.tiers.get(caller).copied().unwrap_or(PackageTier::Team)
+    }
+
+    /// The Providers a caller in `tier` may reach, by contract identity. A Team
+    /// caller sees only Team Providers; a Personal caller sees both tiers, which
+    /// never overlap because admission refuses an overlap with
+    /// `port_provider_conflict`.
+    pub(crate) fn providers_for(&self, tier: PackageTier) -> BTreeMap<String, PackageIdentity> {
+        let mut providers = self.team_providers.clone();
+        if tier == PackageTier::Personal {
+            providers.extend(
+                self.personal_providers
+                    .iter()
+                    .map(|(contract, provider)| (contract.clone(), provider.clone())),
+            );
+        }
+        providers
+    }
+
+    /// One caller's consumed Port declarations.
+    pub(crate) fn consumed_of(&self, caller: &PackageIdentity) -> &[ConsumedContract] {
+        self.consumed.get(caller).map_or(&[], Vec::as_slice)
+    }
+
+    /// One caller's selected route for `contract`.
+    pub(crate) fn route_of(
+        &self,
+        caller: &PackageIdentity,
+        contract: &str,
+    ) -> Option<&PortAvailability> {
+        self.graph
+            .get(caller)
+            .and_then(|routes| routes.iter().find(|route| route.contract == contract))
+    }
+
+    /// The contracts one Provider declares.
+    pub(crate) fn provided_contracts(
+        &self,
+        provider: &PackageIdentity,
+    ) -> Option<&Arc<CompiledPortContracts>> {
+        self.contracts.get(provider)
+    }
+
+    /// The guided contract `caller` may reach through Agent access, with its
+    /// Provider, schemas, major, and minor.
+    pub(crate) fn agent_contract(
+        &self,
+        caller: &PackageIdentity,
+        contract: &str,
+    ) -> Result<(PackageIdentity, Arc<CompiledPortContracts>, u16, u16), PackageErrorCode> {
+        let provider = self
+            .providers_for(self.tier_of(caller))
+            .remove(contract)
+            .ok_or(PackageErrorCode::PortUnavailable)?;
+        let schemas = self
+            .provided_contracts(&provider)
+            .cloned()
+            .ok_or(PackageErrorCode::PortUnavailable)?;
+        if !schemas.has_guide(contract) {
+            return Err(PackageErrorCode::PortUngranted);
+        }
+        let descriptor = schemas
+            .contracts
+            .iter()
+            .find(|c| c.identity == contract)
+            .ok_or(PackageErrorCode::PortUnavailable)?;
+        let (major, minor) = (descriptor.major, descriptor.minor);
+        Ok((provider, schemas, major, minor))
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl PortSnapshot {
+    pub(crate) fn probe(&self) -> crate::PortSnapshotProbe {
+        crate::PortSnapshotProbe {
+            revision: self.revision,
+            team: self
+                .tiers
+                .iter()
+                .filter(|(_, tier)| **tier == PackageTier::Team)
+                .map(|(identity, _)| {
+                    (
+                        identity.clone(),
+                        crate::TeamPortEntry {
+                            routes: self.graph.get(identity).cloned().unwrap_or_default(),
+                            consumed: self.consumed_of(identity).to_vec(),
+                            contracts: self
+                                .contracts
+                                .get(identity)
+                                .map(|contracts| Arc::as_ptr(contracts) as usize),
+                        },
+                    )
+                })
+                .collect(),
+            team_providers: self.team_providers.clone(),
+            personal_providers: self.personal_providers.clone(),
+        }
+    }
+}
+
+fn fresh_revision() -> [u8; 32] {
+    let mut revision = [0; 32];
+    getrandom::fill(&mut revision).expect("Port snapshot revision entropy");
+    revision
+}
+
+fn keep<V: Clone>(
+    map: &BTreeMap<PackageIdentity, V>,
+    team: impl Fn(&PackageIdentity) -> bool,
+) -> BTreeMap<PackageIdentity, V> {
+    map.iter()
+        .filter(|(identity, _)| team(identity))
+        .map(|(identity, value)| (identity.clone(), value.clone()))
+        .collect()
+}
+
+impl PortBroker {
+    /// Builds the broker over the initial snapshot of every admitted Package.
+    pub(crate) fn new(snapshot: PortSnapshot, access: crate::port_access::PortAccess) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(feature = "test-hooks")]
             authorized_pause: std::sync::Mutex::new(None),
@@ -102,7 +289,6 @@ impl PortBroker {
             subscription_leases: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "test-hooks")]
             selection_pause: std::sync::Mutex::new(None),
-            metadata_revision,
             #[cfg(feature = "test-hooks")]
             record_availability_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -110,11 +296,8 @@ impl PortBroker {
             #[cfg(feature = "test-hooks")]
             binding_pause: std::sync::Mutex::new(None),
             authority_generations: std::sync::Mutex::new(BTreeMap::new()),
-            fixed,
-            graph: RwLock::new(graph),
+            snapshot: RwLock::new(Arc::new(snapshot)),
             observations: crate::port_observation::channel(),
-            consumed: RwLock::new(consumed),
-            contracts: RwLock::new(contracts),
             instances: RwLock::new(BTreeMap::new()),
             routes: Arc::new(Semaphore::new(ROUTES)),
             bytes: Arc::new(Semaphore::new(ROUTE_BYTES)),
@@ -296,149 +479,44 @@ impl PortBroker {
     /// Makes one Instance unreachable for new routes. A call that already
     /// resolved it keeps its own reference and ends under the R14 rules.
     pub(crate) fn unregister(&self, key: &PackageInstanceKey) {
-        debug_assert!(!self.fixed.contains(&key.package_identity));
         self.instances
             .write()
             .expect("port registry poisoned")
             .remove(key);
     }
 
-    /// Adds or replaces one changeable caller's routes, consumed Ports, and provided contracts.
-    pub(crate) fn insert_caller(
-        &self,
-        caller: &PackageIdentity,
-        routes: Vec<PortAvailability>,
-        consumed: Vec<ConsumedContract>,
-        contracts: Option<Arc<CompiledPortContracts>>,
-    ) {
-        if self.fixed.contains(caller) {
-            debug_assert!(false, "a fixed caller's entries never change");
-            return;
-        }
-        self.graph
-            .write()
-            .expect("port graph poisoned")
-            .insert(caller.clone(), routes);
-        self.consumed
-            .write()
-            .expect("port graph poisoned")
-            .insert(caller.clone(), consumed);
-        let mut provided = self.contracts.write().expect("port graph poisoned");
-        match contracts {
-            Some(contracts) => {
-                provided.insert(caller.clone(), contracts);
-            }
-            None => {
-                provided.remove(caller);
-            }
-        }
-    }
-
-    /// Replaces one changeable caller's selected routes.
-    pub(crate) fn set_routes(&self, caller: &PackageIdentity, routes: Vec<PortAvailability>) {
-        if self.fixed.contains(caller) {
-            debug_assert!(false, "a fixed caller's routes never change");
-            return;
-        }
-        self.graph
-            .write()
-            .expect("port graph poisoned")
-            .insert(caller.clone(), routes);
-    }
-
-    /// Removes one changeable caller's entries, so new calls from or to it are refused.
-    pub(crate) fn remove_caller(&self, caller: &PackageIdentity) {
-        if self.fixed.contains(caller) {
-            debug_assert!(false, "a fixed caller's entries are never removed");
-            return;
-        }
-        self.graph
-            .write()
-            .expect("port graph poisoned")
-            .remove(caller);
-        self.consumed
-            .write()
-            .expect("port graph poisoned")
-            .remove(caller);
-        self.contracts
-            .write()
-            .expect("port graph poisoned")
-            .remove(caller);
-    }
-
-    /// Whether `caller` is in the Team tier, whose entries never change.
-    pub(crate) fn is_team(&self, caller: &PackageIdentity) -> bool {
-        self.fixed.contains(caller)
-    }
-
-    /// One caller's consumed Port declarations, read under the lock.
-    fn consumed_of(&self, caller: &PackageIdentity) -> Vec<ConsumedContract> {
-        self.consumed
+    /// The current snapshot. An operation clones it once and reads only it, so a
+    /// later [`publish`](Self::publish) never changes what it already resolved.
+    pub(crate) fn snapshot(&self) -> Arc<PortSnapshot> {
+        self.snapshot
             .read()
-            .expect("port graph poisoned")
-            .get(caller)
-            .cloned()
-            .unwrap_or_default()
+            .expect("port snapshot poisoned")
+            .clone()
     }
 
-    /// One caller's selected route for `contract`, read under the lock.
-    fn route_of(&self, caller: &PackageIdentity, contract: &str) -> Option<PortAvailability> {
-        self.graph
-            .read()
-            .expect("port graph poisoned")
-            .get(caller)
-            .and_then(|routes| routes.iter().find(|route| route.contract == contract))
-            .cloned()
+    /// Replaces the snapshot in one swap. Callers serialize publishes; only the
+    /// Personal tier publishes, under its tier lock.
+    pub(crate) fn publish(&self, next: PortSnapshot) {
+        *self.snapshot.write().expect("port snapshot poisoned") = Arc::new(next);
     }
 
-    /// The contracts one Provider declares, read under the lock.
-    pub(crate) fn provided_contracts(
-        &self,
-        provider: &PackageIdentity,
-    ) -> Option<Arc<CompiledPortContracts>> {
-        self.contracts
-            .read()
-            .expect("port graph poisoned")
-            .get(provider)
-            .cloned()
-    }
-
-    /// One caller's consumed Ports with each selected route, read under the lock.
-    fn declared_routes(
-        &self,
-        caller: &PackageIdentity,
-    ) -> Vec<(ConsumedContract, PortAvailability)> {
-        let consumed = self.consumed.read().expect("port graph poisoned");
-        let graph = self.graph.read().expect("port graph poisoned");
-        consumed
-            .get(caller)
-            .into_iter()
-            .flatten()
-            .filter_map(|consumed| {
-                graph
-                    .get(caller)
-                    .and_then(|routes| {
-                        routes
-                            .iter()
-                            .find(|entry| entry.contract == consumed.identity)
-                    })
-                    .map(|route| (consumed.clone(), route.clone()))
-            })
-            .collect()
-    }
-
+    /// Resolves one declared Port against `snapshot`, the caller's one snapshot.
     pub(crate) fn resolve(
         &self,
+        snapshot: &PortSnapshot,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
         contract: &str,
         port: &str,
         kind: PortKind,
     ) -> Result<(Arc<InstanceActor>, Arc<CompiledPortContracts>, u16, u16), PackageErrorCode> {
-        let (requested, route) = self
-            .declared_routes(caller)
-            .into_iter()
-            .find(|(entry, _)| entry.identity == contract)
+        let requested = snapshot
+            .consumed_of(caller)
+            .iter()
+            .find(|entry| entry.identity == contract)
+            .ok_or(PackageErrorCode::PortUngranted)?;
+        let route = snapshot
+            .route_of(caller, contract)
             .ok_or(PackageErrorCode::PortUngranted)?;
         if !requested
             .ports
@@ -464,11 +542,8 @@ impl PortBroker {
             ))
             .and_then(Weak::upgrade)
             .ok_or(PackageErrorCode::PortUnavailable)?;
-        let schemas = self
-            .contracts
-            .read()
-            .expect("port graph poisoned")
-            .get(provider)
+        let schemas = snapshot
+            .provided_contracts(provider)
             .cloned()
             .ok_or(PackageErrorCode::PortUnavailable)?;
         Ok((
@@ -747,11 +822,15 @@ pub(crate) async fn empty_broker() -> Arc<PortBroker> {
         .await
         .unwrap();
     PortBroker::new(
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeSet::new(),
-        crate::port_access::PortAccess::new(store, BTreeMap::new(), BTreeMap::new()),
+        PortSnapshot::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ),
+        crate::port_access::PortAccess::new(store),
     )
 }
 
@@ -808,5 +887,32 @@ mod tests {
         ));
         permits.clear();
         assert!(broker.permit(&request).is_ok());
+    }
+
+    // Verifies: TEAM.SYS.PKG-R09
+    #[tokio::test]
+    async fn snapshot_revision_changes_on_publish() {
+        let broker = empty_broker().await;
+        let before = broker.snapshot();
+        let provider: PackageIdentity = "dev.example.provider".parse().unwrap();
+
+        broker.publish(before.with_personal(
+            BTreeMap::new(),
+            BTreeMap::from([("dev.example.messages".to_owned(), provider.clone())]),
+        ));
+
+        let after = broker.snapshot();
+        assert_ne!(after.revision(), before.revision());
+        assert!(
+            before.providers_for(PackageTier::Personal).is_empty(),
+            "a snapshot an operation already holds never changes"
+        );
+        assert_eq!(
+            after.providers_for(PackageTier::Personal)["dev.example.messages"],
+            provider
+        );
+        assert!(after.providers_for(PackageTier::Team).is_empty());
+        broker.publish(after.with_personal(BTreeMap::new(), BTreeMap::new()));
+        assert_ne!(broker.snapshot().revision(), after.revision());
     }
 }

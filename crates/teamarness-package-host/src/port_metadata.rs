@@ -1,4 +1,4 @@
-//! Declared metadata from the broker's immutable, final admission snapshot.
+//! Declared and Agent metadata, each page or chunk read from one immutable Port snapshot.
 use std::collections::BTreeSet;
 use std::sync::Weak;
 
@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use teamarness_package_contract::port_contract::PortMetadata;
 use teamarness_package_contract::ui_contract::MAX_UI_PAYLOAD_BYTES;
 
-use super::PortBroker;
+use super::{PortBroker, PortSnapshot};
 use crate::{LifecycleState, PackageErrorCode, PackageIdentity, PackageInstanceKey, WorkspaceId};
 
 const PAGE_ROWS: usize = 32;
@@ -17,23 +17,23 @@ const CHUNK_BYTES: usize = MAX_UI_PAYLOAD_BYTES / 4;
 
 impl PortBroker {
     fn declared_metadata(
-        &self,
+        snapshot: &PortSnapshot,
         caller: &PackageIdentity,
         contract: &str,
     ) -> Result<PortMetadata, PackageErrorCode> {
-        let declaration = self
+        let declaration = snapshot
             .consumed_of(caller)
-            .into_iter()
+            .iter()
             .find(|c| c.identity == contract)
             .ok_or(PackageErrorCode::PortUngranted)?;
-        let route = self
+        let route = snapshot
             .route_of(caller, contract)
             .filter(|r| r.unavailable.is_none())
             .ok_or(PackageErrorCode::PortUnavailable)?;
         let schemas = route
             .provider
             .as_ref()
-            .and_then(|p| self.provided_contracts(p))
+            .and_then(|p| snapshot.provided_contracts(p))
             .ok_or(PackageErrorCode::PortUnavailable)?;
         let names = declaration
             .ports
@@ -70,19 +70,20 @@ impl PortBroker {
     }
 
     fn cursor(
-        &self,
+        snapshot: &PortSnapshot,
         caller: &PackageIdentity,
         workspace: &WorkspaceId,
         access: &str,
         last: &str,
     ) -> String {
-        // The random Host-open revision makes every previous admission snapshot stale.
-        // Hash the exact scope and last identity with that private revision; no client state.
+        // Each published snapshot has a fresh random revision, so a cursor from any earlier
+        // snapshot is stale. Hash the exact scope and last identity with that private
+        // revision; no client state.
         let bytes = serde_json::to_vec(&json!([caller.as_str(), workspace.as_str(), access, last]))
             .expect("JSON scope");
         let mut hash = Sha256::new();
         hash.update(&bytes);
-        hash.update(self.metadata_revision);
+        hash.update(snapshot.revision());
         let digest = hash.finalize();
         format!("{}.{}", STANDARD.encode(bytes), STANDARD.encode(digest))
     }
@@ -105,6 +106,8 @@ impl PortBroker {
         let access = input["access"]
             .as_str()
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        // One snapshot for the whole page, including the cursor it checks and issues.
+        let snapshot = self.snapshot();
         if access == "agent" && state.actor["kind"] != "agent" {
             return Err(PackageErrorCode::AgentNotBound);
         }
@@ -122,20 +125,21 @@ impl PortBroker {
             let scope: Vec<String> =
                 serde_json::from_slice(&bytes).map_err(|_| PackageErrorCode::PortCatalogChanged)?;
             let last = scope.get(3).ok_or(PackageErrorCode::PortCatalogChanged)?;
-            if cursor != self.cursor(caller, workspace, access, last) {
+            if cursor != Self::cursor(&snapshot, caller, workspace, access, last) {
                 return Err(PackageErrorCode::PortCatalogChanged);
             }
             Some(last.clone())
         } else {
             None
         };
-        let consumed = self.consumed_of(caller);
+        let consumed = snapshot.consumed_of(caller);
         let mut identities: BTreeSet<String> = if access == "declared" {
             consumed.iter().map(|c| c.identity.clone()).collect()
         } else {
-            self.providers_for(caller)
+            snapshot
+                .providers_for(snapshot.tier_of(caller))
                 .keys()
-                .filter(|c| self.agent_contract(caller, c).is_ok())
+                .filter(|c| snapshot.agent_contract(caller, c).is_ok())
                 .cloned()
                 .chain(state.selections.keys().cloned())
                 .collect()
@@ -150,11 +154,11 @@ impl PortBroker {
                     .iter()
                     .find(|c| &c.identity == contract)
                     .expect("declared identity");
-                let route = self.route_of(caller, contract);
-                let provider = route.as_ref().and_then(|r| r.provider.clone());
+                let route = snapshot.route_of(caller, contract);
+                let provider = route.and_then(|r| r.provider.clone());
                 let description = provider
                     .as_ref()
-                    .and_then(|p| self.provided_contracts(p))
+                    .and_then(|p| snapshot.provided_contracts(p))
                     .and_then(|s| {
                         s.contracts
                             .iter()
@@ -163,13 +167,13 @@ impl PortBroker {
                     });
                 (
                     provider,
-                    self.declared_metadata(caller, contract).ok(),
+                    Self::declared_metadata(&snapshot, caller, contract).ok(),
                     declaration.major,
                     route.and_then(|r| r.minor),
                     description,
                 )
             } else if let Ok((provider, schemas, major, minor)) =
-                self.agent_contract(caller, contract)
+                snapshot.agent_contract(caller, contract)
             {
                 let description = schemas
                     .contracts
@@ -197,7 +201,8 @@ impl PortBroker {
             rows.push(json!({"contract":contract,"major":major,"minor":minor,"description":description,"available":available,"enabled":enabled_major.is_some(),"enabledMajor":enabled_major,"metadataSha256":metadata.map(|m| m.sha256)}));
             let mut candidate = json!({"contracts":rows});
             if index + 1 < remaining.len() {
-                candidate["nextCursor"] = json!(self.cursor(caller, workspace, access, contract));
+                candidate["nextCursor"] =
+                    json!(Self::cursor(&snapshot, caller, workspace, access, contract));
             }
             if serde_json::to_vec(&candidate)
                 .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
@@ -242,12 +247,14 @@ impl PortBroker {
             .and_then(Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        // One snapshot for the whole chunk.
+        let snapshot = self.snapshot();
         let (metadata, provider) = if input["access"] == "agent" {
             if state.actor["kind"] != "agent" {
                 return Err(PackageErrorCode::AgentNotBound);
             }
             let (provider, schemas, _, _) =
-                self.agent_contract(caller, contract).map_err(|code| {
+                snapshot.agent_contract(caller, contract).map_err(|code| {
                     if state.selections.contains_key(contract) {
                         PackageErrorCode::PortUnavailable
                     } else {
@@ -261,8 +268,8 @@ impl PortBroker {
                 Some(provider),
             )
         } else {
-            let metadata = self.declared_metadata(caller, contract)?;
-            let provider = self
+            let metadata = Self::declared_metadata(&snapshot, caller, contract)?;
+            let provider = snapshot
                 .route_of(caller, contract)
                 .and_then(|r| r.provider.clone());
             (metadata, provider)

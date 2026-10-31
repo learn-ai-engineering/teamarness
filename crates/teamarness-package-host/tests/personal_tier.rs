@@ -42,8 +42,21 @@ fn capabilities() -> Vec<serde_json::Value> {
 
 impl Live {
     async fn open() -> Self {
+        Self::open_with(|_| {}).await
+    }
+
+    /// Opens the Host after `team` edits the Team Package manifest.
+    async fn open_with(team: impl FnOnce(&mut serde_json::Value)) -> Self {
         let fixture =
             common::Fixture::node_with_capabilities(&[("team", TEAM)], &capabilities()).await;
+        let manifest_path = fixture
+            .config
+            .application_root()
+            .join("team/teamarness.package.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        team(&mut manifest);
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         fixture.core.create_workspace("Second Workspace").unwrap();
         let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
             .await
@@ -235,6 +248,52 @@ async fn post(
         panic!("{outcome:?}")
     };
     Ok(serde_json::to_value(payload).unwrap())
+}
+
+/// Calls one Ports capability method from a mount and returns the UI response.
+async fn capability(
+    host: &PackageHost,
+    mount: &UiMountId,
+    method: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let outcome = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new(format!("ports-{}", rand_suffix())).unwrap(),
+            operation: "fixture.capability".into(),
+            payload: serde_json::from_value(serde_json::json!({
+                "capability":"teamarness.package-ports","method":method,"arguments":arguments
+            }))
+            .unwrap(),
+        }))
+        .await
+        .unwrap();
+    let PackageHostOutcome::UiResponse { payload } = outcome else {
+        panic!("{outcome:?}")
+    };
+    serde_json::to_value(payload).unwrap()
+}
+
+/// Sends one fixture request to a mount and returns its payload.
+async fn fixture_request(
+    host: &PackageHost,
+    mount: &UiMountId,
+    operation: &str,
+) -> serde_json::Value {
+    let outcome = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: mount.clone(),
+            request: UiRequestId::new(format!("fixture-{}", rand_suffix())).unwrap(),
+            operation: operation.into(),
+            payload: serde_json::from_value(serde_json::json!({})).unwrap(),
+        }))
+        .await
+        .unwrap();
+    let PackageHostOutcome::UiResponse { payload } = outcome else {
+        panic!("{outcome:?}")
+    };
+    serde_json::to_value(payload).unwrap()
 }
 
 fn assert_active(instances: &[PackageInstanceSnapshot], workspaces: usize) {
@@ -1063,4 +1122,219 @@ async fn a_hand_written_entry_for_a_team_identity_is_removed_and_the_bundled_pac
         .await
         .unwrap();
     drop(live.fixture);
+}
+
+/// The first declared metadata page's cursor from the Team mount. The Team
+/// Package declares more optional contracts than one page holds.
+async fn open_cursor(live: &Live) -> String {
+    let first = capability(
+        &live.host,
+        &live.team_mount,
+        "available",
+        serde_json::json!({"access":"declared"}),
+    )
+    .await;
+    first["result"]["nextCursor"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a second page exists: {first}"))
+        .to_owned()
+}
+
+async fn next_page(live: &Live, cursor: &str) -> serde_json::Value {
+    capability(
+        &live.host,
+        &live.team_mount,
+        "available",
+        serde_json::json!({"access":"declared","cursor":cursor}),
+    )
+    .await
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn personal_change_invalidates_open_metadata_cursors() {
+    let live = Live::open_with(|manifest| {
+        manifest["consumedPorts"] = (0..34)
+            .map(|n| serde_json::json!({
+                "identity":format!("com.example.absent{n:02}"),"major":1,"minMinor":0,"maxMinor":0,
+                "required":false,"ports":[{"name":"value.read","kind":"query"}]
+            }))
+            .collect();
+    })
+    .await;
+    let path = live.package("personal", "com.example.personal", Ports::None);
+    let cursor = open_cursor(&live).await;
+    let page = next_page(&live, &cursor).await;
+    assert_eq!(
+        page["result"]["contracts"].as_array().map(Vec::len),
+        Some(2),
+        "the cursor works before a Personal change: {page}"
+    );
+
+    live.install(&path, "com.example.personal").await.unwrap();
+    let stale = next_page(&live, &cursor).await;
+    assert_eq!(stale["error"], "port_catalog_changed", "install: {stale}");
+
+    let cursor = open_cursor(&live).await;
+    live.reload("com.example.personal").await.unwrap();
+    let stale = next_page(&live, &cursor).await;
+    assert_eq!(stale["error"], "port_catalog_changed", "reload: {stale}");
+
+    let cursor = open_cursor(&live).await;
+    live.remove("com.example.personal").await.unwrap();
+    let stale = next_page(&live, &cursor).await;
+    assert_eq!(stale["error"], "port_catalog_changed", "remove: {stale}");
+
+    let cursor = open_cursor(&live).await;
+    let page = next_page(&live, &cursor).await;
+    assert!(
+        page["result"]["contracts"].is_array(),
+        "a cursor from the current snapshot works: {page}"
+    );
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn team_snapshot_entries_are_identical_across_personal_changes() {
+    // The Team Package optionally consumes the contract only a Personal Package provides.
+    let live = Live::open_with(|manifest| {
+        manifest["consumedPorts"] = serde_json::json!([{
+            "identity":CONTRACT,"major":1,"minMinor":0,"maxMinor":0,"required":false,
+            "ports":[{"name":"message.post","kind":"command"}]
+        }]);
+    })
+    .await;
+    let provider = live.package("provider", "com.example.provider", Ports::Provides);
+    let consumer = live.package("consumer", "com.example.consumer", Ports::Requires);
+    let before = live.host.port_snapshot_for_tests();
+    let team_route = &before.team[&TEAM.parse::<PackageIdentity>().unwrap()].routes;
+    assert_eq!(team_route.len(), 1);
+    assert_eq!(team_route[0].provider, None, "no Team Provider exists");
+    let mut revisions = vec![before.revision];
+
+    for (step, change) in [
+        "install provider",
+        "install consumer",
+        "reload provider",
+        "remove provider",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match step {
+            0 => live.install(&provider, "com.example.provider").await,
+            1 => live.install(&consumer, "com.example.consumer").await,
+            2 => live.reload("com.example.provider").await,
+            _ => live.remove("com.example.provider").await,
+        }
+        .unwrap();
+        let after = live.host.port_snapshot_for_tests();
+        assert!(
+            !revisions.contains(&after.revision),
+            "{change} published a new revision"
+        );
+        revisions.push(after.revision);
+        assert_eq!(
+            after.team, before.team,
+            "{change} left every Team entry unchanged"
+        );
+        assert_eq!(after.team_providers, before.team_providers);
+        let personal: Vec<_> = after.personal_providers.keys().cloned().collect();
+        let expected: &[&str] = if step == 3 { &[] } else { &[CONTRACT] };
+        assert_eq!(personal, expected, "{change}");
+    }
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R14
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn in_flight_call_keeps_provider_resolved_before_swap() {
+    let live = Live::open().await;
+    let provider = live.package("provider", "com.example.provider", Ports::Provides);
+    let consumer = live.package("consumer", "com.example.consumer", Ports::Requires);
+    let bystander = live.package("bystander", "com.example.bystander", Ports::None);
+    live.install(&provider, "com.example.provider")
+        .await
+        .unwrap();
+    live.install(&consumer, "com.example.consumer")
+        .await
+        .unwrap();
+    let consumer_key = instances(&live.host, "com.example.consumer").await[0]
+        .key
+        .clone();
+    let provider_before = instances(&live.host, "com.example.provider")
+        .await
+        .into_iter()
+        .find(|instance| instance.key.workspace_id == consumer_key.workspace_id)
+        .unwrap();
+    let routed = mount(&live.host, consumer_key.clone()).await;
+    let consumer_identity: PackageIdentity = "com.example.consumer".parse().unwrap();
+    let mut observations = live.host.observe_ports();
+
+    // A call resolved before an unrelated swap completes on the Provider it resolved.
+    let pause = live
+        .host
+        .pause_next_command_authorized_for_tests(consumer_identity.clone());
+    let host = live.host.clone();
+    let mount_id = routed.clone();
+    let held = tokio::spawn(async move { post(&host, &mount_id, "kept").await });
+    pause.paused().await;
+    let revision = live.host.port_snapshot_for_tests().revision;
+    live.install(&bystander, "com.example.bystander")
+        .await
+        .unwrap();
+    assert_ne!(live.host.port_snapshot_for_tests().revision, revision);
+    pause.resume();
+    let answer = held.await.unwrap().unwrap();
+    assert_eq!(answer["result"]["accepted"], true, "{answer}");
+    let dispatched = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let observation = observations.recv().await.unwrap();
+            if observation.stage == PortStage::Dispatched {
+                return observation;
+            }
+        }
+    })
+    .await
+    .expect("the held command reached its Provider");
+    assert_eq!(
+        dispatched.provider_generation, provider_before.process_generation,
+        "the command went to the Provider generation it resolved"
+    );
+
+    // A call resolved before its Provider's reload never reaches the new generation.
+    let pause = live
+        .host
+        .pause_next_command_authorized_for_tests(consumer_identity);
+    let host = live.host.clone();
+    let mount_id = routed.clone();
+    let held = tokio::spawn(async move { post(&host, &mount_id, "stale").await });
+    pause.paused().await;
+    live.reload("com.example.provider").await.unwrap();
+    pause.resume();
+    match held.await.unwrap() {
+        Ok(answer) => assert!(answer["error"].is_string(), "{answer}"),
+        Err(error) => panic!("the consumer was not restarted: {error:?}"),
+    }
+    let provider_after = instances(&live.host, "com.example.provider")
+        .await
+        .into_iter()
+        .find(|instance| instance.key.workspace_id == consumer_key.workspace_id)
+        .unwrap();
+    assert!(provider_after.process_generation > provider_before.process_generation);
+    let provider_mount = mount(&live.host, provider_after.key.clone()).await;
+    let last = fixture_request(&live.host, &provider_mount, "fixture.port_last_actor").await;
+    assert_eq!(
+        last["commands"], 0,
+        "the reloaded Provider received no command resolved before the swap: {last}"
+    );
+    let posted = post(&live.host, &routed, "after").await.unwrap();
+    assert_eq!(posted["result"]["accepted"], true, "{posted}");
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
 }

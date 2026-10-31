@@ -89,15 +89,15 @@ impl PackageHost {
             .map(|(identity, _)| identity.clone())
             .collect();
         let port_broker = broker::PortBroker::new(
-            report.graph.clone(),
-            consumed,
-            port_contracts.clone(),
-            team_identities.clone(),
-            crate::port_access::PortAccess::new(
-                store.clone(),
+            broker::PortSnapshot::new(
+                report.graph.clone(),
+                consumed,
+                port_contracts.clone(),
+                report.tiers.clone(),
                 report.team_providers.clone(),
                 report.personal_providers.clone(),
             ),
+            crate::port_access::PortAccess::new(store.clone()),
         );
         let tiers = Self::split_tiers(&config, &mut report, &team_identities)?;
         let templates: Vec<_> = tiers

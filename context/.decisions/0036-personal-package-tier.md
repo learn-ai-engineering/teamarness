@@ -43,7 +43,8 @@ Teamarness has two kinds of Packages. Team Packages ship with the application an
 ## Consequences
 
 - From this decision on, a Team Package cannot use a Port provided only by a Personal Package. Such a route reports the Port as unavailable, with a diagnostic.
-- The `PortBroker` route maps become per-caller mutable for Personal callers. Team entries are inserted once and never removed. An in-flight call keeps the provider it resolved.
+- The `PortBroker` resolves Ports through one immutable Port snapshot: per-caller routes, consumed Ports and provided contracts, the Team and Personal Provider maps, each Package's tier, and a random revision. Each Personal install, reload or remove builds the next snapshot under the Personal tier lock, copies every Team entry unchanged, and swaps it in once with a fresh revision. Every resolve, metadata page or chunk, and access check reads one snapshot, so an in-flight call keeps the provider it resolved. Metadata cursors hash the revision, so a Personal change invalidates every open cursor. (Amended 2026-10-31 at the Ports 2.0 integration; this replaced per-caller mutable route maps.)
+- ADR 0035's "one immutable admission snapshot" now means one Port snapshot per operation. The snapshot is no longer fixed for the Host's lifetime, but no operation sees two.
 - Workspace reconciliation creates Instances from the Team templates and the current Personal templates.
 - `TEAM.SYS.PKG-R09` no longer permits a restart requirement for Personal registrations. Overrides still require one. `contracts/packages/v1/README.md` drops "admitted on the next Host open, not live" for the Personal tier.
 - A Package Backend can still write the registration file itself, through its ambient filesystem authority (`TEAM.SYS.PKG-R11`). This decision adds no boundary against trusted native code.
@@ -51,8 +52,8 @@ Teamarness has two kinds of Packages. Team Packages ship with the application an
 ## Evidence
 
 - Workstream `packagement`: scope, research and design artifacts (see Provenance). Design revision 2 records the developer review that replaced the whole-Host reopen.
-- `crates/teamarness-package-host/src/catalog.rs` (file policy), `src/admission.rs` (whole-Installation admission, `finalize` side effects), `src/broker.rs` (per-caller route maps), `src/host/lifecycle.rs` (fixed Host structures, reconciliation), `src/instance.rs` (per-actor generation).
-- **Weaknesses:** the per-caller broker mutability and the affected-consumer restart had not been exercised when this decision was accepted. The implementing workstream must test that Team generations and mounts are unchanged across Personal operations.
+- `crates/teamarness-package-host/src/catalog.rs` (file policy), `src/admission.rs` (whole-Installation admission, `finalize` side effects), `src/broker.rs` (`PortSnapshot`, swapped per Personal change), `src/host/lifecycle.rs` (fixed Host structures, reconciliation), `src/instance.rs` (per-actor generation).
+- **Weaknesses:** the live broker change and the affected-consumer restart had not been exercised when this decision was accepted. The implementing workstream must test that Team generations and mounts are unchanged across Personal operations.
 
 ### Provenance (non-versioned)
 

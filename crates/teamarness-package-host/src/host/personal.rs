@@ -10,8 +10,11 @@
 //!   shutdown take the same lock, so neither sees half of an operation, and no
 //!   Instance key ever gets a second actor.
 //! - An operation never touches a Team Instance, route, generation, or mount.
-//!   Team Packages never route to a Personal Provider, and the broker refuses
-//!   to change a Team caller's entries.
+//!   Team Packages never route to a Personal Provider, and every Port snapshot
+//!   the tier publishes copies the Team entries unchanged.
+//! - Each install, reload, or remove publishes the broker's next Port snapshot
+//!   once, with the target's entries and every re-resolved Personal consumer's
+//!   routes in the same swap.
 //! - A running Provider is never displaced: a candidate that claims a contract
 //!   a running Package provides is refused with `port_provider_conflict`.
 //! - An Instance key's process generation never decreases while the Host runs,
@@ -33,6 +36,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use crate::admission::{
     self, Admission, AdmissionMode, Eligible, LiveAdmission, LiveVerdict, View,
 };
+use crate::broker::CallerPorts;
 use crate::catalog::{self, InstallationEntry, InstallationRegistration};
 use crate::errors::{activation_error, host_error, instance_error};
 use crate::host::lifecycle::{prepare_instance, process_template};
@@ -58,7 +62,7 @@ pub(crate) struct TeamTier {
 pub(crate) struct PersonalPackage {
     pub(crate) admitted: (PackageCatalogEntry, Admission),
     pub(crate) template: supervisor::ProcessTemplate,
-    /// Its consumed-Port routes, as the broker has them.
+    /// Its consumed-Port routes, as the last published Port snapshot has them.
     pub(crate) routes: Vec<PortAvailability>,
 }
 
@@ -241,11 +245,12 @@ impl PackageHost {
                     .await);
             }
         };
-        match verdict.result {
+        let changed = match verdict.result {
             Ok(admitted) => {
-                self.enter(admitted, verdict.catalog, &mut tier).await;
+                let changed = self.enter(admitted, verdict.catalog, &mut tier).await;
                 self.upsert_registration(snapshot_of(&entry, RegistrationStatus::Admitted))
                     .await;
+                changed
             }
             Err(code) => {
                 if replaced {
@@ -260,8 +265,8 @@ impl PackageHost {
                     )
                     .await);
             }
-        }
-        self.reresolve_consumers(Some(&identity)).await;
+        };
+        self.restart_consumers(changed).await;
         Ok(PackageHostOutcome::PersonalInstalled {
             revision: self.bump_revision().await,
         })
@@ -293,11 +298,12 @@ impl PackageHost {
             catalog,
             diagnostics,
         } = verdict;
-        match result {
+        let changed = match result {
             Ok(admitted) => {
-                self.enter(admitted, catalog, &mut tier).await;
+                let changed = self.enter(admitted, catalog, &mut tier).await;
                 self.upsert_registration(snapshot_of(&entry, RegistrationStatus::Admitted))
                     .await;
+                changed
             }
             Err(code) => {
                 if let Some(catalog) = catalog {
@@ -312,8 +318,8 @@ impl PackageHost {
                     .refuse_registration(&identity, refusal(code, &identity))
                     .await);
             }
-        }
-        self.reresolve_consumers(Some(&identity)).await;
+        };
+        self.restart_consumers(changed).await;
         Ok(PackageHostOutcome::PersonalReloaded {
             revision: self.bump_revision().await,
         })
@@ -347,7 +353,7 @@ impl PackageHost {
             .await
             .registrations
             .retain(|registration| registration.expected_identity != identity.as_str());
-        self.reresolve_consumers(None).await;
+        self.reresolve_consumers().await;
         Ok(PackageHostOutcome::PersonalRemoved {
             revision: self.bump_revision().await,
         })
@@ -585,6 +591,10 @@ impl PackageHost {
 
     /// Disposes every Instance of `identity`, which revokes its mounts, then
     /// removes its entries. Returns whether it was running.
+    ///
+    /// The published Port snapshot keeps its entries until the operation
+    /// publishes the next one; its Instances are already unreachable, so a new
+    /// call to it is refused with `port_unavailable` meanwhile.
     async fn retire(&self, identity: &PackageIdentity, tier: &mut TierGuard<'_>) -> bool {
         let actors = self
             .inner
@@ -614,16 +624,9 @@ impl PackageHost {
         let running = {
             let mut entries = self.inner.personal.write();
             entries.providers.retain(|_, provider| provider != identity);
-            self.inner
-                .port_broker
-                .access
-                .set_personal_providers(entries.providers.clone());
             entries.catalog.remove(identity);
             entries.packages.remove(identity).is_some()
         };
-        if running {
-            self.inner.port_broker.remove_caller(identity);
-        }
         let mut data = self.inner.data.lock().await;
         data.packages
             .retain(|package| package.identity != *identity);
@@ -637,14 +640,15 @@ impl PackageHost {
         running
     }
 
-    /// Inserts one admitted Package's entries, then creates and activates its
-    /// Instances in every Workspace.
+    /// Inserts one admitted Package's entries, publishes the next Port snapshot
+    /// with them, then creates and activates its Instances in every Workspace.
+    /// Returns the Personal consumers whose routes changed, for a restart.
     async fn enter(
         &self,
         admitted: LiveAdmission,
         catalog: Option<AuthoringCatalogEntry>,
         tier: &mut TierGuard<'_>,
-    ) {
+    ) -> Vec<PackageIdentity> {
         let LiveAdmission {
             entry,
             admission,
@@ -653,19 +657,9 @@ impl PackageHost {
         } = admitted;
         let identity = entry.identity.clone();
         let template = process_template(&self.inner.config, &entry, &admission);
-        self.inner.port_broker.insert_caller(
-            &identity,
-            graph.clone(),
-            admission.manifest.consumed_ports.clone(),
-            admission.manifest.port_contract.clone(),
-        );
         {
             let mut entries = self.inner.personal.write();
             entries.providers.extend(providers);
-            self.inner
-                .port_broker
-                .access
-                .set_personal_providers(entries.providers.clone());
             if let Some(catalog) = catalog {
                 entries.catalog.insert(identity.clone(), catalog);
             }
@@ -685,7 +679,10 @@ impl PackageHost {
             data.packages
                 .sort_by(|left, right| left.identity.cmp(&right.identity));
         }
+        // Publish before the new Instances exist, so their first calls see their routes.
+        let changed = self.publish_personal(Some(&identity)).await;
         self.create_instances(&template, tier).await;
+        changed
     }
 
     /// Creates one Instance of `template` per Workspace, then activates the
@@ -756,63 +753,93 @@ impl PackageHost {
         }
     }
 
+    /// Publishes the next Port snapshot after a remove or a refused
+    /// registration, then restarts the Personal consumers whose routes changed.
+    async fn reresolve_consumers(&self) {
+        let changed = self.publish_personal(None).await;
+        self.restart_consumers(changed).await;
+    }
+
     /// Re-resolves every running Personal consumer except `except` against the
-    /// current Providers. A consumer whose selected routes changed gets its new
-    /// routes, a diagnostic for each required Port that is now unavailable, and
-    /// a restart. No other Instance is touched.
-    async fn reresolve_consumers(&self, except: Option<&PackageIdentity>) {
-        let changed: Vec<(
-            PackageIdentity,
-            Vec<PortAvailability>,
-            Vec<PackageErrorCode>,
-        )> = {
-            let entries = self.inner.personal.read();
-            let mut running: View<'_> = self
-                .inner
-                .team
-                .admitted
-                .iter()
-                .map(|(identity, entry)| (identity.clone(), entry))
-                .collect();
-            running.extend(
+    /// current Providers, then publishes the next Port snapshot in one swap: the
+    /// Team entries unchanged, and every Personal entry and Provider as the tier
+    /// now has them. A consumer whose selected routes changed gets a diagnostic
+    /// for each required Port that is now unavailable. Returns those consumers.
+    ///
+    /// The caller holds the tier lock, which serializes every publish.
+    async fn publish_personal(&self, except: Option<&PackageIdentity>) -> Vec<PackageIdentity> {
+        let changed: Vec<(PackageIdentity, Vec<PackageErrorCode>)> = {
+            let mut entries = self.inner.personal.write();
+            let resolved: Vec<_> = {
+                let mut running: View<'_> = self
+                    .inner
+                    .team
+                    .admitted
+                    .iter()
+                    .map(|(identity, entry)| (identity.clone(), entry))
+                    .collect();
+                running.extend(
+                    entries
+                        .packages
+                        .iter()
+                        .map(|(identity, package)| (identity.clone(), &package.admitted)),
+                );
+                let mut providers = self.inner.team.providers.clone();
+                providers.extend(entries.providers.clone());
                 entries
                     .packages
                     .iter()
-                    .map(|(identity, package)| (identity.clone(), &package.admitted)),
-            );
-            let mut providers = self.inner.team.providers.clone();
-            providers.extend(entries.providers.clone());
-            entries
-                .packages
-                .iter()
-                .filter(|(identity, _)| Some(*identity) != except)
-                .filter_map(|(identity, package)| {
-                    let consumed = &package.admitted.1.manifest.consumed_ports;
-                    let routes = admission::resolve_routes(consumed, &providers, &running);
-                    (routes != package.routes).then(|| {
-                        let missing = consumed
-                            .iter()
-                            .zip(&routes)
-                            .filter(|(request, _)| request.required)
-                            .filter_map(|(_, route)| route.unavailable)
-                            .collect();
-                        (identity.clone(), routes, missing)
+                    .filter(|(identity, _)| Some(*identity) != except)
+                    .filter_map(|(identity, package)| {
+                        let consumed = &package.admitted.1.manifest.consumed_ports;
+                        let routes = admission::resolve_routes(consumed, &providers, &running);
+                        (routes != package.routes).then(|| {
+                            let missing = consumed
+                                .iter()
+                                .zip(&routes)
+                                .filter(|(request, _)| request.required)
+                                .filter_map(|(_, route)| route.unavailable)
+                                .collect();
+                            (identity.clone(), routes, missing)
+                        })
                     })
-                })
-                .collect()
-        };
-        for (identity, routes, missing) in &changed {
-            {
-                let mut entries = self.inner.personal.write();
-                if let Some(package) = entries.packages.get_mut(identity) {
-                    package.routes = routes.clone();
-                }
-                if let Some(catalog) = entries.catalog.get_mut(identity) {
+                    .collect()
+            };
+            let mut changed = Vec::with_capacity(resolved.len());
+            for (identity, routes, missing) in resolved {
+                if let Some(catalog) = entries.catalog.get_mut(&identity) {
                     catalog.availability = routes.clone();
                 }
+                if let Some(package) = entries.packages.get_mut(&identity) {
+                    package.routes = routes;
+                }
+                changed.push((identity, missing));
             }
-            self.inner.port_broker.set_routes(identity, routes.clone());
-            let mut data = self.inner.data.lock().await;
+            let personal = entries
+                .packages
+                .iter()
+                .map(|(identity, package)| {
+                    let manifest = &package.admitted.1.manifest;
+                    (
+                        identity.clone(),
+                        CallerPorts {
+                            routes: package.routes.clone(),
+                            consumed: manifest.consumed_ports.clone(),
+                            contracts: manifest.port_contract.clone(),
+                        },
+                    )
+                })
+                .collect();
+            let broker = &self.inner.port_broker;
+            broker.publish(
+                broker
+                    .snapshot()
+                    .with_personal(personal, entries.providers.clone()),
+            );
+            changed
+        };
+        let mut data = self.inner.data.lock().await;
+        for (identity, missing) in &changed {
             data.diagnostics.retain(|error| {
                 error.affected_package.as_ref() != Some(identity) || !route_code(error.code)
             });
@@ -831,7 +858,13 @@ impl PackageHost {
                 }
             }
         }
-        for (identity, _, _) in changed {
+        changed.into_iter().map(|(identity, _)| identity).collect()
+    }
+
+    /// Restarts every Instance of each changed consumer over its new routes.
+    /// No other Instance is touched.
+    async fn restart_consumers(&self, changed: Vec<PackageIdentity>) {
+        for identity in changed {
             let actors = self
                 .inner
                 .data
@@ -903,7 +936,7 @@ impl PackageHost {
                 data.diagnostics.push(error.clone());
             }
         }
-        self.reresolve_consumers(None).await;
+        self.reresolve_consumers().await;
         self.bump_revision().await;
         error
     }

@@ -1,4 +1,4 @@
-//! Self-scoped durable selections and authorization over the immutable admission snapshot.
+//! Self-scoped durable selections and authorization over one immutable Port snapshot per operation.
 use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use serde_json::{Map, Value, json};
@@ -13,32 +13,11 @@ use crate::{
 
 pub(crate) struct PortAccess {
     pub(crate) store: HostStoreHandle,
-    /// Contract identity to the Team tier's Provider. Fixed for the Host's life.
-    team_providers: BTreeMap<String, PackageIdentity>,
-    /// Contract identity to the Personal tier's Provider. Replaced on every
-    /// Personal install, reload, or remove.
-    personal_providers: std::sync::RwLock<BTreeMap<String, PackageIdentity>>,
 }
 
 impl PortAccess {
-    pub(crate) fn new(
-        store: HostStoreHandle,
-        team_providers: BTreeMap<String, PackageIdentity>,
-        personal_providers: BTreeMap<String, PackageIdentity>,
-    ) -> Self {
-        Self {
-            store,
-            team_providers,
-            personal_providers: std::sync::RwLock::new(personal_providers),
-        }
-    }
-
-    /// Replaces the Personal tier's Providers after a Personal change.
-    pub(crate) fn set_personal_providers(&self, providers: BTreeMap<String, PackageIdentity>) {
-        *self
-            .personal_providers
-            .write()
-            .expect("port providers poisoned") = providers;
+    pub(crate) fn new(store: HostStoreHandle) -> Self {
+        Self { store }
     }
 }
 
@@ -128,8 +107,9 @@ impl PortBroker {
                 return Err(PackageErrorCode::AgentNotBound);
             }
             if let Some(major) = major {
-                let (_, _, selected, _) =
-                    broker.agent_contract(&key.package_identity, &contract)?;
+                let (_, _, selected, _) = broker
+                    .snapshot()
+                    .agent_contract(&key.package_identity, &contract)?;
                 if selected != major {
                     return Err(PackageErrorCode::PortVersionMismatch);
                 }
@@ -177,51 +157,6 @@ impl PortBroker {
         .await
     }
 
-    /// The Providers `caller` may reach by contract identity. A Team caller sees
-    /// only Team Providers; a Personal caller sees both tiers, which never overlap
-    /// because admission refuses an overlap with `port_provider_conflict`.
-    pub(crate) fn providers_for(
-        &self,
-        caller: &PackageIdentity,
-    ) -> BTreeMap<String, PackageIdentity> {
-        let mut providers = self.access.team_providers.clone();
-        if !self.is_team(caller) {
-            providers.extend(
-                self.access
-                    .personal_providers
-                    .read()
-                    .expect("port providers poisoned")
-                    .iter()
-                    .map(|(contract, provider)| (contract.clone(), provider.clone())),
-            );
-        }
-        providers
-    }
-
-    pub(crate) fn agent_contract(
-        &self,
-        caller: &PackageIdentity,
-        contract: &str,
-    ) -> Result<(PackageIdentity, Arc<CompiledPortContracts>, u16, u16), PackageErrorCode> {
-        let provider = self
-            .providers_for(caller)
-            .remove(contract)
-            .ok_or(PackageErrorCode::PortUnavailable)?;
-        let schemas = self
-            .provided_contracts(&provider)
-            .ok_or(PackageErrorCode::PortUnavailable)?;
-        if !schemas.has_guide(contract) {
-            return Err(PackageErrorCode::PortUngranted);
-        }
-        let descriptor = schemas
-            .contracts
-            .iter()
-            .find(|c| c.identity == contract)
-            .ok_or(PackageErrorCode::PortUnavailable)?;
-        let (major, minor) = (descriptor.major, descriptor.minor);
-        Ok((provider, schemas, major, minor))
-    }
-
     pub(crate) fn resolve_access(
         &self,
         caller: &PackageIdentity,
@@ -244,8 +179,10 @@ impl PortBroker {
             _ => return Err(PackageErrorCode::PortUngranted),
         };
         let is_agent = state.actor["kind"] == "agent";
+        // One snapshot for the whole check; a later publish never changes this route.
+        let snapshot = self.snapshot();
         let (provider, schemas, major, minor) = match input.get("access").and_then(Value::as_str) {
-            Some("declared") => self.resolve(caller, workspace, contract, port, kind)?,
+            Some("declared") => self.resolve(&snapshot, caller, workspace, contract, port, kind)?,
             Some("agent") => {
                 if !is_agent {
                     return Err(PackageErrorCode::AgentNotBound);
@@ -258,7 +195,8 @@ impl PortBroker {
                 if state.selections.get(contract) != Some(&requested) {
                     return Err(PackageErrorCode::PortNotEnabled);
                 }
-                let (identity, schemas, major, minor) = self.agent_contract(caller, contract)?;
+                let (identity, schemas, major, minor) =
+                    snapshot.agent_contract(caller, contract)?;
                 if major != requested {
                     return Err(PackageErrorCode::PortUnavailable);
                 }
